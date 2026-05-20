@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
+use super::port::{self, PortReservation};
 use super::relay::TestRelay;
 
 // NOTE: Using rust-nostr Kind variants:
@@ -811,11 +812,22 @@ impl MetricsTestHarness {
         self.syncing_relay = Some(TestRelay::start_with_sync(Some(source_url)).await);
     }
 
-    /// Start syncing relay on a specific port pointing to source[idx]
-    pub async fn start_syncing_relay_on_port(&mut self, source_idx: usize, port: u16) {
+    /// Start syncing relay on a caller-reserved port pointing to source[idx].
+    ///
+    /// The caller holds the [`PortReservation`] until they pass it in;
+    /// while it's held, no other parallel test in this process can be
+    /// handed the same port. See [`crate::common::port`] for why this
+    /// matters.
+    pub async fn start_syncing_relay_on_reservation(
+        &mut self,
+        source_idx: usize,
+        reservation: PortReservation,
+    ) {
         let source_url = self.source_relays[source_idx].url().to_string();
-        self.syncing_relay =
-            Some(TestRelay::start_on_port_with_options(port, Some(source_url), false).await);
+        self.syncing_relay = Some(
+            TestRelay::start_on_reservation_with_options(reservation, Some(source_url), false)
+                .await,
+        );
     }
 
     /// Start syncing relay pointing to random unused port (for failure tests)
@@ -1422,8 +1434,12 @@ pub async fn run_sync_test(historic_events: &[Event], live_events: &[Event]) -> 
     }
     // Note: Both slices can be empty - this tests just the announcement sync
 
-    // 1. Pre-allocate syncing relay port for announcement tags
-    let syncing_port = TestRelay::find_free_port();
+    // 1. Pre-allocate syncing relay port for announcement tags. We hold
+    //    the reservation through the announcement+state-event setup so
+    //    no other parallel test in this process can be handed the same
+    //    port number before step 10 starts the relay.
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
 
     // 2. Start source relay
@@ -1495,8 +1511,12 @@ pub async fn run_sync_test(historic_events: &[Event], live_events: &[Event]) -> 
     }
 
     // 10. Start syncing relay (connects to source)
-    let syncing =
-        TestRelay::start_on_port_with_options(syncing_port, Some(source.url().into()), false).await;
+    let syncing = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
+        Some(source.url().into()),
+        false,
+    )
+    .await;
 
     // 11. Wait for sync connection to establish
     let _ = wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(5)).await;

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
-use crate::common::{sync_helpers::*, TestRelay};
+use crate::common::{port, sync_helpers::*, TestRelay};
 
 /// Test 1: Bootstrap sync - relay syncs existing events from bootstrap relay on startup
 ///
@@ -208,8 +208,12 @@ async fn test_announcement_not_listing_relay_is_not_synced() {
 /// This is different from "live sync" where events arrive after connection.
 #[tokio::test]
 async fn test_history_sync_without_negentropy() {
-    // Pre-allocate syncing relay port to get its domain
-    let syncing_port = TestRelay::find_free_port();
+    // Pre-allocate syncing relay port to get its domain. Holding the
+    // reservation prevents any other parallel test in this process from
+    // being handed the same port between here and the relay actually
+    // booting (announcement setup below adds non-trivial latency).
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
     println!("Pre-allocated syncing relay domain: {}", syncing_domain);
 
@@ -247,8 +251,8 @@ async fn test_history_sync_without_negentropy() {
 
     // NOW start syncing relay on the reserved port, with negentropy DISABLED
     // This syncing relay has never connected before - it needs to do HISTORY sync
-    let syncing = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source.url().into()),
         true, // disable_negentropy = true
     )
@@ -301,8 +305,12 @@ async fn test_history_sync_without_negentropy() {
 #[tokio::test]
 #[ignore]
 async fn test_pagination_for_large_historic_sync() {
-    // Pre-allocate syncing relay port to get its domain
-    let syncing_port = TestRelay::find_free_port();
+    // Pre-allocate syncing relay port to get its domain. Holding the
+    // reservation prevents any other parallel test in this process from
+    // being handed the same port between here and the relay actually
+    // booting (announcement setup below adds non-trivial latency).
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
     println!("Pre-allocated syncing relay domain: {}", syncing_domain);
 
@@ -388,8 +396,8 @@ async fn test_pagination_for_large_historic_sync() {
 
     // NOW start syncing relay on the reserved port, with negentropy DISABLED
     // This forces it to use REQ+EOSE historic sync with pagination
-    let syncing = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source.url().into()),
         true, // disable_negentropy = true (force REQ+EOSE)
     )

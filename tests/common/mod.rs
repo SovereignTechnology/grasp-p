@@ -4,12 +4,14 @@
 
 pub mod git_server;
 pub mod mock_relay;
+pub mod port;
 pub mod purgatory_helpers;
 pub mod relay;
 pub mod sync_helpers;
 
 pub use git_server::{SimpleGitServer, SmartGitServer};
 pub use mock_relay::MockRelay;
+pub use port::{PortReservation, reserve_port};
 pub use purgatory_helpers::*;
 pub use relay::TestRelay;
 pub use sync_helpers::*;

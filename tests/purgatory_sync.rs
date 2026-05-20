@@ -30,7 +30,7 @@ mod common;
 use common::{
     add_commit_to_repo, build_repo_coord, check_ref_at_commit, create_pr_event,
     create_pr_event_with_clone, create_repo_announcement, create_state_event,
-    create_test_repo_with_commit, push_ref_to_relay, push_to_relay, verify_event_not_served,
+    create_test_repo_with_commit, port, push_ref_to_relay, push_to_relay, verify_event_not_served,
     wait_for_event_served, wait_for_sync_connection, CommitVariant, MockRelay, SmartGitServer,
     TestRelay,
 };
@@ -144,7 +144,8 @@ async fn test_state_event_syncs_from_remote() {
     let identifier = "state-sync-test-repo";
 
     // Pre-allocate syncing relay port so we can include it in announcement
-    let syncing_port = TestRelay::find_free_port();
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
 
     // 2. Create test repository locally with deterministic commit
@@ -228,8 +229,8 @@ async fn test_state_event_syncs_from_remote() {
         .expect("State event should be served on source relay after push");
 
     // 6. Start syncing relay (syncs from source)
-    let syncing_relay = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing_relay = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source_relay.url().to_string()),
         false,
     )
@@ -305,7 +306,8 @@ async fn test_pr_event_syncs_from_remote() {
     let identifier = "pr-sync-test-repo";
 
     // Pre-allocate syncing relay port so we can include it in announcement
-    let syncing_port = TestRelay::find_free_port();
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
 
     // 2. Create test repository locally with PR commit
@@ -436,8 +438,8 @@ async fn test_pr_event_syncs_from_remote() {
         .expect("PR event should be served on source relay after push");
 
     // Step 6: Start syncing relay (syncs from source)
-    let syncing_relay = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing_relay = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source_relay.url().to_string()),
         false,
     )
@@ -512,7 +514,8 @@ async fn test_concurrent_state_and_pr_sync() {
     let identifier = "concurrent-sync-test-repo";
 
     // Pre-allocate syncing relay port so we can include it in announcement
-    let syncing_port = TestRelay::find_free_port();
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
 
     // 2. Create test repository with two commits
@@ -651,8 +654,8 @@ async fn test_concurrent_state_and_pr_sync() {
         .expect("PR event should be served on source relay after push");
 
     // Step 6: Start syncing relay (syncs from source)
-    let syncing_relay = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing_relay = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source_relay.url().to_string()),
         false,
     )
@@ -819,7 +822,8 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
     let git_server = SmartGitServer::start(repo_b.path()).await;
 
     // 4. Pre-allocate syncing_relay port for announcement tags
-    let syncing_port = TestRelay::find_free_port();
+    let syncing_reservation = port::reserve_port();
+    let syncing_port = syncing_reservation.port();
     let syncing_domain = format!("127.0.0.1:{}", syncing_port);
 
     // ========================================================================
@@ -985,8 +989,8 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
     // We do NOT publish the announcement directly to syncing_relay. Instead,
     // syncing_relay discovers it via the bootstrap connection to source_grasp,
     // which has the promoted announcement in its database.
-    let syncing_relay = TestRelay::start_on_port_with_options(
-        syncing_port,
+    let syncing_relay = TestRelay::start_on_reservation_with_options(
+        syncing_reservation,
         Some(source_grasp.url().to_string()), // Bootstrap from source_grasp
         true, // Disable negentropy - MockRelay doesn't support NIP-77
     )

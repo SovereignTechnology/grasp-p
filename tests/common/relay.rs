@@ -1,17 +1,52 @@
 //! Test relay fixture
 //!
 //! Provides automatic relay lifecycle management for integration tests.
+//!
+//! ## Port allocation
+//!
+//! All public `start*` methods route through [`PortReservation`] (see
+//! [`crate::common::port`]) so that parallel `#[tokio::test]`s cannot be
+//! handed the same loopback port. Callers that need to embed the relay's
+//! address into events *before* the relay is up should reserve the port
+//! themselves and pass the reservation into one of the
+//! `start_on_reservation_*` constructors — the listener stays bound for
+//! the duration of the reservation, eliminating the same-process race.
 
 use nostr_sdk::ToBech32;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+use crate::common::port::{self, PortReservation};
+
+/// How long to wait for the spawned ngit-grasp subprocess to accept TCP
+/// connections before giving up on a single attempt.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often to retry the TCP probe while waiting for readiness.
+const READY_POLL: Duration = Duration::from_millis(100);
+/// Extra grace after the listener accepts before declaring the relay
+/// ready. Mirrors the existing fixture; without it the first WebSocket
+/// upgrade can race the handler wiring.
+const READY_GRACE: Duration = Duration::from_millis(100);
+/// How many fresh port reservations to attempt before giving up. The
+/// subprocess binds itself from `NGIT_BIND_ADDRESS`, so there is a
+/// microsecond-scale TOCTOU window between [`PortReservation::release`]
+/// and the subprocess's own `bind`. If that window loses the race the
+/// subprocess exits before its TCP listener accepts; the readiness
+/// check picks that up via `try_wait` so we can retry on a fresh port
+/// instead of hanging the full readiness timeout.
+///
+/// In practice this loop has never been observed to fire in local
+/// stress testing — kept as defense-in-depth for CI / loaded hardware.
+const MAX_BIND_ATTEMPTS: usize = 5;
 
 /// Test relay fixture that manages relay lifecycle
 ///
 /// Automatically starts and stops the ngit-grasp relay for testing.
-/// Uses a random port to avoid conflicts and cleans up created repositories.
+/// Uses a kernel-assigned port held open by a [`PortReservation`] until
+/// just before subprocess spawn, eliminating the same-process port race
+/// that plagued the older "bind, drop, return port" pattern.
 pub struct TestRelay {
     process: Child,
     url: String,
@@ -23,8 +58,20 @@ pub struct TestRelay {
     git_data_path: PathBuf,
 }
 
+/// Options that the various `start*` constructors fan out into a single
+/// internal entry point. Field names mirror the original positional
+/// parameters so the call-site changes are mechanical.
+#[derive(Default, Clone)]
+struct RelayOptions {
+    bootstrap_relay_url: Option<String>,
+    disable_negentropy: bool,
+    archive_all: bool,
+    archive_read_only: bool,
+    grasp06_enable: bool,
+}
+
 impl TestRelay {
-    /// Start a test relay instance
+    /// Start a test relay instance on a kernel-assigned loopback port.
     ///
     /// # Example
     ///
@@ -39,26 +86,7 @@ impl TestRelay {
     /// }
     /// ```
     pub async fn start() -> Self {
-        Self::start_with_options(Self::find_free_port(), None).await
-    }
-
-    /// Start relay on a specific port
-    pub async fn start_with_port(port: u16) -> Self {
-        Self::start_with_full_options(port, None, false).await
-    }
-
-    /// Start relay on a specific port with full options
-    ///
-    /// This is useful for testing history sync where we need to:
-    /// 1. Start relay_b (first instance) to get its domain
-    /// 2. Stop relay_b
-    /// 3. Start relay_b (second instance) on SAME port with different options
-    pub async fn start_on_port_with_options(
-        port: u16,
-        bootstrap_relay_url: Option<String>,
-        disable_negentropy: bool,
-    ) -> Self {
-        Self::start_with_full_options(port, bootstrap_relay_url, disable_negentropy).await
+        Self::start_internal(port::reserve_port(), RelayOptions::default()).await
     }
 
     /// Start relay with sync from another relay (bootstrap relay)
@@ -78,30 +106,30 @@ impl TestRelay {
     /// }
     /// ```
     pub async fn start_with_sync(bootstrap_relay_url: Option<String>) -> Self {
-        Self::start_with_full_options(Self::find_free_port(), bootstrap_relay_url, false).await
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                ..RelayOptions::default()
+            },
+        )
+        .await
     }
 
     /// Start relay with sync and negentropy disabled
     ///
     /// This is useful for testing that sync works without NIP-77 negentropy.
     /// History sync will use REQ+EOSE instead of the more efficient negentropy protocol.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use common::TestRelay;
-    ///
-    /// #[tokio::test]
-    /// async fn test_sync_without_negentropy() {
-    ///     let source = TestRelay::start().await;
-    ///     let syncing = TestRelay::start_with_sync_no_negentropy(Some(source.url().into())).await;
-    ///     // ... test sync behavior without negentropy ...
-    ///     syncing.stop().await;
-    ///     source.stop().await;
-    /// }
-    /// ```
     pub async fn start_with_sync_no_negentropy(bootstrap_relay_url: Option<String>) -> Self {
-        Self::start_with_full_options(Self::find_free_port(), bootstrap_relay_url, true).await
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
     }
 
     /// Start relay with archive configuration
@@ -111,26 +139,14 @@ impl TestRelay {
     /// # Arguments
     /// * `archive_all` - Accept all repository announcements (GRASP-05)
     /// * `archive_read_only` - Reject git pushes (read-only archive mode)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use common::TestRelay;
-    ///
-    /// #[tokio::test]
-    /// async fn test_archive_mode() {
-    ///     let relay = TestRelay::start_with_archive_config(true, true).await;
-    ///     // ... test archive behavior ...
-    ///     relay.stop().await;
-    /// }
-    /// ```
     pub async fn start_with_archive_config(archive_all: bool, archive_read_only: bool) -> Self {
-        Self::start_with_archive_and_sync(
-            Self::find_free_port(),
-            None,
-            false,
-            archive_all,
-            archive_read_only,
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                archive_all,
+                archive_read_only,
+                ..RelayOptions::default()
+            },
         )
         .await
     }
@@ -142,72 +158,137 @@ impl TestRelay {
     /// the env var is ignored — this is harmless and lets the same test file
     /// drive both the pre- and post-implementation contracts.
     pub async fn start_with_grasp_06_enabled() -> Self {
-        Self::start_with_all_options(Self::find_free_port(), None, false, false, false, true).await
-    }
-
-    /// Start relay with options (internal, maintains backward compatibility)
-    async fn start_with_options(port: u16, bootstrap_relay_url: Option<String>) -> Self {
-        Self::start_with_full_options(port, bootstrap_relay_url, false).await
-    }
-
-    /// Start relay with full options
-    async fn start_with_full_options(
-        port: u16,
-        bootstrap_relay_url: Option<String>,
-        disable_negentropy: bool,
-    ) -> Self {
-        Self::start_with_archive_and_sync(
-            port,
-            bootstrap_relay_url,
-            disable_negentropy,
-            false,
-            false,
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                grasp06_enable: true,
+                ..RelayOptions::default()
+            },
         )
         .await
     }
 
-    /// Start relay with all options including archive configuration and sync
+    /// Start a relay on a port that the caller has already reserved.
     ///
-    /// This is the most flexible method for starting a test relay with all options.
-    /// Use this when you need both archive mode AND sync from a bootstrap relay.
+    /// Use this when the test needs the port number *before* the relay
+    /// boots — e.g. to embed `127.0.0.1:{port}` into an announcement event
+    /// that will be created and published before the syncing relay
+    /// itself comes up. Holding the [`PortReservation`] across the gap
+    /// guarantees no other parallel test in this process will be handed
+    /// the same port number in the meantime.
+    pub async fn start_on_reservation_with_options(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        disable_negentropy: bool,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay with archive configuration on a pre-reserved port.
     ///
-    /// # Arguments
-    /// * `port` - Port to bind to
-    /// * `bootstrap_relay_url` - URL of relay to sync from (optional)
-    /// * `disable_negentropy` - Whether to disable NIP-77 negentropy sync
-    /// * `archive_all` - Accept all repository announcements (GRASP-05)
-    /// * `archive_read_only` - Reject git pushes (read-only archive mode)
-    pub async fn start_with_archive_and_sync(
-        port: u16,
+    /// See [`Self::start_on_reservation_with_options`] for why one would
+    /// reserve a port up front; this variant additionally accepts the
+    /// archive flags.
+    pub async fn start_on_reservation_with_archive_and_sync(
+        reservation: PortReservation,
         bootstrap_relay_url: Option<String>,
         disable_negentropy: bool,
         archive_all: bool,
         archive_read_only: bool,
     ) -> Self {
-        Self::start_with_all_options(
-            port,
-            bootstrap_relay_url,
-            disable_negentropy,
-            archive_all,
-            archive_read_only,
-            false,
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy,
+                archive_all,
+                archive_read_only,
+                ..RelayOptions::default()
+            },
         )
         .await
     }
 
-    /// Start relay with every configurable option, including GRASP-06.
+    /// Start a relay with every configurable option, on a pre-reserved port.
     ///
-    /// Prefer the narrower constructors (`start`, `start_with_grasp_06_enabled`,
-    /// `start_with_archive_config`, etc.) — this exists so the option matrix has
-    /// a single place to grow.
-    pub async fn start_with_all_options(
-        port: u16,
+    /// Prefer the narrower constructors above — this exists so the option
+    /// matrix has a single place to grow.
+    pub async fn start_on_reservation_with_all_options(
+        reservation: PortReservation,
         bootstrap_relay_url: Option<String>,
         disable_negentropy: bool,
         archive_all: bool,
         archive_read_only: bool,
         grasp06_enable: bool,
     ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy,
+                archive_all,
+                archive_read_only,
+                grasp06_enable,
+            },
+        )
+        .await
+    }
+
+    /// Single entry point that drives the spawn+readiness loop.
+    ///
+    /// Retries up to [`MAX_BIND_ATTEMPTS`] times if the subprocess exits
+    /// early — that's the signature of having lost the bind race in the
+    /// microseconds between [`PortReservation::release`] and the
+    /// subprocess's own `bind`. Each retry draws a brand-new
+    /// kernel-assigned port; two consecutive `AddrInUse` failures would
+    /// therefore require two independent races back to back.
+    async fn start_internal(initial_reservation: PortReservation, options: RelayOptions) -> Self {
+        let mut reservation = Some(initial_reservation);
+        for attempt in 1..=MAX_BIND_ATTEMPTS {
+            // Each attempt consumes the current reservation. On retry we
+            // re-acquire from the kernel — guaranteed to give us a port
+            // number different from any reservation currently held
+            // elsewhere in this process.
+            let r = reservation
+                .take()
+                .expect("reservation always present on attempt entry");
+            match Self::try_start_once(r, &options).await {
+                StartOutcome::Ready(relay) => return relay,
+                StartOutcome::EarlyExit { status } if attempt < MAX_BIND_ATTEMPTS => {
+                    eprintln!(
+                        "[TestRelay] ngit-grasp exited early on attempt \
+                         {attempt}/{MAX_BIND_ATTEMPTS} (status: {status:?}); \
+                         likely a port-bind race — retrying with a fresh port",
+                    );
+                    reservation = Some(port::reserve_port());
+                    continue;
+                }
+                StartOutcome::EarlyExit { status } => {
+                    panic!(
+                        "ngit-grasp subprocess exited early after {MAX_BIND_ATTEMPTS} attempts \
+                         (last exit status: {status:?}). If this is not a port-bind race, \
+                         check /tmp/relay-*.log for the relay's stdout."
+                    );
+                }
+            }
+        }
+        unreachable!("MAX_BIND_ATTEMPTS loop terminated without returning")
+    }
+
+    /// One attempt at spawning ngit-grasp on the given reservation and
+    /// waiting for it to be ready. Returns [`StartOutcome::EarlyExit`]
+    /// specifically when the subprocess died before the readiness probe
+    /// succeeded — the caller may retry in that case.
+    async fn try_start_once(reservation: PortReservation, options: &RelayOptions) -> StartOutcome {
+        let port = reservation.port();
         let bind_address = format!("127.0.0.1:{}", port);
         let url = format!("ws://127.0.0.1:{}", port);
 
@@ -231,7 +312,9 @@ impl TestRelay {
             .to_bech32()
             .expect("Failed to generate test npub");
 
-        // Start the relay process
+        // Build the Command *before* releasing the reservation so that
+        // none of the env-setting allocations happen while the listener
+        // is held. We release immediately before `spawn`.
         let mut cmd = Command::new(&binary_path);
         cmd.env("NGIT_BIND_ADDRESS", &bind_address)
             .env("NGIT_DOMAIN", &bind_address) // Set domain to match bind address
@@ -258,35 +341,41 @@ impl TestRelay {
             .stderr(Stdio::inherit()); // Inherit stderr for test output
 
         // Add bootstrap relay URL if provided
-        if let Some(ref bootstrap_url) = bootstrap_relay_url {
+        if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
             cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url);
         }
 
         // Add negentropy disable flag if requested
-        if disable_negentropy {
+        if options.disable_negentropy {
             cmd.env("NGIT_SYNC_DISABLE_NEGENTROPY", "true");
         }
 
         // Add archive configuration if requested
-        if archive_all {
+        if options.archive_all {
             cmd.env("NGIT_ARCHIVE_ALL", "true");
         }
-        if archive_read_only {
+        if options.archive_read_only {
             cmd.env("NGIT_ARCHIVE_READ_ONLY", "true");
         }
 
         // Enable GRASP-06 if requested. If the binary does not yet recognise
         // this env var (pre-implementation), clap simply ignores it.
-        if grasp06_enable {
+        if options.grasp06_enable {
             cmd.env("NGIT_GRASP06_ENABLE", "true");
         }
+
+        // Release the port reservation immediately before spawning the
+        // subprocess that will bind it. Holding the reservation through
+        // env-var setup above is what keeps any concurrent
+        // `reserve_port()` calls from picking this same number.
+        let _ = reservation.release();
 
         let process = cmd.spawn().expect("Failed to start relay process");
 
         // Store git data path for test assertions
         let git_data_path = git_data_dir.path().to_path_buf();
 
-        let relay = Self {
+        let mut relay = Self {
             process,
             url,
             port,
@@ -294,10 +383,16 @@ impl TestRelay {
             git_data_path,
         };
 
-        // Wait for relay to be ready
-        relay.wait_for_ready().await;
-
-        relay
+        match relay.wait_for_ready_or_early_exit().await {
+            ReadyOutcome::Ready => StartOutcome::Ready(relay),
+            ReadyOutcome::EarlyExit { status } => {
+                // The subprocess is already gone; release the rest of
+                // the fixture (tempdir, etc.) by dropping `relay` here
+                // so the retry doesn't pile up unused temp dirs.
+                drop(relay);
+                StartOutcome::EarlyExit { status }
+            }
+        }
     }
 
     /// Get the relay WebSocket URL
@@ -318,25 +413,40 @@ impl TestRelay {
         &self.git_data_path
     }
 
-    /// Wait for the relay to be ready to accept connections
-    async fn wait_for_ready(&self) {
-        let max_attempts = 50; // 5 seconds total
-        let delay = Duration::from_millis(100);
+    /// Probe the listener with async TCP connects until it accepts,
+    /// while concurrently watching for the subprocess to exit early
+    /// (the signature of a lost port-bind race). Without the early-exit
+    /// check we'd burn the full [`READY_TIMEOUT`] on a process that's
+    /// already dead.
+    async fn wait_for_ready_or_early_exit(&mut self) -> ReadyOutcome {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            // Check whether the subprocess has already exited. If so the
+            // TCP probe will never succeed — bail immediately so the
+            // caller can retry with a fresh port.
+            match self.process.try_wait() {
+                Ok(Some(status)) => return ReadyOutcome::EarlyExit { status },
+                Ok(None) => { /* still running */ }
+                Err(e) => {
+                    panic!("Failed to poll relay subprocess status during readiness check: {e}");
+                }
+            }
 
-        for attempt in 0..max_attempts {
-            // Try to connect to the relay
-            match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", self.port)).await {
+            match tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await {
                 Ok(_) => {
                     // Connection successful, relay is ready
                     // Give it a tiny bit more time to fully initialize
-                    sleep(Duration::from_millis(100)).await;
-                    return;
+                    sleep(READY_GRACE).await;
+                    return ReadyOutcome::Ready;
                 }
-                Err(_) => {
-                    if attempt == max_attempts - 1 {
-                        panic!("Relay failed to start after {} attempts", max_attempts);
-                    }
-                    sleep(delay).await;
+                Err(_) if Instant::now() < deadline => {
+                    sleep(READY_POLL).await;
+                }
+                Err(e) => {
+                    panic!(
+                        "Relay at 127.0.0.1:{} did not become ready within {:?}: {e}",
+                        self.port, READY_TIMEOUT,
+                    );
                 }
             }
         }
@@ -354,24 +464,6 @@ impl TestRelay {
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
-
-    /// Find a free port to use for testing
-    pub fn find_free_port() -> u16 {
-        use std::net::TcpListener;
-
-        // Bind to port 0 to get a random free port
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
-
-        let port = listener
-            .local_addr()
-            .expect("Failed to get local address")
-            .port();
-
-        // Drop the listener to free the port
-        drop(listener);
-
-        port
-    }
 }
 
 impl Drop for TestRelay {
@@ -382,14 +474,36 @@ impl Drop for TestRelay {
     }
 }
 
+/// Internal outcome of a single [`TestRelay::try_start_once`] attempt.
+///
+/// `EarlyExit` is the retry-eligible case (subprocess died before
+/// becoming ready — almost always a lost bind race); `Ready` is the
+/// happy path.
+enum StartOutcome {
+    Ready(TestRelay),
+    EarlyExit { status: std::process::ExitStatus },
+}
+
+/// Internal outcome of the readiness wait loop. Mirrors `StartOutcome`
+/// but without the `TestRelay` payload — the relay is constructed by
+/// the caller before calling the readiness probe.
+enum ReadyOutcome {
+    Ready,
+    EarlyExit { status: std::process::ExitStatus },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_find_free_port() {
-        let port = TestRelay::find_free_port();
-        assert!(port > 0);
-        // Port is u16, so it's always < 65536
+    /// `start()` reserves and uses a non-zero port end-to-end.
+    /// (The reservation correctness invariants — distinct ports across
+    /// parallel reservations, bindability after release — live in
+    /// `port.rs`'s own unit tests.)
+    #[tokio::test]
+    async fn start_acquires_a_usable_port() {
+        let relay = TestRelay::start().await;
+        assert!(relay.port > 0);
+        relay.stop().await;
     }
 }

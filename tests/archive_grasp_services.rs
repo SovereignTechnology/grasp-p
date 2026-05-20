@@ -31,8 +31,8 @@ mod common;
 
 use common::{
     check_ref_at_commit, create_repo_announcement, create_state_event,
-    create_test_repo_with_commit, push_to_relay, wait_for_event_served, wait_for_sync_connection,
-    CommitVariant, TestRelay,
+    create_test_repo_with_commit, port, push_to_relay, wait_for_event_served,
+    wait_for_sync_connection, CommitVariant, TestRelay,
 };
 use nostr_sdk::prelude::*;
 use std::path::PathBuf;
@@ -41,12 +41,18 @@ use std::time::Duration;
 
 /// Helper to start a relay with archive_grasp_services configuration
 ///
-/// This is a specialized version of TestRelay::start_with_archive_and_sync
+/// This is a specialized version of TestRelay::start_on_reservation_with_archive_and_sync
 /// that adds the NGIT_ARCHIVE_GRASP_SERVICES environment variable.
 async fn start_relay_with_grasp_services(services: &str) -> (Child, String, PathBuf) {
-    let port = TestRelay::find_free_port();
-    let bind_address = format!("127.0.0.1:{}", port);
-    let url = format!("ws://127.0.0.1:{}", port);
+    // Reserve a port and hold the listener bound until just before the
+    // subprocess spawns — mirrors the pattern in `TestRelay`. Without
+    // this hold, a parallel test in this process could be handed the
+    // same port between the kernel-assigned bind and ngit-grasp's own
+    // bind, producing a flaky `Address already in use` failure.
+    let reservation = port::reserve_port();
+    let relay_port = reservation.port();
+    let bind_address = format!("127.0.0.1:{}", relay_port);
+    let url = format!("ws://127.0.0.1:{}", relay_port);
 
     // Create temporary directory for git repositories
     let git_data_dir = tempfile::tempdir().expect("Failed to create temporary git data directory");
@@ -82,13 +88,17 @@ async fn start_relay_with_grasp_services(services: &str) -> (Child, String, Path
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    // Release the reservation immediately before spawn so the subprocess
+    // can bind the port. See `tests/common/port.rs` for the rationale.
+    let _ = reservation.release();
+
     let process = cmd.spawn().expect("Failed to start relay process");
 
     // Store git data path for test assertions
     let git_data_path = git_data_dir.path().to_path_buf();
 
     // Wait for relay to be ready
-    wait_for_relay_ready(port).await;
+    wait_for_relay_ready(relay_port).await;
 
     (process, url, git_data_path)
 }
@@ -398,9 +408,11 @@ async fn test_archive_read_only_creates_bare_repo() {
     let keys = Keys::generate();
     let identifier = "archive-test-repo";
 
-    // Pre-allocate archive relay port so we can include it in announcement
-    let archive_port = TestRelay::find_free_port();
-    let archive_domain = format!("127.0.0.1:{}", archive_port);
+    // Pre-allocate archive relay port so we can include it in
+    // announcement. Hold the reservation across announcement+push setup
+    // so no parallel test in this process is handed the same port.
+    let archive_reservation = port::reserve_port();
+    let archive_domain = format!("127.0.0.1:{}", archive_reservation.port());
 
     // 2. Create test repository locally with deterministic commit
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -481,8 +493,8 @@ async fn test_archive_read_only_creates_bare_repo() {
         .expect("State event should be served on source relay after push");
 
     // 6. Start archive relay with archive_all=true, archive_read_only=true, syncing from source
-    let archive_relay = TestRelay::start_with_archive_and_sync(
-        archive_port,
+    let archive_relay = TestRelay::start_on_reservation_with_archive_and_sync(
+        archive_reservation,
         Some(source_relay.url().to_string()),
         false, // negentropy enabled
         true,  // archive_all

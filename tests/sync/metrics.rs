@@ -15,6 +15,7 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 
 use crate::common::{
+    port,
     sync_helpers::{
         create_repo_announcement, fetch_metrics, setup_announcement_on_relay,
         wait_for_sync_connection, MetricsTestHarness, ParsedMetrics, TestClient,
@@ -397,8 +398,11 @@ async fn test_connection_failure_increments_counter() {
 /// since Layer 2 events are accepted directly to the DB.
 #[tokio::test]
 async fn test_live_sync_event_count() {
-    // Pre-allocate syncing relay port to include in announcements
-    let sync_port = TestRelay::find_free_port();
+    // Pre-allocate syncing relay port to include in announcements.
+    // Holding the reservation across the announcement setup prevents
+    // another parallel test in this process from grabbing the same port.
+    let sync_reservation = port::reserve_port();
+    let sync_port = sync_reservation.port();
     let sync_domain = format!("127.0.0.1:{}", sync_port);
 
     // Start source relay
@@ -417,8 +421,8 @@ async fn test_live_sync_event_count() {
     println!("Announcement set up on source relay with git data");
 
     // Start syncing relay with pre-allocated port
-    let syncing_relay = TestRelay::start_on_port_with_options(
-        sync_port,
+    let syncing_relay = TestRelay::start_on_reservation_with_options(
+        sync_reservation,
         Some(source_relay.url().to_string()),
         false,
     )
@@ -592,9 +596,11 @@ async fn test_multi_source_aggregate_counts() {
     // that with one source, tracked=1 and connected=1
     let mut harness = MetricsTestHarness::with_sources(1).await;
 
-    // Pre-allocate syncing relay port and create an announcement that includes both domains
-    let sync_port = TestRelay::find_free_port();
-    let sync_domain = format!("127.0.0.1:{}", sync_port);
+    // Pre-allocate syncing relay port and create an announcement that includes both domains.
+    // Hold the reservation across announcement setup so a parallel test
+    // cannot be handed the same port number.
+    let sync_reservation = port::reserve_port();
+    let sync_domain = format!("127.0.0.1:{}", sync_reservation.port());
 
     // Create announcement on source that references both relays
     let keys = Keys::generate();
@@ -606,7 +612,9 @@ async fn test_multi_source_aggregate_counts() {
     harness.submit_events(0, &[announcement]).await.unwrap();
 
     // Now start syncing relay - it should sync the existing announcement
-    harness.start_syncing_relay_on_port(0, sync_port).await;
+    harness
+        .start_syncing_relay_on_reservation(0, sync_reservation)
+        .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let metrics = harness.get_metrics().await.unwrap();
