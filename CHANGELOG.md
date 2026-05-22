@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-22
+
 ### Added
 
 - **GRASP-06 contributor PR submission endpoint** (`NGIT_GRASP06_ENABLE`, default off). When enabled, the relay accepts unauthenticated `git push` of `refs/nostr/<event-id>` to `/prs/<npub>/<identifier>.git` from any contributor, even for repositories this relay has no accepted announcement for. The corresponding PR (kind 1618) or PR Update (kind 1619) event is accepted into purgatory when its `clone` tag names this relay's `/prs/<signer>/<d>.git` endpoint and its `a` tag's d-tag matches the URL identifier. When the event and the push match (signer, d-tag, c-tag commit) the event is released from purgatory and the ref is mirrored into any accepted-announcement repos on this relay. Empty `/prs/` repos (probe pushes, mismatched events) are garbage-collected inline at the three runtime sites that can leave them empty (receive handler at end of push, PR-event policy when discarding a mismatched scoped placeholder, purgatory sweep when a scoped placeholder expires without a matching event) plus a one-shot startup scan that removes any zero-ref `/prs/` bare repos left behind by a previous run (crash, mid-cleanup failure, or shutdown with unresolved scoped placeholders). GRASP-06 is advertised in NIP-11 `supported_grasps` when enabled. See [how-to/enable-grasp-06.md](docs/how-to/enable-grasp-06.md) and [explanation/grasp-06-contributor-pr-submission.md](docs/explanation/grasp-06-contributor-pr-submission.md).
+
+### Fixed
+
+- Handle `HEAD` requests for `info/refs` endpoints (previously returned 405).
 
 ## [1.0.2] - 2026-04-10
 
@@ -41,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.2...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.1.0...HEAD
+[1.1.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.2...v1.1.0
 [1.0.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.1...v1.0.2
 [1.0.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/releases/tag/v1.0.0
