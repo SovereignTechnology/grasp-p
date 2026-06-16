@@ -134,7 +134,7 @@ impl RelayInformationDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::nips::nip19::ToBech32;
+    use nostr::nips::nip19::ToBech32;
 
     #[test]
     fn test_relay_information_document_structure() {
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_nip11_with_whitelist_archive() {
-        let keys = nostr_sdk::Keys::generate();
+        let keys = nostr_sdk::prelude::Keys::generate();
         let test_npub = keys.public_key().to_bech32().unwrap();
         let mut config = Config::for_testing();
         config.domain = "relay.example.com".to_string();
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_nip11_with_repository_whitelist() {
-        let keys = nostr_sdk::Keys::generate();
+        let keys = nostr_sdk::prelude::Keys::generate();
         let test_npub = keys.public_key().to_bech32().unwrap();
         let mut config = Config::for_testing();
         config.domain = "relay.example.com".to_string();
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_nip11_with_archive_and_repository_whitelist() {
-        let keys = nostr_sdk::Keys::generate();
+        let keys = nostr_sdk::prelude::Keys::generate();
         let test_npub = keys.public_key().to_bech32().unwrap();
         let mut config = Config::for_testing();
         config.domain = "relay.example.com".to_string();

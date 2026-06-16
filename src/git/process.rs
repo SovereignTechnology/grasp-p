@@ -13,7 +13,7 @@ use crate::git::sync::{
     sync_pr_refs_to_tagged_owner_repos,
 };
 use crate::nostr::events::RepositoryState;
-use nostr_sdk::Event;
+use nostr_sdk::prelude::Event;
 use std::path::Path;
 
 /// Result of processing a state event with git data

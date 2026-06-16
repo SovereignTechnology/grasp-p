@@ -15,6 +15,7 @@
 //!
 //! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
+use futures_util::StreamExt;
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
@@ -111,7 +112,9 @@ impl RelayConnection {
     /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
     pub fn new(url: String, keys: Keys) -> Self {
         let normalized_url = Self::normalize_url(&url);
-        let client = Client::new(keys);
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys))
+            .build();
         Self {
             url: normalized_url,
             client,
@@ -129,7 +132,9 @@ impl RelayConnection {
     /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
     pub fn new_with_database(url: String, database: SharedDatabase, keys: Keys) -> Self {
         let normalized_url = Self::normalize_url(&url);
-        let client = Client::new(keys);
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys))
+            .build();
         Self {
             url: normalized_url,
             client,
@@ -223,139 +228,128 @@ impl RelayConnection {
         // Get the Relay from the client to access relay-level notifications
         // which include RelayStatus changes (not available at pool level)
         let relay = match self.client.relay(&self.url).await {
-            Ok(r) => r,
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::error!(relay = %url, "Relay not found in client");
+                return;
+            }
             Err(e) => {
                 tracing::error!(relay = %url, error = %e, "Failed to get relay from client");
                 return;
             }
         };
 
-        // Subscribe to relay-level notifications (includes RelayStatus)
+        // Subscribe to relay-level notifications (includes RelayStatus).
+        // In nostr-sdk 0.45 this returns a Stream rather than a broadcast receiver.
         let mut notifications = relay.notifications();
 
         tracing::debug!(relay = %url, "Starting event loop with relay-level notifications");
 
-        loop {
-            match notifications.recv().await {
-                Ok(notification) => {
-                    match notification {
-                        RelayNotification::Event {
-                            event,
-                            subscription_id,
-                        } => {
-                            tracing::trace!(
+        while let Some(notification) = notifications.next().await {
+            match notification {
+                RelayNotification::Event {
+                    event,
+                    subscription_id,
+                } => {
+                    tracing::trace!(
+                        relay = %url,
+                        event_id = %event.id,
+                        sub_id = %subscription_id,
+                        "Received event"
+                    );
+                    if event_sender
+                        .send(RelayEvent::Event(Box::new(*event), subscription_id.clone()))
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(relay = %url, "Event sender closed, stopping event loop");
+                        break;
+                    }
+                }
+                RelayNotification::Message { message } => match *message {
+                    RelayMessage::EndOfStoredEvents(sub_id) => {
+                        tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
+                        // Convert Cow<SubscriptionId> to owned SubscriptionId
+                        let owned_sub_id = sub_id.into_owned();
+                        if event_sender
+                            .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(
                                 relay = %url,
-                                event_id = %event.id,
-                                sub_id = %subscription_id,
-                                "Received event"
+                                "Event sender closed, stopping event loop"
                             );
-                            if event_sender
-                                .send(RelayEvent::Event(Box::new(*event), subscription_id.clone()))
-                                .await
-                                .is_err()
-                            {
-                                tracing::debug!(relay = %url, "Event sender closed, stopping event loop");
-                                break;
-                            }
-                        }
-                        RelayNotification::Message { message } => match message {
-                            RelayMessage::EndOfStoredEvents(sub_id) => {
-                                tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
-                                // Convert Cow<SubscriptionId> to owned SubscriptionId
-                                let owned_sub_id = sub_id.into_owned();
-                                if event_sender
-                                    .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::debug!(
-                                        relay = %url,
-                                        "Event sender closed, stopping event loop"
-                                    );
-                                    break;
-                                }
-                            }
-                            RelayMessage::Notice(msg) => {
-                                // Check if this is a negentropy-related notice
-                                let is_negentropy_notice = msg.contains("envelope")
-                                    || msg.contains("NEG-")
-                                    || msg.contains("negentropy");
-
-                                if is_negentropy_notice {
-                                    self.mark_negentropy_unsupported();
-
-                                    tracing::info!(
-                                        relay = %url,
-                                        notice = %msg,
-                                        "Relay does not support NIP-77 (negentropy)"
-                                    );
-                                } else {
-                                    tracing::debug!(relay = %url, message = %msg, "Received NOTICE");
-                                }
-
-                                let _ =
-                                    event_sender.send(RelayEvent::Notice(msg.to_string())).await;
-                                // Don't break - continue processing events
-                            }
-                            RelayMessage::Closed { message: msg, .. } => {
-                                tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
-                                let _ =
-                                    event_sender.send(RelayEvent::Closed(msg.to_string())).await;
-                                // Don't break - CLOSED is subscription-specific, not connection-specific
-                                // The event loop should continue running for other active subscriptions
-                            }
-                            _ => {}
-                        },
-                        RelayNotification::RelayStatus { status } => {
-                            // Event-driven disconnect detection - no polling needed!
-                            match status {
-                                RelayStatus::Disconnected => {
-                                    tracing::info!(
-                                        relay = %url,
-                                        "Relay disconnected (detected via RelayNotification)"
-                                    );
-                                    break;
-                                }
-                                RelayStatus::Terminated => {
-                                    tracing::info!(
-                                        relay = %url,
-                                        "Relay terminated (detected via RelayNotification)"
-                                    );
-                                    break;
-                                }
-                                _ => {
-                                    // Log other status changes for debugging
-                                    tracing::trace!(
-                                        relay = %url,
-                                        status = ?status,
-                                        "Relay status changed"
-                                    );
-                                }
-                            }
-                        }
-                        RelayNotification::Shutdown => {
-                            tracing::info!(relay = %url, "Relay shutdown notification");
-                            let _ = event_sender.send(RelayEvent::Shutdown).await;
                             break;
                         }
-                        RelayNotification::Authenticated => {
-                            tracing::debug!(relay = %url, "Authenticated to relay (NIP-42)");
+                    }
+                    RelayMessage::Notice(msg) => {
+                        // Check if this is a negentropy-related notice
+                        let is_negentropy_notice = msg.contains("envelope")
+                            || msg.contains("NEG-")
+                            || msg.contains("negentropy");
+
+                        if is_negentropy_notice {
+                            self.mark_negentropy_unsupported();
+
+                            tracing::info!(
+                                relay = %url,
+                                notice = %msg,
+                                "Relay does not support NIP-77 (negentropy)"
+                            );
+                        } else {
+                            tracing::debug!(relay = %url, message = %msg, "Received NOTICE");
                         }
-                        RelayNotification::AuthenticationFailed => {
-                            tracing::warn!(relay = %url, "Authentication failed to relay (NIP-42)");
-                            // Don't break - relay may still work for public data
+
+                        let _ = event_sender.send(RelayEvent::Notice(msg.to_string())).await;
+                        // Don't break - continue processing events
+                    }
+                    RelayMessage::Closed { message: msg, .. } => {
+                        tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
+                        let _ = event_sender.send(RelayEvent::Closed(msg.to_string())).await;
+                        // Don't break - CLOSED is subscription-specific, not connection-specific
+                        // The event loop should continue running for other active subscriptions
+                    }
+                    _ => {}
+                },
+                RelayNotification::RelayStatus { status } => {
+                    // Event-driven disconnect detection - no polling needed!
+                    match status {
+                        RelayStatus::Disconnected => {
+                            tracing::info!(
+                                relay = %url,
+                                "Relay disconnected (detected via RelayNotification)"
+                            );
+                            break;
+                        }
+                        RelayStatus::Terminated => {
+                            tracing::info!(
+                                relay = %url,
+                                "Relay terminated (detected via RelayNotification)"
+                            );
+                            break;
+                        }
+                        _ => {
+                            // Log other status changes for debugging
+                            tracing::trace!(
+                                relay = %url,
+                                status = ?status,
+                                "Relay status changed"
+                            );
                         }
                     }
                 }
-                Err(_) => {
-                    // Notification channel closed - connection lost
-                    tracing::debug!(relay = %url, "Notification channel error, stopping event loop");
-                    break;
+                RelayNotification::Authenticated => {
+                    tracing::debug!(relay = %url, "Authenticated to relay (NIP-42)");
+                }
+                RelayNotification::AuthenticationFailed => {
+                    tracing::warn!(relay = %url, "Authentication failed to relay (NIP-42)");
+                    // Don't break - relay may still work for public data
                 }
             }
         }
 
-        tracing::debug!(relay = %url, "Event loop terminated");
+        tracing::debug!(relay = %url, "Notification stream ended, event loop terminated");
     }
 
     /// Add additional filter subscription (for Layer 2 + 3)
@@ -384,25 +378,25 @@ impl RelayConnection {
             "subscribe_filter called with filter"
         );
 
-        let opts = if auto_close {
-            Some(SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE))
+        let output = if auto_close {
+            self.client
+                .subscribe(filter)
+                .close_on(
+                    SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE),
+                )
+                .await
         } else {
-            None
-        };
-
-        let output = self
-            .client
-            .subscribe(filter, opts)
-            .await
-            .map_err(|e| format!("Failed to subscribe on {}: {}", self.url, e))?;
+            self.client.subscribe(filter).await
+        }
+        .map_err(|e| format!("Failed to subscribe on {}: {}", self.url, e))?;
 
         tracing::debug!(
             relay = %self.url,
-            subscription_id = %output.val,
+            subscription_id = %output.value,
             "subscribe_filter succeeded"
         );
 
-        Ok(output.val)
+        Ok(output.value)
     }
 
     /// Get the relay URL
@@ -437,7 +431,9 @@ impl RelayConnection {
     /// with consolidated filters. This sends CLOSE messages for all active
     /// subscriptions on the relay.
     pub async fn unsubscribe_all(&self) {
-        self.client.unsubscribe_all().await;
+        if let Err(e) = self.client.unsubscribe_all().await {
+            tracing::debug!(relay = %self.url, error = %e, "Failed to unsubscribe from all subscriptions");
+        }
         tracing::debug!(relay = %self.url, "Unsubscribed from all subscriptions");
     }
 
@@ -499,7 +495,7 @@ impl RelayConnection {
     /// * `filter` - The filter to sync
     ///
     /// # Returns
-    /// * `Ok(Reconciliation)` - Reconciliation result with remote/local/sent event IDs
+    /// * `Ok(SyncSummary)` - Reconciliation result with remote/local/sent event IDs
     /// * `Err(String)` - Sync failed (relay may not support NIP-77, or other error)
     ///
     /// # Usage Pattern
@@ -516,7 +512,10 @@ impl RelayConnection {
     ///
     /// // 3. Events come through normal flow and get validated via process_event_static
     /// ```
-    pub async fn negentropy_sync_diff(&self, filter: Filter) -> Result<Reconciliation, String> {
+    pub async fn negentropy_sync_diff(
+        &self,
+        filter: Filter,
+    ) -> Result<nostr_sdk::client::SyncSummary, String> {
         // Use dry_run to only identify differences without downloading events
         let sync_opts = SyncOptions::default().dry_run();
 
@@ -540,7 +539,7 @@ impl RelayConnection {
         };
 
         // Race the sync operation against the polling task
-        let sync_task = self.client.sync(filter.clone(), &sync_opts);
+        let sync_task = self.client.sync(filter.clone()).opts(sync_opts);
 
         let result = tokio::select! {
             poll_result = poll_task => {
@@ -556,7 +555,7 @@ impl RelayConnection {
                         if !output.failed.is_empty() {
                             Err(format!("Negentropy diff had failures: {:?}", output.failed))
                         } else {
-                            Ok(output.val)
+                            Ok(output.value)
                         }
                     }
                     Err(e) => Err(format!("Negentropy diff failed: {}", e))

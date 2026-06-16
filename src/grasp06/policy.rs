@@ -216,19 +216,19 @@ mod tests {
         let mut builder = EventBuilder::new(kind, "test");
         for (pk_hex, ident) in a_tags {
             builder = builder.tag(Tag::custom(
-                TagKind::custom("a"),
+                "a",
                 vec![format!("30617:{}:{}", pk_hex, ident)],
             ));
         }
         // c tag is required by downstream policy but not by this predicate.
-        builder = builder.tag(Tag::custom(TagKind::custom("c"), vec!["0".repeat(40)]));
+        builder = builder.tag(Tag::custom("c", vec!["0".repeat(40)]));
         if !clone_urls.is_empty() {
             builder = builder.tag(Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 clone_urls.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             ));
         }
-        builder.sign_with_keys(signer).unwrap()
+        builder.finalize(signer).unwrap()
     }
 
     #[test]
@@ -408,12 +408,12 @@ mod tests {
         let other_hex = Keys::generate().public_key().to_hex();
         let event = EventBuilder::new(Kind::GitPullRequest, "x")
             .tag(Tag::custom(
-                TagKind::custom("a"),
+                "a",
                 vec![format!("30000:{}:my-repo", other_hex)],
             ))
-            .tag(Tag::custom(TagKind::custom("c"), vec!["0".repeat(40)]))
-            .tag(Tag::custom(TagKind::custom("clone"), vec![url]))
-            .sign_with_keys(&signer)
+            .tag(Tag::custom("c", vec!["0".repeat(40)]))
+            .tag(Tag::custom("clone", vec![url]))
+            .finalize(&signer)
             .unwrap();
         let cfg = config_with_domain("relay.example", true);
         assert!(!event_qualifies_for_pr_relaxation(&event, &cfg));

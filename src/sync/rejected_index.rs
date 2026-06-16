@@ -85,7 +85,7 @@
 //! }
 //! ```
 
-use nostr_sdk::{Event, EventId, PublicKey};
+use nostr_sdk::prelude::{Event, EventId, PublicKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -833,7 +833,7 @@ mod tests {
 
     async fn create_test_event() -> Event {
         let keys = Keys::generate();
-        let unsigned = nostr_sdk::EventBuilder::text_note("test").build(keys.public_key());
+        let unsigned = nostr_sdk::prelude::EventBuilder::text_note("test").finalize_unsigned(keys.public_key());
         keys.sign_event(unsigned).await.unwrap()
     }
 
@@ -1032,10 +1032,10 @@ mod tests {
         let keys1 = Keys::generate();
         let keys2 = Keys::generate();
 
-        let unsigned1 = nostr_sdk::EventBuilder::text_note("test1").build(keys1.public_key());
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("test1").finalize_unsigned(keys1.public_key());
         let event1 = keys1.sign_event(unsigned1).await.unwrap();
 
-        let unsigned2 = nostr_sdk::EventBuilder::text_note("test2").build(keys2.public_key());
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("test2").finalize_unsigned(keys2.public_key());
         let event2 = keys2.sign_event(unsigned2).await.unwrap();
 
         // Add two different maintainer repos
@@ -1076,11 +1076,11 @@ mod tests {
 
         // Create an announcement event
         let unsigned_ann =
-            nostr_sdk::EventBuilder::text_note("announcement").build(keys.public_key());
+            nostr_sdk::prelude::EventBuilder::text_note("announcement").finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).await.unwrap();
 
         // Create a state event
-        let unsigned_state = nostr_sdk::EventBuilder::text_note("state").build(keys.public_key());
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state").finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).await.unwrap();
 
         let pubkey = event_ann.pubkey;
@@ -1135,11 +1135,11 @@ mod tests {
 
         // Create an announcement event
         let unsigned_ann =
-            nostr_sdk::EventBuilder::text_note("announcement").build(keys.public_key());
+            nostr_sdk::prelude::EventBuilder::text_note("announcement").finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).await.unwrap();
 
         // Create a state event
-        let unsigned_state = nostr_sdk::EventBuilder::text_note("state").build(keys.public_key());
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state").finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).await.unwrap();
 
         let pubkey = event_ann.pubkey;
@@ -1280,10 +1280,10 @@ mod tests {
         let keys = Keys::generate();
 
         // Create two events
-        let unsigned1 = nostr_sdk::EventBuilder::text_note("event1").build(keys.public_key());
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("event1").finalize_unsigned(keys.public_key());
         let event1 = keys.sign_event(unsigned1).await.unwrap();
 
-        let unsigned2 = nostr_sdk::EventBuilder::text_note("event2").build(keys.public_key());
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("event2").finalize_unsigned(keys.public_key());
         let event2 = keys.sign_event(unsigned2).await.unwrap();
 
         // Add both events
@@ -1492,11 +1492,11 @@ mod tests {
 
         // Create announcement event
         let unsigned_ann =
-            nostr_sdk::EventBuilder::text_note("announcement").build(keys.public_key());
+            nostr_sdk::prelude::EventBuilder::text_note("announcement").finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).await.unwrap();
 
         // Create state event
-        let unsigned_state = nostr_sdk::EventBuilder::text_note("state").build(keys.public_key());
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state").finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).await.unwrap();
 
         // Add both types
@@ -1545,13 +1545,13 @@ mod tests {
         let keys = Keys::generate();
 
         // Create events with different rejection reasons
-        let unsigned1 = nostr_sdk::EventBuilder::text_note("event1").build(keys.public_key());
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("event1").finalize_unsigned(keys.public_key());
         let event1 = keys.sign_event(unsigned1).await.unwrap();
 
-        let unsigned2 = nostr_sdk::EventBuilder::text_note("event2").build(keys.public_key());
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("event2").finalize_unsigned(keys.public_key());
         let event2 = keys.sign_event(unsigned2).await.unwrap();
 
-        let unsigned3 = nostr_sdk::EventBuilder::text_note("event3").build(keys.public_key());
+        let unsigned3 = nostr_sdk::prelude::EventBuilder::text_note("event3").finalize_unsigned(keys.public_key());
         let event3 = keys.sign_event(unsigned3).await.unwrap();
 
         // Add with different rejection reasons

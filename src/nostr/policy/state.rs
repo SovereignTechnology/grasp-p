@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nostr_relay_builder::builder::WritePolicyResult;
+use nostr_relay_builder::prelude::MachineReadablePrefix;
 /// State Policy - State event validation + ref alignment
 ///
 /// Handles validation of NIP-34 repository state events (kind 30618)
@@ -72,6 +73,7 @@ impl StatePolicy {
             );
             return Ok(WritePolicyResult::Reject {
                 status: true,
+                prefix: MachineReadablePrefix::Duplicate,
                 message: "duplicate: in purgatory".into(),
             });
         }
@@ -105,6 +107,7 @@ impl StatePolicy {
             }
             return Ok(WritePolicyResult::Reject {
                 status: false,
+                prefix: MachineReadablePrefix::Invalid,
                 message: "invalid: no announcement exists for this repository".into(),
             });
         }
@@ -134,6 +137,7 @@ impl StatePolicy {
             }
             return Ok(WritePolicyResult::Reject {
                 status: false,
+                prefix: MachineReadablePrefix::Restricted,
                 message: "invalid: author not authorized for this repository".into(),
             });
         }
@@ -157,7 +161,7 @@ impl StatePolicy {
         // event proves the repo is active regardless of which owner's announcement
         // authorized it.
         for owner_hex in &authorized_owners {
-            if let Ok(owner_pk) = nostr_sdk::PublicKey::from_hex(owner_hex) {
+            if let Ok(owner_pk) = nostr_sdk::prelude::PublicKey::from_hex(owner_hex) {
                 if self
                     .ctx
                     .purgatory
@@ -183,6 +187,7 @@ impl StatePolicy {
             tracing::debug!("processed state event duplicate (in db): {}", event.id);
             return Ok(WritePolicyResult::Reject {
                 status: true,
+                prefix: MachineReadablePrefix::Duplicate,
                 message: "duplicate".into(),
             });
         }
@@ -274,6 +279,7 @@ impl StatePolicy {
                 );
                 return Ok(WritePolicyResult::Reject {
                     status: false,
+                    prefix: MachineReadablePrefix::Invalid,
                     message: "invalid: previously expired from purgatory without git data".into(),
                 });
             }
@@ -294,6 +300,7 @@ impl StatePolicy {
             );
             Ok(WritePolicyResult::Reject {
                 status: true,
+                prefix: MachineReadablePrefix::Duplicate,
                 message: "purgatory: won't be served until git data arrives".into(),
             })
         }

@@ -760,20 +760,20 @@ pub mod mock {
 
                 if !self.clone_urls.is_empty() {
                     // Create a minimal announcement with the clone URLs
-                    let mut tags = vec![nostr_sdk::Tag::custom(
-                        nostr_sdk::TagKind::Custom("d".into()),
+                    let mut tags = vec![nostr_sdk::prelude::Tag::custom(
+                        "d",
                         vec!["test-repo".to_string()],
                     )];
 
                     // Create a single clone tag with multiple values (NIP-34 format)
-                    tags.push(nostr_sdk::Tag::custom(
-                        nostr_sdk::TagKind::Custom("clone".into()),
+                    tags.push(nostr_sdk::prelude::Tag::custom(
+                        "clone",
                         self.clone_urls.to_vec(),
                     ));
 
                     let event = EventBuilder::new(Kind::from(30617), "")
                         .tags(tags)
-                        .sign_with_keys(&keys)
+                        .finalize(&keys)
                         .unwrap();
 
                     if let Ok(ann) = RepositoryAnnouncement::from_event(event) {

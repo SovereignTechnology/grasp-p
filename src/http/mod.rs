@@ -18,9 +18,9 @@ use hyper::service::Service;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use nostr_relay_builder::LocalRelay;
-use nostr_sdk::hashes::sha1::Hash as Sha1Hash;
-use nostr_sdk::hashes::{Hash, HashEngine};
-use nostr_sdk::PublicKey;
+use nostr::hashes::sha1::Hash as Sha1Hash;
+use nostr::hashes::{Hash, HashEngine};
+use nostr_sdk::prelude::PublicKey;
 use tokio::net::TcpListener;
 
 use crate::config::Config;

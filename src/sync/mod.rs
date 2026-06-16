@@ -2863,7 +2863,7 @@ impl SyncManager {
                     if let Some(identifier) = event
                         .tags
                         .iter()
-                        .find(|t| t.kind() == nostr_sdk::TagKind::d())
+                        .find(|t| t.kind() == "d")
                         .and_then(|t| t.content())
                     {
                         // Get rejected state events for this pubkey + identifier
@@ -2903,7 +2903,9 @@ impl SyncManager {
 
                 ProcessResult::Saved
             }
-            WritePolicyResult::Reject { message, status } => {
+            WritePolicyResult::Reject {
+                message, status, ..
+            } => {
                 if status {
                     tracing::debug!(
                         event_id = %event.id,
@@ -2929,7 +2931,7 @@ impl SyncManager {
                         if let Some(identifier) = event
                             .tags
                             .iter()
-                            .find(|t| t.kind() == nostr_sdk::TagKind::d())
+                            .find(|t| t.kind() == "d")
                             .and_then(|t| t.content())
                         {
                             // Determine rejection reason based on message
@@ -3525,8 +3527,9 @@ impl SyncManager {
                     Ok(reconciliation) => {
                         let remote_excluding_ids: HashSet<EventId> = reconciliation
                             .remote
-                            .difference(&excluded_ids)
-                            .cloned()
+                            .keys()
+                            .filter(|id| !excluded_ids.contains(id))
+                            .copied()
                             .collect();
                         let remote_count = remote_excluding_ids.len();
                         tracing::debug!(
@@ -3830,11 +3833,8 @@ mod tests {
         // Create test announcement event (kind 30617) with 'd' tag
         let keys = Keys::generate();
         let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "test content")
-            .tag(nostr_sdk::Tag::custom(
-                nostr_sdk::TagKind::d(),
-                vec!["test-repo"],
-            ))
-            .sign_with_keys(&keys)
+            .tag(nostr_sdk::prelude::Tag::custom("d", vec!["test-repo"]))
+            .finalize(&keys)
             .unwrap();
 
         // Verify index is empty
@@ -3873,11 +3873,8 @@ mod tests {
         // Add rejected event to index
         let keys = Keys::generate();
         let rejected_event = EventBuilder::new(Kind::GitRepoAnnouncement, "rejected")
-            .tag(nostr_sdk::Tag::custom(
-                nostr_sdk::TagKind::d(),
-                vec!["rejected-repo"],
-            ))
-            .sign_with_keys(&keys)
+            .tag(nostr_sdk::prelude::Tag::custom("d", vec!["rejected-repo"]))
+            .finalize(&keys)
             .unwrap();
 
         // Override the event ID for testing (we need a specific ID)

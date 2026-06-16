@@ -11,9 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use nostr_sdk::prelude::Timestamp;
 use nostr_sdk::prelude::*;
-use nostr_sdk::Timestamp;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::nostr::builder::SharedDatabase;
@@ -247,11 +247,11 @@ impl SelfSubscriber {
     /// Returns `LoopControl::Break` if the loop should exit, `LoopControl::Continue` otherwise.
     async fn process_notification(
         &self,
-        notification: Result<RelayPoolNotification, RecvError>,
+        notification: ClientNotification,
         pending: &mut PendingUpdates,
     ) -> LoopControl {
         match notification {
-            Ok(RelayPoolNotification::Event { event, .. }) => {
+            ClientNotification::Event { event, .. } => {
                 // Process 30617 events for relay discovery
                 // Note: Events reaching here have already passed write policy validation
                 // (archive_all, archive_whitelist, blacklist, etc.) so no additional
@@ -285,12 +285,8 @@ impl SelfSubscriber {
                 }
                 LoopControl::Continue
             }
-            Ok(RelayPoolNotification::Shutdown) => {
+            ClientNotification::Shutdown => {
                 tracing::info!("SelfSubscriber received shutdown notification");
-                LoopControl::Break
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Error receiving notification");
                 LoopControl::Break
             }
             _ => LoopControl::Continue,
@@ -400,7 +396,7 @@ impl SelfSubscriber {
         // Update last_connected AFTER creating filter but BEFORE subscribing
         self.last_connected = Some(Timestamp::now());
 
-        if let Err(e) = client.subscribe(filter, None).await {
+        if let Err(e) = client.subscribe(filter).await {
             tracing::error!(
                 error = %e,
                 "Failed to subscribe to own relay for self-subscription"
@@ -430,9 +426,17 @@ impl SelfSubscriber {
             // Build the select based on whether we have a shutdown receiver
             if let Some(ref mut rx) = shutdown_rx {
                 tokio::select! {
-                    notification = notifications.recv() => {
-                        if let LoopControl::Break = self.process_notification(notification, &mut pending).await {
-                            break;
+                    notification = notifications.next() => {
+                        match notification {
+                            Some(notification) => {
+                                if let LoopControl::Break = self.process_notification(notification, &mut pending).await {
+                                    break;
+                                }
+                            }
+                            None => {
+                                tracing::info!("SelfSubscriber notification stream ended");
+                                break;
+                            }
                         }
                     }
                     _ = timer.tick() => {
@@ -448,9 +452,17 @@ impl SelfSubscriber {
             } else {
                 // No shutdown receiver - original behavior
                 tokio::select! {
-                    notification = notifications.recv() => {
-                        if let LoopControl::Break = self.process_notification(notification, &mut pending).await {
-                            break;
+                    notification = notifications.next() => {
+                        match notification {
+                            Some(notification) => {
+                                if let LoopControl::Break = self.process_notification(notification, &mut pending).await {
+                                    break;
+                                }
+                            }
+                            None => {
+                                tracing::info!("SelfSubscriber notification stream ended");
+                                break;
+                            }
                         }
                     }
                     _ = timer.tick() => {
