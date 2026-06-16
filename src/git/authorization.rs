@@ -30,7 +30,7 @@
 use anyhow::{anyhow, Result};
 use hyper::body::Bytes;
 use nostr_relay_builder::prelude::*;
-use nostr_sdk::{EventId, ToBech32};
+use nostr_sdk::prelude::{EventId, ToBech32};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use crate::nostr::builder::SharedDatabase;
 use crate::nostr::events::{RepositoryAnnouncement, RepositoryState};
 use crate::purgatory::Purgatory;
-use nostr_sdk::{Kind, PublicKey};
+use nostr_sdk::prelude::{Kind, PublicKey};
 
 /// Perform GRASP authorization for a push operation
 ///
@@ -1403,14 +1403,14 @@ fn describe_known_event_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{EventBuilder, Keys, Tag, TagKind};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     fn create_test_keys() -> Keys {
         Keys::generate()
     }
 
     fn create_announcement_event(keys: &Keys, identifier: &str, maintainers: &[&Keys]) -> Event {
-        let mut tags = vec![Tag::custom(TagKind::d(), vec![identifier.to_string()])];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         // Add maintainers as a single "maintainers" tag per NIP-34
         // Format: ["maintainers", "<pubkey1-hex>", "<pubkey2-hex>", ...]
@@ -1419,41 +1419,35 @@ mod tests {
                 .iter()
                 .map(|k| k.public_key().to_hex())
                 .collect();
-            tags.push(Tag::custom(
-                TagKind::Custom("maintainers".into()),
-                maintainer_pubkeys,
-            ));
+            tags.push(Tag::custom("maintainers", maintainer_pubkeys));
         }
 
         // Add clone and relay tags for validity
         tags.push(Tag::custom(
-            TagKind::Clone,
+            "clone",
             vec!["https://example.com/test.git".to_string()],
         ));
-        tags.push(Tag::custom(
-            TagKind::Relays,
-            vec!["wss://example.com".to_string()],
-        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
 
         EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 
     fn create_state_event(keys: &Keys, identifier: &str, branches: &[(&str, &str)]) -> Event {
-        let mut tags = vec![Tag::custom(TagKind::d(), vec![identifier.to_string()])];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         for (branch, commit) in branches {
             tags.push(Tag::custom(
-                TagKind::Custom(format!("refs/heads/{}", branch).into()),
+                format!("refs/heads/{}", branch),
                 vec![commit.to_string()],
             ));
         }
 
         EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 

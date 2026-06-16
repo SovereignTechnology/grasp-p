@@ -175,11 +175,11 @@ impl MirroringTests {
                     "grasp-06 audit: PR via /prs/ should mirror to announced repo",
                 )
                 .tag(Tag::custom(
-                    TagKind::custom("a"),
+                    "a",
                     vec![format!("30617:{}:{}", owner_pubkey_hex, repo_id)],
                 ))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_hash.clone()]))
-                .tag(Tag::custom(TagKind::custom("clone"), vec![prs_url.clone()]))
+                .tag(Tag::custom("c", vec![commit_hash.clone()]))
+                .tag(Tag::custom("clone", vec![prs_url.clone()]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
             let pr_event_id_typed = pr_event.id;
@@ -409,11 +409,11 @@ impl MirroringTests {
                     "grasp-06 audit: git-first PR via /prs/ should still promote + mirror",
                 )
                 .tag(Tag::custom(
-                    TagKind::custom("a"),
+                    "a",
                     vec![format!("30617:{}:{}", owner_pubkey_hex, repo_id)],
                 ))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_hash.clone()]))
-                .tag(Tag::custom(TagKind::custom("clone"), vec![prs_url.clone()]))
+                .tag(Tag::custom("c", vec![commit_hash.clone()]))
+                .tag(Tag::custom("clone", vec![prs_url.clone()]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
             let pr_event_id_typed = pr_event.id;
@@ -678,7 +678,7 @@ impl MirroringTests {
 fn extract_repo_id(repo: &Event) -> Result<String, String> {
     repo.tags
         .iter()
-        .find(|t| t.kind() == TagKind::d())
+        .find(|t| t.kind() == "d")
         .and_then(|t| t.content())
         .map(str::to_string)
         .ok_or_else(|| "Missing `d` tag in repo announcement".to_string())

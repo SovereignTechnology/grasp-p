@@ -108,9 +108,9 @@ impl EventAcceptanceTests {
                     Kind::GitPullRequest,
                     "grasp-06 audit: PR for un-announced coord, clone tag on /prs/",
                 )
-                .tag(Tag::custom(TagKind::custom("a"), vec![a_tag_value]))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_hex]))
-                .tag(Tag::custom(TagKind::custom("clone"), vec![clone_url]))
+                .tag(Tag::custom("a", vec![a_tag_value]))
+                .tag(Tag::custom("c", vec![commit_hex]))
+                .tag(Tag::custom("clone", vec![clone_url]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
 
@@ -209,9 +209,9 @@ impl EventAcceptanceTests {
                     Kind::GitPullRequest,
                     "grasp-06 audit: orphan PR must land in purgatory, not be served",
                 )
-                .tag(Tag::custom(TagKind::custom("a"), vec![a_tag_value]))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_hex]))
-                .tag(Tag::custom(TagKind::custom("clone"), vec![clone_url]))
+                .tag(Tag::custom("a", vec![a_tag_value]))
+                .tag(Tag::custom("c", vec![commit_hex]))
+                .tag(Tag::custom("clone", vec![clone_url]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
             let event_id = event.id;
@@ -313,12 +313,9 @@ impl EventAcceptanceTests {
                     Kind::GitPullRequest,
                     "grasp-06 audit: PR for un-announced coord, clone tag on foreign host",
                 )
-                .tag(Tag::custom(TagKind::custom("a"), vec![a_tag_value]))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_hex]))
-                .tag(Tag::custom(
-                    TagKind::custom("clone"),
-                    vec![foreign_clone_url],
-                ))
+                .tag(Tag::custom("a", vec![a_tag_value]))
+                .tag(Tag::custom("c", vec![commit_hex]))
+                .tag(Tag::custom("clone", vec![foreign_clone_url]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
 

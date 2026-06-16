@@ -53,9 +53,13 @@ pub fn extract_refs_from_state(event: &Event) -> Vec<RefPair> {
         .tags
         .iter()
         .filter_map(|tag| {
-            // Check if this is a custom tag with a ref name
-            if let TagKind::Custom(ref_name) = tag.kind() {
-                let ref_str = ref_name.as_ref();
+            // Check if this is a custom tag with a ref name.
+            // In nostr 0.45 `tag.kind()` returns the raw tag-name string for
+            // all tags, so we match on the string directly. The downstream
+            // `refs/heads/*` / `refs/tags/*` filter preserves the previous
+            // behaviour (which only matched non-standardized custom kinds).
+            {
+                let ref_str: &str = tag.kind();
 
                 // Only process refs/heads/* and refs/tags/*
                 // Exclude peeled tag notation (e.g. "refs/tags/v1.0.0^{}") — these are
@@ -343,22 +347,19 @@ pub fn diagnose_state_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{EventBuilder, Keys, Tag};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     fn create_test_state_event(identifier: &str, refs: Vec<(&str, &str)>) -> Event {
         let keys = Keys::generate();
-        let mut tags = vec![Tag::custom(TagKind::d(), vec![identifier.to_string()])];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         for (ref_name, sha) in refs {
-            tags.push(Tag::custom(
-                TagKind::custom(ref_name),
-                vec![sha.to_string()],
-            ));
+            tags.push(Tag::custom(ref_name, vec![sha.to_string()]));
         }
 
         EventBuilder::new(Kind::from(30618), "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap()
     }
 
@@ -391,17 +392,14 @@ mod tests {
     fn test_extract_refs_ignores_non_ref_tags() {
         let keys = Keys::generate();
         let tags = vec![
-            Tag::custom(TagKind::d(), vec!["test-repo".to_string()]),
-            Tag::custom(
-                TagKind::custom("refs/heads/main"),
-                vec!["abc123".to_string()],
-            ),
-            Tag::custom(TagKind::custom("some-other-tag"), vec!["value".to_string()]),
+            Tag::custom("d", vec!["test-repo".to_string()]),
+            Tag::custom("refs/heads/main", vec!["abc123".to_string()]),
+            Tag::custom("some-other-tag", vec!["value".to_string()]),
         ];
 
         let event = EventBuilder::new(Kind::from(30618), "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let refs = extract_refs_from_state(&event);

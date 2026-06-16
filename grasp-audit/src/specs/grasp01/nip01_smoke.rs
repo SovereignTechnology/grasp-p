@@ -92,7 +92,8 @@ impl Nip01SmokeTests {
                 let direct_filter = Filter::new().kind(Kind::GitRepoAnnouncement).id(event_id);
                 let direct_events = client
                     .client()
-                    .fetch_events(direct_filter, std::time::Duration::from_secs(5))
+                    .fetch_events(direct_filter)
+                    .timeout(std::time::Duration::from_secs(5))
                     .await
                     .map_err(|e| format!("Direct query failed: {}", e))?;
                 let direct_vec: Vec<Event> = direct_events.into_iter().collect();
@@ -209,7 +210,7 @@ impl Nip01SmokeTests {
             let wrong_keys = Keys::generate();
             let wrong_event = EventBuilder::new(event.kind, event.content.clone())
                 .tags(event.tags.clone())
-                .sign_with_keys(&wrong_keys)
+                .finalize(&wrong_keys)
                 .map_err(|e| format!("Failed to build wrong event: {}", e))?;
 
             // Create event JSON with mismatched pubkey and signature

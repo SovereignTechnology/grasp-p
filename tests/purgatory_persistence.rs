@@ -40,9 +40,7 @@ use std::time::Duration;
 
 /// Helper to create a test event
 async fn create_test_event(keys: &Keys, content: &str) -> Event {
-    EventBuilder::text_note(content)
-        .sign_with_keys(keys)
-        .unwrap()
+    EventBuilder::text_note(content).finalize(keys).unwrap()
 }
 
 /// Helper to create a state event with specific refs
@@ -56,14 +54,14 @@ fn create_state_event_with_refs(
     // Add ref tags
     for (ref_name, commit_hash) in refs {
         tags.push(Tag::custom(
-            TagKind::custom("ref"),
+            "ref",
             vec![ref_name.to_string(), commit_hash.to_string()],
         ));
     }
 
     let event = EventBuilder::new(Kind::from(30618), "")
         .tags(tags)
-        .sign_with_keys(keys)?;
+        .finalize(keys)?;
 
     Ok(event)
 }

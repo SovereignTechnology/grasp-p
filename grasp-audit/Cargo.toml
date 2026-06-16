@@ -12,7 +12,7 @@ path = "src/bin/grasp-audit.rs"
 
 [dependencies]
 # Nostr
-nostr-sdk = { git = "https://github.com/rust-nostr/nostr", rev = "4767ad13" }
+nostr-sdk = "0.45.0-alpha.1"
 
 # Async
 tokio = { version = "1", features = ["full"] }

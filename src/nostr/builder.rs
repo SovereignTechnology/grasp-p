@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use nostr::nips::nip19::ToBech32;
 use nostr_lmdb::NostrLmdb;
+use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::policy::{
+    accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
     ReferenceResult, RelatedEventPolicy, StatePolicy, StateResult,
 };
@@ -108,11 +110,10 @@ impl Nip34WritePolicy {
     /// Used for structured logging when parsing fails - we try to extract
     /// the identifier even if full parsing failed.
     fn extract_identifier_from_event(event: &Event) -> String {
-        use nostr_relay_builder::prelude::TagKind;
         event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string())
@@ -206,7 +207,7 @@ impl Nip34WritePolicy {
                             repo,
                             npub
                         );
-                        WritePolicyResult::reject(format!("Failed to parse announcement: {}", e))
+                        reject_invalid(format!("Failed to parse announcement: {}", e))
                     }
                 }
             }
@@ -219,10 +220,7 @@ impl Nip34WritePolicy {
                             event_id_str
                         );
 
-                        WritePolicyResult::Reject {
-                            status: true, // Client sees OK
-                            message: "purgatory: won't be served until git data arrives".into(),
-                        }
+                        accepted_purgatory("won't be served until git data arrives")
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -230,7 +228,7 @@ impl Nip34WritePolicy {
                             event_id_str,
                             e
                         );
-                        WritePolicyResult::reject(e)
+                        reject_error(e)
                     }
                 }
             }
@@ -269,7 +267,7 @@ impl Nip34WritePolicy {
                             repo,
                             npub
                         );
-                        WritePolicyResult::reject(format!("Failed to parse announcement: {}", e))
+                        reject_invalid(format!("Failed to parse announcement: {}", e))
                     }
                 }
             }
@@ -279,7 +277,7 @@ impl Nip34WritePolicy {
                     event_id_str,
                     reason
                 );
-                WritePolicyResult::reject(reason)
+                reject_invalid(reason)
             }
         }
     }
@@ -317,10 +315,7 @@ impl Nip34WritePolicy {
                             npub
                         );
                         // reject if processing failed
-                        WritePolicyResult::Reject {
-                            status: false,
-                            message: format!("error: {e}").into(),
-                        }
+                        reject_error(format!("{e}"))
                     }
                 }
             }
@@ -341,7 +336,7 @@ impl Nip34WritePolicy {
                     repo,
                     npub
                 );
-                WritePolicyResult::reject(reason)
+                reject_invalid(reason)
             }
         }
     }
@@ -365,31 +360,19 @@ impl Nip34WritePolicy {
                 "processed PR event duplicate (already in purgatory): {}",
                 event.id,
             );
-            return WritePolicyResult::Reject {
-                status: true, // Client sees OK
-                message: "duplicate: in purgatory".into(),
-            };
+            return duplicate("in purgatory");
         }
 
         // duplicate check in db
         match &self.ctx.database.check_id(&event.id).await {
             Ok(DatabaseEventStatus::Saved) => {
-                return WritePolicyResult::Reject {
-                    status: true, // Client sees OK
-                    message: "duplicate".into(),
-                };
+                return duplicate("already have this event");
             }
             Ok(DatabaseEventStatus::Deleted) => {
-                return WritePolicyResult::Reject {
-                    status: false,
-                    message: "invalid: accepted deletion request for this event".into(),
-                };
+                return reject_invalid("accepted deletion request for this event");
             }
             Err(e) => {
-                return WritePolicyResult::Reject {
-                    status: false,
-                    message: format!("error: internal error: {e}").into(),
-                };
+                return reject_error(format!("internal error: {e}"));
             }
             _ => {} // continue
         }
@@ -429,11 +412,9 @@ impl Nip34WritePolicy {
                         event_id = %event_id_str,
                         "PR event previously expired from purgatory (synced), rejecting to prevent re-sync loop"
                     );
-                    return WritePolicyResult::Reject {
-                        status: false,
-                        message: "invalid: previously expired from purgatory without git data"
-                            .into(),
-                    };
+                    return reject_invalid(
+                        "previously expired from purgatory without git data",
+                    );
                 }
 
                 // No git data exists - add to purgatory
@@ -464,14 +445,10 @@ impl Nip34WritePolicy {
                     is_synced,
                 );
 
-                WritePolicyResult::Reject {
-                    status: true, // Client sees OK
-                    message: format!(
-                        "purgatory: PR event stored, waiting for git push with commit {}",
-                        commit
-                    )
-                    .into(),
-                }
+                accepted_purgatory(format!(
+                    "PR event stored, waiting for git push with commit {}",
+                    commit
+                ))
             }
             Ok(true) => {
                 // Git data exists - proceed with normal validation
@@ -499,7 +476,7 @@ impl Nip34WritePolicy {
                         npub
                     );
                 }
-                WritePolicyResult::reject(format!("Failed to check git data: {}", e))
+                reject_error(format!("Failed to check git data: {}", e))
             }
         }
     }
@@ -613,7 +590,7 @@ impl Nip34WritePolicy {
                     addressable_refs.len(),
                     event_refs.len()
                 );
-                WritePolicyResult::reject(format!(
+                reject_restricted(format!(
                     "{} event must reference an accepted repository or accepted event",
                     event_type
                 ))
@@ -625,7 +602,7 @@ impl Nip34WritePolicy {
                     event_id_str,
                     e
                 );
-                WritePolicyResult::reject(format!("Database query failed: {}", e))
+                reject_error(format!("Database query failed: {}", e))
             }
         }
     }
@@ -646,7 +623,7 @@ impl WritePolicy for Nip34WritePolicy {
                     reason = %reason,
                     "Rejected event from blacklisted author"
                 );
-                return WritePolicyResult::reject(reason);
+                return WritePolicyResult::reject(MachineReadablePrefix::Blocked, reason);
             }
 
             // Detect if this is a synced event (from proactive sync) vs user-submitted
@@ -705,10 +682,7 @@ pub async fn create_relay(
     let database: SharedDatabase = match config.database_backend {
         DatabaseBackend::Memory => {
             tracing::info!("Using in-memory database (no persistence)");
-            Arc::new(MemoryDatabase::with_opts(MemoryDatabaseOptions {
-                events: true,
-                max_events: Some(NonZeroUsize::new(100_000).unwrap()),
-            }))
+            Arc::new(MemoryDatabase::bounded(NonZeroUsize::new(100_000).unwrap()))
         }
         DatabaseBackend::Lmdb => {
             tracing::info!("Using LMDB backend at: {}", db_path.display());

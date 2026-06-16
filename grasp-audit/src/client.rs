@@ -42,7 +42,9 @@ impl AuditClient {
         let maintainer_keys = Keys::generate();
         let recursive_maintainer_keys = Keys::generate();
         let pr_author_keys = Keys::generate();
-        let client = Client::new(keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
         Self {
             client,
             config,
@@ -61,7 +63,9 @@ impl AuditClient {
         let maintainer_keys = Keys::generate();
         let recursive_maintainer_keys = Keys::generate();
         let pr_author_keys = Keys::generate();
-        let client = Client::new(keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
 
         // Add relay and connect
         client.add_relay(relay_url).await?;
@@ -74,7 +78,7 @@ impl AuditClient {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let relays = client.relays().await;
-            connected = relays.values().any(|r| r.is_connected());
+            connected = relays.values().any(|r| r.status().is_connected());
 
             if connected {
                 break;
@@ -129,7 +133,9 @@ impl AuditClient {
         let maintainer_keys = Keys::generate();
         let recursive_maintainer_keys = Keys::generate();
         let pr_author_keys = Keys::generate();
-        let client = Client::new(keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
 
         // Add relay and connect
         client.add_relay(relay_url).await?;
@@ -142,7 +148,7 @@ impl AuditClient {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let relays = client.relays().await;
-            connected = relays.values().any(|r| r.is_connected());
+            connected = relays.values().any(|r| r.status().is_connected());
 
             if connected {
                 break;
@@ -235,7 +241,7 @@ impl AuditClient {
         // Check if we have any connected relays
         let relays = self.client.relays().await;
         for relay in relays.values() {
-            if relay.is_connected() {
+            if relay.status().is_connected() {
                 return true;
             }
         }
@@ -326,7 +332,8 @@ impl AuditClient {
     pub async fn is_event_on_relay(&self, id: EventId) -> Result<bool> {
         Ok(!self
             .client
-            .fetch_events(vec![Filter::new().id(id)], Duration::from_secs(1))
+            .fetch_events(vec![Filter::new().id(id)])
+            .timeout(Duration::from_secs(1))
             .await
             .context("error trying to query relay for event")?
             .is_empty())
@@ -355,7 +362,7 @@ impl AuditClient {
     ///
     /// // Create event with automatic audit tags
     /// let event = client.event_builder(Kind::TextNote, "test content")
-    ///     .tag(Tag::custom(TagKind::custom("custom"), vec!["value"]))
+    ///     .tag(Tag::custom("custom", vec!["value"]))
     ///     .build(client.keys())?;
     ///
     /// // Event now has both your custom tag AND the 3 audit tags
@@ -384,7 +391,8 @@ impl AuditClient {
 
         let events = self
             .client
-            .fetch_events(filter, Duration::from_secs(5))
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(5))
             .await?;
 
         Ok(events.into_iter().collect())
@@ -400,7 +408,7 @@ impl AuditClient {
         let mut all_events = Vec::new();
 
         for filter in filters {
-            let events = self.client.fetch_events(filter, timeout).await?;
+            let events = self.client.fetch_events(filter).timeout(timeout).await?;
             all_events.extend(events.into_iter());
         }
 
@@ -498,25 +506,19 @@ impl AuditClient {
             )
             .tag(Tag::identifier(&repo_id))
             .tag(Tag::custom(
-                TagKind::custom("name"),
+                "name",
                 vec![format!("{} Test Repository", test_name)],
             ))
             .tag(Tag::custom(
-                TagKind::custom("description"),
+                "description",
                 vec![format!("Repository for {} testing", test_name)],
             ))
             .tag(Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!("{}/{}/{}.git", http_url, npub, repo_id)],
             ))
-            .tag(Tag::custom(
-                TagKind::custom("relays"),
-                vec![relay_url.clone()],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("maintainers"),
-                maintainer_pubkeys.to_vec(),
-            ))
+            .tag(Tag::custom("relays", vec![relay_url.clone()]))
+            .tag(Tag::custom("maintainers", maintainer_pubkeys.to_vec()))
             .build(signing_keys)
             .map_err(|e| anyhow!("Failed to build repository announcement event: {}", e))?;
 
@@ -589,7 +591,7 @@ impl AuditClient {
         let repo_id = repo_event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .ok_or_else(|| anyhow!("Repository event must have a 'd' tag"))?
             .to_string();
@@ -598,8 +600,8 @@ impl AuditClient {
         let a_tag_value = format!("30617:{}:{}", repo_pubkey, repo_id);
 
         let mut tags = vec![
-            Tag::custom(TagKind::custom("a"), vec![a_tag_value]),
-            Tag::custom(TagKind::custom("subject"), vec![issue_title]),
+            Tag::custom("a", vec![a_tag_value]),
+            Tag::custom("subject", vec![issue_title]),
         ];
 
         // Add any additional tags
@@ -632,11 +634,11 @@ impl AuditClient {
 
         let mut tags = vec![
             Tag::custom(
-                TagKind::custom("E"),
+                "E",
                 vec![event_id.to_hex(), "".to_string(), "root".to_string()],
             ),
             Tag::event(event_id),
-            Tag::custom(TagKind::custom("K"), vec![event_kind.as_u16().to_string()]),
+            Tag::custom("K", vec![event_kind.as_u16().to_string()]),
             Tag::public_key(event_pubkey),
         ];
 
@@ -677,7 +679,9 @@ mod tests {
         let recursive_maintainer_keys = Keys::generate();
         let pr_author_keys = Keys::generate();
         let client = AuditClient {
-            client: Client::new(keys.clone()),
+            client: Client::builder()
+                .authenticator(SignerAuthenticator::new(keys.clone()))
+                .build(),
             config: config.clone(),
             keys: keys.clone(),
             maintainer_keys,
@@ -701,7 +705,9 @@ mod tests {
         let recursive_maintainer_keys = Keys::generate();
         let pr_author_keys = Keys::generate();
         let client = AuditClient {
-            client: Client::new(keys.clone()),
+            client: Client::builder()
+                .authenticator(SignerAuthenticator::new(keys.clone()))
+                .build(),
             config: config.clone(),
             keys: keys.clone(),
             maintainer_keys,
@@ -714,7 +720,7 @@ mod tests {
         // Create an event with a custom tag
         let event = client
             .event_builder(Kind::TextNote, "test content")
-            .tag(Tag::custom(TagKind::custom("custom"), vec!["value"]))
+            .tag(Tag::custom("custom", vec!["value"]))
             .build(&keys)
             .unwrap();
 
@@ -776,18 +782,12 @@ mod tests {
         let event = client
             .event_builder(Kind::GitRepoAnnouncement, "Test repository")
             .tag(Tag::identifier("test-repo"))
-            .tag(Tag::custom(
-                TagKind::custom("maintainers"),
-                maintainer_pubkeys.clone(),
-            ))
+            .tag(Tag::custom("maintainers", maintainer_pubkeys.clone()))
             .build(client.keys())
             .unwrap();
 
         // Verify the maintainers tag is present and correctly formatted
-        let maintainers_tag = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == TagKind::custom("maintainers"));
+        let maintainers_tag = event.tags.iter().find(|t| t.kind() == "maintainers");
 
         assert!(
             maintainers_tag.is_some(),

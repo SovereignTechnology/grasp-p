@@ -962,7 +962,7 @@ impl<'a> TestContext<'a> {
                 let repo_id = repo
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::d())
+                    .find(|t| t.kind() == "d")
                     .and_then(|t| t.content())
                     .ok_or_else(|| anyhow::anyhow!("Missing d tag in repo announcement"))?
                     .to_string();
@@ -977,11 +977,11 @@ impl<'a> TestContext<'a> {
                     .event_builder(Kind::RepoState, "")
                     .tag(Tag::identifier(&repo_id))
                     .tag(Tag::custom(
-                        TagKind::custom("refs/heads/main"),
+                        "refs/heads/main",
                         vec![DETERMINISTIC_COMMIT_HASH.to_string()],
                     ))
                     .tag(Tag::custom(
-                        TagKind::custom("HEAD"),
+                        "HEAD",
                         vec!["ref: refs/heads/main".to_string()],
                     ))
                     .custom_time(older_timestamp)
@@ -1004,11 +1004,11 @@ impl<'a> TestContext<'a> {
                     .event_builder(Kind::RepoState, "")
                     .tag(Tag::identifier(&repo_id))
                     .tag(Tag::custom(
-                        TagKind::custom("refs/heads/main"),
+                        "refs/heads/main",
                         vec![DETERMINISTIC_COMMIT_HASH.to_string()],
                     ))
                     .tag(Tag::custom(
-                        TagKind::custom("HEAD"),
+                        "HEAD",
                         vec!["ref: refs/heads/main".to_string()],
                     ))
                     .custom_time(older_timestamp)
@@ -1032,7 +1032,7 @@ impl<'a> TestContext<'a> {
                 let repo_id = repo
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::d())
+                    .find(|t| t.kind() == "d")
                     .and_then(|t| t.content())
                     .ok_or_else(|| anyhow::anyhow!("Missing repo_id in ValidRepoServed fixture"))?
                     .to_string();
@@ -1048,17 +1048,14 @@ impl<'a> TestContext<'a> {
                         "Test PR for GRASP validation",
                     )
                     .tag(Tag::custom(
-                        TagKind::custom("a"),
+                        "a",
                         vec![format!(
                             "30617:{}:{}",
                             self.client.public_key().to_hex(), // Owner pubkey
                             repo_id
                         )],
                     ))
-                    .tag(Tag::custom(
-                        TagKind::custom("c"),
-                        vec![PR_TEST_COMMIT_HASH.to_string()],
-                    ))
+                    .tag(Tag::custom("c", vec![PR_TEST_COMMIT_HASH.to_string()]))
                     .custom_time(pr_timestamp)
                     .build(self.client.pr_author_keys())
                     .map_err(|e| anyhow::anyhow!("Failed to build PR event: {}", e))
@@ -1075,7 +1072,7 @@ impl<'a> TestContext<'a> {
                 let repo_id = repo
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::d())
+                    .find(|t| t.kind() == "d")
                     .and_then(|t| t.content())
                     .ok_or_else(|| anyhow::anyhow!("Missing repo_id in ValidRepoServed fixture"))?
                     .to_string();
@@ -1091,17 +1088,14 @@ impl<'a> TestContext<'a> {
                         "Test PR for GRASP validation",
                     )
                     .tag(Tag::custom(
-                        TagKind::custom("a"),
+                        "a",
                         vec![format!(
                             "30617:{}:{}",
                             self.client.public_key().to_hex(), // Owner pubkey
                             repo_id
                         )],
                     ))
-                    .tag(Tag::custom(
-                        TagKind::custom("c"),
-                        vec![PR_TEST_COMMIT_HASH.to_string()],
-                    ))
+                    .tag(Tag::custom("c", vec![PR_TEST_COMMIT_HASH.to_string()]))
                     .custom_time(pr_timestamp)
                     .build(self.client.pr_author_keys())
                     .map_err(|e| anyhow::anyhow!("Failed to build PR event: {}", e))
@@ -1172,16 +1166,16 @@ impl<'a> TestContext<'a> {
             )
             .tag(Tag::identifier(repo_id))
             .tag(Tag::custom(
-                TagKind::custom("name"),
+                "name",
                 vec![format!("{} (maintainer)", repo_id)],
             ))
             .tag(Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!("{}/{}/{}.git", http_url, maintainer_npub, repo_id)],
             ))
-            .tag(Tag::custom(TagKind::custom("relays"), vec![relay_url]))
+            .tag(Tag::custom("relays", vec![relay_url]))
             .tag(Tag::custom(
-                TagKind::custom("maintainers"),
+                "maintainers",
                 vec![self.client.recursive_maintainer_pubkey_hex()],
             ))
             .build(self.client.maintainer_keys())
@@ -1190,10 +1184,9 @@ impl<'a> TestContext<'a> {
 
     /// Extract repo_id from a repo announcement event
     fn extract_repo_id(&self, repo: &Event) -> Result<String> {
-        use nostr_sdk::prelude::*;
         repo.tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("Missing d tag in repo announcement"))
@@ -1225,12 +1218,12 @@ impl<'a> TestContext<'a> {
             .client
             .event_builder(Kind::GitRepoAnnouncement, "")
             .tag(Tag::identifier(&repo_id))
-            .tag(Tag::custom(TagKind::custom("name"), vec![repo_id.clone()]))
+            .tag(Tag::custom("name", vec![repo_id.clone()]))
             .tag(Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!("{}/{}/{}.git", http_url, npub, repo_id)],
             ))
-            .tag(Tag::custom(TagKind::custom("relays"), vec![relay_url]))
+            .tag(Tag::custom("relays", vec![relay_url]))
             .build(self.client.keys())
             .map_err(|e| anyhow::anyhow!("Failed to build repo announcement: {}", e))?;
 
@@ -1274,11 +1267,11 @@ impl<'a> TestContext<'a> {
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
             .tag(Tag::custom(
-                TagKind::custom("refs/heads/main"),
+                "refs/heads/main",
                 vec![DETERMINISTIC_COMMIT_HASH.to_string()],
             ))
             .tag(Tag::custom(
-                TagKind::custom("HEAD"),
+                "HEAD",
                 vec!["ref: refs/heads/main".to_string()],
             ))
             .custom_time(older_timestamp)
@@ -1540,11 +1533,11 @@ impl<'a> TestContext<'a> {
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
             .tag(Tag::custom(
-                TagKind::custom("refs/heads/main"),
+                "refs/heads/main",
                 vec![MAINTAINER_DETERMINISTIC_COMMIT_HASH.to_string()],
             ))
             .tag(Tag::custom(
-                TagKind::custom("HEAD"),
+                "HEAD",
                 vec!["ref: refs/heads/main".to_string()],
             ))
             .custom_time(maintainer_timestamp)
@@ -1715,11 +1708,11 @@ impl<'a> TestContext<'a> {
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
             .tag(Tag::custom(
-                TagKind::custom("refs/heads/main"),
+                "refs/heads/main",
                 vec![RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH.to_string()],
             ))
             .tag(Tag::custom(
-                TagKind::custom("HEAD"),
+                "HEAD",
                 vec!["ref: refs/heads/main".to_string()],
             ))
             .custom_time(recursive_maintainer_timestamp)
@@ -1883,12 +1876,9 @@ impl<'a> TestContext<'a> {
             .client
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
+            .tag(Tag::custom("HEAD", vec!["refs/heads/develop".to_string()]))
             .tag(Tag::custom(
-                TagKind::custom("HEAD"),
-                vec!["refs/heads/develop".to_string()],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("refs/heads/develop"),
+                "refs/heads/develop",
                 vec![RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH.to_string()],
             ))
             .custom_time(develop_timestamp)
@@ -2043,17 +2033,14 @@ impl<'a> TestContext<'a> {
         self.client
             .event_builder(Kind::GitPullRequest, "Test PR 2 for GRASP validation")
             .tag(Tag::custom(
-                TagKind::custom("a"),
+                "a",
                 vec![format!(
                     "30617:{}:{}",
                     self.client.public_key().to_hex(),
                     repo_id
                 )],
             ))
-            .tag(Tag::custom(
-                TagKind::custom("c"),
-                vec![PR_TEST_COMMIT_HASH_2.to_string()],
-            ))
+            .tag(Tag::custom("c", vec![PR_TEST_COMMIT_HASH_2.to_string()]))
             .custom_time(pr_timestamp)
             .build(self.client.pr_author_keys())
             .map_err(|e| anyhow::anyhow!("Failed to build PR event 2: {}", e))

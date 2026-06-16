@@ -425,7 +425,9 @@ async fn test_pagination_for_large_historic_sync() {
 
     // Query for all issues
     let temp_keys = Keys::generate();
-    let client = Client::new(temp_keys);
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(temp_keys))
+        .build();
     client
         .add_relay(syncing.url())
         .await
@@ -436,7 +438,8 @@ async fn test_pagination_for_large_historic_sync() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let synced_issues = client
-        .fetch_events(issues_filter, Duration::from_secs(5))
+        .fetch_events(issues_filter)
+        .timeout(Duration::from_secs(5))
         .await
         .expect("Failed to fetch issues from syncing relay");
 

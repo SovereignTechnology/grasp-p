@@ -56,7 +56,7 @@ async fn test_nip77_negentropy_sync_finds_events() {
     // Build kind 10317 events (replaceable per pubkey, so two keys = two stored events)
     let event1 = EventBuilder::new(Kind::GitUserGraspList, "")
         .tags(vec![Tag::identifier("grasp-list-nip77-a")])
-        .sign_with_keys(&keys1)
+        .finalize(&keys1)
         .expect("Failed to sign event 1");
     let event1_id = event1.id;
     println!(
@@ -67,7 +67,7 @@ async fn test_nip77_negentropy_sync_finds_events() {
 
     let event2 = EventBuilder::new(Kind::GitUserGraspList, "")
         .tags(vec![Tag::identifier("grasp-list-nip77-b")])
-        .sign_with_keys(&keys2)
+        .finalize(&keys2)
         .expect("Failed to sign event 2");
     let event2_id = event2.id;
     println!(
@@ -102,7 +102,9 @@ async fn test_nip77_negentropy_sync_finds_events() {
 
     // 5. Create a fresh client to perform sync (different instance, no local events)
     let sync_keys = Keys::generate(); // Different keys, doesn't matter for sync
-    let sync_client = Client::new(sync_keys);
+    let sync_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(sync_keys))
+        .build();
 
     sync_client
         .add_relay(relay.url())
@@ -122,7 +124,7 @@ async fn test_nip77_negentropy_sync_finds_events() {
 
     let sync_opts = SyncOptions::default();
 
-    let result = sync_client.sync(filter, &sync_opts).await;
+    let result = sync_client.sync(filter).opts(sync_opts).await;
 
     // 7. Cleanup
     sync_client.disconnect().await;
@@ -131,7 +133,7 @@ async fn test_nip77_negentropy_sync_finds_events() {
     // 8. Verify results
     match result {
         Ok(output) => {
-            let reconciliation = output.val;
+            let reconciliation = output.value;
             println!("Negentropy sync completed!");
             println!("  Local: {:?}", reconciliation.local);
             println!("  Remote: {:?}", reconciliation.remote);
@@ -180,7 +182,9 @@ async fn test_nip77_negentropy_sync_empty_result() {
 
     // 2. Create client
     let keys = Keys::generate();
-    let client = Client::new(keys.clone());
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
 
     client
         .add_relay(relay.url())
@@ -199,7 +203,7 @@ async fn test_nip77_negentropy_sync_empty_result() {
 
     let sync_opts = SyncOptions::default();
 
-    let result = client.sync(filter, &sync_opts).await;
+    let result = client.sync(filter).opts(sync_opts).await;
 
     // 4. Cleanup
     client.disconnect().await;
@@ -208,7 +212,7 @@ async fn test_nip77_negentropy_sync_empty_result() {
     // 5. Verify - should succeed but find nothing
     match result {
         Ok(output) => {
-            let reconciliation = output.val;
+            let reconciliation = output.value;
             println!("Empty sync completed!");
             println!("  Received: {:?}", reconciliation.received);
             println!("  Remote: {:?}", reconciliation.remote);

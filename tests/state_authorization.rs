@@ -20,10 +20,10 @@ async fn test_reject_state_without_announcement() {
     // Create a state event without any announcement
     let state_event = EventBuilder::new(Kind::RepoState, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(TagKind::custom("refs/heads/main"), ["abc123"]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("refs/heads/main", ["abc123"]),
         ])
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
 
     // Connect to relay
@@ -77,14 +77,11 @@ async fn test_reject_state_from_unauthorized_author() {
     // Create announcement
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(
-                TagKind::custom("clone"),
-                [format!("https://{}/test.git", relay.domain())],
-            ),
-            Tag::custom(TagKind::custom("relays"), [relay.url()]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
         ])
-        .sign_with_keys(&announcement_keys)
+        .finalize(&announcement_keys)
         .unwrap();
 
     // Connect to relay
@@ -101,10 +98,10 @@ async fn test_reject_state_from_unauthorized_author() {
     // Try to send state event from unauthorized author
     let state_event = EventBuilder::new(Kind::RepoState, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(TagKind::custom("refs/heads/main"), ["abc123"]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("refs/heads/main", ["abc123"]),
         ])
-        .sign_with_keys(&unauthorized_keys)
+        .finalize(&unauthorized_keys)
         .unwrap();
 
     let result = client.send_event(&state_event).await;
@@ -144,14 +141,11 @@ async fn test_accept_state_from_announcement_author() {
     // Create announcement
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(
-                TagKind::custom("clone"),
-                [format!("https://{}/test.git", relay.domain())],
-            ),
-            Tag::custom(TagKind::custom("relays"), [relay.url()]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
         ])
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
 
     // Connect to relay
@@ -168,10 +162,10 @@ async fn test_accept_state_from_announcement_author() {
     // Send state event from same author (should be accepted or go to purgatory)
     let state_event = EventBuilder::new(Kind::RepoState, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(TagKind::custom("refs/heads/main"), ["abc123"]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("refs/heads/main", ["abc123"]),
         ])
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
 
     let result = client.send_event(&state_event).await;
@@ -214,18 +208,12 @@ async fn test_accept_state_from_maintainer() {
     // Create announcement with maintainer
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(
-                TagKind::custom("clone"),
-                [format!("https://{}/test.git", relay.domain())],
-            ),
-            Tag::custom(TagKind::custom("relays"), [relay.url()]),
-            Tag::custom(
-                TagKind::custom("maintainers"),
-                [maintainer_keys.public_key().to_hex()],
-            ),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("maintainers", [maintainer_keys.public_key().to_hex()]),
         ])
-        .sign_with_keys(&owner_keys)
+        .finalize(&owner_keys)
         .unwrap();
 
     // Connect to relay
@@ -242,10 +230,10 @@ async fn test_accept_state_from_maintainer() {
     // Send state event from maintainer
     let state_event = EventBuilder::new(Kind::RepoState, "")
         .tags([
-            Tag::custom(TagKind::custom("d"), ["test-repo"]),
-            Tag::custom(TagKind::custom("refs/heads/main"), ["abc123"]),
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("refs/heads/main", ["abc123"]),
         ])
-        .sign_with_keys(&maintainer_keys)
+        .finalize(&maintainer_keys)
         .unwrap();
 
     let result = client.send_event(&state_event).await;

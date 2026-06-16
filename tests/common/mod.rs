@@ -11,7 +11,7 @@ pub mod sync_helpers;
 
 pub use git_server::{SimpleGitServer, SmartGitServer};
 pub use mock_relay::MockRelay;
-pub use port::{PortReservation, reserve_port};
+pub use port::{reserve_port, PortReservation};
 pub use purgatory_helpers::*;
 pub use relay::TestRelay;
 pub use sync_helpers::*;

@@ -753,27 +753,27 @@ pub mod mock {
                 // Create minimal repo data with just clone URLs
                 // In real tests, you'd set up proper announcements
                 use crate::nostr::events::RepositoryAnnouncement;
-                use nostr_sdk::{EventBuilder, Keys, Kind};
+                use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
 
                 let keys = Keys::generate();
                 let mut announcements = Vec::new();
 
                 if !self.clone_urls.is_empty() {
                     // Create a minimal announcement with the clone URLs
-                    let mut tags = vec![nostr_sdk::Tag::custom(
-                        nostr_sdk::TagKind::Custom("d".into()),
+                    let mut tags = vec![nostr_sdk::prelude::Tag::custom(
+                        "d",
                         vec!["test-repo".to_string()],
                     )];
 
                     // Create a single clone tag with multiple values (NIP-34 format)
-                    tags.push(nostr_sdk::Tag::custom(
-                        nostr_sdk::TagKind::Custom("clone".into()),
+                    tags.push(nostr_sdk::prelude::Tag::custom(
+                        "clone",
                         self.clone_urls.to_vec(),
                     ));
 
                     let event = EventBuilder::new(Kind::from(30617), "")
                         .tags(tags)
-                        .sign_with_keys(&keys)
+                        .finalize(&keys)
                         .unwrap();
 
                     if let Ok(ann) = RepositoryAnnouncement::from_event(event) {

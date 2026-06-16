@@ -14,7 +14,7 @@
 //!     let mock = MockRelay::start().await;
 //!     
 //!     // Use mock.url() for WebSocket connections
-//!     let client = Client::new(keys);
+//!     let client = Client::builder().authenticator(SignerAuthenticator::new(keys)).build();
 //!     client.add_relay(mock.url()).await.unwrap();
 //!     
 //!     // All events are accepted without validation
@@ -249,8 +249,8 @@ async fn handle_request(
 
 /// Derive the Sec-WebSocket-Accept key from the request key.
 fn derive_accept_key(request_key: &[u8]) -> String {
-    use nostr_sdk::hashes::sha1::Hash as Sha1Hash;
-    use nostr_sdk::hashes::{Hash, HashEngine};
+    use nostr::hashes::sha1::Hash as Sha1Hash;
+    use nostr::hashes::{Hash, HashEngine};
 
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -308,7 +308,9 @@ mod tests {
 
         // Create a client and connect
         let keys = Keys::generate();
-        let client = Client::new(keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
         client
             .add_relay(mock.url())
             .await
@@ -320,7 +322,7 @@ mod tests {
 
         // Create and send a simple event
         let event = EventBuilder::text_note("Test note from MockRelay test")
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("Failed to sign event");
 
         let result = client.send_event(&event).await;
@@ -329,7 +331,8 @@ mod tests {
         // Verify event was stored by fetching it back
         let filter = Filter::new().id(event.id);
         let events = client
-            .fetch_events(filter, Duration::from_secs(2))
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(2))
             .await
             .expect("Failed to fetch events");
 

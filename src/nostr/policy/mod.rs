@@ -9,7 +9,12 @@ mod announcement;
 mod deletion;
 mod pr_event;
 mod related;
+mod result;
 mod state;
+
+pub(crate) use result::{
+    accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
+};
 
 pub use announcement::{AnnouncementPolicy, AnnouncementResult};
 pub use deletion::DeletionPolicy;

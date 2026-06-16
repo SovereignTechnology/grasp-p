@@ -64,7 +64,7 @@ impl PrsEndpointTests {
             // 3. Build a /prs/<valid-npub>/<id>.git/info/refs URL with a known-valid
             //    npub. Using a fresh random npub guarantees no implementation could
             //    have a repo there by accident.
-            let probe_keys = nostr_sdk::Keys::generate();
+            let probe_keys = nostr_sdk::prelude::Keys::generate();
             let probe_npub = probe_keys
                 .public_key()
                 .to_bech32()
@@ -139,7 +139,7 @@ impl PrsEndpointTests {
             // 2. Build a /prs/<valid-npub>/<random-id>.git URL. Using fresh
             //    random keys and a UUID identifier guarantees no implementation
             //    could have prior state for this path.
-            let probe_keys = nostr_sdk::Keys::generate();
+            let probe_keys = nostr_sdk::prelude::Keys::generate();
             let probe_npub = probe_keys
                 .public_key()
                 .to_bech32()
@@ -268,7 +268,7 @@ impl PrsEndpointTests {
             //    64-hex without pulling in a `rand` dep. No matching event
             //    will ever exist; that's fine — the spec's contract here is
             //    push acceptance, not purgatory release.
-            let event_id_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+            let event_id_hex = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
             let refname = format!("refs/nostr/{}", event_id_hex);
 
             // 5. Push. Success means: relay routes /prs/, accepts our ref
@@ -473,9 +473,9 @@ impl PushValidationTests {
                     Kind::GitPullRequest,
                     "grasp-06 audit: PR with c tag pointing at commit B (not the pushed commit A)",
                 )
-                .tag(Tag::custom(TagKind::custom("a"), vec![a_tag_value]))
-                .tag(Tag::custom(TagKind::custom("c"), vec![commit_b.clone()]))
-                .tag(Tag::custom(TagKind::custom("clone"), vec![prs_url.clone()]))
+                .tag(Tag::custom("a", vec![a_tag_value]))
+                .tag(Tag::custom("c", vec![commit_b.clone()]))
+                .tag(Tag::custom("clone", vec![prs_url.clone()]))
                 .build(client.pr_author_keys())
                 .map_err(|e| format!("Failed to build PR event: {}", e))?;
             let pr_event_id_typed = pr_event.id;
@@ -586,7 +586,7 @@ impl PushValidationTests {
 /// Fresh random keys + UUID ensure the path has no prior state and no
 /// implementation could have a repo there by accident.
 fn build_fresh_prs_url(http_url: &str) -> Result<String, String> {
-    let probe_keys = nostr_sdk::Keys::generate();
+    let probe_keys = nostr_sdk::prelude::Keys::generate();
     let probe_npub = probe_keys
         .public_key()
         .to_bech32()

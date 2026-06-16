@@ -81,7 +81,7 @@ impl GitFilterTests {
         let repo_id = match repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),
@@ -203,7 +203,7 @@ impl GitFilterTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .ok_or("Missing d tag")
             .unwrap()
@@ -314,7 +314,7 @@ impl GitFilterTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .ok_or("Missing d tag")
             .unwrap()

@@ -131,19 +131,12 @@ impl AuditConfig {
     /// // ]
     /// ```
     pub fn audit_tags(&self) -> Vec<Tag> {
-        use nostr_sdk::prelude::{Alphabet, SingleLetterTag};
-
         // Use "t" tags for categorization (standard NIP-01 hashtag type)
-        let t_tag = SingleLetterTag::lowercase(Alphabet::T);
-
         vec![
-            Tag::custom(TagKind::SingleLetter(t_tag), vec!["grasp-audit-test-event"]),
+            Tag::custom("t", vec!["grasp-audit-test-event"]),
+            Tag::custom("t", vec![format!("audit-{}", self.run_id)]),
             Tag::custom(
-                TagKind::SingleLetter(t_tag),
-                vec![format!("audit-{}", self.run_id)],
-            ),
-            Tag::custom(
-                TagKind::SingleLetter(t_tag),
+                "t",
                 vec![format!(
                     "audit-cleanup-after-{}",
                     self.cleanup_after.as_secs()
@@ -228,7 +221,7 @@ impl AuditEventBuilder {
             builder
         };
 
-        let event = builder.sign_with_keys(keys)?;
+        let event = builder.finalize(keys)?;
 
         Ok(event)
     }
@@ -256,22 +249,14 @@ mod tests {
 
     #[test]
     fn test_audit_tags() {
-        use nostr_sdk::prelude::{Alphabet, SingleLetterTag};
-
         let config = AuditConfig::isolated();
         let tags = config.audit_tags();
 
         assert_eq!(tags.len(), 3);
 
-        let t_tag = SingleLetterTag::lowercase(Alphabet::T);
-
         // All tags should be "t" tags (hashtags)
         for tag in &tags {
-            if let TagKind::SingleLetter(letter) = tag.kind() {
-                assert_eq!(letter, t_tag);
-            } else {
-                panic!("Expected SingleLetter tag");
-            }
+            assert_eq!(tag.kind(), "t", "Expected 't' (SingleLetter) tag");
         }
 
         // Check for "t" tag with "grasp-audit-test-event"
@@ -300,7 +285,7 @@ mod tests {
         let keys = Keys::generate();
 
         let event = AuditEventBuilder::new(Kind::TextNote, "test", config.clone())
-            .tag(Tag::custom(TagKind::Custom("test".into()), vec!["value"]))
+            .tag(Tag::custom("test", vec!["value"]))
             .build(&keys)
             .unwrap();
 

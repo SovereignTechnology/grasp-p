@@ -221,7 +221,7 @@ async fn setup_pr_test_repo(
     let repo_id = repo_event
         .tags
         .iter()
-        .find(|t| t.kind() == TagKind::d())
+        .find(|t| t.kind() == "d")
         .and_then(|t| t.content())
         .ok_or("No repo identifier in announcement")?
         .to_string();
@@ -424,7 +424,7 @@ impl PushAuthorizationTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .unwrap()
             .to_string();
@@ -569,7 +569,7 @@ impl PushAuthorizationTests {
         let repo_id = match state_event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),
@@ -809,7 +809,7 @@ impl PushAuthorizationTests {
         let repo_id = match state_event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),
@@ -880,10 +880,7 @@ impl PushAuthorizationTests {
         let rogue_state = match client
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
-            .tag(Tag::custom(
-                TagKind::custom("refs/heads/main"),
-                vec![new_commit.clone()],
-            ))
+            .tag(Tag::custom("refs/heads/main", vec![new_commit.clone()]))
             .build(&rogue_keys)
         {
             Ok(e) => e,
@@ -973,7 +970,7 @@ impl PushAuthorizationTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .unwrap()
             .to_string();
@@ -1121,7 +1118,7 @@ impl PushAuthorizationTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .unwrap_or("unknown")
             .to_string();
@@ -1209,7 +1206,7 @@ impl PushAuthorizationTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .unwrap_or("unknown")
             .to_string();
@@ -1300,7 +1297,7 @@ impl PushAuthorizationTests {
         let repo_id = repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .unwrap_or("unknown")
             .to_string();
@@ -1436,7 +1433,7 @@ impl PushAuthorizationTests {
         let repo_id = match valid_repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),
@@ -1539,7 +1536,7 @@ impl PushAuthorizationTests {
         let repo_id = match valid_repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),
@@ -1599,16 +1596,13 @@ impl PushAuthorizationTests {
         let state_event = match client
             .event_builder(Kind::RepoState, "")
             .tag(Tag::identifier(&repo_id))
+            .tag(Tag::custom("HEAD", vec!["refs/heads/develop1".to_string()]))
             .tag(Tag::custom(
-                TagKind::custom("HEAD"),
-                vec!["refs/heads/develop1".to_string()],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("refs/heads/develop1"),
+                "refs/heads/develop1",
                 vec![commit_hash.clone()],
             ))
             .tag(Tag::custom(
-                TagKind::custom("refs/heads/develop"),
+                "refs/heads/develop",
                 vec![RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH.to_string()],
             ))
             .build(client.keys())

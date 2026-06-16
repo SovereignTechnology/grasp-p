@@ -7,7 +7,7 @@
 /// - NIP-34: https://nips.nostr.com/34
 /// - GRASP-01: https://gitworkshop.dev/danconwaydev.com/grasp/01.md
 use anyhow::{anyhow, Result};
-use nostr_sdk::{Event, Kind, TagKind, ToBech32};
+use nostr_sdk::prelude::{Event, Kind, ToBech32};
 
 // NOTE: Using rust-nostr Kind variants instead of hardcoded constants:
 // - KIND_REPOSITORY_ANNOUNCEMENT -> Kind::GitRepoAnnouncement (30617)
@@ -44,7 +44,7 @@ impl RepositoryAnnouncement {
         let identifier = event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .ok_or_else(|| anyhow!("Repository announcement missing 'd' tag (identifier)"))?
             .to_string();
@@ -53,7 +53,7 @@ impl RepositoryAnnouncement {
         let name = event
             .tags
             .iter()
-            .find(|t| matches!(t.kind(), TagKind::Name))
+            .find(|t| t.kind() == "name")
             .and_then(|t| t.content())
             .map(|s| s.to_string());
 
@@ -68,7 +68,7 @@ impl RepositoryAnnouncement {
         let clone_urls = event
             .tags
             .iter()
-            .filter(|t| matches!(t.kind(), TagKind::Clone))
+            .filter(|t| t.kind() == "clone")
             .flat_map(|t| {
                 let vec = t.clone().to_vec();
                 // Skip first element (tag name), rest are values
@@ -77,11 +77,7 @@ impl RepositoryAnnouncement {
             .collect();
 
         // return error if mutliple clone tags (incorrect formatting)
-        let clone_tag_count = event
-            .tags
-            .iter()
-            .filter(|t| matches!(t.kind(), TagKind::Clone))
-            .count();
+        let clone_tag_count = event.tags.iter().filter(|t| t.kind() == "clone").count();
 
         if clone_tag_count > 1 {
             return Err(anyhow::anyhow!("multiple clone tags found. correct format is single clone tag with multiple values"));
@@ -91,7 +87,7 @@ impl RepositoryAnnouncement {
         let relays = event
             .tags
             .iter()
-            .filter(|t| matches!(t.kind(), TagKind::Relays))
+            .filter(|t| t.kind() == "relays")
             .flat_map(|t| {
                 let vec = t.clone().to_vec();
                 // Skip first element (tag name), rest are values
@@ -103,13 +99,7 @@ impl RepositoryAnnouncement {
         let web_urls = event
             .tags
             .iter()
-            .filter(|t| {
-                if let TagKind::Custom(s) = t.kind() {
-                    s.as_ref() == "web"
-                } else {
-                    false
-                }
-            })
+            .filter(|t| t.kind() == "web")
             .flat_map(|t| {
                 let vec = t.clone().to_vec();
                 // Skip first element (tag name), rest are values
@@ -227,7 +217,7 @@ impl RepositoryState {
         let identifier = event
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
             .ok_or_else(|| anyhow!("Repository state missing 'd' tag (identifier)"))?
             .to_string();
@@ -238,17 +228,14 @@ impl RepositoryState {
             .tags
             .iter()
             .filter_map(|t| {
-                if let TagKind::Custom(s) = t.kind() {
-                    if s.as_ref().starts_with("refs/heads/") {
-                        let parts = t.clone().to_vec();
-                        if parts.len() >= 2 {
-                            Some(BranchState {
-                                name: s.as_ref().strip_prefix("refs/heads/").unwrap().to_string(),
-                                commit: parts[1].clone(),
-                            })
-                        } else {
-                            None
-                        }
+                let kind = t.kind();
+                if kind.starts_with("refs/heads/") {
+                    let parts = t.clone().to_vec();
+                    if parts.len() >= 2 {
+                        Some(BranchState {
+                            name: kind.strip_prefix("refs/heads/").unwrap().to_string(),
+                            commit: parts[1].clone(),
+                        })
                     } else {
                         None
                     }
@@ -266,17 +253,14 @@ impl RepositoryState {
             .tags
             .iter()
             .filter_map(|t| {
-                if let TagKind::Custom(s) = t.kind() {
-                    if s.as_ref().starts_with("refs/tags/") && !s.as_ref().ends_with("^{}") {
-                        let parts = t.clone().to_vec();
-                        if parts.len() >= 2 {
-                            Some(TagState {
-                                name: s.as_ref().strip_prefix("refs/tags/").unwrap().to_string(),
-                                commit: parts[1].clone(),
-                            })
-                        } else {
-                            None
-                        }
+                let kind = t.kind();
+                if kind.starts_with("refs/tags/") && !kind.ends_with("^{}") {
+                    let parts = t.clone().to_vec();
+                    if parts.len() >= 2 {
+                        Some(TagState {
+                            name: kind.strip_prefix("refs/tags/").unwrap().to_string(),
+                            commit: parts[1].clone(),
+                        })
                     } else {
                         None
                     }
@@ -291,13 +275,7 @@ impl RepositoryState {
         let head = event
             .tags
             .iter()
-            .find(|t| {
-                if let TagKind::Custom(s) = t.kind() {
-                    s.as_ref() == "HEAD"
-                } else {
-                    false
-                }
-            })
+            .find(|t| t.kind() == "HEAD")
             .and_then(|t| {
                 let parts = t.clone().to_vec();
                 if parts.len() >= 2 {
@@ -432,7 +410,7 @@ pub fn validate_announcement(
     }
 
     // Must have identifier
-    let has_identifier = event.tags.iter().any(|t| t.kind() == TagKind::d());
+    let has_identifier = event.tags.iter().any(|t| t.kind() == "d");
     if !has_identifier {
         return AnnouncementResult::Reject("Missing required 'd' tag (identifier)".to_string());
     }
@@ -518,7 +496,7 @@ pub fn validate_state(event: &Event) -> Result<()> {
     }
 
     // Must have identifier
-    let has_identifier = event.tags.iter().any(|t| t.kind() == TagKind::d());
+    let has_identifier = event.tags.iter().any(|t| t.kind() == "d");
     if !has_identifier {
         return Err(anyhow!("Missing required 'd' tag (identifier)"));
     }
@@ -532,7 +510,7 @@ pub fn validate_state(event: &Event) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{EventBuilder, Keys};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 
     fn create_test_keys() -> Keys {
         Keys::generate()
@@ -544,53 +522,44 @@ mod tests {
         clone_urls: Vec<&str>,
         relays: Vec<&str>,
     ) -> Event {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec![identifier.to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         // NIP-34: Single clone tag with multiple values
         if !clone_urls.is_empty() {
             tags.push(Tag::custom(
-                nostr_sdk::TagKind::Clone,
+                "clone",
                 clone_urls.iter().map(|s| s.to_string()),
             ));
         }
 
         // NIP-34: Single relays tag with multiple values
         if !relays.is_empty() {
-            tags.push(Tag::custom(
-                nostr_sdk::TagKind::Relays,
-                relays.iter().map(|s| s.to_string()),
-            ));
+            tags.push(Tag::custom("relays", relays.iter().map(|s| s.to_string())));
         }
 
         EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 
     fn create_state_event(keys: &Keys, identifier: &str, branches: Vec<(&str, &str)>) -> Event {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec![identifier.to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         for (branch, commit) in branches {
             tags.push(Tag::custom(
-                nostr_sdk::TagKind::Custom(format!("refs/heads/{}", branch).into()),
+                format!("refs/heads/{}", branch),
                 vec![commit.to_string()],
             ));
         }
 
         EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 
@@ -618,7 +587,7 @@ mod tests {
     fn test_parse_announcement_missing_identifier() {
         let keys = create_test_keys();
         let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let result = RepositoryAnnouncement::from_event(event);
@@ -748,7 +717,7 @@ mod tests {
     fn test_validate_state_missing_identifier() {
         let keys = create_test_keys();
         let event = EventBuilder::new(Kind::RepoState, "")
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let result = validate_state(&event);
@@ -758,33 +727,30 @@ mod tests {
 
     #[test]
     fn test_announcement_maintainers() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
         let maintainer_keys = create_test_keys();
 
         let mut tags = vec![
-            Tag::custom(nostr_sdk::TagKind::d(), vec!["test-repo".to_string()]),
+            Tag::custom("d", vec!["test-repo".to_string()]),
             Tag::custom(
-                nostr_sdk::TagKind::Clone,
+                "clone",
                 vec!["https://gitnostr.com/alice/test-repo.git".to_string()],
             ),
-            Tag::custom(
-                nostr_sdk::TagKind::Relays,
-                vec!["wss://gitnostr.com".to_string()],
-            ),
+            Tag::custom("relays", vec!["wss://gitnostr.com".to_string()]),
         ];
 
         // Add maintainer using NIP-34 "maintainers" tag format
         // Format: ["maintainers", "<pubkey1-hex>", "<pubkey2-hex>", ...]
         tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("maintainers".into()),
+            "maintainers",
             vec![maintainer_keys.public_key().to_hex()],
         ));
 
         let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let announcement = RepositoryAnnouncement::from_event(event).unwrap();
@@ -797,29 +763,23 @@ mod tests {
 
     #[test]
     fn test_state_with_tags() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
-        tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("refs/heads/main".into()),
-            vec!["a1b2c3d4".to_string()],
-        ));
+        tags.push(Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]));
 
         // Add tag
         tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("refs/tags/v1.0.0".into()),
+            "refs/tags/v1.0.0",
             vec!["e5f6g7h8".to_string()],
         ));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let state = RepositoryState::from_event(event).unwrap();
@@ -831,29 +791,26 @@ mod tests {
 
     #[test]
     fn test_state_with_head_ref_prefix() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
         tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("refs/heads/main".into()),
+            "refs/heads/main",
             vec!["a1b2c3d4e5f6g7h8".to_string()],
         ));
 
         // Add HEAD with "ref: " prefix (common NIP-34 format)
         tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("HEAD".into()),
+            "HEAD",
             vec!["ref: refs/heads/main".to_string()],
         ));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let state = RepositoryState::from_event(event).unwrap();
@@ -864,29 +821,23 @@ mod tests {
 
     #[test]
     fn test_state_with_head_no_prefix() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
         tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("refs/heads/develop".into()),
+            "refs/heads/develop",
             vec!["deadbeefcafe".to_string()],
         ));
 
         // Add HEAD without "ref: " prefix (also valid)
-        tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("HEAD".into()),
-            vec!["refs/heads/develop".to_string()],
-        ));
+        tags.push(Tag::custom("HEAD", vec!["refs/heads/develop".to_string()]));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let state = RepositoryState::from_event(event).unwrap();
@@ -897,20 +848,17 @@ mod tests {
 
     #[test]
     fn test_state_without_head() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
         let tags = vec![
-            Tag::custom(nostr_sdk::TagKind::d(), vec!["test-repo".to_string()]),
-            Tag::custom(
-                nostr_sdk::TagKind::Custom("refs/heads/main".into()),
-                vec!["a1b2c3d4".to_string()],
-            ),
+            Tag::custom("d", vec!["test-repo".to_string()]),
+            Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]),
         ];
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let state = RepositoryState::from_event(event).unwrap();
@@ -921,29 +869,20 @@ mod tests {
 
     #[test]
     fn test_state_head_commit_not_available() {
-        use nostr_sdk::Tag;
+        use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            nostr_sdk::TagKind::d(),
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch for "main"
-        tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("refs/heads/main".into()),
-            vec!["a1b2c3d4".to_string()],
-        ));
+        tags.push(Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]));
 
         // HEAD points to "develop" which doesn't exist in branches
-        tags.push(Tag::custom(
-            nostr_sdk::TagKind::Custom("HEAD".into()),
-            vec!["refs/heads/develop".to_string()],
-        ));
+        tags.push(Tag::custom("HEAD", vec!["refs/heads/develop".to_string()]));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let state = RepositoryState::from_event(event).unwrap();

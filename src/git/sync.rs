@@ -35,7 +35,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use nostr_sdk::Event;
+use nostr_sdk::prelude::Event;
 
 use crate::git::authorization::{
     collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
@@ -1421,7 +1421,7 @@ async fn process_purgatory_announcements(
     };
 
     // Parse the npub back to PublicKey
-    let owner = match nostr_sdk::PublicKey::parse(&owner_pubkey) {
+    let owner = match nostr_sdk::prelude::PublicKey::parse(&owner_pubkey) {
         Ok(pk) => pk,
         Err(e) => {
             warn!(
@@ -1491,7 +1491,7 @@ async fn process_purgatory_announcements(
                             );
 
                             for maintainer_hex in &announcement.maintainers {
-                                match nostr_sdk::PublicKey::from_hex(maintainer_hex) {
+                                match nostr_sdk::prelude::PublicKey::from_hex(maintainer_hex) {
                                     Ok(maintainer_pubkey) => {
                                         let (removed, hot_events) = rei.invalidate_and_get(
                                             &maintainer_pubkey,
@@ -1619,7 +1619,7 @@ pub(crate) async fn mirror_prs_pr_to_announced_repos(
         let maintainer_hex = parts[1];
         let identifier = parts[2];
 
-        let maintainer = match nostr_sdk::PublicKey::parse(maintainer_hex) {
+        let maintainer = match nostr_sdk::prelude::PublicKey::parse(maintainer_hex) {
             Ok(pk) => pk,
             Err(e) => {
                 debug!(
@@ -1738,7 +1738,7 @@ pub fn extract_owner_from_repo_path(repo_path: &Path, git_data_path: &Path) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::Keys;
+    use nostr_sdk::prelude::Keys;
 
     #[test]
     fn test_process_result_default() {
@@ -1849,17 +1849,17 @@ mod tests {
 
     #[test]
     fn test_extract_identifier_from_pr_event_valid() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
         let tags = vec![Tag::custom(
-            TagKind::Custom("a".into()),
+            "a",
             vec!["30617:abc123def456:test-repo".to_string()],
         )];
 
         let event = EventBuilder::new(Kind::from(1618), "PR content")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let result = extract_identifier_from_pr_event(&event);
@@ -1868,17 +1868,14 @@ mod tests {
 
     #[test]
     fn test_extract_identifier_from_pr_event_missing_tag() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
-        let tags = vec![Tag::custom(
-            TagKind::Custom("c".into()),
-            vec!["commit123".to_string()],
-        )];
+        let tags = vec![Tag::custom("c", vec!["commit123".to_string()])];
 
         let event = EventBuilder::new(Kind::from(1618), "PR content")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let result = extract_identifier_from_pr_event(&event);
@@ -1887,17 +1884,17 @@ mod tests {
 
     #[test]
     fn test_extract_identifier_from_pr_event_wrong_kind_a_tag() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
         let tags = vec![Tag::custom(
-            TagKind::Custom("a".into()),
+            "a",
             vec!["30618:abc123:test-repo".to_string()], // 30618 not 30617
         )];
 
         let event = EventBuilder::new(Kind::from(1618), "PR content")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let result = extract_identifier_from_pr_event(&event);
@@ -1941,26 +1938,20 @@ mod tests {
 
     #[test]
     fn test_extract_tagged_owners_from_pr_events_with_a_tags() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
 
         // Create a PR event with `a` tags referencing repos
         let tags = vec![
-            Tag::custom(
-                TagKind::Custom("a".into()),
-                vec!["30617:abc123def456:test-repo".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("a".into()),
-                vec!["30617:789xyz000111:another-repo".to_string()],
-            ),
-            Tag::custom(TagKind::Custom("c".into()), vec!["commit123".to_string()]),
+            Tag::custom("a", vec!["30617:abc123def456:test-repo".to_string()]),
+            Tag::custom("a", vec!["30617:789xyz000111:another-repo".to_string()]),
+            Tag::custom("c", vec!["commit123".to_string()]),
         ];
 
         let event = EventBuilder::new(Kind::from(1618), "PR content")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let owners = extract_tagged_owners_from_pr_events(&[event]);
@@ -1971,29 +1962,23 @@ mod tests {
 
     #[test]
     fn test_extract_tagged_owners_from_pr_events_deduplicates() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
 
         // Create two events with overlapping owners
-        let tags1 = vec![Tag::custom(
-            TagKind::Custom("a".into()),
-            vec!["30617:same_owner:repo1".to_string()],
-        )];
+        let tags1 = vec![Tag::custom("a", vec!["30617:same_owner:repo1".to_string()])];
 
-        let tags2 = vec![Tag::custom(
-            TagKind::Custom("a".into()),
-            vec!["30617:same_owner:repo2".to_string()],
-        )];
+        let tags2 = vec![Tag::custom("a", vec!["30617:same_owner:repo2".to_string()])];
 
         let event1 = EventBuilder::new(Kind::from(1618), "PR 1")
             .tags(tags1)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let event2 = EventBuilder::new(Kind::from(1618), "PR 2")
             .tags(tags2)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let owners = extract_tagged_owners_from_pr_events(&[event1, event2]);
@@ -2003,25 +1988,22 @@ mod tests {
 
     #[test]
     fn test_extract_tagged_owners_ignores_non_30617_a_tags() {
-        use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
         let keys = Keys::generate();
 
         // Create a PR event with a non-30617 `a` tag
         let tags = vec![
+            Tag::custom("a", vec!["30617:valid_owner:test-repo".to_string()]),
             Tag::custom(
-                TagKind::Custom("a".into()),
-                vec!["30617:valid_owner:test-repo".to_string()],
-            ),
-            Tag::custom(
-                TagKind::Custom("a".into()),
+                "a",
                 vec!["30618:state_event:test-repo".to_string()], // Not 30617
             ),
         ];
 
         let event = EventBuilder::new(Kind::from(1618), "PR content")
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let owners = extract_tagged_owners_from_pr_events(&[event]);
@@ -2037,20 +2019,17 @@ mod tests {
         created_at: u64,
         nonce: &str,
     ) -> RepositoryState {
-        use nostr_sdk::{EventBuilder, Kind, Tag, TagKind, Timestamp};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Kind, Tag, Timestamp};
 
         let tags = vec![
-            Tag::custom(TagKind::d(), vec![identifier.to_string()]),
-            Tag::custom(
-                TagKind::custom("refs/heads/main"),
-                vec![format!("abc123{}", nonce)],
-            ),
+            Tag::custom("d", vec![identifier.to_string()]),
+            Tag::custom("refs/heads/main", vec![format!("abc123{}", nonce)]),
         ];
 
         let event = EventBuilder::new(Kind::from(30618), nonce)
             .tags(tags)
             .custom_created_at(Timestamp::from(created_at))
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap();
 
         RepositoryState::from_event(event).unwrap()

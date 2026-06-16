@@ -7,7 +7,7 @@
 //!
 //! # nostr-sdk 0.43 API Notes
 //! - Use field access: `event.id`, `event.tags`, `event.tags.iter()`
-//! - Use `Tag::custom(TagKind::custom("name"), vec![...])` syntax
+//! - Use `Tag::custom("name", vec![...])` syntax
 //! - Use `EventBuilder::new(kind, content).tags(tags)` syntax
 
 use std::collections::HashMap;
@@ -46,7 +46,9 @@ impl TestClient {
     /// * `Ok(TestClient)` on successful connection
     /// * `Err(String)` if connection fails after all retries
     pub async fn new(relay_url: &str, keys: Keys) -> Result<Self, String> {
-        let client = Client::new(keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
 
         client
             .add_relay(relay_url)
@@ -74,7 +76,7 @@ impl TestClient {
         for attempt in 0..30 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let relays = self.client.relays().await;
-            if relays.values().any(|r| r.is_connected()) {
+            if relays.values().any(|r| r.status().is_connected()) {
                 return Ok(());
             }
             if attempt == 29 {
@@ -112,7 +114,7 @@ impl TestClient {
             match self.client.send_event(event).await {
                 Ok(output) => {
                     if !output.success.is_empty() {
-                        return Ok(output.val);
+                        return Ok(output.value);
                     }
                     // Log failures for debugging
                     if !output.failed.is_empty() {
@@ -215,16 +217,16 @@ fn build_layer2_issue_with_tag(
     tag_variant: TagVariant,
 ) -> Result<Event, String> {
     let tag = match tag_variant {
-        TagVariant::LowercaseA => Tag::custom(TagKind::custom("a"), vec![repo_coord.to_string()]),
-        TagVariant::UppercaseA => Tag::custom(TagKind::custom("A"), vec![repo_coord.to_string()]),
-        TagVariant::QuoteQ => Tag::custom(TagKind::custom("q"), vec![repo_coord.to_string()]),
+        TagVariant::LowercaseA => Tag::custom("a", vec![repo_coord.to_string()]),
+        TagVariant::UppercaseA => Tag::custom("A", vec![repo_coord.to_string()]),
+        TagVariant::QuoteQ => Tag::custom("q", vec![repo_coord.to_string()]),
     };
 
     let tags = vec![tag];
 
     EventBuilder::new(Kind::GitIssue, title)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign Layer 2 issue event: {}", e))
 }
 
@@ -257,11 +259,11 @@ pub fn build_layer3_comment_event(
     // Choose tag based on kind (NIP-22 uses E, NIP-10 style uses e)
     let tag = if kind_num == Kind::Comment.as_u16() {
         // NIP-22 comment: uppercase 'E' tag
-        Tag::custom(TagKind::custom("E"), vec![parent_event_id.to_hex()])
+        Tag::custom("E", vec![parent_event_id.to_hex()])
     } else {
         // Kind 1 reply: lowercase 'e' tag with root marker (NIP-10)
         Tag::custom(
-            TagKind::custom("e"),
+            "e",
             vec![parent_event_id.to_hex(), "".to_string(), "root".to_string()],
         )
     };
@@ -270,7 +272,7 @@ pub fn build_layer3_comment_event(
 
     EventBuilder::new(kind, content)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign Layer 3 comment event: {}", e))
 }
 
@@ -281,13 +283,13 @@ pub fn build_layer3_reply_with_e_tag(
     content: &str,
 ) -> Result<Event, String> {
     let tag = Tag::custom(
-        TagKind::custom("e"),
+        "e",
         vec![parent_event_id.to_hex(), "".to_string(), "root".to_string()],
     );
 
     EventBuilder::new(Kind::Custom(1), content)
         .tags(vec![tag])
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign Layer 3 reply event: {}", e))
 }
 
@@ -297,11 +299,11 @@ pub fn build_layer3_comment_with_uppercase_e_tag(
     parent_event_id: &EventId,
     content: &str,
 ) -> Result<Event, String> {
-    let tag = Tag::custom(TagKind::custom("E"), vec![parent_event_id.to_hex()]);
+    let tag = Tag::custom("E", vec![parent_event_id.to_hex()]);
 
     EventBuilder::new(Kind::Comment, content)
         .tags(vec![tag])
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign Layer 3 comment event: {}", e))
 }
 
@@ -311,11 +313,11 @@ pub fn build_layer3_quote_with_q_tag(
     parent_event_id: &EventId,
     content: &str,
 ) -> Result<Event, String> {
-    let tag = Tag::custom(TagKind::custom("q"), vec![parent_event_id.to_hex()]);
+    let tag = Tag::custom("q", vec![parent_event_id.to_hex()]);
 
     EventBuilder::new(Kind::Custom(1), content)
         .tags(vec![tag])
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign Layer 3 quote event: {}", e))
 }
 
@@ -355,13 +357,13 @@ pub fn create_repo_announcement(keys: &Keys, domains: &[&str], identifier: &str)
     // Build tags for repository announcement
     let tags = vec![
         Tag::identifier(identifier),
-        Tag::custom(TagKind::custom("clone"), clone_urls),
-        Tag::custom(TagKind::custom("relays"), relay_urls),
+        Tag::custom("clone", clone_urls),
+        Tag::custom("relays", relay_urls),
     ];
 
     EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("Failed to sign repo announcement")
 }
 
@@ -514,7 +516,9 @@ pub async fn wait_for_event_on_relay(relay_url: &str, filter: Filter, timeout: D
     loop {
         // Create a fresh client for each poll attempt (avoids stale connection state)
         let temp_keys = Keys::generate();
-        let client = Client::new(temp_keys);
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(temp_keys))
+            .build();
 
         if client.add_relay(relay_url).await.is_err() {
             if tokio::time::Instant::now() >= deadline {
@@ -531,7 +535,7 @@ pub async fn wait_for_event_on_relay(relay_url: &str, filter: Filter, timeout: D
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let relays = client.relays().await;
-            if relays.values().any(|r| r.is_connected()) {
+            if relays.values().any(|r| r.status().is_connected()) {
                 connected = true;
                 break;
             }
@@ -540,7 +544,10 @@ pub async fn wait_for_event_on_relay(relay_url: &str, filter: Filter, timeout: D
         if connected {
             // Use a short fetch window — if the event is there, EOSE comes back quickly
             let fetch_timeout = Duration::from_millis(500);
-            let result = client.fetch_events(filter.clone(), fetch_timeout).await;
+            let result = client
+                .fetch_events(filter.clone())
+                .timeout(fetch_timeout)
+                .await;
             client.disconnect().await;
 
             match result {
@@ -1349,10 +1356,10 @@ pub async fn setup_announcement_on_relay(
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(vec![
             Tag::identifier(identifier),
-            Tag::custom(TagKind::custom("clone"), clone_urls.clone()),
-            Tag::custom(TagKind::custom("relays"), relay_urls.clone()),
+            Tag::custom("clone", clone_urls.clone()),
+            Tag::custom("relays", relay_urls.clone()),
         ])
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("Failed to sign repo announcement");
 
     // Build state event with all domains' clone URLs
@@ -1471,10 +1478,10 @@ pub async fn run_sync_test(historic_events: &[Event], live_events: &[Event]) -> 
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(vec![
             Tag::identifier("test-repo"),
-            Tag::custom(TagKind::custom("clone"), clone_urls.clone()),
-            Tag::custom(TagKind::custom("relays"), relay_urls.clone()),
+            Tag::custom("clone", clone_urls.clone()),
+            Tag::custom("relays", relay_urls.clone()),
         ])
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .expect("Failed to sign repo announcement");
 
     // 5. Create state event referencing the commit

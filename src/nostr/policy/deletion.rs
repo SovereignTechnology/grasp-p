@@ -297,10 +297,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_context() -> PolicyContext {
-        let db = Arc::new(MemoryDatabase::with_opts(MemoryDatabaseOptions {
-            events: true,
-            max_events: None,
-        }));
+        let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
         let config = crate::config::Config::for_testing();
         PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
@@ -310,12 +307,9 @@ mod tests {
         EventBuilder::new(Kind::GitRepoAnnouncement, "")
             .tags(vec![
                 Tag::identifier(identifier),
-                Tag::custom(
-                    TagKind::custom("clone"),
-                    vec!["https://example.com/repo.git"],
-                ),
+                Tag::custom("clone", vec!["https://example.com/repo.git"]),
             ])
-            .sign_with_keys(keys)
+            .finalize(keys)
             .unwrap()
     }
 
@@ -346,9 +340,9 @@ mod tests {
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![
                 Tag::event(announcement.id),
-                Tag::custom(TagKind::custom("k"), vec!["30617"]),
+                Tag::custom("k", vec!["30617"]),
             ])
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
@@ -379,10 +373,10 @@ mod tests {
         let coord = format!("30617:{}:{}", keys.public_key().to_hex(), identifier);
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![
-                Tag::custom(TagKind::custom("a"), vec![coord]),
-                Tag::custom(TagKind::custom("k"), vec!["30617"]),
+                Tag::custom("a", vec![coord]),
+                Tag::custom("k", vec!["30617"]),
             ])
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
@@ -410,9 +404,9 @@ mod tests {
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![
                 Tag::event(announcement.id),
-                Tag::custom(TagKind::custom("k"), vec!["30617"]),
+                Tag::custom("k", vec!["30617"]),
             ])
-            .sign_with_keys(&attacker_keys)
+            .finalize(&attacker_keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
@@ -441,10 +435,10 @@ mod tests {
         let coord = format!("30617:{}:{}", owner_keys.public_key().to_hex(), identifier);
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![
-                Tag::custom(TagKind::custom("a"), vec![coord]),
-                Tag::custom(TagKind::custom("k"), vec!["30617"]),
+                Tag::custom("a", vec![coord]),
+                Tag::custom("k", vec!["30617"]),
             ])
-            .sign_with_keys(&attacker_keys)
+            .finalize(&attacker_keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
@@ -466,10 +460,10 @@ mod tests {
         // No purgatory entry exists — deletion should still be accepted
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![Tag::custom(
-                TagKind::custom("a"),
+                "a",
                 vec![format!("30617:{}:nonexistent", keys.public_key().to_hex())],
             )])
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
@@ -489,15 +483,15 @@ mod tests {
         let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
             .tags(vec![Tag::identifier(identifier)])
             .custom_created_at(Timestamp::from(future_ts))
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .unwrap();
         add_to_purgatory(&ctx, &announcement, identifier);
 
         // Deletion event with current timestamp (older than announcement)
         let coord = format!("30617:{}:{}", keys.public_key().to_hex(), identifier);
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
-            .tags(vec![Tag::custom(TagKind::custom("a"), vec![coord])])
-            .sign_with_keys(&keys)
+            .tags(vec![Tag::custom("a", vec![coord])])
+            .finalize(&keys)
             .unwrap();
 
         let policy = DeletionPolicy::new(ctx.clone());
