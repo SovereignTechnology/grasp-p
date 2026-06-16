@@ -94,7 +94,7 @@
 use crate::fixtures::{send_and_verify_accepted, send_and_verify_rejected};
 use crate::specs::grasp01::SpecRef;
 use crate::{AuditClient, AuditResult, FixtureKind, TestContext, TestResult};
-use nostr_sdk::{Event, Filter, Kind, Tag, TagKind, Timestamp, ToBech32};
+use nostr_sdk::prelude::{Event, Filter, Kind, Tag, Timestamp, ToBech32};
 use std::time::Duration;
 
 /// Test suite for GRASP-01 event acceptance policy
@@ -186,7 +186,7 @@ impl EventAcceptancePolicyTests {
             let repo_id = event
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in announcement")?
                 .to_string();
@@ -221,13 +221,13 @@ impl EventAcceptancePolicyTests {
 
             // Verify key tags are present
             let has_clone_tag = stored_event.tags.iter().any(|t| {
-                t.kind() == TagKind::Custom("clone".into())
-                    && t.content().map(|c| c.contains(&http_url)).unwrap_or(false)
+                t.kind() == "clone" && t.content().map(|c| c.contains(&http_url)).unwrap_or(false)
             });
 
-            let has_relays_tag = stored_event.tags.iter().any(|t| {
-                t.kind() == TagKind::Custom("relays".into()) && t.content() == Some(&relay_url)
-            });
+            let has_relays_tag = stored_event
+                .tags
+                .iter()
+                .any(|t| t.kind() == "relays" && t.content() == Some(&relay_url));
 
             if !has_clone_tag {
                 return Err(format!(
@@ -279,18 +279,12 @@ impl EventAcceptancePolicyTests {
             let event = client
                 .event_builder(Kind::GitRepoAnnouncement, "")
                 .tag(Tag::identifier(&repo_id))
+                .tag(Tag::custom("name", vec!["Test Repo No Clone"]))
                 .tag(Tag::custom(
-                    TagKind::Custom("name".into()),
-                    vec!["Test Repo No Clone"],
-                ))
-                .tag(Tag::custom(
-                    TagKind::Custom("clone".into()),
+                    "clone",
                     vec!["https://github.com/user/repo.git"],
                 )) // NOT this service
-                .tag(Tag::custom(
-                    TagKind::Custom("relays".into()),
-                    vec![relay_url.clone()],
-                )) // Correct relay
+                .tag(Tag::custom("relays", vec![relay_url.clone()])) // Correct relay
                 .build(client.keys())
                 .map_err(|e| format!("Failed to build event: {}", e))?;
 
@@ -360,22 +354,16 @@ impl EventAcceptancePolicyTests {
             let event = client
                 .event_builder(Kind::GitRepoAnnouncement, "")
                 .tag(Tag::identifier(&repo_id))
+                .tag(Tag::custom("name", vec!["Test Repo No Relays"]))
                 .tag(Tag::custom(
-                    TagKind::custom("name"),
-                    vec!["Test Repo No Relays"],
-                ))
-                .tag(Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!(
                         "{}/{}/test-repo.git",
                         http_url,
                         client.public_key()
                     )],
                 )) // Correct clone
-                .tag(Tag::custom(
-                    TagKind::custom("relays"),
-                    vec!["wss://relay.damus.io"],
-                )) // NOT this service
+                .tag(Tag::custom("relays", vec!["wss://relay.damus.io"])) // NOT this service
                 .build(client.keys())
                 .map_err(|e| format!("Failed to build event: {}", e))?;
 
@@ -454,7 +442,7 @@ impl EventAcceptancePolicyTests {
             let repo_id = recursive_state
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in recursive maintainer state")?
                 .to_string();
@@ -479,12 +467,12 @@ impl EventAcceptancePolicyTests {
                 )
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("name"),
+                    "name",
                     vec![format!("{} (recursive maintainer view)", repo_id)],
                 ))
                 // Clone points to another server, NOT the GRASP server
                 .tag(Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!(
                         "https://another-grasp-server.com/{}/{}.git",
                         recursive_maintainer_npub, repo_id
@@ -492,7 +480,7 @@ impl EventAcceptancePolicyTests {
                 ))
                 // Relays also points elsewhere (not this server)
                 .tag(Tag::custom(
-                    TagKind::custom("relays"),
+                    "relays",
                     vec!["wss://relay.damus.io"],
                 ))
                 .build(client.recursive_maintainer_keys())
@@ -661,10 +649,10 @@ impl EventAcceptancePolicyTests {
             // Create comment with `A` tag (root reference to repo)
             let tags = vec![
                 Tag::custom(
-                    TagKind::custom("A"),
+                    "A",
                     vec![a_tag_value.clone(), "".to_string(), "root".to_string()],
                 ),
-                Tag::custom(TagKind::custom("K"), vec!["30617".to_string()]),
+                Tag::custom("K", vec!["30617".to_string()]),
                 Tag::public_key(repo.pubkey),
             ];
 
@@ -715,7 +703,7 @@ impl EventAcceptancePolicyTests {
             let a_tag_value = format!("30617:{}:{}", repo.pubkey, repo_id);
 
             // Create kind 1 note with `q` tag (quote reference to repo)
-            let tags = vec![Tag::custom(TagKind::custom("q"), vec![a_tag_value])];
+            let tags = vec![Tag::custom("q", vec![a_tag_value])];
 
             let note = client
                 .event_builder(Kind::TextNote, "Mentioning this repo")
@@ -766,8 +754,7 @@ impl EventAcceptancePolicyTests {
             let repo_b = Self::create_test_repo(client, "repo-b").await?;
 
             // Create Issue B that quotes accepted Issue A via 'q' tag (should make it accepted)
-            let additional_tags =
-                vec![Tag::custom(TagKind::custom("q"), vec![issue_a.id.to_hex()])];
+            let additional_tags = vec![Tag::custom("q", vec![issue_a.id.to_hex()])];
 
             let issue_b = client
                 .create_issue(&repo_b, "Issue B", "issue content", additional_tags)
@@ -853,7 +840,7 @@ impl EventAcceptancePolicyTests {
 
             let kind1_a = client
                 .event_builder(Kind::TextNote, "Note A about repo")
-                .tags(vec![Tag::custom(TagKind::custom("q"), vec![a_tag_value])])
+                .tags(vec![Tag::custom("q", vec![a_tag_value])])
                 .build(client.keys())
                 .map_err(|e| format!("Failed to build kind1 A: {}", e))?;
 
@@ -938,19 +925,16 @@ impl EventAcceptancePolicyTests {
             let issue_tags = vec![
                 // Reference to accepted repo
                 Tag::custom(
-                    TagKind::custom("a"),
+                    "a",
                     vec![format!(
                         "30617:{}:{}",
                         repo.pubkey,
                         Self::extract_d_tag(&repo).unwrap()
                     )],
                 ),
-                Tag::custom(
-                    TagKind::custom("subject"),
-                    vec!["Issue referencing kind1".to_string()],
-                ),
+                Tag::custom("subject", vec!["Issue referencing kind1".to_string()]),
                 // Quote the Kind 1 that hasn't been sent yet
-                Tag::custom(TagKind::custom("q"), vec![kind1_note.id.to_hex()]),
+                Tag::custom("q", vec![kind1_note.id.to_hex()]),
             ];
 
             let issue = client
@@ -1003,14 +987,14 @@ impl EventAcceptancePolicyTests {
             let comment_b_tags = vec![
                 // NIP-22 tags for the original issue
                 Tag::custom(
-                    TagKind::custom("E"),
+                    "E",
                     vec![issue.id.to_hex(), "".to_string(), "root".to_string()],
                 ),
                 Tag::event(issue.id),
-                Tag::custom(TagKind::custom("K"), vec![issue.kind.as_u16().to_string()]),
+                Tag::custom("K", vec![issue.kind.as_u16().to_string()]),
                 Tag::public_key(issue.pubkey),
                 // Quote Comment A which hasn't been sent yet
-                Tag::custom(TagKind::custom("q"), vec![comment_a.id.to_hex()]),
+                Tag::custom("q", vec![comment_a.id.to_hex()]),
             ];
 
             let comment_b = client
@@ -1077,8 +1061,8 @@ impl EventAcceptancePolicyTests {
             let kind1_b = client
                 .event_builder(Kind::TextNote, "Note B mentioning Note A")
                 .tags(vec![
-                    Tag::custom(TagKind::custom("q"), vec![a_tag_value]), // Quote repo (accepted)
-                    Tag::event(kind1_a.id),                               // Mention unsent Kind 1 A
+                    Tag::custom("q", vec![a_tag_value]), // Quote repo (accepted)
+                    Tag::event(kind1_a.id),              // Mention unsent Kind 1 A
                 ])
                 .build(client.keys())
                 .map_err(|e| format!("Failed to build kind1 B: {}", e))?;
@@ -1188,11 +1172,8 @@ impl EventAcceptancePolicyTests {
 
             // Create comment that references ONLY repo B (unaccepted)
             let tags = vec![
-                Tag::custom(
-                    TagKind::custom("A"),
-                    vec![repo_b_a_tag, "".to_string(), "root".to_string()],
-                ),
-                Tag::custom(TagKind::custom("K"), vec!["30617".to_string()]),
+                Tag::custom("A", vec![repo_b_a_tag, "".to_string(), "root".to_string()]),
+                Tag::custom("K", vec!["30617".to_string()]),
                 Tag::public_key(repo_b.pubkey),
             ];
 

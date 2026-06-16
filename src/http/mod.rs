@@ -17,9 +17,9 @@ use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
-use nostr_relay_builder::LocalRelay;
 use nostr::hashes::sha1::Hash as Sha1Hash;
 use nostr::hashes::{Hash, HashEngine};
+use nostr_relay_builder::LocalRelay;
 use nostr_sdk::prelude::PublicKey;
 use tokio::net::TcpListener;
 

@@ -753,7 +753,7 @@ pub mod mock {
                 // Create minimal repo data with just clone URLs
                 // In real tests, you'd set up proper announcements
                 use crate::nostr::events::RepositoryAnnouncement;
-                use nostr_sdk::{EventBuilder, Keys, Kind};
+                use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind};
 
                 let keys = Keys::generate();
                 let mut announcements = Vec::new();

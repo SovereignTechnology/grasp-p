@@ -61,7 +61,6 @@ fn duplicate(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyR
     WritePolicyResult::ok_msg(MachineReadablePrefix::Duplicate, message)
 }
 
-
 /// NIP-34 Write Policy with Full GRASP-01 Event Validation
 ///
 /// Validates all events according to GRASP-01 specification using modular sub-policies:

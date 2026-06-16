@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use nostr_relay_builder::builder::WritePolicyResult;
-use nostr_relay_builder::prelude::MachineReadablePrefix;
 /// State Policy - State event validation + ref alignment
 ///
 /// Handles validation of NIP-34 repository state events (kind 30618)
 /// and aligns git refs with authorized state according to GRASP-01.
 use nostr_relay_builder::prelude::Event;
+use nostr_relay_builder::prelude::MachineReadablePrefix;
 
 use super::PolicyContext;
 use crate::git;

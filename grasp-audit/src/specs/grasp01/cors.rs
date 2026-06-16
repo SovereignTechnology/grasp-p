@@ -265,7 +265,7 @@ impl CorsTests {
         let repo_id = match repo
             .tags
             .iter()
-            .find(|t| t.kind() == TagKind::d())
+            .find(|t| t.kind() == "d")
             .and_then(|t| t.content())
         {
             Some(id) => id.to_string(),

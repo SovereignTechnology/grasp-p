@@ -102,7 +102,7 @@ impl PurgatoryTests {
             let repo_id = repo
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in repo announcement")?
                 .to_string();
@@ -168,7 +168,7 @@ impl PurgatoryTests {
             let repo_id = state_event
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in state event")?
                 .to_string();
@@ -242,7 +242,7 @@ impl PurgatoryTests {
             let repo_id = repo
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in repo announcement")?
                 .to_string();
@@ -323,7 +323,7 @@ impl PurgatoryTests {
             let repo_id = repo
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in repo announcement")?
                 .to_string();
@@ -332,11 +332,11 @@ impl PurgatoryTests {
                 .event_builder(Kind::RepoState, "")
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("refs/heads/main"),
+                    "refs/heads/main",
                     vec!["abc123".to_string()],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("HEAD"),
+                    "HEAD",
                     vec!["ref: refs/heads/main".to_string()],
                 ))
                 .build(client.keys())
@@ -417,7 +417,7 @@ impl PurgatoryTests {
             let repo_id = existing_state
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in state event")?
                 .to_string();
@@ -428,11 +428,11 @@ impl PurgatoryTests {
                 .event_builder(Kind::RepoState, "")
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("refs/heads/main"),
+                    "refs/heads/main",
                     vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("HEAD"),
+                    "HEAD",
                     vec!["ref: refs/heads/main".to_string()],
                 ))
                 .build(client.keys())
@@ -682,7 +682,7 @@ impl PurgatoryTests {
             let repo_id = existing_state
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in state event")?
                 .to_string();
@@ -716,11 +716,11 @@ impl PurgatoryTests {
                 .event_builder(Kind::RepoState, "")
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("refs/heads/main"),
+                    "refs/heads/main",
                     vec![unique_commit.clone()],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("HEAD"),
+                    "HEAD",
                     vec!["ref: refs/heads/main".to_string()],
                 ))
                 .build(client.keys())
@@ -744,7 +744,7 @@ impl PurgatoryTests {
             let deletion = client
                 .event_builder(Kind::EventDeletion, "")
                 .tag(Tag::event(state_event.id))
-                .tag(Tag::custom(TagKind::custom("k"), vec!["30618"]))
+                .tag(Tag::custom("k", vec!["30618"]))
                 .build(client.keys())
                 .map_err(|e| { cleanup(); format!("Failed to build deletion event: {}", e) })?;
 
@@ -811,7 +811,7 @@ impl PurgatoryTests {
             let repo_id = existing_state
                 .tags
                 .iter()
-                .find(|t| t.kind() == TagKind::d())
+                .find(|t| t.kind() == "d")
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in state event")?
                 .to_string();
@@ -839,15 +839,15 @@ impl PurgatoryTests {
                 .event_builder(Kind::GitRepoAnnouncement, "")
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!("{}/{}/{}.git", http_url, npub, repo_id)],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("relays"),
+                    "relays",
                     vec![relay_url.clone()],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("maintainers"),
+                    "maintainers",
                     vec![new_maintainer_hex.clone()],
                 ))
                 .build(client.keys())
@@ -883,11 +883,11 @@ impl PurgatoryTests {
                 .event_builder(Kind::RepoState, "")
                 .tag(Tag::identifier(&repo_id))
                 .tag(Tag::custom(
-                    TagKind::custom("refs/heads/main"),
+                    "refs/heads/main",
                     vec![unique_commit.clone()],
                 ))
                 .tag(Tag::custom(
-                    TagKind::custom("HEAD"),
+                    "HEAD",
                     vec!["ref: refs/heads/main".to_string()],
                 ))
                 .build(&new_maintainer_keys)
@@ -913,8 +913,8 @@ impl PurgatoryTests {
 
             let deletion = client
                 .event_builder(Kind::EventDeletion, "")
-                .tag(Tag::custom(TagKind::custom("a"), vec![coord]))
-                .tag(Tag::custom(TagKind::custom("k"), vec!["30618"]))
+                .tag(Tag::custom("a", vec![coord]))
+                .tag(Tag::custom("k", vec!["30618"]))
                 .build(&new_maintainer_keys)
                 .map_err(|e| { cleanup(); format!("Failed to build deletion event: {}", e) })?;
 

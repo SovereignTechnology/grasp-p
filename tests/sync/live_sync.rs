@@ -238,7 +238,9 @@ async fn test_live_sync_layer3_events() {
     let mut has_correct_ref = false;
     if comment_synced {
         let temp_keys = Keys::generate();
-        let client = Client::new(temp_keys);
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(temp_keys))
+            .build();
         if client.add_relay(relay_b.url()).await.is_ok() {
             client.connect().await;
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -246,7 +248,8 @@ async fn test_live_sync_layer3_events() {
             let fetch_filter = Filter::new().kind(Kind::Comment).id(comment_id);
 
             if let Ok(events) = client
-                .fetch_events(fetch_filter, Duration::from_secs(2))
+                .fetch_events(fetch_filter)
+                .timeout(Duration::from_secs(2))
                 .await
             {
                 if let Some(event) = events.first() {
@@ -376,7 +379,9 @@ async fn test_live_sync_event_ordering() {
 
     // 6. Fetch all events from relay_b
     let temp_keys = Keys::generate();
-    let client = Client::new(temp_keys);
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(temp_keys))
+        .build();
 
     let events_found: Vec<Event>;
     if client.add_relay(relay_b.url()).await.is_ok() {
@@ -385,7 +390,11 @@ async fn test_live_sync_event_ordering() {
 
         let filter = Filter::new().kind(Kind::GitIssue).author(keys.public_key());
 
-        match client.fetch_events(filter, Duration::from_secs(3)).await {
+        match client
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(3))
+            .await
+        {
             Ok(events) => {
                 events_found = events.into_iter().collect();
             }

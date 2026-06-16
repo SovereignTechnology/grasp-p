@@ -347,7 +347,7 @@ pub fn diagnose_state_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     fn create_test_state_event(identifier: &str, refs: Vec<(&str, &str)>) -> Event {
         let keys = Keys::generate();

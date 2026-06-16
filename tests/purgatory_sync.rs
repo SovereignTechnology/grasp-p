@@ -62,7 +62,9 @@ async fn test_push_triggers_unified_processing() {
     // 3. Create and send announcement
     let announcement = create_repo_announcement(&keys, &[&relay.domain()], identifier);
 
-    let client = Client::new(keys.clone());
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     client
         .add_relay(relay.url())
         .await
@@ -163,7 +165,9 @@ async fn test_state_event_syncs_from_remote() {
         identifier,
     );
 
-    let source_client = Client::new(keys.clone());
+    let source_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     source_client
         .add_relay(source_relay.url())
         .await
@@ -327,7 +331,9 @@ async fn test_pr_event_syncs_from_remote() {
         identifier,
     );
 
-    let source_client = Client::new(owner_keys.clone());
+    let source_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(owner_keys.clone()))
+        .build();
     source_client
         .add_relay(source_relay.url())
         .await
@@ -404,7 +410,9 @@ async fn test_pr_event_syncs_from_remote() {
     let pr_event_id = pr_event.id;
 
     // Send PR event to source relay using PR author's client
-    let pr_client = Client::new(pr_author_keys.clone());
+    let pr_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(pr_author_keys.clone()))
+        .build();
     pr_client
         .add_relay(source_relay.url())
         .await
@@ -540,7 +548,9 @@ async fn test_concurrent_state_and_pr_sync() {
         identifier,
     );
 
-    let source_client = Client::new(owner_keys.clone());
+    let source_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(owner_keys.clone()))
+        .build();
     source_client
         .add_relay(source_relay.url())
         .await
@@ -620,7 +630,9 @@ async fn test_concurrent_state_and_pr_sync() {
     let pr_event_id = pr_event.id;
 
     // Send PR event to source relay using PR author's client
-    let pr_client = Client::new(pr_author_keys.clone());
+    let pr_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(pr_author_keys.clone()))
+        .build();
     pr_client
         .add_relay(source_relay.url())
         .await
@@ -852,18 +864,18 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
     // Create announcement with custom clone/relay URLs
     // Clone URLs: source_grasp + syncing (NOT git_server - PR commit only via PR's clone tag)
     // Relay URLs: source_grasp + mock_relay + syncing
-    let announcement = nostr_sdk::EventBuilder::new(
+    let announcement = nostr_sdk::prelude::EventBuilder::new(
         Kind::GitRepoAnnouncement,
         "Repository for PR clone tag + partial OID test",
     )
     .tags(vec![
-        nostr_sdk::Tag::identifier(identifier),
-        nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::custom("clone"),
+        nostr_sdk::prelude::Tag::identifier(identifier),
+        nostr_sdk::prelude::Tag::custom(
+            "clone",
             vec![clone_url_source.clone(), clone_url_syncing.clone()],
         ),
-        nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::custom("relays"),
+        nostr_sdk::prelude::Tag::custom(
+            "relays",
             vec![
                 source_grasp.url().to_string(),
                 mock_relay.url().to_string(),
@@ -871,11 +883,13 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
             ],
         ),
     ])
-    .sign_with_keys(&owner_keys)
+    .finalize(&owner_keys)
     .expect("Failed to sign announcement");
 
     // Connect to source_grasp and send announcement
-    let source_client = Client::new(owner_keys.clone());
+    let source_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(owner_keys.clone()))
+        .build();
     source_client
         .add_relay(source_grasp.url())
         .await
@@ -929,7 +943,9 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
     // First, send announcement to mock_relay so it has the repo context
     // This is needed because the sync system filters events based on whether
     // they reference repos that list our relay
-    let mock_client = Client::new(owner_keys.clone());
+    let mock_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(owner_keys.clone()))
+        .build();
     mock_client
         .add_relay(mock_relay.url())
         .await
@@ -960,7 +976,9 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
 
     // Send PR event to mock_relay
     // MockRelay accepts all events without validation (no purgatory)
-    let pr_client = Client::new(pr_author_keys.clone());
+    let pr_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(pr_author_keys.clone()))
+        .build();
     pr_client
         .add_relay(mock_relay.url())
         .await

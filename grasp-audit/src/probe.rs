@@ -324,18 +324,9 @@ pub async fn run_probe(
             config.clone(),
         )
         .tag(Tag::identifier(&repo_id))
-        .tag(Tag::custom(
-            TagKind::custom("name"),
-            vec!["GRASP Probe Repository"],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("clone"),
-            vec![clone_url.clone()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("relays"),
-            vec![relay_url.to_string()],
-        ))
+        .tag(Tag::custom("name", vec!["GRASP Probe Repository"]))
+        .tag(Tag::custom("clone", vec![clone_url.clone()]))
+        .tag(Tag::custom("relays", vec![relay_url.to_string()]))
         .build(&keys);
 
         announcement_event_opt = ann_result.ok();
@@ -343,12 +334,9 @@ pub async fn run_probe(
         let state_result = if let Some(ref ch) = commit_hash {
             crate::audit::AuditEventBuilder::new(Kind::RepoState, "", config.clone())
                 .tag(Tag::identifier(&repo_id))
+                .tag(Tag::custom("refs/heads/main", vec![ch.clone()]))
                 .tag(Tag::custom(
-                    TagKind::custom("refs/heads/main"),
-                    vec![ch.clone()],
-                ))
-                .tag(Tag::custom(
-                    TagKind::custom("HEAD"),
+                    "HEAD",
                     vec!["ref: refs/heads/main".to_string()],
                 ))
                 .build(&keys)
@@ -819,10 +807,7 @@ pub async fn run_probe(
 
                 if let Some(ref state_ev) = state_event_opt {
                     for tag in state_ev.tags.iter() {
-                        let kind_str = match tag.kind() {
-                            TagKind::Custom(ref s) => s.clone(),
-                            _ => continue,
-                        };
+                        let kind_str = tag.kind().to_string();
                         // Only check refs/heads/* and refs/tags/*, skip HEAD and refs/nostr/*
                         if !kind_str.starts_with("refs/heads/")
                             && !kind_str.starts_with("refs/tags/")
@@ -886,8 +871,8 @@ pub async fn run_probe(
         let filter = Filter::new().kind(Kind::GitRepoAnnouncement).limit(1);
         let existing = client
             .client()
-            .fetch_events(
-                filter,
+            .fetch_events(filter)
+            .timeout(
                 deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(5)),
@@ -905,7 +890,7 @@ pub async fn run_probe(
                     let ann_id = ev
                         .tags
                         .iter()
-                        .find(|t| t.kind() == TagKind::d())
+                        .find(|t| t.kind() == "d")
                         .and_then(|t| t.content())
                         .unwrap_or("unknown")
                         .to_string();
@@ -947,7 +932,7 @@ pub async fn run_probe(
                 let ann_id = ev
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::d())
+                    .find(|t| t.kind() == "d")
                     .and_then(|t| t.content())
                     .unwrap_or("unknown")
                     .to_string();
@@ -956,7 +941,7 @@ pub async fn run_probe(
                 let fetch_url = ev
                     .tags
                     .iter()
-                    .find(|t| t.kind() == TagKind::custom("clone"))
+                    .find(|t| t.kind() == "clone")
                     .and_then(|t| t.content())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("{}/{}/{}.git", http_base, ann_npub, ann_id));
@@ -1054,8 +1039,8 @@ pub async fn run_probe(
                         );
                         let state_events = client
                             .client()
-                            .fetch_events(
-                                state_filter,
+                            .fetch_events(state_filter)
+                            .timeout(
                                 deadline
                                     .saturating_duration_since(Instant::now())
                                     .min(Duration::from_secs(5)),
@@ -1087,10 +1072,7 @@ pub async fn run_probe(
                             for state_ev in state_events.iter() {
                                 let ts = state_ev.created_at.as_secs();
                                 for tag in state_ev.tags.iter() {
-                                    let kind_str = match tag.kind() {
-                                        TagKind::Custom(ref s) => s.clone(),
-                                        _ => continue,
-                                    };
+                                    let kind_str = tag.kind().to_string();
                                     if !kind_str.starts_with("refs/heads/")
                                         && !kind_str.starts_with("refs/tags/")
                                     {
@@ -1101,7 +1083,7 @@ pub async fn run_probe(
                                         None => continue,
                                     };
                                     let prev_ts =
-                                        latest_ts.get(kind_str.as_ref()).copied().unwrap_or(0);
+                                        latest_ts.get(kind_str.as_str()).copied().unwrap_or(0);
                                     if ts >= prev_ts {
                                         expected.insert(kind_str.to_string(), hash);
                                         latest_ts.insert(kind_str.to_string(), ts);

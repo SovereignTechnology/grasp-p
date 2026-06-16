@@ -183,14 +183,11 @@ async fn test_metric_values_are_numeric() {
 ///
 /// Used to create Layer 2 events like patches that reference a repository.
 fn create_event_referencing_repo(keys: &Keys, repo_coord: &str, kind: u16, content: &str) -> Event {
-    let tags = vec![Tag::custom(
-        TagKind::custom("a"),
-        vec![repo_coord.to_string()],
-    )];
+    let tags = vec![Tag::custom("a", vec![repo_coord.to_string()])];
 
     EventBuilder::new(Kind::from_u16(kind), content)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .expect("Failed to sign event")
 }
 

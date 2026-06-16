@@ -8,7 +8,7 @@
 //!
 //! # nostr-sdk 0.43 API Notes
 //! - Use field access: `event.id`, `event.tags`, `event.tags.iter()`
-//! - Use `Tag::custom(TagKind::custom("name"), vec![...])` syntax
+//! - Use `Tag::custom("name", vec![...])` syntax
 //! - Use `EventBuilder::new(kind, content).tags(tags)` syntax
 
 use nostr_sdk::prelude::*;
@@ -193,50 +193,41 @@ pub fn create_state_event(
 ) -> Result<Event, String> {
     let mut event_tags = vec![
         // d-tag (identifier)
-        Tag::custom(TagKind::d(), vec![identifier.to_string()]),
+        Tag::custom("d", vec![identifier.to_string()]),
     ];
 
     // Add clone URLs
     if !clone_urls.is_empty() {
         let urls: Vec<String> = clone_urls.iter().map(|s| s.to_string()).collect();
-        event_tags.push(Tag::custom(TagKind::Clone, urls));
+        event_tags.push(Tag::custom("clone", urls));
     }
 
     // Add relay URLs
     if !relay_urls.is_empty() {
         let urls: Vec<String> = relay_urls.iter().map(|s| s.to_string()).collect();
-        event_tags.push(Tag::custom(TagKind::Relays, urls));
+        event_tags.push(Tag::custom("relays", urls));
     }
 
     // Add branch refs (refs/heads/*)
     for (name, commit) in branches {
         let ref_name = format!("refs/heads/{}", name);
-        event_tags.push(Tag::custom(
-            TagKind::Custom(ref_name.into()),
-            vec![commit.to_string()],
-        ));
+        event_tags.push(Tag::custom(ref_name, vec![commit.to_string()]));
     }
 
     // Add tag refs (refs/tags/*)
     for (name, commit) in tags {
         let ref_name = format!("refs/tags/{}", name);
-        event_tags.push(Tag::custom(
-            TagKind::Custom(ref_name.into()),
-            vec![commit.to_string()],
-        ));
+        event_tags.push(Tag::custom(ref_name, vec![commit.to_string()]));
     }
 
     // Add HEAD pointing to main (if main exists)
     if branches.iter().any(|(name, _)| *name == "main") {
-        event_tags.push(Tag::custom(
-            TagKind::Custom("HEAD".into()),
-            vec!["refs/heads/main".to_string()],
-        ));
+        event_tags.push(Tag::custom("HEAD", vec!["refs/heads/main".to_string()]));
     }
 
     EventBuilder::new(Kind::RepoState, "")
         .tags(event_tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign state event: {}", e))
 }
 
@@ -262,14 +253,14 @@ pub fn create_pr_event(
 ) -> Result<Event, String> {
     let tags = vec![
         // a-tag referencing the repository
-        Tag::custom(TagKind::custom("a"), vec![repo_coord.to_string()]),
+        Tag::custom("a", vec![repo_coord.to_string()]),
         // c-tag with the commit hash
-        Tag::custom(TagKind::custom("c"), vec![commit_hash.to_string()]),
+        Tag::custom("c", vec![commit_hash.to_string()]),
     ];
 
     EventBuilder::new(Kind::GitPullRequest, title)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign PR event: {}", e))
 }
 
@@ -310,20 +301,20 @@ pub fn create_pr_event_with_clone(
 ) -> Result<Event, String> {
     let mut tags = vec![
         // a-tag referencing the repository
-        Tag::custom(TagKind::custom("a"), vec![repo_coord.to_string()]),
+        Tag::custom("a", vec![repo_coord.to_string()]),
         // c-tag with the commit hash
-        Tag::custom(TagKind::custom("c"), vec![commit_hash.to_string()]),
+        Tag::custom("c", vec![commit_hash.to_string()]),
     ];
 
     // Add clone URLs if provided
     if !clone_urls.is_empty() {
         let urls: Vec<String> = clone_urls.iter().map(|s| s.to_string()).collect();
-        tags.push(Tag::custom(TagKind::Clone, urls));
+        tags.push(Tag::custom("clone", urls));
     }
 
     EventBuilder::new(Kind::GitPullRequest, title)
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign PR event: {}", e))
 }
 
@@ -362,17 +353,17 @@ pub fn create_announcement_event(
 
     if !clone_urls.is_empty() {
         let urls: Vec<String> = clone_urls.iter().map(|s| s.to_string()).collect();
-        tags.push(Tag::custom(TagKind::custom("clone"), urls));
+        tags.push(Tag::custom("clone", urls));
     }
 
     if !relay_urls.is_empty() {
         let urls: Vec<String> = relay_urls.iter().map(|s| s.to_string()).collect();
-        tags.push(Tag::custom(TagKind::custom("relays"), urls));
+        tags.push(Tag::custom("relays", urls));
     }
 
     EventBuilder::new(Kind::GitRepoAnnouncement, "")
         .tags(tags)
-        .sign_with_keys(keys)
+        .finalize(keys)
         .map_err(|e| format!("Failed to sign announcement event: {}", e))
 }
 
@@ -395,7 +386,9 @@ pub async fn wait_for_event_served(
     timeout: Duration,
 ) -> Result<Event, String> {
     let temp_keys = Keys::generate();
-    let client = Client::new(temp_keys);
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(temp_keys))
+        .build();
 
     client
         .add_relay(relay_url)
@@ -409,7 +402,7 @@ pub async fn wait_for_event_served(
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let relays = client.relays().await;
-        if relays.values().any(|r| r.is_connected()) {
+        if relays.values().any(|r| r.status().is_connected()) {
             connected = true;
             break;
         }
@@ -428,7 +421,11 @@ pub async fn wait_for_event_served(
     while start.elapsed() < timeout {
         let filter = Filter::new().id(*event_id);
 
-        match client.fetch_events(filter, Duration::from_secs(2)).await {
+        match client
+            .fetch_events(filter)
+            .timeout(Duration::from_secs(2))
+            .await
+        {
             Ok(events) => {
                 if let Some(event) = events.into_iter().next() {
                     client.disconnect().await;
@@ -470,7 +467,9 @@ pub async fn verify_event_not_served(
     check_duration: Duration,
 ) -> Result<(), String> {
     let temp_keys = Keys::generate();
-    let client = Client::new(temp_keys);
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(temp_keys))
+        .build();
 
     client
         .add_relay(relay_url)
@@ -484,7 +483,7 @@ pub async fn verify_event_not_served(
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let relays = client.relays().await;
-        if relays.values().any(|r| r.is_connected()) {
+        if relays.values().any(|r| r.status().is_connected()) {
             connected = true;
             break;
         }
@@ -498,7 +497,7 @@ pub async fn verify_event_not_served(
     // Check that event is NOT served
     let filter = Filter::new().id(*event_id);
 
-    match client.fetch_events(filter, check_duration).await {
+    match client.fetch_events(filter).timeout(check_duration).await {
         Ok(events) => {
             client.disconnect().await;
             if events.is_empty() {

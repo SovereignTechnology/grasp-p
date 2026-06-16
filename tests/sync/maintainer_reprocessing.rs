@@ -62,7 +62,7 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
             .tags(vec![
                 Tag::identifier(identifier),
                 Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!(
                         "http://{}/{}/{}.git",
                         relay_a.domain(),
@@ -70,9 +70,9 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
                         identifier
                     )],
                 ),
-                Tag::custom(TagKind::custom("relays"), vec![relay_a.url().to_string()]),
+                Tag::custom("relays", vec![relay_a.url().to_string()]),
             ])
-            .sign_with_keys(&maintainer_keys)
+            .finalize(&maintainer_keys)
             .unwrap();
     send_to_relay(&relay_a, &maintainer_announcement)
         .await
@@ -104,7 +104,7 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
         .tags(vec![
             Tag::identifier(identifier),
             Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!(
                     "http://{}/{}/{}.git",
                     relay_b.domain(),
@@ -113,15 +113,12 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
                 )],
             ),
             Tag::custom(
-                TagKind::custom("relays"),
+                "relays",
                 vec![relay_a.url().to_string(), relay_b.url().to_string()],
             ),
-            Tag::custom(
-                TagKind::custom("maintainers"),
-                vec![maintainer_keys.public_key().to_hex()],
-            ),
+            Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
         ])
-        .sign_with_keys(&owner_keys)
+        .finalize(&owner_keys)
         .unwrap();
 
     send_to_relay(&relay_b, &owner_announcement).await.unwrap();
@@ -208,15 +205,12 @@ async fn test_maintainer_announcement_cold_index_prevents_refetch() {
             .tags(vec![
                 Tag::identifier(identifier),
                 Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!("https://example.com/{}.git", identifier)],
                 ),
-                Tag::custom(
-                    TagKind::custom("relays"),
-                    vec!["wss://example.com".to_string()],
-                ),
+                Tag::custom("relays", vec!["wss://example.com".to_string()]),
             ])
-            .sign_with_keys(&maintainer_keys)
+            .finalize(&maintainer_keys)
             .unwrap();
 
     // Send maintainer announcement - expect it to be rejected
@@ -232,16 +226,13 @@ async fn test_maintainer_announcement_cold_index_prevents_refetch() {
         .tags(vec![
             Tag::identifier(identifier),
             Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!("https://{}/{}.git", relay.domain(), identifier)],
             ),
-            Tag::custom(TagKind::custom("relays"), vec![relay.url().to_string()]),
-            Tag::custom(
-                TagKind::custom("maintainers"),
-                vec![maintainer_keys.public_key().to_hex()],
-            ),
+            Tag::custom("relays", vec![relay.url().to_string()]),
+            Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
         ])
-        .sign_with_keys(&owner_keys)
+        .finalize(&owner_keys)
         .unwrap();
 
     client.send_event(&owner_announcement).await.unwrap();
@@ -324,7 +315,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
         .tags(vec![
             Tag::identifier(identifier.as_str()),
             Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!(
                     "http://{}/{}/{}.git",
                     relay_a.domain(),
@@ -332,9 +323,9 @@ async fn test_multiple_maintainers_all_reprocessed() {
                     identifier
                 )],
             ),
-            Tag::custom(TagKind::custom("relays"), vec![relay_a.url().to_string()]),
+            Tag::custom("relays", vec![relay_a.url().to_string()]),
         ])
-        .sign_with_keys(maintainer_keys)
+        .finalize(*maintainer_keys)
         .unwrap();
         send_to_relay(&relay_a, &announcement).await.unwrap();
         // Use push_unique_git_data_to_relay so each maintainer gets a distinct commit
@@ -395,7 +386,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
         .tags(vec![
             Tag::identifier(identifier),
             Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!(
                     "http://{}/{}/{}.git",
                     relay_b.domain(),
@@ -404,11 +395,11 @@ async fn test_multiple_maintainers_all_reprocessed() {
                 )],
             ),
             Tag::custom(
-                TagKind::custom("relays"),
+                "relays",
                 vec![relay_a.url().to_string(), relay_b.url().to_string()],
             ),
             Tag::custom(
-                TagKind::custom("maintainers"),
+                "maintainers",
                 vec![
                     maintainer1_keys.public_key().to_hex(),
                     maintainer2_keys.public_key().to_hex(),
@@ -416,7 +407,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
                 ],
             ),
         ])
-        .sign_with_keys(&owner_keys)
+        .finalize(&owner_keys)
         .unwrap();
 
     send_to_relay(&relay_b, &owner_announcement).await.unwrap();
@@ -482,15 +473,12 @@ async fn test_invalid_maintainer_pubkey_handled_gracefully() {
             .tags(vec![
                 Tag::identifier(identifier),
                 Tag::custom(
-                    TagKind::custom("clone"),
+                    "clone",
                     vec![format!("https://example.com/{}.git", identifier)],
                 ),
-                Tag::custom(
-                    TagKind::custom("relays"),
-                    vec!["wss://example.com".to_string()],
-                ),
+                Tag::custom("relays", vec!["wss://example.com".to_string()]),
             ])
-            .sign_with_keys(&maintainer_keys)
+            .finalize(&maintainer_keys)
             .unwrap();
 
     // Send maintainer announcement - expect it to be rejected
@@ -509,7 +497,7 @@ async fn test_invalid_maintainer_pubkey_handled_gracefully() {
         .tags(vec![
             Tag::identifier(identifier),
             Tag::custom(
-                TagKind::custom("clone"),
+                "clone",
                 vec![format!(
                     "http://{}/{}/{}.git",
                     relay.domain(),
@@ -517,13 +505,10 @@ async fn test_invalid_maintainer_pubkey_handled_gracefully() {
                     identifier
                 )],
             ),
-            Tag::custom(TagKind::custom("relays"), vec![relay.url().to_string()]),
-            Tag::custom(
-                TagKind::custom("maintainers"),
-                vec!["invalid-hex-not-a-pubkey".to_string()],
-            ),
+            Tag::custom("relays", vec![relay.url().to_string()]),
+            Tag::custom("maintainers", vec!["invalid-hex-not-a-pubkey".to_string()]),
         ])
-        .sign_with_keys(&owner_keys)
+        .finalize(&owner_keys)
         .unwrap();
 
     send_to_relay(&relay, &owner_announcement).await.unwrap();

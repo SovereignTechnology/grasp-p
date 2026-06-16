@@ -77,11 +77,7 @@ impl RepositoryAnnouncement {
             .collect();
 
         // return error if mutliple clone tags (incorrect formatting)
-        let clone_tag_count = event
-            .tags
-            .iter()
-            .filter(|t| t.kind() == "clone")
-            .count();
+        let clone_tag_count = event.tags.iter().filter(|t| t.kind() == "clone").count();
 
         if clone_tag_count > 1 {
             return Err(anyhow::anyhow!("multiple clone tags found. correct format is single clone tag with multiple values"));
@@ -514,7 +510,7 @@ pub fn validate_state(event: &Event) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{EventBuilder, Keys};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 
     fn create_test_keys() -> Keys {
         Keys::generate()
@@ -528,10 +524,7 @@ mod tests {
     ) -> Event {
         use nostr_sdk::prelude::Tag;
 
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec![identifier.to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         // NIP-34: Single clone tag with multiple values
         if !clone_urls.is_empty() {
@@ -543,10 +536,7 @@ mod tests {
 
         // NIP-34: Single relays tag with multiple values
         if !relays.is_empty() {
-            tags.push(Tag::custom(
-                "relays",
-                relays.iter().map(|s| s.to_string()),
-            ));
+            tags.push(Tag::custom("relays", relays.iter().map(|s| s.to_string())));
         }
 
         EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
@@ -558,10 +548,7 @@ mod tests {
     fn create_state_event(keys: &Keys, identifier: &str, branches: Vec<(&str, &str)>) -> Event {
         use nostr_sdk::prelude::Tag;
 
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec![identifier.to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
 
         for (branch, commit) in branches {
             tags.push(Tag::custom(
@@ -751,10 +738,7 @@ mod tests {
                 "clone",
                 vec!["https://gitnostr.com/alice/test-repo.git".to_string()],
             ),
-            Tag::custom(
-                "relays",
-                vec!["wss://gitnostr.com".to_string()],
-            ),
+            Tag::custom("relays", vec!["wss://gitnostr.com".to_string()]),
         ];
 
         // Add maintainer using NIP-34 "maintainers" tag format
@@ -782,16 +766,10 @@ mod tests {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
-        tags.push(Tag::custom(
-            "refs/heads/main",
-            vec!["a1b2c3d4".to_string()],
-        ));
+        tags.push(Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]));
 
         // Add tag
         tags.push(Tag::custom(
@@ -816,10 +794,7 @@ mod tests {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
         tags.push(Tag::custom(
@@ -849,10 +824,7 @@ mod tests {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch
         tags.push(Tag::custom(
@@ -861,10 +833,7 @@ mod tests {
         ));
 
         // Add HEAD without "ref: " prefix (also valid)
-        tags.push(Tag::custom(
-            "HEAD",
-            vec!["refs/heads/develop".to_string()],
-        ));
+        tags.push(Tag::custom("HEAD", vec!["refs/heads/develop".to_string()]));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)
@@ -884,10 +853,7 @@ mod tests {
         let keys = create_test_keys();
         let tags = vec![
             Tag::custom("d", vec!["test-repo".to_string()]),
-            Tag::custom(
-                "refs/heads/main",
-                vec!["a1b2c3d4".to_string()],
-            ),
+            Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]),
         ];
 
         let event = EventBuilder::new(Kind::RepoState, "")
@@ -906,22 +872,13 @@ mod tests {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
-        let mut tags = vec![Tag::custom(
-            "d",
-            vec!["test-repo".to_string()],
-        )];
+        let mut tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
 
         // Add branch for "main"
-        tags.push(Tag::custom(
-            "refs/heads/main",
-            vec!["a1b2c3d4".to_string()],
-        ));
+        tags.push(Tag::custom("refs/heads/main", vec!["a1b2c3d4".to_string()]));
 
         // HEAD points to "develop" which doesn't exist in branches
-        tags.push(Tag::custom(
-            "HEAD",
-            vec!["refs/heads/develop".to_string()],
-        ));
+        tags.push(Tag::custom("HEAD", vec!["refs/heads/develop".to_string()]));
 
         let event = EventBuilder::new(Kind::RepoState, "")
             .tags(tags)

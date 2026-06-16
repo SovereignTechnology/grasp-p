@@ -297,10 +297,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_context() -> PolicyContext {
-        let db = Arc::new(MemoryDatabase::with_opts(MemoryDatabaseOptions {
-            events: true,
-            max_events: None,
-        }));
+        let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
         let config = crate::config::Config::for_testing();
         PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
@@ -310,10 +307,7 @@ mod tests {
         EventBuilder::new(Kind::GitRepoAnnouncement, "")
             .tags(vec![
                 Tag::identifier(identifier),
-                Tag::custom(
-                    "clone",
-                    vec!["https://example.com/repo.git"],
-                ),
+                Tag::custom("clone", vec!["https://example.com/repo.git"]),
             ])
             .finalize(keys)
             .unwrap()

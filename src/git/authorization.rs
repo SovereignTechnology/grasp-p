@@ -1403,7 +1403,7 @@ fn describe_known_event_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     fn create_test_keys() -> Keys {
         Keys::generate()
@@ -1419,10 +1419,7 @@ mod tests {
                 .iter()
                 .map(|k| k.public_key().to_hex())
                 .collect();
-            tags.push(Tag::custom(
-                "maintainers",
-                maintainer_pubkeys,
-            ));
+            tags.push(Tag::custom("maintainers", maintainer_pubkeys));
         }
 
         // Add clone and relay tags for validity
@@ -1430,10 +1427,7 @@ mod tests {
             "clone",
             vec!["https://example.com/test.git".to_string()],
         ));
-        tags.push(Tag::custom(
-            "relays",
-            vec!["wss://example.com".to_string()],
-        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
 
         EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
             .tags(tags)

@@ -12,7 +12,7 @@
 //! `start_on_reservation_*` constructors — the listener stays bound for
 //! the duration of the reservation, eliminating the same-process race.
 
-use nostr_sdk::ToBech32;
+use nostr_sdk::prelude::ToBech32;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -306,7 +306,7 @@ impl TestRelay {
             .join("ngit-grasp");
 
         // Generate a test owner npub (using a random keypair)
-        let test_keys = nostr_sdk::Keys::generate();
+        let test_keys = nostr_sdk::prelude::Keys::generate();
         let test_npub = test_keys
             .public_key()
             .to_bech32()

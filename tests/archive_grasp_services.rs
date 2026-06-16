@@ -67,7 +67,7 @@ async fn start_relay_with_grasp_services(services: &str) -> (Child, String, Path
         .join("ngit-grasp");
 
     // Generate a test owner npub
-    let test_keys = nostr_sdk::Keys::generate();
+    let test_keys = nostr_sdk::prelude::Keys::generate();
     let test_npub = test_keys
         .public_key()
         .to_bech32()
@@ -145,22 +145,21 @@ async fn test_archive_accepts_matching_grasp_service() {
     let tags = vec![
         Tag::identifier(identifier),
         Tag::custom(
-            TagKind::custom("clone"),
+            "clone",
             vec![format!("https://git.example.com/user/{}.git", identifier)],
         ),
-        Tag::custom(
-            TagKind::custom("relays"),
-            vec!["wss://relay.example.com".to_string()],
-        ),
+        Tag::custom("relays", vec!["wss://relay.example.com".to_string()]),
     ];
 
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags)
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .expect("Failed to sign announcement");
 
     // Send announcement to relay
-    let client = Client::new(keys.clone());
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     client.add_relay(&url).await.expect("Failed to add relay");
     client.connect().await;
 
@@ -205,22 +204,21 @@ async fn test_archive_rejects_non_matching_grasp_service() {
     let tags = vec![
         Tag::identifier(identifier),
         Tag::custom(
-            TagKind::custom("clone"),
+            "clone",
             vec![format!("https://github.com/user/{}.git", identifier)],
         ),
-        Tag::custom(
-            TagKind::custom("relays"),
-            vec!["wss://relay.example.com".to_string()],
-        ),
+        Tag::custom("relays", vec!["wss://relay.example.com".to_string()]),
     ];
 
     let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags)
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .expect("Failed to sign announcement");
 
     // Send announcement to relay
-    let client = Client::new(keys.clone());
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     client.add_relay(&url).await.expect("Failed to add relay");
     client.connect().await;
 
@@ -268,21 +266,20 @@ async fn test_archive_multiple_grasp_services() {
     let tags1 = vec![
         Tag::identifier(identifier1),
         Tag::custom(
-            TagKind::custom("clone"),
+            "clone",
             vec![format!("https://git.example.com/user/{}.git", identifier1)],
         ),
-        Tag::custom(
-            TagKind::custom("relays"),
-            vec!["wss://relay.example.com".to_string()],
-        ),
+        Tag::custom("relays", vec!["wss://relay.example.com".to_string()]),
     ];
 
     let announcement1 = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags1)
-        .sign_with_keys(&keys1)
+        .finalize(&keys1)
         .expect("Failed to sign announcement");
 
-    let client1 = Client::new(keys1.clone());
+    let client1 = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys1.clone()))
+        .build();
     client1.add_relay(&url).await.expect("Failed to add relay");
     client1.connect().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -301,24 +298,23 @@ async fn test_archive_multiple_grasp_services() {
     let tags2 = vec![
         Tag::identifier(identifier2),
         Tag::custom(
-            TagKind::custom("clone"),
+            "clone",
             vec![format!(
                 "https://gitlab.example.org/user/{}.git",
                 identifier2
             )],
         ),
-        Tag::custom(
-            TagKind::custom("relays"),
-            vec!["wss://relay.example.com".to_string()],
-        ),
+        Tag::custom("relays", vec!["wss://relay.example.com".to_string()]),
     ];
 
     let announcement2 = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags2)
-        .sign_with_keys(&keys2)
+        .finalize(&keys2)
         .expect("Failed to sign announcement");
 
-    let client2 = Client::new(keys2.clone());
+    let client2 = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys2.clone()))
+        .build();
     client2.add_relay(&url).await.expect("Failed to add relay");
     client2.connect().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -337,21 +333,20 @@ async fn test_archive_multiple_grasp_services() {
     let tags3 = vec![
         Tag::identifier(identifier3),
         Tag::custom(
-            TagKind::custom("clone"),
+            "clone",
             vec![format!("https://github.com/user/{}.git", identifier3)],
         ),
-        Tag::custom(
-            TagKind::custom("relays"),
-            vec!["wss://relay.example.com".to_string()],
-        ),
+        Tag::custom("relays", vec!["wss://relay.example.com".to_string()]),
     ];
 
     let announcement3 = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
         .tags(tags3)
-        .sign_with_keys(&keys3)
+        .finalize(&keys3)
         .expect("Failed to sign announcement");
 
-    let client3 = Client::new(keys3.clone());
+    let client3 = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys3.clone()))
+        .build();
     client3.add_relay(&url).await.expect("Failed to add relay");
     client3.connect().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -429,7 +424,9 @@ async fn test_archive_read_only_creates_bare_repo() {
         identifier,
     );
 
-    let source_client = Client::new(keys.clone());
+    let source_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
     source_client
         .add_relay(source_relay.url())
         .await
