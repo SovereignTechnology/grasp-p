@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Change to script's directory to ensure cargo finds grasp-audit/Cargo.toml
-# This allows the script to be run from any directory
+# Change to script's directory so `cargo run`/`cargo test` select the
+# grasp-audit package within the workspace (cargo resolves the workspace
+# root automatically). This allows the script to be run from any directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 

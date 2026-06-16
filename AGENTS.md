@@ -4,12 +4,30 @@ This file provides guidance to agents when working with code in this repository.
 
 ## Project Structure
 
-**Workspace with Two Rust Projects:**
+**Single Cargo Workspace with Two Crates:**
 
 - Root: `ngit-grasp` (main GRASP relay implementation)
-- `grasp-audit/`: Separate subproject with own `Cargo.toml` and `flake.nix`
+- `grasp-audit/`: Audit/compliance tool crate, a member of the same workspace
 
-Cannot build grasp-audit from root - must `cd grasp-audit` first.
+Both crates share **one** `Cargo.lock`, **one** `flake.nix`, and **one** `target/`
+directory at the repo root. There is no separate lockfile or flake inside
+`grasp-audit/`. You can build either crate from anywhere in the workspace; cargo
+resolves the workspace root automatically.
+
+```bash
+# Build everything
+nix develop -c cargo build
+
+# Build / test just the audit crate (from the repo root)
+nix develop -c cargo build -p grasp-audit
+nix develop -c cargo test  -p grasp-audit
+```
+
+> grasp-audit has no dependency on ngit-grasp; the coupling is one-directional
+> (ngit-grasp's dev-dependencies use grasp-audit). It is co-located only because
+> the audit suite's release cadence is currently driven by ngit-grasp features.
+> It is structured to be split into its own crate/repo if an external consumer
+> ever starts driving its roadmap. Do **not** publish to crates.io yet.
 
 ## Build & Test
 
@@ -17,11 +35,16 @@ Cannot build grasp-audit from root - must `cd grasp-audit` first.
 
 **CRITICAL:** Use `nix develop`, NOT `nix-shell` (we use flake.nix, not shell.nix)
 
+The single root flake exposes both packages and one dev shell:
+
 ```bash
-# ✅ Correct
-cd grasp-audit
+# ✅ Correct (one dev shell for the whole workspace)
 nix develop -c cargo build
-nix develop -c cargo test
+nix develop -c cargo build -p grasp-audit
+
+# Build either crate as a Nix package
+nix build .#ngit-grasp
+nix build .#grasp-audit
 
 # ❌ Wrong
 nix-shell
@@ -72,7 +95,7 @@ async fn test_something() {
 | --------------------------- | ---------------------------------------------------------------------- |
 | ngit-grasp (this project)   | `cargo test` from project root                                         |
 | ngit-relay (reference impl) | `cd grasp-audit && nix develop -c bash test-ngit-relay.sh --mode test` |
-| grasp-audit unit tests      | `cd grasp-audit && nix develop -c cargo test --lib`                    |
+| grasp-audit unit tests      | `nix develop -c cargo test -p grasp-audit --lib`                       |
 
 ### Running Single Test
 
@@ -80,8 +103,8 @@ async fn test_something() {
 # ngit-grasp test (from project root)
 cargo test --test nip01_compliance test_websocket_connection -- --nocapture
 
-# grasp-audit test (from grasp-audit/)
-nix develop -c cargo test --lib specific_test_name -- --nocapture
+# grasp-audit test (from anywhere in the workspace)
+nix develop -c cargo test -p grasp-audit --lib specific_test_name -- --nocapture
 ```
 
 ### Troubleshooting
@@ -264,7 +287,7 @@ This was a key learning from GRASP-01: docs described plans, not implementation,
 
 ## Critical Gotchas
 
-1. **Workspace compilation:** Can't `cargo build` from root for grasp-audit
+1. **Single workspace:** One `Cargo.lock` and one `flake.nix` at the root cover both crates. Build the audit crate with `cargo build -p grasp-audit` (no `cd` needed).
 2. **Nix environment:** Must use `nix develop`, not `nix-shell`
 3. **nostr-sdk API:** Fields not methods in 0.43
 4. **Test isolation:** Integration tests use `TestRelay` (ngit-grasp) or `test-ngit-relay.sh` (ngit-relay)
@@ -289,10 +312,10 @@ Code mode can only edit files matching specific patterns (enforced by system):
 cargo test
 
 # Build grasp-audit
-cd grasp-audit && nix develop -c cargo build
+nix develop -c cargo build -p grasp-audit
 
 # Run grasp-audit unit tests
-cd grasp-audit && nix develop -c cargo test --lib
+nix develop -c cargo test -p grasp-audit --lib
 
 # Check session files
 ls work/  # Should only have README.md when clean

@@ -1,9 +1,8 @@
 # AI assistant context
 .ai/
 
-# Rust build artifacts
+# Rust build artifacts (single workspace target at repo root)
 target/
-grasp-audit/target
 
 # Working directory (session-specific temporary files)
 work/*

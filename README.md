@@ -582,19 +582,14 @@ nix develop -c cargo test --test nip01_compliance test_nip01_smoke
 **2. GRASP Audit Tool (grasp-audit)**
 
 The audit tool tests GRASP compliance of any relay (including ours or external ones).
+It is a member of the same workspace, so run it with `-p grasp-audit` from anywhere.
 
 ```bash
-# Enter grasp-audit directory
-cd grasp-audit
-
 # Run unit tests
-nix develop -c cargo test
+nix develop -c cargo test -p grasp-audit
 
 # Test against any relay (including external ones)
-nix develop -c cargo run -- --url wss://relay.example.com
-
-# Or test against any external relay:
-nix develop -c cargo run -- --url wss://relay.example.com
+nix develop -c cargo run -p grasp-audit -- --url wss://relay.example.com
 ```
 
 ### Development Commands
@@ -670,7 +665,7 @@ ngit-grasp/
 │   ├── tutorials/           # Getting started, first steps
 │   └── reference/           # API docs, test strategy
 ├── tests/                   # Integration tests (NIP-01, NIP-34, purgatory)
-├── grasp-audit/             # Compliance audit subproject
+├── grasp-audit/             # Compliance audit crate (workspace member)
 └── README.md
 ```
 
