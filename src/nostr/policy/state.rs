@@ -8,9 +8,8 @@ use nostr_relay_builder::builder::WritePolicyResult;
 /// Handles validation of NIP-34 repository state events (kind 30618)
 /// and aligns git refs with authorized state according to GRASP-01.
 use nostr_relay_builder::prelude::Event;
-use nostr_relay_builder::prelude::MachineReadablePrefix;
 
-use super::PolicyContext;
+use super::{accepted_purgatory, duplicate, reject_invalid, reject_restricted, PolicyContext};
 use crate::git;
 use crate::git::authorization::fetch_repository_data_with_purgatory;
 use crate::nostr::events::{validate_state, RepositoryAnnouncement, RepositoryState};
@@ -71,11 +70,7 @@ impl StatePolicy {
                 "processed state event duplicate (already in purgatory): {}",
                 event.id,
             );
-            return Ok(WritePolicyResult::Reject {
-                status: true,
-                prefix: MachineReadablePrefix::Duplicate,
-                message: "duplicate: in purgatory".into(),
-            });
+            return Ok(duplicate("in purgatory"));
         }
 
         // Get all repositories and state events from db with identifier
@@ -105,11 +100,7 @@ impl StatePolicy {
                     "Rejecting state event: no announcement exists for this repository"
                 );
             }
-            return Ok(WritePolicyResult::Reject {
-                status: false,
-                prefix: MachineReadablePrefix::Invalid,
-                message: "invalid: no announcement exists for this repository".into(),
-            });
+            return Ok(reject_invalid("no announcement exists for this repository"));
         }
 
         let authorized_owners = crate::git::authorization::pubkey_authorised_for_repo_owners(
@@ -135,11 +126,7 @@ impl StatePolicy {
                     "Rejecting state event: author not in maintainer set of any announcement"
                 );
             }
-            return Ok(WritePolicyResult::Reject {
-                status: false,
-                prefix: MachineReadablePrefix::Restricted,
-                message: "invalid: author not authorized for this repository".into(),
-            });
+            return Ok(reject_restricted("author not authorized for this repository"));
         }
 
         tracing::debug!(
@@ -185,11 +172,7 @@ impl StatePolicy {
         // Duplicate check in db
         if db_repo_data.states.iter().any(|e| e.event.id.eq(&event.id)) {
             tracing::debug!("processed state event duplicate (in db): {}", event.id);
-            return Ok(WritePolicyResult::Reject {
-                status: true,
-                prefix: MachineReadablePrefix::Duplicate,
-                message: "duplicate".into(),
-            });
+            return Ok(duplicate("already have this event"));
         }
 
         // Check if git data is available
@@ -277,11 +260,9 @@ impl StatePolicy {
                     identifier = %state.identifier,
                     "State event previously expired from purgatory (synced), rejecting to prevent re-sync loop"
                 );
-                return Ok(WritePolicyResult::Reject {
-                    status: false,
-                    prefix: MachineReadablePrefix::Invalid,
-                    message: "invalid: previously expired from purgatory without git data".into(),
-                });
+                return Ok(reject_invalid(
+                    "previously expired from purgatory without git data",
+                ));
             }
 
             // If no git data - add to purgatory
@@ -298,11 +279,7 @@ impl StatePolicy {
                 state.event.id,
                 state.identifier,
             );
-            Ok(WritePolicyResult::Reject {
-                status: true,
-                prefix: MachineReadablePrefix::Duplicate,
-                message: "purgatory: won't be served until git data arrives".into(),
-            })
+            Ok(accepted_purgatory("won't be served until git data arrives"))
         }
     }
 }

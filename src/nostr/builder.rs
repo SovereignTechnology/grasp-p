@@ -15,51 +15,13 @@ use nostr_relay_builder::prelude::*;
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::policy::{
+    accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
     ReferenceResult, RelatedEventPolicy, StatePolicy, StateResult,
 };
 
 /// Type alias for the shared database used by the relay
 pub type SharedDatabase = Arc<dyn NostrDatabase>;
-
-/// Build a rejection carrying the `invalid:` NIP-01 machine-readable prefix.
-///
-/// Use for client-fault rejections: malformed/unparseable events, failed
-/// validation, bad refs, accepted-deletion-request, etc.
-fn reject_invalid(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyResult {
-    WritePolicyResult::reject(MachineReadablePrefix::Invalid, message)
-}
-
-/// Build a rejection carrying the `error:` NIP-01 machine-readable prefix.
-///
-/// Use for server-fault rejections: database/git failures and other internal
-/// errors where the client is not at fault.
-fn reject_error(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyResult {
-    WritePolicyResult::reject(MachineReadablePrefix::Error, message)
-}
-
-/// Build a rejection carrying the `restricted:` NIP-01 machine-readable prefix.
-///
-/// Use for authorization-style rejections, e.g. an event that does not
-/// reference an accepted repository or accepted event.
-fn reject_restricted(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyResult {
-    WritePolicyResult::reject(MachineReadablePrefix::Restricted, message)
-}
-
-/// Build an "accepted but not yet served" response (`status: true`) for events
-/// parked in purgatory while awaiting their git data.
-///
-/// Uses the `duplicate:` prefix as the closest standard machine-readable hint
-/// that the client should treat the submission as successfully received and
-/// not retry immediately.
-fn accepted_purgatory(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyResult {
-    WritePolicyResult::ok_msg(MachineReadablePrefix::Duplicate, message)
-}
-
-/// Build a "duplicate, already have it" response (`status: true`).
-fn duplicate(message: impl Into<std::borrow::Cow<'static, str>>) -> WritePolicyResult {
-    WritePolicyResult::ok_msg(MachineReadablePrefix::Duplicate, message)
-}
 
 /// NIP-34 Write Policy with Full GRASP-01 Event Validation
 ///
@@ -258,7 +220,7 @@ impl Nip34WritePolicy {
                             event_id_str
                         );
 
-                        accepted_purgatory("purgatory: won't be served until git data arrives")
+                        accepted_purgatory("won't be served until git data arrives")
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -353,11 +315,7 @@ impl Nip34WritePolicy {
                             npub
                         );
                         // reject if processing failed
-                        WritePolicyResult::Reject {
-                            status: false,
-                            prefix: MachineReadablePrefix::Error,
-                            message: format!("error: {e}").into(),
-                        }
+                        reject_error(format!("{e}"))
                     }
                 }
             }
@@ -402,19 +360,19 @@ impl Nip34WritePolicy {
                 "processed PR event duplicate (already in purgatory): {}",
                 event.id,
             );
-            return duplicate("duplicate: in purgatory");
+            return duplicate("in purgatory");
         }
 
         // duplicate check in db
         match &self.ctx.database.check_id(&event.id).await {
             Ok(DatabaseEventStatus::Saved) => {
-                return duplicate("duplicate");
+                return duplicate("already have this event");
             }
             Ok(DatabaseEventStatus::Deleted) => {
-                return reject_invalid("invalid: accepted deletion request for this event");
+                return reject_invalid("accepted deletion request for this event");
             }
             Err(e) => {
-                return reject_error(format!("error: internal error: {e}"));
+                return reject_error(format!("internal error: {e}"));
             }
             _ => {} // continue
         }
@@ -455,7 +413,7 @@ impl Nip34WritePolicy {
                         "PR event previously expired from purgatory (synced), rejecting to prevent re-sync loop"
                     );
                     return reject_invalid(
-                        "invalid: previously expired from purgatory without git data",
+                        "previously expired from purgatory without git data",
                     );
                 }
 
@@ -487,15 +445,10 @@ impl Nip34WritePolicy {
                     is_synced,
                 );
 
-                WritePolicyResult::Reject {
-                    status: true, // Client sees OK
-                    prefix: MachineReadablePrefix::Duplicate,
-                    message: format!(
-                        "purgatory: PR event stored, waiting for git push with commit {}",
-                        commit
-                    )
-                    .into(),
-                }
+                accepted_purgatory(format!(
+                    "PR event stored, waiting for git push with commit {}",
+                    commit
+                ))
             }
             Ok(true) => {
                 // Git data exists - proceed with normal validation
