@@ -6,6 +6,72 @@ This document describes the planned architecture for NIP-09 deletion request sup
 
 ---
 
+## Implemented: ngit-grasp owns NIP-09 / NIP-62 handling
+
+> The rest of this document is the **planned** design for further work
+> (holding database, cascade, archival, recovery, disrespector mode). It is
+> still aspirational. What follows in this section is what is **actually built
+> today** and is the foundation that work builds on.
+
+Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
+*automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
+`process_nip09 = true`, `process_nip62 = true`). The backend silently removed
+deleted/vanished events from the main DB and blocked their re-submission via the
+relay-builder `check_id` gate, which consulted the backend's internal
+`deleted-ids` / `deleted-coordinates` / `vanished-public-keys` LMDB tables.
+
+We disable that automatic processing
+([`src/nostr/builder.rs`](../../src/nostr/builder.rs) sets
+`process_nip09(false)` and `process_nip62(false)` on both the main database and
+the tombstone database) and implement NIP-09 / NIP-62 in ngit-grasp itself,
+bypassing the backend so we can apply our own customisations in the future. The
+observable behaviour is unchanged; only the implementation moved. There is no
+cascade, holding DB, archival, recovery, or disrespector yet — those remain
+planned (see below).
+
+**Components added:**
+
+- **Tombstone store** ([`src/nostr/tombstones.rs`](../../src/nostr/tombstones.rs)):
+  a dedicated, persistent nostr database (a separate `NostrLmdb` at
+  `<relay_data_path>/tombstones`, or `MemoryDatabase` for the memory backend)
+  that stores the kind-5 deletion requests and kind-62 vanish requests
+  themselves. Deleted/vanished state is *derived* by querying it:
+  - kind-5 with an `e` tag → that event id is deleted,
+  - kind-5 with an `a` tag → that coordinate is deleted up to the kind-5's
+    `created_at`,
+  - kind-62 by pubkey `P` → pubkey `P` is vanished.
+  Because the requests are stored in a real database, the deleted/vanished state
+  survives restarts exactly as the backend's internal tables did.
+
+- **Deletion gate** (`Nip34WritePolicy::deletion_gate` in
+  [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): runs at the top of
+  `admit_event` and reproduces the now-silent library `check_id == Deleted`
+  rejection — it rejects re-submission of a deleted event id, a deleted
+  coordinate, or any event from a vanished pubkey, by consulting the tombstone
+  store.
+
+- **NIP-09 handler** ([`src/nostr/policy/deletion.rs`](../../src/nostr/policy/deletion.rs)):
+  in addition to the existing purgatory eviction (and bare-repo deletion), it now
+  validates author ownership, hard-deletes the targeted events from the main
+  database via `NostrDatabase::delete(filter)`, and records the deletion in the
+  tombstone store. An `e`-tag delete targeting an event owned by a different
+  author is rejected (matching the backend's `InvalidDelete`).
+
+- **NIP-62 handler** (`Nip34WritePolicy::handle_vanish` in
+  [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): for a vanish request
+  targeting this relay (or `ALL_RELAYS`), records the vanish tombstone,
+  hard-deletes the author's events from the main DB, and evicts the author's
+  purgatory entries (deleting their bare repos).
+
+**Why store the requests rather than a bespoke tombstone table?** The
+`NostrDatabase` trait does not expose the backend's internal deletion tables, so
+we cannot read or write them. Persisting the request events in our own database
+gives us durable, queryable deletion/vanish state for free and is the natural
+foundation for the later cascade/recovery work (recovery = remove the
+tombstone; cascade = walk the references of a recorded deletion).
+
+---
+
 ## Overview
 
 ngit-grasp will implement optional support for NIP-09 deletion requests, allowing repository owners to remove their repositories from the relay while providing safeguards against the "left-pad problem" through configurable archival behavior.
@@ -480,7 +546,7 @@ When implementation is complete, the following documentation will be updated:
 
 **Phase 6: Analysis & Edge Cases** 🔄 (Planned)
 - Background cleanup timing strategy (daily doesn't work with 3-second test retention)
-- rust-nostr deletion behavior investigation (does relay builder auto-process deletions?)
+- ~~rust-nostr deletion behavior investigation (does relay builder auto-process deletions?)~~ ✅ **Resolved:** the LMDB backend auto-processes NIP-09/NIP-62 when `process_nip09`/`process_nip62` are `true` (the defaults); ngit-grasp now runs with both `false` and implements the handling itself (see the "Implemented" section above).
 - Author validation enforcement and testing
 - Max depth edge case analysis
 - Large-scale testing

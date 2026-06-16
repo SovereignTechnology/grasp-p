@@ -29,6 +29,7 @@ use super::SharedDatabase;
 #[cfg(test)]
 use crate::grasp06::receive::new_repo_init_locks;
 use crate::grasp06::receive::RepoInitLocks;
+use crate::nostr::tombstones::Tombstones;
 use crate::purgatory::Purgatory;
 use nostr_relay_builder::LocalRelay;
 use std::sync::Arc;
@@ -38,6 +39,14 @@ use std::sync::Arc;
 pub struct PolicyContext {
     pub domain: String,
     pub database: SharedDatabase,
+    /// Persistent record of NIP-09 deletions and NIP-62 vanish requests.
+    ///
+    /// Since the LMDB backend no longer auto-processes NIP-09/NIP-62
+    /// (`process_nip09(false)` / `process_nip62(false)`), ngit-grasp owns the
+    /// deletion/vanish bookkeeping. This store persists deletion/vanish requests
+    /// so re-submission of a deleted event (or an event from a vanished pubkey)
+    /// is still rejected, surviving restarts.
+    pub tombstones: Tombstones,
     pub git_data_path: std::path::PathBuf,
     pub purgatory: Arc<Purgatory>,
     /// Local relay for notifying WebSocket subscribers (set after relay creation)
@@ -54,6 +63,7 @@ impl PolicyContext {
     pub fn new(
         domain: impl Into<String>,
         database: SharedDatabase,
+        tombstones: Tombstones,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: Arc<Purgatory>,
         config: crate::config::Config,
@@ -62,6 +72,7 @@ impl PolicyContext {
         Self {
             domain: domain.into(),
             database,
+            tombstones,
             git_data_path: git_data_path.into(),
             purgatory,
             local_relay: Arc::new(std::sync::RwLock::new(None)),
@@ -84,6 +95,7 @@ impl PolicyContext {
         Self::new(
             domain,
             database,
+            Tombstones::in_memory(),
             git_data_path,
             purgatory,
             config,

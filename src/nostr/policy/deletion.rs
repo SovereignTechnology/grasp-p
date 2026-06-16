@@ -16,9 +16,25 @@
 /// - Kind 30617 (announcement) in purgatory: entry removed, bare repo deleted from disk
 /// - Kind 30618 (state event) in purgatory: matching state event(s) removed by event ID
 ///   or by (author, identifier) coordinate
-use nostr_relay_builder::prelude::{Event, WritePolicyResult};
+/// ## Main-database interaction
+///
+/// Because the relay now runs the LMDB backend with `process_nip09(false)`,
+/// ngit-grasp owns NIP-09 entirely. In addition to evicting purgatory entries,
+/// the handler:
+/// - hard-deletes the targeted events from the main database (the backend used
+///   to do this for us), and
+/// - records the deletion request in the persistent [`Tombstones`] store so
+///   re-submission of the deleted event/coordinate stays rejected across
+///   restarts (the resubmission gate in `builder.rs` consults this store).
+///
+/// Author ownership is enforced before any main-DB deletion or tombstone
+/// recording: only the original author may delete their event.
+use nostr_relay_builder::prelude::{
+    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, WritePolicyResult,
+};
 
 use super::PolicyContext;
+use crate::nostr::policy::reject_invalid;
 
 /// Policy for handling NIP-09 event deletion requests
 #[derive(Clone)]
@@ -33,19 +49,144 @@ impl DeletionPolicy {
 
     /// Process a kind 5 (EventDeletion) event.
     ///
-    /// Checks whether the deletion request targets any purgatory announcements
-    /// and removes them if so. The deletion event itself is always accepted
-    /// (relays should store deletion requests per NIP-09).
+    /// Removes any targeted purgatory entries, hard-deletes targeted events from
+    /// the main database, and records the deletion in the persistent tombstone
+    /// store so the deletion survives restarts and re-submission is blocked.
     ///
-    /// Only the event author can delete their own events — this is enforced by
-    /// checking that the purgatory entry's owner matches `event.pubkey`.
+    /// The deletion event itself is accepted (and therefore stored) per NIP-09 —
+    /// unless it is an *invalid* delete (it references an event owned by a
+    /// different author), in which case it is rejected, matching the LMDB
+    /// backend's historical `InvalidDelete` behaviour.
+    ///
+    /// Only the event author can delete their own events. Authorship is checked
+    /// per-target: `e`-tag targets must be authored by the deleter, and `a`-tag
+    /// coordinates must carry the deleter's pubkey.
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
-        // Process purgatory removals synchronously (no async needed)
+        // Validate authorship of all targets first. If any `e`-tag target exists
+        // in the main DB and is owned by someone else, the whole deletion is
+        // invalid (mirrors the backend's `handle_deletion_event` returning
+        // `invalid`). `a`-tag author mismatches are simply ignored (the
+        // coordinate pubkey is part of the tag, so a mismatch is a no-op rather
+        // than an attack signal).
+        for id in Self::e_tag_ids(event) {
+            match self.ctx.database.event_by_id(&id).await {
+                Ok(Some(target)) if target.pubkey != event.pubkey => {
+                    tracing::warn!(
+                        deleter = %event.pubkey.to_hex(),
+                        target_author = %target.pubkey.to_hex(),
+                        target_id = %id.to_hex(),
+                        "Rejected invalid NIP-09 deletion: target authored by another pubkey"
+                    );
+                    return reject_invalid("cannot delete event authored by another pubkey");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Database lookup failed during deletion validation");
+                    return super::reject_error(format!("internal error: {e}"));
+                }
+            }
+        }
+
+        // Process purgatory removals (synchronous, in-memory).
         self.remove_purgatory_targets(event);
 
-        // Always accept the deletion event itself so it is stored and
-        // can prevent re-acceptance of the deleted event in the future.
+        // Hard-delete targeted events from the main database.
+        self.delete_main_db_targets(event).await;
+
+        // Record the deletion so future re-submission is rejected.
+        if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
+            tracing::error!(error = %e, "Failed to record deletion tombstone");
+            return super::reject_error(format!("internal error recording deletion: {e}"));
+        }
+
+        // Accept the deletion event itself so it is stored.
         WritePolicyResult::Accept
+    }
+
+    /// Extract all event-id (`e` tag) targets from a deletion event.
+    fn e_tag_ids(event: &Event) -> Vec<EventId> {
+        event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let v = tag.as_slice();
+                if v.len() >= 2 && v[0] == "e" {
+                    EventId::from_hex(&v[1]).ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Hard-delete the targeted events from the main database.
+    ///
+    /// Handles both `e`-tag (by event id) and `a`-tag (by coordinate) targets.
+    /// Authorship for `e`-tag targets was validated in [`handle`]; `a`-tag
+    /// coordinates carry their own pubkey which is matched against the deleter.
+    async fn delete_main_db_targets(&self, event: &Event) {
+        // `e` tags: delete by event id.
+        let ids = Self::e_tag_ids(event);
+        if !ids.is_empty() {
+            let filter = Filter::new().ids(ids);
+            if let Err(e) = self.ctx.database.delete(filter).await {
+                tracing::warn!(error = %e, "Failed to delete events by id during NIP-09 deletion");
+            }
+        }
+
+        // `a` tags: delete matching addressable/replaceable events up to the
+        // deletion's created_at.
+        for tag in event.tags.iter() {
+            let v = tag.as_slice();
+            if v.len() < 2 || v[0] != "a" {
+                continue;
+            }
+            self.delete_coordinate_from_main_db(&event.pubkey, &v[1], event.created_at)
+                .await;
+        }
+    }
+
+    /// Delete events matching an `a`-tag coordinate from the main database.
+    async fn delete_coordinate_from_main_db(
+        &self,
+        author: &PublicKey,
+        coordinate: &str,
+        deletion_created_at: nostr_relay_builder::prelude::Timestamp,
+    ) {
+        // coordinate: `<kind>:<pubkey>:<d-identifier>`
+        let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return;
+        }
+        let Ok(kind_num) = parts[0].parse::<u16>() else {
+            return;
+        };
+        let coord_pubkey_hex = parts[1];
+        let identifier = parts[2];
+
+        // The coordinate pubkey must match the deletion author.
+        if coord_pubkey_hex != author.to_hex() {
+            return;
+        }
+
+        let kind = Kind::from(kind_num);
+        let mut filter = Filter::new().kind(kind).author(*author);
+        if kind.is_addressable() {
+            filter = filter.custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                identifier.to_string(),
+            );
+        }
+        // Per NIP-09, only versions up to the deletion's created_at are deleted.
+        filter = filter.until(deletion_created_at);
+
+        if let Err(e) = self.ctx.database.delete(filter).await {
+            tracing::warn!(
+                error = %e,
+                coordinate = %coordinate,
+                "Failed to delete events by coordinate during NIP-09 deletion"
+            );
+        }
     }
 
     /// Remove any purgatory entries targeted by this deletion event.
