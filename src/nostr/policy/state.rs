@@ -126,7 +126,9 @@ impl StatePolicy {
                     "Rejecting state event: author not in maintainer set of any announcement"
                 );
             }
-            return Ok(reject_restricted("author not authorized for this repository"));
+            return Ok(reject_restricted(
+                "author not authorized for this repository",
+            ));
         }
 
         tracing::debug!(

@@ -353,11 +353,11 @@ async fn run_daily_timer(
     sync_manager: Arc<Mutex<SyncManager>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    use ::rand::Rng;
+    use ::rand::RngExt;
 
     loop {
         // Random interval between 23-25 hours
-        let hours = 23.0 + ::rand::thread_rng().gen::<f64>() * 2.0;
+        let hours = 23.0 + ::rand::rng().random::<f64>() * 2.0;
         let seconds = (hours * 3600.0) as u64;
 
         tracing::info!(

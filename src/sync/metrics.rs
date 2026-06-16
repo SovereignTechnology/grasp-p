@@ -527,7 +527,7 @@ impl SyncMetrics {
 
             // Update detailed info (occurrence count)
             self.naughty_relay_info
-                .with_label_values(&[&url, entry.category.as_str(), &entry.reason])
+                .with_label_values(&[url.as_str(), entry.category.as_str(), entry.reason.as_str()])
                 .set(entry.occurrence_count as i64);
         }
 

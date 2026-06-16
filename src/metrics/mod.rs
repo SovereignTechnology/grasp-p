@@ -204,9 +204,10 @@ impl Metrics {
 
     /// Record a rejected Nostr event
     pub fn record_event_rejected(&self, kind: u64, reason: &str) {
+        let kind = kind.to_string();
         self.inner
             .events_rejected_total
-            .with_label_values(&[&kind.to_string(), reason])
+            .with_label_values(&[kind.as_str(), reason])
             .inc();
     }
 

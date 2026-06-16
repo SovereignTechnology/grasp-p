@@ -409,7 +409,7 @@ impl AuditClient {
 
         for filter in filters {
             let events = self.client.fetch_events(filter).timeout(timeout).await?;
-            all_events.extend(events.into_iter());
+            all_events.extend(events);
         }
 
         Ok(all_events)

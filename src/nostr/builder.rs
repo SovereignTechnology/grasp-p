@@ -412,9 +412,7 @@ impl Nip34WritePolicy {
                         event_id = %event_id_str,
                         "PR event previously expired from purgatory (synced), rejecting to prevent re-sync loop"
                     );
-                    return reject_invalid(
-                        "previously expired from purgatory without git data",
-                    );
+                    return reject_invalid("previously expired from purgatory without git data");
                 }
 
                 // No git data exists - add to purgatory

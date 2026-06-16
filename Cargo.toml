@@ -31,15 +31,15 @@ base64 = "0.22"
 flate2 = "1.0"
 
 # Metrics
-prometheus = "0.13"
-dashmap = "5"
+prometheus = "0.14"
+dashmap = "6"
 lazy_static = "1.4"
 
 # Data structures
 indexmap = "2"
 
 # Random (for startup jitter)
-rand = "0.8"
+rand = "0.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -69,7 +69,7 @@ tempfile = "3"
 # Testing
 grasp-audit = { path = "grasp-audit" }
 tempfile = "3"
-reqwest = "0.12"
+reqwest = "0.13"
 
 [lib]
 name = "ngit_grasp"
