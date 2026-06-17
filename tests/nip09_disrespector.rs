@@ -7,14 +7,18 @@
 //! These tests deliberately assert only on observable contract, not on any
 //! internal "holding database" — the current implementation is tombstone /
 //! purgatory based, so the disrespector simply accepts the kind-5 request and
-//! does nothing with it. The three properties under test are:
+//! does nothing with it. The two properties under test are:
 //!
 //! 1. **Disrespector accepts but ignores deletion** — a kind-5 request gets an
 //!    `OK`, yet the targeted announcement remains queryable afterwards.
-//! 2. **Normal mode honours deletion** — the same flow against a default relay
-//!    removes the target.
-//! 3. **NIP-11 advertisement** — a disrespector relay omits `9` and `62` from
+//! 2. **NIP-11 advertisement** — a disrespector relay omits `9` and `62` from
 //!    `supported_nips`; a normal relay advertises both.
+//!
+//! The normal-mode baseline ("a default relay honours the deletion") lives in
+//! `nip09_validation.rs` as `normal_mode_honours_deletion`. Shared helpers
+//! (`publish_served_repo`, `announcement_served_by_coordinate`,
+//! `announcement_coordinate`, `build_deletion`) live in
+//! `tests/common/nip09_helpers.rs`.
 //!
 //! # Running
 //!
@@ -25,177 +29,12 @@
 
 mod common;
 
-use common::TestRelay;
-
-use grasp_audit::{
-    clone_repo, create_deterministic_commit, try_push, AuditClient, AuditConfig,
-    DETERMINISTIC_COMMIT_HASH,
+use common::{
+    announcement_coordinate, announcement_served_by_coordinate, build_deletion,
+    publish_served_repo, TestRelay,
 };
-use nostr_sdk::prelude::*;
-use std::path::PathBuf;
-use std::time::Duration;
 
-/// Publish a repo announcement, submit a matching state event, and push the
-/// deterministic git data so the announcement is promoted out of purgatory and
-/// becomes queryable.
-///
-/// Returns the announcement event (kind 30617) and its repo identifier.
-///
-/// This is a self-contained replica of the `PurgatoryOwnerStateDataPushed`
-/// fixture lifecycle. It is inlined here (rather than reusing the fixture)
-/// because the disrespector tests need the *announcement* event itself to
-/// target with the kind-5 deletion, whereas the fixture returns the state
-/// event.
-async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Event, String) {
-    let relay_url = client
-        .relay_url()
-        .await
-        .expect("client should have a relay");
-    let relay_domain = relay_url
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .to_string();
-    let http_url = format!("http://{}", relay_domain);
-
-    let npub = client.public_key().to_bech32().expect("pubkey to bech32");
-
-    let repo_id = format!(
-        "{}-{}",
-        test_name,
-        &Keys::generate().public_key().to_hex()[..8]
-    );
-
-    // Stage 1: announcement (enters purgatory until git data arrives)
-    let announcement = client
-        .event_builder(Kind::GitRepoAnnouncement, "")
-        .tag(Tag::identifier(&repo_id))
-        .tag(Tag::custom("name", vec![repo_id.clone()]))
-        .tag(Tag::custom(
-            "clone",
-            vec![format!("{}/{}/{}.git", http_url, npub, repo_id)],
-        ))
-        .tag(Tag::custom("relays", vec![relay_url.clone()]))
-        .build(client.keys())
-        .expect("build announcement");
-
-    client
-        .send_event(announcement.clone())
-        .await
-        .expect("relay should accept announcement");
-
-    // Stage 2: state event pointing at the deterministic commit (purgatory)
-    let state_event = client
-        .event_builder(Kind::RepoState, "")
-        .tag(Tag::identifier(&repo_id))
-        .tag(Tag::custom(
-            "refs/heads/main",
-            vec![DETERMINISTIC_COMMIT_HASH.to_string()],
-        ))
-        .tag(Tag::custom(
-            "HEAD",
-            vec!["ref: refs/heads/main".to_string()],
-        ))
-        .build(client.keys())
-        .expect("build state event");
-
-    client
-        .send_event_and_note_purgatory(state_event.clone())
-        .await
-        .expect("relay should accept state event");
-
-    // Stage 3: clone, create the deterministic commit, push — promotes the repo
-    let clone_path =
-        clone_repo(&relay_domain, &npub, &repo_id).expect("clone purgatory repo over git http");
-
-    let cleanup = |path: &PathBuf| {
-        let _ = std::fs::remove_dir_all(path);
-    };
-
-    let commit_hash = match create_deterministic_commit(&clone_path, "Initial commit") {
-        Ok(h) => h,
-        Err(e) => {
-            cleanup(&clone_path);
-            panic!("failed to create deterministic commit: {}", e);
-        }
-    };
-    assert_eq!(
-        commit_hash, DETERMINISTIC_COMMIT_HASH,
-        "deterministic commit hash mismatch"
-    );
-
-    let _ = std::process::Command::new("git")
-        .args(["branch", "main"])
-        .current_dir(&clone_path)
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(&clone_path)
-        .output();
-
-    let pushed = try_push(&clone_path);
-    cleanup(&clone_path);
-    match pushed {
-        Ok(true) => {}
-        Ok(false) => panic!("git push rejected while promoting repo out of purgatory"),
-        Err(e) => panic!("git push error while promoting repo: {}", e),
-    }
-
-    // Give the relay a moment to promote the events out of purgatory.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
-
-    (announcement, repo_id)
-}
-
-/// Query the relay for a served repo announcement using a real client's access
-/// pattern: author + kind + `d` identifier (a NIP-01 addressable-event query),
-/// rather than a by-id lookup. Returns whether the relay serves it.
-async fn announcement_served_by_coordinate(
-    client: &AuditClient,
-    announcement: &Event,
-    repo_id: &str,
-) -> bool {
-    let filter = Filter::new()
-        .kind(Kind::GitRepoAnnouncement)
-        .author(announcement.pubkey)
-        .identifier(repo_id);
-
-    client
-        .query(filter)
-        .await
-        .expect("query announcement by coordinate")
-        .iter()
-        .any(|e| e.id == announcement.id)
-}
-
-/// Build a kind-5 deletion request from the announcement's author targeting the
-/// announcement both by event id and by `a` coordinate (replaceable event).
-fn build_deletion(client: &AuditClient, announcement: &Event, repo_id: &str) -> Event {
-    let coordinate = format!(
-        "{}:{}:{}",
-        Kind::GitRepoAnnouncement.as_u16(),
-        announcement.pubkey.to_hex(),
-        repo_id
-    );
-
-    client
-        .event_builder(Kind::EventDeletion, "")
-        .tag(Tag::event(announcement.id))
-        .tag(Tag::custom("a", vec![coordinate]))
-        .tag(Tag::custom(
-            "k",
-            vec![Kind::GitRepoAnnouncement.as_u16().to_string()],
-        ))
-        .build(client.keys())
-        .expect("build deletion event")
-}
+use grasp_audit::{AuditClient, AuditConfig};
 
 /// Disrespector mode: the kind-5 deletion is accepted (OK) but ignored — the
 /// targeted announcement remains queryable.
@@ -208,7 +47,8 @@ async fn disrespector_accepts_but_ignores_deletion() {
 
     let (announcement, repo_id) = publish_served_repo(&client, "disrespector-ignores").await;
 
-    let deletion = build_deletion(&client, &announcement, &repo_id);
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[announcement.id], &[coordinate]);
     let deletion_id = deletion.id;
 
     // The relay MUST accept the deletion (archival mode still stores/acks it).
@@ -217,7 +57,7 @@ async fn disrespector_accepts_but_ignores_deletion() {
         .await
         .expect("disrespector relay should OK the kind-5 deletion");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Contract part 1: the kind-5 request itself MUST be stored/served — the
     // archival relay accepts and preserves the request rather than dropping it.
@@ -254,49 +94,6 @@ async fn disrespector_accepts_but_ignores_deletion() {
         target_served_by_coordinate,
         "disrespector relay must ignore the deletion: announcement {} should still be \
          served for an author+kind+identifier query",
-        announcement.id
-    );
-}
-
-/// Normal mode (default relay) honours the deletion: after a kind-5 request the
-/// targeted announcement is gone.
-#[tokio::test]
-async fn normal_mode_honours_deletion() {
-    let relay = TestRelay::start().await;
-    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
-        .await
-        .expect("create audit client");
-
-    let (announcement, repo_id) = publish_served_repo(&client, "normal-honours").await;
-
-    let deletion = build_deletion(&client, &announcement, &repo_id);
-
-    client
-        .send_event(deletion)
-        .await
-        .expect("normal relay should OK the kind-5 deletion");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let served_by_id = client
-        .is_event_on_relay(announcement.id)
-        .await
-        .expect("query announcement by id after deletion");
-    let served_by_coordinate =
-        announcement_served_by_coordinate(&client, &announcement, &repo_id).await;
-
-    relay.stop().await;
-
-    assert!(
-        !served_by_id,
-        "normal relay must honour the deletion: announcement {} should no longer be \
-         queryable by id",
-        announcement.id
-    );
-    assert!(
-        !served_by_coordinate,
-        "normal relay must honour the deletion: announcement {} should no longer be served \
-         for an author+kind+identifier query",
         announcement.id
     );
 }
