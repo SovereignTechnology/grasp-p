@@ -7,6 +7,7 @@
 //! - Same-identifier announcements by different maintainers
 //! - Dependent event retention when at least one referenced announcement survives
 //! - Dependent event hard-deletion when all referenced announcements are deleted
+//! - Different maintainer-subset anchors surviving a middle-maintainer deletion
 //!
 //! Serving note: these tests use the maintainer-exception path for the second
 //! and third announcement (`maintainers` tag + non-local `relays` tag), because
@@ -398,5 +399,141 @@ async fn test_three_maintainers_middle_deletes_event_survives() {
     assert!(
         patch_survived,
         "patch must survive because it remains anchored to announcements A and C"
+    );
+}
+
+#[tokio::test]
+async fn test_three_maintainers_subset_anchors_survive_middle_deletion() {
+    let relay = TestRelay::start().await;
+    let client_a = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create maintainer A client");
+    let client_b =
+        AuditClient::new_with_keys(relay.url(), AuditConfig::isolated(), Keys::generate())
+            .await
+            .expect("create maintainer B client");
+    let client_c =
+        AuditClient::new_with_keys(relay.url(), AuditConfig::isolated(), Keys::generate())
+            .await
+            .expect("create maintainer C client");
+
+    let (announcement_a, repo_id) = publish_served_repo_with_maintainers(
+        &client_a,
+        "multi-subset-a",
+        &[
+            client_b.public_key().to_hex(),
+            client_c.public_key().to_hex(),
+        ],
+    )
+    .await;
+    let announcement_b = publish_served_announcement_for_identifier(&client_b, &repo_id).await;
+    let announcement_c = publish_served_announcement_for_identifier(&client_c, &repo_id).await;
+    let coordinate_a = announcement_coordinate(&announcement_a, &repo_id);
+    let coordinate_b = announcement_coordinate(&announcement_b, &repo_id);
+    let coordinate_c = announcement_coordinate(&announcement_c, &repo_id);
+
+    let event_ab = client_a
+        .event_builder(Kind::from(1617), "event anchored to A+B")
+        .tag(Tag::custom("a", vec![coordinate_a.clone()]))
+        .tag(Tag::custom("a", vec![coordinate_b.clone()]))
+        .build(client_a.keys())
+        .expect("build event anchored to A+B");
+    let event_bc = client_a
+        .event_builder(Kind::from(1617), "event anchored to B+C")
+        .tag(Tag::custom("a", vec![coordinate_b.clone()]))
+        .tag(Tag::custom("a", vec![coordinate_c.clone()]))
+        .build(client_a.keys())
+        .expect("build event anchored to B+C");
+    let event_ac = client_a
+        .event_builder(Kind::from(1617), "event anchored to A+C")
+        .tag(Tag::custom("a", vec![coordinate_a.clone()]))
+        .tag(Tag::custom("a", vec![coordinate_c.clone()]))
+        .build(client_a.keys())
+        .expect("build event anchored to A+C");
+
+    for event in [&event_ab, &event_bc, &event_ac] {
+        client_a
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept subset-anchored event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for (label, id) in [
+        ("announcement_a", announcement_a.id),
+        ("announcement_b", announcement_b.id),
+        ("announcement_c", announcement_c.id),
+        ("event_ab", event_ab.id),
+        ("event_bc", event_bc.id),
+        ("event_ac", event_ac.id),
+    ] {
+        assert!(
+            client_a
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    let deletion_b = build_deletion(&client_b, &[], std::slice::from_ref(&coordinate_b));
+    client_b
+        .send_event(deletion_b)
+        .await
+        .expect("relay should accept announcement B deletion");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let announcement_a_survived = client_a
+        .is_event_on_relay(announcement_a.id)
+        .await
+        .expect("query announcement A after deletion");
+    let announcement_b_survived = client_b
+        .is_event_on_relay(announcement_b.id)
+        .await
+        .expect("query announcement B after deletion");
+    let announcement_c_survived = client_c
+        .is_event_on_relay(announcement_c.id)
+        .await
+        .expect("query announcement C after deletion");
+    let event_ab_survived = client_a
+        .is_event_on_relay(event_ab.id)
+        .await
+        .expect("query event AB after deletion");
+    let event_bc_survived = client_a
+        .is_event_on_relay(event_bc.id)
+        .await
+        .expect("query event BC after deletion");
+    let event_ac_survived = client_a
+        .is_event_on_relay(event_ac.id)
+        .await
+        .expect("query event AC after deletion");
+    let announcement_b_by_coordinate =
+        announcement_served_by_coordinate(&client_b, &announcement_b, &repo_id).await;
+
+    relay.stop().await;
+
+    assert!(announcement_a_survived, "announcement A must survive");
+    assert!(
+        !announcement_b_survived,
+        "announcement B must be hard-deleted"
+    );
+    assert!(announcement_c_survived, "announcement C must survive");
+    assert!(
+        event_ab_survived,
+        "event A+B must survive due to alternative anchor A"
+    );
+    assert!(
+        event_bc_survived,
+        "event B+C must survive due to alternative anchor C"
+    );
+    assert!(
+        event_ac_survived,
+        "event A+C must survive because both anchors remain"
+    );
+    assert!(
+        !announcement_b_by_coordinate,
+        "announcement B coordinate must not be served after deletion"
     );
 }
