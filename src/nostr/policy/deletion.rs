@@ -37,6 +37,7 @@ use nostr_relay_builder::prelude::{
 };
 
 use super::{PolicyContext, RetentionReason};
+use crate::nostr::holding::{DeletionSource, HoldingMetadata};
 use crate::nostr::policy::reject_invalid;
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
@@ -137,8 +138,9 @@ impl DeletionPolicy {
         // Process purgatory removals (synchronous, in-memory).
         self.remove_purgatory_targets(event);
 
-        // Hard-delete targeted events from the main database.
-        self.delete_main_db_targets(event).await;
+        // Move targeted events into holding DB, then delete from main DB.
+        let mut moved_ids = HashSet::new();
+        self.delete_main_db_targets(event, &mut moved_ids).await;
 
         // Record the deletion so future re-submission is rejected.
         if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
@@ -171,14 +173,19 @@ impl DeletionPolicy {
     /// Handles both `e`-tag (by event id) and `a`-tag (by coordinate) targets.
     /// Authorship for `e`-tag targets was validated in [`handle`]; `a`-tag
     /// coordinates carry their own pubkey which is matched against the deleter.
-    async fn delete_main_db_targets(&self, event: &Event) {
+    async fn delete_main_db_targets(&self, event: &Event, moved_ids: &mut HashSet<EventId>) {
         // `e` tags: delete by event id.
         let ids = Self::e_tag_ids(event);
         if !ids.is_empty() {
             let filter = Filter::new().ids(ids);
-            if let Err(e) = self.ctx.database.delete(filter).await {
-                tracing::warn!(error = %e, "Failed to delete events by id during NIP-09 deletion");
-            }
+            let metadata = HoldingMetadata {
+                deleted_at: event.created_at,
+                source: DeletionSource::Nip09,
+                coordinate: None,
+                identifier: None,
+            };
+            self.archive_and_delete_filter(filter, &metadata, moved_ids, "NIP-09 e-tag deletion")
+                .await;
         }
 
         // `a` tags: delete matching addressable/replaceable events up to the
@@ -198,8 +205,14 @@ impl DeletionPolicy {
                 self.cascade_delete_announcement(&event.pubkey, &v[1], event.created_at)
                     .await;
             } else {
-                self.delete_coordinate_from_main_db(&event.pubkey, &v[1], event.created_at)
-                    .await;
+                self.delete_coordinate_from_main_db(
+                    &event.pubkey,
+                    &v[1],
+                    event.created_at,
+                    moved_ids,
+                    DeletionSource::Nip09,
+                )
+                .await;
             }
         }
     }
@@ -244,6 +257,8 @@ impl DeletionPolicy {
         announcement_addr: &str,
         deletion_created_at: Timestamp,
     ) {
+        let mut moved_ids = HashSet::new();
+
         // Parse `30617:<pubkey>:<identifier>` (already validated as a 30617
         // coordinate for this author, but re-parse defensively).
         let parts: Vec<&str> = announcement_addr.splitn(3, ':').collect();
@@ -258,8 +273,14 @@ impl DeletionPolicy {
             Ok(events) => events,
             Err(e) => {
                 tracing::warn!(error = %e, "Cascade deletion: failed to query candidate events; falling back to simple coordinate deletion");
-                self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
-                    .await;
+                self.delete_coordinate_from_main_db(
+                    author,
+                    announcement_addr,
+                    deletion_created_at,
+                    &mut moved_ids,
+                    DeletionSource::Nip09,
+                )
+                .await;
                 return;
             }
         };
@@ -283,8 +304,14 @@ impl DeletionPolicy {
             Ok(result) => result,
             Err(e) => {
                 tracing::warn!(error = %e, "Cascade deletion: re-evaluation failed; falling back to simple coordinate deletion");
-                self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
-                    .await;
+                self.delete_coordinate_from_main_db(
+                    author,
+                    announcement_addr,
+                    deletion_created_at,
+                    &mut moved_ids,
+                    DeletionSource::Nip09,
+                )
+                .await;
                 return;
             }
         };
@@ -350,22 +377,43 @@ impl DeletionPolicy {
                 "Cascade deletion: hard-deleting orphaned events"
             );
             let filter = Filter::new().ids(orphan_ids);
-            if let Err(e) = self.ctx.database.delete(filter).await {
-                tracing::warn!(error = %e, "Cascade deletion: failed to delete orphaned events");
-            }
+            let metadata = HoldingMetadata {
+                deleted_at: deletion_created_at,
+                source: DeletionSource::Nip09,
+                coordinate: Some(announcement_addr.to_string()),
+                identifier: Some(identifier.to_string()),
+            };
+            self.archive_and_delete_filter(
+                filter,
+                &metadata,
+                &mut moved_ids,
+                "cascade orphan deletion",
+            )
+            .await;
         }
 
         // Step 5b: hard-delete the announcement coordinate itself (up to the
         // deletion's created_at, per NIP-09), exactly as the simple path does.
-        self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
-            .await;
+        self.delete_coordinate_from_main_db(
+            author,
+            announcement_addr,
+            deletion_created_at,
+            &mut moved_ids,
+            DeletionSource::Nip09,
+        )
+        .await;
 
         // Step 5c: repository state (30618) is keyed by identifier, not by
         // graph edges. After deleting this announcement coordinate, delete
         // state events for the identifier only when no announcement for that
         // identifier remains in the main DB.
-        self.delete_repo_state_if_identifier_is_unanchored(identifier)
-            .await;
+        self.delete_repo_state_if_identifier_is_unanchored(
+            identifier,
+            deletion_created_at,
+            &mut moved_ids,
+            DeletionSource::Nip09,
+        )
+        .await;
     }
 
     /// Delete kind-30618 state events for `identifier` when the repository is
@@ -373,7 +421,13 @@ impl DeletionPolicy {
     ///
     /// This is separate from graph traversal because state events are keyed by
     /// identifier rather than `a`/`e`/`q` relationships.
-    async fn delete_repo_state_if_identifier_is_unanchored(&self, identifier: &str) {
+    async fn delete_repo_state_if_identifier_is_unanchored(
+        &self,
+        identifier: &str,
+        deletion_created_at: Timestamp,
+        moved_ids: &mut HashSet<EventId>,
+        source: DeletionSource,
+    ) {
         let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement).custom_tag(
             SingleLetterTag::lowercase(Alphabet::D),
             identifier.to_string(),
@@ -400,13 +454,19 @@ impl DeletionPolicy {
             identifier.to_string(),
         );
 
-        if let Err(e) = self.ctx.database.delete(state_filter).await {
-            tracing::warn!(
-                error = %e,
-                identifier = %identifier,
-                "Cascade deletion: failed to delete unanchored repository state events"
-            );
-        }
+        let metadata = HoldingMetadata {
+            deleted_at: deletion_created_at,
+            source,
+            coordinate: None,
+            identifier: Some(identifier.to_string()),
+        };
+        self.archive_and_delete_filter(
+            state_filter,
+            &metadata,
+            moved_ids,
+            "unanchored state deletion",
+        )
+        .await;
     }
 
     /// Query the candidate event set for the cascade graph: every repository
@@ -446,6 +506,8 @@ impl DeletionPolicy {
         author: &PublicKey,
         coordinate: &str,
         deletion_created_at: nostr_relay_builder::prelude::Timestamp,
+        moved_ids: &mut HashSet<EventId>,
+        source: DeletionSource,
     ) {
         // coordinate: `<kind>:<pubkey>:<d-identifier>`
         let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
@@ -474,12 +536,58 @@ impl DeletionPolicy {
         // Per NIP-09, only versions up to the deletion's created_at are deleted.
         filter = filter.until(deletion_created_at);
 
-        if let Err(e) = self.ctx.database.delete(filter).await {
-            tracing::warn!(
-                error = %e,
-                coordinate = %coordinate,
-                "Failed to delete events by coordinate during NIP-09 deletion"
-            );
+        let metadata = HoldingMetadata {
+            deleted_at: deletion_created_at,
+            source,
+            coordinate: Some(coordinate.to_string()),
+            identifier: Some(identifier.to_string()),
+        };
+        self.archive_and_delete_filter(filter, &metadata, moved_ids, "coordinate deletion")
+            .await;
+    }
+
+    async fn archive_and_delete_filter(
+        &self,
+        filter: Filter,
+        metadata: &HoldingMetadata,
+        moved_ids: &mut HashSet<EventId>,
+        context: &str,
+    ) {
+        let matches = match self.ctx.database.query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(error = %e, op = %context, "Failed to query deletion targets");
+                return;
+            }
+        };
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let mut deletable = Vec::with_capacity(matches.len());
+        for event in matches {
+            if moved_ids.insert(event.id) {
+                if let Err(e) = self.ctx.holding.archive_event(&event, metadata).await {
+                    tracing::warn!(
+                        error = %e,
+                        event_id = %event.id.to_hex(),
+                        op = %context,
+                        "Skipping main-DB deletion because holding archival failed"
+                    );
+                    continue;
+                }
+            }
+            deletable.push(event.id);
+        }
+
+        if deletable.is_empty() {
+            return;
+        }
+
+        let delete_filter = Filter::new().ids(deletable);
+        if let Err(e) = self.ctx.database.delete(delete_filter).await {
+            tracing::warn!(error = %e, op = %context, "Failed to delete events from main DB");
         }
     }
 

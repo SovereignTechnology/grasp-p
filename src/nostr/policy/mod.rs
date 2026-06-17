@@ -47,6 +47,7 @@ use super::SharedDatabase;
 #[cfg(test)]
 use crate::grasp06::receive::new_repo_init_locks;
 use crate::grasp06::receive::RepoInitLocks;
+use crate::nostr::holding::HoldingStore;
 use crate::nostr::tombstones::Tombstones;
 use crate::purgatory::Purgatory;
 use nostr_relay_builder::LocalRelay;
@@ -65,6 +66,8 @@ pub struct PolicyContext {
     /// so re-submission of a deleted event (or an event from a vanished pubkey)
     /// is still rejected, surviving restarts.
     pub tombstones: Tombstones,
+    /// Holding DB for events moved out of main DB by deletion flows.
+    pub holding: HoldingStore,
     pub git_data_path: std::path::PathBuf,
     pub purgatory: Arc<Purgatory>,
     /// Local relay for notifying WebSocket subscribers (set after relay creation)
@@ -82,6 +85,7 @@ impl PolicyContext {
         domain: impl Into<String>,
         database: SharedDatabase,
         tombstones: Tombstones,
+        holding: HoldingStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: Arc<Purgatory>,
         config: crate::config::Config,
@@ -91,6 +95,7 @@ impl PolicyContext {
             domain: domain.into(),
             database,
             tombstones,
+            holding,
             git_data_path: git_data_path.into(),
             purgatory,
             local_relay: Arc::new(std::sync::RwLock::new(None)),
@@ -114,6 +119,7 @@ impl PolicyContext {
             domain,
             database,
             Tombstones::in_memory(),
+            HoldingStore::in_memory(),
             git_data_path,
             purgatory,
             config,

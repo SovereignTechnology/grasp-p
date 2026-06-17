@@ -57,6 +57,7 @@ impl Nip34WritePolicy {
     pub fn new(
         database: SharedDatabase,
         tombstones: crate::nostr::tombstones::Tombstones,
+        holding: crate::nostr::holding::HoldingStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: std::sync::Arc<crate::purgatory::Purgatory>,
         config: crate::config::Config,
@@ -66,6 +67,7 @@ impl Nip34WritePolicy {
             &config.domain,
             database,
             tombstones,
+            holding,
             git_data_path,
             purgatory,
             config.clone(),
@@ -885,53 +887,58 @@ pub async fn create_relay(
     // would silently hard-delete events and block re-submission via its own
     // internal tables that we cannot inspect, conflicting with our purgatory /
     // bare-repo bookkeeping.
-    let (database, tombstones): (SharedDatabase, crate::nostr::tombstones::Tombstones) =
-        match config.database_backend {
-            DatabaseBackend::Memory => {
-                tracing::info!("Using in-memory database (no persistence)");
-                // Disable the backend's built-in NIP-09 / NIP-62 auto-processing to
-                // match the LMDB path: ngit-grasp owns this handling (DeletionPolicy,
-                // the kind-62 handler, and the Tombstones store). Leaving the memory
-                // backend's defaults (`true`) would silently suppress targeted events
-                // at query time the moment a kind-5 is *stored* — which in particular
-                // defeats `deletion_request_disrespector` (archival) mode, where the
-                // kind-5 is intentionally stored but not acted upon.
-                let db = MemoryDatabase::builder()
-                    .max_events(NonZeroUsize::new(100_000).unwrap())
-                    .process_nip09(false)
-                    .process_nip62(false)
-                    .build();
-                (
-                    Arc::new(db),
-                    crate::nostr::tombstones::Tombstones::in_memory(),
+    let (database, tombstones, holding): (
+        SharedDatabase,
+        crate::nostr::tombstones::Tombstones,
+        crate::nostr::holding::HoldingStore,
+    ) = match config.database_backend {
+        DatabaseBackend::Memory => {
+            tracing::info!("Using in-memory database (no persistence)");
+            // Disable the backend's built-in NIP-09 / NIP-62 auto-processing to
+            // match the LMDB path: ngit-grasp owns this handling (DeletionPolicy,
+            // the kind-62 handler, and the Tombstones store). Leaving the memory
+            // backend's defaults (`true`) would silently suppress targeted events
+            // at query time the moment a kind-5 is *stored* — which in particular
+            // defeats `deletion_request_disrespector` (archival) mode, where the
+            // kind-5 is intentionally stored but not acted upon.
+            let db = MemoryDatabase::builder()
+                .max_events(NonZeroUsize::new(100_000).unwrap())
+                .process_nip09(false)
+                .process_nip62(false)
+                .build();
+            (
+                Arc::new(db),
+                crate::nostr::tombstones::Tombstones::in_memory(),
+                crate::nostr::holding::HoldingStore::in_memory(),
+            )
+        }
+        DatabaseBackend::Lmdb => {
+            tracing::info!("Using LMDB backend at: {}", db_path.display());
+            // Ensure the database directory exists
+            std::fs::create_dir_all(db_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create LMDB directory {}: {}",
+                    db_path.display(),
+                    e
                 )
-            }
-            DatabaseBackend::Lmdb => {
-                tracing::info!("Using LMDB backend at: {}", db_path.display());
-                // Ensure the database directory exists
-                std::fs::create_dir_all(db_path).map_err(|e| {
+            })?;
+            let db = NostrLmdb::builder(db_path)
+                .process_nip09(false)
+                .process_nip62(false)
+                .build()
+                .await
+                .map_err(|e| {
                     anyhow::anyhow!(
-                        "Failed to create LMDB directory {}: {}",
+                        "Failed to open LMDB database at {}: {}",
                         db_path.display(),
                         e
                     )
                 })?;
-                let db = NostrLmdb::builder(db_path)
-                    .process_nip09(false)
-                    .process_nip62(false)
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to open LMDB database at {}: {}",
-                            db_path.display(),
-                            e
-                        )
-                    })?;
-                let tombstones = crate::nostr::tombstones::Tombstones::open_lmdb(db_path).await?;
-                (Arc::new(db), tombstones)
-            }
-        };
+            let tombstones = crate::nostr::tombstones::Tombstones::open_lmdb(db_path).await?;
+            let holding = crate::nostr::holding::HoldingStore::open_lmdb(db_path).await?;
+            (Arc::new(db), tombstones, holding)
+        }
+    };
 
     // Build relay with GRASP-01 validation
     // Clone Arc for the write policy so both relay and policy can access the database
@@ -961,6 +968,7 @@ pub async fn create_relay(
     let write_policy = Nip34WritePolicy::new(
         database.clone(),
         tombstones,
+        holding,
         &git_data_path,
         purgatory,
         config.clone(),

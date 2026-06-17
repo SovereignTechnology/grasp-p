@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod events;
+pub mod holding;
 pub mod policy;
 pub mod tombstones;
 

@@ -1,10 +1,10 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** ✅ **PARTIALLY IMPLEMENTED (hard-delete path live)**
+**Status:** ✅ **PARTIALLY IMPLEMENTED (holding DB foundation live)**
 
-This document now reflects both the implemented single-node hard-delete path
-(main DB + tombstones, no holding DB) and the still-planned archival/recovery
-architecture.
+This document now reflects both the implemented single-node deletion path
+(main DB + tombstones + holding DB foundation) and the still-planned
+expiry/archive/recovery architecture.
 
 ---
 
@@ -14,8 +14,8 @@ architecture.
 > (holding database, archival, recovery). It is still aspirational.
 > What follows in this section is what is **actually built today** and is the
 > foundation that work builds on. The `deletion-request-disrespector` archival
-> mode is now implemented (see below); the holding DB, git archival, and
-> recovery remain planned.
+> mode and the holding-DB move semantics are now implemented (see below);
+> cleanup expiry, git archival, and recovery remain planned.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -29,8 +29,9 @@ We disable that automatic processing
 `process_nip09(false)` and `process_nip62(false)` on both the main database and
 the tombstone database) and implement NIP-09 / NIP-62 in ngit-grasp itself,
 bypassing the backend so we can apply our own customisations in the future.
-ngit-grasp now has custom announcement cascade deletion in the main DB (pure
-hard-delete, no holding DB), including dependent NIP-34 graph events and
+ngit-grasp now has custom announcement cascade deletion in the main DB with a
+holding-DB handoff: affected events are first copied into the holding DB and
+then removed from the main DB, including dependent NIP-34 graph events and
 repository-state (kind 30618) cleanup when an identifier becomes unanchored.
 The cascade walk is kind-agnostic over `a` / `e` / `q` edges; supported
 dependent kinds are controlled by
@@ -60,9 +61,9 @@ include the full PR chain (`1618`/`1619`/`1631`/`1632`).
 
 - **NIP-09 handler** ([`src/nostr/policy/deletion.rs`](../../src/nostr/policy/deletion.rs)):
   in addition to the existing purgatory eviction (and bare-repo deletion), it now
-  validates author ownership, hard-deletes the targeted events from the main
-  database via `NostrDatabase::delete(filter)`, and records the deletion in the
-  tombstone store. An `e`-tag delete targeting an event owned by a different
+  validates author ownership, moves the targeted events into the holding DB,
+  deletes them from the main database, and records the deletion in the tombstone
+  store. An `e`-tag delete targeting an event owned by a different
   author is rejected (matching the backend's `InvalidDelete`).
 
   For kind-30617 announcement `a`-coordinate deletes, this includes
@@ -71,6 +72,11 @@ include the full PR chain (`1618`/`1619`/`1631`/`1632`).
   repository identifier (`d` tag) instead of graph edges, state events are
   hard-deleted when (and only when) no announcement remains for that
   identifier.
+
+  Holding metadata currently records:
+  - deletion timestamp,
+  - deletion source (`nip09`),
+  - coordinate/identifier linkage when available.
 
 - **NIP-62 handler** (`Nip34WritePolicy::handle_vanish` in
   [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): for a vanish request
@@ -90,8 +96,9 @@ tombstone; cascade = walk the references of a recorded deletion).
   when enabled, [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs)
   short-circuits at the top — the kind-5 deletion request is still accepted (and
   therefore stored in the main DB so clients get an OK), but it is **not** acted
-  upon: no purgatory eviction, no main-DB deletion, and no tombstone is recorded.
-  Targeted events stay fully accessible, making the relay an archival server.
+  upon: no purgatory eviction, no main-DB deletion, no move to holding DB, and no
+  tombstone is recorded. Targeted events stay fully accessible, making the relay
+  an archival server.
   The short-circuit only affects NIP-09 (kind 5) *processing*; NIP-62 vanish
   *handling* is unchanged. NIP-11 advertisement, however, reflects the mode for
   both deletion NIPs: NIP-09 (`9`) and NIP-62 (`62`) are included in
@@ -553,12 +560,14 @@ When implementation is complete, the following documentation will be updated:
 
 ## Implementation Status
 
-### Completed in the current hard-delete path
+### Completed in the current implementation
 
-The following are implemented now (no holding DB / archive / recovery yet):
+The following are implemented now (expiry/archive/recovery still pending):
 
 - ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
 - tombstone persistence and deletion re-submission gate
+- holding-DB foundation (same backend family as main DB) with move-before-delete
+  semantics for NIP-09 deletion paths
 - announcement cascade deletion with multi-maintainer retention semantics
 - extended dependent-kind coverage, including PR chain kinds
   (`1618`/`1619`/`1631`/`1632`)
@@ -578,18 +587,18 @@ using served PR/PR-update fixtures (event + git-ref promotion).
   - multi-maintainer orphan/survivor semantics
   - `30618` identifier-level cleanup when last anchor is removed
 
-**Phase 2 (next): Holding database foundation** 🔄
+**Phase 2: Holding database foundation** ✅
 - Implement a dedicated holding DB for deleted events (same backend family as
   main DB; persistent for LMDB, in-memory for memory backend).
-- On NIP-09/blacklist deletion flow, move affected events into holding DB before
+- NIP-09 deletion flow now moves affected events into holding DB before
   removing from main DB.
+- Blacklist-triggered deletion parity remains to be wired through the same
+  holding-DB path when that runtime deletion path is active.
 - Store enough metadata for retention decisions and future recovery orchestration
   (deletion reason, timestamp, identifier/coordinate linkage).
-- **Test strategy for this phase:**
-  - Add holding-DB assertions only to a focused subset of integration tests
-    (single-maintainer cascade + multi-maintainer + state-event path).
-  - Do not mirror holding-DB checks into every cascade test; that adds cost with
-    little additional confidence for simple move semantics.
+- **Implemented test strategy:** dedicated focused suite
+  [`tests/nip09_holding_db.rs`](../../tests/nip09_holding_db.rs) for holding-DB
+  assertions; existing cascade suites remain focused on cascade semantics.
 
 **Phase 3: Expiry/cleanup engine (the complex part)** 🔄
 - Implement retention expiry policy for holding DB (and associated metadata).

@@ -56,6 +56,10 @@ pub struct TestRelay {
     _git_data_dir: tempfile::TempDir,
     /// Path to git data directory (for test assertions)
     git_data_path: PathBuf,
+    /// Temporary directory for relay data (LMDB side stores)
+    _relay_data_dir: tempfile::TempDir,
+    /// Path to relay data directory (for test assertions)
+    relay_data_path: PathBuf,
 }
 
 /// Options that the various `start*` constructors fan out into a single
@@ -69,6 +73,7 @@ struct RelayOptions {
     archive_read_only: bool,
     grasp06_enable: bool,
     deletion_request_disrespector: bool,
+    lmdb_backend: bool,
 }
 
 impl TestRelay {
@@ -233,6 +238,31 @@ impl TestRelay {
         .await
     }
 
+    /// Start a relay with LMDB backend (persistent side DBs on a temp dir).
+    pub async fn start_with_lmdb() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay with LMDB backend + deletion disrespector mode.
+    pub async fn start_with_lmdb_deletion_disrespector() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                deletion_request_disrespector: true,
+                lmdb_backend: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -312,6 +342,8 @@ impl TestRelay {
         // Create temporary directory for git repositories
         let git_data_dir =
             tempfile::tempdir().expect("Failed to create temporary git data directory");
+        let relay_data_dir =
+            tempfile::tempdir().expect("Failed to create temporary relay data directory");
 
         // Use the built binary directly (faster than cargo run)
         let binary_path = std::env::current_exe()
@@ -336,7 +368,7 @@ impl TestRelay {
         cmd.env("NGIT_BIND_ADDRESS", &bind_address)
             .env("NGIT_DOMAIN", &bind_address) // Set domain to match bind address
             .env("NGIT_GIT_DATA_PATH", git_data_dir.path())
-            .env("NGIT_DATABASE_BACKEND", "memory") // Force in-memory database for isolation
+            .env("NGIT_RELAY_DATA_PATH", relay_data_dir.path())
             .env("NGIT_OWNER_NPUB", &test_npub)
             .env("NGIT_TEST", "1") // Enable test mode: fast timers (200ms batch window, 200ms purgatory sync)
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
@@ -356,6 +388,15 @@ impl TestRelay {
                     .unwrap_or(Stdio::null()),
             )
             .stderr(Stdio::inherit()); // Inherit stderr for test output
+
+        cmd.env(
+            "NGIT_DATABASE_BACKEND",
+            if options.lmdb_backend {
+                "lmdb"
+            } else {
+                "memory"
+            },
+        );
 
         // Add bootstrap relay URL if provided
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
@@ -396,6 +437,7 @@ impl TestRelay {
 
         // Store git data path for test assertions
         let git_data_path = git_data_dir.path().to_path_buf();
+        let relay_data_path = relay_data_dir.path().to_path_buf();
 
         let mut relay = Self {
             process,
@@ -403,6 +445,8 @@ impl TestRelay {
             port,
             _git_data_dir: git_data_dir,
             git_data_path,
+            _relay_data_dir: relay_data_dir,
+            relay_data_path,
         };
 
         match relay.wait_for_ready_or_early_exit().await {
@@ -433,6 +477,11 @@ impl TestRelay {
     /// git repositories were created correctly.
     pub fn git_data_path(&self) -> &PathBuf {
         &self.git_data_path
+    }
+
+    /// Get the relay data directory path.
+    pub fn relay_data_path(&self) -> &PathBuf {
+        &self.relay_data_path
     }
 
     /// Probe the listener with async TCP connects until it accepts,
