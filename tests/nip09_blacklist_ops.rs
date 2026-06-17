@@ -9,6 +9,7 @@ use ngit_grasp::config::Config;
 use ngit_grasp::grasp06::receive::new_repo_init_locks;
 use ngit_grasp::metrics::{self, Metrics};
 use ngit_grasp::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use ngit_grasp::nostr::history::ReplaceableHistoryStore;
 use ngit_grasp::nostr::holding::{
     DeletionSource, GitArchiveMetadata, HoldingMetadata, HoldingStore, HOLDING_ARCHIVE_PATH_TAG,
 };
@@ -68,6 +69,7 @@ fn make_policy(
         database,
         Tombstones::in_memory(),
         holding,
+        ReplaceableHistoryStore::in_memory(),
         git_data_path.to_path_buf(),
         purgatory,
         config,

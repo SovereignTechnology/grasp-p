@@ -47,6 +47,7 @@ use super::SharedDatabase;
 #[cfg(test)]
 use crate::grasp06::receive::new_repo_init_locks;
 use crate::grasp06::receive::RepoInitLocks;
+use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::HoldingStore;
 use crate::nostr::tombstones::Tombstones;
 use crate::purgatory::Purgatory;
@@ -68,6 +69,8 @@ pub struct PolicyContext {
     pub tombstones: Tombstones,
     /// Holding DB for events moved out of main DB by deletion flows.
     pub holding: HoldingStore,
+    /// Durable rollback history for superseded replaceable/addressable events.
+    pub history: ReplaceableHistoryStore,
     pub git_data_path: std::path::PathBuf,
     pub purgatory: Arc<Purgatory>,
     /// Local relay for notifying WebSocket subscribers (set after relay creation)
@@ -86,6 +89,7 @@ impl PolicyContext {
         database: SharedDatabase,
         tombstones: Tombstones,
         holding: HoldingStore,
+        history: ReplaceableHistoryStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: Arc<Purgatory>,
         config: crate::config::Config,
@@ -96,6 +100,7 @@ impl PolicyContext {
             database,
             tombstones,
             holding,
+            history,
             git_data_path: git_data_path.into(),
             purgatory,
             local_relay: Arc::new(std::sync::RwLock::new(None)),
@@ -120,6 +125,7 @@ impl PolicyContext {
             database,
             Tombstones::in_memory(),
             HoldingStore::in_memory(),
+            ReplaceableHistoryStore::in_memory(),
             git_data_path,
             purgatory,
             config,
