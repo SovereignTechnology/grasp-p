@@ -16,6 +16,8 @@
 //! - `a`-tag coordinates are deleted when the coordinate pubkey matches the
 //!   deleter;
 //! - deletion of a non-existent target is accepted (NIP-09 pre-emptive delete);
+//! - a pre-emptive delete that arrives *before* its target lays down a
+//!   tombstone, so the later-arriving target is rejected and never served;
 //! - malformed `a` coordinates are silently treated as no-ops (accepted).
 //!
 //! `normal_mode_honours_deletion` in `nip09_disrespector.rs` already covers the
@@ -291,6 +293,81 @@ async fn deletion_of_nonexistent_event_is_accepted() {
         result.is_ok(),
         "deletion of a non-existent event must be accepted (NIP-09 pre-emptive delete), got: {:?}",
         result.err()
+    );
+}
+
+/// 2b. Out-of-order deletion: a kind-5 deleting an own event arrives *before*
+///     the relay has ever seen that event. The deletion is accepted (NIP-09
+///     pre-emptive delete) and records a tombstone; a subsequent submission of
+///     the now-deleted event is rejected by the resubmission gate ("this event
+///     is deleted") and the event is never served.
+///
+/// This exercises the delete-then-create ordering: the server receives the
+/// deletion request first and must still honour it when the target finally
+/// shows up.
+#[tokio::test]
+async fn deletion_before_target_rejects_later_submission() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    // Promote a repo so we can build a well-formed issue against it. The issue
+    // is built (so we know its id) but deliberately NOT sent yet.
+    let (announcement, _repo_id) = publish_served_repo(&client, "delete-first").await;
+
+    let issue = client
+        .create_issue(&announcement, "Issue deleted before it arrives", "delete me", vec![])
+        .expect("build issue");
+    let issue_id = issue.id;
+
+    // Sanity: the relay has never seen the issue.
+    assert!(
+        !client
+            .is_event_on_relay(issue_id)
+            .await
+            .expect("query issue before anything is sent"),
+        "issue should not be served before it is ever submitted"
+    );
+
+    // Send the deletion FIRST — the relay receives the deletion request before
+    // the event it deletes. This must be accepted (pre-emptive delete) and lay
+    // down a tombstone for the issue id.
+    let deletion = build_deletion(&client, &[issue_id], &[]);
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept pre-emptive deletion of own (not-yet-seen) event");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Now send the issue the deletion already targeted. The resubmission gate
+    // must reject it because a tombstone for this id already exists.
+    let result = client.send_event(issue.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let served = client
+        .is_event_on_relay(issue_id)
+        .await
+        .expect("query issue after late submission");
+
+    relay.stop().await;
+
+    assert!(
+        result.is_err(),
+        "submission of an already-deleted event must be rejected, but it was accepted"
+    );
+    let msg = result.err().unwrap().to_string().to_lowercase();
+    assert!(
+        msg.contains("delete"),
+        "rejection message should mention the event was deleted; got: {}",
+        msg
+    );
+    assert!(
+        !served,
+        "issue {} must never be served: it was deleted before it arrived",
+        issue_id
     );
 }
 
