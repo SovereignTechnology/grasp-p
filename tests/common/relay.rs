@@ -53,11 +53,11 @@ pub struct TestRelay {
     port: u16,
     /// Temporary directory for git repositories
     /// Kept alive for the lifetime of the relay
-    _git_data_dir: tempfile::TempDir,
+    _git_data_dir: Option<tempfile::TempDir>,
     /// Path to git data directory (for test assertions)
     git_data_path: PathBuf,
     /// Temporary directory for relay data (LMDB side stores)
-    _relay_data_dir: tempfile::TempDir,
+    _relay_data_dir: Option<tempfile::TempDir>,
     /// Path to relay data directory (for test assertions)
     relay_data_path: PathBuf,
 }
@@ -74,6 +74,9 @@ struct RelayOptions {
     grasp06_enable: bool,
     deletion_request_disrespector: bool,
     lmdb_backend: bool,
+    repository_blacklist: Option<String>,
+    git_data_path: Option<PathBuf>,
+    relay_data_path: Option<PathBuf>,
 }
 
 impl TestRelay {
@@ -263,6 +266,40 @@ impl TestRelay {
         .await
     }
 
+    /// Start a relay with LMDB backend and repository blacklist.
+    pub async fn start_with_lmdb_blacklist(repository_blacklist: impl Into<String>) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                repository_blacklist: Some(repository_blacklist.into()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay on fresh port using pre-existing LMDB/git directories.
+    pub async fn start_with_existing_lmdb_paths(
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+        repository_blacklist: Option<String>,
+        deletion_request_disrespector: bool,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                repository_blacklist,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                deletion_request_disrespector,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -339,11 +376,25 @@ impl TestRelay {
         let bind_address = format!("127.0.0.1:{}", port);
         let url = format!("ws://127.0.0.1:{}", port);
 
-        // Create temporary directory for git repositories
-        let git_data_dir =
-            tempfile::tempdir().expect("Failed to create temporary git data directory");
-        let relay_data_dir =
-            tempfile::tempdir().expect("Failed to create temporary relay data directory");
+        // Create temporary directories unless caller provided explicit paths.
+        let (git_data_dir, git_data_path) = if let Some(path) = options.git_data_path.clone() {
+            std::fs::create_dir_all(&path).expect("Failed to create provided git data directory");
+            (None, path)
+        } else {
+            let dir = tempfile::tempdir().expect("Failed to create temporary git data directory");
+            let path = dir.path().to_path_buf();
+            (Some(dir), path)
+        };
+
+        let (relay_data_dir, relay_data_path) = if let Some(path) = options.relay_data_path.clone()
+        {
+            std::fs::create_dir_all(&path).expect("Failed to create provided relay data directory");
+            (None, path)
+        } else {
+            let dir = tempfile::tempdir().expect("Failed to create temporary relay data directory");
+            let path = dir.path().to_path_buf();
+            (Some(dir), path)
+        };
 
         // Use the built binary directly (faster than cargo run)
         let binary_path = std::env::current_exe()
@@ -367,8 +418,8 @@ impl TestRelay {
         let mut cmd = Command::new(&binary_path);
         cmd.env("NGIT_BIND_ADDRESS", &bind_address)
             .env("NGIT_DOMAIN", &bind_address) // Set domain to match bind address
-            .env("NGIT_GIT_DATA_PATH", git_data_dir.path())
-            .env("NGIT_RELAY_DATA_PATH", relay_data_dir.path())
+            .env("NGIT_GIT_DATA_PATH", &git_data_path)
+            .env("NGIT_RELAY_DATA_PATH", &relay_data_path)
             .env("NGIT_OWNER_NPUB", &test_npub)
             .env("NGIT_TEST", "1") // Enable test mode: fast timers (200ms batch window, 200ms purgatory sync)
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
@@ -427,6 +478,10 @@ impl TestRelay {
             cmd.env("NGIT_DELETION_REQUEST_DISRESPECTOR", "true");
         }
 
+        if let Some(ref blacklist) = options.repository_blacklist {
+            cmd.env("NGIT_REPOSITORY_BLACKLIST", blacklist);
+        }
+
         // Release the port reservation immediately before spawning the
         // subprocess that will bind it. Holding the reservation through
         // env-var setup above is what keeps any concurrent
@@ -434,10 +489,6 @@ impl TestRelay {
         let _ = reservation.release();
 
         let process = cmd.spawn().expect("Failed to start relay process");
-
-        // Store git data path for test assertions
-        let git_data_path = git_data_dir.path().to_path_buf();
-        let relay_data_path = relay_data_dir.path().to_path_buf();
 
         let mut relay = Self {
             process,

@@ -48,6 +48,15 @@ pub struct Nip34WritePolicy {
     deletion_policy: DeletionPolicy,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlacklistParityStats {
+    pub scanned_announcements: usize,
+    pub matched_announcements: usize,
+    pub attempted_deletions: usize,
+    pub successful_deletions: usize,
+    pub failed_deletions: usize,
+}
+
 impl std::fmt::Debug for Nip34WritePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Nip34WritePolicy")
@@ -109,6 +118,95 @@ impl Nip34WritePolicy {
     /// Get a reference to the holding store for retention cleanup orchestration.
     pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
         &self.ctx.holding
+    }
+
+    /// Startup-only blacklist parity pass.
+    ///
+    /// Scans already-stored kind-30617 announcements, identifies entries
+    /// matching `repository_blacklist`, and applies the same deletion pipeline as
+    /// NIP-09 (cascade + holding/archive) but with `DeletionSource::Blacklist`.
+    pub async fn run_startup_blacklist_parity_pass(&self) -> BlacklistParityStats {
+        let blacklist = self.ctx.config.blacklist_config();
+        if !blacklist.enabled() {
+            return BlacklistParityStats::default();
+        }
+
+        let announcements = match self
+            .ctx
+            .database
+            .query(Filter::new().kind(Kind::GitRepoAnnouncement))
+            .await
+        {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::error!(error = %e, "Blacklist startup parity scan failed to query announcements");
+                return BlacklistParityStats::default();
+            }
+        };
+
+        let mut stats = BlacklistParityStats {
+            scanned_announcements: announcements.len(),
+            ..BlacklistParityStats::default()
+        };
+
+        for announcement in announcements {
+            let parsed = match RepositoryAnnouncement::from_event(announcement.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        event_id = %announcement.id.to_hex(),
+                        error = %e,
+                        "Blacklist startup parity: skipping unparseable announcement"
+                    );
+                    continue;
+                }
+            };
+
+            let npub = announcement
+                .pubkey
+                .to_bech32()
+                .expect("public key to bech32 should be infallible");
+
+            let Some(reason) = blacklist.check(&npub, &parsed.identifier) else {
+                continue;
+            };
+
+            stats.matched_announcements += 1;
+            stats.attempted_deletions += 1;
+            crate::metrics::record_blacklist_deletion_attempt("startup");
+
+            match self
+                .deletion_policy
+                .apply_blacklist_deletion_for_announcement(&announcement)
+                .await
+            {
+                Ok(()) => {
+                    stats.successful_deletions += 1;
+                    crate::metrics::record_blacklist_deletion_success("startup");
+                    tracing::info!(
+                        event_id = %announcement.id.to_hex(),
+                        owner = %announcement.pubkey.to_hex(),
+                        identifier = %parsed.identifier,
+                        reason = %reason,
+                        "Blacklist startup parity: deleted stored repository"
+                    );
+                }
+                Err(e) => {
+                    stats.failed_deletions += 1;
+                    crate::metrics::record_blacklist_deletion_failure("startup");
+                    tracing::error!(
+                        event_id = %announcement.id.to_hex(),
+                        owner = %announcement.pubkey.to_hex(),
+                        identifier = %parsed.identifier,
+                        reason = %reason,
+                        error = %e,
+                        "Blacklist startup parity: deletion failed"
+                    );
+                }
+            }
+        }
+
+        stats
     }
 
     /// Set the local relay for purgatory notifications.
@@ -1235,6 +1333,8 @@ impl Nip34WritePolicy {
             return false;
         }
 
+        crate::metrics::record_recovery_attempt();
+
         let mut archive_paths = BTreeSet::new();
         for record in &records {
             if let Some(path) = &record.archive_relative_path {
@@ -1286,6 +1386,7 @@ impl Nip34WritePolicy {
                                     archive = %abs_path.display(),
                                     "Recovery failed restoring git archive; aborting recovery"
                                 );
+                                crate::metrics::record_recovery_failed();
                                 return false;
                             }
                         }
@@ -1311,6 +1412,7 @@ impl Nip34WritePolicy {
                 identifier = %identifier,
                 "Recovery found only non-restorable state"
             );
+            crate::metrics::record_recovery_failed();
             return false;
         }
 
@@ -1369,6 +1471,13 @@ impl Nip34WritePolicy {
             git_ready = git_ready,
             "Recovery workflow completed for re-announcement"
         );
+
+        let partial = !blocked_records.is_empty() || !git_ready;
+        if partial {
+            crate::metrics::record_recovery_partial();
+        } else {
+            crate::metrics::record_recovery_success();
+        }
 
         true
     }

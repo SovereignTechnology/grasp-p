@@ -103,8 +103,7 @@ impl DeletionPolicy {
     /// main database) so clients see an OK and the request is preserved, but it
     /// is NOT acted upon — no purgatory eviction, no main-DB deletion, and no
     /// tombstone recording. The targeted events therefore remain fully
-    /// accessible. This only affects NIP-09 user-initiated deletions. Runtime
-    /// blacklist-triggered deletion flow is currently deferred.
+    /// accessible. This only affects NIP-09 user-initiated deletions.
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
         // Archival mode: store the deletion request but do not process it.
         if self.ctx.config.deletion_request_disrespector {
@@ -210,8 +209,13 @@ impl DeletionPolicy {
                 continue;
             }
             if Self::is_announcement_coordinate_for_author(&v[1], &event.pubkey) {
-                self.cascade_delete_announcement(&event.pubkey, &v[1], event.created_at)
-                    .await;
+                self.cascade_delete_announcement(
+                    &event.pubkey,
+                    &v[1],
+                    event.created_at,
+                    DeletionSource::Nip09,
+                )
+                .await;
             } else {
                 self.delete_coordinate_from_main_db(
                     &event.pubkey,
@@ -266,6 +270,7 @@ impl DeletionPolicy {
         author: &PublicKey,
         announcement_addr: &str,
         deletion_created_at: Timestamp,
+        source: DeletionSource,
     ) {
         let mut moved_ids = HashSet::new();
 
@@ -288,7 +293,7 @@ impl DeletionPolicy {
                     announcement_addr,
                     deletion_created_at,
                     &mut moved_ids,
-                    DeletionSource::Nip09,
+                    source,
                 )
                 .await;
                 return;
@@ -319,7 +324,7 @@ impl DeletionPolicy {
                     announcement_addr,
                     deletion_created_at,
                     &mut moved_ids,
-                    DeletionSource::Nip09,
+                    source,
                 )
                 .await;
                 return;
@@ -389,7 +394,7 @@ impl DeletionPolicy {
             let filter = Filter::new().ids(orphan_ids);
             let metadata = HoldingMetadata {
                 deleted_at: deletion_created_at,
-                source: DeletionSource::Nip09,
+                source,
                 coordinate: Some(announcement_addr.to_string()),
                 identifier: Some(identifier.to_string()),
                 owner_pubkey: Some(author.to_hex()),
@@ -417,7 +422,7 @@ impl DeletionPolicy {
             announcement_addr,
             deletion_created_at,
             &mut moved_ids,
-            DeletionSource::Nip09,
+            source,
         )
         .await;
 
@@ -429,9 +434,45 @@ impl DeletionPolicy {
             identifier,
             deletion_created_at,
             &mut moved_ids,
-            DeletionSource::Nip09,
+            source,
         )
         .await;
+    }
+
+    /// Apply operator-driven blacklist deletion for a stored kind-30617
+    /// announcement.
+    ///
+    /// This path intentionally bypasses `deletion_request_disrespector` and uses
+    /// the same cascade + holding/archive flow as user NIP-09 deletions, but
+    /// marks holding metadata with `DeletionSource::Blacklist`.
+    pub async fn apply_blacklist_deletion_for_announcement(
+        &self,
+        announcement: &Event,
+    ) -> anyhow::Result<()> {
+        if announcement.kind != Kind::GitRepoAnnouncement {
+            return Err(anyhow::anyhow!(
+                "blacklist deletion requires kind 30617 announcement, got {}",
+                announcement.kind.as_u16()
+            ));
+        }
+
+        let Some(identifier) = identifier_from_event(announcement) else {
+            return Err(anyhow::anyhow!(
+                "announcement {} missing identifier tag",
+                announcement.id.to_hex()
+            ));
+        };
+
+        let coordinate = format!("30617:{}:{}", announcement.pubkey.to_hex(), identifier);
+        self.cascade_delete_announcement(
+            &announcement.pubkey,
+            &coordinate,
+            Timestamp::now(),
+            DeletionSource::Blacklist,
+        )
+        .await;
+
+        Ok(())
     }
 
     /// Delete kind-30618 state events for `identifier` when the repository is

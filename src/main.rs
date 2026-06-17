@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
+use nostr_sdk::prelude::PublicKey;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -35,6 +36,30 @@ enum Cli {
     /// Runs in dry-run mode by default. Pass --execute to make changes.
     /// Stop the relay service before running with --execute.
     CleanupEmptyRepos(cleanup_empty_repos::CleanupArgs),
+
+    /// Permanently eject deleted repository data from holding/archive stores.
+    ///
+    /// This is an operator/admin maintenance command and is idempotent.
+    HoldingEject(HoldingEjectArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct HoldingEjectArgs {
+    /// Owner pubkey (npub or hex) for the repository scope to eject.
+    #[arg(long)]
+    owner: String,
+
+    /// Repository identifier (`d` tag value).
+    #[arg(long)]
+    identifier: String,
+
+    /// Relay data path containing the holding LMDB directory.
+    #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
+    relay_data_path: String,
+
+    /// Git data path containing the `.archive` subtree.
+    #[arg(long, env = "NGIT_GIT_DATA_PATH", default_value = "./data/git")]
+    git_data_path: String,
 }
 
 #[tokio::main]
@@ -46,7 +71,7 @@ async fn main() -> Result<()> {
     // If not, prepend the implicit "serve" subcommand so that clap routes to Cli::Serve
     // and all relay flags are parsed normally (preserving backward compatibility).
     let mut args: Vec<String> = std::env::args().collect();
-    let known_subcommands = ["serve", "cleanup-empty-repos", "help"];
+    let known_subcommands = ["serve", "cleanup-empty-repos", "holding-eject", "help"];
     let has_subcommand = args.get(1).is_some_and(|a| {
         known_subcommands.contains(&a.as_str())
             || matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")
@@ -57,6 +82,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse_from(args) {
         Cli::CleanupEmptyRepos(cleanup_args) => cleanup_empty_repos::run(&cleanup_args).await,
+        Cli::HoldingEject(eject_args) => run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
             // Finish initialising the Config (load relay owner key if not provided).
@@ -69,6 +95,33 @@ async fn main() -> Result<()> {
             run_relay(config).await
         }
     }
+}
+
+async fn run_holding_eject(args: HoldingEjectArgs) -> Result<()> {
+    let owner_hex = PublicKey::parse(&args.owner)
+        .map(|pk| pk.to_hex())
+        .map_err(|e| anyhow::anyhow!("invalid --owner pubkey '{}': {}", args.owner, e))?;
+
+    let holding = nostr::holding::HoldingStore::open_lmdb(
+        std::path::Path::new(&args.relay_data_path),
+        std::path::Path::new(&args.git_data_path),
+    )
+    .await?;
+
+    let stats = holding
+        .manual_eject_repository(&owner_hex, &args.identifier)
+        .await?;
+
+    println!(
+        "Holding ejection complete: owner={} identifier={} metadata_deleted={} payload_deleted={} archive_files_deleted={}",
+        owner_hex,
+        args.identifier,
+        stats.metadata_deleted,
+        stats.archived_events_deleted,
+        stats.archive_files_deleted
+    );
+
+    Ok(())
 }
 
 async fn run_relay(config: Config) -> Result<()> {
@@ -176,6 +229,21 @@ async fn run_relay(config: Config) -> Result<()> {
         relay_with_db
             .write_policy
             .set_local_relay(relay_with_db.relay.clone());
+
+        let blacklist_stats = relay_with_db
+            .write_policy
+            .run_startup_blacklist_parity_pass()
+            .await;
+        if blacklist_stats.scanned_announcements > 0 || blacklist_stats.matched_announcements > 0 {
+            info!(
+                scanned = blacklist_stats.scanned_announcements,
+                matched = blacklist_stats.matched_announcements,
+                attempted = blacklist_stats.attempted_deletions,
+                succeeded = blacklist_stats.successful_deletions,
+                failed = blacklist_stats.failed_deletions,
+                "Startup blacklist parity pass completed"
+            );
+        }
 
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling

@@ -68,6 +68,20 @@ When an IP exceeds the abuse threshold, a warning is logged but the IP is never 
 
 See [Prometheus Setup Guide](../how-to/prometheus-setup.md) for NixOS configuration and Grafana dashboard provisioning.
 
+## Deletion Lifecycle Metrics
+
+The deletion/recovery operational paths expose these additional metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ngit_blacklist_deletions_total` | Counter | `phase`, `result` | Startup blacklist parity deletion attempts/success/failure |
+| `ngit_holding_cleanup_runs_total` | Counter | - | Number of holding cleanup passes run |
+| `ngit_holding_cleanup_deleted_total` | Counter | `type` | Total deleted objects by cleanup (`metadata`, `payload`, `archive_file`) |
+| `ngit_holding_cleanup_last_run_deleted` | Gauge | `type` | Deleted object counts for most recent cleanup pass |
+| `ngit_recovery_total` | Counter | `result` | Recovery attempts and outcomes (`attempted`, `succeeded`, `failed`, `partial`) |
+| `ngit_manual_ejections_total` | Counter | - | Number of operator manual ejection operations |
+| `ngit_manual_ejection_deleted_total` | Counter | `type` | Objects removed by manual ejection (`metadata`, `payload`, `archive_file`) |
+
 ## Future: Load-Based Sync Scheduling (GRASP-02)
 
 The metrics infrastructure enables future load-based scheduling for GRASP-02 sync jobs:

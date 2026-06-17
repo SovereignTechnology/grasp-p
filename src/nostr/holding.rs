@@ -7,6 +7,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::BTreeSet, io::ErrorKind};
 
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
@@ -86,6 +87,14 @@ pub struct RecoveryMetadataRecord {
 pub struct CleanupStats {
     pub metadata_examined: usize,
     pub expired_records: usize,
+    pub metadata_deleted: usize,
+    pub archived_events_deleted: usize,
+    pub archive_files_deleted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ManualEjectionStats {
+    pub records_matched: usize,
     pub metadata_deleted: usize,
     pub archived_events_deleted: usize,
     pub archive_files_deleted: usize,
@@ -616,6 +625,109 @@ impl HoldingStore {
                 stats.archive_files_deleted += 1;
             }
         }
+
+        crate::metrics::record_holding_cleanup_run(
+            stats.metadata_deleted,
+            stats.archived_events_deleted,
+            stats.archive_files_deleted,
+        );
+
+        Ok(stats)
+    }
+
+    /// Permanently eject all holding/archive artifacts for one
+    /// `(owner_pubkey_hex, identifier)` scope.
+    ///
+    /// This is an idempotent operator operation intended for manual moderation.
+    /// Missing metadata/payload/archive files are tolerated.
+    pub async fn manual_eject_repository(
+        &self,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> anyhow::Result<ManualEjectionStats> {
+        let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
+        let metadata_events = self.db.query(filter).await.map_err(|e| {
+            anyhow::anyhow!("Failed to query holding metadata for manual ejection: {e}")
+        })?;
+
+        let mut records = Vec::new();
+        let mut archive_paths = BTreeSet::new();
+        for metadata_event in metadata_events {
+            if !Self::metadata_matches_recovery_scope(&metadata_event, owner_pubkey_hex, identifier)
+            {
+                continue;
+            }
+
+            let archive_relative_path = Self::parse_archive_relative_path(&metadata_event);
+            if let Some(path) = &archive_relative_path {
+                archive_paths.insert(path.clone());
+            }
+
+            records.push(RecoveryMetadataRecord {
+                metadata_event_id: metadata_event.id,
+                archived_event_id: Self::parse_archived_event_id(&metadata_event),
+                archive_relative_path,
+            });
+        }
+
+        let mut stats = ManualEjectionStats {
+            records_matched: records.len(),
+            ..ManualEjectionStats::default()
+        };
+
+        for record in &records {
+            let (metadata_deleted, payload_deleted) = self.delete_recovery_record(record).await?;
+            if metadata_deleted {
+                stats.metadata_deleted += 1;
+            }
+            if payload_deleted {
+                stats.archived_events_deleted += 1;
+            }
+        }
+
+        for relative_path in archive_paths {
+            let Some(absolute_path) = self.resolve_archive_path(&relative_path) else {
+                tracing::warn!(
+                    owner = %owner_pubkey_hex,
+                    identifier = %identifier,
+                    path = %relative_path,
+                    "Manual ejection skipped invalid archive path"
+                );
+                continue;
+            };
+
+            match std::fs::remove_file(&absolute_path) {
+                Ok(()) => {
+                    stats.archive_files_deleted += 1;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        owner = %owner_pubkey_hex,
+                        identifier = %identifier,
+                        path = %absolute_path.display(),
+                        error = %e,
+                        "Manual ejection failed deleting archive file"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            owner = %owner_pubkey_hex,
+            identifier = %identifier,
+            records_matched = stats.records_matched,
+            metadata_deleted = stats.metadata_deleted,
+            payload_deleted = stats.archived_events_deleted,
+            archive_files_deleted = stats.archive_files_deleted,
+            "Manual holding ejection completed"
+        );
+
+        crate::metrics::record_manual_ejection(
+            stats.metadata_deleted,
+            stats.archived_events_deleted,
+            stats.archive_files_deleted,
+        );
 
         Ok(stats)
     }

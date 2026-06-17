@@ -1,10 +1,10 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** ✅ **PARTIALLY IMPLEMENTED (Phases 1–5 live; Phase 6 deferred)**
+**Status:** ✅ **PARTIALLY IMPLEMENTED (core deletion lifecycle and ops visibility live; runtime hardening deferred)**
 
 This document now reflects both the implemented single-node deletion path
 (main DB + tombstones + holding DB + git archive lifecycle + recovery) and the
-still-planned Phase 6 operational hardening.
+still-planned runtime operational hardening.
 
 ---
 
@@ -173,7 +173,7 @@ The deletion system uses three separate data stores:
 ### Holding Database Operations
 
 **Automatic Operations:**
-- **Move to holding:** NIP-09 deletions, blacklist deletions
+- **Move to holding:** NIP-09 deletions, startup blacklist parity deletions
 - **Automatic recovery:** Re-publishing after NIP-09 deletion (within retention window)
 - **Expiry cleanup:** Daily background task removes entries older than retention period
 
@@ -181,7 +181,7 @@ The deletion system uses three separate data stores:
 - **Manual ejection:** Operator force-deletes before retention expires
   - Use case: Large repos consuming excessive storage
   - Use case: Confirmed malware requiring immediate permanent deletion
-  - Mechanism: CLI command or admin tool (design in Phase 6)
+  - Mechanism: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
   - Logged for audit trail
 - **Manual restoration:** Operator restores blacklisted repo after removal from blacklist
   - Future: May support automatic restoration
@@ -259,7 +259,7 @@ When `deletion_request_disrespector = true`:
 Result: Archival relay preserves all content
 ```
 
-**Important:** Disrespector mode ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions.
+**Important:** Disrespector mode ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions (including startup parity).
 
 **Rationale:**
 - NIP-09 deletions are user agency decisions (left-pad protection needed)
@@ -595,7 +595,7 @@ When implementation is complete, the following documentation will be updated:
 
 ### Completed in the current implementation
 
-The following are implemented now (recovery still pending):
+The following are implemented now:
 
 - ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
 - tombstone persistence and deletion re-submission gate
@@ -671,21 +671,32 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Recovery cleanup removes recovered holding metadata/payload and archive
   tracking artifacts.
 
-**Phase 6: Ops hardening and policy edge-cases** 🔄
-- Blacklist-triggered deletion parity and blacklist/disrespector interaction.
-- Manual ejection flow and safety/audit semantics.
-- Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
+**Ops parity + observability** ✅
+- Startup blacklist parity pass is implemented via
+  `Nip34WritePolicy::run_startup_blacklist_parity_pass`.
+- Matching stored announcements are deleted through the same cascade +
+  holding/archive pipeline as NIP-09, with holding metadata source set to
+  `blacklist`.
+- `deletion_request_disrespector` does not block blacklist-triggered moderation
+  deletion paths.
+- Manual operator ejection is available via:
+  - `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
+- Metrics are wired for blacklist deletions, holding cleanup runs/deletes,
+  recovery outcomes, and manual ejections.
+
+**Remaining hardening** 🔄
+- Dynamic blacklist update handling (runtime watcher/reconciliation).
+- Expanded operator controls (restore flows, confirmation UX).
 - Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
 
 ### Deferred items after Phase 5
 
 The remaining intentionally deferred items are:
 
-1. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
-   runtime blacklist-triggered deletion path in the codebase; when introduced,
-   it must route through holding with `DeletionSource::Blacklist`.
-2. **Manual/operator controls (Phase 6):** explicit ejection/restore workflows,
-   safety confirmation UX, and policy knobs beyond automatic owner re-announcement.
+1. **Runtime blacklist update handling:** blacklist reconciliation is
+   startup-only today.
+2. **Extended manual/operator controls:** restore workflows,
+   safety confirmation UX, and policy knobs beyond the current ejection command.
 
 > ✅ Resolved prerequisite from earlier plan: rust-nostr backend auto-processing
 > behavior is understood; ngit-grasp runs with `process_nip09(false)` and
@@ -727,17 +738,14 @@ The remaining intentionally deferred items are:
 
 ## Monitoring & Metrics
 
-**Prometheus Metrics (Planned):**
-- `ngit_deletion_requests_total` - Count of NIP-09 deletion requests received
-- `ngit_deletion_requests_processed` - Count actually processed (disrespector mode = 0)
-- `ngit_blacklist_deletions_total` - Count of blacklist-triggered deletions
-- `ngit_holding_database_events` - Current event count in holding DB
-- `ngit_holding_database_size_bytes` - Holding DB disk usage
-- `ngit_archive_files_total` - Count of archive tar.gz files
-- `ngit_archive_size_bytes` - Total archive disk usage
-- `ngit_recoveries_total` - Count of successful automatic recoveries
-- `ngit_permanent_deletions_total` - Count of events permanently deleted (post-retention)
-- `ngit_manual_ejections_total` - Count of operator-initiated ejections from holding area
+**Prometheus Metrics (implemented for current operational paths):**
+- `ngit_blacklist_deletions_total{phase,result}`
+- `ngit_holding_cleanup_runs_total`
+- `ngit_holding_cleanup_deleted_total{type}`
+- `ngit_holding_cleanup_last_run_deleted{type}`
+- `ngit_recovery_total{result}`
+- `ngit_manual_ejections_total`
+- `ngit_manual_ejection_deleted_total{type}`
 
 ## Testing Strategy
 
