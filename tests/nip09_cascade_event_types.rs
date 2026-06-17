@@ -240,3 +240,100 @@ async fn test_announcement_cascade_deletes_served_pr_chain_kinds() {
         "announcement deletion should cascade across PR-chain dependent kinds; survivors: {survivors:?}"
     );
 }
+
+#[tokio::test]
+async fn test_announcement_cascade_deletes_deep_mixed_reference_chain() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-deep-mixed-chain").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    // Root-dependent issue and patch via `a` tags.
+    let issue = client
+        .create_issue(&announcement, "Deep chain issue", "issue body", vec![])
+        .expect("build issue");
+    let patch = client
+        .event_builder(Kind::from(1617), "deep chain patch")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build patch");
+
+    // Mid-chain descendants mix `e` and `q` references.
+    let comment = client
+        .event_builder(Kind::from(1111), "comment on issue")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .build(&keys)
+        .expect("build issue comment");
+    let quote = client
+        .event_builder(Kind::from(1111), "quote patch and comment")
+        .tag(Tag::custom("q", vec![patch.id.to_hex()]))
+        .tag(Tag::custom("e", vec![comment.id.to_hex()]))
+        .build(&keys)
+        .expect("build quote event");
+
+    // Deep leaf status references quote by `q` and issue by `e`.
+    let status = client
+        .event_builder(Kind::from(1630), "deep chain status")
+        .tag(Tag::custom("q", vec![quote.id.to_hex()]))
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .build(&keys)
+        .expect("build deep status");
+
+    for event in [&issue, &patch, &comment, &quote, &status] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept deep-chain event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let deep_chain = [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("patch", patch.id),
+        ("comment", comment.id),
+        ("quote", quote.id),
+        ("status", status.id),
+    ];
+
+    for (label, id) in deep_chain {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let mut survivors = Vec::new();
+    for (label, id) in deep_chain {
+        let served = client
+            .is_event_on_relay(id)
+            .await
+            .expect("query event after deletion");
+        if served {
+            survivors.push(format!("{label} ({id})"));
+        }
+    }
+
+    relay.stop().await;
+
+    assert!(
+        survivors.is_empty(),
+        "announcement deletion should cascade through deep mixed-tag chains; survivors: {survivors:?}"
+    );
+}

@@ -534,3 +534,136 @@ async fn test_three_maintainers_subset_anchors_survive_middle_deletion() {
         "announcement B coordinate must not be served after deletion"
     );
 }
+
+#[tokio::test]
+async fn test_shared_subgraph_survives_when_one_anchor_path_removed() {
+    let relay = TestRelay::start().await;
+    let client_a = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create maintainer A client");
+    let client_b =
+        AuditClient::new_with_keys(relay.url(), AuditConfig::isolated(), Keys::generate())
+            .await
+            .expect("create maintainer B client");
+
+    let (announcement_a, repo_id) = publish_served_repo_with_maintainers(
+        &client_a,
+        "multi-shared-subgraph",
+        &[client_b.public_key().to_hex()],
+    )
+    .await;
+    let announcement_b = publish_served_announcement_for_identifier(&client_b, &repo_id).await;
+    let coordinate_a = announcement_coordinate(&announcement_a, &repo_id);
+    let coordinate_b = announcement_coordinate(&announcement_b, &repo_id);
+
+    // Top-level dependents under different anchoring conditions.
+    let top_shared = client_a
+        .event_builder(Kind::from(1617), "top shared A+B")
+        .tag(Tag::custom("a", vec![coordinate_a.clone()]))
+        .tag(Tag::custom("a", vec![coordinate_b.clone()]))
+        .build(client_a.keys())
+        .expect("build top shared event");
+    let top_unique_a = client_a
+        .event_builder(Kind::from(1617), "top unique A")
+        .tag(Tag::custom("a", vec![coordinate_a.clone()]))
+        .build(client_a.keys())
+        .expect("build top unique A event");
+
+    // Shared descendant references both tops and should survive through top_shared.
+    let shared_descendant = client_a
+        .event_builder(Kind::from(1111), "shared descendant")
+        .tag(Tag::custom("e", vec![top_shared.id.to_hex()]))
+        .tag(Tag::custom("e", vec![top_unique_a.id.to_hex()]))
+        .build(client_a.keys())
+        .expect("build shared descendant");
+
+    // Unique branch descendant should be deleted with top_unique_a.
+    let unique_descendant = client_a
+        .event_builder(Kind::from(1111), "unique descendant")
+        .tag(Tag::custom("e", vec![top_unique_a.id.to_hex()]))
+        .build(client_a.keys())
+        .expect("build unique descendant");
+
+    for event in [&top_shared, &top_unique_a, &shared_descendant, &unique_descendant] {
+        client_a
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept shared-subgraph event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement_a", announcement_a.id),
+        ("announcement_b", announcement_b.id),
+        ("top_shared", top_shared.id),
+        ("top_unique_a", top_unique_a.id),
+        ("shared_descendant", shared_descendant.id),
+        ("unique_descendant", unique_descendant.id),
+    ] {
+        assert!(
+            client_a
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    let deletion_a = build_deletion(&client_a, &[], std::slice::from_ref(&coordinate_a));
+    client_a
+        .send_event(deletion_a)
+        .await
+        .expect("relay should accept announcement A deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let announcement_a_survived = client_a
+        .is_event_on_relay(announcement_a.id)
+        .await
+        .expect("query announcement A after deletion");
+    let announcement_b_survived = client_b
+        .is_event_on_relay(announcement_b.id)
+        .await
+        .expect("query announcement B after deletion");
+    let top_shared_survived = client_a
+        .is_event_on_relay(top_shared.id)
+        .await
+        .expect("query top shared after deletion");
+    let top_unique_a_survived = client_a
+        .is_event_on_relay(top_unique_a.id)
+        .await
+        .expect("query top unique A after deletion");
+    let shared_descendant_survived = client_a
+        .is_event_on_relay(shared_descendant.id)
+        .await
+        .expect("query shared descendant after deletion");
+    let unique_descendant_survived = client_a
+        .is_event_on_relay(unique_descendant.id)
+        .await
+        .expect("query unique descendant after deletion");
+
+    relay.stop().await;
+
+    assert!(
+        !announcement_a_survived,
+        "announcement A must be hard-deleted"
+    );
+    assert!(announcement_b_survived, "announcement B must survive");
+    assert!(
+        top_shared_survived,
+        "top shared event must survive because anchor B remains"
+    );
+    assert!(
+        !top_unique_a_survived,
+        "top unique A event must be deleted after A deletion"
+    );
+    assert!(
+        shared_descendant_survived,
+        "shared descendant must survive through still-anchored top_shared path"
+    );
+    assert!(
+        !unique_descendant_survived,
+        "unique descendant must be deleted with the A-only branch"
+    );
+}
