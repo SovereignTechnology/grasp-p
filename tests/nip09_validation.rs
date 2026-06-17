@@ -18,7 +18,10 @@
 //! - deletion of a non-existent target is accepted (NIP-09 pre-emptive delete);
 //! - a pre-emptive delete that arrives *before* its target lays down a
 //!   tombstone, so the later-arriving target is rejected and never served;
-//! - malformed `a` coordinates are silently treated as no-ops (accepted).
+//! - malformed `a` coordinates are silently treated as no-ops (accepted);
+//! - the NIP-09 timestamp rule for `a`-coordinate deletions: a version of an
+//!   addressable event *newer* than the deletion request is accepted and served
+//!   (the deletion only applies up to its own `created_at`).
 //!
 //! `normal_mode_honours_deletion` in `nip09_disrespector.rs` already covers the
 //! "announcement deleted by `a` coordinate is removed" path, so it is NOT
@@ -737,5 +740,160 @@ async fn empty_deletion_currently_accepted() {
         result.is_ok(),
         "status quo: an empty kind-5 (no e/a tags) is currently accepted; got: {:?}",
         result.err()
+    );
+}
+
+/// 7. NIP-09 timestamp rule for addressable events: an `a`-coordinate deletion
+///    only deletes versions of that coordinate with `created_at` *up to* the
+///    deletion request's `created_at`. A NEWER version of the same coordinate,
+///    published after the deletion, must be accepted and served — the deletion
+///    must not censor it.
+///
+/// To keep this focused on the NIP-09 timestamp rule (and away from the
+/// purgatory/git-promotion machinery that kind-30617 announcements require), the
+/// addressable event under test is a generic kind-30078 (NIP-78
+/// application-specific data) event that references the promoted repo by its `a`
+/// coordinate. Like an issue, a referencing event is a Layer-2 event served
+/// immediately — but unlike an issue it is *addressable*, so the NIP-09
+/// `created_at` rule for `a`-tag deletions applies to it.
+///
+/// Flow:
+///   1. Promote a repo announcement (served) to anchor referencing events.
+///   2. Publish addressable event v1 (kind 30078, own `d`) referencing the repo;
+///      it is served immediately.
+///   3. Delete it by its own `a` coordinate (`30078:<pubkey>:<d>`), with the
+///      deletion's `created_at == now`.
+///   4. Verify v1 is gone.
+///   5. Publish v2 of the SAME coordinate with a strictly newer `created_at` and
+///      assert it is accepted and served — the deletion must not block it.
+///
+/// This is the served/main-DB counterpart of the purgatory-only unit test
+/// `test_deletion_by_coordinate_respects_created_at` in
+/// `src/nostr/policy/deletion.rs`, and exercises the resubmission gate's
+/// `is_coordinate_deleted` timestamp check (a newer event must NOT be blocked).
+#[tokio::test]
+async fn newer_addressable_event_survives_a_tag_deletion() {
+    // A generic addressable (parameterized-replaceable) kind in the 30000-39999
+    // range. NIP-78 application-specific data; any addressable kind works.
+    const ADDRESSABLE_KIND: u16 = 30078;
+
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    // Stage 1: promote a repo so referencing events are accepted/served.
+    let (announcement, repo_id) = publish_served_repo(&client, "newer-survives").await;
+    let repo_coord = announcement_coordinate(&announcement, &repo_id);
+
+    // Build the addressable coordinate under test: `30078:<pubkey>:<d>`.
+    let addr_d = format!("note-{}", &repo_id);
+    let addr_coord = format!(
+        "{}:{}:{}",
+        ADDRESSABLE_KIND,
+        client.public_key().to_hex(),
+        addr_d
+    );
+
+    // Helper: build a kind-30078 addressable event referencing the repo's `a`
+    // coordinate, with the given content and created_at.
+    let build_addressable = |content: &str, ts: Timestamp| {
+        client
+            .event_builder(Kind::from(ADDRESSABLE_KIND), content)
+            .tag(Tag::identifier(&addr_d))
+            .tag(Tag::custom("a", vec![repo_coord.clone()]))
+            .custom_time(ts)
+            .build(client.keys())
+            .expect("build addressable event")
+    };
+
+    // Stage 2: publish addressable v1 (older). It references the promoted repo,
+    // so it is a Layer-2 event served immediately.
+    let v1 = build_addressable("version 1", Timestamp::now());
+    let v1_id = v1.id;
+    client
+        .send_event(v1.clone())
+        .await
+        .expect("relay should accept addressable event referencing the repo");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        client
+            .is_event_on_relay(v1_id)
+            .await
+            .expect("query v1 before deletion"),
+        "addressable v1 should be served before deletion"
+    );
+
+    // Stage 3: delete v1 by its own `a` coordinate. The deletion's created_at is
+    // "now", so only versions at or before now are deleted.
+    let deletion = build_deletion(&client, &[], &[addr_coord.clone()]);
+    let deletion_ts = deletion.created_at;
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept deletion by coordinate");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Stage 4: v1 must be gone.
+    assert!(
+        !client
+            .is_event_on_relay(v1_id)
+            .await
+            .expect("query v1 after deletion"),
+        "addressable v1 {} should be deleted by its a coordinate",
+        v1_id
+    );
+
+    // Stage 5: publish v2 of the SAME coordinate with a strictly newer
+    // created_at than the deletion request. The resubmission gate must NOT block
+    // it (it is newer than the deletion), so it is accepted and served.
+    let newer_ts = Timestamp::from(deletion_ts.as_secs() + 60);
+    let v2 = build_addressable("version 2", newer_ts);
+    let v2_id = v2.id;
+    assert!(
+        v2.created_at > deletion_ts,
+        "v2 must be strictly newer than the deletion request"
+    );
+
+    client
+        .send_event(v2.clone())
+        .await
+        .expect("relay should accept an addressable event newer than the deletion request");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let served_by_id = client
+        .is_event_on_relay(v2_id)
+        .await
+        .expect("query v2 by id");
+
+    // Also confirm it is served via a real NIP-01 addressable-event query
+    // (author + kind + d identifier), not just by id.
+    let coord_filter = Filter::new()
+        .kind(Kind::from(ADDRESSABLE_KIND))
+        .author(client.public_key())
+        .identifier(&addr_d);
+    let served_by_coord = client
+        .query(coord_filter)
+        .await
+        .expect("query v2 by coordinate")
+        .iter()
+        .any(|e| e.id == v2_id);
+
+    relay.stop().await;
+
+    assert!(
+        served_by_id,
+        "newer addressable v2 {} must be served (by-id): a NIP-09 deletion \
+         must not censor a version newer than the deletion request",
+        v2_id
+    );
+    assert!(
+        served_by_coord,
+        "newer addressable v2 {} must be served (by author+kind+identifier): \
+         a NIP-09 deletion must not censor a version newer than the deletion request",
+        v2_id
     );
 }
