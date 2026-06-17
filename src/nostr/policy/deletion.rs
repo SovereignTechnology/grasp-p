@@ -29,12 +29,37 @@
 ///
 /// Author ownership is enforced before any main-DB deletion or tombstone
 /// recording: only the original author may delete their event.
+use std::collections::{HashMap, HashSet};
+
 use nostr_relay_builder::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, WritePolicyResult,
+    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
+    WritePolicyResult,
 };
 
-use super::PolicyContext;
+use super::{PolicyContext, RetentionReason};
 use crate::nostr::policy::reject_invalid;
+
+/// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
+/// state event) that participate in the repository dependency graph. These are
+/// the events that can become orphaned when an announcement is deleted: they
+/// reference the announcement directly via an `a` tag or transitively via
+/// `e`/`q` tags to other graph members.
+///
+/// Kept deliberately broad (issues, patches, PR/PR-updates, the four status
+/// kinds, and NIP-22 comments) so the cascade can reach the whole reachable
+/// sub-graph. Kind 30618 (repository state) is intentionally excluded because
+/// it is keyed by a `d` tag rather than connected via graph edges.
+const GRAPH_DEPENDENT_KINDS: &[u16] = &[
+    1111, // NIP-22 comment
+    1617, // patch
+    1618, // pull request
+    1619, // PR update
+    1621, // issue
+    1630, // issue status
+    1631, // PR status
+    1632, // patch status
+    1633, // repository status
+];
 
 /// Policy for handling NIP-09 event deletion requests
 #[derive(Clone)]
@@ -156,14 +181,212 @@ impl DeletionPolicy {
 
         // `a` tags: delete matching addressable/replaceable events up to the
         // deletion's created_at.
+        //
+        // A kind-30617 announcement coordinate authored by the deletion author
+        // triggers the graph-based cascade: the announcement is deleted AND
+        // every dependent event that becomes orphaned (no longer reachable from
+        // a surviving maintainer's announcement) is hard-deleted too. Every
+        // other coordinate keeps the simple "delete this coordinate" behaviour.
         for tag in event.tags.iter() {
             let v = tag.as_slice();
             if v.len() < 2 || v[0] != "a" {
                 continue;
             }
-            self.delete_coordinate_from_main_db(&event.pubkey, &v[1], event.created_at)
-                .await;
+            if Self::is_announcement_coordinate_for_author(&v[1], &event.pubkey) {
+                self.cascade_delete_announcement(&event.pubkey, &v[1], event.created_at)
+                    .await;
+            } else {
+                self.delete_coordinate_from_main_db(&event.pubkey, &v[1], event.created_at)
+                    .await;
+            }
         }
+    }
+
+    /// Whether `coordinate` is a kind-30617 announcement coordinate whose
+    /// pubkey matches `author`.
+    ///
+    /// Only such coordinates trigger the graph-based cascade path; everything
+    /// else (other kinds, or a 30617 coordinate naming a different pubkey)
+    /// stays on the simple deletion path.
+    fn is_announcement_coordinate_for_author(coordinate: &str, author: &PublicKey) -> bool {
+        let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
+        parts.len() == 3 && parts[0] == "30617" && parts[1] == author.to_hex()
+    }
+
+    /// Graph-based cascade deletion of a repository announcement.
+    ///
+    /// Mirrors the algorithm order of the multi-maintainer deletion design:
+    ///
+    /// 1. Query the candidate event set (the announcement's siblings + all
+    ///    NIP-34 dependent events) and build the dependency graph via
+    ///    [`super::build_event_graph`] (a/e/q tag edges).
+    /// 2. Re-evaluate the candidate events WITHOUT the deleted announcement but
+    ///    WITH every OTHER maintainer's announcement for the same identifier via
+    ///    [`super::reevaluate_events_without_announcement`], yielding the
+    ///    kept/deleted split (multi-maintainer retention).
+    /// 3. Add every surviving announcement (a different identifier, or the same
+    ///    identifier authored by a different maintainer) to the kept set so the
+    ///    traversal keeps everything still anchored to a live announcement.
+    /// 4. Traverse the graph from the kept announcements via
+    ///    [`super::traverse_and_mark_deletions`] to compute the final orphan
+    ///    set (events unreachable from any surviving announcement).
+    /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
+    ///    itself from the main DB.
+    ///
+    /// All holding-DB / archival / recovery orchestration from the original
+    /// multi-maintainer prototype is deliberately omitted — this is a pure
+    /// hard-delete cascade.
+    async fn cascade_delete_announcement(
+        &self,
+        author: &PublicKey,
+        announcement_addr: &str,
+        deletion_created_at: Timestamp,
+    ) {
+        // Parse `30617:<pubkey>:<identifier>` (already validated as a 30617
+        // coordinate for this author, but re-parse defensively).
+        let parts: Vec<&str> = announcement_addr.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return;
+        }
+
+        // Step 1: candidate event set — all announcements (to know which other
+        // maintainers survive) plus all NIP-34 dependent events.
+        let candidates = match self.query_cascade_candidates().await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(error = %e, "Cascade deletion: failed to query candidate events; falling back to simple coordinate deletion");
+                self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
+                    .await;
+                return;
+            }
+        };
+
+        let graph = super::build_event_graph(&candidates);
+
+        // The set of candidate event ids we feed into re-evaluation. The
+        // re-evaluation engine queries each one back from the DB; passing the
+        // full candidate set lets it decide retention for every dependent.
+        let candidate_ids: HashSet<EventId> = candidates.iter().map(|e| e.id).collect();
+
+        // Step 2: re-evaluate dependents WITHOUT the deleted announcement but
+        // WITH any other surviving maintainers' announcements.
+        let reeval = match super::reevaluate_events_without_announcement(
+            &self.ctx.database,
+            announcement_addr,
+            &candidate_ids,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "Cascade deletion: re-evaluation failed; falling back to simple coordinate deletion");
+                self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
+                    .await;
+                return;
+            }
+        };
+
+        let mut kept_events: HashMap<EventId, RetentionReason> = reeval.keep;
+
+        // Step 3: any announcement that is NOT the one being deleted is a
+        // surviving anchor. Add it to the kept set (with a Repository
+        // Announcement retention reason) so the traversal starts from it. This
+        // covers both "different identifier" and "same identifier, different
+        // maintainer" survivors.
+        for event in &candidates {
+            if event.kind != Kind::GitRepoAnnouncement {
+                continue;
+            }
+            let event_addr = announcement_address_of(event);
+            if event_addr == announcement_addr {
+                // This is the announcement being deleted — do not keep it.
+                continue;
+            }
+            kept_events
+                .entry(event.id)
+                .or_insert_with(|| RetentionReason {
+                    event_id: event.id,
+                    valid_announcements: vec![event_addr],
+                    event_type: "Repository Announcement".to_string(),
+                });
+        }
+
+        // Step 4: traverse from kept announcements to find the final orphans.
+        let deleted_announcement_id = candidates
+            .iter()
+            .find(|e| {
+                e.kind == Kind::GitRepoAnnouncement
+                    && announcement_address_of(e) == announcement_addr
+            })
+            .map(|e| e.id)
+            .unwrap_or_else(EventId::all_zeros);
+
+        let traversal =
+            super::traverse_and_mark_deletions(&graph, &kept_events, deleted_announcement_id);
+
+        tracing::info!(
+            announcement = %announcement_addr,
+            kept = traversal.keep.len(),
+            deleted = traversal.delete.len(),
+            circular = traversal.circular_dependencies.len(),
+            "Announcement cascade deletion: graph traversal complete"
+        );
+        for circular in &traversal.circular_dependencies {
+            tracing::debug!(
+                events = ?circular.events,
+                anchored = circular.anchored,
+                "Cascade deletion: circular dependency"
+            );
+        }
+
+        // Step 5a: hard-delete the orphaned dependent events by id.
+        let orphan_ids: Vec<EventId> = traversal.delete.into_iter().collect();
+        if !orphan_ids.is_empty() {
+            tracing::debug!(
+                count = orphan_ids.len(),
+                "Cascade deletion: hard-deleting orphaned events"
+            );
+            let filter = Filter::new().ids(orphan_ids);
+            if let Err(e) = self.ctx.database.delete(filter).await {
+                tracing::warn!(error = %e, "Cascade deletion: failed to delete orphaned events");
+            }
+        }
+
+        // Step 5b: hard-delete the announcement coordinate itself (up to the
+        // deletion's created_at, per NIP-09), exactly as the simple path does.
+        self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
+            .await;
+    }
+
+    /// Query the candidate event set for the cascade graph: every repository
+    /// announcement (so surviving maintainers can be identified) plus every
+    /// NIP-34 dependent event kind.
+    async fn query_cascade_candidates(&self) -> Result<Vec<Event>, String> {
+        let mut events = Vec::new();
+
+        // All announcements.
+        let ann_filter = Filter::new().kind(Kind::GitRepoAnnouncement);
+        events.extend(
+            self.ctx
+                .database
+                .query(ann_filter)
+                .await
+                .map_err(|e| format!("query announcements failed: {e}"))?,
+        );
+
+        // All dependent kinds.
+        for kind_num in GRAPH_DEPENDENT_KINDS {
+            let filter = Filter::new().kind(Kind::from(*kind_num));
+            events.extend(
+                self.ctx
+                    .database
+                    .query(filter)
+                    .await
+                    .map_err(|e| format!("query kind {kind_num} failed: {e}"))?,
+            );
+        }
+
+        Ok(events)
     }
 
     /// Delete events matching an `a`-tag coordinate from the main database.
@@ -445,6 +668,24 @@ impl DeletionPolicy {
             self.ctx.purgatory.remove_state(identifier);
         }
     }
+}
+
+/// Build the `30617:<pubkey>:<identifier>` coordinate string for a kind-30617
+/// announcement event (the identifier comes from its `d` tag).
+fn announcement_address_of(event: &Event) -> String {
+    let identifier = event
+        .tags
+        .iter()
+        .find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "d" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    format!("30617:{}:{}", event.pubkey.to_hex(), identifier)
 }
 
 #[cfg(test)]
