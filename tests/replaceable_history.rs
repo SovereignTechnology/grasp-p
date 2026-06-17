@@ -279,3 +279,56 @@ async fn serving_behavior_unchanged_latest_version_is_still_served() {
 
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn history_not_captured_for_purgatory_only_announcement() {
+    let relay = TestRelay::start_with_lmdb().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let relay_url = client
+        .relay_url()
+        .await
+        .expect("client should have relay url");
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let npub = client.public_key().to_bech32().expect("pubkey to npub");
+    let repo_id = format!(
+        "history-purgatory-only-{}",
+        &Keys::generate().public_key().to_hex()[..8]
+    );
+
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::identifier(&repo_id),
+            Tag::custom("name", vec![repo_id.clone()]),
+            Tag::custom(
+                "clone",
+                vec![format!("http://{}/{}/{}.git", relay_domain, npub, repo_id)],
+            ),
+            Tag::custom("relays", vec![relay_url]),
+        ])
+        .finalize(client.keys())
+        .expect("build purgatory-only announcement");
+
+    client
+        .send_event(announcement)
+        .await
+        .expect("send announcement to purgatory");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let coordinate = format!("30617:{}:{}", client.public_key().to_hex(), repo_id);
+    let history = open_history(relay.relay_data_path()).await;
+    let latest = history
+        .latest_superseded_before(&coordinate, Timestamp::now())
+        .await;
+    assert!(
+        latest.is_none(),
+        "purgatory-only announcements must not capture superseded history"
+    );
+
+    relay.stop().await;
+}

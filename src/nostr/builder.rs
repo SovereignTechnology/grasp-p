@@ -378,9 +378,6 @@ impl Nip34WritePolicy {
                             "Accepted announcement to purgatory: {} (waiting for git data)",
                             event_id_str
                         );
-
-                        self.capture_superseded_replaceable_history(event).await;
-
                         accepted_purgatory("won't be served until git data arrives")
                     }
                     Err(e) => {
@@ -880,10 +877,7 @@ impl Nip34WritePolicy {
     }
 
     fn event_persists_to_main_db(result: &WritePolicyResult) -> bool {
-        matches!(
-            result,
-            WritePolicyResult::Accept | WritePolicyResult::Reject { status: true, .. }
-        )
+        matches!(result, WritePolicyResult::Accept)
     }
 
     async fn capture_superseded_replaceable_history(&self, incoming: &Event) {

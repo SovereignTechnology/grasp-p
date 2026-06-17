@@ -183,6 +183,36 @@ impl ReplaceableHistoryStore {
             .collect()
     }
 
+    /// Return the latest superseded record at or before `cutoff` for a coordinate.
+    ///
+    /// Ordering is deterministic:
+    /// 1. `superseded_at` descending (missing treated as 0)
+    /// 2. `captured_at` descending (missing treated as 0)
+    /// 3. `metadata_event_id` descending
+    pub async fn latest_superseded_before(
+        &self,
+        coordinate: &str,
+        cutoff: Timestamp,
+    ) -> Option<SupersededRecord> {
+        let mut records = self
+            .superseded_records_for_coordinate_before(coordinate, cutoff)
+            .await;
+
+        records.sort_by(|a, b| {
+            b.superseded_at
+                .unwrap_or_else(|| Timestamp::from_secs(0))
+                .cmp(&a.superseded_at.unwrap_or_else(|| Timestamp::from_secs(0)))
+                .then_with(|| {
+                    b.captured_at
+                        .unwrap_or_else(|| Timestamp::from_secs(0))
+                        .cmp(&a.captured_at.unwrap_or_else(|| Timestamp::from_secs(0)))
+                })
+                .then_with(|| b.metadata_event_id.cmp(&a.metadata_event_id))
+        });
+
+        records.into_iter().next()
+    }
+
     pub async fn event_by_id(&self, id: &EventId) -> anyhow::Result<Option<Event>> {
         self.db
             .event_by_id(id)
@@ -297,5 +327,59 @@ mod tests {
             .expect("lookup")
             .expect("payload exists");
         assert_eq!(payload.id, v1.id);
+    }
+
+    #[tokio::test]
+    async fn latest_superseded_before_prefers_newest_superseded_timestamp() {
+        let store = ReplaceableHistoryStore::in_memory();
+        let keys = Keys::generate();
+        let coord = format!("30617:{}:repo", keys.public_key().to_hex());
+
+        let v1 = announcement(&keys, "repo", 100, "v1");
+        let v2 = announcement(&keys, "repo", 120, "v2");
+        let v3 = announcement(&keys, "repo", 140, "v3");
+
+        store
+            .archive_superseded_event(&v1, &v2, &coord)
+            .await
+            .expect("archive v1");
+        store
+            .archive_superseded_event(&v2, &v3, &coord)
+            .await
+            .expect("archive v2");
+
+        let latest = store
+            .latest_superseded_before(&coord, Timestamp::from_secs(200))
+            .await
+            .expect("latest record");
+
+        assert_eq!(latest.superseded_event_id, Some(v2.id));
+    }
+
+    #[tokio::test]
+    async fn latest_superseded_before_respects_cutoff() {
+        let store = ReplaceableHistoryStore::in_memory();
+        let keys = Keys::generate();
+        let coord = format!("30617:{}:repo", keys.public_key().to_hex());
+
+        let v1 = announcement(&keys, "repo", 100, "v1");
+        let v2 = announcement(&keys, "repo", 120, "v2");
+        let v3 = announcement(&keys, "repo", 140, "v3");
+
+        store
+            .archive_superseded_event(&v1, &v2, &coord)
+            .await
+            .expect("archive v1");
+        store
+            .archive_superseded_event(&v2, &v3, &coord)
+            .await
+            .expect("archive v2");
+
+        let latest = store
+            .latest_superseded_before(&coord, Timestamp::from_secs(110))
+            .await
+            .expect("latest record before cutoff");
+
+        assert_eq!(latest.superseded_event_id, Some(v1.id));
     }
 }

@@ -43,6 +43,12 @@ use nostr_relay_builder::prelude::{
 use tar::Builder as TarBuilder;
 
 use super::{PolicyContext, RetentionReason};
+use crate::git;
+use crate::git::authorization::{
+    collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
+};
+use crate::git::process;
+use crate::nostr::events::RepositoryState;
 use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 use crate::nostr::policy::reject_invalid;
 
@@ -74,6 +80,14 @@ const GRAPH_DEPENDENT_KINDS: &[u16] = &[
 #[derive(Clone)]
 pub struct DeletionPolicy {
     ctx: PolicyContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StateRollbackPlan {
+    coordinate: String,
+    identifier: String,
+    deleted_event_id: EventId,
+    cutoff: Timestamp,
 }
 
 impl DeletionPolicy {
@@ -140,12 +154,24 @@ impl DeletionPolicy {
             }
         }
 
+        let rollback_plans = self.collect_state_rollback_plans(event).await;
+
         // Process purgatory removals (synchronous, in-memory).
         self.remove_purgatory_targets(event);
 
         // Move targeted events into holding DB, then delete from main DB.
         let mut moved_ids = HashSet::new();
         self.delete_main_db_targets(event, &mut moved_ids).await;
+
+        let mut identifiers_to_realign = HashSet::new();
+        for plan in rollback_plans {
+            identifiers_to_realign.insert(plan.identifier.clone());
+            self.rollback_deleted_active_state(&plan).await;
+        }
+
+        for identifier in identifiers_to_realign {
+            self.realign_identifier_state(&identifier).await;
+        }
 
         // Record the deletion so future re-submission is rejected.
         if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
@@ -171,6 +197,358 @@ impl DeletionPolicy {
                 }
             })
             .collect()
+    }
+
+    async fn collect_state_rollback_plans(&self, deletion: &Event) -> Vec<StateRollbackPlan> {
+        let mut plans = Vec::new();
+
+        for target_id in Self::e_tag_ids(deletion) {
+            let Ok(Some(target)) = self.ctx.database.event_by_id(&target_id).await else {
+                continue;
+            };
+
+            if target.kind != Kind::RepoState || target.pubkey != deletion.pubkey {
+                continue;
+            }
+
+            let Some(identifier) = identifier_from_event(&target) else {
+                continue;
+            };
+
+            let Some(active) = self
+                .latest_state_for_coordinate(&target.pubkey, &identifier, None)
+                .await
+            else {
+                continue;
+            };
+
+            if active.id != target.id {
+                continue;
+            }
+
+            plans.push(StateRollbackPlan {
+                coordinate: format!("30618:{}:{}", target.pubkey.to_hex(), identifier),
+                identifier,
+                deleted_event_id: target.id,
+                cutoff: target.created_at,
+            });
+        }
+
+        for coordinate in Self::a_tag_coordinates(deletion) {
+            let Some((kind, coord_pubkey, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if kind != Kind::RepoState || coord_pubkey != deletion.pubkey {
+                continue;
+            }
+
+            let Some(active_any_cutoff) = self
+                .latest_state_for_coordinate(&coord_pubkey, &identifier, None)
+                .await
+            else {
+                continue;
+            };
+
+            if active_any_cutoff.created_at > deletion.created_at {
+                continue;
+            }
+
+            plans.push(StateRollbackPlan {
+                coordinate,
+                identifier,
+                deleted_event_id: active_any_cutoff.id,
+                cutoff: deletion.created_at,
+            });
+        }
+
+        plans
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn a_tag_coordinates(event: &Event) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let v = tag.as_slice();
+                if v.len() >= 2 && v[0] == "a" {
+                    Some(v[1].clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn parse_coordinate(coordinate: &str) -> Option<(Kind, PublicKey, String)> {
+        let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let kind_num = parts[0].parse::<u16>().ok()?;
+        let pubkey = PublicKey::from_hex(parts[1]).ok()?;
+        Some((Kind::from(kind_num), pubkey, parts[2].to_string()))
+    }
+
+    async fn latest_state_for_coordinate(
+        &self,
+        author: &PublicKey,
+        identifier: &str,
+        until: Option<Timestamp>,
+    ) -> Option<Event> {
+        let mut filter = Filter::new()
+            .kind(Kind::RepoState)
+            .author(*author)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                identifier.to_string(),
+            );
+        if let Some(cutoff) = until {
+            filter = filter.until(cutoff);
+        }
+
+        let Ok(events) = self.ctx.database.query(filter).await else {
+            return None;
+        };
+
+        events.into_iter().max_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        })
+    }
+
+    async fn rollback_deleted_active_state(&self, plan: &StateRollbackPlan) {
+        let Some(record) = self
+            .ctx
+            .history
+            .latest_superseded_before(&plan.coordinate, plan.cutoff)
+            .await
+        else {
+            tracing::info!(
+                coordinate = %plan.coordinate,
+                deleted_event_id = %plan.deleted_event_id.to_hex(),
+                cutoff = plan.cutoff.as_secs(),
+                "No rollback candidate in history; entering no-active-state path"
+            );
+            return;
+        };
+
+        let Some(candidate_id) = record.superseded_event_id else {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                metadata_event_id = %record.metadata_event_id.to_hex(),
+                "History record missing superseded event id; cannot rollback"
+            );
+            return;
+        };
+
+        let candidate = match self.ctx.history.event_by_id(&candidate_id).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                tracing::warn!(
+                    coordinate = %plan.coordinate,
+                    candidate_id = %candidate_id.to_hex(),
+                    "History payload missing for rollback candidate"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    coordinate = %plan.coordinate,
+                    candidate_id = %candidate_id.to_hex(),
+                    error = %e,
+                    "History lookup failed for rollback candidate"
+                );
+                return;
+            }
+        };
+
+        let Ok(candidate_state) = RepositoryState::from_event(candidate.clone()) else {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                "Rollback candidate is not a valid state event"
+            );
+            return;
+        };
+
+        let repo_data = match fetch_repository_data_excluding_purgatory(
+            &self.ctx.database,
+            &candidate_state.identifier,
+        )
+        .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(
+                    coordinate = %plan.coordinate,
+                    error = %e,
+                    "Failed to load repository data before rollback"
+                );
+                return;
+            }
+        };
+
+        if crate::git::authorization::pubkey_authorised_for_repo_owners(
+            &candidate.pubkey,
+            &repo_data,
+        )
+        .is_empty()
+        {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                author = %candidate.pubkey.to_hex(),
+                "Rollback candidate author is no longer authorized; skipping restore"
+            );
+            return;
+        }
+
+        if let Err(e) = self.ctx.database.save_event(&candidate).await {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                error = %e,
+                "Failed to restore rollback candidate into main DB"
+            );
+            return;
+        }
+
+        tracing::info!(
+            coordinate = %plan.coordinate,
+            deleted_event_id = %plan.deleted_event_id.to_hex(),
+            restored_event_id = %candidate.id.to_hex(),
+            "Restored deleted active state from replaceable history"
+        );
+    }
+
+    async fn realign_identifier_state(&self, identifier: &str) {
+        let repo_data =
+            match fetch_repository_data_excluding_purgatory(&self.ctx.database, identifier).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        identifier = %identifier,
+                        error = %e,
+                        "Failed to reload repository data for post-deletion state alignment"
+                    );
+                    return;
+                }
+            };
+
+        if repo_data.announcements.is_empty() {
+            return;
+        }
+
+        let by_owner = collect_authorized_maintainers(&repo_data.announcements);
+
+        for announcement in &repo_data.announcements {
+            let owner_hex = announcement.event.pubkey.to_hex();
+            let Some(maintainers) = by_owner.get(&owner_hex) else {
+                continue;
+            };
+
+            let target_repo_path = self.ctx.git_data_path.join(announcement.repo_path());
+            if !target_repo_path.is_dir() {
+                continue;
+            }
+
+            let latest_state = repo_data
+                .states
+                .iter()
+                .filter(|state| maintainers.contains(&state.event.pubkey.to_hex()))
+                .max_by(|a, b| {
+                    a.event
+                        .created_at
+                        .cmp(&b.event.created_at)
+                        .then_with(|| a.event.id.cmp(&b.event.id))
+                });
+
+            match latest_state {
+                Some(state) => {
+                    let source_repo_path =
+                        repo_data
+                            .announcements
+                            .iter()
+                            .find_map(|candidate_announcement| {
+                                let candidate_path = self
+                                    .ctx
+                                    .git_data_path
+                                    .join(candidate_announcement.repo_path());
+                                if candidate_path.is_dir()
+                                    && state.branches.iter().all(|branch| {
+                                        branch.commit.starts_with("ref: ")
+                                            || git::oid_exists(&candidate_path, &branch.commit)
+                                    })
+                                    && state
+                                        .tags
+                                        .iter()
+                                        .all(|tag| git::oid_exists(&candidate_path, &tag.commit))
+                                {
+                                    Some(candidate_path)
+                                } else {
+                                    None
+                                }
+                            });
+
+                    if let Some(source_repo_path) = source_repo_path {
+                        let result = process::process_state_with_git_data(
+                            state,
+                            &source_repo_path,
+                            &repo_data,
+                            &self.ctx.git_data_path,
+                        );
+                        tracing::info!(
+                            identifier = %identifier,
+                            owner = %owner_hex,
+                            state_event_id = %state.event.id.to_hex(),
+                            repos_synced = result.repos_synced,
+                            refs_created = result.refs_created,
+                            refs_updated = result.refs_updated,
+                            refs_deleted = result.refs_deleted,
+                            "Realigned git refs after state deletion/rollback"
+                        );
+                    }
+                }
+                None => {
+                    let refs = match git::list_refs(&target_repo_path) {
+                        Ok(refs) => refs,
+                        Err(e) => {
+                            tracing::warn!(
+                                identifier = %identifier,
+                                owner = %owner_hex,
+                                repo = %target_repo_path.display(),
+                                error = %e,
+                                "Failed to list refs for no-active-state cleanup"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let mut deleted_refs = 0usize;
+                    for (ref_name, _) in refs {
+                        if (ref_name.starts_with("refs/heads/")
+                            || ref_name.starts_with("refs/tags/"))
+                            && git::delete_ref(&target_repo_path, &ref_name).is_ok()
+                        {
+                            deleted_refs += 1;
+                        }
+                    }
+
+                    tracing::info!(
+                        identifier = %identifier,
+                        owner = %owner_hex,
+                        repo = %target_repo_path.display(),
+                        deleted_refs,
+                        "No active authorized state remains; cleared managed refs"
+                    );
+                }
+            }
+        }
     }
 
     /// Hard-delete the targeted events from the main database.
