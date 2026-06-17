@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Result;
 use clap::Parser;
 use tokio::signal;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -309,6 +310,82 @@ async fn run_relay(config: Config) -> Result<()> {
         // Start HTTP server with integrated relay and database
         info!("Starting HTTP server on {}", config.bind_address);
 
+        // Holding DB expiry engine:
+        // 1) startup catch-up pass (runs once)
+        // 2) periodic background cleanup pass
+        let holding_cleanup_store = relay_with_db.holding.clone();
+        match holding_cleanup_store
+            .cleanup_expired(
+                nostr_sdk::prelude::Timestamp::now(),
+                nostr::holding::DEFAULT_RETENTION,
+            )
+            .await
+        {
+            Ok(stats) => {
+                if stats.expired_records > 0 {
+                    info!(
+                        examined = stats.metadata_examined,
+                        expired = stats.expired_records,
+                        metadata_deleted = stats.metadata_deleted,
+                        archived_events_deleted = stats.archived_events_deleted,
+                        "Holding cleanup startup catch-up completed"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Holding cleanup startup catch-up failed");
+            }
+        }
+
+        let (holding_cleanup_shutdown_tx, mut holding_cleanup_shutdown_rx) = watch::channel(false);
+        let holding_cleanup_interval = nostr::holding::DEFAULT_CLEANUP_INTERVAL;
+        let holding_cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + holding_cleanup_interval,
+                holding_cleanup_interval,
+            );
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match holding_cleanup_store
+                            .cleanup_expired(
+                                nostr_sdk::prelude::Timestamp::now(),
+                                nostr::holding::DEFAULT_RETENTION,
+                            )
+                            .await
+                        {
+                            Ok(stats) => {
+                                if stats.expired_records > 0 {
+                                    info!(
+                                        examined = stats.metadata_examined,
+                                        expired = stats.expired_records,
+                                        metadata_deleted = stats.metadata_deleted,
+                                        archived_events_deleted = stats.archived_events_deleted,
+                                        "Holding cleanup periodic pass completed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Holding cleanup periodic pass failed");
+                            }
+                        }
+                    }
+                    changed = holding_cleanup_shutdown_rx.changed() => {
+                        if changed.is_ok() && *holding_cleanup_shutdown_rx.borrow() {
+                            info!("Holding cleanup task received shutdown signal");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        info!(
+            retention_secs = nostr::holding::DEFAULT_RETENTION.as_secs(),
+            interval_secs = nostr::holding::DEFAULT_CLEANUP_INTERVAL.as_secs(),
+            "Holding cleanup task started"
+        );
+
         // Wrap write_policy in Arc for sharing between HTTP server connections
         let http_write_policy = Arc::new(relay_with_db.write_policy.clone());
 
@@ -359,6 +436,12 @@ async fn run_relay(config: Config) -> Result<()> {
                     info!("Received SIGINT (Ctrl+C), cleaning up...");
                 }
             }
+        }
+
+        // Stop holding cleanup task cleanly.
+        let _ = holding_cleanup_shutdown_tx.send(true);
+        if let Err(e) = holding_cleanup_task.await {
+            warn!(error = %e, "Holding cleanup task join failed during shutdown");
         }
 
         // Save purgatory state to disk

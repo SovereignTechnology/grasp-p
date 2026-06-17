@@ -487,9 +487,9 @@ pub struct Config {
     /// relay an archival server, preventing "left-pad" scenarios by ensuring at least
     /// some relays preserve deleted content.
     ///
-    /// This setting ONLY affects NIP-09 user-initiated deletions. It does NOT prevent
-    /// blacklist-triggered deletions, which are an operator moderation mechanism that
-    /// archival relays still need.
+    /// This setting ONLY affects NIP-09 user-initiated deletions. Runtime
+    /// blacklist-triggered deletion orchestration is deferred, so there is no
+    /// active blacklist deletion path to bypass today.
     ///
     /// When `true`, NIP-09 (`"deletion"`) is NOT advertised in the NIP-11 supported
     /// NIPs list so clients can discover that the relay does not honour deletions.

@@ -97,8 +97,8 @@ impl DeletionPolicy {
     /// main database) so clients see an OK and the request is preserved, but it
     /// is NOT acted upon — no purgatory eviction, no main-DB deletion, and no
     /// tombstone recording. The targeted events therefore remain fully
-    /// accessible. This only affects NIP-09 user-initiated deletions; it does
-    /// not influence blacklist-triggered deletions.
+    /// accessible. This only affects NIP-09 user-initiated deletions. Runtime
+    /// blacklist-triggered deletion flow is currently deferred.
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
         // Archival mode: store the deletion request but do not process it.
         if self.ctx.config.deletion_request_disrespector {
@@ -248,9 +248,10 @@ impl DeletionPolicy {
     /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
     ///    itself from the main DB.
     ///
-    /// All holding-DB / archival / recovery orchestration from the original
-    /// multi-maintainer prototype is deliberately omitted — this is a pure
-    /// hard-delete cascade.
+    /// Phase-2 holding orchestration is active in this cascade path via
+    /// [`Self::archive_and_delete_filter`]: every deleted orphan/coordinate
+    /// target is moved into holding before main-DB deletion. Archive-file
+    /// lifecycle and recovery orchestration remain future phases.
     async fn cascade_delete_announcement(
         &self,
         author: &PublicKey,

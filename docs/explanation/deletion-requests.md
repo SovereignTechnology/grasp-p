@@ -1,9 +1,9 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** ✅ **PARTIALLY IMPLEMENTED (holding DB foundation live)**
+**Status:** ✅ **PARTIALLY IMPLEMENTED (holding DB cleanup engine live)**
 
 This document now reflects both the implemented single-node deletion path
-(main DB + tombstones + holding DB foundation) and the still-planned
+(main DB + tombstones + holding DB cleanup engine) and the still-planned
 expiry/archive/recovery architecture.
 
 ---
@@ -15,7 +15,7 @@ expiry/archive/recovery architecture.
 > What follows in this section is what is **actually built today** and is the
 > foundation that work builds on. The `deletion-request-disrespector` archival
 > mode and the holding-DB move semantics are now implemented (see below);
-> cleanup expiry, git archival, and recovery remain planned.
+> cleanup expiry is now implemented; git archival and recovery remain planned.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -562,12 +562,17 @@ When implementation is complete, the following documentation will be updated:
 
 ### Completed in the current implementation
 
-The following are implemented now (expiry/archive/recovery still pending):
+The following are implemented now (archive/recovery still pending):
 
 - ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
 - tombstone persistence and deletion re-submission gate
 - holding-DB foundation (same backend family as main DB) with move-before-delete
   semantics for NIP-09 deletion paths
+- holding-DB retention cleanup engine:
+  - startup catch-up pass,
+  - periodic expiry cleanup task,
+  - graceful shutdown signal handling for the cleanup task,
+  - idempotent handling of partial/missing holding data during cleanup
 - announcement cascade deletion with multi-maintainer retention semantics
 - extended dependent-kind coverage, including PR chain kinds
   (`1618`/`1619`/`1631`/`1632`)
@@ -600,12 +605,12 @@ using served PR/PR-update fixtures (event + git-ref promotion).
   [`tests/nip09_holding_db.rs`](../../tests/nip09_holding_db.rs) for holding-DB
   assertions; existing cascade suites remain focused on cascade semantics.
 
-**Phase 3: Expiry/cleanup engine (the complex part)** 🔄
-- Implement retention expiry policy for holding DB (and associated metadata).
-- Add cleanup scheduler + startup catch-up behavior.
-- Handle partial/corrupt/missing cleanup inputs safely and idempotently.
-- Add focused tests for short-retention timing, deterministic expiry windows, and
-  restart/offline cleanup catch-up.
+**Phase 3: Expiry/cleanup engine (the complex part)** ✅
+- Implemented retention expiry policy for holding DB metadata + archived events.
+- Added startup catch-up cleanup and periodic background cleanup orchestration.
+- Cleanup is idempotent and safe with partial/missing holding data.
+- Added focused cleanup tests in
+  [`tests/nip09_holding_cleanup.rs`](../../tests/nip09_holding_cleanup.rs).
 
 **Phase 4: Git archive + metadata lifecycle** 🔄
 - Add git archive creation (`.tar.gz`) on deletion and archive metadata linkage.
@@ -623,6 +628,18 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Manual ejection flow and safety/audit semantics.
 - Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
 - Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
+
+### Deferred items after Phase 3
+
+The next phases still intentionally deferred are:
+
+1. **Git archive lifecycle (Phase 4):** create and clean up `.tar.gz` git
+   archives linked to holding entries.
+2. **Recovery workflow (Phase 5):** restore events/git data from holding/archive
+   on explicit/operator-approved flows.
+3. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
+   runtime blacklist-triggered deletion path in the codebase; when introduced,
+   it must route through holding with `DeletionSource::Blacklist`.
 
 > ✅ Resolved prerequisite from earlier plan: rust-nostr backend auto-processing
 > behavior is understood; ngit-grasp runs with `process_nip09(false)` and

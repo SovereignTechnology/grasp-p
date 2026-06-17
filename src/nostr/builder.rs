@@ -101,6 +101,11 @@ impl Nip34WritePolicy {
         &self.ctx.purgatory
     }
 
+    /// Get a reference to the holding store for retention cleanup orchestration.
+    pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
+        &self.ctx.holding
+    }
+
     /// Set the local relay for purgatory notifications.
     ///
     /// This must be called after the relay is created since the relay depends
@@ -861,6 +866,8 @@ pub struct RelayWithDatabase {
     pub database: SharedDatabase,
     /// The write policy used for event validation
     pub write_policy: Nip34WritePolicy,
+    /// Holding store used for deletion archival + expiry cleanup
+    pub holding: crate::nostr::holding::HoldingStore,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
@@ -968,7 +975,7 @@ pub async fn create_relay(
     let write_policy = Nip34WritePolicy::new(
         database.clone(),
         tombstones,
-        holding,
+        holding.clone(),
         &git_data_path,
         purgatory,
         config.clone(),
@@ -1000,5 +1007,6 @@ pub async fn create_relay(
         relay,
         database,
         write_policy,
+        holding,
     })
 }
