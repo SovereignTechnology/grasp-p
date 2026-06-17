@@ -1,12 +1,25 @@
-//! NIP-62 request-to-vanish validation integration tests
+//! NIP-62 request-to-vanish standard-behaviour integration tests
 //!
-//! Characterises the relay's kind-62 (`RequestToVanish`) handling end-to-end
-//! against a live ngit-grasp instance driven by the [`TestRelay`] fixture.
+//! This suite is the canonical, end-to-end characterisation of the relay's
+//! kind-62 (`RequestToVanish`) handling **as specified by NIP-62**, driven
+//! against a live ngit-grasp instance via the [`TestRelay`] fixture.
 //!
 //! These tests are the NIP-62 counterpart of `nip09_validation.rs`. They lock
-//! in the current `handle_vanish` / `deletion_gate` behaviour
+//! in spec-compliant `handle_vanish` / `deletion_gate` behaviour
 //! (`src/nostr/builder.rs`) and the persistent tombstone store
 //! (`src/nostr/tombstones.rs`):
+//!
+//! SCOPE — STANDARD NIP-62 BEHAVIOUR ONLY. Every test in this file must assert
+//! plain, spec-compliant NIP-62 request-to-vanish semantics. This file is the
+//! reference that proves ngit-grasp still behaves like a vanilla NIP-62 relay.
+//!
+//! DO NOT add tests here for any custom, non-standard, or ngit-grasp-specific
+//! vanish/deletion behaviour (e.g. cascade deletion, multi-maintainer deletion
+//! graphs, holding-DB / archival / recovery, or any extension layered on top of
+//! NIP-62). Such behaviour is deliberately out of scope and, when it is built,
+//! belongs in its own dedicated test file so this suite remains a pure
+//! standard-conformance baseline. If a change you are testing diverges from
+//! what a stock NIP-62 relay would do, it does NOT belong in this file.
 //!
 //! - a kind-62 targeting this relay (via `["relay", "ALL_RELAYS"]`) is accepted,
 //!   hard-deletes the author's served events, and lays down a vanish tombstone;

@@ -1,13 +1,22 @@
-//! NIP-09 deletion-request validation integration tests (Phase 1)
+//! NIP-09 deletion-request standard-behaviour integration tests
 //!
-//! Characterises the *current* `pr/cascade-delete` branch behaviour of the
-//! relay's kind-5 (EventDeletion) handling end-to-end against a live
-//! ngit-grasp instance driven by the [`TestRelay`] fixture.
+//! This suite is the canonical, end-to-end characterisation of the relay's
+//! kind-5 (EventDeletion) handling **as specified by NIP-09**, driven against a
+//! live ngit-grasp instance via the [`TestRelay`] fixture.
 //!
-//! This is Phase 1 of the cascade/multi-maintainer deletion work: it locks in
-//! validation-only behaviour. There is deliberately NO cascade, NO
-//! multi-maintainer graph, and NO holding-DB / archival / recovery exercised
-//! here.
+//! SCOPE — STANDARD NIP-09 BEHAVIOUR ONLY. Every test in this file must assert
+//! plain, spec-compliant NIP-09 deletion semantics: an author deleting their
+//! own events, the cross-author authorship guard, pre-emptive deletion, and the
+//! `created_at` timestamp rule for addressable coordinates. This file is the
+//! reference that proves ngit-grasp still behaves like a vanilla NIP-09 relay.
+//!
+//! DO NOT add tests here for any custom, non-standard, or ngit-grasp-specific
+//! deletion behaviour (e.g. cascade deletion, multi-maintainer deletion graphs,
+//! holding-DB / archival / recovery, or any extension layered on top of
+//! NIP-09). Such behaviour is deliberately out of scope and, when it is built,
+//! belongs in its own dedicated test file so this suite remains a pure
+//! standard-conformance baseline. If a change you are testing diverges from
+//! what a stock NIP-09 relay would do, it does NOT belong in this file.
 //!
 //! These tests mirror the live [`DeletionPolicy`] (`src/nostr/policy/deletion.rs`):
 //! - `e`-tag targets owned by another pubkey cause the whole deletion to be
@@ -513,8 +522,8 @@ async fn deletion_invalid_address_format_handled_gracefully() {
         let result = client.send_event(deletion).await;
 
         // Current behaviour: malformed coordinates are silently no-ops, so the
-        // kind-5 is accepted. If a future phase tightens this to a rejection,
-        // the rejection message must still be non-empty.
+        // kind-5 is accepted. If the standard handling is ever tightened to a
+        // rejection, the rejection message must still be non-empty.
         match result {
             Ok(_) => { /* accepted as a no-op — current behaviour */ }
             Err(e) => {
@@ -553,11 +562,10 @@ async fn deletion_invalid_address_format_handled_gracefully() {
 /// ACCEPTED by the relay (the `DeletionPolicy` simply records nothing and
 /// returns Accept; there is no pre-gate requiring at least one target).
 ///
-/// TODO(phase-?): NIP-09 arguably calls for rejecting a deletion request that
-/// targets nothing. Phase 1 only characterises existing behaviour and must not
-/// change production code, so this test documents the current accept-as-no-op
-/// outcome. Tighten to a rejection (and flip this assertion) in a later phase
-/// if/when the policy is updated.
+/// NIP-09 arguably calls for rejecting a deletion request that targets nothing.
+/// This test documents the current standard-relay accept-as-no-op outcome; if
+/// the NIP-09 policy is ever tightened to reject empty deletions, update this
+/// test (and flip the assertion) to match the new standard behaviour.
 #[tokio::test]
 async fn empty_deletion_currently_accepted() {
     let relay = TestRelay::start().await;
