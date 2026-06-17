@@ -538,3 +538,110 @@ async fn test_announcement_cascade_traverses_mixed_tag_variants() {
         "announcement deletion should traverse mixed tag variants; survivors: {survivors:?}"
     );
 }
+
+#[tokio::test]
+async fn test_announcement_cascade_covers_fanout_fanin_graph() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-fanout-fanin").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    // Fan-out: multiple top-level dependents from the same root.
+    let top_a = client
+        .event_builder(Kind::from(1617), "top A")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build top A");
+    let top_b = client
+        .event_builder(Kind::from(1617), "top B")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build top B");
+    let top_c = client
+        .event_builder(Kind::from(1617), "top C")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build top C");
+
+    // Fan-in: converging descendants referencing multiple parents.
+    let fanin_left = client
+        .event_builder(Kind::from(1111), "fanin left")
+        .tag(Tag::custom("e", vec![top_a.id.to_hex()]))
+        .tag(Tag::custom("q", vec![top_b.id.to_hex()]))
+        .build(&keys)
+        .expect("build fanin left");
+    let fanin_right = client
+        .event_builder(Kind::from(1111), "fanin right")
+        .tag(Tag::custom("e", vec![top_b.id.to_hex()]))
+        .tag(Tag::custom("q", vec![top_c.id.to_hex()]))
+        .build(&keys)
+        .expect("build fanin right");
+    let sink_status = client
+        .event_builder(Kind::from(1630), "fanin sink status")
+        .tag(Tag::custom("e", vec![fanin_left.id.to_hex()]))
+        .tag(Tag::custom("q", vec![fanin_right.id.to_hex()]))
+        .build(&keys)
+        .expect("build sink status");
+
+    for event in [&top_a, &top_b, &top_c, &fanin_left, &fanin_right, &sink_status] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept fanout/fanin event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let graph = [
+        ("announcement", announcement.id),
+        ("top_a", top_a.id),
+        ("top_b", top_b.id),
+        ("top_c", top_c.id),
+        ("fanin_left", fanin_left.id),
+        ("fanin_right", fanin_right.id),
+        ("sink_status", sink_status.id),
+    ];
+
+    for (label, id) in graph {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let mut survivors = Vec::new();
+    for (label, id) in graph {
+        if client
+            .is_event_on_relay(id)
+            .await
+            .expect("query event after deletion")
+        {
+            survivors.push(format!("{label} ({id})"));
+        }
+    }
+
+    relay.stop().await;
+
+    assert!(
+        survivors.is_empty(),
+        "announcement deletion should traverse complete fanout/fanin graph; survivors: {survivors:?}"
+    );
+}
