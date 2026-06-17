@@ -337,3 +337,204 @@ async fn test_announcement_cascade_deletes_deep_mixed_reference_chain() {
         "announcement deletion should cascade through deep mixed-tag chains; survivors: {survivors:?}"
     );
 }
+
+#[tokio::test]
+async fn test_sequential_overlapping_deletions_are_idempotent() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-idempotent-order").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let issue = client
+        .create_issue(&announcement, "Ordering issue", "issue body", vec![])
+        .expect("build issue");
+    let patch = client
+        .event_builder(Kind::from(1617), "ordering patch")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build patch");
+    let comment = client
+        .event_builder(Kind::from(1111), "ordering comment")
+        .tag(Tag::custom("e", vec![patch.id.to_hex()]))
+        .build(&keys)
+        .expect("build comment");
+
+    for event in [&issue, &patch, &comment] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept ordering test event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let chain = [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("patch", patch.id),
+        ("comment", comment.id),
+    ];
+    for (label, id) in chain {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    // Step 1: remove one dependent by event-id.
+    client
+        .send_event(build_deletion(&client, &[patch.id], &[]))
+        .await
+        .expect("relay should accept patch deletion");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query announcement after step 1"),
+        "announcement should still exist after deleting patch by e-tag"
+    );
+    assert!(
+        !client
+            .is_event_on_relay(patch.id)
+            .await
+            .expect("query patch after step 1"),
+        "patch should be deleted after step 1"
+    );
+
+    // Step 2: delete root coordinate to trigger full cascade.
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept announcement deletion");
+
+    // Step 3: repeat overlapping deletions (idempotence / no-op semantics).
+    client
+        .send_event(build_deletion(
+            &client,
+            &[patch.id, comment.id],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept repeated overlapping deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let mut survivors = Vec::new();
+    for (label, id) in chain {
+        if client
+            .is_event_on_relay(id)
+            .await
+            .expect("query event after final deletion")
+        {
+            survivors.push(format!("{label} ({id})"));
+        }
+    }
+
+    relay.stop().await;
+
+    assert!(
+        survivors.is_empty(),
+        "sequential overlapping deletions must converge to the same final empty state; survivors: {survivors:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_announcement_cascade_traverses_mixed_tag_variants() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-tag-variants").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    // Use accepted uppercase/lowercase variants for address/event references.
+    let patch_upper_a = client
+        .event_builder(Kind::from(1617), "patch via uppercase A")
+        .tag(Tag::custom("A", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build uppercase-A patch");
+    let comment_upper_e = client
+        .event_builder(Kind::from(1111), "comment via uppercase E")
+        .tag(Tag::custom("E", vec![patch_upper_a.id.to_hex()]))
+        .build(&keys)
+        .expect("build uppercase-E comment");
+    let quote_lower_q = client
+        .event_builder(Kind::from(1111), "quote via lowercase q")
+        .tag(Tag::custom("q", vec![comment_upper_e.id.to_hex()]))
+        .build(&keys)
+        .expect("build lowercase-q quote");
+
+    for event in [&patch_upper_a, &comment_upper_e, &quote_lower_q] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept mixed-tag event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement", announcement.id),
+        ("patch_upper_a", patch_upper_a.id),
+        ("comment_upper_e", comment_upper_e.id),
+        ("quote_lower_q", quote_lower_q.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let mut survivors = Vec::new();
+    for (label, id) in [
+        ("announcement", announcement.id),
+        ("patch_upper_a", patch_upper_a.id),
+        ("comment_upper_e", comment_upper_e.id),
+        ("quote_lower_q", quote_lower_q.id),
+    ] {
+        if client
+            .is_event_on_relay(id)
+            .await
+            .expect("query event after deletion")
+        {
+            survivors.push(format!("{label} ({id})"));
+        }
+    }
+
+    relay.stop().await;
+
+    assert!(
+        survivors.is_empty(),
+        "announcement deletion should traverse mixed tag variants; survivors: {survivors:?}"
+    );
+}
