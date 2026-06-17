@@ -3541,7 +3541,7 @@ impl SyncManager {
                             "[DIAG TRACE] ✓ Negentropy diff results for filter {}", idx
                         );
                         if remote_count > 0 {
-                            all_remote_ids.extend(remote_excluding_ids.into_iter());
+                            all_remote_ids.extend(remote_excluding_ids);
                         }
                     }
                     Err(e) => {
