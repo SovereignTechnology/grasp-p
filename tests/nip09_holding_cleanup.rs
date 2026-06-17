@@ -26,6 +26,8 @@ async fn cleanup_removes_expired_holding_events_and_metadata() {
                 source: DeletionSource::Nip09,
                 coordinate: None,
                 identifier: None,
+                owner_pubkey: None,
+                git_archive: None,
             },
         )
         .await
@@ -56,6 +58,8 @@ async fn cleanup_preserves_non_expired_entries() {
                 source: DeletionSource::Nip09,
                 coordinate: None,
                 identifier: None,
+                owner_pubkey: None,
+                git_archive: None,
             },
         )
         .await
@@ -76,7 +80,7 @@ async fn startup_catchup_cleanup_removes_expired_entries_after_restart() {
     let temp = tempfile::tempdir().expect("create temp dir");
 
     let event_id = {
-        let store = HoldingStore::open_lmdb(temp.path())
+        let store = HoldingStore::open_lmdb(temp.path(), temp.path())
             .await
             .expect("open holding");
         let event = build_test_event("restart-expired", Timestamp::from_secs(10));
@@ -89,6 +93,8 @@ async fn startup_catchup_cleanup_removes_expired_entries_after_restart() {
                     source: DeletionSource::Nip09,
                     coordinate: None,
                     identifier: None,
+                    owner_pubkey: None,
+                    git_archive: None,
                 },
             )
             .await
@@ -97,7 +103,7 @@ async fn startup_catchup_cleanup_removes_expired_entries_after_restart() {
     };
 
     // Simulate process restart: reopen store and run startup catch-up pass.
-    let reopened = HoldingStore::open_lmdb(temp.path())
+    let reopened = HoldingStore::open_lmdb(temp.path(), temp.path())
         .await
         .expect("reopen holding");
     let stats = reopened
@@ -119,6 +125,8 @@ async fn cleanup_is_idempotent_with_partial_missing_event_data() {
         source: DeletionSource::Nip09,
         coordinate: None,
         identifier: None,
+        owner_pubkey: None,
+        git_archive: None,
     };
 
     // Two metadata rows referencing the same archived event: first delete removes

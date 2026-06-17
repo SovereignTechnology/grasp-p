@@ -942,7 +942,11 @@ pub async fn create_relay(
                     )
                 })?;
             let tombstones = crate::nostr::tombstones::Tombstones::open_lmdb(db_path).await?;
-            let holding = crate::nostr::holding::HoldingStore::open_lmdb(db_path).await?;
+            let holding = crate::nostr::holding::HoldingStore::open_lmdb(
+                db_path,
+                Path::new(&config.effective_git_data_path()),
+            )
+            .await?;
             (Arc::new(db), tombstones, holding)
         }
     };

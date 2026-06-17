@@ -1,10 +1,10 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** ✅ **PARTIALLY IMPLEMENTED (holding DB cleanup engine live)**
+**Status:** ✅ **PARTIALLY IMPLEMENTED (Phases 1–4 live; recovery deferred)**
 
 This document now reflects both the implemented single-node deletion path
-(main DB + tombstones + holding DB cleanup engine) and the still-planned
-expiry/archive/recovery architecture.
+(main DB + tombstones + holding DB + git archive lifecycle) and the still-planned
+recovery architecture.
 
 ---
 
@@ -15,7 +15,7 @@ expiry/archive/recovery architecture.
 > What follows in this section is what is **actually built today** and is the
 > foundation that work builds on. The `deletion-request-disrespector` archival
 > mode and the holding-DB move semantics are now implemented (see below);
-> cleanup expiry is now implemented; git archival and recovery remain planned.
+> cleanup expiry and git archival lifecycle are now implemented; recovery remains planned.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -562,7 +562,7 @@ When implementation is complete, the following documentation will be updated:
 
 ### Completed in the current implementation
 
-The following are implemented now (archive/recovery still pending):
+The following are implemented now (recovery still pending):
 
 - ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
 - tombstone persistence and deletion re-submission gate
@@ -573,6 +573,15 @@ The following are implemented now (archive/recovery still pending):
   - periodic expiry cleanup task,
   - graceful shutdown signal handling for the cleanup task,
   - idempotent handling of partial/missing holding data during cleanup
+- git archive lifecycle for repository-announcement deletions:
+  - creates `.archive/<owner>/<identifier>-<timestamp>.tar.gz` snapshots,
+  - stores archive linkage tags in holding metadata (`holding-archive-path`,
+    archive creation timestamp, owner linkage),
+  - integrates archive file deletion into holding-expiry cleanup,
+  - tolerates missing/corrupt archive files during cleanup (log + continue)
+    to avoid hard-failure loops,
+  - applies **fail-safe preservation**: when archive creation fails while live
+    git data exists, destructive announcement deletion is skipped
 - announcement cascade deletion with multi-maintainer retention semantics
 - extended dependent-kind coverage, including PR chain kinds
   (`1618`/`1619`/`1631`/`1632`)
@@ -612,10 +621,12 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Added focused cleanup tests in
   [`tests/nip09_holding_cleanup.rs`](../../tests/nip09_holding_cleanup.rs).
 
-**Phase 4: Git archive + metadata lifecycle** 🔄
-- Add git archive creation (`.tar.gz`) on deletion and archive metadata linkage.
-- Integrate archive cleanup with holding-DB expiry pipeline.
-- Add failure-mode handling (archive create/extract errors, missing files).
+**Phase 4: Git archive + metadata lifecycle** ✅
+- Git archive creation (`.tar.gz`) on announcement deletion paths is implemented.
+- Archive metadata linkage is persisted in holding metadata events.
+- Archive cleanup is integrated with holding-DB expiry cleanup.
+- Failure-mode handling is implemented with fail-safe preservation on archive-create
+  failure and best-effort cleanup on missing archive files.
 
 **Phase 5: Recovery workflow** 🔄
 - Re-announcement detection and eligibility checks (within retention window,
@@ -629,15 +640,13 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
 - Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
 
-### Deferred items after Phase 3
+### Deferred items after Phase 4
 
 The next phases still intentionally deferred are:
 
-1. **Git archive lifecycle (Phase 4):** create and clean up `.tar.gz` git
-   archives linked to holding entries.
-2. **Recovery workflow (Phase 5):** restore events/git data from holding/archive
+1. **Recovery workflow (Phase 5):** restore events/git data from holding/archive
    on explicit/operator-approved flows.
-3. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
+2. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
    runtime blacklist-triggered deletion path in the codebase; when introduced,
    it must route through holding with `DeletionSource::Blacklist`.
 

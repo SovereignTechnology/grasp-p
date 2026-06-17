@@ -4,7 +4,7 @@
 //! - copy/move deleted events out of the main DB into a dedicated holding DB,
 //! - persist minimal per-event metadata for later retention/recovery phases.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +20,9 @@ pub const HOLDING_DIR: &str = "holding";
 
 /// Internal metadata event kind stored alongside archived events.
 pub const HOLDING_METADATA_KIND: u16 = 9905;
+pub const HOLDING_ARCHIVE_PATH_TAG: &str = "holding-archive-path";
+pub const HOLDING_ARCHIVE_CREATED_AT_TAG: &str = "holding-archive-created-at";
+pub const HOLDING_OWNER_PUBKEY_TAG: &str = "holding-owner-pubkey";
 
 /// Default retention window for deleted events kept in the holding DB.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -48,18 +51,28 @@ pub struct HoldingMetadata {
     pub source: DeletionSource,
     pub coordinate: Option<String>,
     pub identifier: Option<String>,
+    pub owner_pubkey: Option<String>,
+    pub git_archive: Option<GitArchiveMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitArchiveMetadata {
+    pub relative_path: String,
+    pub created_at: Timestamp,
 }
 
 #[derive(Clone)]
 pub struct HoldingStore {
     db: Arc<dyn NostrDatabase>,
     metadata_signer: Keys,
+    archive_root: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredMetadataRecord {
     pub metadata_event_id: EventId,
     pub archived_event_id: Option<EventId>,
+    pub archive_relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +81,7 @@ pub struct CleanupStats {
     pub expired_records: usize,
     pub metadata_deleted: usize,
     pub archived_events_deleted: usize,
+    pub archive_files_deleted: usize,
 }
 
 impl std::fmt::Debug for HoldingStore {
@@ -77,7 +91,7 @@ impl std::fmt::Debug for HoldingStore {
 }
 
 impl HoldingStore {
-    pub async fn open_lmdb(relay_data_path: &Path) -> anyhow::Result<Self> {
+    pub async fn open_lmdb(relay_data_path: &Path, git_data_path: &Path) -> anyhow::Result<Self> {
         let path = relay_data_path.join(HOLDING_DIR);
         std::fs::create_dir_all(&path).map_err(|e| {
             anyhow::anyhow!(
@@ -99,6 +113,7 @@ impl HoldingStore {
         Ok(Self {
             db: Arc::new(db),
             metadata_signer: Keys::generate(),
+            archive_root: Some(git_data_path.join(".archive")),
         })
     }
 
@@ -106,6 +121,7 @@ impl HoldingStore {
         Self {
             db: Arc::new(MemoryDatabase::unbounded()),
             metadata_signer: Keys::generate(),
+            archive_root: None,
         }
     }
 
@@ -133,6 +149,22 @@ impl HoldingStore {
         }
         if let Some(identifier) = &metadata.identifier {
             tags.push(Tag::custom("d", vec![identifier.clone()]));
+        }
+        if let Some(owner_pubkey) = &metadata.owner_pubkey {
+            tags.push(Tag::custom(
+                HOLDING_OWNER_PUBKEY_TAG,
+                vec![owner_pubkey.clone()],
+            ));
+        }
+        if let Some(git_archive) = &metadata.git_archive {
+            tags.push(Tag::custom(
+                HOLDING_ARCHIVE_PATH_TAG,
+                vec![git_archive.relative_path.clone()],
+            ));
+            tags.push(Tag::custom(
+                HOLDING_ARCHIVE_CREATED_AT_TAG,
+                vec![git_archive.created_at.as_secs().to_string()],
+            ));
         }
 
         let metadata_event = EventBuilder::new(Kind::from(HOLDING_METADATA_KIND), "")
@@ -194,6 +226,38 @@ impl HoldingStore {
         })
     }
 
+    fn parse_archive_relative_path(metadata_event: &Event) -> Option<String> {
+        metadata_event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == HOLDING_ARCHIVE_PATH_TAG {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_archive_path(&self, relative_path: &str) -> Option<PathBuf> {
+        let root = self.archive_root.as_ref()?;
+        let rel = Path::new(relative_path);
+        if rel.is_absolute() {
+            tracing::warn!(path = %relative_path, "Ignoring absolute holding archive path");
+            return None;
+        }
+
+        if rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            tracing::warn!(path = %relative_path, "Ignoring unsafe holding archive path");
+            return None;
+        }
+
+        Some(root.join(rel))
+    }
+
     /// Find expired metadata records in holding based on `holding-deleted-at`
     /// and a retention window.
     ///
@@ -223,6 +287,7 @@ impl HoldingStore {
                     Some(ExpiredMetadataRecord {
                         metadata_event_id: metadata_event.id,
                         archived_event_id: Self::parse_archived_event_id(&metadata_event),
+                        archive_relative_path: Self::parse_archive_relative_path(&metadata_event),
                     })
                 } else {
                     None
@@ -238,9 +303,33 @@ impl HoldingStore {
     pub async fn delete_expired_record(
         &self,
         record: ExpiredMetadataRecord,
-    ) -> anyhow::Result<(bool, bool)> {
+    ) -> anyhow::Result<(bool, bool, bool)> {
         let mut metadata_deleted = false;
         let mut event_deleted = false;
+        let mut archive_deleted = false;
+
+        if let Some(relative_path) = record.archive_relative_path.as_deref() {
+            if let Some(absolute_path) = self.resolve_archive_path(relative_path) {
+                match std::fs::remove_file(&absolute_path) {
+                    Ok(()) => {
+                        archive_deleted = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::warn!(
+                            path = %absolute_path.display(),
+                            "Holding cleanup archive file missing; continuing"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %absolute_path.display(),
+                            error = %e,
+                            "Holding cleanup failed to delete archive file; continuing"
+                        );
+                    }
+                }
+            }
+        }
 
         if let Some(event_id) = record.archived_event_id {
             let exists = self.db.event_by_id(&event_id).await.map_err(|e| {
@@ -280,7 +369,7 @@ impl HoldingStore {
             metadata_deleted = true;
         }
 
-        Ok((metadata_deleted, event_deleted))
+        Ok((metadata_deleted, event_deleted, archive_deleted))
     }
 
     /// Cleanup pass for expired holding records.
@@ -310,12 +399,16 @@ impl HoldingStore {
         };
 
         for record in expired {
-            let (metadata_deleted, event_deleted) = self.delete_expired_record(record).await?;
+            let (metadata_deleted, event_deleted, archive_deleted) =
+                self.delete_expired_record(record).await?;
             if metadata_deleted {
                 stats.metadata_deleted += 1;
             }
             if event_deleted {
                 stats.archived_events_deleted += 1;
+            }
+            if archive_deleted {
+                stats.archive_files_deleted += 1;
             }
         }
 
@@ -370,6 +463,8 @@ mod tests {
                     source: DeletionSource::Nip09,
                     coordinate: None,
                     identifier: None,
+                    owner_pubkey: None,
+                    git_archive: None,
                 },
             )
             .await

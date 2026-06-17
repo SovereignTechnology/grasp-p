@@ -30,14 +30,20 @@
 /// Author ownership is enforced before any main-DB deletion or tombstone
 /// recording: only the original author may delete their event.
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::path::PathBuf;
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
     WritePolicyResult,
 };
+use tar::Builder as TarBuilder;
 
 use super::{PolicyContext, RetentionReason};
-use crate::nostr::holding::{DeletionSource, HoldingMetadata};
+use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 use crate::nostr::policy::reject_invalid;
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
@@ -183,6 +189,8 @@ impl DeletionPolicy {
                 source: DeletionSource::Nip09,
                 coordinate: None,
                 identifier: None,
+                owner_pubkey: None,
+                git_archive: None,
             };
             self.archive_and_delete_filter(filter, &metadata, moved_ids, "NIP-09 e-tag deletion")
                 .await;
@@ -248,10 +256,11 @@ impl DeletionPolicy {
     /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
     ///    itself from the main DB.
     ///
-    /// Phase-2 holding orchestration is active in this cascade path via
+    /// Holding orchestration is active in this cascade path via
     /// [`Self::archive_and_delete_filter`]: every deleted orphan/coordinate
-    /// target is moved into holding before main-DB deletion. Archive-file
-    /// lifecycle and recovery orchestration remain future phases.
+    /// target is moved into holding before main-DB deletion, and announcement
+    /// deletions include git archive metadata linkage for cleanup lifecycle.
+    /// Recovery orchestration remains a future phase.
     async fn cascade_delete_announcement(
         &self,
         author: &PublicKey,
@@ -383,6 +392,14 @@ impl DeletionPolicy {
                 source: DeletionSource::Nip09,
                 coordinate: Some(announcement_addr.to_string()),
                 identifier: Some(identifier.to_string()),
+                owner_pubkey: Some(author.to_hex()),
+                git_archive: self
+                    .ensure_repo_archive(
+                        &owner_directory_component(author),
+                        identifier,
+                        deletion_created_at,
+                    )
+                    .await,
             };
             self.archive_and_delete_filter(
                 filter,
@@ -460,6 +477,8 @@ impl DeletionPolicy {
             source,
             coordinate: None,
             identifier: Some(identifier.to_string()),
+            owner_pubkey: None,
+            git_archive: None,
         };
         self.archive_and_delete_filter(
             state_filter,
@@ -542,7 +561,37 @@ impl DeletionPolicy {
             source,
             coordinate: Some(coordinate.to_string()),
             identifier: Some(identifier.to_string()),
+            owner_pubkey: Some(author.to_hex()),
+            git_archive: if kind == Kind::GitRepoAnnouncement {
+                self.ensure_repo_archive(
+                    &owner_directory_component(author),
+                    identifier,
+                    deletion_created_at,
+                )
+                .await
+            } else {
+                None
+            },
         };
+
+        // Fail-safe preservation policy: when deleting an announcement, if git
+        // archival was required but failed, skip the destructive event delete.
+        if kind == Kind::GitRepoAnnouncement
+            && self.repo_exists_for_owner_and_identifier(
+                &owner_directory_component(author),
+                identifier,
+            )
+            && metadata.git_archive.is_none()
+        {
+            tracing::warn!(
+                author = %author.to_hex(),
+                identifier = %identifier,
+                op = "coordinate deletion",
+                "Skipping announcement deletion because git archival failed (fail-safe preservation)"
+            );
+            return;
+        }
+
         self.archive_and_delete_filter(filter, &metadata, moved_ids, "coordinate deletion")
             .await;
     }
@@ -568,8 +617,45 @@ impl DeletionPolicy {
 
         let mut deletable = Vec::with_capacity(matches.len());
         for event in matches {
+            let mut event_metadata = metadata.clone();
+
+            if event.kind == Kind::GitRepoAnnouncement {
+                let owner_hex = event.pubkey.to_hex();
+                let owner_dir = owner_directory_component(&event.pubkey);
+                if let Some(identifier) = identifier_from_event(&event) {
+                    event_metadata.identifier = Some(identifier.clone());
+                    event_metadata.owner_pubkey = Some(owner_hex.clone());
+
+                    if event_metadata.git_archive.is_none() {
+                        event_metadata.git_archive = self
+                            .ensure_repo_archive(&owner_dir, &identifier, metadata.deleted_at)
+                            .await;
+                    }
+
+                    // Fail-safe policy applies here too: if this announcement has
+                    // on-disk git data but we couldn't archive it, skip delete.
+                    if self.repo_exists_for_owner_and_identifier(&owner_dir, &identifier)
+                        && event_metadata.git_archive.is_none()
+                    {
+                        tracing::warn!(
+                            event_id = %event.id.to_hex(),
+                            owner = %owner_hex,
+                            identifier = %identifier,
+                            op = %context,
+                            "Skipping announcement deletion because git archival failed (fail-safe preservation)"
+                        );
+                        continue;
+                    }
+                }
+            }
+
             if moved_ids.insert(event.id) {
-                if let Err(e) = self.ctx.holding.archive_event(&event, metadata).await {
+                if let Err(e) = self
+                    .ctx
+                    .holding
+                    .archive_event(&event, &event_metadata)
+                    .await
+                {
                     tracing::warn!(
                         error = %e,
                         event_id = %event.id.to_hex(),
@@ -590,6 +676,115 @@ impl DeletionPolicy {
         if let Err(e) = self.ctx.database.delete(delete_filter).await {
             tracing::warn!(error = %e, op = %context, "Failed to delete events from main DB");
         }
+    }
+
+    fn archive_output_path(
+        &self,
+        owner_path_component: &str,
+        identifier: &str,
+        deleted_at: Timestamp,
+    ) -> PathBuf {
+        self.ctx
+            .git_data_path
+            .join(".archive")
+            .join(owner_path_component)
+            .join(format!("{}-{}.tar.gz", identifier, deleted_at.as_secs()))
+    }
+
+    fn repo_path_for_owner_and_identifier(
+        &self,
+        owner_path_component: &str,
+        identifier: &str,
+    ) -> PathBuf {
+        self.ctx
+            .git_data_path
+            .join(owner_path_component)
+            .join(format!("{}.git", identifier))
+    }
+
+    fn repo_exists_for_owner_and_identifier(
+        &self,
+        owner_path_component: &str,
+        identifier: &str,
+    ) -> bool {
+        self.repo_path_for_owner_and_identifier(owner_path_component, identifier)
+            .is_dir()
+    }
+
+    async fn ensure_repo_archive(
+        &self,
+        owner_path_component: &str,
+        identifier: &str,
+        deleted_at: Timestamp,
+    ) -> Option<GitArchiveMetadata> {
+        let repo_path = self.repo_path_for_owner_and_identifier(owner_path_component, identifier);
+        if !repo_path.is_dir() {
+            tracing::debug!(
+                owner = %owner_path_component,
+                identifier = %identifier,
+                path = %repo_path.display(),
+                "No on-disk git repository found for announcement deletion; skipping archive creation"
+            );
+            return None;
+        }
+
+        let archive_path = self.archive_output_path(owner_path_component, identifier, deleted_at);
+        let relative_path = format!(
+            "{}/{}-{}.tar.gz",
+            owner_path_component,
+            identifier,
+            deleted_at.as_secs()
+        );
+
+        if archive_path.exists() {
+            return Some(GitArchiveMetadata {
+                relative_path,
+                created_at: Timestamp::now(),
+            });
+        }
+
+        if let Some(parent) = archive_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    owner = %owner_path_component,
+                    identifier = %identifier,
+                    path = %parent.display(),
+                    error = %e,
+                    "Failed to create archive directory"
+                );
+                return None;
+            }
+        }
+
+        let tmp_path = archive_path.with_extension("tar.gz.tmp");
+        let result = (|| -> anyhow::Result<()> {
+            let archive_file = File::create(&tmp_path)?;
+            let encoder = GzEncoder::new(archive_file, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            tar.append_dir_all(format!("{}.git", identifier), &repo_path)?;
+            let encoder = tar.into_inner()?;
+            encoder.finish()?;
+            std::fs::rename(&tmp_path, &archive_path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(
+                owner = %owner_path_component,
+                identifier = %identifier,
+                repo = %repo_path.display(),
+                archive = %archive_path.display(),
+                error = %e,
+                "Failed to archive git repository for deletion"
+            );
+            return None;
+        }
+
+        Some(GitArchiveMetadata {
+            relative_path,
+            created_at: Timestamp::now(),
+        })
     }
 
     /// Remove any purgatory entries targeted by this deletion event.
@@ -846,6 +1041,21 @@ fn announcement_address_of(event: &Event) -> String {
         })
         .unwrap_or_default();
     format!("30617:{}:{}", event.pubkey.to_hex(), identifier)
+}
+
+fn identifier_from_event(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let v = tag.as_slice();
+        if v.len() >= 2 && v[0] == "d" {
+            Some(v[1].clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn owner_directory_component(pubkey: &PublicKey) -> String {
+    pubkey.to_bech32().unwrap_or_else(|_| pubkey.to_hex())
 }
 
 #[cfg(test)]

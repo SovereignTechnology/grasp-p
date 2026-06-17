@@ -14,7 +14,7 @@ use nostr_sdk::prelude::*;
 use std::time::Duration;
 
 async fn open_holding(relay: &TestRelay) -> HoldingStore {
-    HoldingStore::open_lmdb(relay.relay_data_path())
+    HoldingStore::open_lmdb(relay.relay_data_path(), relay.git_data_path())
         .await
         .expect("open holding db")
 }
