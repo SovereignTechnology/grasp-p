@@ -1,9 +1,21 @@
 # Deletion request architecture (NIP-09 / NIP-62)
 
-This document explains how deletion works in ngit-grasp today.
+This document explains how deletion works in ngit-grasp.
 
 It is intentionally architecture-focused: what the relay does at runtime, why it
 does it that way, and where operators have control.
+
+## Core consistency invariant
+
+ngit-grasp enforces the following invariant across admission, serving, deletion,
+and recovery:
+
+> **Served nostr state must always match git refs we can actually serve.**
+
+This invariant is the design center for deletion handling. If the currently
+served repository state is deleted and no valid rollback state exists, the relay
+must stop serving that repository state and transition into a controlled
+"awaiting state" lifecycle instead of serving stale refs.
 
 ## Why this design exists
 
@@ -65,6 +77,44 @@ When a kind-5 event is processed (`src/nostr/policy/deletion.rs:84`):
 
 The deletion request event itself is accepted/stored if valid.
 
+### 1a) Replaceable/addressable rollback flow for deleted active state
+
+For kind-30618 state, ngit-grasp now evaluates whether deletion removed the
+currently served state for an identifier and applies deterministic rollback
+semantics:
+
+1. Detect that the deleted target was the active served state.
+2. Resolve rollback candidate from repository state history (newest surviving
+   prior valid state for the identifier/owner scope).
+3. If candidate exists: restore that state as active and immediately re-align
+   git refs to match the restored state.
+4. If candidate does not exist: transition to `NO_ACTIVE_STATE` lifecycle
+   (described below).
+
+This applies to both `e`-target and `a`-coordinate deletion paths, with
+coordinate range semantics (`<= deletion.created_at`) preserved for `a` tags.
+
+### 1b) `NO_ACTIVE_STATE` lifecycle (no rollback candidate available)
+
+When deletion removes active state and no previous valid state exists, the relay
+enters `NO_ACTIVE_STATE` for that repository scope:
+
+1. Announcement is retained in storage but treated as **not served** (purgatory
+   semantics for serving eligibility).
+2. Git serving for the repository is transitioned to an empty/no-refs state so
+   served git data cannot drift from served nostr state.
+3. A grace timer starts (30 minutes).
+4. If a valid state event arrives before grace expiry, normal serving resumes:
+   - state becomes active,
+   - git refs are aligned,
+   - `NO_ACTIVE_STATE` is cleared.
+5. If no valid state arrives before grace expiry, relay executes identifier
+   cleanup: announcement and related now-unservable events are deleted through
+   the same cascade + holding + archive pipeline.
+
+This gives purgatory-style behavior under deletions while preserving the core
+consistency invariant.
+
 ### 2) Disrespector mode (archival NIP-09 behavior)
 
 With `deletion_request_disrespector=true`, NIP-09 processing short-circuits
@@ -125,9 +175,39 @@ Circular components without a surviving anchor are deleted.
 
 ### Kind 30618 handling
 
-Kind 30618 (repo state) is keyed by identifier, not by graph edges. After
-announcement deletion, repo-state events are deleted only when no announcement
-for that identifier remains (`src/nostr/policy/deletion.rs:478`).
+Kind 30618 (repo state) is keyed by identifier, not by graph edges.
+
+After announcement deletion, ngit-grasp resolves state handling in this order:
+
+1. If at least one surviving maintainer announcement remains, keep identifier
+   anchored and recompute active state from surviving authorized states.
+2. If no announcement remains, identifier becomes unanchored and state is
+   deleted from served main state.
+3. If anchored-but-no-valid-state (e.g. deleted active state with no rollback
+   candidate), repository enters `NO_ACTIVE_STATE` lifecycle until state is
+   republished or grace expiry cleanup runs.
+
+This ensures multi-maintainer retention does not accidentally serve stale git
+state after state deletions.
+
+## History storage for rollback correctness
+
+To make deletion-time rollback deterministic and independent of backend internal
+replaceable compaction behavior, ngit-grasp persists superseded versions of
+critical replaceable/addressable events in dedicated history storage.
+
+Scope:
+
+- repository state events (kind 30618) — required for rollback,
+- repository announcements (kind 30617) — retained for consistent lifecycle and
+  operator auditability.
+
+Rationale:
+
+- rust-nostr backend internals for replaceable/addressable version retention are
+  not used as the rollback source of truth,
+- rollback availability is controlled by ngit-grasp policy and retention,
+- deletion handling remains deterministic across backend upgrades.
 
 ## Holding DB lifecycle
 
@@ -171,6 +251,12 @@ Archive files are removed during holding expiry cleanup (`src/nostr/holding.rs:5
 
 Recovery is triggered by accepted re-announcement for the same
 `owner+identifier` scope (`src/nostr/builder.rs:297`, `src/nostr/builder.rs:1319`).
+
+Recovery and rollback are complementary:
+
+- **Rollback** handles deletion-time transition to previous known-valid state.
+- **Recovery** handles restoring deleted/archived repository payload and git
+  artifacts when announcements are republished.
 
 Eligibility (`src/nostr/holding.rs:315`):
 
@@ -242,6 +328,12 @@ deletion, archival, and recovery:
 - **Durable enforcement:** tombstones persist and feed admission-time gating.
 - **Safer deletion:** move-to-holding + git archiving provide a controlled
   retention window.
+- **State/git consistency under deletion:** `NO_ACTIVE_STATE` lifecycle prevents
+  stale refs from being served when active state is deleted and no rollback
+  candidate exists.
+- **Deterministic rollback:** dedicated history storage for critical
+  replaceable/addressable events avoids reliance on backend-internal retention
+  behavior.
 - **Recoverability:** re-announcement-driven recovery can restore data while
   tolerating partial state.
 - **Operator control:** blacklist parity and manual ejection support moderation
