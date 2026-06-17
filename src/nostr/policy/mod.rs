@@ -12,6 +12,15 @@ mod related;
 mod result;
 mod state;
 
+// Multi-maintainer cascade deletion: dependency graph + retention re-evaluation
+// + reachability traversal. These are pure algorithm modules (graph/traversal
+// have no DB dependency; reevaluation queries the shared database) and carry
+// their own unit tests. They are the building blocks for graph-based cascade
+// deletion of repository announcements.
+mod graph;
+mod reevaluation;
+mod traversal;
+
 pub(crate) use result::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
 };
@@ -21,6 +30,15 @@ pub use deletion::DeletionPolicy;
 pub use pr_event::PrEventPolicy;
 pub use related::{ReferenceResult, RelatedEventPolicy};
 pub use state::{StatePolicy, StateResult};
+
+// Cascade-deletion graph algorithm exports (used by the deletion policy when it
+// is wired up to perform graph-based cascade; re-exported here so sibling
+// modules can refer to them via `super::`).
+pub use graph::{build_event_graph, EventGraph, EventNode};
+pub use reevaluation::{
+    reevaluate_events_without_announcement, ReevaluationResult, RetentionReason,
+};
+pub use traversal::{traverse_and_mark_deletions, CircularDependency, TraversalResult};
 
 // Re-export AlignmentResult from git::sync (canonical location)
 pub use crate::git::sync::AlignmentResult;
