@@ -165,7 +165,11 @@ pub fn announcement_coordinate(announcement: &Event, repo_id: &str) -> String {
 
 /// Build a kind-5 deletion request signed by `client` carrying the supplied
 /// `e`-tag event ids and `a`-tag coordinate strings.
-pub fn build_deletion(client: &AuditClient, event_ids: &[EventId], coordinates: &[String]) -> Event {
+pub fn build_deletion(
+    client: &AuditClient,
+    event_ids: &[EventId],
+    coordinates: &[String],
+) -> Event {
     let mut builder = client.event_builder(Kind::EventDeletion, "delete");
 
     for id in event_ids {

@@ -49,9 +49,7 @@
 
 mod common;
 
-use common::{
-    announcement_served_by_coordinate, build_vanish, publish_served_repo, TestRelay,
-};
+use common::{announcement_served_by_coordinate, build_vanish, publish_served_repo, TestRelay};
 
 use grasp_audit::{AuditClient, AuditConfig};
 use std::time::Duration;
@@ -157,7 +155,12 @@ async fn events_from_vanished_pubkey_are_rejected() {
 
     // A brand-new event from the now-vanished pubkey must be rejected.
     let issue = client
-        .create_issue(&announcement, "Post-vanish issue", "should be blocked", vec![])
+        .create_issue(
+            &announcement,
+            "Post-vanish issue",
+            "should be blocked",
+            vec![],
+        )
         .expect("build issue");
     let issue_id = issue.id;
 

@@ -670,7 +670,7 @@ async fn newer_addressable_event_survives_a_tag_deletion() {
 
     // Stage 3: delete v1 by its own `a` coordinate. The deletion's created_at is
     // "now", so only versions at or before now are deleted.
-    let deletion = build_deletion(&client, &[], &[addr_coord.clone()]);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&addr_coord));
     let deletion_ts = deletion.created_at;
     client
         .send_event(deletion)
