@@ -8,12 +8,12 @@ This document describes the planned architecture for NIP-09 deletion request sup
 
 ## Implemented: ngit-grasp owns NIP-09 / NIP-62 handling
 
-> The rest of this document is the **planned** design for further work
-> (holding database, cascade, archival, recovery). It is still aspirational.
+> The rest of this document is mostly historical **planned** design
+> (holding database, archival, recovery). It is still aspirational.
 > What follows in this section is what is **actually built today** and is the
 > foundation that work builds on. The `deletion-request-disrespector` archival
-> mode is now implemented (see below); the holding DB, cascade, git archival,
-> and recovery remain planned.
+> mode is now implemented (see below); the holding DB, git archival, and
+> recovery remain planned.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -26,10 +26,10 @@ We disable that automatic processing
 ([`src/nostr/builder.rs`](../../src/nostr/builder.rs) sets
 `process_nip09(false)` and `process_nip62(false)` on both the main database and
 the tombstone database) and implement NIP-09 / NIP-62 in ngit-grasp itself,
-bypassing the backend so we can apply our own customisations in the future. The
-observable behaviour is unchanged; only the implementation moved. There is no
-cascade, holding DB, archival, recovery, or disrespector yet — those remain
-planned (see below).
+bypassing the backend so we can apply our own customisations in the future.
+ngit-grasp now has custom announcement cascade deletion in the main DB (pure
+hard-delete, no holding DB), including dependent NIP-34 graph events and
+repository-state (kind 30618) cleanup when an identifier becomes unanchored.
 
 **Components added:**
 
@@ -58,6 +58,13 @@ planned (see below).
   database via `NostrDatabase::delete(filter)`, and records the deletion in the
   tombstone store. An `e`-tag delete targeting an event owned by a different
   author is rejected (matching the backend's `InvalidDelete`).
+
+  For kind-30617 announcement `a`-coordinate deletes, this includes
+  graph-based cascade deletion of orphaned dependent events, plus special
+  handling for kind-30618 repository state events: because state is keyed by
+  repository identifier (`d` tag) instead of graph edges, state events are
+  hard-deleted when (and only when) no announcement remains for that
+  identifier.
 
 - **NIP-62 handler** (`Nip34WritePolicy::handle_vanish` in
   [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): for a vanish request

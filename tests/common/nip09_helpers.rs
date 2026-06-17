@@ -14,6 +14,11 @@ use nostr_sdk::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::purgatory_helpers::{
+    create_state_event, create_test_repo_with_commit, push_to_relay, CommitVariant,
+};
+use super::sync_helpers::create_repo_announcement;
+
 /// Publish a repo announcement, submit a matching state event, and push the
 /// deterministic git data so the announcement is promoted out of purgatory and
 /// becomes queryable.
@@ -130,6 +135,80 @@ pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Even
     );
 
     (announcement, repo_id)
+}
+
+/// Publish a served announcement + served state event for one repository.
+///
+/// Unlike [`publish_served_repo`], this helper returns the exact kind-30618
+/// state event it published so cascade tests can assert strict pre/post
+/// conditions by event id.
+pub async fn publish_served_repo_with_state_event(
+    client: &AuditClient,
+    test_name: &str,
+) -> (Event, String, Event) {
+    let relay_url = client
+        .relay_url()
+        .await
+        .expect("client should have a relay");
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let npub = client.public_key().to_bech32().expect("pubkey to bech32");
+
+    let repo_id = format!(
+        "{}-{}",
+        test_name,
+        &Keys::generate().public_key().to_hex()[..8]
+    );
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir for repo push");
+    let commit_hash = create_test_repo_with_commit(temp_dir.path(), CommitVariant::StateTest)
+        .expect("create deterministic state-test commit");
+
+    let announcement = create_repo_announcement(client.keys(), &[relay_domain.as_str()], &repo_id);
+    client
+        .send_event(announcement.clone())
+        .await
+        .expect("relay should accept announcement");
+
+    let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
+    let state_event = create_state_event(
+        client.keys(),
+        &repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[clone_url.as_str()],
+        &[relay_url.as_str()],
+    )
+    .expect("build repo state event");
+
+    client
+        .send_event_and_note_purgatory(state_event.clone())
+        .await
+        .expect("relay should accept state event");
+
+    push_to_relay(temp_dir.path(), &relay_domain, &npub, &repo_id)
+        .expect("git push should promote announcement + state event out of purgatory");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query announcement"),
+        "announcement should be served after git data arrives"
+    );
+    assert!(
+        client
+            .is_event_on_relay(state_event.id)
+            .await
+            .expect("query state event"),
+        "state event should be served after git data arrives"
+    );
+
+    (announcement, repo_id, state_event)
 }
 
 /// Query the relay for a served repo announcement using a real client's access

@@ -47,8 +47,10 @@ use crate::nostr::policy::reject_invalid;
 ///
 /// Kept deliberately broad (issues, patches, PR/PR-updates, the four status
 /// kinds, and NIP-22 comments) so the cascade can reach the whole reachable
-/// sub-graph. Kind 30618 (repository state) is intentionally excluded because
-/// it is keyed by a `d` tag rather than connected via graph edges.
+/// sub-graph. Kind 30618 (repository state) is intentionally excluded from
+/// graph traversal because it is keyed by repository identifier (`d` tag), not
+/// by `a`/`e`/`q` edges. It is handled separately in
+/// [`DeletionPolicy::delete_repo_state_if_identifier_is_unanchored`].
 const GRAPH_DEPENDENT_KINDS: &[u16] = &[
     1111, // NIP-22 comment
     1617, // patch
@@ -248,6 +250,7 @@ impl DeletionPolicy {
         if parts.len() != 3 {
             return;
         }
+        let identifier = parts[2];
 
         // Step 1: candidate event set — all announcements (to know which other
         // maintainers survive) plus all NIP-34 dependent events.
@@ -356,6 +359,54 @@ impl DeletionPolicy {
         // deletion's created_at, per NIP-09), exactly as the simple path does.
         self.delete_coordinate_from_main_db(author, announcement_addr, deletion_created_at)
             .await;
+
+        // Step 5c: repository state (30618) is keyed by identifier, not by
+        // graph edges. After deleting this announcement coordinate, delete
+        // state events for the identifier only when no announcement for that
+        // identifier remains in the main DB.
+        self.delete_repo_state_if_identifier_is_unanchored(identifier)
+            .await;
+    }
+
+    /// Delete kind-30618 state events for `identifier` when the repository is
+    /// now unanchored (no surviving kind-30617 announcement with that `d` tag).
+    ///
+    /// This is separate from graph traversal because state events are keyed by
+    /// identifier rather than `a`/`e`/`q` relationships.
+    async fn delete_repo_state_if_identifier_is_unanchored(&self, identifier: &str) {
+        let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement).custom_tag(
+            SingleLetterTag::lowercase(Alphabet::D),
+            identifier.to_string(),
+        );
+
+        let remaining_announcements = match self.ctx.database.query(announcement_filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    identifier = %identifier,
+                    "Cascade deletion: failed to check remaining announcements for identifier"
+                );
+                return;
+            }
+        };
+
+        if !remaining_announcements.is_empty() {
+            return;
+        }
+
+        let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
+            SingleLetterTag::lowercase(Alphabet::D),
+            identifier.to_string(),
+        );
+
+        if let Err(e) = self.ctx.database.delete(state_filter).await {
+            tracing::warn!(
+                error = %e,
+                identifier = %identifier,
+                "Cascade deletion: failed to delete unanchored repository state events"
+            );
+        }
     }
 
     /// Query the candidate event set for the cascade graph: every repository

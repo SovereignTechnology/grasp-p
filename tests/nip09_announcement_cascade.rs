@@ -164,3 +164,159 @@ async fn test_announcement_cascade_deletes_dependents() {
         announcement.id
     );
 }
+
+/// Deleting a patch by `e` tag must stay on the simple deletion path:
+/// only the patch is removed, while the announcement and unrelated siblings
+/// survive.
+#[tokio::test]
+async fn test_deleting_patch_by_event_id_does_not_delete_announcement_or_siblings() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "simple-delete-patch").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let issue = client
+        .create_issue(&announcement, "Sibling issue", "must survive", vec![])
+        .expect("build issue");
+
+    let patch = client
+        .event_builder(Kind::from(1617), "patch to delete")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(&keys)
+        .expect("build patch");
+
+    for event in [&issue, &patch] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept dependent event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let precondition = [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("patch", patch.id),
+    ];
+    for (label, id) in precondition {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before patch deletion"
+        );
+    }
+
+    let deletion = build_deletion(&client, &[patch.id], &[]);
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept patch deletion");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let announcement_survived = client
+        .is_event_on_relay(announcement.id)
+        .await
+        .expect("query announcement after deletion");
+    let issue_survived = client
+        .is_event_on_relay(issue.id)
+        .await
+        .expect("query issue after deletion");
+    let patch_survived = client
+        .is_event_on_relay(patch.id)
+        .await
+        .expect("query patch after deletion");
+    relay.stop().await;
+
+    assert!(
+        announcement_survived,
+        "announcement must survive patch e-tag deletion"
+    );
+    assert!(
+        issue_survived,
+        "unrelated sibling issue must survive patch e-tag deletion"
+    );
+    assert!(!patch_survived, "patch must be deleted by its e-tag");
+}
+
+/// Deleting a comment by `e` tag must not trigger repository graph cascade:
+/// the parent issue and announcement must survive.
+#[tokio::test]
+async fn test_deleting_comment_by_event_id_does_not_cascade_to_issue_or_announcement() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, _repo_id) = publish_served_repo(&client, "simple-delete-comment").await;
+
+    let issue = client
+        .create_issue(&announcement, "Issue anchor", "must survive", vec![])
+        .expect("build issue");
+    let comment = client
+        .event_builder(Kind::from(1111), "comment to delete")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .build(&keys)
+        .expect("build comment");
+
+    for event in [&issue, &comment] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for (label, id) in [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("comment", comment.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before comment deletion"
+        );
+    }
+
+    let deletion = build_deletion(&client, &[comment.id], &[]);
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept comment deletion");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let announcement_survived = client
+        .is_event_on_relay(announcement.id)
+        .await
+        .expect("query announcement after deletion");
+    let issue_survived = client
+        .is_event_on_relay(issue.id)
+        .await
+        .expect("query issue after deletion");
+    let comment_survived = client
+        .is_event_on_relay(comment.id)
+        .await
+        .expect("query comment after deletion");
+
+    relay.stop().await;
+
+    assert!(
+        announcement_survived,
+        "announcement must survive comment e-tag deletion"
+    );
+    assert!(issue_survived, "issue must survive comment e-tag deletion");
+    assert!(!comment_survived, "comment must be deleted by its e-tag");
+}
