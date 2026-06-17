@@ -584,7 +584,12 @@ async fn test_shared_subgraph_survives_when_one_anchor_path_removed() {
         .build(client_a.keys())
         .expect("build unique descendant");
 
-    for event in [&top_shared, &top_unique_a, &shared_descendant, &unique_descendant] {
+    for event in [
+        &top_shared,
+        &top_unique_a,
+        &shared_descendant,
+        &unique_descendant,
+    ] {
         client_a
             .send_event(event.clone())
             .await

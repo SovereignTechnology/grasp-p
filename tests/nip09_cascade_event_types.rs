@@ -587,7 +587,14 @@ async fn test_announcement_cascade_covers_fanout_fanin_graph() {
         .build(&keys)
         .expect("build sink status");
 
-    for event in [&top_a, &top_b, &top_c, &fanin_left, &fanin_right, &sink_status] {
+    for event in [
+        &top_a,
+        &top_b,
+        &top_c,
+        &fanin_left,
+        &fanin_right,
+        &sink_status,
+    ] {
         client
             .send_event(event.clone())
             .await
