@@ -68,6 +68,7 @@ struct RelayOptions {
     archive_all: bool,
     archive_read_only: bool,
     grasp06_enable: bool,
+    deletion_request_disrespector: bool,
 }
 
 impl TestRelay {
@@ -217,6 +218,21 @@ impl TestRelay {
         .await
     }
 
+    /// Start a relay in NIP-09 deletion "disrespector" (archival) mode.
+    ///
+    /// Sets `NGIT_DELETION_REQUEST_DISRESPECTOR=true`: the relay stores incoming
+    /// kind-5 deletion requests but does not act on them.
+    pub async fn start_with_deletion_disrespector() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                deletion_request_disrespector: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -237,6 +253,7 @@ impl TestRelay {
                 archive_all,
                 archive_read_only,
                 grasp06_enable,
+                ..RelayOptions::default()
             },
         )
         .await
@@ -362,6 +379,11 @@ impl TestRelay {
         // this env var (pre-implementation), clap simply ignores it.
         if options.grasp06_enable {
             cmd.env("NGIT_GRASP06_ENABLE", "true");
+        }
+
+        // Enable NIP-09 deletion disrespector (archival) mode if requested.
+        if options.deletion_request_disrespector {
+            cmd.env("NGIT_DELETION_REQUEST_DISRESPECTOR", "true");
         }
 
         // Release the port reservation immediately before spawning the

@@ -883,8 +883,20 @@ pub async fn create_relay(
         match config.database_backend {
             DatabaseBackend::Memory => {
                 tracing::info!("Using in-memory database (no persistence)");
+                // Disable the backend's built-in NIP-09 / NIP-62 auto-processing to
+                // match the LMDB path: ngit-grasp owns this handling (DeletionPolicy,
+                // the kind-62 handler, and the Tombstones store). Leaving the memory
+                // backend's defaults (`true`) would silently suppress targeted events
+                // at query time the moment a kind-5 is *stored* — which in particular
+                // defeats `deletion_request_disrespector` (archival) mode, where the
+                // kind-5 is intentionally stored but not acted upon.
+                let db = MemoryDatabase::builder()
+                    .max_events(NonZeroUsize::new(100_000).unwrap())
+                    .process_nip09(false)
+                    .process_nip62(false)
+                    .build();
                 (
-                    Arc::new(MemoryDatabase::bounded(NonZeroUsize::new(100_000).unwrap())),
+                    Arc::new(db),
                     crate::nostr::tombstones::Tombstones::in_memory(),
                 )
             }
