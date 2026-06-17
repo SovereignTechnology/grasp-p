@@ -1055,14 +1055,14 @@ Event blacklist does **not** affect NIP-11 metadata:
     hard-deleted from the relay, matching purgatory entries are evicted, and a
     persistent tombstone is recorded so re-submission of the deleted event stays
     rejected across restarts.
-  - NIP-11 `supported_nips` includes `9` (deletion).
+  - NIP-11 `supported_nips` includes `9` (deletion) and `62` (request to vanish).
 - When `true`:
   - Incoming NIP-09 deletion requests are still **stored** (the client receives
     an OK), but they are **not acted upon**. Targeted events remain fully
     accessible. This makes the relay an archival server, preserving content and
     preventing "left-pad" scenarios.
-  - NIP-11 `supported_nips` does **not** include `9`, so clients can discover
-    that this relay does not honour deletions.
+  - NIP-11 `supported_nips` does **not** include `9` or `62`, so clients can
+    discover that this relay does not honour deletions.
 
 **IMPORTANT:** This setting ONLY affects NIP-09 user-initiated deletions. It does
 **NOT** prevent blacklist-triggered deletions, which are an operator moderation

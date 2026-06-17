@@ -266,13 +266,14 @@ let
           When enabled, incoming NIP-09 (kind 5) deletion requests are stored
           but NOT acted upon: targeted events remain fully accessible. This
           preserves content and prevents "left-pad" scenarios. NIP-11
-          supported_nips will NOT advertise NIP-09 (deletion).
+          supported_nips will NOT advertise NIP-09 (deletion) or NIP-62
+          (request to vanish).
 
           This ONLY affects NIP-09 user-initiated deletions. It does NOT prevent
           blacklist-triggered deletions (operator moderation).
 
-          When disabled (default), deletion requests are honoured and NIP-09 is
-          advertised in NIP-11.
+          When disabled (default), deletion requests are honoured and NIP-09 and
+          NIP-62 are advertised in NIP-11.
 
           See: docs/explanation/deletion-requests.md
         '';

@@ -112,13 +112,15 @@ impl RelayInformationDocument {
                     34, // NIP-34: Git repository announcements
                     77, // NIP-77: Negentropy sync (reconciliation protocol)
                 ];
-                // NIP-09 (deletion) is honoured only when not running as an
-                // archival "disrespector" relay. When disrespector mode is on
-                // the relay stores but ignores deletion requests, so we must not
-                // advertise NIP-09 support — clients can then discover that this
-                // relay does not honour deletions.
+                // NIP-09 (deletion) and NIP-62 (request to vanish) are honoured
+                // only when not running as an archival "disrespector" relay. When
+                // disrespector mode is on the relay stores but ignores deletion /
+                // vanish requests, so we must not advertise NIP-09 or NIP-62
+                // support — clients can then discover that this relay does not
+                // honour deletions.
                 if !config.deletion_request_disrespector {
                     nips.push(9); // NIP-09: Event deletion requests
+                    nips.push(62); // NIP-62: Request to vanish
                     nips.sort_unstable();
                 }
                 nips
@@ -170,8 +172,10 @@ mod tests {
         assert!(doc.supported_nips.contains(&11));
         assert!(doc.supported_nips.contains(&34));
         assert!(doc.supported_nips.contains(&77));
-        // NIP-09 (deletion) advertised by default (disrespector off).
+        // NIP-09 (deletion) and NIP-62 (vanish) advertised by default
+        // (disrespector off).
         assert!(doc.supported_nips.contains(&9));
+        assert!(doc.supported_nips.contains(&62));
         // Without archive mode, only GRASP-01 and GRASP-02
         assert_eq!(doc.supported_grasps, vec!["GRASP-01", "GRASP-02"]);
         assert!(doc.repo_acceptance_criteria.contains("None"));
@@ -329,8 +333,10 @@ mod tests {
         let config = Config::for_testing();
         let doc = RelayInformationDocument::from_config(&config);
 
-        // NIP-09 (deletion) is honoured (and advertised) by default.
+        // NIP-09 (deletion) and NIP-62 (vanish) are honoured (and advertised)
+        // by default.
         assert!(doc.supported_nips.contains(&9));
+        assert!(doc.supported_nips.contains(&62));
     }
 
     #[test]
@@ -340,9 +346,10 @@ mod tests {
 
         let doc = RelayInformationDocument::from_config(&config);
 
-        // Archival relays do not honour deletions, so NIP-09 must not be
-        // advertised.
+        // Archival relays do not honour deletions, so NIP-09 and NIP-62 must
+        // not be advertised.
         assert!(!doc.supported_nips.contains(&9));
+        assert!(!doc.supported_nips.contains(&62));
         // Other NIPs are unaffected.
         assert!(doc.supported_nips.contains(&1));
         assert!(doc.supported_nips.contains(&34));

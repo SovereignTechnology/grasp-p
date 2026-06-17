@@ -79,10 +79,12 @@ tombstone; cascade = walk the references of a recorded deletion).
   therefore stored in the main DB so clients get an OK), but it is **not** acted
   upon: no purgatory eviction, no main-DB deletion, and no tombstone is recorded.
   Targeted events stay fully accessible, making the relay an archival server.
-  This only affects NIP-09 (kind 5); NIP-62 vanish handling is unchanged.
-  NIP-11 advertisement reflects the mode: NIP-09 (`9`) is included in
+  The short-circuit only affects NIP-09 (kind 5) *processing*; NIP-62 vanish
+  *handling* is unchanged. NIP-11 advertisement, however, reflects the mode for
+  both deletion NIPs: NIP-09 (`9`) and NIP-62 (`62`) are included in
   `supported_nips` only when disrespector is `false`
-  ([`src/http/nip11.rs`](../../src/http/nip11.rs)).
+  ([`src/http/nip11.rs`](../../src/http/nip11.rs)), so clients can discover that
+  an archival relay does not honour deletion requests.
 
 ---
 
@@ -516,8 +518,8 @@ How long to retain archived events and git data before permanent deletion. Provi
 Deletion support is **conditionally advertised** in NIP-11 relay information
 (implemented in [`src/http/nip11.rs`](../../src/http/nip11.rs)):
 
-- **When `deletion_request_disrespector = false`:** include `9` (`"deletion"`) in the supported NIPs array
-- **When `deletion_request_disrespector = true`:** do NOT include `9` (archival mode doesn't honor deletions)
+- **When `deletion_request_disrespector = false`:** include `9` (`"deletion"`) and `62` (`"request to vanish"`) in the supported NIPs array
+- **When `deletion_request_disrespector = true`:** do NOT include `9` or `62` (archival mode doesn't honor deletions)
 
 This allows clients to discover whether a relay respects deletion requests.
 

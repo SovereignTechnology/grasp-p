@@ -13,8 +13,8 @@
 //!    `OK`, yet the targeted announcement remains queryable afterwards.
 //! 2. **Normal mode honours deletion** — the same flow against a default relay
 //!    removes the target.
-//! 3. **NIP-11 advertisement** — a disrespector relay omits `9` from
-//!    `supported_nips`; a normal relay advertises it.
+//! 3. **NIP-11 advertisement** — a disrespector relay omits `9` and `62` from
+//!    `supported_nips`; a normal relay advertises both.
 //!
 //! # Running
 //!
@@ -330,10 +330,11 @@ async fn fetch_supported_nips(relay: &TestRelay) -> Vec<u64> {
         .expect("NIP-11 document must contain a supported_nips array")
 }
 
-/// NIP-11 advertisement: disrespector omits NIP-09, normal mode advertises it.
+/// NIP-11 advertisement: disrespector omits NIP-09/NIP-62, normal mode
+/// advertises both.
 #[tokio::test]
 async fn nip11_advertisement_reflects_deletion_support() {
-    // Disrespector relay: NIP-09 (9) MUST be absent.
+    // Disrespector relay: NIP-09 (9) and NIP-62 (62) MUST be absent.
     let disrespector = TestRelay::start_with_deletion_disrespector().await;
     let supported = fetch_supported_nips(&disrespector).await;
     disrespector.stop().await;
@@ -343,8 +344,13 @@ async fn nip11_advertisement_reflects_deletion_support() {
         "disrespector relay must NOT advertise NIP-09; supported_nips = {:?}",
         supported
     );
+    assert!(
+        !supported.contains(&62),
+        "disrespector relay must NOT advertise NIP-62; supported_nips = {:?}",
+        supported
+    );
 
-    // Normal relay: NIP-09 (9) MUST be present.
+    // Normal relay: NIP-09 (9) and NIP-62 (62) MUST be present.
     let normal = TestRelay::start().await;
     let supported = fetch_supported_nips(&normal).await;
     normal.stop().await;
@@ -352,6 +358,11 @@ async fn nip11_advertisement_reflects_deletion_support() {
     assert!(
         supported.contains(&9),
         "normal relay must advertise NIP-09; supported_nips = {:?}",
+        supported
+    );
+    assert!(
+        supported.contains(&62),
+        "normal relay must advertise NIP-62; supported_nips = {:?}",
         supported
     );
 }
