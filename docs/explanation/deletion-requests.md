@@ -553,50 +553,71 @@ When implementation is complete, the following documentation will be updated:
 
 ## Implementation Status
 
-**Phase 1: Core Deletion + Simple Cascade** ✅ (Implemented, hard-delete mode)
-- Config options for NIP-09 handling and archival disrespector mode
-- Kind 5 processing owned by ngit-grasp (not backend auto-processing)
-- Main-DB hard-delete + tombstone recording
-- Simple announcement cascade in live DB
+### Completed in the current hard-delete path
 
-**Phase 2: Git Archival & Cleanup** 🔄 (Planned)
-- Archive tar.gz creation
-- Background cleanup task
-- Metadata storage
+The following are implemented now (no holding DB / archive / recovery yet):
 
-**Phase 3: Multi-Maintainer Graph Algorithm** ✅ (Implemented, hard-delete mode)
-- Dependency graph traversal over `a` / `e` / `q` references
-- Multi-maintainer survival semantics (retain dependents when alternative
-  anchors remain)
-- Deletion of orphaned dependents when all anchors are removed
-
-**Phase 4: Recovery Mechanism** 🔄 (Planned)
-- Re-announcement detection
-- Archive restoration
-- Event recovery from holding DB
-
-**Phase 5: Extended Cascade Deletion** ✅ (Implemented)
-- Kind-agnostic cascade over configured dependent kinds
-- Coverage includes patches/issues/comments/status kinds and PR chain kinds
+- ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
+- tombstone persistence and deletion re-submission gate
+- announcement cascade deletion with multi-maintainer retention semantics
+- extended dependent-kind coverage, including PR chain kinds
   (`1618`/`1619`/`1631`/`1632`)
-- Repository state (`30618`) identifier-level cleanup when unanchored
+- repository-state (`30618`) cleanup when an identifier becomes unanchored
 
-PR-chain integration coverage is now present in
+PR-chain integration coverage is present in
 [`tests/nip09_cascade_event_types.rs`](../../tests/nip09_cascade_event_types.rs)
 using served PR/PR-update fixtures (event + git-ref promotion).
 
-**Phase 6: Analysis & Edge Cases** 🔄 (Planned)
-- Background cleanup timing strategy (daily doesn't work with 3-second test retention)
-- ~~rust-nostr deletion behavior investigation (does relay builder auto-process deletions?)~~ ✅ **Resolved:** the LMDB backend auto-processes NIP-09/NIP-62 when `process_nip09`/`process_nip62` are `true` (the defaults); ngit-grasp now runs with both `false` and implements the handling itself (see the "Implemented" section above).
-- Author validation enforcement and testing
-- Max depth edge case analysis
-- Large-scale testing
-- Race condition investigation
-- Lock strategy finalization
-- **Blacklist deletion behavior** (startup scanning, cascade logic, metadata)
-- **Blacklist + disrespector interaction** (disrespector doesn't prevent blacklist deletion)
-- **Manual ejection mechanism** (CLI command, safety, logging)
-- **Blacklist recovery flow** (manual vs automatic restoration)
+### Prompt-sized phase plan to completion (1 phase = 1 prompt)
+
+**Phase 1 (done): Hard-delete baseline + cascade correctness** ✅
+- Scope delivered:
+  - custom NIP-09/NIP-62 processing in ngit-grasp
+  - hard-delete from main DB + tombstone recording
+  - graph cascade over `a`/`e`/`q` for dependent kinds
+  - multi-maintainer orphan/survivor semantics
+  - `30618` identifier-level cleanup when last anchor is removed
+
+**Phase 2 (next): Holding database foundation** 🔄
+- Implement a dedicated holding DB for deleted events (same backend family as
+  main DB; persistent for LMDB, in-memory for memory backend).
+- On NIP-09/blacklist deletion flow, move affected events into holding DB before
+  removing from main DB.
+- Store enough metadata for retention decisions and future recovery orchestration
+  (deletion reason, timestamp, identifier/coordinate linkage).
+- **Test strategy for this phase:**
+  - Add holding-DB assertions only to a focused subset of integration tests
+    (single-maintainer cascade + multi-maintainer + state-event path).
+  - Do not mirror holding-DB checks into every cascade test; that adds cost with
+    little additional confidence for simple move semantics.
+
+**Phase 3: Expiry/cleanup engine (the complex part)** 🔄
+- Implement retention expiry policy for holding DB (and associated metadata).
+- Add cleanup scheduler + startup catch-up behavior.
+- Handle partial/corrupt/missing cleanup inputs safely and idempotently.
+- Add focused tests for short-retention timing, deterministic expiry windows, and
+  restart/offline cleanup catch-up.
+
+**Phase 4: Git archive + metadata lifecycle** 🔄
+- Add git archive creation (`.tar.gz`) on deletion and archive metadata linkage.
+- Integrate archive cleanup with holding-DB expiry pipeline.
+- Add failure-mode handling (archive create/extract errors, missing files).
+
+**Phase 5: Recovery workflow** 🔄
+- Re-announcement detection and eligibility checks (within retention window,
+  author constraints).
+- Restore events from holding DB and git data from archive.
+- Define operator/manual recovery controls and clear outcome reporting.
+
+**Phase 6: Ops hardening and policy edge-cases** 🔄
+- Blacklist-triggered deletion parity and blacklist/disrespector interaction.
+- Manual ejection flow and safety/audit semantics.
+- Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
+- Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
+
+> ✅ Resolved prerequisite from earlier plan: rust-nostr backend auto-processing
+> behavior is understood; ngit-grasp runs with `process_nip09(false)` and
+> `process_nip62(false)` and owns deletion handling itself.
 
 ## Security Considerations
 
@@ -656,11 +677,11 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Recovery detection
 
 ### Integration Tests
-- Full deletion workflow (3-5 second retention)
-- Multi-maintainer scenarios
+- Cascade correctness (single-maintainer + multi-maintainer + state-event paths)
+- Holding DB move semantics (subset of representative scenarios, not every test)
+- Retention/expiry cleanup behavior (short-retention deterministic tests)
 - Recovery mechanism
 - Disrespector mode behavior
-- Background cleanup timing (mocked)
 
 ### Audit Tests
 - NIP-09 compliance validation
