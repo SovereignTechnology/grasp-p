@@ -131,14 +131,21 @@ impl Tombstones {
         Ok(())
     }
 
-    /// Has this event id been deleted by a recorded kind-5 (`e` tag)?
+    /// Has this event id been deleted by a recorded kind-5 (`e` tag) authored by
+    /// `author`?
     ///
     /// Mirrors the backend's `is_deleted` check that previously fed the
-    /// relay-builder `check_id` gate.
-    pub async fn is_event_deleted(&self, id: &EventId) -> bool {
-        // Any stored kind-5 carrying this id in an `e` tag means it was deleted.
+    /// relay-builder `check_id` gate, but with explicit author binding: only the
+    /// event's own author may delete it (NIP-09). A deletion request signed by a
+    /// different pubkey must NOT block (re-)submission of `author`'s event —
+    /// otherwise any pubkey could pre-emptively censor another's events by
+    /// racing a kind-5 ahead of the target (out-of-order delete).
+    pub async fn is_event_deleted(&self, id: &EventId, author: &PublicKey) -> bool {
+        // A stored kind-5 authored by `author` carrying this id in an `e` tag
+        // means `author` deleted their own event.
         let filter = Filter::new()
             .kind(Kind::EventDeletion)
+            .author(*author)
             .custom_tag(SingleLetterTag::lowercase(Alphabet::E), id.to_hex());
         match self.db.query(filter).await {
             Ok(events) => !events.is_empty(),
@@ -159,19 +166,31 @@ impl Tombstones {
     /// to the deletion request's `created_at`. So a candidate event is blocked
     /// only if a recorded deletion for the same coordinate has
     /// `deletion.created_at >= event_created_at`.
+    ///
+    /// Author binding: a coordinate is `<kind>:<pubkey>:<d>`, so only the pubkey
+    /// embedded in the coordinate may delete it. A kind-5 signed by a different
+    /// pubkey referencing this coordinate is ignored, otherwise any pubkey could
+    /// pre-emptively censor another's addressable events.
     pub async fn is_coordinate_deleted(
         &self,
         coordinate: &str,
         event_created_at: Timestamp,
     ) -> bool {
+        // The coordinate owner (pubkey hex) is the only party allowed to delete
+        // it. Extract it so we can require the kind-5 author to match.
+        let coord_owner_hex = coordinate.split(':').nth(1);
+
         let filter = Filter::new().kind(Kind::EventDeletion).custom_tag(
             SingleLetterTag::lowercase(Alphabet::A),
             coordinate.to_string(),
         );
         match self.db.query(filter).await {
-            Ok(events) => events
-                .iter()
-                .any(|deletion| deletion.created_at >= event_created_at),
+            Ok(events) => events.iter().any(|deletion| {
+                deletion.created_at >= event_created_at
+                    && coord_owner_hex
+                        .map(|owner| owner == deletion.pubkey.to_hex())
+                        .unwrap_or(false)
+            }),
             Err(e) => {
                 tracing::error!(error = %e, "Tombstone query failed for is_coordinate_deleted");
                 false
@@ -212,12 +231,39 @@ mod tests {
         let keys = Keys::generate();
         let target = EventId::all_zeros();
 
-        assert!(!store.is_event_deleted(&target).await);
+        assert!(!store.is_event_deleted(&target, &keys.public_key()).await);
 
         let deletion = deletion_by_event(&keys, target);
         store.record_deletion(&deletion).await.unwrap();
 
-        assert!(store.is_event_deleted(&target).await);
+        assert!(store.is_event_deleted(&target, &keys.public_key()).await);
+    }
+
+    #[tokio::test]
+    async fn deletion_does_not_block_a_different_authors_event() {
+        // A kind-5 from pubkey B targeting an event id must NOT mark that id as
+        // deleted for a different author A: only the event's own author may
+        // delete it (NIP-09). Guards against pre-emptive cross-author censorship
+        // when the deletion races ahead of the target (out-of-order delete).
+        let store = Tombstones::in_memory();
+        let attacker = Keys::generate();
+        let victim = Keys::generate();
+        let target = EventId::all_zeros();
+
+        let deletion = deletion_by_event(&attacker, target);
+        store.record_deletion(&deletion).await.unwrap();
+
+        // The attacker "deleted" it for themselves...
+        assert!(
+            store
+                .is_event_deleted(&target, &attacker.public_key())
+                .await
+        );
+        // ...but the victim's identical id is NOT considered deleted.
+        assert!(
+            !store.is_event_deleted(&target, &victim.public_key()).await,
+            "a deletion from another pubkey must not block the victim's event"
+        );
     }
 
     #[tokio::test]
@@ -249,6 +295,31 @@ mod tests {
             !store
                 .is_coordinate_deleted(&coord, Timestamp::from_secs(1500))
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_deletion_by_other_pubkey_is_ignored() {
+        // A kind-5 from pubkey B carrying an `a` tag for a coordinate owned by
+        // pubkey A must NOT mark that coordinate as deleted: only the pubkey
+        // embedded in the coordinate may delete it.
+        let store = Tombstones::in_memory();
+        let victim = Keys::generate();
+        let attacker = Keys::generate();
+        let coord = format!("30618:{}:my-repo", victim.public_key().to_hex());
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord.clone()])])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&attacker)
+            .unwrap();
+        store.record_deletion(&deletion).await.unwrap();
+
+        assert!(
+            !store
+                .is_coordinate_deleted(&coord, Timestamp::from_secs(1000))
+                .await,
+            "a coordinate deletion signed by a different pubkey must be ignored"
         );
     }
 

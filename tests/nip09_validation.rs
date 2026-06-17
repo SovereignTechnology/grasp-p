@@ -278,10 +278,9 @@ async fn deletion_of_nonexistent_event_is_accepted() {
         .expect("create audit client");
 
     // A random id the relay has never stored.
-    let nonexistent = EventId::from_hex(
-        "0000000000000000000000000000000000000000000000000000000000000001",
-    )
-    .expect("parse nonexistent id");
+    let nonexistent =
+        EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+            .expect("parse nonexistent id");
 
     let deletion = build_deletion(&client, &[nonexistent], &[]);
 
@@ -317,7 +316,12 @@ async fn deletion_before_target_rejects_later_submission() {
     let (announcement, _repo_id) = publish_served_repo(&client, "delete-first").await;
 
     let issue = client
-        .create_issue(&announcement, "Issue deleted before it arrives", "delete me", vec![])
+        .create_issue(
+            &announcement,
+            "Issue deleted before it arrives",
+            "delete me",
+            vec![],
+        )
         .expect("build issue");
     let issue_id = issue.id;
 
@@ -367,6 +371,84 @@ async fn deletion_before_target_rejects_later_submission() {
     assert!(
         !served,
         "issue {} must never be served: it was deleted before it arrived",
+        issue_id
+    );
+}
+
+/// 2c. Out-of-order deletion by a DIFFERENT pubkey must NOT be actioned.
+///
+/// Author B sends a kind-5 targeting (by `e` tag) an event id that the relay
+/// has never seen — an id that will later belong to author A's event. Because
+/// B is not the author of the target, the deletion must not lay down a
+/// tombstone that censors A: when A subsequently submits the genuine event it
+/// must be accepted and served.
+///
+/// This is the cross-author counterpart of
+/// `deletion_before_target_rejects_later_submission`. The earlier
+/// `deletion_author_mismatch_rejected` test only covers the case where the
+/// target already exists; this one covers the harder out-of-order case where B
+/// races ahead of A and could otherwise pre-emptively block A's event.
+#[tokio::test]
+async fn out_of_order_deletion_by_other_pubkey_not_actioned() {
+    let relay = TestRelay::start().await;
+
+    let author_a = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create author A client");
+    let author_b = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create author B client");
+
+    // A promotes a repo and builds (but does NOT yet send) an issue, so we know
+    // the id of A's future event.
+    let (announcement_a, _repo_id) = publish_served_repo(&author_a, "other-pubkey-race").await;
+    let issue = author_a
+        .create_issue(&announcement_a, "A's issue", "owned by A", vec![])
+        .expect("build issue");
+    let issue_id = issue.id;
+
+    // Sanity: the relay has never seen the issue.
+    assert!(
+        !author_a
+            .is_event_on_relay(issue_id)
+            .await
+            .expect("query issue before anything is sent"),
+        "issue should not be served before it is ever submitted"
+    );
+
+    // B races ahead and sends a deletion targeting A's not-yet-seen event id.
+    // The relay cannot yet know the author of the target. Whether the relay
+    // accepts B's kind-5 (as a pre-emptive no-op) or rejects it outright, the
+    // critical requirement is that it MUST NOT lay down a tombstone that blocks
+    // A's genuine event.
+    let deletion = build_deletion(&author_b, &[issue_id], &[]);
+    let _ = author_b.send_event(deletion).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A now submits the genuine event. It must be accepted: B's deletion of an
+    // event B does not own must never have been actioned.
+    let result = author_a.send_event(issue.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let served = author_a
+        .is_event_on_relay(issue_id)
+        .await
+        .expect("query A's issue after submission");
+
+    relay.stop().await;
+
+    assert!(
+        result.is_ok(),
+        "A's genuine event must be accepted: a deletion from another pubkey \
+         must not block it, but submission was rejected: {:?}",
+        result.err()
+    );
+    assert!(
+        served,
+        "A's issue {} must be served: a deletion request from another pubkey \
+         must not be actioned against A's events",
         issue_id
     );
 }
@@ -583,9 +665,9 @@ async fn deletion_invalid_address_format_handled_gracefully() {
         .expect("create audit client");
 
     let malformed = [
-        "invalid:format",      // only two parts
-        "notanumber:pk:id",    // unparseable kind
-        "30617:badhex:id",     // unparseable pubkey hex
+        "invalid:format",   // only two parts
+        "notanumber:pk:id", // unparseable kind
+        "30617:badhex:id",  // unparseable pubkey hex
     ];
 
     for coord in malformed {
@@ -612,10 +694,10 @@ async fn deletion_invalid_address_format_handled_gracefully() {
     // prove it by round-tripping a normal acceptance.
     let probe = build_deletion(
         &client,
-        &[EventId::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000002",
-        )
-        .expect("parse probe id")],
+        &[
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .expect("parse probe id"),
+        ],
         &[],
     );
     let probe_result = client.send_event(probe).await;

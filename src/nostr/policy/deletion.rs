@@ -728,7 +728,9 @@ mod tests {
         assert!(matches!(result, WritePolicyResult::Accept));
         // No tombstone recorded -> re-submission of the target is NOT blocked.
         assert!(
-            !ctx.tombstones.is_event_deleted(&target).await,
+            !ctx.tombstones
+                .is_event_deleted(&target, &keys.public_key())
+                .await,
             "Disrespector mode must NOT record a deletion tombstone"
         );
     }

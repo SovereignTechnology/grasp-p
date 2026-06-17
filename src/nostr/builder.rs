@@ -634,8 +634,14 @@ impl Nip34WritePolicy {
             return Some(reject_invalid("this pubkey has requested to vanish"));
         }
 
-        // 2. Deleted event id
-        if self.ctx.tombstones.is_event_deleted(&event.id).await {
+        // 2. Deleted event id (author-bound: only the event's own author may
+        //    have deleted it)
+        if self
+            .ctx
+            .tombstones
+            .is_event_deleted(&event.id, &event.pubkey)
+            .await
+        {
             tracing::debug!(
                 event_id = %event.id.to_hex(),
                 "Rejected re-submission of deleted event"
