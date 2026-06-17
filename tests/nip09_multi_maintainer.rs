@@ -13,9 +13,6 @@
 //! and third announcement (`maintainers` tag + non-local `relays` tag), because
 //! independent second-announcement git promotion is not currently reliable in
 //! this fixture setup.
-//!
-//! Not covered here: PR-chain kinds (1618/1619/1631/1632), which need additional
-//! PR-specific test wiring outside this Phase 4 scope.
 
 mod common;
 

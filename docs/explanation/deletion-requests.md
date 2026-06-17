@@ -1,8 +1,10 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** 🚧 **PLANNED - NOT YET IMPLEMENTED** 🚧
+**Status:** ✅ **PARTIALLY IMPLEMENTED (hard-delete path live)**
 
-This document describes the planned architecture for NIP-09 deletion request support in ngit-grasp. Implementation is scheduled for 6-week phased rollout. See `work/active-issues/deletion-request-support.md` for implementation tracking.
+This document now reflects both the implemented single-node hard-delete path
+(main DB + tombstones, no holding DB) and the still-planned archival/recovery
+architecture.
 
 ---
 
@@ -30,6 +32,10 @@ bypassing the backend so we can apply our own customisations in the future.
 ngit-grasp now has custom announcement cascade deletion in the main DB (pure
 hard-delete, no holding DB), including dependent NIP-34 graph events and
 repository-state (kind 30618) cleanup when an identifier becomes unanchored.
+The cascade walk is kind-agnostic over `a` / `e` / `q` edges; supported
+dependent kinds are controlled by
+[`GRAPH_DEPENDENT_KINDS`](../../src/nostr/policy/deletion.rs) and currently
+include the full PR chain (`1618`/`1619`/`1631`/`1632`).
 
 **Components added:**
 
@@ -547,32 +553,37 @@ When implementation is complete, the following documentation will be updated:
 
 ## Implementation Status
 
-**Phase 1: Core Deletion + Simple Cascade** 🔄 (Planned)
-- Config options
-- Holding database
-- Kind 5 processing
-- Simple cascade delete
+**Phase 1: Core Deletion + Simple Cascade** ✅ (Implemented, hard-delete mode)
+- Config options for NIP-09 handling and archival disrespector mode
+- Kind 5 processing owned by ngit-grasp (not backend auto-processing)
+- Main-DB hard-delete + tombstone recording
+- Simple announcement cascade in live DB
 
 **Phase 2: Git Archival & Cleanup** 🔄 (Planned)
 - Archive tar.gz creation
 - Background cleanup task
 - Metadata storage
 
-**Phase 3: Multi-Maintainer Graph Algorithm** 🔄 (Planned)
-- Dependency graph building
-- Re-evaluation through acceptance policy
-- Circular dependency detection
+**Phase 3: Multi-Maintainer Graph Algorithm** ✅ (Implemented, hard-delete mode)
+- Dependency graph traversal over `a` / `e` / `q` references
+- Multi-maintainer survival semantics (retain dependents when alternative
+  anchors remain)
+- Deletion of orphaned dependents when all anchors are removed
 
 **Phase 4: Recovery Mechanism** 🔄 (Planned)
 - Re-announcement detection
 - Archive restoration
 - Event recovery from holding DB
 
-**Phase 5: Extended Cascade Deletion** 🔄 (Planned)
-- Patches (1617) cascade
-- Issues (1621) cascade  
-- PR Updates (1619) cascade
-- Full event type coverage
+**Phase 5: Extended Cascade Deletion** ✅ (Implemented)
+- Kind-agnostic cascade over configured dependent kinds
+- Coverage includes patches/issues/comments/status kinds and PR chain kinds
+  (`1618`/`1619`/`1631`/`1632`)
+- Repository state (`30618`) identifier-level cleanup when unanchored
+
+PR-chain integration coverage is now present in
+[`tests/nip09_cascade_event_types.rs`](../../tests/nip09_cascade_event_types.rs)
+using served PR/PR-update fixtures (event + git-ref promotion).
 
 **Phase 6: Analysis & Edge Cases** 🔄 (Planned)
 - Background cleanup timing strategy (daily doesn't work with 3-second test retention)

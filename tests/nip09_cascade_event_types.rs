@@ -142,7 +142,10 @@ async fn test_announcement_cascade_deletes_served_pr_chain_kinds() {
         .event_builder(Kind::GitPullRequestUpdate, "cascade pr update")
         .tag(Tag::custom("a", vec![coordinate.clone()]))
         .tag(Tag::custom("e", vec![pr.id.to_hex()]))
-        .tag(Tag::custom("c", vec![DETERMINISTIC_COMMIT_HASH.to_string()]))
+        .tag(Tag::custom(
+            "c",
+            vec![DETERMINISTIC_COMMIT_HASH.to_string()],
+        ))
         .build(&keys)
         .expect("build PR update event");
     client
