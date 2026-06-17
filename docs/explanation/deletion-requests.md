@@ -1,10 +1,10 @@
 # Deletion Request Support (NIP-09)
 
-**Status:** ✅ **PARTIALLY IMPLEMENTED (Phases 1–4 live; recovery deferred)**
+**Status:** ✅ **PARTIALLY IMPLEMENTED (Phases 1–5 live; Phase 6 deferred)**
 
 This document now reflects both the implemented single-node deletion path
-(main DB + tombstones + holding DB + git archive lifecycle) and the still-planned
-recovery architecture.
+(main DB + tombstones + holding DB + git archive lifecycle + recovery) and the
+still-planned Phase 6 operational hardening.
 
 ---
 
@@ -15,7 +15,7 @@ recovery architecture.
 > What follows in this section is what is **actually built today** and is the
 > foundation that work builds on. The `deletion-request-disrespector` archival
 > mode and the holding-DB move semantics are now implemented (see below);
-> cleanup expiry and git archival lifecycle are now implemented; recovery remains planned.
+> cleanup expiry, git archival lifecycle, and automatic recovery are now implemented.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -286,22 +286,55 @@ Scenario: Owner deletes repository, then changes their mind
 
 1. Owner publishes new announcement with same identifier
    ↓
-2. System detects matching entry in holding database
+2. System detects matching holding metadata for same owner+identifier
    ↓
-3. Check: Is entry within retention period?
+3. Check: Is metadata within retention period?
    ↓
 4. If YES:
-   - Extract git data from archive tar.gz
-   - Restore to <git_data_path>/<npub>/<identifier>.git
-   - Move events from holding DB → main DB
-   - Re-run acceptance policy (should now pass)
-   - Delete archive records
-   - Return: "Restored X events"
+   - Restore git data from archive tar.gz when archive exists
+   - Restore event payloads from holding DB into main DB
+   - Clean recovered holding metadata/payload rows
+   - Remove consumed archive file when recovery cleanup is complete
+   - Continue normal announcement acceptance path
    ↓
 5. If NO (expired):
    - Process as new repository
-   - Return: "New repository created"
+   - No holding/archive restore occurs
 ```
+
+#### Implemented recovery contract (Phase 5)
+
+Recovery is triggered during **accepted** kind-30617 re-announcement processing
+for the same `<owner-pubkey, identifier>` scope.
+
+Eligibility rules:
+
+- metadata must match the same owner+identifier scope,
+- metadata must still be within `DEFAULT_RETENTION`,
+- cleaned/expired rows are naturally ineligible.
+
+Deterministic partial-state behavior:
+
+- **Holding events exist, archive missing/invalid:** continue with
+  **events-only** recovery; ensure announcement acceptance still proceeds.
+- **Archive exists, holding payload missing:** continue with
+  **git-only + metadata cleanup** for stale rows; missing payload is logged.
+- **Archive extraction error (corrupt/unreadable):** abort recovery for this
+  trigger (fail-safe), keep holding metadata for retry.
+
+Idempotency/cleanup:
+
+- restoring the same trigger repeatedly does not duplicate events,
+- recovered metadata/payload rows are removed from holding,
+- consumed archive files are removed after successful full cleanup,
+- if any payload restore step fails, only successful rows are cleaned; failed
+  rows remain for retry.
+
+Tombstone interaction:
+
+- tombstones are **not** removed by recovery,
+- coordinate/event deletion guards remain in force for older events,
+- newer re-announcements remain valid by existing timestamp semantics.
 
 ### Blacklist Recovery
 
@@ -628,11 +661,15 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Failure-mode handling is implemented with fail-safe preservation on archive-create
   failure and best-effort cleanup on missing archive files.
 
-**Phase 5: Recovery workflow** 🔄
+**Phase 5: Recovery workflow** ✅
 - Re-announcement detection and eligibility checks (within retention window,
-  author constraints).
-- Restore events from holding DB and git data from archive.
-- Define operator/manual recovery controls and clear outcome reporting.
+  owner/identifier constraints) are implemented.
+- Recovery orchestration restores holding payloads to main DB and restores git
+  archive data when available.
+- Partial-state behavior is explicit and deterministic (events-only vs git-only,
+  plus fail-safe abort on archive extraction errors).
+- Recovery cleanup removes recovered holding metadata/payload and archive
+  tracking artifacts.
 
 **Phase 6: Ops hardening and policy edge-cases** 🔄
 - Blacklist-triggered deletion parity and blacklist/disrespector interaction.
@@ -640,15 +677,15 @@ using served PR/PR-update fixtures (event + git-ref promotion).
 - Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
 - Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
 
-### Deferred items after Phase 4
+### Deferred items after Phase 5
 
-The next phases still intentionally deferred are:
+The remaining intentionally deferred items are:
 
-1. **Recovery workflow (Phase 5):** restore events/git data from holding/archive
-   on explicit/operator-approved flows.
-2. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
+1. **Blacklist runtime deletion parity (Phase 6):** there is currently no active
    runtime blacklist-triggered deletion path in the codebase; when introduced,
    it must route through holding with `DeletionSource::Blacklist`.
+2. **Manual/operator controls (Phase 6):** explicit ejection/restore workflows,
+   safety confirmation UX, and policy knobs beyond automatic owner re-announcement.
 
 > ✅ Resolved prerequisite from earlier plan: rust-nostr backend auto-processing
 > behavior is understood; ngit-grasp runs with `process_nip09(false)` and

@@ -5,15 +5,20 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::BTreeSet, fs::File};
 
+use flate2::read::GzDecoder;
 use nostr::nips::nip19::ToBech32;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
+use tar::Archive as TarArchive;
 
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::holding::RecoveryMetadataRecord;
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
@@ -191,6 +196,11 @@ impl Nip34WritePolicy {
                             // Note: We still accept the event even if repo creation fails
                         }
 
+                        // Phase 5 recovery trigger: accepted re-announcement for
+                        // same owner+identifier can restore holding/archive state.
+                        self.maybe_recover_deleted_repository(event, &announcement.identifier)
+                            .await;
+
                         tracing::debug!("Accepted repository announcement: {}", event_id_str);
 
                         // Check purgatory for state events that might now be authorized
@@ -221,6 +231,37 @@ impl Nip34WritePolicy {
                 }
             }
             AnnouncementResult::AcceptPurgatory => {
+                let announcement = match RepositoryAnnouncement::from_event(event.clone()) {
+                    Ok(announcement) => announcement,
+                    Err(e) => {
+                        return reject_invalid(format!("Failed to parse announcement: {}", e))
+                    }
+                };
+
+                // Phase 5 recovery trigger for deleted repos: if eligible holding
+                // state exists, restore and accept immediately (no purgatory wait).
+                let recovered = self
+                    .maybe_recover_deleted_repository(event, &announcement.identifier)
+                    .await;
+                if recovered {
+                    tracing::info!(
+                        identifier = %announcement.identifier,
+                        event_id = %event_id_str,
+                        "Accepted re-announcement with recovery"
+                    );
+                    if let Err(e) = self
+                        .announcement_policy
+                        .ensure_bare_repository(&announcement)
+                    {
+                        tracing::warn!(
+                            "Failed to ensure bare repository after recovery for {}: {}",
+                            event_id_str,
+                            e
+                        );
+                    }
+                    return WritePolicyResult::Accept;
+                }
+
                 // New announcement - add to purgatory
                 match self.announcement_policy.add_to_purgatory(event) {
                     Ok(()) => {
@@ -1013,4 +1054,322 @@ pub async fn create_relay(
         write_policy,
         holding,
     })
+}
+
+impl Nip34WritePolicy {
+    fn owner_directory_component(pubkey: &PublicKey) -> String {
+        pubkey.to_bech32().unwrap_or_else(|_| pubkey.to_hex())
+    }
+
+    fn repo_path_for_owner_and_identifier(
+        &self,
+        owner_path_component: &str,
+        identifier: &str,
+    ) -> PathBuf {
+        self.ctx
+            .git_data_path
+            .join(owner_path_component)
+            .join(format!("{}.git", identifier))
+    }
+
+    fn restore_git_archive_to_repo(
+        &self,
+        archive_path: &Path,
+        owner_path_component: &str,
+        identifier: &str,
+    ) -> anyhow::Result<bool> {
+        let target_repo = self.repo_path_for_owner_and_identifier(owner_path_component, identifier);
+        if target_repo.is_dir() {
+            return Ok(false);
+        }
+
+        let owner_dir = target_repo
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid repository path {}", target_repo.display()))?;
+        std::fs::create_dir_all(owner_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create owner directory {}: {}",
+                owner_dir.display(),
+                e
+            )
+        })?;
+
+        let staging_dir = owner_dir.join(format!(
+            ".restore-{}-{}",
+            identifier,
+            Timestamp::now().as_secs()
+        ));
+        if staging_dir.exists() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        }
+        std::fs::create_dir_all(&staging_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create restore staging directory {}: {}",
+                staging_dir.display(),
+                e
+            )
+        })?;
+
+        let result = (|| -> anyhow::Result<()> {
+            let archive_file = File::open(archive_path).map_err(|e| {
+                anyhow::anyhow!("failed to open archive {}: {}", archive_path.display(), e)
+            })?;
+            let decoder = GzDecoder::new(archive_file);
+            let mut tar = TarArchive::new(decoder);
+            tar.unpack(&staging_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to extract archive {} into {}: {}",
+                    archive_path.display(),
+                    staging_dir.display(),
+                    e
+                )
+            })?;
+
+            let extracted_repo = staging_dir.join(format!("{}.git", identifier));
+            if !extracted_repo.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "archive {} did not contain {}.git",
+                    archive_path.display(),
+                    identifier
+                ));
+            }
+
+            std::fs::rename(&extracted_repo, &target_repo).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to move restored repository {} -> {}: {}",
+                    extracted_repo.display(),
+                    target_repo.display(),
+                    e
+                )
+            })?;
+
+            Ok(())
+        })();
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        result?;
+        Ok(true)
+    }
+
+    async fn restore_events_from_holding(
+        &self,
+        records: &[RecoveryMetadataRecord],
+    ) -> (Vec<RecoveryMetadataRecord>, Vec<RecoveryMetadataRecord>) {
+        let mut restorable = Vec::new();
+        let mut blocked = Vec::new();
+
+        for record in records {
+            let Some(event_id) = record.archived_event_id else {
+                // Metadata-only row (no payload) can be cleaned up.
+                restorable.push(record.clone());
+                continue;
+            };
+
+            match self.ctx.holding.archived_event(&event_id).await {
+                Ok(Some(event)) => {
+                    let already_exists = match self.ctx.database.event_by_id(&event_id).await {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                event_id = %event_id.to_hex(),
+                                "Recovery failed while checking main DB event existence"
+                            );
+                            blocked.push(record.clone());
+                            continue;
+                        }
+                    };
+
+                    if !already_exists {
+                        if let Err(e) = self.ctx.database.save_event(&event).await {
+                            tracing::error!(
+                                error = %e,
+                                event_id = %event_id.to_hex(),
+                                "Recovery failed to restore event payload into main DB"
+                            );
+                            blocked.push(record.clone());
+                            continue;
+                        }
+                    }
+
+                    restorable.push(record.clone());
+                }
+                Ok(None) => {
+                    // Stale metadata referencing missing payload: deterministic
+                    // behavior is to keep recovery moving and clean this row.
+                    tracing::warn!(
+                        event_id = %event_id.to_hex(),
+                        "Recovery metadata referenced missing holding payload event; cleaning metadata"
+                    );
+                    restorable.push(record.clone());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        event_id = %event_id.to_hex(),
+                        "Recovery failed to load holding payload event"
+                    );
+                    blocked.push(record.clone());
+                }
+            }
+        }
+
+        (restorable, blocked)
+    }
+
+    async fn maybe_recover_deleted_repository(&self, event: &Event, identifier: &str) -> bool {
+        let owner_hex = event.pubkey.to_hex();
+        let records = self
+            .ctx
+            .holding
+            .eligible_recovery_records(
+                &owner_hex,
+                identifier,
+                Timestamp::now(),
+                crate::nostr::holding::DEFAULT_RETENTION,
+            )
+            .await;
+
+        if records.is_empty() {
+            return false;
+        }
+
+        let mut archive_paths = BTreeSet::new();
+        for record in &records {
+            if let Some(path) = &record.archive_relative_path {
+                archive_paths.insert(path.clone());
+            }
+        }
+
+        let selected_archive_rel = archive_paths.iter().next().cloned();
+        if archive_paths.len() > 1 {
+            tracing::warn!(
+                owner = %owner_hex,
+                identifier = %identifier,
+                selected_archive = ?selected_archive_rel,
+                archives = ?archive_paths,
+                "Recovery found multiple archive paths; selecting lexicographically first path"
+            );
+        }
+
+        let owner_component = Self::owner_directory_component(&event.pubkey);
+        let mut git_ready = true;
+        let mut archive_restored = false;
+        let mut selected_archive_abs: Option<PathBuf> = None;
+        if let Some(rel_path) = &selected_archive_rel {
+            match self.ctx.holding.archive_absolute_path(rel_path) {
+                Some(abs_path) => {
+                    selected_archive_abs = Some(abs_path.clone());
+                    if !abs_path.exists() {
+                        tracing::warn!(
+                            owner = %owner_hex,
+                            identifier = %identifier,
+                            archive = %abs_path.display(),
+                            "Recovery archive file missing; continuing with events-only recovery"
+                        );
+                        git_ready = false;
+                    } else {
+                        match self.restore_git_archive_to_repo(
+                            &abs_path,
+                            &owner_component,
+                            identifier,
+                        ) {
+                            Ok(restored) => {
+                                archive_restored = restored;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    owner = %owner_hex,
+                                    identifier = %identifier,
+                                    archive = %abs_path.display(),
+                                    "Recovery failed restoring git archive; aborting recovery"
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        owner = %owner_hex,
+                        identifier = %identifier,
+                        archive_rel = %rel_path,
+                        "Recovery archive path is invalid; continuing with events-only recovery"
+                    );
+                    git_ready = false;
+                }
+            }
+        }
+
+        let (cleanup_candidates, blocked_records) =
+            self.restore_events_from_holding(&records).await;
+        if cleanup_candidates.is_empty() && !git_ready {
+            tracing::warn!(
+                owner = %owner_hex,
+                identifier = %identifier,
+                "Recovery found only non-restorable state"
+            );
+            return false;
+        }
+
+        let mut cleaned = 0usize;
+        for record in &cleanup_candidates {
+            match self.ctx.holding.delete_recovery_record(record).await {
+                Ok((metadata_deleted, _payload_deleted)) => {
+                    if metadata_deleted {
+                        cleaned += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        metadata_event_id = %record.metadata_event_id.to_hex(),
+                        "Recovery failed to clean up holding record"
+                    );
+                }
+            }
+        }
+
+        let all_records_cleared = blocked_records.is_empty() && cleaned == cleanup_candidates.len();
+        if all_records_cleared && selected_archive_rel.is_some() {
+            if let Some(abs_path) = selected_archive_abs {
+                match std::fs::remove_file(&abs_path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            owner = %owner_hex,
+                            identifier = %identifier,
+                            archive = %abs_path.display(),
+                            "Recovery removed consumed git archive"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            owner = %owner_hex,
+                            identifier = %identifier,
+                            archive = %abs_path.display(),
+                            "Recovery failed to delete consumed archive file"
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            owner = %owner_hex,
+            identifier = %identifier,
+            records_considered = records.len(),
+            records_cleaned = cleaned,
+            records_blocked = blocked_records.len(),
+            archive_tracked = selected_archive_rel.is_some(),
+            archive_restored = archive_restored,
+            git_ready = git_ready,
+            "Recovery workflow completed for re-announcement"
+        );
+
+        true
+    }
 }

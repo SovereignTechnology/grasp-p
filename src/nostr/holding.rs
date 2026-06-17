@@ -75,6 +75,13 @@ pub struct ExpiredMetadataRecord {
     pub archive_relative_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryMetadataRecord {
+    pub metadata_event_id: EventId,
+    pub archived_event_id: Option<EventId>,
+    pub archive_relative_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CleanupStats {
     pub metadata_examined: usize,
@@ -235,6 +242,204 @@ impl HoldingStore {
                 None
             }
         })
+    }
+
+    fn parse_identifier(metadata_event: &Event) -> Option<String> {
+        metadata_event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "d" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn parse_owner_pubkey(metadata_event: &Event) -> Option<String> {
+        metadata_event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == HOLDING_OWNER_PUBKEY_TAG {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn parse_coordinate(metadata_event: &Event) -> Option<String> {
+        metadata_event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "a" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn metadata_matches_recovery_scope(
+        metadata_event: &Event,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> bool {
+        let expected_coord = format!("30617:{}:{}", owner_pubkey_hex, identifier);
+
+        if Self::parse_coordinate(metadata_event).as_deref() == Some(expected_coord.as_str()) {
+            return true;
+        }
+
+        let Some(meta_identifier) = Self::parse_identifier(metadata_event) else {
+            return false;
+        };
+
+        if meta_identifier != identifier {
+            return false;
+        }
+
+        match Self::parse_owner_pubkey(metadata_event) {
+            Some(owner) => owner == owner_pubkey_hex,
+            // Legacy/unanchored state metadata may not carry an owner pubkey.
+            None => true,
+        }
+    }
+
+    /// Find holding metadata records eligible for repository recovery.
+    ///
+    /// Eligibility requires all of:
+    /// - metadata belongs to the same owner+identifier recovery scope,
+    /// - metadata has a parseable `holding-deleted-at`,
+    /// - metadata is within `retention` from `now`.
+    pub async fn eligible_recovery_records(
+        &self,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+        now: Timestamp,
+        retention: Duration,
+    ) -> Vec<RecoveryMetadataRecord> {
+        let cutoff = now.as_secs().saturating_sub(retention.as_secs());
+        let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
+
+        let metadata_events = match self.db.query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::error!(error = %e, "Holding recovery failed to query metadata events");
+                return Vec::new();
+            }
+        };
+
+        metadata_events
+            .into_iter()
+            .filter(|metadata_event| {
+                Self::metadata_matches_recovery_scope(metadata_event, owner_pubkey_hex, identifier)
+            })
+            .filter_map(|metadata_event| {
+                let deleted_at = Self::parse_holding_deleted_at(&metadata_event)?;
+                if deleted_at.as_secs() <= cutoff {
+                    return None;
+                }
+
+                Some(RecoveryMetadataRecord {
+                    metadata_event_id: metadata_event.id,
+                    archived_event_id: Self::parse_archived_event_id(&metadata_event),
+                    archive_relative_path: Self::parse_archive_relative_path(&metadata_event),
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve an archive-relative path to an absolute path under `.archive`.
+    pub fn archive_absolute_path(&self, relative_path: &str) -> Option<PathBuf> {
+        self.resolve_archive_path(relative_path)
+    }
+
+    /// Load one archived payload event by id from the holding DB.
+    pub async fn archived_event(&self, id: &EventId) -> anyhow::Result<Option<Event>> {
+        self.db
+            .event_by_id(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load archived holding event {}: {e}", id))
+    }
+
+    /// Delete one archived payload event by id (without touching metadata).
+    ///
+    /// Intended for corruption handling/tests that need to model stale metadata
+    /// pointing at a missing payload event.
+    pub async fn delete_archived_payload(&self, id: &EventId) -> anyhow::Result<bool> {
+        let exists = self.db.event_by_id(id).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to look up archived holding payload event {}: {e}",
+                id
+            )
+        })?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        self.db
+            .delete(Filter::new().ids(vec![*id]))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to delete archived holding payload event {}: {e}",
+                    id
+                )
+            })?;
+
+        Ok(true)
+    }
+
+    /// Remove one recovery metadata record and its archived payload (if present).
+    ///
+    /// Idempotent: missing payload/metadata rows are tolerated.
+    pub async fn delete_recovery_record(
+        &self,
+        record: &RecoveryMetadataRecord,
+    ) -> anyhow::Result<(bool, bool)> {
+        let mut metadata_deleted = false;
+        let mut payload_deleted = false;
+
+        if let Some(event_id) = record.archived_event_id {
+            let payload_exists = self.db.event_by_id(&event_id).await.map_err(|e| {
+                anyhow::anyhow!("Failed to look up archived holding event {}: {e}", event_id)
+            })?;
+            if payload_exists.is_some() {
+                self.db
+                    .delete(Filter::new().ids(vec![event_id]))
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to delete recovered holding payload event {}: {e}",
+                            event_id
+                        )
+                    })?;
+                payload_deleted = true;
+            }
+        }
+
+        let metadata_exists = self
+            .db
+            .event_by_id(&record.metadata_event_id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to look up holding recovery metadata event {}: {e}",
+                    record.metadata_event_id
+                )
+            })?;
+        if metadata_exists.is_some() {
+            self.db
+                .delete(Filter::new().ids(vec![record.metadata_event_id]))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to delete holding recovery metadata event {}: {e}",
+                        record.metadata_event_id
+                    )
+                })?;
+            metadata_deleted = true;
+        }
+
+        Ok((metadata_deleted, payload_deleted))
     }
 
     fn resolve_archive_path(&self, relative_path: &str) -> Option<PathBuf> {
@@ -487,5 +692,119 @@ mod tests {
         assert_eq!(stats.archived_events_deleted, 0);
         assert_eq!(stats.metadata_deleted, 1);
         assert!(store.metadata_for_event(&event.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn eligible_recovery_records_filters_by_scope_and_retention() {
+        let store = HoldingStore::in_memory();
+        let owner = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let other_owner_hex = Keys::generate().public_key().to_hex();
+        let identifier = "repo-a";
+        let now = Timestamp::from_secs(1_000);
+
+        let in_scope_event = test_event("in-scope", Timestamp::from_secs(900));
+        store
+            .archive_event(
+                &in_scope_event,
+                &HoldingMetadata {
+                    deleted_at: Timestamp::from_secs(980),
+                    source: DeletionSource::Nip09,
+                    coordinate: Some(format!("30617:{}:{}", owner_hex, identifier)),
+                    identifier: Some(identifier.to_string()),
+                    owner_pubkey: Some(owner_hex.clone()),
+                    git_archive: None,
+                },
+            )
+            .await
+            .expect("archive in-scope event");
+
+        let wrong_owner_event = test_event("wrong-owner", Timestamp::from_secs(900));
+        store
+            .archive_event(
+                &wrong_owner_event,
+                &HoldingMetadata {
+                    deleted_at: Timestamp::from_secs(980),
+                    source: DeletionSource::Nip09,
+                    coordinate: Some(format!("30617:{}:{}", other_owner_hex, identifier)),
+                    identifier: Some(identifier.to_string()),
+                    owner_pubkey: Some(other_owner_hex),
+                    git_archive: None,
+                },
+            )
+            .await
+            .expect("archive wrong-owner event");
+
+        let expired_event = test_event("expired", Timestamp::from_secs(900));
+        store
+            .archive_event(
+                &expired_event,
+                &HoldingMetadata {
+                    deleted_at: Timestamp::from_secs(100),
+                    source: DeletionSource::Nip09,
+                    coordinate: Some(format!("30617:{}:{}", owner_hex, identifier)),
+                    identifier: Some(identifier.to_string()),
+                    owner_pubkey: Some(owner_hex.clone()),
+                    git_archive: None,
+                },
+            )
+            .await
+            .expect("archive expired event");
+
+        let records = store
+            .eligible_recovery_records(&owner_hex, identifier, now, Duration::from_secs(50))
+            .await;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].archived_event_id, Some(in_scope_event.id));
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_record_is_idempotent_for_missing_payload() {
+        let store = HoldingStore::in_memory();
+        let event = test_event("recover", Timestamp::from_secs(10));
+        store
+            .archive_event(
+                &event,
+                &HoldingMetadata {
+                    deleted_at: Timestamp::from_secs(11),
+                    source: DeletionSource::Nip09,
+                    coordinate: Some("30617:owner:repo".to_string()),
+                    identifier: Some("repo".to_string()),
+                    owner_pubkey: Some("owner".to_string()),
+                    git_archive: None,
+                },
+            )
+            .await
+            .expect("archive event");
+
+        let records = store
+            .eligible_recovery_records(
+                "owner",
+                "repo",
+                Timestamp::from_secs(20),
+                Duration::from_secs(100),
+            )
+            .await;
+        assert_eq!(records.len(), 1);
+
+        // Remove payload directly to simulate stale metadata.
+        store
+            .db
+            .delete(Filter::new().ids(vec![event.id]))
+            .await
+            .expect("delete payload directly");
+
+        let first = store
+            .delete_recovery_record(&records[0])
+            .await
+            .expect("delete stale recovery record");
+        assert_eq!(first, (true, false));
+
+        let second = store
+            .delete_recovery_record(&records[0])
+            .await
+            .expect("delete stale recovery record again");
+        assert_eq!(second, (false, false));
     }
 }
