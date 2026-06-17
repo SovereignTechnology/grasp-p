@@ -9,9 +9,11 @@ This document describes the planned architecture for NIP-09 deletion request sup
 ## Implemented: ngit-grasp owns NIP-09 / NIP-62 handling
 
 > The rest of this document is the **planned** design for further work
-> (holding database, cascade, archival, recovery, disrespector mode). It is
-> still aspirational. What follows in this section is what is **actually built
-> today** and is the foundation that work builds on.
+> (holding database, cascade, archival, recovery). It is still aspirational.
+> What follows in this section is what is **actually built today** and is the
+> foundation that work builds on. The `deletion-request-disrespector` archival
+> mode is now implemented (see below); the holding DB, cascade, git archival,
+> and recovery remain planned.
 
 Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
 *automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
@@ -69,6 +71,18 @@ we cannot read or write them. Persisting the request events in our own database
 gives us durable, queryable deletion/vanish state for free and is the natural
 foundation for the later cascade/recovery work (recovery = remove the
 tombstone; cascade = walk the references of a recorded deletion).
+
+- **Disrespector mode** (`deletion_request_disrespector`, env
+  `NGIT_DELETION_REQUEST_DISRESPECTOR`, CLI `--deletion-request-disrespector`):
+  when enabled, [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs)
+  short-circuits at the top — the kind-5 deletion request is still accepted (and
+  therefore stored in the main DB so clients get an OK), but it is **not** acted
+  upon: no purgatory eviction, no main-DB deletion, and no tombstone is recorded.
+  Targeted events stay fully accessible, making the relay an archival server.
+  This only affects NIP-09 (kind 5); NIP-62 vanish handling is unchanged.
+  NIP-11 advertisement reflects the mode: NIP-09 (`9`) is included in
+  `supported_nips` only when disrespector is `false`
+  ([`src/http/nip11.rs`](../../src/http/nip11.rs)).
 
 ---
 
@@ -231,7 +245,13 @@ Result: Archival relay preserves all content
 - Archival relays still need ability to moderate malicious content
 - Different policy goals: preservation vs. safety
 
-**Implementation Note:** We need to verify that `nostr-relay-builder` doesn't automatically process deletion requests at the relay library level. If it does, we'll need to override or disable this behavior when disrespector mode is enabled. This will be investigated in Phase 6.
+**Implementation Note:** Implemented. The LMDB backend's automatic NIP-09
+processing is disabled (`process_nip09(false)`); ngit-grasp owns deletion
+handling in [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs), which
+short-circuits when `deletion_request_disrespector` is set — storing but not
+acting on the kind-5 request. NIP-09 is omitted from the NIP-11
+`supported_nips` list in this mode. The git-archival / holding-DB pieces of the
+broader design remain planned.
 
 ## Recovery Mechanism
 
@@ -493,10 +513,11 @@ How long to retain archived events and git data before permanent deletion. Provi
 
 ## NIP-11 Advertisement
 
-Deletion support is **conditionally advertised** in NIP-11 relay information:
+Deletion support is **conditionally advertised** in NIP-11 relay information
+(implemented in [`src/http/nip11.rs`](../../src/http/nip11.rs)):
 
-- **When `deletion_request_disrespector = false`:** Include `"deletion"` in supported NIPs array
-- **When `deletion_request_disrespector = true`:** Do NOT include `"deletion"` (archival mode doesn't honor deletions)
+- **When `deletion_request_disrespector = false`:** include `9` (`"deletion"`) in the supported NIPs array
+- **When `deletion_request_disrespector = true`:** do NOT include `9` (archival mode doesn't honor deletions)
 
 This allows clients to discover whether a relay respects deletion requests.
 

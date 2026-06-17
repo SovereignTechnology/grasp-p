@@ -105,12 +105,24 @@ impl RelayInformationDocument {
             description: config.relay_description.clone(),
             pubkey: config.relay_owner_pubkey_hex().ok(),
             contact: None, // Could be added to config if needed
-            supported_nips: vec![
-                1,  // NIP-01: Basic protocol flow
-                11, // NIP-11: Relay information document (this!)
-                34, // NIP-34: Git repository announcements
-                77, // NIP-77: Negentropy sync (reconciliation protocol)
-            ],
+            supported_nips: {
+                let mut nips = vec![
+                    1,  // NIP-01: Basic protocol flow
+                    11, // NIP-11: Relay information document (this!)
+                    34, // NIP-34: Git repository announcements
+                    77, // NIP-77: Negentropy sync (reconciliation protocol)
+                ];
+                // NIP-09 (deletion) is honoured only when not running as an
+                // archival "disrespector" relay. When disrespector mode is on
+                // the relay stores but ignores deletion requests, so we must not
+                // advertise NIP-09 support — clients can then discover that this
+                // relay does not honour deletions.
+                if !config.deletion_request_disrespector {
+                    nips.push(9); // NIP-09: Event deletion requests
+                    nips.sort_unstable();
+                }
+                nips
+            },
             software: "https://gitworkshop.dev/danconwaydev.com/ngit-grasp".to_string(),
             version: match option_env!("GIT_COMMIT_SHORT") {
                 Some(commit) => format!("{}-{}", env!("CARGO_PKG_VERSION"), commit),
@@ -158,6 +170,8 @@ mod tests {
         assert!(doc.supported_nips.contains(&11));
         assert!(doc.supported_nips.contains(&34));
         assert!(doc.supported_nips.contains(&77));
+        // NIP-09 (deletion) advertised by default (disrespector off).
+        assert!(doc.supported_nips.contains(&9));
         // Without archive mode, only GRASP-01 and GRASP-02
         assert_eq!(doc.supported_grasps, vec!["GRASP-01", "GRASP-02"]);
         assert!(doc.repo_acceptance_criteria.contains("None"));
@@ -308,5 +322,29 @@ mod tests {
             doc.supported_grasps,
             vec!["GRASP-01", "GRASP-02", "GRASP-06"]
         );
+    }
+
+    #[test]
+    fn test_nip11_advertises_deletion_by_default() {
+        let config = Config::for_testing();
+        let doc = RelayInformationDocument::from_config(&config);
+
+        // NIP-09 (deletion) is honoured (and advertised) by default.
+        assert!(doc.supported_nips.contains(&9));
+    }
+
+    #[test]
+    fn test_nip11_omits_deletion_in_disrespector_mode() {
+        let mut config = Config::for_testing();
+        config.deletion_request_disrespector = true;
+
+        let doc = RelayInformationDocument::from_config(&config);
+
+        // Archival relays do not honour deletions, so NIP-09 must not be
+        // advertised.
+        assert!(!doc.supported_nips.contains(&9));
+        // Other NIPs are unaffected.
+        assert!(doc.supported_nips.contains(&1));
+        assert!(doc.supported_nips.contains(&34));
     }
 }

@@ -61,7 +61,27 @@ impl DeletionPolicy {
     /// Only the event author can delete their own events. Authorship is checked
     /// per-target: `e`-tag targets must be authored by the deleter, and `a`-tag
     /// coordinates must carry the deleter's pubkey.
+    ///
+    /// ## Disrespector mode
+    ///
+    /// When `deletion_request_disrespector` is enabled the relay acts as an
+    /// archival server: the kind-5 event is still accepted (and stored in the
+    /// main database) so clients see an OK and the request is preserved, but it
+    /// is NOT acted upon — no purgatory eviction, no main-DB deletion, and no
+    /// tombstone recording. The targeted events therefore remain fully
+    /// accessible. This only affects NIP-09 user-initiated deletions; it does
+    /// not influence blacklist-triggered deletions.
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
+        // Archival mode: store the deletion request but do not process it.
+        if self.ctx.config.deletion_request_disrespector {
+            tracing::info!(
+                event_id = %event.id.to_hex(),
+                author = %event.pubkey.to_hex(),
+                "Disrespector mode: storing NIP-09 deletion request without acting on it"
+            );
+            return WritePolicyResult::Accept;
+        }
+
         // Validate authorship of all targets first. If any `e`-tag target exists
         // in the main DB and is owned by someone else, the whole deletion is
         // invalid (mirrors the backend's `handle_deletion_event` returning
@@ -444,6 +464,16 @@ mod tests {
         PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
     }
 
+    fn make_disrespector_context() -> PolicyContext {
+        let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
+        let config = crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        };
+        PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
+    }
+
     fn make_announcement_event(keys: &Keys, identifier: &str) -> Event {
         EventBuilder::new(Kind::GitRepoAnnouncement, "")
             .tags(vec![
@@ -643,6 +673,90 @@ mod tests {
             ctx.purgatory
                 .has_purgatory_announcement(&keys.public_key(), identifier),
             "Purgatory entry should NOT be removed: entry is newer than deletion request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disrespector_accepts_but_does_not_remove_purgatory_entry() {
+        let ctx = make_disrespector_context();
+        let keys = Keys::generate();
+        let identifier = "my-repo";
+
+        let announcement = make_announcement_event(&keys, identifier);
+        add_to_purgatory(&ctx, &announcement, identifier);
+
+        assert!(ctx
+            .purgatory
+            .has_purgatory_announcement(&keys.public_key(), identifier));
+
+        // Deletion event the author is allowed to make.
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![
+                Tag::event(announcement.id),
+                Tag::custom("k", vec!["30617"]),
+            ])
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx.clone());
+        let result = policy.handle(&deletion).await;
+
+        // The deletion request is accepted (stored) ...
+        assert!(matches!(result, WritePolicyResult::Accept));
+        // ... but NOT acted upon: the purgatory entry remains.
+        assert!(
+            ctx.purgatory
+                .has_purgatory_announcement(&keys.public_key(), identifier),
+            "Disrespector mode must NOT remove the purgatory entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disrespector_does_not_record_tombstone() {
+        let ctx = make_disrespector_context();
+        let keys = Keys::generate();
+        let target = EventId::all_zeros();
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target)])
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx.clone());
+        let result = policy.handle(&deletion).await;
+
+        assert!(matches!(result, WritePolicyResult::Accept));
+        // No tombstone recorded -> re-submission of the target is NOT blocked.
+        assert!(
+            !ctx.tombstones.is_event_deleted(&target).await,
+            "Disrespector mode must NOT record a deletion tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disrespector_does_not_delete_target_from_main_db() {
+        let ctx = make_disrespector_context();
+        let keys = Keys::generate();
+
+        // Store a target event in the main DB.
+        let target = make_announcement_event(&keys, "keep-me");
+        ctx.database.save_event(&target).await.unwrap();
+
+        // Author requests its deletion.
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target.id)])
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx.clone());
+        let result = policy.handle(&deletion).await;
+
+        assert!(matches!(result, WritePolicyResult::Accept));
+        // Target must still be present in the main database.
+        let still_there = ctx.database.event_by_id(&target.id).await.unwrap();
+        assert!(
+            still_there.is_some(),
+            "Disrespector mode must NOT delete the target from the main DB"
         );
     }
 }

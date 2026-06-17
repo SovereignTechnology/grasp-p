@@ -480,6 +480,26 @@ pub struct Config {
     #[arg(long, env = "NGIT_EVENT_BLACKLIST", default_value = "")]
     pub event_blacklist: String,
 
+    /// Deletion request disrespector: ignore NIP-09 deletion requests (archival mode)
+    ///
+    /// When `true`, the relay stores incoming NIP-09 (kind 5) deletion requests but
+    /// does NOT act on them: targeted events remain fully accessible. This makes the
+    /// relay an archival server, preventing "left-pad" scenarios by ensuring at least
+    /// some relays preserve deleted content.
+    ///
+    /// This setting ONLY affects NIP-09 user-initiated deletions. It does NOT prevent
+    /// blacklist-triggered deletions, which are an operator moderation mechanism that
+    /// archival relays still need.
+    ///
+    /// When `true`, NIP-09 (`"deletion"`) is NOT advertised in the NIP-11 supported
+    /// NIPs list so clients can discover that the relay does not honour deletions.
+    #[arg(
+        long,
+        env = "NGIT_DELETION_REQUEST_DISRESPECTOR",
+        default_value_t = false
+    )]
+    pub deletion_request_disrespector: bool,
+
     /// Maximum total connections to the relay (default: unlimited, defers to OS/infrastructure limits)
     #[arg(long, env = "NGIT_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
@@ -769,6 +789,7 @@ impl Config {
             repository_whitelist: String::new(),
             repository_blacklist: String::new(),
             event_blacklist: String::new(),
+            deletion_request_disrespector: false,
             max_connections: None,
             log_level: "debug".to_string(),
         }
@@ -1413,6 +1434,21 @@ mod tests {
         let event_blacklist_config = config.event_blacklist_config();
         assert!(event_blacklist_config.blacklisted_npubs.is_empty());
         assert!(!event_blacklist_config.enabled());
+    }
+
+    #[test]
+    fn test_deletion_request_disrespector_default() {
+        let config = Config::for_testing();
+        assert!(!config.deletion_request_disrespector);
+    }
+
+    #[test]
+    fn test_deletion_request_disrespector_enabled() {
+        let config = Config {
+            deletion_request_disrespector: true,
+            ..Config::for_testing()
+        };
+        assert!(config.deletion_request_disrespector);
     }
 
     #[test]

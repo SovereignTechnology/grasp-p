@@ -1038,6 +1038,57 @@ Event blacklist does **not** affect NIP-11 metadata:
 
 ---
 
+### Deletion Requests (NIP-09)
+
+#### `NGIT_DELETION_REQUEST_DISRESPECTOR`
+
+**Description:** Ignore NIP-09 deletion requests and act as an archival server  
+**Type:** Boolean  
+**Default:** `false` (deletion requests are honoured)  
+**Required:** No  
+**CLI:** `--deletion-request-disrespector`
+
+**Behavior:**
+
+- When `false` (default):
+  - NIP-09 (kind 5) deletion requests are honoured: targeted events are
+    hard-deleted from the relay, matching purgatory entries are evicted, and a
+    persistent tombstone is recorded so re-submission of the deleted event stays
+    rejected across restarts.
+  - NIP-11 `supported_nips` includes `9` (deletion).
+- When `true`:
+  - Incoming NIP-09 deletion requests are still **stored** (the client receives
+    an OK), but they are **not acted upon**. Targeted events remain fully
+    accessible. This makes the relay an archival server, preserving content and
+    preventing "left-pad" scenarios.
+  - NIP-11 `supported_nips` does **not** include `9`, so clients can discover
+    that this relay does not honour deletions.
+
+**IMPORTANT:** This setting ONLY affects NIP-09 user-initiated deletions. It does
+**NOT** prevent blacklist-triggered deletions, which are an operator moderation
+mechanism (spam/malware/abuse) that archival relays still need.
+
+**Use Cases:**
+
+- Community archival relays
+- Research / historical preservation
+- Backup / mirror relays
+
+**Examples:**
+
+```bash
+# Archival relay: preserve deleted content (disrespect NIP-09)
+NGIT_DELETION_REQUEST_DISRESPECTOR=true
+
+# Standard relay: honour deletion requests (default)
+NGIT_DELETION_REQUEST_DISRESPECTOR=false
+```
+
+See [`docs/explanation/deletion-requests.md`](../explanation/deletion-requests.md)
+for the full design rationale.
+
+---
+
 ### Rate Limiting & DoS Protection
 
 #### `NGIT_MAX_CONNECTIONS`
