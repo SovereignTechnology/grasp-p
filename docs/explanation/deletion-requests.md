@@ -475,7 +475,7 @@ When `true`, relay ignores **NIP-09 deletion requests** and acts as an archival 
 - Community archival relays
 - Research/historical preservation
 - Backup/mirror relays
-- GRASP-05 archive mode (future)
+- GRASP-05 archive mode deployments
 
 ### holding_retention_secs
 
@@ -587,16 +587,16 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ## Future Enhancements
 
-Outstanding enhancements identified from b905 + ddbf follow-up work:
+Remaining enhancements (updated after subsequent deletion/archival and GRASP-05
+work):
 
-### Archive-mode roadmap
-- **GRASP-05 archive mode integration:** formalize archival relay requirements on top of `deletion_request_disrespector`.
+### Archive-mode policy extensions
 - **Selective disrespect:** policy-based disrespect for specific criteria (e.g. popularity, community contribution, identifier allowlist).
 - **Distributed archive coordination:** cross-relay replication for redundancy of deleted content.
 
 ### Cleanup and deletion engine hardening
 - **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
-- **rust-nostr deletion behavior verification:** fully validate/lock down backend deletion behavior so disrespector mode is guaranteed at library level.
+- **Backend/index behavior verification:** continue validating deletion behavior across backend upgrades, including index consistency when relay-owned deletion paths mutate served data.
 - **Large-scale + edge-case analysis:** document/validate max-depth behavior, large dependency graphs, and memory/performance characteristics.
 - **Concurrency/race handling:** deletion during active sync, concurrent shared-repo deletes, and archival locking strategy.
 
@@ -621,7 +621,7 @@ Outstanding enhancements identified from b905 + ddbf follow-up work:
 
 ### Monitoring and integration follow-up
 - Expand deletion/archival/recovery metrics and provide dashboard + alerting guidance.
-- Re-verify compatibility with evolving master-branch features (purgatory persistence, defensive controls, rejected-event indexing).
+- Re-verify compatibility as core relay features evolve.
 
 ## Conclusion
 
