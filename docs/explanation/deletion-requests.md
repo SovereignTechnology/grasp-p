@@ -260,12 +260,13 @@ parked in purgatory:
 
 ### Rollback history source-of-truth
 
-Rollback for deleted active replaceable/addressable state uses ngit-grasp's
-dedicated replaceable-history store (`src/nostr/history.rs`), not backend
-internal replaceable compaction behavior.
+Rollback for deleted active replaceable/addressable repository events uses
+ngit-grasp's dedicated replaceable-history store (`src/nostr/history.rs`), not
+backend internal replaceable compaction behavior.
 
 The relay archives superseded 30617/30618 versions on write and uses that
-history at deletion time to pick rollback candidates.
+history at deletion time to pick rollback candidates for active `e`-target
+deletions (announcement + state).
 
 ### Blacklist Recovery
 
@@ -616,7 +617,7 @@ work):
 - Expose policy knobs (notification delay, archive delay, activity/creator thresholds).
 
 ### Advanced deletion semantics
-- **Event-ID deletion behavior (`e` target):** for replaceable/addressable state, prefer rollback to prior valid version rather than immediate cascade where applicable.
+- **Generalized replaceable/addressable rollback policy:** current `e`-target rollback covers repository announcement/state (30617/30618); evaluate whether additional kinds should adopt the same behavior.
 - **PR deletion policy refinement:** define final behavior for deleting PR-related events without unintended dependent-data loss.
 
 ### Monitoring and integration follow-up
