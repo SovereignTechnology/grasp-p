@@ -844,6 +844,41 @@ impl DeletionPolicy {
         Ok(())
     }
 
+    /// Apply operator-driven whitelist deletion for a stored kind-30617
+    /// announcement.
+    ///
+    /// Uses the same cascade + holding/archive flow as NIP-09 deletions, but
+    /// marks holding metadata with `DeletionSource::Whitelist`.
+    pub async fn apply_whitelist_deletion_for_announcement(
+        &self,
+        announcement: &Event,
+    ) -> anyhow::Result<()> {
+        if announcement.kind != Kind::GitRepoAnnouncement {
+            return Err(anyhow::anyhow!(
+                "whitelist deletion requires kind 30617 announcement, got {}",
+                announcement.kind.as_u16()
+            ));
+        }
+
+        let Some(identifier) = identifier_from_event(announcement) else {
+            return Err(anyhow::anyhow!(
+                "announcement {} missing identifier tag",
+                announcement.id.to_hex()
+            ));
+        };
+
+        let coordinate = format!("30617:{}:{}", announcement.pubkey.to_hex(), identifier);
+        self.cascade_delete_announcement(
+            &announcement.pubkey,
+            &coordinate,
+            Timestamp::now(),
+            DeletionSource::Whitelist,
+        )
+        .await;
+
+        Ok(())
+    }
+
     /// Delete kind-30618 state events for `identifier` when the repository is
     /// now unanchored (no surviving kind-30617 announcement with that `d` tag).
     ///

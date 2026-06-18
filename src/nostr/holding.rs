@@ -35,6 +35,7 @@ pub const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 pub enum DeletionSource {
     Nip09,
     Blacklist,
+    Whitelist,
 }
 
 impl DeletionSource {
@@ -42,6 +43,7 @@ impl DeletionSource {
         match self {
             Self::Nip09 => "nip09",
             Self::Blacklist => "blacklist",
+            Self::Whitelist => "whitelist",
         }
     }
 }

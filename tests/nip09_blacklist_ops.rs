@@ -35,15 +35,19 @@ fn repo_identifier(event: &Event) -> String {
         .expect("announcement identifier tag")
 }
 
-fn make_announcement(keys: &Keys, identifier: &str) -> Event {
+fn make_announcement_with_domain(keys: &Keys, identifier: &str, domain: &str) -> Event {
     EventBuilder::new(Kind::GitRepoAnnouncement, "")
         .tags(vec![
             Tag::identifier(identifier),
-            Tag::custom("clone", vec!["https://example.com/repo.git"]),
-            Tag::custom("relays", vec!["wss://example.com"]),
+            Tag::custom("clone", vec![format!("https://{domain}/repo.git")]),
+            Tag::custom("relays", vec![format!("wss://{domain}")]),
         ])
         .finalize(keys)
         .expect("build announcement")
+}
+
+fn make_announcement(keys: &Keys, identifier: &str) -> Event {
+    make_announcement_with_domain(keys, identifier, "example.com")
 }
 
 fn make_issue(keys: &Keys, announcement: &Event) -> Event {
@@ -226,6 +230,105 @@ async fn startup_blacklist_scan_leaves_non_matching_repositories_untouched() {
             .expect("query announcement")
             .is_some(),
         "non-matching repository must remain in main DB"
+    );
+    assert!(holding
+        .metadata_for_event(&announcement.id)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn startup_whitelist_scan_deletes_non_matching_repositories_via_holding_archive_path() {
+    let relay_dir = tempfile::tempdir().expect("relay tempdir");
+    let git_dir = tempfile::tempdir().expect("git tempdir");
+
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let holding = HoldingStore::open_lmdb(relay_dir.path(), git_dir.path())
+        .await
+        .expect("open holding lmdb");
+
+    let owner = Keys::generate();
+    let announcement = make_announcement_with_domain(&owner, "not-whitelisted", "test.example.com");
+    let issue = make_issue(&owner, &announcement);
+
+    db.save_event(&announcement)
+        .await
+        .expect("save announcement");
+    db.save_event(&issue).await.expect("save issue");
+
+    let owner_npub = owner.public_key().to_bech32().expect("npub");
+    std::fs::create_dir_all(
+        git_dir
+            .path()
+            .join(owner_npub)
+            .join("not-whitelisted.git")
+            .join("refs"),
+    )
+    .expect("create bare repo dir");
+
+    let mut config = base_config();
+    config.repository_whitelist = "allowed-repo".to_string();
+
+    let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
+    let stats = policy.run_startup_whitelist_parity_pass().await;
+
+    assert_eq!(stats.mismatched_announcements, 1);
+    assert_eq!(stats.successful_deletions, 1);
+    assert!(
+        db.event_by_id(&announcement.id)
+            .await
+            .expect("query announcement")
+            .is_none(),
+        "non-whitelisted announcement must be deleted from main DB"
+    );
+    assert!(
+        db.event_by_id(&issue.id)
+            .await
+            .expect("query issue")
+            .is_none(),
+        "dependent events must be cascade-deleted from main DB"
+    );
+
+    assert!(holding.has_event(&announcement.id).await);
+    assert!(holding.has_event(&issue.id).await);
+    let announcement_meta = holding.metadata_for_event(&announcement.id).await;
+    assert!(
+        announcement_meta
+            .iter()
+            .any(|m| metadata_has_tag(m, "holding-source", Some("whitelist"))),
+        "holding metadata must mark whitelist deletion source"
+    );
+}
+
+#[tokio::test]
+async fn startup_whitelist_scan_leaves_matching_repositories_untouched() {
+    let relay_dir = tempfile::tempdir().expect("relay tempdir");
+    let git_dir = tempfile::tempdir().expect("git tempdir");
+
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let holding = HoldingStore::open_lmdb(relay_dir.path(), git_dir.path())
+        .await
+        .expect("open holding lmdb");
+
+    let owner = Keys::generate();
+    let announcement = make_announcement_with_domain(&owner, "matching-repo", "test.example.com");
+    db.save_event(&announcement)
+        .await
+        .expect("save announcement");
+
+    let mut config = base_config();
+    config.repository_whitelist = "matching-repo".to_string();
+
+    let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
+    let stats = policy.run_startup_whitelist_parity_pass().await;
+
+    assert_eq!(stats.mismatched_announcements, 0);
+    assert!(
+        db.event_by_id(&announcement.id)
+            .await
+            .expect("query announcement")
+            .is_some(),
+        "whitelisted repository must remain in main DB"
     );
     assert!(holding
         .metadata_for_event(&announcement.id)

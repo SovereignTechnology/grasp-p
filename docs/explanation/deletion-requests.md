@@ -128,17 +128,19 @@ NIP-11 currently omits 9 and 62 in this mode (`src/http/nip11.rs:115`).
 
 ### 3) Startup policy parity flow
 
-On startup, ngit-grasp currently runs a **blacklist parity** pass: it scans
-stored announcements against blacklist config and deletes matches through the
-same cascade + holding + archive path, marking metadata source as `blacklist`
-(`src/nostr/builder.rs:140`, `src/nostr/policy/deletion.rs:817`).
+On startup, ngit-grasp runs parity cleanup for both policy lists:
 
-This gives parity for already-stored repos that became blacklisted while the
-relay was offline.
+- **Blacklist parity:** scans stored announcements against blacklist config and
+  deletes matches through the same cascade + holding + archive path, marking
+  metadata source as `blacklist` (`src/nostr/builder.rs:140`,
+  `src/nostr/policy/deletion.rs:817`).
+- **Whitelist parity:** scans stored announcements that list this relay’s
+  service domain and deletes entries that no longer match
+  `repository_whitelist`, marking metadata source as `whitelist`
+  (`src/nostr/builder.rs:232`, `src/nostr/policy/deletion.rs:850`).
 
-Repository whitelist enforcement is currently admission-time (new/replacement
-announcements) and does **not** yet run a startup cleanup sweep for previously
-stored announcements that no longer match whitelist policy.
+This gives startup-time parity for repositories that became out-of-policy while
+the relay was offline.
 
 ### 4) NIP-62 vanish flow
 

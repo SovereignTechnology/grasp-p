@@ -58,6 +58,15 @@ pub struct BlacklistParityStats {
     pub failed_deletions: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WhitelistParityStats {
+    pub scanned_announcements: usize,
+    pub mismatched_announcements: usize,
+    pub attempted_deletions: usize,
+    pub successful_deletions: usize,
+    pub failed_deletions: usize,
+}
+
 impl std::fmt::Debug for Nip34WritePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Nip34WritePolicy")
@@ -213,6 +222,102 @@ impl Nip34WritePolicy {
                         reason = %reason,
                         error = %e,
                         "Blacklist startup parity: deletion failed"
+                    );
+                }
+            }
+        }
+
+        stats
+    }
+
+    /// Startup-only whitelist parity pass.
+    ///
+    /// Scans already-stored kind-30617 announcements that list this relay's
+    /// service domain and removes repositories that no longer match
+    /// `repository_whitelist`, using the same cascade + holding/archive flow as
+    /// NIP-09 but with `DeletionSource::Whitelist`.
+    pub async fn run_startup_whitelist_parity_pass(&self) -> WhitelistParityStats {
+        let whitelist = self.ctx.config.repository_config();
+        if !whitelist.enabled() {
+            return WhitelistParityStats::default();
+        }
+
+        let blacklist = self.ctx.config.blacklist_config();
+        let announcements = match self
+            .ctx
+            .database
+            .query(Filter::new().kind(Kind::GitRepoAnnouncement))
+            .await
+        {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::error!(error = %e, "Whitelist startup parity scan failed to query announcements");
+                return WhitelistParityStats::default();
+            }
+        };
+
+        let mut stats = WhitelistParityStats {
+            scanned_announcements: announcements.len(),
+            ..WhitelistParityStats::default()
+        };
+
+        for announcement in announcements {
+            let parsed = match RepositoryAnnouncement::from_event(announcement.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        event_id = %announcement.id.to_hex(),
+                        error = %e,
+                        "Whitelist startup parity: skipping unparseable announcement"
+                    );
+                    continue;
+                }
+            };
+
+            if !parsed.lists_service(&self.ctx.domain) {
+                continue;
+            }
+
+            let npub = announcement
+                .pubkey
+                .to_bech32()
+                .expect("public key to bech32 should be infallible");
+
+            // Blacklist precedence: if this repository is blacklisted, it belongs to
+            // the blacklist parity path and should be attributed there.
+            if blacklist.check(&npub, &parsed.identifier).is_some() {
+                continue;
+            }
+
+            if whitelist.matches(&npub, &parsed.identifier) {
+                continue;
+            }
+
+            stats.mismatched_announcements += 1;
+            stats.attempted_deletions += 1;
+
+            match self
+                .deletion_policy
+                .apply_whitelist_deletion_for_announcement(&announcement)
+                .await
+            {
+                Ok(()) => {
+                    stats.successful_deletions += 1;
+                    tracing::info!(
+                        event_id = %announcement.id.to_hex(),
+                        owner = %announcement.pubkey.to_hex(),
+                        identifier = %parsed.identifier,
+                        "Whitelist startup parity: deleted stored repository"
+                    );
+                }
+                Err(e) => {
+                    stats.failed_deletions += 1;
+                    tracing::error!(
+                        event_id = %announcement.id.to_hex(),
+                        owner = %announcement.pubkey.to_hex(),
+                        identifier = %parsed.identifier,
+                        error = %e,
+                        "Whitelist startup parity: deletion failed"
                     );
                 }
             }

@@ -245,6 +245,22 @@ async fn run_relay(config: Config) -> Result<()> {
             );
         }
 
+        let whitelist_stats = relay_with_db
+            .write_policy
+            .run_startup_whitelist_parity_pass()
+            .await;
+        if whitelist_stats.scanned_announcements > 0 || whitelist_stats.mismatched_announcements > 0
+        {
+            info!(
+                scanned = whitelist_stats.scanned_announcements,
+                mismatched = whitelist_stats.mismatched_announcements,
+                attempted = whitelist_stats.attempted_deletions,
+                succeeded = whitelist_stats.successful_deletions,
+                failed = whitelist_stats.failed_deletions,
+                "Startup whitelist parity pass completed"
+            );
+        }
+
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling
         // refs/nostr/<event-id> refs (and zero-ref bare repos) when a
