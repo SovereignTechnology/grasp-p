@@ -593,7 +593,6 @@ work):
 
 ### Archive-mode policy extensions
 - **Selective disrespect:** policy-based disrespect for specific criteria (e.g. popularity, community contribution, identifier allowlist).
-- **Distributed archive coordination:** cross-relay replication for redundancy of deleted content.
 
 ### Cleanup and deletion engine hardening
 - **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
