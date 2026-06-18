@@ -6,6 +6,34 @@ ngit-grasp implements optional support for NIP-09 deletion requests, allowing
 repository owners to remove their repositories from the relay while giving
 operators configurable archival behavior for left-pad resilience.
 
+## Core consistency invariant
+
+ngit-grasp enforces the following invariant across admission, serving, deletion,
+and recovery:
+
+> **Served nostr state must always match git refs we can actually serve.**
+
+This invariant is the design center for deletion handling and a key rationale
+for purgatory. If the currently served repository state is deleted and no valid
+rollback state exists, the relay must stop serving that state, park the
+announcement scope in purgatory, and wait for a promotable state before serving
+again.
+
+## Ownership of deletion behavior
+
+ngit-grasp disables backend auto-processing and owns NIP-09/NIP-62 handling in
+relay policy code:
+
+- main DB uses `process_nip09(false)` and `process_nip62(false)`
+  (`src/nostr/builder.rs`)
+- tombstones DB uses `process_nip09(false)` and `process_nip62(false)`
+  (`src/nostr/tombstones.rs`)
+- holding DB uses `process_nip09(false)` and `process_nip62(false)`
+  (`src/nostr/holding.rs`)
+
+This keeps deletion behavior auditable and consistent across cascade, holding,
+archive, and recovery flows.
+
 ## The Left-Pad Problem
 
 The "left-pad problem" refers to a 2016 incident where a critical npm package was unpublished, breaking thousands of dependent projects. In the context of decentralized Git hosting, this translates to:
@@ -18,7 +46,7 @@ The "left-pad problem" refers to a 2016 incident where a critical npm package wa
 
 ### Three-Database Design
 
-The deletion system uses three separate data stores:
+The deletion system uses three relay databases plus archive filesystem storage:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -27,6 +55,12 @@ The deletion system uses three separate data stores:
 │    LMDB/Memory backend                                 │
 └─────────────────────────────────────────────────────────┘
                          ↓ deletion request
+┌─────────────────────────────────────────────────────────┐
+│                 Tombstones Database                     │
+│     (Kind-5 / Kind-62 requests, deletion gate state)   │
+│      Derived state: deleted IDs/coords/vanished keys   │
+└─────────────────────────────────────────────────────────┘
+                         ↓ delete acceptance gate
 ┌─────────────────────────────────────────────────────────┐
 │                 Holding Database                        │
 │    (Archived events - recovery window)                 │
@@ -61,8 +95,11 @@ The deletion system uses three separate data stores:
 ### Why Three Stores?
 
 1. **Main Database:** Fast queries, clean data model (deleted = gone)
-2. **Holding Database:** Recovery mechanism, prevents accidental permanent deletion
-3. **Archive Filesystem:** Git data backup, compressed storage
+2. **Tombstones Database:** Durable deletion/vanish state for admission-time gating
+3. **Holding Database:** Recovery mechanism, prevents accidental permanent deletion
+
+Archive files on disk complement the DB layers by preserving repository git
+data during the retention window.
 
 ### Holding Database Operations
 
@@ -102,13 +139,20 @@ The deletion system uses three separate data stores:
    ↓
 6. Delete events from main database
    ↓
-7. Events no longer served in queries
+7. Record deletion tombstone so re-submission is gated
    ↓
-8. Background task (daily):
+8. Events no longer served in queries
+   ↓
+9. Background task (daily):
    - Check holding database for expired entries
    - Delete events older than retention period
    - Delete corresponding archive files
 ```
+
+Deletion gate checks tombstones before kind-specific admission and rejects:
+- events from vanished pubkeys,
+- re-submission of deleted event IDs,
+- replaceable/addressable events covered by coordinate tombstones.
 
 #### Blacklist-Triggered Deletion
 
@@ -174,16 +218,18 @@ acting on the kind-5 request. NIP-09 is omitted from the NIP-11
 
 ## Recovery Mechanism
 
-The holding database enables **accidental deletion recovery**:
+The holding database enables **accidental deletion recovery** via two distinct
+triggers for the same owner+identifier scope.
 
-### Automatic Recovery (NIP-09 Deletions)
+### Trigger A: Re-announcement recovery
 
 ```
-Scenario: Owner deletes repository, then changes their mind
+Scenario: repository was deleted via announcement deletion, then announced again
 
 1. Owner publishes new announcement with same identifier
    ↓
-2. System detects matching entry in holding database
+2. Before parking that announcement in purgatory, system checks holding/archive
+   eligibility for same owner+identifier
    ↓
 3. Check: Is entry within retention period?
    ↓
@@ -200,12 +246,15 @@ Scenario: Owner deletes repository, then changes their mind
    - Return: "New repository created"
 ```
 
-### Promotion Recovery (Deleted Active State)
+### Trigger B: Promotion recovery (deleted active state)
 
 When deletion removes the currently served state and announcement serving is
-parked in purgatory, a later valid state promotion can trigger recovery for the
-same owner+identifier scope (restoring archived events/git before normal serving
-resumes).
+parked in purgatory:
+
+1. Wait for a new valid authorized state event that can be promoted.
+2. Promotion out of purgatory runs recovery hook for same owner+identifier.
+3. Restore archived events/git from holding/archive.
+4. Resume normal serving with git/state alignment.
 
 ### Blacklist Recovery
 
