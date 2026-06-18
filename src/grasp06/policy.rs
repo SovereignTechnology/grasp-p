@@ -79,6 +79,48 @@ pub fn event_names_relays_prs_endpoint(event: &Event, domain: &str) -> bool {
     false
 }
 
+/// Return all distinct `<d>` identifiers named by this event's `clone` tags
+/// that target this relay's `/prs/<signer-npub>/<d>.git` endpoint and also
+/// appear in the event's `a` tags.
+///
+/// This is used by deletion/recovery code paths to map a PR/PR-update event to
+/// its scoped `/prs/` bare repository locations.
+pub fn prs_identifiers_named_by_event_clone_tags(event: &Event, domain: &str) -> Vec<String> {
+    if !matches!(
+        event.kind,
+        Kind::GitPullRequest | Kind::GitPullRequestUpdate
+    ) {
+        return Vec::new();
+    }
+
+    let d_tags: std::collections::HashSet<String> =
+        collect_a_tag_d_values(event).into_iter().collect();
+    if d_tags.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = std::collections::BTreeSet::new();
+    for tag in event.tags.iter() {
+        let parts = tag.clone().to_vec();
+        if parts.first().map(String::as_str) != Some("clone") {
+            continue;
+        }
+
+        for url in parts.iter().skip(1) {
+            let Some(identifier) = clone_url_prs_identifier_for_relay(url, domain, &event.pubkey)
+            else {
+                continue;
+            };
+
+            if d_tags.contains(&identifier) {
+                out.insert(identifier);
+            }
+        }
+    }
+
+    out.into_iter().collect()
+}
+
 /// Extract `<d>` from every well-formed `a` tag of the form
 /// `30617:<64-hex-pubkey>:<d>` on `event`. Malformed tags are silently
 /// skipped — a malformed `a` tag must not crash, it just means the event
@@ -129,68 +171,80 @@ pub fn clone_url_names_relays_prs_endpoint(
     signer: &PublicKey,
     d_tags: &[String],
 ) -> bool {
+    let Some(d_decoded) = clone_url_prs_identifier_for_relay(url, domain, signer) else {
+        return false;
+    };
+
+    d_tags.contains(&d_decoded)
+}
+
+/// Parse `url` as this relay's `/prs/<signer-npub>/<d>.git` endpoint and
+/// return the decoded `<d>` when it matches.
+fn clone_url_prs_identifier_for_relay(
+    url: &str,
+    domain: &str,
+    signer: &PublicKey,
+) -> Option<String> {
     // Scheme: http or https only, case-insensitive.
     let rest = if let Some(r) = strip_prefix_ignore_ascii_case(url, "http://") {
         r
     } else if let Some(r) = strip_prefix_ignore_ascii_case(url, "https://") {
         r
     } else {
-        return false;
+        return None;
     };
 
     // Reject query strings and fragments outright.
     if rest.contains('?') || rest.contains('#') {
-        return false;
+        return None;
     }
 
     // Split authority and path on the first `/`.
     let slash_idx = match rest.find('/') {
         Some(i) => i,
-        None => return false,
+        None => return None,
     };
     let authority = &rest[..slash_idx];
     let path = &rest[slash_idx..]; // includes leading `/`.
 
     if !authority.eq_ignore_ascii_case(domain) {
-        return false;
+        return None;
     }
 
     let path = path.trim_end_matches('/');
 
     let inner = match path.strip_prefix(&format!("/{}/", PRS_URL_PREFIX)) {
         Some(s) => s,
-        None => return false,
+        None => return None,
     };
 
     // Exactly two segments: `<npub>` and `<repo>.git`.
     let segments: Vec<&str> = inner.split('/').collect();
     if segments.len() != 2 {
-        return false;
+        return None;
     }
     let npub_segment = segments[0];
     let repo_segment = segments[1];
 
     if !npub_segment.starts_with("npub1") {
-        return false;
+        return None;
     }
     let url_pubkey = match PublicKey::from_bech32(npub_segment) {
         Ok(pk) => pk,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     if url_pubkey != *signer {
-        return false;
+        return None;
     }
 
     let d_encoded = match repo_segment.strip_suffix(".git") {
         Some(s) => s,
-        None => return false,
+        None => return None,
     };
     if d_encoded.is_empty() {
-        return false;
+        return None;
     }
-    let d_decoded = percent_decode(d_encoded);
-
-    d_tags.contains(&d_decoded)
+    Some(percent_decode(d_encoded))
 }
 
 /// Case-insensitive equivalent of `str::strip_prefix` for ASCII prefixes.
@@ -288,6 +342,29 @@ mod tests {
         );
         let cfg = config_with_domain("relay.example:8080", true);
         assert!(event_qualifies_for_pr_relaxation(&event, &cfg));
+    }
+
+    #[test]
+    fn extracts_prs_identifiers_from_clone_tags() {
+        let signer = Keys::generate();
+        let target_hex = Keys::generate().public_key().to_hex();
+        let npub = signer.public_key().to_bech32().unwrap();
+        let event = pr_event(
+            &signer,
+            &[(&target_hex, "my-repo"), (&target_hex, "other-repo")],
+            &[
+                &format!("http://relay.example/prs/{}/my-repo.git", npub),
+                &format!("https://relay.example/prs/{}/other-repo.git", npub),
+                &format!("https://other.example/prs/{}/my-repo.git", npub),
+            ],
+            Kind::GitPullRequest,
+        );
+
+        let identifiers = prs_identifiers_named_by_event_clone_tags(&event, "relay.example");
+        assert_eq!(
+            identifiers,
+            vec!["my-repo".to_string(), "other-repo".to_string()]
+        );
     }
 
     #[test]

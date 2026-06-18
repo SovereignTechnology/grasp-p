@@ -29,7 +29,7 @@
 ///
 /// Author ownership is enforced before any main-DB deletion or tombstone
 /// recording: only the original author may delete their event.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -1227,6 +1227,25 @@ impl DeletionPolicy {
         for event in matches {
             let mut event_metadata = metadata.clone();
 
+            if matches!(
+                event.kind,
+                Kind::GitPullRequest | Kind::GitPullRequestUpdate
+            ) {
+                if let Some((coord, owner_hex, identifier)) =
+                    Self::pr_event_primary_announcement_scope(&event)
+                {
+                    if event_metadata.coordinate.is_none() {
+                        event_metadata.coordinate = Some(coord);
+                    }
+                    if event_metadata.identifier.is_none() {
+                        event_metadata.identifier = Some(identifier);
+                    }
+                    if event_metadata.owner_pubkey.is_none() {
+                        event_metadata.owner_pubkey = Some(owner_hex);
+                    }
+                }
+            }
+
             if event.kind == Kind::GitRepoAnnouncement {
                 let owner_hex = event.pubkey.to_hex();
                 let owner_dir = owner_directory_component(&event.pubkey);
@@ -1272,6 +1291,13 @@ impl DeletionPolicy {
                     );
                     continue;
                 }
+
+                if matches!(
+                    event.kind,
+                    Kind::GitPullRequest | Kind::GitPullRequestUpdate
+                ) {
+                    self.delete_pr_event_git_refs(&event).await;
+                }
             }
             deletable.push(event.id);
         }
@@ -1283,6 +1309,150 @@ impl DeletionPolicy {
         let delete_filter = Filter::new().ids(deletable);
         if let Err(e) = self.ctx.database.delete(delete_filter).await {
             tracing::warn!(error = %e, op = %context, "Failed to delete events from main DB");
+        }
+    }
+
+    fn pr_event_primary_announcement_scope(event: &Event) -> Option<(String, String, String)> {
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, owner, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if kind != Kind::GitRepoAnnouncement {
+                continue;
+            }
+
+            return Some((
+                format!("30617:{}:{}", owner.to_hex(), identifier),
+                owner.to_hex(),
+                identifier,
+            ));
+        }
+
+        None
+    }
+
+    fn pr_identifiers_from_a_tags(event: &Event) -> BTreeSet<String> {
+        let mut identifiers = BTreeSet::new();
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, _, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if kind == Kind::GitRepoAnnouncement {
+                identifiers.insert(identifier);
+            }
+        }
+        identifiers
+    }
+
+    async fn collect_normal_repo_paths_for_pr_event(&self, event: &Event) -> BTreeSet<PathBuf> {
+        let mut paths = BTreeSet::new();
+
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, owner, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if kind != Kind::GitRepoAnnouncement {
+                continue;
+            }
+
+            paths.insert(self.repo_path_for_owner_and_identifier(
+                &owner_directory_component(&owner),
+                &identifier,
+            ));
+        }
+
+        for identifier in Self::pr_identifiers_from_a_tags(event) {
+            let Ok(repo_data) =
+                fetch_repository_data_excluding_purgatory(&self.ctx.database, &identifier).await
+            else {
+                continue;
+            };
+
+            for announcement in &repo_data.announcements {
+                paths.insert(self.ctx.git_data_path.join(announcement.repo_path()));
+            }
+        }
+
+        paths
+    }
+
+    fn collect_grasp06_repo_paths_for_pr_event(&self, event: &Event) -> BTreeSet<PathBuf> {
+        crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
+            event,
+            &self.ctx.config.domain,
+        )
+        .into_iter()
+        .map(|identifier| {
+            crate::grasp06::paths::prs_repo_path(
+                &self.ctx.git_data_path,
+                &event.pubkey.to_hex(),
+                &identifier,
+            )
+        })
+        .collect()
+    }
+
+    fn cleanup_zero_ref_grasp06_repo_if_idle(&self, repo_path: &PathBuf) {
+        if !crate::grasp06::paths::is_prs_repo_path(repo_path, &self.ctx.git_data_path) {
+            return;
+        }
+
+        let state = crate::grasp06::receive::path_state(&self.ctx.repo_init_locks, repo_path);
+        let _guard = state.mu.lock().expect("prs path mutex poisoned");
+
+        if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return;
+        }
+
+        let is_zero_ref = matches!(git::list_refs(repo_path), Ok(refs) if refs.is_empty());
+        if !is_zero_ref {
+            return;
+        }
+
+        if let Err(e) = std::fs::remove_dir_all(repo_path) {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %e,
+                "Failed to remove zero-ref /prs/ repo while processing deletion request"
+            );
+            return;
+        }
+
+        if let Some(parent) = repo_path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    async fn delete_pr_event_git_refs(&self, event: &Event) {
+        let ref_name = format!("refs/nostr/{}", event.id.to_hex());
+        let mut repo_paths = self.collect_normal_repo_paths_for_pr_event(event).await;
+        repo_paths.extend(self.collect_grasp06_repo_paths_for_pr_event(event));
+
+        for repo_path in repo_paths {
+            if !repo_path.is_dir() {
+                continue;
+            }
+
+            match git::delete_ref(&repo_path, &ref_name) {
+                Ok(()) => {
+                    tracing::info!(
+                        event_id = %event.id.to_hex(),
+                        repo = %repo_path.display(),
+                        ref_name = %ref_name,
+                        "Deleted PR git ref for deletion-requested event"
+                    );
+                    self.cleanup_zero_ref_grasp06_repo_if_idle(&repo_path);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        event_id = %event.id.to_hex(),
+                        repo = %repo_path.display(),
+                        ref_name = %ref_name,
+                        error = %e,
+                        "PR git ref not deleted for this repository"
+                    );
+                }
+            }
         }
     }
 
@@ -1978,6 +2148,62 @@ mod tests {
         assert!(
             still_there.is_some(),
             "Disrespector mode must NOT delete the target from the main DB"
+        );
+    }
+
+    #[test]
+    fn test_grasp06_pr_clone_tags_map_to_prs_repo_paths() {
+        let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
+        let git_data_path = PathBuf::from("/tmp/ngit-grasp-test-git");
+        let config = crate::config::Config {
+            domain: "test.example.com".to_string(),
+            ..crate::config::Config::for_testing()
+        };
+        let ctx = PolicyContext::new_for_test(
+            "test.example.com",
+            db,
+            git_data_path.clone(),
+            purgatory,
+            config,
+        );
+
+        let signer = Keys::generate();
+        let target = Keys::generate();
+        let npub = signer.public_key().to_bech32().expect("pubkey to bech32");
+        let event = EventBuilder::new(Kind::GitPullRequest, "prs clone test")
+            .tags(vec![
+                Tag::custom(
+                    "a",
+                    vec![format!(
+                        "30617:{}:{}",
+                        target.public_key().to_hex(),
+                        "my-repo"
+                    )],
+                ),
+                Tag::custom(
+                    "clone",
+                    vec![format!(
+                        "http://test.example.com/prs/{}/{}.git",
+                        npub, "my-repo"
+                    )],
+                ),
+                Tag::custom("c", vec!["0".repeat(40)]),
+            ])
+            .finalize(&signer)
+            .expect("build pr event");
+
+        let policy = DeletionPolicy::new(ctx.clone());
+        let paths = policy.collect_grasp06_repo_paths_for_pr_event(&event);
+        let expected = crate::grasp06::paths::prs_repo_path(
+            &git_data_path,
+            &signer.public_key().to_hex(),
+            "my-repo",
+        );
+
+        assert!(
+            paths.contains(&expected),
+            "expected /prs/ repo path derived from clone tag"
         );
     }
 }

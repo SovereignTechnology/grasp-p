@@ -14,7 +14,23 @@ use common::{
 use grasp_audit::{clone_repo, AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
 use nostr_sdk::prelude::*;
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
+
+fn repo_has_ref(repo_path: &Path, ref_name: &str) -> bool {
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            repo_path.to_str().expect("repo path utf8"),
+            "show-ref",
+            "--verify",
+            ref_name,
+        ])
+        .output()
+        .expect("run git show-ref");
+    output.status.success()
+}
 
 #[tokio::test]
 async fn test_announcement_cascade_deletes_supported_dependent_kinds() {
@@ -176,6 +192,19 @@ async fn test_announcement_cascade_deletes_served_pr_chain_kinds() {
     .expect("push PR update ref should succeed");
     fs::remove_dir_all(&clone_path).expect("remove cloned repo");
 
+    let repo_path = relay
+        .git_data_path()
+        .join(client.public_key().to_bech32().expect("pubkey to bech32"))
+        .join(format!("{}.git", repo_id));
+    assert!(
+        repo_has_ref(&repo_path, &pr_ref),
+        "PR ref should exist before deletion"
+    );
+    assert!(
+        repo_has_ref(&repo_path, &pr_update_ref),
+        "PR update ref should exist before deletion"
+    );
+
     let pr_status = client
         .event_builder(Kind::from(1631), "pr status")
         .tag(Tag::custom("e", vec![pr.id.to_hex()]))
@@ -238,6 +267,14 @@ async fn test_announcement_cascade_deletes_served_pr_chain_kinds() {
     assert!(
         survivors.is_empty(),
         "announcement deletion should cascade across PR-chain dependent kinds; survivors: {survivors:?}"
+    );
+    assert!(
+        !repo_has_ref(&repo_path, &pr_ref),
+        "announcement deletion should remove PR git ref"
+    );
+    assert!(
+        !repo_has_ref(&repo_path, &pr_update_ref),
+        "announcement deletion should remove PR update git ref"
     );
 }
 

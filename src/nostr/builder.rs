@@ -1759,6 +1759,123 @@ impl Nip34WritePolicy {
         Ok(restored_any)
     }
 
+    fn pr_event_commit(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| {
+            let parts = tag.as_slice();
+            if parts.len() >= 2 && parts[0] == "c" {
+                Some(parts[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn pr_event_identifiers(event: &Event) -> BTreeSet<String> {
+        event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let parts = tag.as_slice();
+                if parts.len() < 2 || parts[0] != "a" {
+                    return None;
+                }
+
+                let coord: Vec<&str> = parts[1].splitn(3, ':').collect();
+                if coord.len() != 3 || coord[0] != "30617" {
+                    return None;
+                }
+
+                Some(coord[2].to_string())
+            })
+            .collect()
+    }
+
+    async fn pr_target_repo_paths_for_recovery(&self, event: &Event) -> BTreeSet<PathBuf> {
+        let mut paths = BTreeSet::new();
+
+        for identifier in Self::pr_event_identifiers(event) {
+            let Ok(repo_data) =
+                crate::git::authorization::fetch_repository_data_excluding_purgatory(
+                    &self.ctx.database,
+                    &identifier,
+                )
+                .await
+            else {
+                continue;
+            };
+
+            for announcement in &repo_data.announcements {
+                paths.insert(self.ctx.git_data_path.join(announcement.repo_path()));
+            }
+        }
+
+        for identifier in crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
+            event,
+            &self.ctx.config.domain,
+        ) {
+            paths.insert(crate::grasp06::paths::prs_repo_path(
+                &self.ctx.git_data_path,
+                &event.pubkey.to_hex(),
+                &identifier,
+            ));
+        }
+
+        paths
+    }
+
+    async fn restore_pr_git_refs_for_recovered_event(&self, event: &Event) -> anyhow::Result<bool> {
+        if !matches!(
+            event.kind,
+            Kind::GitPullRequest | Kind::GitPullRequestUpdate
+        ) {
+            return Ok(true);
+        }
+
+        let Some(commit) = Self::pr_event_commit(event) else {
+            tracing::warn!(
+                event_id = %event.id.to_hex(),
+                "Recovery could not restore PR git ref: event missing c-tag"
+            );
+            return Ok(false);
+        };
+
+        let ref_name = format!("refs/nostr/{}", event.id.to_hex());
+        let mut restored_any = false;
+        let repo_paths = self.pr_target_repo_paths_for_recovery(event).await;
+
+        for repo_path in repo_paths {
+            if !repo_path.is_dir() {
+                continue;
+            }
+
+            if !crate::git::commit_exists(&repo_path, &commit) {
+                continue;
+            }
+
+            crate::git::update_ref(&repo_path, &ref_name, &commit).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to restore PR ref {} -> {} in {}: {}",
+                    ref_name,
+                    commit,
+                    repo_path.display(),
+                    e
+                )
+            })?;
+            restored_any = true;
+        }
+
+        if !restored_any {
+            tracing::warn!(
+                event_id = %event.id.to_hex(),
+                ref_name = %ref_name,
+                commit = %commit,
+                "Recovery did not find a repository with commit needed to restore PR ref"
+            );
+        }
+
+        Ok(restored_any)
+    }
+
     async fn restore_events_from_holding(
         &self,
         records: &[RecoveryMetadataRecord],
@@ -1811,6 +1928,28 @@ impl Nip34WritePolicy {
                             );
                             blocked.push(record.clone());
                             continue;
+                        }
+                    }
+
+                    if matches!(
+                        event.kind,
+                        Kind::GitPullRequest | Kind::GitPullRequestUpdate
+                    ) {
+                        match self.restore_pr_git_refs_for_recovered_event(&event).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                blocked.push(record.clone());
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    event_id = %event_id.to_hex(),
+                                    "Recovery failed restoring PR git refs"
+                                );
+                                blocked.push(record.clone());
+                                continue;
+                            }
                         }
                     }
 
