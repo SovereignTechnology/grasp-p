@@ -272,6 +272,64 @@ async fn test_e_delete_active_state_rolls_back_and_realigns_refs() {
 }
 
 #[tokio::test]
+async fn test_e_delete_active_announcement_rolls_back_previous_version() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let (v1, repo_id) = publish_served_repo(&client, "announcement-rollback-e").await;
+    let base = Timestamp::from_secs(Timestamp::now().as_secs() + 60);
+    let v2 = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(v1.tags.clone())
+        .custom_created_at(base)
+        .finalize(client.keys())
+        .expect("build replacement announcement");
+
+    client
+        .send_event(v2.clone())
+        .await
+        .expect("send replacement announcement");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(v2.id)
+            .await
+            .expect("query replacement announcement before deletion"),
+        "replacement announcement must be active before deletion"
+    );
+
+    client
+        .send_event(build_deletion(&client, &[v2.id], &[]))
+        .await
+        .expect("send e-tag deletion for active announcement");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(v1.id)
+            .await
+            .expect("query v1 after announcement rollback"),
+        "previous announcement must be restored"
+    );
+    assert!(
+        !client
+            .is_event_on_relay(v2.id)
+            .await
+            .expect("query v2 after announcement rollback"),
+        "deleted active announcement must stay deleted"
+    );
+
+    assert!(
+        announcement_served_by_coordinate(&client, &v1, &repo_id).await,
+        "announcement coordinate must remain served after rollback"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn test_a_delete_coordinate_old_cutoff_keeps_newer_active_state() {
     let relay = TestRelay::start().await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())

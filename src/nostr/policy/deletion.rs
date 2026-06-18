@@ -83,7 +83,8 @@ pub struct DeletionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct StateRollbackPlan {
+struct ReplaceableRollbackPlan {
+    kind: u16,
     coordinate: String,
     identifier: String,
     deleted_event_id: EventId,
@@ -154,7 +155,7 @@ impl DeletionPolicy {
             }
         }
 
-        let rollback_plans = self.collect_state_rollback_plans(event).await;
+        let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
 
         // Process purgatory removals (synchronous, in-memory).
@@ -165,8 +166,10 @@ impl DeletionPolicy {
         self.delete_main_db_targets(event, &mut moved_ids).await;
 
         for plan in &rollback_plans {
-            identifiers_to_realign.insert(plan.identifier.clone());
-            self.rollback_deleted_active_state(plan).await;
+            self.rollback_deleted_active_replaceable(plan).await;
+            if plan.kind == Kind::RepoState.as_u16() {
+                identifiers_to_realign.insert(plan.identifier.clone());
+            }
         }
 
         for identifier in identifiers_to_realign {
@@ -199,7 +202,10 @@ impl DeletionPolicy {
             .collect()
     }
 
-    async fn collect_state_rollback_plans(&self, deletion: &Event) -> Vec<StateRollbackPlan> {
+    async fn collect_replaceable_rollback_plans(
+        &self,
+        deletion: &Event,
+    ) -> Vec<ReplaceableRollbackPlan> {
         let mut plans = Vec::new();
 
         for target_id in Self::e_tag_ids(deletion) {
@@ -207,7 +213,11 @@ impl DeletionPolicy {
                 continue;
             };
 
-            if target.kind != Kind::RepoState || target.pubkey != deletion.pubkey {
+            if target.pubkey != deletion.pubkey {
+                continue;
+            }
+
+            if target.kind != Kind::RepoState && target.kind != Kind::GitRepoAnnouncement {
                 continue;
             }
 
@@ -216,7 +226,7 @@ impl DeletionPolicy {
             };
 
             let Some(active) = self
-                .latest_state_for_coordinate(&target.pubkey, &identifier, None)
+                .latest_event_for_coordinate(target.kind, &target.pubkey, &identifier, None)
                 .await
             else {
                 continue;
@@ -226,8 +236,14 @@ impl DeletionPolicy {
                 continue;
             }
 
-            plans.push(StateRollbackPlan {
-                coordinate: format!("30618:{}:{}", target.pubkey.to_hex(), identifier),
+            plans.push(ReplaceableRollbackPlan {
+                kind: target.kind.as_u16(),
+                coordinate: format!(
+                    "{}:{}:{}",
+                    target.kind.as_u16(),
+                    target.pubkey.to_hex(),
+                    identifier
+                ),
                 identifier,
                 deleted_event_id: target.id,
                 cutoff: target.created_at,
@@ -284,19 +300,20 @@ impl DeletionPolicy {
         Some((Kind::from(kind_num), pubkey, parts[2].to_string()))
     }
 
-    async fn latest_state_for_coordinate(
+    async fn latest_event_for_coordinate(
         &self,
+        kind: Kind,
         author: &PublicKey,
         identifier: &str,
         until: Option<Timestamp>,
     ) -> Option<Event> {
-        let mut filter = Filter::new()
-            .kind(Kind::RepoState)
-            .author(*author)
-            .custom_tag(
+        let mut filter = Filter::new().kind(kind).author(*author);
+        if kind.is_addressable() {
+            filter = filter.custom_tag(
                 SingleLetterTag::lowercase(Alphabet::D),
                 identifier.to_string(),
             );
+        }
         if let Some(cutoff) = until {
             filter = filter.until(cutoff);
         }
@@ -312,7 +329,15 @@ impl DeletionPolicy {
         })
     }
 
-    async fn rollback_deleted_active_state(&self, plan: &StateRollbackPlan) {
+    async fn rollback_deleted_active_replaceable(&self, plan: &ReplaceableRollbackPlan) {
+        match Kind::from(plan.kind) {
+            Kind::RepoState => self.rollback_deleted_active_state(plan).await,
+            Kind::GitRepoAnnouncement => self.rollback_deleted_active_announcement(plan).await,
+            _ => {}
+        }
+    }
+
+    async fn rollback_deleted_active_state(&self, plan: &ReplaceableRollbackPlan) {
         let Some(record) = self
             .ctx
             .history
@@ -414,6 +439,109 @@ impl DeletionPolicy {
             deleted_event_id = %plan.deleted_event_id.to_hex(),
             restored_event_id = %candidate.id.to_hex(),
             "Restored deleted active state from replaceable history"
+        );
+    }
+
+    async fn rollback_deleted_active_announcement(&self, plan: &ReplaceableRollbackPlan) {
+        let Some(record) = self
+            .ctx
+            .history
+            .latest_superseded_before(&plan.coordinate, plan.cutoff)
+            .await
+        else {
+            tracing::info!(
+                coordinate = %plan.coordinate,
+                deleted_event_id = %plan.deleted_event_id.to_hex(),
+                cutoff = plan.cutoff.as_secs(),
+                "No announcement rollback candidate in history"
+            );
+            return;
+        };
+
+        let Some(candidate_id) = record.superseded_event_id else {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                metadata_event_id = %record.metadata_event_id.to_hex(),
+                "History record missing superseded announcement event id; cannot rollback"
+            );
+            return;
+        };
+
+        let candidate = match self.ctx.history.event_by_id(&candidate_id).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                tracing::warn!(
+                    coordinate = %plan.coordinate,
+                    candidate_id = %candidate_id.to_hex(),
+                    "History payload missing for announcement rollback candidate"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    coordinate = %plan.coordinate,
+                    candidate_id = %candidate_id.to_hex(),
+                    error = %e,
+                    "History lookup failed for announcement rollback candidate"
+                );
+                return;
+            }
+        };
+
+        if candidate.kind != Kind::GitRepoAnnouncement {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                kind = candidate.kind.as_u16(),
+                "Rollback candidate is not an announcement"
+            );
+            return;
+        }
+
+        let Some((_kind, coord_pubkey, coord_identifier)) =
+            Self::parse_coordinate(&plan.coordinate)
+        else {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                "Invalid rollback coordinate while restoring announcement"
+            );
+            return;
+        };
+
+        if candidate.pubkey != coord_pubkey {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                "Announcement rollback candidate author does not match coordinate"
+            );
+            return;
+        }
+
+        if identifier_from_event(&candidate).as_deref() != Some(coord_identifier.as_str()) {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                expected_identifier = %coord_identifier,
+                "Announcement rollback candidate identifier mismatch"
+            );
+            return;
+        }
+
+        if let Err(e) = self.ctx.database.save_event(&candidate).await {
+            tracing::warn!(
+                coordinate = %plan.coordinate,
+                candidate_id = %candidate.id.to_hex(),
+                error = %e,
+                "Failed to restore announcement rollback candidate into main DB"
+            );
+            return;
+        }
+
+        tracing::info!(
+            coordinate = %plan.coordinate,
+            deleted_event_id = %plan.deleted_event_id.to_hex(),
+            restored_event_id = %candidate.id.to_hex(),
+            "Restored deleted active announcement from replaceable history"
         );
     }
 
