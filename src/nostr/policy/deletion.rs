@@ -1090,6 +1090,41 @@ impl DeletionPolicy {
             );
         }
 
+        // Exclude GRASP-06 PR / PR-update subgraphs from cascade deletion.
+        //
+        // These events can intentionally target this relay's `/prs/` endpoint
+        // via clone tags and should not be treated as regular announcement-
+        // anchored dependents for announcement cascade deletion.
+        let excluded_roots: HashSet<EventId> = events
+            .iter()
+            .filter(|event| {
+                crate::grasp06::policy::event_names_relays_prs_endpoint(
+                    event,
+                    &self.ctx.config.domain,
+                )
+            })
+            .map(|event| event.id)
+            .collect();
+
+        if !excluded_roots.is_empty() {
+            let graph = super::build_event_graph(&events);
+            let mut excluded_ids = excluded_roots.clone();
+            for root in &excluded_roots {
+                excluded_ids.extend(graph.get_transitive_dependents(root));
+            }
+
+            let total_before = events.len();
+            events.retain(|event| !excluded_ids.contains(&event.id));
+
+            tracing::debug!(
+                total_before,
+                excluded_roots = excluded_roots.len(),
+                excluded_related = excluded_ids.len().saturating_sub(excluded_roots.len()),
+                total_after = events.len(),
+                "Cascade deletion: excluded GRASP-06 PR candidate subgraphs"
+            );
+        }
+
         Ok(events)
     }
 

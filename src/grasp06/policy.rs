@@ -41,6 +41,17 @@ pub fn event_qualifies_for_pr_relaxation(event: &Event, config: &Config) -> bool
         return false;
     }
 
+    event_names_relays_prs_endpoint(event, &config.domain)
+}
+
+/// Returns true when `event` is a PR/PR-Update event whose `clone` tag names
+/// this relay's `/prs/<signer-npub>/<d>.git` endpoint (for a `<d>` listed in one
+/// of the event's `a` tags).
+///
+/// Unlike [`event_qualifies_for_pr_relaxation`], this helper does **not** check
+/// `grasp06_enable`; callers that need pure URL-based classification can use it
+/// directly.
+pub fn event_names_relays_prs_endpoint(event: &Event, domain: &str) -> bool {
     if !matches!(
         event.kind,
         Kind::GitPullRequest | Kind::GitPullRequestUpdate
@@ -59,7 +70,7 @@ pub fn event_qualifies_for_pr_relaxation(event: &Event, config: &Config) -> bool
             continue;
         }
         for url in parts.iter().skip(1) {
-            if clone_url_names_relays_prs_endpoint(url, &config.domain, &event.pubkey, &d_tags) {
+            if clone_url_names_relays_prs_endpoint(url, domain, &event.pubkey, &d_tags) {
                 return true;
             }
         }
