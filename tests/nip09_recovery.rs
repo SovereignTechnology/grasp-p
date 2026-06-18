@@ -3,9 +3,9 @@
 mod common;
 
 use common::{
-    announcement_coordinate, build_deletion, publish_served_announcement_for_identifier,
-    publish_served_repo, publish_served_repo_with_maintainers, publish_served_repo_with_state_event,
-    create_pr_event, create_state_event, create_test_repo_with_commit, push_to_relay,
+    announcement_coordinate, build_deletion, create_pr_event, create_state_event,
+    create_test_repo_with_commit, publish_served_announcement_for_identifier, publish_served_repo,
+    publish_served_repo_with_maintainers, publish_served_repo_with_state_event, push_to_relay,
     CommitVariant, TestRelay,
 };
 use grasp_audit::{AuditClient, AuditConfig};
@@ -35,25 +35,121 @@ fn metadata_tag_value(event: &Event, key: &str) -> Option<String> {
 }
 
 fn build_reannouncement(client: &AuditClient, relay: &TestRelay, repo_id: &str) -> Event {
+    build_reannouncement_with_clone(
+        client,
+        relay,
+        repo_id,
+        &format!(
+            "http://{}/{}/{}.git",
+            relay
+                .url()
+                .trim_start_matches("ws://")
+                .trim_start_matches("wss://"),
+            client.public_key().to_bech32().expect("pubkey to bech32"),
+            repo_id
+        ),
+    )
+}
+
+fn build_reannouncement_with_clone(
+    client: &AuditClient,
+    relay: &TestRelay,
+    repo_id: &str,
+    clone_url: &str,
+) -> Event {
     let relay_url = relay.url().to_string();
-    let relay_domain = relay
-        .url()
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .to_string();
-    let npub = client.public_key().to_bech32().expect("pubkey to bech32");
 
     client
         .event_builder(Kind::GitRepoAnnouncement, "reannounce")
         .tag(Tag::identifier(repo_id))
         .tag(Tag::custom("name", vec![repo_id.to_string()]))
-        .tag(Tag::custom(
-            "clone",
-            vec![format!("http://{}/{}/{}.git", relay_domain, npub, repo_id)],
-        ))
+        .tag(Tag::custom("clone", vec![clone_url.to_string()]))
         .tag(Tag::custom("relays", vec![relay_url]))
         .build(client.keys())
         .expect("build re-announcement")
+}
+
+async fn publish_served_repo_for_identifier(
+    client: &AuditClient,
+    relay: &TestRelay,
+    repo_id: &str,
+) -> String {
+    let temp_dir = tempfile::tempdir().expect("create temp repo for served repo publish");
+    let commit_hash = create_test_repo_with_commit(temp_dir.path(), CommitVariant::StateTest)
+        .expect("create deterministic commit for served repo");
+
+    let relay_url = relay.url().to_string();
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let npub = client
+        .public_key()
+        .to_bech32()
+        .expect("npub for served repo publish");
+    let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
+
+    let announcement = client
+        .event_builder(Kind::GitRepoAnnouncement, "")
+        .tag(Tag::identifier(repo_id))
+        .tag(Tag::custom("name", vec![repo_id.to_string()]))
+        .tag(Tag::custom("clone", vec![clone_url.clone()]))
+        .tag(Tag::custom("relays", vec![relay_url.clone()]))
+        .build(client.keys())
+        .expect("build served announcement");
+    client
+        .send_event(announcement.clone())
+        .await
+        .expect("send served announcement");
+
+    let state_event = create_state_event(
+        client.keys(),
+        repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[clone_url.as_str()],
+        &[relay_url.as_str()],
+    )
+    .expect("build served state event");
+    client
+        .send_event_and_note_purgatory(state_event.clone())
+        .await
+        .expect("send served state event");
+
+    push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id).expect("push served repo data");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query served announcement"),
+        "served announcement should be promoted"
+    );
+    assert!(
+        client
+            .is_event_on_relay(state_event.id)
+            .await
+            .expect("query served state"),
+        "served state event should be promoted"
+    );
+
+    commit_hash
+}
+
+async fn wait_for_event_presence(
+    client: &AuditClient,
+    event_id: EventId,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if client.is_event_on_relay(event_id).await.unwrap_or(false) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
 }
 
 fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> std::process::Output {
@@ -146,7 +242,11 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
         .await
         .expect("send pr update");
 
-    set_bare_ref(&repo_path, &format!("refs/nostr/{}", pr.id.to_hex()), &main_commit);
+    set_bare_ref(
+        &repo_path,
+        &format!("refs/nostr/{}", pr.id.to_hex()),
+        &main_commit,
+    );
     set_bare_ref(
         &repo_path,
         &format!("refs/nostr/{}", pr_update.id.to_hex()),
@@ -276,11 +376,9 @@ async fn submit_new_state_and_push_for_promotion(
 
 #[tokio::test]
 async fn purgatory_promotion_restores_events_and_pr_git_archive_data() {
-    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
-        "promotion-recovery-success",
-        false,
-    )
-    .await;
+    let fixture =
+        setup_parked_announcement_with_failed_ingest_recovery("promotion-recovery-success", false)
+            .await;
 
     std::fs::write(&fixture.archive_path, &fixture.archive_backup)
         .expect("restore archive bytes before promotion");
@@ -330,11 +428,9 @@ async fn purgatory_promotion_restores_events_and_pr_git_archive_data() {
 
 #[tokio::test]
 async fn purgatory_promotion_recovery_respects_state_tombstones() {
-    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
-        "promotion-recovery-tombstone",
-        true,
-    )
-    .await;
+    let fixture =
+        setup_parked_announcement_with_failed_ingest_recovery("promotion-recovery-tombstone", true)
+            .await;
 
     std::fs::write(&fixture.archive_path, &fixture.archive_backup)
         .expect("restore archive bytes before tombstone promotion");
@@ -378,7 +474,8 @@ async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
     let first_state = submit_new_state_and_push_for_promotion(&fixture, "idempotent-first").await;
 
     // Trigger another post-promotion write flow; recovery should remain a no-op.
-    let second_reannouncement = build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
+    let second_reannouncement =
+        build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
     fixture
         .client
         .send_event(second_reannouncement.clone())
@@ -426,13 +523,12 @@ async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
 
 #[tokio::test]
 async fn promotion_with_missing_or_invalid_recovery_artifacts_is_deterministic() {
-    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
-        "promotion-recovery-fallback",
-        false,
-    )
-    .await;
+    let fixture =
+        setup_parked_announcement_with_failed_ingest_recovery("promotion-recovery-fallback", false)
+            .await;
 
-    let promoted_state = submit_new_state_and_push_for_promotion(&fixture, "promotion-fallback").await;
+    let promoted_state =
+        submit_new_state_and_push_for_promotion(&fixture, "promotion-fallback").await;
 
     assert!(fixture
         .client
@@ -471,6 +567,166 @@ async fn promotion_with_missing_or_invalid_recovery_artifacts_is_deterministic()
     assert!(
         !pending.is_empty(),
         "failed recovery should leave deterministic holding records for future retries"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn state_event_received_route_runs_promotion_recovery_with_tombstones() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-state-route",
+        true,
+    )
+    .await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before state-route promotion");
+
+    let collaborator = AuditClient::new(fixture.relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create collaborator client");
+
+    let commit_hash =
+        publish_served_repo_for_identifier(&collaborator, &fixture.relay, &fixture.repo_id).await;
+
+    let relay_url = fixture.relay.url().to_string();
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let collaborator_npub = collaborator
+        .public_key()
+        .to_bech32()
+        .expect("collaborator npub for state-route test");
+    let collaborator_clone = format!(
+        "http://{}/{}/{}.git",
+        relay_domain, collaborator_npub, fixture.repo_id
+    );
+
+    let recovery_state = create_state_event(
+        fixture.client.keys(),
+        &fixture.repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[collaborator_clone.as_str()],
+        &[relay_url.as_str()],
+    )
+    .expect("build state-route recovery trigger state event");
+
+    fixture
+        .client
+        .send_event(recovery_state.clone())
+        .await
+        .expect("send state-route recovery trigger state event");
+
+    assert!(
+        wait_for_event_presence(
+            &fixture.client,
+            fixture.reannouncement.id,
+            Duration::from_secs(8)
+        )
+        .await,
+        "state-event route should promote parked re-announcement"
+    );
+    assert!(
+        wait_for_event_presence(&fixture.client, recovery_state.id, Duration::from_secs(8)).await,
+        "state-event route should accept recovery trigger state"
+    );
+    assert!(
+        wait_for_event_presence(&fixture.client, fixture.issue.id, Duration::from_secs(8)).await,
+        "state-event route should run recovery and restore issue"
+    );
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.old_state_event.id)
+            .await
+            .expect("query tombstoned state after state-route recovery"),
+        "tombstoned state must not resurrect on state-event route"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn state_event_received_route_fallback_is_deterministic_when_recovery_artifacts_missing() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-state-route-fallback",
+        false,
+    )
+    .await;
+
+    let collaborator = AuditClient::new(fixture.relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create collaborator client for fallback path");
+    let commit_hash =
+        publish_served_repo_for_identifier(&collaborator, &fixture.relay, &fixture.repo_id).await;
+
+    let relay_url = fixture.relay.url().to_string();
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let collaborator_npub = collaborator
+        .public_key()
+        .to_bech32()
+        .expect("collaborator npub for fallback state-route test");
+    let collaborator_clone = format!(
+        "http://{}/{}/{}.git",
+        relay_domain, collaborator_npub, fixture.repo_id
+    );
+
+    let fallback_state = create_state_event(
+        fixture.client.keys(),
+        &fixture.repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[collaborator_clone.as_str()],
+        &[relay_url.as_str()],
+    )
+    .expect("build fallback state-route trigger state event");
+
+    fixture
+        .client
+        .send_event(fallback_state.clone())
+        .await
+        .expect("send fallback state-route trigger state event");
+
+    assert!(
+        wait_for_event_presence(
+            &fixture.client,
+            fixture.reannouncement.id,
+            Duration::from_secs(8)
+        )
+        .await,
+        "state-event route should promote parked re-announcement in fallback path"
+    );
+    assert!(
+        wait_for_event_presence(&fixture.client, fallback_state.id, Duration::from_secs(8)).await,
+        "state-event route should accept fallback trigger state"
+    );
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.issue.id)
+            .await
+            .expect("query issue after state-route fallback"),
+        "state-event route fallback must avoid partial event resurrection"
+    );
+
+    let pending = open_holding(&fixture.relay)
+        .await
+        .eligible_recovery_records(
+            &fixture.client.public_key().to_hex(),
+            &fixture.repo_id,
+            Timestamp::now(),
+            DEFAULT_RETENTION,
+        )
+        .await;
+    assert!(
+        !pending.is_empty(),
+        "state-event route fallback should leave deterministic holding records for retries"
     );
 
     fixture.relay.stop().await;

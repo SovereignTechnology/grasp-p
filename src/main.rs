@@ -355,6 +355,7 @@ async fn run_relay(config: Config) -> Result<()> {
             PathBuf::from(config.effective_git_data_path()),
             Some(config.domain.clone()),
             Some(relay_with_db.relay.clone()),
+            Some(relay_with_db.write_policy.clone()),
             git_naughty_list.clone(),
         ));
 
