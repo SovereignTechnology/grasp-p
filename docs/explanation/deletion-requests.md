@@ -79,9 +79,14 @@ The deletion request event itself is accepted/stored if valid.
 
 ### 1a) Replaceable/addressable rollback flow for deleted active state
 
-For kind-30618 state, ngit-grasp now evaluates whether deletion removed the
+For kind-30618 state, ngit-grasp evaluates whether deletion removed the
 currently served state for an identifier and applies deterministic rollback
-semantics:
+semantics, split by deletion target type:
+
+- **`e`-target deletes:** may rollback to a previous history version.
+- **`a`-coordinate deletes:** never rollback from history.
+
+For `e`-target deletes of active state:
 
 1. Detect that the deleted target was the active served state.
 2. Resolve rollback candidate from repository state history (newest surviving
@@ -91,8 +96,16 @@ semantics:
 4. If candidate does not exist: transition to `NO_ACTIVE_STATE` lifecycle
    (described below).
 
-This applies to both `e`-target and `a`-coordinate deletion paths, with
-coordinate range semantics (`<= deletion.created_at`) preserved for `a` tags.
+For `a`-coordinate deletes of state:
+
+1. Apply NIP-09 coordinate cutoff semantics (`<= deletion.created_at`).
+2. Never restore from history for this path.
+3. Re-align refs based only on surviving authorized main-DB state.
+4. If no state survives cutoff, transition to `NO_ACTIVE_STATE` cleanup path.
+
+This guarantees an old `a` delete cannot clobber a newer active state, and a
+current `a` delete cannot resurrect a state version that the same tombstone
+declared deleted.
 
 ### 1b) `NO_ACTIVE_STATE` lifecycle (no rollback candidate available)
 
@@ -254,7 +267,8 @@ Recovery is triggered by accepted re-announcement for the same
 
 Recovery and rollback are complementary:
 
-- **Rollback** handles deletion-time transition to previous known-valid state.
+- **Rollback (`e`-path only)** handles deletion-time transition to previous
+  known-valid state.
 - **Recovery** handles restoring deleted/archived repository payload and git
   artifacts when announcements are republished.
 
