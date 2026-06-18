@@ -126,7 +126,9 @@ data during the retention window.
 ```
 1. Kind 5 deletion request arrives
    ↓
-2. Validate: author matches announcement pubkey
+2. Validate targets:
+   - `e` targets must be authored by deleter (cross-author delete rejected)
+   - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
 3. Query dependent events (PRs, issues, patches, comments)
    ↓
@@ -256,6 +258,15 @@ parked in purgatory:
 3. Restore archived events/git from holding/archive.
 4. Resume normal serving with git/state alignment.
 
+### Rollback history source-of-truth
+
+Rollback for deleted active replaceable/addressable state uses ngit-grasp's
+dedicated replaceable-history store (`src/nostr/history.rs`), not backend
+internal replaceable compaction behavior.
+
+The relay archives superseded 30617/30618 versions on write and uses that
+history at deletion time to pick rollback candidates.
+
 ### Blacklist Recovery
 
 When a repository is removed from the blacklist:
@@ -380,10 +391,9 @@ Repository Announcement (30617)
 ├─→ Pull Requests (1618) - tag via 'a'
 ├─→ Issues (1621) - tag via 'a'  
 ├─→ Patches (1617) - tag via 'a'
+├─→ Repository/Issue/PR/Patch status (1633/1630/1631/1632)
     ↓ all above deleted
     └─→ Comments (1111) - tag via 'e'
-        ├─→ Reactions (7) - tag via 'e'
-        └─→ Text Notes (1) - tag via 'e'
 ```
 
 **Implementation:** Recursive dependency graph traversal starting from announcement.
@@ -437,9 +447,9 @@ When npub1alice deletes her announcement:
 4. Mark unreachable events as "delete"
 
 **Max Depth Limit:**
-- Configurable maximum traversal depth (prevent infinite loops)
+- Internal maximum traversal depth guard (prevents infinite loops)
 - Default: 100 levels
-- Note: Will analyze edge cases where this limit matters
+- Note: this is currently code-level, not a user/operator config option
 
 **Complexity:**
 - Deletion events are rare (not performance critical)
@@ -504,10 +514,11 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ### Validation
 
-1. **Author Matching:** Deletion request pubkey MUST match announcement pubkey
-   - **Critical Requirement:** We ONLY honor deletion requests where the deletion request author is the same as the deleted event author
+1. **Author Matching:**
+   - For `e` targets, deletion request author MUST match deleted event author
+   - For `a` targets, only coordinates with matching author are acted on
    - This prevents malicious actors from deleting other people's repositories
-   - Enforced at validation layer before any deletion processing
+   - Enforced before destructive deletion processing
 2. **Signature Verification:** Handled by nostr-relay-builder (already implemented)
 3. **Timestamp Check:** For addressable events, delete versions up to deletion `created_at`
 
