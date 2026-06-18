@@ -14,8 +14,9 @@ and recovery:
 
 This invariant is the design center for deletion handling. If the currently
 served repository state is deleted and no valid rollback state exists, the relay
-must stop serving that repository state and transition into a controlled
-"awaiting state" lifecycle instead of serving stale refs.
+must stop serving that repository state, follow deletion archival flow, and
+park repository announcement serving in purgatory until state can be promoted
+again.
 
 ## Why this design exists
 
@@ -93,40 +94,39 @@ For `e`-target deletes of active state:
    prior valid state for the identifier/owner scope).
 3. If candidate exists: restore that state as active and immediately re-align
    git refs to match the restored state.
-4. If candidate does not exist: transition to `NO_ACTIVE_STATE` lifecycle
-   (described below).
+4. If candidate does not exist: transition to deletion + purgatory parking
+   lifecycle (described below).
 
 For `a`-coordinate deletes of state:
 
 1. Apply NIP-09 coordinate cutoff semantics (`<= deletion.created_at`).
 2. Never restore from history for this path.
 3. Re-align refs based only on surviving authorized main-DB state.
-4. If no state survives cutoff, transition to `NO_ACTIVE_STATE` cleanup path.
+4. If no state survives cutoff, transition to deletion + purgatory parking
+   lifecycle.
 
 This guarantees an old `a` delete cannot clobber a newer active state, and a
 current `a` delete cannot resurrect a state version that the same tombstone
 declared deleted.
 
-### 1b) `NO_ACTIVE_STATE` lifecycle (no rollback candidate available)
+### 1b) Deletion + purgatory parking lifecycle (no rollback candidate available)
 
-When deletion removes active state and no previous valid state exists, the relay
-enters `NO_ACTIVE_STATE` for that repository scope:
+When deletion removes active state and no previous valid state exists, ngit-grasp
+reuses existing deletion and purgatory machinery instead of a separate timed
+`NO_ACTIVE_STATE` state machine:
 
-1. Announcement is retained in storage but treated as **not served** (purgatory
-   semantics for serving eligibility).
-2. Git serving for the repository is transitioned to an empty/no-refs state so
-   served git data cannot drift from served nostr state.
-3. A grace timer starts (30 minutes).
-4. If a valid state event arrives before grace expiry, normal serving resumes:
-   - state becomes active,
-   - git refs are aligned,
-   - `NO_ACTIVE_STATE` is cleared.
-5. If no valid state arrives before grace expiry, relay executes identifier
-   cleanup: announcement and related now-unservable events are deleted through
-   the same cascade + holding + archive pipeline.
+1. Follow normal deletion workflow for now-unservable repository scope
+   (move affected events to holding, clear served refs/state).
+2. Remove announcement from live serving/indexed set as part of deletion flow.
+3. Insert announcement scope into purgatory so the repository is parked and
+   visible to promotion logic, with an empty/non-served git ref surface.
+4. No dedicated lifecycle deadline is required.
+5. On later valid promotion (state/announcement conditions met), run restore
+   hook to recover repository events and archived git PR/review data from
+   holding/archive, then perform normal git/state alignment.
 
-This gives purgatory-style behavior under deletions while preserving the core
-consistency invariant.
+This keeps behavior aligned with existing deletion + purgatory semantics while
+preserving the core consistency invariant.
 
 ### 2) Disrespector mode (archival NIP-09 behavior)
 
@@ -197,8 +197,8 @@ After announcement deletion, ngit-grasp resolves state handling in this order:
 2. If no announcement remains, identifier becomes unanchored and state is
    deleted from served main state.
 3. If anchored-but-no-valid-state (e.g. deleted active state with no rollback
-   candidate), repository enters `NO_ACTIVE_STATE` lifecycle until state is
-   republished or grace expiry cleanup runs.
+   candidate), repository follows deletion + purgatory parking lifecycle until
+   a later valid promotion restores servable state.
 
 This ensures multi-maintainer retention does not accidentally serve stale git
 state after state deletions.
@@ -262,15 +262,17 @@ Archive files are removed during holding expiry cleanup (`src/nostr/holding.rs:5
 
 ## Recovery workflow
 
-Recovery is triggered by accepted re-announcement for the same
-`owner+identifier` scope (`src/nostr/builder.rs:297`, `src/nostr/builder.rs:1319`).
+Recovery is triggered by accepted re-announcement or promotion out of purgatory
+for the same `owner+identifier` scope (`src/nostr/builder.rs:297`,
+`src/nostr/builder.rs:1319`).
 
 Recovery and rollback are complementary:
 
 - **Rollback (`e`-path only)** handles deletion-time transition to previous
   known-valid state.
 - **Recovery** handles restoring deleted/archived repository payload and git
-  artifacts when announcements are republished.
+  artifacts when announcements are republished or promoted back out of
+  purgatory.
 
 Eligibility (`src/nostr/holding.rs:315`):
 
@@ -342,7 +344,7 @@ deletion, archival, and recovery:
 - **Durable enforcement:** tombstones persist and feed admission-time gating.
 - **Safer deletion:** move-to-holding + git archiving provide a controlled
   retention window.
-- **State/git consistency under deletion:** `NO_ACTIVE_STATE` lifecycle prevents
+- **State/git consistency under deletion:** deletion + purgatory parking prevents
   stale refs from being served when active state is deleted and no rollback
   candidate exists.
 - **Deterministic rollback:** dedicated history storage for critical
