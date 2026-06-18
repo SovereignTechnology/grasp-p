@@ -155,6 +155,7 @@ impl DeletionPolicy {
         }
 
         let rollback_plans = self.collect_state_rollback_plans(event).await;
+        let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
 
         // Process purgatory removals (synchronous, in-memory).
         self.remove_purgatory_targets(event);
@@ -163,10 +164,9 @@ impl DeletionPolicy {
         let mut moved_ids = HashSet::new();
         self.delete_main_db_targets(event, &mut moved_ids).await;
 
-        let mut identifiers_to_realign = HashSet::new();
-        for plan in rollback_plans {
+        for plan in &rollback_plans {
             identifiers_to_realign.insert(plan.identifier.clone());
-            self.rollback_deleted_active_state(&plan).await;
+            self.rollback_deleted_active_state(plan).await;
         }
 
         for identifier in identifiers_to_realign {
@@ -234,37 +234,28 @@ impl DeletionPolicy {
             });
         }
 
-        for coordinate in Self::a_tag_coordinates(deletion) {
-            let Some((kind, coord_pubkey, identifier)) = Self::parse_coordinate(&coordinate) else {
-                continue;
-            };
-            if kind != Kind::RepoState || coord_pubkey != deletion.pubkey {
-                continue;
-            }
-
-            let Some(active_any_cutoff) = self
-                .latest_state_for_coordinate(&coord_pubkey, &identifier, None)
-                .await
-            else {
-                continue;
-            };
-
-            if active_any_cutoff.created_at > deletion.created_at {
-                continue;
-            }
-
-            plans.push(StateRollbackPlan {
-                coordinate,
-                identifier,
-                deleted_event_id: active_any_cutoff.id,
-                cutoff: deletion.created_at,
-            });
-        }
-
         plans
             .into_iter()
             .collect::<HashSet<_>>()
             .into_iter()
+            .collect()
+    }
+
+    fn state_a_tag_identifiers_for_author(event: &Event) -> HashSet<String> {
+        Self::a_tag_coordinates(event)
+            .into_iter()
+            .filter_map(|coordinate| {
+                let Some((kind, coord_pubkey, identifier)) = Self::parse_coordinate(&coordinate)
+                else {
+                    return None;
+                };
+
+                if kind == Kind::RepoState && coord_pubkey == event.pubkey {
+                    Some(identifier)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
