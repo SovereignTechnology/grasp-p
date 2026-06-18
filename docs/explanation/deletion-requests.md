@@ -1,380 +1,745 @@
-# Deletion request architecture (NIP-09 / NIP-62)
-
-This document explains how deletion works in ngit-grasp.
-
-It is intentionally architecture-focused: what the relay does at runtime, why it
-does it that way, and where operators have control.
-
-## Core consistency invariant
-
-ngit-grasp enforces the following invariant across admission, serving, deletion,
-and recovery:
-
-> **Served nostr state must always match git refs we can actually serve.**
-
-This invariant is the design center for deletion handling. If the currently
-served repository state is deleted and no valid rollback state exists, the relay
-must stop serving that repository state, follow deletion archival flow, and
-park repository announcement serving in purgatory until state can be promoted
-again.
-
-## Why this design exists
-
-Deletion in a git relay has competing goals:
-
-1. **User agency:** repository owners can request deletion (NIP-09).
-2. **Network resilience:** relays may choose archival behavior to avoid “left-pad”
-   style loss of shared work.
-3. **Operational safety:** operators can still enforce moderation and retention.
-
-ngit-grasp addresses this by making deletion policy explicit in relay code (not
-delegated to hidden backend behavior), while preserving deterministic lifecycle
-rules for deleted data.
-
-## Ownership of deletion behavior
-
-ngit-grasp disables backend auto-processing and owns NIP-09/NIP-62 policy in
-its write path:
-
-- main DB: `process_nip09(false)`, `process_nip62(false)`
-  (`src/nostr/builder.rs:1071`)
-- tombstones DB: `process_nip09(false)`, `process_nip62(false)`
-  (`src/nostr/tombstones.rs:86`)
-- holding DB: `process_nip09(false)`, `process_nip62(false)`
-  (`src/nostr/holding.rs:120`)
-
-This keeps behavior auditable and lets ngit-grasp implement cascade, holding,
-archive, and recovery consistently.
-
-## Core architecture
-
-Deletion uses three persistence layers plus a write-time gate:
-
-- **Main DB:** live query-serving events.
-- **Tombstones DB:** persisted kind-5/kind-62 request records used to derive
-  deleted/vanished state (`src/nostr/tombstones.rs:1`).
-- **Holding DB:** deleted payload + metadata retained for cleanup/recovery
-  (`src/nostr/holding.rs:19`).
-- **Deletion gate:** enforced before kind-specific admission to reject:
-  - events from vanished pubkeys,
-  - re-submission of deleted ids,
-  - replaceable/addressable events covered by coordinate tombstones
-    (`src/nostr/builder.rs:757`).
-
-## Runtime flows
-
-### 1) Standard NIP-09 deletion flow
-
-When a kind-5 event is processed (`src/nostr/policy/deletion.rs:84`):
-
-1. Validate ownership for `e` targets; cross-author deletes are rejected
-   (`src/nostr/policy/deletion.rs:118`).
-2. Evict matching purgatory entries (including purgatory bare-repo cleanup)
-   (`src/nostr/policy/deletion.rs:831`, `src/nostr/policy/deletion.rs:1029`).
-3. Move targeted main-DB events into holding with metadata, then delete from main
-   (`src/nostr/policy/deletion.rs:640`, `src/nostr/holding.rs:144`).
-4. Record deletion tombstone so future submissions are gated
-   (`src/nostr/policy/deletion.rs:150`).
-
-The deletion request event itself is accepted/stored if valid.
-
-### 1a) Replaceable/addressable rollback flow for deleted active state
-
-For kind-30618 state, ngit-grasp evaluates whether deletion removed the
-currently served state for an identifier and applies deterministic rollback
-semantics, split by deletion target type:
-
-- **`e`-target deletes:** may rollback to a previous history version.
-- **`a`-coordinate deletes:** never rollback from history.
-
-For `e`-target deletes of active state:
-
-1. Detect that the deleted target was the active served state.
-2. Resolve rollback candidate from repository state history (newest surviving
-   prior valid state for the identifier/owner scope).
-3. If candidate exists: restore that state as active and immediately re-align
-   git refs to match the restored state.
-4. If candidate does not exist: transition to deletion + purgatory parking
-   lifecycle.
-
-For `a`-coordinate deletes of state:
-
-1. Apply NIP-09 coordinate cutoff semantics (`<= deletion.created_at`).
-2. Never restore deleted `<= cutoff` versions from history for this path.
-3. Re-align refs based only on surviving authorized main-DB state.
-4. If no alternative valid authorized state event is found, follow repository
-   deletion flow, then add announcement scope to purgatory so the repository can
-   immediately accept a new state and trigger full restore on promotion (events
-   + archived PR/review git data from holding; see Recovery workflow).
-
-This guarantees an old `a` delete cannot clobber a newer active state, and a
-current `a` delete cannot resurrect a state version that the same tombstone
-declared deleted.
-
-### 2) Disrespector mode (archival NIP-09 behavior)
-
-With `deletion_request_disrespector=true`, NIP-09 processing short-circuits
-(`src/nostr/policy/deletion.rs:101`):
-
-- kind-5 request is accepted/stored,
-- but no purgatory eviction, no main DB delete, no holding move, no tombstone.
-
-Result: repository content remains served.
-
-This switch is NIP-09-specific; blacklist parity deletion still runs
-(`src/nostr/policy/deletion.rs:445`).
-
-NIP-11 currently omits 9 and 62 in this mode (`src/http/nip11.rs:115`).
-
-### 3) Startup policy parity flow
-
-On startup, ngit-grasp runs parity cleanup for both policy lists:
-
-- **Blacklist parity:** scans stored announcements against blacklist config and
-  deletes matches through the same cascade + holding + archive path, marking
-  metadata source as `blacklist` (`src/nostr/builder.rs:140`,
-  `src/nostr/policy/deletion.rs:817`).
-- **Whitelist parity:** scans stored announcements that list this relay’s
-  service domain and deletes entries that no longer match
-  `repository_whitelist`, marking metadata source as `whitelist`
-  (`src/nostr/builder.rs:232`, `src/nostr/policy/deletion.rs:850`).
-
-This gives startup-time parity for repositories that became out-of-policy while
-the relay was offline.
-
-### 4) NIP-62 vanish flow
-
-For kind-62 requests targeting this relay (or `ALL_RELAYS`), ngit-grasp:
-
-- records vanish tombstone,
-- hard-deletes all events by the author,
-- evicts that author’s purgatory entries
-  (`src/nostr/builder.rs:847`).
-
-Non-targeting kind-62 requests are accepted/stored without local action
-(`src/nostr/builder.rs:862`).
-
-## Cascade deletion behavior
-
-Deleting an announcement coordinate (`30617:<owner>:<identifier>`) triggers a
-graph-based cascade (`src/nostr/policy/deletion.rs:243`).
-
-Candidate set and traversal:
-
-- candidates include all announcements + dependent graph kinds in
-  `GRAPH_DEPENDENT_KINDS` (1111, 1617, 1618, 1619, 1621, 1630, 1631, 1632,
-  1633) (`src/nostr/policy/deletion.rs:61`),
-- references are evaluated through `a` / `e` / `q` relationships,
-- orphaned events are moved to holding then deleted from main.
-
-### Multi-maintainer semantics
-
-If multiple maintainers announce the same identifier, deleting one maintainer’s
-announcement does **not** delete events still anchored by surviving
-maintainer announcements (`src/nostr/policy/deletion.rs:334`).
-
-Circular components without a surviving anchor are deleted.
-
-### Kind 30618 handling
-
-Kind 30618 (repo state) is keyed by identifier, not by graph edges.
-
-After announcement deletion, ngit-grasp resolves state handling in this order:
-
-1. If at least one surviving maintainer announcement remains, keep identifier
-   anchored and recompute active state from surviving authorized states.
-2. If no announcement remains, identifier becomes unanchored and state is
-   deleted from served main state.
-3. If anchored-but-no-valid-state (e.g. deleted active state with no rollback
-   candidate), repository follows deletion + purgatory parking lifecycle until
-   a later valid promotion restores servable state.
-
-This ensures multi-maintainer retention does not accidentally serve stale git
-state after state deletions.
-
-## History storage for rollback correctness
-
-To make deletion-time rollback deterministic and independent of backend internal
-replaceable compaction behavior, ngit-grasp persists superseded versions of
-critical replaceable/addressable events in dedicated history storage.
-
-Scope:
-
-- repository state events (kind 30618) — required for rollback,
-- repository announcements (kind 30617) — retained for consistent lifecycle and
-  operator auditability.
-
-Rationale:
-
-- rust-nostr backend internals for replaceable/addressable version retention are
-  not used as the rollback source of truth,
-- rollback availability is controlled by ngit-grasp policy and retention,
-- deletion handling remains deterministic across backend upgrades.
-
-## Holding DB lifecycle
-
-Holding DB stores archived payload + metadata events:
-
-- metadata includes source, deleted-at timestamp, and optional
-  coordinate/identifier/owner/archive tags (`src/nostr/holding.rs:154`),
-- default retention window is 90 days (`DEFAULT_RETENTION`)
-  (`src/nostr/holding.rs:29`).
-
-Cleanup lifecycle:
-
-- **Startup catch-up pass:** one cleanup run when relay starts (`src/main.rs:381`).
-- **Periodic cleanup:** recurring pass at `DEFAULT_CLEANUP_INTERVAL` (24h)
-  (`src/main.rs:409`, `src/nostr/holding.rs:32`).
-- **Expiration behavior:** deletes expired metadata, payloads, and linked archive
-  files with idempotent, best-effort semantics for partial/missing state
-  (`src/nostr/holding.rs:513`, `src/nostr/holding.rs:589`).
-
-## Git archive lifecycle
-
-On announcement deletion, ngit-grasp attempts to archive git data to:
-
-`<git_data_path>/.archive/<owner>/<identifier>-<timestamp>.tar.gz`
-
-(`src/nostr/policy/deletion.rs:722`).
-
-Archive path/created-at are linked into holding metadata
-(`src/nostr/holding.rs:24`).
-
-### Fail-safe semantics
-
-When live repo data exists but archive creation fails, destructive announcement
-deletion is skipped (both coordinate and cascade paths) so data is not dropped
-without a recoverable artifact (`src/nostr/policy/deletion.rs:618`,
-`src/nostr/policy/deletion.rs:676`).
-
-Archive files are removed during holding expiry cleanup (`src/nostr/holding.rs:525`).
-
-## Recovery workflow
-
-Recovery has **two distinct triggers** for the same `owner+identifier` scope.
-
-Recovery and rollback are complementary:
-
-- **Rollback (`e`-path only)** handles deletion-time transition to previous
-  known-valid state.
-- **Recovery** handles restoring deleted/archived repository payload and git
-  artifacts in either trigger path below.
-
-### Trigger A: re-announcement recovery (announcement was deleted)
-
-When a repository was deleted via announcement deletion and a new announcement
-arrives, ngit-grasp performs recovery check **before** parking that announcement
-in purgatory:
-
-1. Accept incoming 30617 candidate.
-2. Check holding/archive eligibility for same `owner+identifier`.
-3. If eligible and recoverable, restore git archive + deleted events and keep
-   normal served path.
-4. If not recoverable, continue with normal purgatory flow.
-
-This corresponds to the pre-purgatory recovery check in announcement handling
-(`src/nostr/builder.rs:297`, `src/nostr/builder.rs:349`).
-
-### Trigger B: promotion recovery (state was deleted)
-
-When announcement serving is parked after state deletion:
-
-1. Announcement scope is in purgatory.
-2. Wait for a **new valid authorized state event** (not covered by existing
-   tombstone semantics) and matching git-servable conditions.
-3. On promotion out of purgatory, run restore hook to recover repository events
-   and archived PR/review git data from holding/archive.
-4. Run normal git/state alignment and resume served state.
-
-This is a separate trigger from re-announcement and happens at promotion time,
-not at initial announcement receipt.
-
-Eligibility (`src/nostr/holding.rs:315`):
-
-- scope match (owner + identifier),
-- parseable `holding-deleted-at`,
-- still within retention window.
-
-Recovery behavior (both triggers, `src/nostr/builder.rs:1319`,
-`src/nostr/builder.rs:1336`):
-
-- restore git archive when path is valid and archive is readable,
-- restore holding payload events into main DB,
-- clean recovery records from holding,
-- delete consumed archive file after full cleanup.
-
-### Partial-state and idempotency rules
-
-- Missing/invalid archive path: continue with events-only recovery.
-- Missing payload referenced by metadata: clean metadata and continue.
-- Archive open/extract failure: abort recovery attempt; preserve state for retry.
-- Already-restored events are not duplicated (existence checked before save).
-- Recovery-record delete is idempotent (`src/nostr/holding.rs:403`).
-
-Tombstones are not removed by recovery; prior deletion gate semantics remain in
-force for older versions.
-
-## Manual ejection and operator behavior
-
-Operators can permanently remove holding/archive artifacts for a repo scope:
-
-```bash
-ngit-grasp holding-eject --owner <npub|hex> --identifier <id>
+# Deletion Request Support (NIP-09)
+
+**Status:** ✅ **PARTIALLY IMPLEMENTED (hard-delete path live)**
+
+This document now reflects both the implemented single-node hard-delete path
+(main DB + tombstones, no holding DB) and the still-planned archival/recovery
+architecture.
+
+---
+
+## Implemented: ngit-grasp owns NIP-09 / NIP-62 handling
+
+> The rest of this document is mostly historical **planned** design
+> (holding database, archival, recovery). It is still aspirational.
+> What follows in this section is what is **actually built today** and is the
+> foundation that work builds on. The `deletion-request-disrespector` archival
+> mode is now implemented (see below); the holding DB, git archival, and
+> recovery remain planned.
+
+Up to the rust-nostr 0.45 bump, ngit-grasp relied on the LMDB backend's
+*automatic* NIP-09 / NIP-62 processing (`NostrLmdb` defaults
+`process_nip09 = true`, `process_nip62 = true`). The backend silently removed
+deleted/vanished events from the main DB and blocked their re-submission via the
+relay-builder `check_id` gate, which consulted the backend's internal
+`deleted-ids` / `deleted-coordinates` / `vanished-public-keys` LMDB tables.
+
+We disable that automatic processing
+([`src/nostr/builder.rs`](../../src/nostr/builder.rs) sets
+`process_nip09(false)` and `process_nip62(false)` on both the main database and
+the tombstone database) and implement NIP-09 / NIP-62 in ngit-grasp itself,
+bypassing the backend so we can apply our own customisations in the future.
+ngit-grasp now has custom announcement cascade deletion in the main DB (pure
+hard-delete, no holding DB), including dependent NIP-34 graph events and
+repository-state (kind 30618) cleanup when an identifier becomes unanchored.
+The cascade walk is kind-agnostic over `a` / `e` / `q` edges; supported
+dependent kinds are controlled by
+[`GRAPH_DEPENDENT_KINDS`](../../src/nostr/policy/deletion.rs) and currently
+include the full PR chain (`1618`/`1619`/`1631`/`1632`).
+
+**Components added:**
+
+- **Tombstone store** ([`src/nostr/tombstones.rs`](../../src/nostr/tombstones.rs)):
+  a dedicated, persistent nostr database (a separate `NostrLmdb` at
+  `<relay_data_path>/tombstones`, or `MemoryDatabase` for the memory backend)
+  that stores the kind-5 deletion requests and kind-62 vanish requests
+  themselves. Deleted/vanished state is *derived* by querying it:
+  - kind-5 with an `e` tag → that event id is deleted,
+  - kind-5 with an `a` tag → that coordinate is deleted up to the kind-5's
+    `created_at`,
+  - kind-62 by pubkey `P` → pubkey `P` is vanished.
+  Because the requests are stored in a real database, the deleted/vanished state
+  survives restarts exactly as the backend's internal tables did.
+
+- **Deletion gate** (`Nip34WritePolicy::deletion_gate` in
+  [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): runs at the top of
+  `admit_event` and reproduces the now-silent library `check_id == Deleted`
+  rejection — it rejects re-submission of a deleted event id, a deleted
+  coordinate, or any event from a vanished pubkey, by consulting the tombstone
+  store.
+
+- **NIP-09 handler** ([`src/nostr/policy/deletion.rs`](../../src/nostr/policy/deletion.rs)):
+  in addition to the existing purgatory eviction (and bare-repo deletion), it now
+  validates author ownership, hard-deletes the targeted events from the main
+  database via `NostrDatabase::delete(filter)`, and records the deletion in the
+  tombstone store. An `e`-tag delete targeting an event owned by a different
+  author is rejected (matching the backend's `InvalidDelete`).
+
+  For kind-30617 announcement `a`-coordinate deletes, this includes
+  graph-based cascade deletion of orphaned dependent events, plus special
+  handling for kind-30618 repository state events: because state is keyed by
+  repository identifier (`d` tag) instead of graph edges, state events are
+  hard-deleted when (and only when) no announcement remains for that
+  identifier.
+
+- **NIP-62 handler** (`Nip34WritePolicy::handle_vanish` in
+  [`src/nostr/builder.rs`](../../src/nostr/builder.rs)): for a vanish request
+  targeting this relay (or `ALL_RELAYS`), records the vanish tombstone,
+  hard-deletes the author's events from the main DB, and evicts the author's
+  purgatory entries (deleting their bare repos).
+
+**Why store the requests rather than a bespoke tombstone table?** The
+`NostrDatabase` trait does not expose the backend's internal deletion tables, so
+we cannot read or write them. Persisting the request events in our own database
+gives us durable, queryable deletion/vanish state for free and is the natural
+foundation for the later cascade/recovery work (recovery = remove the
+tombstone; cascade = walk the references of a recorded deletion).
+
+- **Disrespector mode** (`deletion_request_disrespector`, env
+  `NGIT_DELETION_REQUEST_DISRESPECTOR`, CLI `--deletion-request-disrespector`):
+  when enabled, [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs)
+  short-circuits at the top — the kind-5 deletion request is still accepted (and
+  therefore stored in the main DB so clients get an OK), but it is **not** acted
+  upon: no purgatory eviction, no main-DB deletion, and no tombstone is recorded.
+  Targeted events stay fully accessible, making the relay an archival server.
+  The short-circuit only affects NIP-09 (kind 5) *processing*; NIP-62 vanish
+  *handling* is unchanged. NIP-11 advertisement, however, reflects the mode for
+  both deletion NIPs: NIP-09 (`9`) and NIP-62 (`62`) are included in
+  `supported_nips` only when disrespector is `false`
+  ([`src/http/nip11.rs`](../../src/http/nip11.rs)), so clients can discover that
+  an archival relay does not honour deletion requests.
+
+---
+
+## Overview
+
+ngit-grasp will implement optional support for NIP-09 deletion requests, allowing repository owners to remove their repositories from the relay while providing safeguards against the "left-pad problem" through configurable archival behavior.
+
+## The Left-Pad Problem
+
+The "left-pad problem" refers to a 2016 incident where a critical npm package was unpublished, breaking thousands of dependent projects. In the context of decentralized Git hosting, this translates to:
+
+**Scenario:** A popular repository with many PRs, issues, and community contributions gets deleted by its owner. All dependent work (forks, patches, discussions) becomes inaccessible, potentially breaking workflows and losing community knowledge.
+
+**Our Solution:** The `deletion-request-disrespector` configuration option allows operators to run **archival relays** that preserve deleted content, ensuring community work survives repository deletion while still respecting deletion requests on standard relays.
+
+## Architecture
+
+### Three-Database Design
+
+The deletion system uses three separate data stores:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Main Database                        │
+│         (Live events - actively served)                 │
+│    LMDB/Memory backend                                 │
+└─────────────────────────────────────────────────────────┘
+                         ↓ deletion request
+┌─────────────────────────────────────────────────────────┐
+│                 Holding Database                        │
+│    (Archived events - recovery window)                 │
+│    Same backend type as main                           │
+│    Retention: configurable (default 90 days)           │
+└─────────────────────────────────────────────────────────┘
+                         ↓ expiry
+┌─────────────────────────────────────────────────────────┐
+│              Permanent Deletion                         │
+│         (Events removed from holding DB)                │
+└─────────────────────────────────────────────────────────┘
+
+                    Git Data Flow
+┌─────────────────────────────────────────────────────────┐
+│          Git Repository (Live)                          │
+│    <git_data_path>/<npub>/<identifier>.git             │
+└─────────────────────────────────────────────────────────┘
+                         ↓ deletion request
+┌─────────────────────────────────────────────────────────┐
+│           Archive Filesystem                            │
+│    .archive/<npub>/<identifier>-<timestamp>.tar.gz     │
+│    + metadata.json                                     │
+│    Retention: configurable (default 90 days)           │
+└─────────────────────────────────────────────────────────┘
+                         ↓ expiry
+┌─────────────────────────────────────────────────────────┐
+│              Permanent Deletion                         │
+│         (Archive files removed)                         │
+└─────────────────────────────────────────────────────────┘
 ```
 
-(`src/main.rs:40`, `src/main.rs:100`).
+### Why Three Stores?
 
-Behavior:
+1. **Main Database:** Fast queries, clean data model (deleted = gone)
+2. **Holding Database:** Recovery mechanism, prevents accidental permanent deletion
+3. **Archive Filesystem:** Git data backup, compressed storage
 
-- deletes matching holding metadata and payload rows,
-- deletes linked archive files,
-- idempotent for missing rows/files,
-- records ejection metrics (`src/nostr/holding.rs:638`).
+### Holding Database Operations
 
-Current operator model:
+**Automatic Operations:**
+- **Move to holding:** NIP-09 deletions, blacklist deletions
+- **Automatic recovery:** Re-publishing after NIP-09 deletion (within retention window)
+- **Expiry cleanup:** Daily background task removes entries older than retention period
 
-- startup blacklist parity is implemented,
-- manual ejection is implemented,
-- dynamic blacklist reconciliation is not implemented (startup-only parity),
-- no dedicated restore CLI exists today.
+**Manual Operations:**
+- **Manual ejection:** Operator force-deletes before retention expires
+  - Use case: Large repos consuming excessive storage
+  - Use case: Confirmed malware requiring immediate permanent deletion
+  - Mechanism: CLI command or admin tool (design in Phase 6)
+  - Logged for audit trail
+- **Manual restoration:** Operator restores blacklisted repo after removal from blacklist
+  - Future: May support automatic restoration
 
-## Metrics currently exposed
+## Deletion Flow
 
-Defined in `src/metrics/mod.rs:35`:
+### Standard Mode (Respects Deletions)
 
-- `ngit_blacklist_deletions_total{phase,result}`
-- `ngit_holding_cleanup_runs_total`
-- `ngit_holding_cleanup_deleted_total{type}`
-- `ngit_holding_cleanup_last_run_deleted{type}`
-- `ngit_recovery_total{result}`
-- `ngit_manual_ejections_total`
-- `ngit_manual_ejection_deleted_total{type}`
+#### NIP-09 Deletion Requests
 
-## Why this approach works
+```
+1. Kind 5 deletion request arrives
+   ↓
+2. Validate: author matches announcement pubkey
+   ↓
+3. Query dependent events (PRs, issues, patches, comments)
+   ↓
+4. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+   ↓
+5. Move events to holding database:
+   - Announcement
+   - All dependent events (cascade delete)
+   ↓
+6. Delete events from main database
+   ↓
+7. Events no longer served in queries
+   ↓
+8. Background task (daily):
+   - Check holding database for expired entries
+   - Delete events older than retention period
+   - Delete corresponding archive files
+```
 
-In practice, this architecture gives ngit-grasp predictable behavior across
-deletion, archival, and recovery:
+#### Blacklist-Triggered Deletion
 
-- **Deterministic policy:** deletion logic is in ngit-grasp policy code, not
-  backend internals.
-- **Durable enforcement:** tombstones persist and feed admission-time gating.
-- **Safer deletion:** move-to-holding + git archiving provide a controlled
-  retention window.
-- **State/git consistency under deletion:** deletion + purgatory parking prevents
-  stale refs from being served when active state is deleted and no rollback
-  candidate exists.
-- **Deterministic rollback:** dedicated history storage for critical
-  replaceable/addressable events avoids reliance on backend-internal retention
-  behavior.
-- **Recoverability:** re-announcement-driven recovery can restore data while
-  tolerating partial state.
-- **Operator control:** blacklist parity and manual ejection support moderation
-  and storage pressure workflows.
+When a repository is added to `NGIT_REPOSITORY_BLACKLIST`, the same deletion flow applies:
 
-## Future work / open ideas
+```
+1. Startup: Scan main DB for repos matching blacklist
+   ↓
+2. For each matching repository:
+   - Query dependent events (same cascade logic)
+   - Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+   - Mark metadata as "blacklist-triggered" (not NIP-09)
+   - Move events to holding database
+   - Delete from main database
+   ↓
+3. Background task (daily):
+   - Check holding database for expired entries
+   - Delete events older than retention period
+   - Delete corresponding archive files
+```
 
-- Dynamic blacklist updates beyond startup-only reconciliation.
-- Expanded operator restore controls and UX.
-- Concurrency/race/scale hardening for large deletion and recovery workloads.
-- Optional policy ideas (not commitments): delayed archival/ejection controls
-  for high-activity repositories.
+**Key Differences from NIP-09:**
+- No author validation required (operator decision)
+- Triggered on startup, not by event arrival
+- Metadata marks deletion as blacklist-triggered
+- `deletion_request_disrespector` does NOT prevent blacklist deletion (see below)
+
+**Future:** When dynamic blacklist updates are supported, deletion will trigger immediately on config change instead of waiting for restart.
+
+### Archival Mode (Disrespector)
+
+When `deletion_request_disrespector = true`:
+
+```
+1. Kind 5 deletion request arrives
+   ↓
+2. Store deletion request event in main database
+   ↓
+3. Do NOT process deletion
+   ↓
+4. Repository and events remain fully accessible
+   ↓
+Result: Archival relay preserves all content
+```
+
+**Important:** Disrespector mode ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions.
+
+**Rationale:**
+- NIP-09 deletions are user agency decisions (left-pad protection needed)
+- Blacklist deletions are operator moderation decisions (spam/malware/abuse)
+- Archival relays still need ability to moderate malicious content
+- Different policy goals: preservation vs. safety
+
+**Implementation Note:** Implemented. The LMDB backend's automatic NIP-09
+processing is disabled (`process_nip09(false)`); ngit-grasp owns deletion
+handling in [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs), which
+short-circuits when `deletion_request_disrespector` is set — storing but not
+acting on the kind-5 request. NIP-09 is omitted from the NIP-11
+`supported_nips` list in this mode. The git-archival / holding-DB pieces of the
+broader design remain planned.
+
+## Recovery Mechanism
+
+The holding database enables **accidental deletion recovery**:
+
+### Automatic Recovery (NIP-09 Deletions)
+
+```
+Scenario: Owner deletes repository, then changes their mind
+
+1. Owner publishes new announcement with same identifier
+   ↓
+2. System detects matching entry in holding database
+   ↓
+3. Check: Is entry within retention period?
+   ↓
+4. If YES:
+   - Extract git data from archive tar.gz
+   - Restore to <git_data_path>/<npub>/<identifier>.git
+   - Move events from holding DB → main DB
+   - Re-run acceptance policy (should now pass)
+   - Delete archive records
+   - Return: "Restored X events"
+   ↓
+5. If NO (expired):
+   - Process as new repository
+   - Return: "New repository created"
+```
+
+### Blacklist Recovery
+
+When a repository is removed from the blacklist:
+
+**Option 1: Manual Restoration (Initial Implementation)**
+- Operator removes from blacklist config
+- Operator manually restores from holding DB if desired
+- Provides explicit control over recovery decisions
+
+**Option 2: Automatic Restoration (Future Enhancement)**
+- On startup, detect repos in holding area no longer blacklisted
+- Automatically restore to main DB if within retention period
+- Requires careful design to prevent unwanted restorations
+
+**Decision:** Start with manual restoration, evaluate automatic restoration in Phase 6.
+
+### Manual Ejection from Holding Area
+
+Operators need ability to **force-delete** items from holding area before retention period expires:
+
+**Use Cases:**
+1. Large repositories consuming excessive storage
+2. Confirmed malware/abuse that shouldn't be recoverable
+3. Legal/compliance requirements for immediate permanent deletion
+
+**Mechanism (TBD in Phase 6):**
+- Admin CLI command: `ngit-grasp eject <npub>/<identifier>`
+- Or database operation with proper tooling
+- Immediately delete from holding DB and archive filesystem
+- Log operation for audit trail
+- Metric: `ngit_manual_ejections_total`
+
+**Safety Considerations:**
+- Manual ejection is permanent (no undo)
+- Should require confirmation for safety
+- Should log npub, identifier, reason, operator
+- Consider retention policy override vs immediate deletion
+
+## Blacklist Deletion Integration
+
+### Overview
+
+Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion requests:
+- Same holding database for 90-day retention
+- Same git archive mechanism
+- Same cascade deletion logic
+- Same recovery capabilities (if unblacklisted)
+
+### Key Differences from NIP-09
+
+| Aspect | NIP-09 Deletion | Blacklist Deletion |
+|--------|----------------|-------------------|
+| **Trigger** | Kind 5 event arrives | Startup scan of main DB |
+| **Author validation** | Required (pubkey match) | Not applicable (operator decision) |
+| **Disrespector mode** | Prevents deletion | Does NOT prevent deletion |
+| **Purpose** | User agency | Moderation/safety |
+| **Recovery** | Automatic (re-publish) | Manual (operator decision) |
+| **Metadata** | Links to Kind 5 event | Marks "blacklist-triggered" |
+
+### Why Disrespector Doesn't Prevent Blacklist Deletion
+
+**Design Decision:** The `deletion_request_disrespector` configuration ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions.
+
+**Rationale:**
+1. **Different Policy Goals:**
+   - NIP-09 = User agency (prevent left-pad)
+   - Blacklist = Operator safety (prevent spam/malware/abuse)
+
+2. **Archival Relays Need Moderation:**
+   - Archive mode preserves valuable deleted content
+   - But still must handle malicious content
+   - Spam, malware, abuse require operator intervention
+
+3. **Separate Concerns:**
+   - Disrespector = "Don't honor user deletion requests"
+   - Blacklist = "Don't accept these specific repos regardless of source"
+
+### Detection and Timing
+
+**Initial Implementation (Startup Scan):**
+```
+1. Relay starts up
+2. Load blacklist configuration
+3. Scan main database for matching repos
+4. For each match: archive → holding DB → delete from main
+5. Continue normal operation
+```
+
+**Future Enhancement (Dynamic Updates):**
+- Watch for configuration file changes
+- Trigger deletion immediately on blacklist addition
+- Requires careful design to avoid race conditions
+
+## Cascade Deletion Strategy
+
+When a repository announcement is deleted (NIP-09 or blacklist), we cascade delete **all dependent events**:
+
+### Rationale
+
+**Decision:** Delete all dependent events, not just owner's events.
+
+**Why?**
+1. **Deletion Intent:** Owner wants repository gone - includes all associated data
+2. **Data Integrity:** Orphaned PRs/issues without context are confusing
+3. **Consistency:** Matches user expectation that "delete repo" means "delete everything"
+4. **Recovery Available:** Holding database preserves everything for recovery window
+
+**Community Protection:**
+- Archival relays (`deletion_request_disrespector = true`) preserve community work
+- 90-day default retention allows time for recovery
+- Other maintainers can continue repository with different identifier
+
+### Event Cascade Hierarchy
+
+```
+Repository Announcement (30617)
+    ↓ deleted
+├─→ State Events (30618) - same identifier
+├─→ Pull Requests (1618) - tag via 'a'
+├─→ Issues (1621) - tag via 'a'  
+├─→ Patches (1617) - tag via 'a'
+    ↓ all above deleted
+    └─→ Comments (1111) - tag via 'e'
+        ├─→ Reactions (7) - tag via 'e'
+        └─→ Text Notes (1) - tag via 'e'
+```
+
+**Implementation:** Recursive dependency graph traversal starting from announcement.
+
+## Multi-Maintainer Scenarios
+
+### Challenge
+
+Multiple maintainers can have announcements for the same `identifier`:
+- `npub1alice.../my-repo` 
+- `npub1bob.../my-repo`
+
+Git data is synced between their repositories. When ONE maintainer deletes, what happens?
+
+### Solution: Graph-Based Retention Algorithm
+
+```
+When npub1alice deletes her announcement:
+
+1. Archive HER git directory:
+   .archive/npub1alice.../my-repo-<timestamp>.tar.gz
+
+2. Query all events that referenced her announcement
+
+3. Re-evaluate each event through acceptance policy:
+   - WITHOUT alice's announcement
+   - WITH bob's announcement still present
+   
+4. Build retention graph:
+   Event A kept because:
+     - References bob's announcement ✓
+   Event B kept because:
+     - References Event A ✓
+   Event C orphaned because:
+     - Only referenced alice's announcement ✗
+
+5. Delete orphaned events, keep retained events
+
+6. Handle circular dependencies:
+   - Event X kept because references Event Y
+   - Event Y kept because references Event X
+   - Neither has external anchor → both deleted
+```
+
+### Graph Algorithm Details
+
+**Topological Traversal:**
+1. Start from remaining announcements (roots)
+2. Traverse dependency edges (a/e/q tags)
+3. Mark reachable events as "keep"
+4. Mark unreachable events as "delete"
+
+**Max Depth Limit:**
+- Configurable maximum traversal depth (prevent infinite loops)
+- Default: 100 levels
+- Note: Will analyze edge cases where this limit matters
+
+**Complexity:**
+- Deletion events are rare (not performance critical)
+- Compute on-demand when deletion request arrives
+- No pre-computation or caching needed at current scale
+- Note: Will analyze large-scale scenarios in future
+
+## Configuration
+
+### deletion_request_disrespector
+
+**Type:** `bool`  
+**Default:** `false` (respects deletion requests)  
+**CLI:** `--deletion-request-disrespector`  
+**Env:** `NGIT_DELETION_REQUEST_DISRESPECTOR`
+
+**Description:**
+When `true`, relay ignores **NIP-09 deletion requests** and acts as an archival server. Critical for preventing left-pad scenarios by ensuring at least some relays preserve deleted content.
+
+**IMPORTANT:** This setting does NOT prevent blacklist-triggered deletions. Blacklist is for operator moderation (spam/malware/abuse), which archival relays still need.
+
+**Use Cases:**
+- Community archival relays
+- Research/historical preservation
+- Backup/mirror relays
+- GRASP-05 archive mode (future)
+
+### archive_retention_secs
+
+**Type:** `u64`  
+**Default:** `7776000` (90 days in seconds)  
+**CLI:** `--archive-retention-secs`  
+**Env:** `NGIT_ARCHIVE_RETENTION_SECS`
+
+**Description:**
+How long to retain archived events and git data before permanent deletion. Provides recovery window for accidental deletions.
+
+**Recommended Values:**
+- Development/Testing: `5` seconds (fast test cycles)
+- Staging: `300` seconds (5 minutes)
+- Production: `7776000` seconds (90 days, default)
+- Archival Relay: `31536000` seconds (1 year) or higher
+
+**Notes:**
+- Configurable in seconds for testing flexibility
+- Background cleanup task runs daily (configuration for testing interval TBD in Phase 6)
+- Check occurs on startup to handle offline periods
+- **Testing Challenge:** Daily cleanup doesn't work well with 3-5 second retention for tests - alternative timing strategy needed
+
+## NIP-11 Advertisement
+
+Deletion support is **conditionally advertised** in NIP-11 relay information
+(implemented in [`src/http/nip11.rs`](../../src/http/nip11.rs)):
+
+- **When `deletion_request_disrespector = false`:** include `9` (`"deletion"`) and `62` (`"request to vanish"`) in the supported NIPs array
+- **When `deletion_request_disrespector = true`:** do NOT include `9` or `62` (archival mode doesn't honor deletions)
+
+This allows clients to discover whether a relay respects deletion requests.
+
+## Documentation Updates
+
+When implementation is complete, the following documentation will be updated:
+
+**README.md:**
+- Add NIP-09 deletion request support to feature list
+- Document cascade deletion behavior
+- Update "Delete Events" roadmap section (mark as implemented)
+- Link to this explanation document
+
+**docs/explanation/architecture.md:**
+- Add deletion request system overview
+- Document cascade deletion strategy
+- Reference this document for detailed information
+
+## Implementation Status
+
+### Completed in the current hard-delete path
+
+The following are implemented now (no holding DB / archive / recovery yet):
+
+- ngit-grasp-owned NIP-09/NIP-62 handling (backend auto-processing disabled)
+- tombstone persistence and deletion re-submission gate
+- announcement cascade deletion with multi-maintainer retention semantics
+- extended dependent-kind coverage, including PR chain kinds
+  (`1618`/`1619`/`1631`/`1632`)
+- repository-state (`30618`) cleanup when an identifier becomes unanchored
+
+PR-chain integration coverage is present in
+[`tests/nip09_cascade_event_types.rs`](../../tests/nip09_cascade_event_types.rs)
+using served PR/PR-update fixtures (event + git-ref promotion).
+
+### Prompt-sized phase plan to completion (1 phase = 1 prompt)
+
+**Phase 1 (done): Hard-delete baseline + cascade correctness** ✅
+- Scope delivered:
+  - custom NIP-09/NIP-62 processing in ngit-grasp
+  - hard-delete from main DB + tombstone recording
+  - graph cascade over `a`/`e`/`q` for dependent kinds
+  - multi-maintainer orphan/survivor semantics
+  - `30618` identifier-level cleanup when last anchor is removed
+
+**Phase 2 (next): Holding database foundation** 🔄
+- Implement a dedicated holding DB for deleted events (same backend family as
+  main DB; persistent for LMDB, in-memory for memory backend).
+- On NIP-09/blacklist deletion flow, move affected events into holding DB before
+  removing from main DB.
+- Store enough metadata for retention decisions and future recovery orchestration
+  (deletion reason, timestamp, identifier/coordinate linkage).
+- **Test strategy for this phase:**
+  - Add holding-DB assertions only to a focused subset of integration tests
+    (single-maintainer cascade + multi-maintainer + state-event path).
+  - Do not mirror holding-DB checks into every cascade test; that adds cost with
+    little additional confidence for simple move semantics.
+
+**Phase 3: Expiry/cleanup engine (the complex part)** 🔄
+- Implement retention expiry policy for holding DB (and associated metadata).
+- Add cleanup scheduler + startup catch-up behavior.
+- Handle partial/corrupt/missing cleanup inputs safely and idempotently.
+- Add focused tests for short-retention timing, deterministic expiry windows, and
+  restart/offline cleanup catch-up.
+
+**Phase 4: Git archive + metadata lifecycle** 🔄
+- Add git archive creation (`.tar.gz`) on deletion and archive metadata linkage.
+- Integrate archive cleanup with holding-DB expiry pipeline.
+- Add failure-mode handling (archive create/extract errors, missing files).
+
+**Phase 5: Recovery workflow** 🔄
+- Re-announcement detection and eligibility checks (within retention window,
+  author constraints).
+- Restore events from holding DB and git data from archive.
+- Define operator/manual recovery controls and clear outcome reporting.
+
+**Phase 6: Ops hardening and policy edge-cases** 🔄
+- Blacklist-triggered deletion parity and blacklist/disrespector interaction.
+- Manual ejection flow and safety/audit semantics.
+- Observability: metrics for holding DB size/count, cleanup, recoveries, ejections.
+- Concurrency/race analysis, max-depth/scale limits, lock strategy finalization.
+
+> ✅ Resolved prerequisite from earlier plan: rust-nostr backend auto-processing
+> behavior is understood; ngit-grasp runs with `process_nip09(false)` and
+> `process_nip62(false)` and owns deletion handling itself.
+
+## Security Considerations
+
+### Validation
+
+1. **Author Matching:** Deletion request pubkey MUST match announcement pubkey
+   - **Critical Requirement:** We ONLY honor deletion requests where the deletion request author is the same as the deleted event author
+   - This prevents malicious actors from deleting other people's repositories
+   - Enforced at validation layer before any deletion processing
+2. **Signature Verification:** Handled by nostr-relay-builder (already implemented)
+3. **Timestamp Check:** For addressable events, delete versions up to deletion `created_at`
+
+### Attack Vectors
+
+**DoS via Deletion Spam:**
+- Mitigation: Deletion requests only processed if announcement exists
+- Mitigation: Idempotent (deleting already-deleted announcement is no-op)
+
+**Archive Disk Exhaustion:**
+- Mitigation: Background cleanup enforces retention limits
+- Mitigation: Compressed tar.gz archives
+- Mitigation: Configurable retention period
+- Mitigation: Manual ejection mechanism for emergency storage relief
+
+**Recovery Abuse:**
+- Mitigation: Recovery only within retention window
+- Mitigation: Must be original owner (pubkey match)
+- Mitigation: Normal announcement validation applies
+
+**Blacklist Bypass:**
+- Mitigation: Blacklist checked on startup (retroactive deletion)
+- Mitigation: Blacklist checked during announcement validation (prevents new)
+- Mitigation: Blacklist deletion not affected by disrespector mode
+- Note: Manual ejection available for confirmed abuse
+
+## Monitoring & Metrics
+
+**Prometheus Metrics (Planned):**
+- `ngit_deletion_requests_total` - Count of NIP-09 deletion requests received
+- `ngit_deletion_requests_processed` - Count actually processed (disrespector mode = 0)
+- `ngit_blacklist_deletions_total` - Count of blacklist-triggered deletions
+- `ngit_holding_database_events` - Current event count in holding DB
+- `ngit_holding_database_size_bytes` - Holding DB disk usage
+- `ngit_archive_files_total` - Count of archive tar.gz files
+- `ngit_archive_size_bytes` - Total archive disk usage
+- `ngit_recoveries_total` - Count of successful automatic recoveries
+- `ngit_permanent_deletions_total` - Count of events permanently deleted (post-retention)
+- `ngit_manual_ejections_total` - Count of operator-initiated ejections from holding area
+
+## Testing Strategy
+
+### Unit Tests
+- Kind 5 validation and parsing
+- Author matching logic
+- Cascade dependency query
+- Graph traversal algorithm
+- Recovery detection
+
+### Integration Tests
+- Cascade correctness (single-maintainer + multi-maintainer + state-event paths)
+- Holding DB move semantics (subset of representative scenarios, not every test)
+- Retention/expiry cleanup behavior (short-retention deterministic tests)
+- Recovery mechanism
+- Disrespector mode behavior
+
+### Audit Tests
+- NIP-09 compliance validation
+- Event re-submission after deletion (rejected)
+- Deletion request event itself (stored)
+- Archival mode relay behavior
+
+## Related Documentation
+
+- **NIP-09 Specification:** `/persistent/dcdev/clones/nips/09.md`
+- **Architecture Overview:** `docs/explanation/architecture.md`
+- **Configuration Reference:** `docs/reference/configuration.md`
+- **Roadmap:** `README.md` lines 198-206
+
+## Future Enhancements
+
+### GRASP-05 Archive Mode
+Once GRASP-05 is specified, `deletion_request_disrespector` mode can form the foundation for archive relay requirements.
+
+### Selective Disrespect
+Allow configuration to disrespect deletions only for specific criteria:
+- Popular repositories (e.g., >N PRs)
+- Repositories with community contributions
+- Specific identifiers (allowlist)
+
+### Distributed Archive Network
+Coordinate between archival relays to ensure redundant preservation of deleted content.
+
+### Recovery Notifications
+Notify repository owner when content is recovered from holding database, allowing them to confirm or re-delete.
+
+### Dynamic Blacklist Updates
+Currently blacklist changes only take effect on startup. Future enhancement:
+- Monitor configuration file for changes
+- Apply blacklist additions immediately (trigger deletion)
+- Apply blacklist removals immediately (optional auto-recovery)
+- Requires careful concurrency design
+
+### Automatic Blacklist Recovery
+Currently removing from blacklist requires manual restoration. Future enhancement:
+- Detect unblacklisted repos in holding area on startup
+- Automatically restore if within retention period
+- Configurable policy: auto-restore vs manual-only
+
+### Enhanced Manual Ejection
+Current design includes basic manual ejection. Future enhancements:
+- Web UI for holding area management
+- Batch ejection operations
+- Selective ejection (events only, keep git archive)
+- Export before ejection (backup)
+- Enhanced audit logging with operator identity
+
+## Conclusion
+
+The deletion request system balances three competing needs:
+
+1. **User Agency:** Owners can delete their repositories
+2. **Community Protection:** Archival relays prevent left-pad scenarios  
+3. **Recovery Grace Period:** Holding database prevents accidental permanent deletion
+
+By making deletion behavior **configurable** rather than mandatory, we enable a heterogeneous relay network where some relays respect deletions (user privacy) while others preserve content (community resilience).
