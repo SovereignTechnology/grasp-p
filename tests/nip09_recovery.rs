@@ -137,6 +137,82 @@ async fn publish_served_repo_for_identifier(
     commit_hash
 }
 
+async fn publish_served_repo_for_identifier_with_maintainers(
+    client: &AuditClient,
+    relay: &TestRelay,
+    repo_id: &str,
+    maintainer_pubkeys: &[String],
+) -> String {
+    let temp_dir = tempfile::tempdir().expect("create temp repo for served repo publish");
+    let commit_hash = create_test_repo_with_commit(temp_dir.path(), CommitVariant::StateTest)
+        .expect("create deterministic commit for served repo");
+
+    let relay_url = relay.url().to_string();
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let npub = client
+        .public_key()
+        .to_bech32()
+        .expect("npub for served repo publish");
+    let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
+
+    let mut announcement_builder = client
+        .event_builder(Kind::GitRepoAnnouncement, "")
+        .tag(Tag::identifier(repo_id))
+        .tag(Tag::custom("name", vec![repo_id.to_string()]))
+        .tag(Tag::custom("clone", vec![clone_url.clone()]))
+        .tag(Tag::custom("relays", vec![relay_url.clone()]));
+    if !maintainer_pubkeys.is_empty() {
+        announcement_builder =
+            announcement_builder.tag(Tag::custom("maintainers", maintainer_pubkeys.to_vec()));
+    }
+
+    let announcement = announcement_builder
+        .build(client.keys())
+        .expect("build served announcement with maintainers");
+    client
+        .send_event(announcement.clone())
+        .await
+        .expect("send served announcement with maintainers");
+
+    let state_event = create_state_event(
+        client.keys(),
+        repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[clone_url.as_str()],
+        &[relay_url.as_str()],
+    )
+    .expect("build served state event with maintainers");
+    client
+        .send_event_and_note_purgatory(state_event.clone())
+        .await
+        .expect("send served state event with maintainers");
+
+    push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id)
+        .expect("push served repo data with maintainers");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query served announcement with maintainers"),
+        "served owner announcement should be promoted"
+    );
+    assert!(
+        client
+            .is_event_on_relay(state_event.id)
+            .await
+            .expect("query served state with maintainers"),
+        "served owner state event should be promoted"
+    );
+
+    commit_hash
+}
+
 async fn wait_for_event_presence(
     client: &AuditClient,
     event_id: EventId,
@@ -567,6 +643,59 @@ async fn promotion_with_missing_or_invalid_recovery_artifacts_is_deterministic()
     assert!(
         !pending.is_empty(),
         "failed recovery should leave deterministic holding records for future retries"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn maintainer_announcement_accept_route_runs_recovery_trigger_a() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-maintainer-accept-route",
+        false,
+    )
+    .await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before maintainer-accept recovery");
+
+    let owner = AuditClient::new(fixture.relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create owner client for maintainer route");
+    let maintainer_hex = fixture.client.public_key().to_hex();
+
+    let _owner_commit = publish_served_repo_for_identifier_with_maintainers(
+        &owner,
+        &fixture.relay,
+        &fixture.repo_id,
+        &[maintainer_hex],
+    )
+    .await;
+
+    let maintainer_reannouncement =
+        build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
+    fixture
+        .client
+        .send_event(maintainer_reannouncement.clone())
+        .await
+        .expect("send maintainer re-announcement recovery trigger");
+
+    assert!(
+        wait_for_event_presence(
+            &fixture.client,
+            maintainer_reannouncement.id,
+            Duration::from_secs(8)
+        )
+        .await,
+        "maintainer-accept route should accept re-announcement"
+    );
+    assert!(
+        wait_for_event_presence(&fixture.client, fixture.issue.id, Duration::from_secs(8)).await,
+        "maintainer-accept route should run recovery and restore issue"
+    );
+    assert!(
+        wait_for_event_presence(&fixture.client, fixture.pr.id, Duration::from_secs(8)).await,
+        "maintainer-accept route should run recovery and restore PR"
     );
 
     fixture.relay.stop().await;

@@ -398,6 +398,12 @@ impl Nip34WritePolicy {
                 // Parse announcement to get details for logging
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
+                        // Phase 5 recovery trigger: any accepted announcement route
+                        // (including maintainer acceptance) can restore eligible
+                        // holding/archive state for this owner+identifier.
+                        self.maybe_recover_deleted_repository(event, &announcement.identifier)
+                            .await;
+
                         tracing::info!(
                             "Accepted maintainer announcement {} (author {} is listed as maintainer for {})",
                             event_id_str,
