@@ -100,6 +100,56 @@ pub async fn handle_info_refs(
         .unwrap())
 }
 
+/// Detect whether a git-receive-pack client negotiated `side-band-64k`.
+///
+/// On a receive-pack POST, the client advertises its capabilities in the
+/// first command pkt-line of the request body. Per the smart-HTTP protocol,
+/// the format of that pkt-line is:
+///
+///   <old-oid> SP <new-oid> SP <ref-name> NUL <capabilities>
+///
+/// Where `<capabilities>` is a space-separated list that may include
+/// `side-band-64k` (and/or the legacy `side-band`). We look at the bytes
+/// after the first NUL inside the first non-flush pkt-line and check for
+/// the capability token.
+///
+/// Returns `false` for any malformed or truncated body, which is the
+/// conservative choice because a `false` answer means we do NOT band-wrap
+/// the ERR pkt-line and clients without sideband-64k will still see it.
+///
+/// `pub(crate)` for testability.
+pub(crate) fn client_negotiated_sideband_64k(request_body: &[u8]) -> bool {
+    // First 4 bytes are the hex length of the first pkt-line. "0000" is a
+    // flush packet (shouldn't appear here) — bail.
+    if request_body.len() < 4 {
+        return false;
+    }
+    let len_str = match std::str::from_utf8(&request_body[0..4]) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let len = match u16::from_str_radix(len_str, 16) {
+        Ok(n) => n as usize,
+        Err(_) => return false,
+    };
+    if len < 4 || request_body.len() < len {
+        return false;
+    }
+    let payload = &request_body[4..len];
+    // Look for capability list after first NUL byte
+    let caps = match payload.iter().position(|&b| b == 0) {
+        Some(pos) => &payload[pos + 1..],
+        None => return false,
+    };
+    // Capabilities are space-separated tokens, possibly terminated by LF.
+    for tok in caps.split(|&b| b == b' ' || b == b'\n' || b == b'\0') {
+        if tok == b"side-band-64k" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build an HTTP 200 OK response with an ERR pkt-line for git protocol errors.
 ///
 /// Per the git smart HTTP protocol spec, protocol-level errors (like "not our ref")
@@ -108,16 +158,45 @@ pub async fn handle_info_refs(
 ///
 /// This allows git clients to properly parse and display the error message.
 ///
+/// **Sideband wrapping (git-receive-pack):** modern `git push` clients
+/// always advertise `side-band-64k` when posting to `git-receive-pack`.
+/// When sideband is negotiated, the client demultiplexes the response via
+/// `recv_sideband`, which reads the first byte of each pkt-line payload as
+/// the band id (1=pack data, 2=progress, 3=error). A bare `ERR ...`
+/// payload is therefore interpreted as band id `0x45` (`'E'`, decimal 69)
+/// and the client aborts with `send-pack: protocol error: bad band #69`.
+///
+/// To stay compatible with sideband-aware clients, when this is a
+/// receive-pack response and `request_body` shows the client advertised
+/// `side-band-64k`, the ERR pkt-line payload is prefixed with band id 3
+/// ("error") inside the pkt-line frame.
+///
 /// `pub(crate)` so the `/prs/` receive-pack handler in `crate::grasp06::receive`
 /// can return identically-shaped rejections without duplicating the pkt-line
 /// framing.
 pub(crate) fn build_git_protocol_error_response(
     service: GitService,
     error_message: &str,
+    request_body: Option<&[u8]>,
 ) -> Response<Full<Bytes>> {
     // Format: "ERR <message>\n"
     let err_content = format!("ERR {}\n", error_message.trim());
-    let err_pktline = PktLine::data(err_content.as_bytes()).encode();
+
+    // Wrap in sideband band 3 when the receive-pack client negotiated
+    // side-band-64k. See doc comment above for the protocol details.
+    let use_sideband = matches!(service, GitService::ReceivePack)
+        && request_body
+            .map(client_negotiated_sideband_64k)
+            .unwrap_or(false);
+
+    let err_pktline = if use_sideband {
+        let mut framed = Vec::with_capacity(1 + err_content.len());
+        framed.push(0x03); // band 3 = error
+        framed.extend_from_slice(err_content.as_bytes());
+        PktLine::data(framed).encode()
+    } else {
+        PktLine::data(err_content.as_bytes()).encode()
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -208,6 +287,7 @@ pub async fn handle_upload_pack(
             return Ok(build_git_protocol_error_response(
                 GitService::UploadPack,
                 &stderr_str,
+                None,
             ));
         }
 
@@ -289,6 +369,7 @@ pub async fn handle_receive_pack(
                 return Ok(build_git_protocol_error_response(
                     GitService::ReceivePack,
                     &format!("authorisation failed: {}", auth_result.reason),
+                    Some(&request_body),
                 ));
             }
             info!(
@@ -305,6 +386,7 @@ pub async fn handle_receive_pack(
             return Ok(build_git_protocol_error_response(
                 GitService::ReceivePack,
                 &format!("authorisation failed: {}", e),
+                Some(&request_body),
             ));
         }
     };
@@ -361,6 +443,7 @@ pub async fn handle_receive_pack(
             return Ok(build_git_protocol_error_response(
                 GitService::ReceivePack,
                 &stderr_str,
+                Some(&request_body),
             ));
         }
 
@@ -469,5 +552,148 @@ impl GitError {
             Self::RepositoryNotFound => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    /// Build a single-update receive-pack request body pkt-line for tests.
+    ///
+    /// Matches the smart-HTTP format:
+    ///   <old-oid> SP <new-oid> SP <ref-name> NUL <capabilities>\n
+    fn build_receive_pack_pktline(caps: &str) -> Vec<u8> {
+        let old = "0".repeat(40);
+        let new = "1".repeat(40);
+        let refname = "refs/heads/main";
+        // payload format with NUL between ref-name and capabilities
+        let mut payload = Vec::new();
+        payload.extend_from_slice(format!("{} {} {}", old, new, refname).as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(caps.as_bytes());
+        payload.push(b'\n');
+        // pkt-line frame: hex length prefix
+        let total_len = payload.len() + 4;
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("{:04x}", total_len).as_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    async fn response_body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+        resp.into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn detects_side_band_64k_in_first_pktline() {
+        let body = build_receive_pack_pktline("report-status side-band-64k agent=git/2.42");
+        assert!(client_negotiated_sideband_64k(&body));
+    }
+
+    #[test]
+    fn detects_side_band_64k_when_only_capability() {
+        let body = build_receive_pack_pktline("side-band-64k");
+        assert!(client_negotiated_sideband_64k(&body));
+    }
+
+    #[test]
+    fn detects_no_sideband_when_only_report_status() {
+        let body = build_receive_pack_pktline("report-status agent=git/2.42");
+        assert!(!client_negotiated_sideband_64k(&body));
+    }
+
+    #[test]
+    fn detects_no_sideband_for_legacy_side_band() {
+        // The legacy `side-band` (without -64k) is NOT what modern clients
+        // use for the demuxer; treat it as no-sideband to be conservative.
+        let body = build_receive_pack_pktline("report-status side-band");
+        assert!(!client_negotiated_sideband_64k(&body));
+    }
+
+    #[test]
+    fn handles_short_or_malformed_body() {
+        assert!(!client_negotiated_sideband_64k(b""));
+        assert!(!client_negotiated_sideband_64k(b"abc"));
+        // claimed length 4 = flush
+        assert!(!client_negotiated_sideband_64k(b"0000"));
+        // invalid hex length
+        assert!(!client_negotiated_sideband_64k(b"zzzz1234"));
+        // length larger than body
+        assert!(!client_negotiated_sideband_64k(b"0099short"));
+    }
+
+    #[tokio::test]
+    async fn receive_pack_err_is_sideband_wrapped_when_client_negotiates() {
+        let body = build_receive_pack_pktline("report-status side-band-64k");
+        let resp = build_git_protocol_error_response(
+            GitService::ReceivePack,
+            "authorisation failed: nope",
+            Some(&body),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or("").to_string()),
+            Some("application/x-git-receive-pack-result".to_string())
+        );
+
+        let raw = response_body_bytes(resp).await;
+        // pkt-line: <4-hex-length><payload>
+        assert!(raw.len() >= 4);
+        let len =
+            u16::from_str_radix(std::str::from_utf8(&raw[0..4]).unwrap(), 16).unwrap() as usize;
+        assert_eq!(raw.len(), len);
+        // First payload byte MUST be the band id 0x03 (error band)
+        assert_eq!(raw[4], 0x03);
+        // Remainder is the ERR pkt-line content
+        let rest = std::str::from_utf8(&raw[5..]).unwrap();
+        assert!(
+            rest.starts_with("ERR authorisation failed: nope"),
+            "unexpected error payload: {:?}",
+            rest
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_pack_err_is_bare_when_no_sideband() {
+        let body = build_receive_pack_pktline("report-status");
+        let resp = build_git_protocol_error_response(
+            GitService::ReceivePack,
+            "authorisation failed: nope",
+            Some(&body),
+        );
+        let raw = response_body_bytes(resp).await;
+        // Without sideband, first payload byte is 'E' (ASCII 0x45) from "ERR".
+        assert!(raw.len() >= 5);
+        assert_eq!(raw[4], b'E');
+        let rest = std::str::from_utf8(&raw[4..]).unwrap();
+        assert!(rest.starts_with("ERR authorisation failed: nope"));
+    }
+
+    #[tokio::test]
+    async fn upload_pack_err_is_never_sideband_wrapped() {
+        // Even if we somehow had a body that mentioned side-band-64k, upload-pack
+        // responses must remain bare ERR pkt-lines.
+        let body = build_receive_pack_pktline("side-band-64k");
+        let resp =
+            build_git_protocol_error_response(GitService::UploadPack, "not our ref", Some(&body));
+        let raw = response_body_bytes(resp).await;
+        assert_eq!(raw[4], b'E');
+    }
+
+    #[tokio::test]
+    async fn receive_pack_err_without_body_is_not_wrapped() {
+        // No request body → conservative path: do not wrap.
+        let resp = build_git_protocol_error_response(GitService::ReceivePack, "boom", None);
+        let raw = response_body_bytes(resp).await;
+        assert_eq!(raw[4], b'E');
     }
 }

@@ -173,6 +173,7 @@ pub async fn handle_prs_receive_pack(
         return Ok(build_git_protocol_error_response(
             GitService::ReceivePack,
             "no ref updates found in push",
+            Some(&request_body),
         ));
     }
 
@@ -190,6 +191,7 @@ pub async fn handle_prs_receive_pack(
                     "GRASP-06: only pushes to refs/nostr/<event-id> are accepted ({})",
                     reason
                 ),
+                Some(&request_body),
             ));
         }
     }
@@ -225,6 +227,7 @@ pub async fn handle_prs_receive_pack(
                 return Ok(build_git_protocol_error_response(
                     GitService::ReceivePack,
                     &format!("GRASP-06: {}", reason),
+                    Some(&request_body),
                 ));
             }
             NostrRefPreValidation::Authorized { .. } | NostrRefPreValidation::Unknown => {}
@@ -488,6 +491,7 @@ async fn run_receive_pack(
             return Ok(build_git_protocol_error_response(
                 GitService::ReceivePack,
                 &stderr_str,
+                Some(request_body),
             ));
         }
         error!(
