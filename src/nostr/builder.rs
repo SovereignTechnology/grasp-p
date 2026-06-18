@@ -19,7 +19,7 @@ use tar::Archive as TarArchive;
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
-use crate::nostr::holding::RecoveryMetadataRecord;
+use crate::nostr::holding::{DeletionSource, RecoveryMetadataRecord};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
@@ -65,6 +65,15 @@ pub struct WhitelistParityStats {
     pub attempted_deletions: usize,
     pub successful_deletions: usize,
     pub failed_deletions: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlacklistRestoreStats {
+    pub scanned_scopes: usize,
+    pub attempted_restores: usize,
+    pub successful_restores: usize,
+    pub failed_restores: usize,
+    pub skipped_scopes: usize,
 }
 
 impl std::fmt::Debug for Nip34WritePolicy {
@@ -320,6 +329,105 @@ impl Nip34WritePolicy {
                         "Whitelist startup parity: deletion failed"
                     );
                 }
+            }
+        }
+
+        stats
+    }
+
+    /// Startup-only blacklist restore pass.
+    ///
+    /// Scans holding metadata for scopes deleted by blacklist parity and restores
+    /// owner+identifier scopes that are no longer blacklisted and still inside
+    /// holding retention.
+    pub async fn run_startup_blacklist_restore_pass(&self) -> BlacklistRestoreStats {
+        if !self.ctx.config.blacklist_auto_restore {
+            return BlacklistRestoreStats::default();
+        }
+
+        let now = Timestamp::now();
+        let retention = self.ctx.config.holding_retention();
+        let scopes = self
+            .ctx
+            .holding
+            .eligible_recovery_scopes_by_source(DeletionSource::Blacklist, now, retention)
+            .await;
+
+        let blacklist = self.ctx.config.blacklist_config();
+        let mut stats = BlacklistRestoreStats {
+            scanned_scopes: scopes.len(),
+            ..BlacklistRestoreStats::default()
+        };
+
+        for scope in scopes {
+            let owner_pubkey = match PublicKey::from_hex(&scope.owner_pubkey_hex) {
+                Ok(pubkey) => pubkey,
+                Err(e) => {
+                    stats.skipped_scopes += 1;
+                    crate::metrics::record_blacklist_startup_restore_skipped("invalid_owner");
+                    tracing::warn!(
+                        owner = %scope.owner_pubkey_hex,
+                        identifier = %scope.identifier,
+                        reason = "invalid_owner",
+                        error = %e,
+                        "Blacklist startup restore: skipping scope"
+                    );
+                    continue;
+                }
+            };
+
+            let owner_npub = match owner_pubkey.to_bech32() {
+                Ok(npub) => npub,
+                Err(e) => {
+                    stats.skipped_scopes += 1;
+                    crate::metrics::record_blacklist_startup_restore_skipped("owner_bech32_failed");
+                    tracing::warn!(
+                        owner = %scope.owner_pubkey_hex,
+                        identifier = %scope.identifier,
+                        reason = "owner_bech32_failed",
+                        error = %e,
+                        "Blacklist startup restore: skipping scope"
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(reason) = blacklist.check(&owner_npub, &scope.identifier) {
+                stats.skipped_scopes += 1;
+                crate::metrics::record_blacklist_startup_restore_skipped("still_blacklisted");
+                tracing::info!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = %reason,
+                    "Blacklist startup restore: skipping scope still blacklisted"
+                );
+                continue;
+            }
+
+            stats.attempted_restores += 1;
+            crate::metrics::record_blacklist_startup_restore_attempt();
+
+            if self
+                .maybe_recover_deleted_repository_for_scope(&owner_pubkey, &scope.identifier)
+                .await
+            {
+                stats.successful_restores += 1;
+                crate::metrics::record_blacklist_startup_restore_success();
+                tracing::info!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = "unblacklisted_within_retention",
+                    "Blacklist startup restore: restored repository scope"
+                );
+            } else {
+                stats.failed_restores += 1;
+                crate::metrics::record_blacklist_startup_restore_failure();
+                tracing::error!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = "recovery_pipeline_failed",
+                    "Blacklist startup restore: recovery pipeline failed"
+                );
             }
         }
 
@@ -1645,7 +1753,16 @@ impl Nip34WritePolicy {
         event: &Event,
         identifier: &str,
     ) -> bool {
-        let owner_hex = event.pubkey.to_hex();
+        self.maybe_recover_deleted_repository_for_scope(&event.pubkey, identifier)
+            .await
+    }
+
+    async fn maybe_recover_deleted_repository_for_scope(
+        &self,
+        owner_pubkey: &PublicKey,
+        identifier: &str,
+    ) -> bool {
+        let owner_hex = owner_pubkey.to_hex();
         let records = self
             .ctx
             .holding
@@ -1681,7 +1798,7 @@ impl Nip34WritePolicy {
             );
         }
 
-        let owner_component = Self::owner_directory_component(&event.pubkey);
+        let owner_component = Self::owner_directory_component(owner_pubkey);
         let mut git_ready = true;
         let mut archive_restored = false;
         let mut selected_archive_abs: Option<PathBuf> = None;

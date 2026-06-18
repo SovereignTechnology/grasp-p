@@ -21,6 +21,7 @@ pub const HOLDING_DIR: &str = "holding";
 
 /// Internal metadata event kind stored alongside archived events.
 pub const HOLDING_METADATA_KIND: u16 = 9905;
+pub const HOLDING_SOURCE_TAG: &str = "holding-source";
 pub const HOLDING_ARCHIVE_PATH_TAG: &str = "holding-archive-path";
 pub const HOLDING_ARCHIVE_CREATED_AT_TAG: &str = "holding-archive-created-at";
 pub const HOLDING_OWNER_PUBKEY_TAG: &str = "holding-owner-pubkey";
@@ -83,6 +84,12 @@ pub struct RecoveryMetadataRecord {
     pub metadata_event_id: EventId,
     pub archived_event_id: Option<EventId>,
     pub archive_relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecoveryScope {
+    pub owner_pubkey_hex: String,
+    pub identifier: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -155,7 +162,10 @@ impl HoldingStore {
 
         let mut tags = vec![
             Tag::event(event.id),
-            Tag::custom("holding-source", vec![metadata.source.as_str().to_string()]),
+            Tag::custom(
+                HOLDING_SOURCE_TAG,
+                vec![metadata.source.as_str().to_string()],
+            ),
             Tag::custom(
                 "holding-deleted-at",
                 vec![metadata.deleted_at.as_secs().to_string()],
@@ -233,6 +243,22 @@ impl HoldingStore {
         })
     }
 
+    fn parse_holding_source(metadata_event: &Event) -> Option<DeletionSource> {
+        metadata_event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() < 2 || v[0] != HOLDING_SOURCE_TAG {
+                return None;
+            }
+
+            match v[1].as_str() {
+                "nip09" => Some(DeletionSource::Nip09),
+                "blacklist" => Some(DeletionSource::Blacklist),
+                "whitelist" => Some(DeletionSource::Whitelist),
+                _ => None,
+            }
+        })
+    }
+
     fn parse_archived_event_id(metadata_event: &Event) -> Option<EventId> {
         metadata_event.tags.iter().find_map(|tag| {
             let v = tag.as_slice();
@@ -285,6 +311,40 @@ impl HoldingStore {
             } else {
                 None
             }
+        })
+    }
+
+    fn parse_scope_from_coordinate(metadata_event: &Event) -> Option<RecoveryScope> {
+        let coordinate = Self::parse_coordinate(metadata_event)?;
+        let mut parts = coordinate.splitn(3, ':');
+        let kind = parts.next()?;
+        let owner = parts.next()?;
+        let identifier = parts.next()?;
+
+        if kind != "30617" || owner.is_empty() || identifier.is_empty() {
+            return None;
+        }
+
+        Some(RecoveryScope {
+            owner_pubkey_hex: owner.to_string(),
+            identifier: identifier.to_string(),
+        })
+    }
+
+    fn parse_recovery_scope(metadata_event: &Event) -> Option<RecoveryScope> {
+        if let Some(scope) = Self::parse_scope_from_coordinate(metadata_event) {
+            return Some(scope);
+        }
+
+        let owner_pubkey_hex = Self::parse_owner_pubkey(metadata_event)?;
+        let identifier = Self::parse_identifier(metadata_event)?;
+        if owner_pubkey_hex.is_empty() || identifier.is_empty() {
+            return None;
+        }
+
+        Some(RecoveryScope {
+            owner_pubkey_hex,
+            identifier,
         })
     }
 
@@ -356,6 +416,54 @@ impl HoldingStore {
                 })
             })
             .collect()
+    }
+
+    /// Find distinct owner+identifier scopes eligible for recovery from a
+    /// specific deletion source.
+    ///
+    /// Eligibility requires all of:
+    /// - metadata has the requested `holding-source`,
+    /// - metadata has a parseable `holding-deleted-at`,
+    /// - metadata is within `retention` from `now`,
+    /// - metadata yields a parseable owner+identifier recovery scope.
+    pub async fn eligible_recovery_scopes_by_source(
+        &self,
+        source: DeletionSource,
+        now: Timestamp,
+        retention: Duration,
+    ) -> Vec<RecoveryScope> {
+        let cutoff = now.as_secs().saturating_sub(retention.as_secs());
+        let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
+
+        let metadata_events = match self.db.query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::error!(error = %e, "Holding recovery failed to query metadata scopes");
+                return Vec::new();
+            }
+        };
+
+        let mut scopes = BTreeSet::new();
+        for metadata_event in metadata_events {
+            if Self::parse_holding_source(&metadata_event) != Some(source) {
+                continue;
+            }
+
+            let Some(deleted_at) = Self::parse_holding_deleted_at(&metadata_event) else {
+                continue;
+            };
+            if deleted_at.as_secs() <= cutoff {
+                continue;
+            }
+
+            let Some(scope) = Self::parse_recovery_scope(&metadata_event) else {
+                continue;
+            };
+
+            scopes.insert(scope);
+        }
+
+        scopes.into_iter().collect()
     }
 
     /// Resolve an archive-relative path to an absolute path under `.archive`.

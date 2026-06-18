@@ -114,8 +114,11 @@ data during the retention window.
   - Use case: Confirmed malware requiring immediate permanent deletion
   - Mechanism: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
   - Logged for audit trail
-- **Manual restoration:** Operator restores blacklisted repo after removal from blacklist
-  - Currently no dedicated restore CLI (restore happens through normal recovery paths)
+- **Blacklist restoration policy:** optional startup auto-restore
+  - Controlled by `NGIT_BLACKLIST_AUTO_RESTORE` (default `false`)
+  - Restores only `holding-source=blacklist` scopes that are now unblacklisted
+    and still within holding retention
+  - Still-blacklisted scopes are skipped
 
 ## Deletion Flow
 
@@ -270,19 +273,21 @@ deletions (announcement + state).
 
 ### Blacklist Recovery
 
-When a repository is removed from the blacklist:
+When a repository is removed from the blacklist, startup behavior depends on
+`NGIT_BLACKLIST_AUTO_RESTORE`:
 
-**Option 1: Manual Restoration (Current Behavior)**
-- Operator removes from blacklist config
-- Operator manually restores from holding DB if desired
-- Provides explicit control over recovery decisions
+**Disabled (default):**
+- No startup restore sweep
+- Repository remains in holding/archive unless recovered by another trigger
 
-**Option 2: Automatic Restoration (Future Enhancement)**
-- On startup, detect repos in holding area no longer blacklisted
-- Automatically restore to main DB if within retention period
-- Requires careful design to prevent unwanted restorations
+**Enabled:**
+- Startup scans holding metadata with `holding-source=blacklist`
+- Deduplicates owner+identifier scopes within retention
+- Restores scopes that no longer match current blacklist
+- Skips scopes still blacklisted
 
-**Current behavior:** manual restoration workflows only.
+This keeps recovery opt-in and operator-controlled while removing manual restore
+steps for common unblacklist workflows.
 
 ### Manual Ejection from Holding Area
 
@@ -323,7 +328,7 @@ Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
 | **Author validation** | Required (pubkey match) | Not applicable (operator decision) |
 | **Disrespector mode** | Prevents deletion | Does NOT prevent deletion |
 | **Purpose** | User agency | Moderation/safety |
-| **Recovery** | Automatic (re-publish) | Manual (operator decision) |
+| **Recovery** | Automatic (re-publish) | Startup auto-restore (optional) |
 | **Metadata** | Links to Kind 5 event | Marks "blacklist-triggered" |
 
 ### Why Disrespector Doesn't Prevent Blacklist Deletion
@@ -359,9 +364,12 @@ In the same startup parity pass, repository whitelist mismatches are also
 reconciled (for announcements that list this relay service but no longer match
 `repository_whitelist`).
 
+When `NGIT_BLACKLIST_AUTO_RESTORE=true`, startup also runs a blacklist restore
+pass between blacklist parity delete and whitelist parity delete.
+
 **Future Enhancement (Dynamic Updates):**
 - Watch for configuration file changes
-- Trigger deletion immediately on blacklist addition
+- Trigger deletion/restore immediately on blacklist addition/removal
 - Requires careful design to avoid race conditions
 
 ## Cascade Deletion Strategy
@@ -550,6 +558,7 @@ This allows clients to discover whether a relay respects deletion requests.
 
 **Prometheus Metrics (Currently Exposed):**
 - `ngit_blacklist_deletions_total{phase,result}`
+- `ngit_blacklist_startup_restore_total{result,reason}`
 - `ngit_holding_cleanup_runs_total`
 - `ngit_holding_cleanup_deleted_total{type}`
 - `ngit_holding_cleanup_last_run_deleted{type}`
@@ -602,7 +611,6 @@ work):
 
 ### Blacklist lifecycle improvements
 - **Dynamic blacklist updates:** apply blacklist additions/removals without restart.
-- **Automatic blacklist recovery (optional policy):** configurable auto-restore for unblacklisted repos within retention.
 - **Dedicated restore CLI:** explicit operator restore commands with clear scope selection and outcomes.
 
 ### Operator controls and UX

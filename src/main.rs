@@ -230,6 +230,12 @@ async fn run_relay(config: Config) -> Result<()> {
             .write_policy
             .set_local_relay(relay_with_db.relay.clone());
 
+        // Startup policy ordering (explicit):
+        // 1) blacklist parity delete (remove currently-blacklisted repos)
+        // 2) blacklist auto-restore (optional, restore previously blacklisted
+        //    repos now unblacklisted and still within holding retention)
+        // 3) whitelist parity delete (final acceptance reconciliation for
+        //    service-listed repos, preventing restore/re-delete churn on later starts)
         let blacklist_stats = relay_with_db
             .write_policy
             .run_startup_blacklist_parity_pass()
@@ -242,6 +248,23 @@ async fn run_relay(config: Config) -> Result<()> {
                 succeeded = blacklist_stats.successful_deletions,
                 failed = blacklist_stats.failed_deletions,
                 "Startup blacklist parity pass completed"
+            );
+        }
+
+        let blacklist_restore_stats = relay_with_db
+            .write_policy
+            .run_startup_blacklist_restore_pass()
+            .await;
+        if blacklist_restore_stats.scanned_scopes > 0
+            || blacklist_restore_stats.attempted_restores > 0
+        {
+            info!(
+                scanned_scopes = blacklist_restore_stats.scanned_scopes,
+                attempted = blacklist_restore_stats.attempted_restores,
+                succeeded = blacklist_restore_stats.successful_restores,
+                failed = blacklist_restore_stats.failed_restores,
+                skipped = blacklist_restore_stats.skipped_scopes,
+                "Startup blacklist restore pass completed"
             );
         }
 

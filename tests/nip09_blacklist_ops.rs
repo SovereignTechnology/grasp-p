@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::Parser;
 use ngit_grasp::config::Config;
 use ngit_grasp::grasp06::receive::new_repo_init_locks;
-use ngit_grasp::metrics::{self, Metrics};
+use ngit_grasp::metrics::{self, REGISTRY};
 use ngit_grasp::nostr::builder::{Nip34WritePolicy, SharedDatabase};
 use ngit_grasp::nostr::history::ReplaceableHistoryStore;
 use ngit_grasp::nostr::holding::{
@@ -16,6 +16,7 @@ use ngit_grasp::nostr::holding::{
 use ngit_grasp::nostr::tombstones::Tombstones;
 use ngit_grasp::purgatory::Purgatory;
 use nostr_sdk::prelude::*;
+use prometheus::{Encoder, TextEncoder};
 
 fn metadata_has_tag(event: &Event, key: &str, value: Option<&str>) -> bool {
     event.tags.iter().any(|tag| {
@@ -33,6 +34,35 @@ fn repo_identifier(event: &Event) -> String {
             (v.len() >= 2 && v[0] == "d").then(|| v[1].clone())
         })
         .expect("announcement identifier tag")
+}
+
+fn metric_value(rendered: &str, metric_name: &str, labels: &[(&str, &str)]) -> f64 {
+    rendered
+        .lines()
+        .find_map(|line| {
+            if !line.starts_with(metric_name) {
+                return None;
+            }
+
+            let labels_match = labels
+                .iter()
+                .all(|(k, v)| line.contains(&format!("{k}=\"{v}\"")));
+            if !labels_match {
+                return None;
+            }
+
+            line.split_whitespace().last()?.parse::<f64>().ok()
+        })
+        .unwrap_or(0.0)
+}
+
+fn render_metrics_snapshot() -> String {
+    let families = REGISTRY.gather();
+    let mut bytes = Vec::new();
+    TextEncoder::new()
+        .encode(&families, &mut bytes)
+        .expect("encode prometheus metrics");
+    String::from_utf8(bytes).expect("utf8 metrics")
 }
 
 fn make_announcement_with_domain(keys: &Keys, identifier: &str, domain: &str) -> Event {
@@ -337,6 +367,213 @@ async fn startup_whitelist_scan_leaves_matching_repositories_untouched() {
 }
 
 #[tokio::test]
+async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempotent() {
+    let relay_dir = tempfile::tempdir().expect("relay tempdir");
+    let git_dir = tempfile::tempdir().expect("git tempdir");
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let holding = HoldingStore::open_lmdb(relay_dir.path(), git_dir.path())
+        .await
+        .expect("open holding lmdb");
+
+    let owner = Keys::generate();
+    let owner_npub = owner.public_key().to_bech32().expect("owner npub");
+    let announcement = make_announcement(&owner, "blacklist-restore-repo");
+    let issue = make_issue(&owner, &announcement);
+
+    db.save_event(&announcement)
+        .await
+        .expect("save announcement");
+    db.save_event(&issue).await.expect("save issue");
+
+    let repo_path = git_dir
+        .path()
+        .join(owner_npub.clone())
+        .join("blacklist-restore-repo.git");
+    std::fs::create_dir_all(repo_path.join("refs")).expect("create bare repo dir");
+
+    let deletion_policy = make_policy(
+        Config {
+            repository_blacklist: owner_npub.clone(),
+            ..base_config()
+        },
+        db.clone(),
+        holding.clone(),
+        git_dir.path(),
+    );
+    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    assert_eq!(deletion_stats.successful_deletions, 1);
+
+    if repo_path.exists() {
+        std::fs::remove_dir_all(&repo_path).expect("remove stale repo directory");
+    }
+
+    let announcement_meta = holding.metadata_for_event(&announcement.id).await;
+    let archive_rel = announcement_meta
+        .iter()
+        .flat_map(|m| m.tags.iter())
+        .find_map(|tag| {
+            let v = tag.as_slice();
+            (v.len() >= 2 && v[0] == HOLDING_ARCHIVE_PATH_TAG).then(|| v[1].clone())
+        })
+        .expect("blacklist deletion should record archive path");
+    let archive_abs = holding
+        .archive_absolute_path(&archive_rel)
+        .expect("resolve archive path");
+    assert!(archive_abs.exists(), "archive must exist before restore");
+
+    let restore_policy = make_policy(
+        Config {
+            blacklist_auto_restore: true,
+            ..base_config()
+        },
+        db.clone(),
+        holding.clone(),
+        git_dir.path(),
+    );
+
+    let before = render_metrics_snapshot();
+    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    assert_eq!(restore_stats.scanned_scopes, 1);
+    assert_eq!(restore_stats.attempted_restores, 1);
+    assert_eq!(restore_stats.successful_restores, 1);
+    assert_eq!(restore_stats.failed_restores, 0);
+    assert_eq!(restore_stats.skipped_scopes, 0);
+
+    assert!(
+        db.event_by_id(&announcement.id)
+            .await
+            .expect("query announcement")
+            .is_some(),
+        "announcement should be restored from holding"
+    );
+    assert!(
+        db.event_by_id(&issue.id)
+            .await
+            .expect("query issue")
+            .is_some(),
+        "dependent events should be restored from holding"
+    );
+    assert!(
+        holding
+            .metadata_for_event(&announcement.id)
+            .await
+            .is_empty(),
+        "holding metadata should be cleaned after restore"
+    );
+    assert!(!archive_abs.exists(), "consumed archive should be deleted");
+
+    let after = render_metrics_snapshot();
+    let attempted_before = metric_value(
+        &before,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "attempted"), ("reason", "none")],
+    );
+    let attempted_after = metric_value(
+        &after,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "attempted"), ("reason", "none")],
+    );
+    assert_eq!(attempted_after, attempted_before + 1.0);
+
+    let success_before = metric_value(
+        &before,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "succeeded"), ("reason", "none")],
+    );
+    let success_after = metric_value(
+        &after,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "succeeded"), ("reason", "none")],
+    );
+    assert_eq!(success_after, success_before + 1.0);
+
+    let second_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    assert_eq!(second_stats.scanned_scopes, 0);
+    assert_eq!(second_stats.attempted_restores, 0);
+    assert_eq!(second_stats.successful_restores, 0);
+    assert_eq!(second_stats.failed_restores, 0);
+    assert_eq!(second_stats.skipped_scopes, 0);
+}
+
+#[tokio::test]
+async fn startup_blacklist_restore_skips_scopes_still_blacklisted() {
+    let relay_dir = tempfile::tempdir().expect("relay tempdir");
+    let git_dir = tempfile::tempdir().expect("git tempdir");
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let holding = HoldingStore::open_lmdb(relay_dir.path(), git_dir.path())
+        .await
+        .expect("open holding lmdb");
+
+    let owner = Keys::generate();
+    let owner_npub = owner.public_key().to_bech32().expect("owner npub");
+    let announcement = make_announcement(&owner, "blacklist-still-blocked-repo");
+    db.save_event(&announcement)
+        .await
+        .expect("save announcement");
+
+    std::fs::create_dir_all(
+        git_dir
+            .path()
+            .join(owner_npub.clone())
+            .join("blacklist-still-blocked-repo.git")
+            .join("refs"),
+    )
+    .expect("create bare repo dir");
+
+    let deletion_policy = make_policy(
+        Config {
+            repository_blacklist: owner_npub.clone(),
+            ..base_config()
+        },
+        db.clone(),
+        holding.clone(),
+        git_dir.path(),
+    );
+    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    assert_eq!(deletion_stats.successful_deletions, 1);
+
+    let restore_policy = make_policy(
+        Config {
+            repository_blacklist: owner_npub,
+            blacklist_auto_restore: true,
+            ..base_config()
+        },
+        db.clone(),
+        holding,
+        git_dir.path(),
+    );
+
+    let before = render_metrics_snapshot();
+    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    assert_eq!(restore_stats.scanned_scopes, 1);
+    assert_eq!(restore_stats.attempted_restores, 0);
+    assert_eq!(restore_stats.successful_restores, 0);
+    assert_eq!(restore_stats.failed_restores, 0);
+    assert_eq!(restore_stats.skipped_scopes, 1);
+
+    assert!(
+        db.event_by_id(&announcement.id)
+            .await
+            .expect("query announcement")
+            .is_none(),
+        "still-blacklisted scope must not be restored"
+    );
+
+    let after = render_metrics_snapshot();
+    let skipped_before = metric_value(
+        &before,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "skipped"), ("reason", "still_blacklisted")],
+    );
+    let skipped_after = metric_value(
+        &after,
+        "ngit_blacklist_startup_restore_total",
+        &[("result", "skipped"), ("reason", "still_blacklisted")],
+    );
+    assert_eq!(skipped_after, skipped_before + 1.0);
+}
+
+#[tokio::test]
 async fn manual_ejection_removes_holding_and_archive_idempotently() {
     let relay_dir = tempfile::tempdir().expect("relay tempdir");
     let git_dir = tempfile::tempdir().expect("git tempdir");
@@ -459,8 +696,9 @@ async fn metrics_increment_on_blacklist_cleanup_recovery_and_manual_ejection_pat
         .await
         .expect("manual ejection");
 
-    let rendered = Metrics::new(10, None).render();
+    let rendered = render_metrics_snapshot();
     assert!(rendered.contains("ngit_blacklist_deletions_total"));
+    assert!(rendered.contains("ngit_blacklist_startup_restore_total"));
     assert!(rendered.contains("ngit_holding_cleanup_runs_total"));
     assert!(rendered.contains("ngit_recovery_total"));
     assert!(rendered.contains("ngit_manual_ejections_total"));

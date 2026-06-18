@@ -492,6 +492,11 @@ pub struct Config {
     #[arg(long, env = "NGIT_REPOSITORY_BLACKLIST", default_value = "")]
     pub repository_blacklist: String,
 
+    /// Automatically restore blacklist-deleted repositories on startup when
+    /// they are no longer blacklisted and still within holding retention.
+    #[arg(long, env = "NGIT_BLACKLIST_AUTO_RESTORE", default_value_t = false)]
+    pub blacklist_auto_restore: bool,
+
     /// Event blacklist: comma-separated list of npubs whose events are rejected
     /// All events from these authors are blocked from both relay storage and purgatory
     #[arg(long, env = "NGIT_EVENT_BLACKLIST", default_value = "")]
@@ -830,6 +835,7 @@ impl Config {
             grasp06_enable: false,
             repository_whitelist: String::new(),
             repository_blacklist: String::new(),
+            blacklist_auto_restore: false,
             event_blacklist: String::new(),
             deletion_request_disrespector: false,
             max_connections: None,

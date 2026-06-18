@@ -306,6 +306,16 @@ let
         '';
       };
 
+      blacklistAutoRestore = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Automatically restore repositories deleted by blacklist parity on
+          startup when they are no longer blacklisted and still within the
+          holding retention window.
+        '';
+      };
+
       eventBlacklist = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -392,6 +402,8 @@ let
         concatStringsSep "," cfg.archiveGraspServices;
       NGIT_REPOSITORY_WHITELIST = concatStringsSep "," cfg.repositoryWhitelist;
       NGIT_REPOSITORY_BLACKLIST = concatStringsSep "," cfg.repositoryBlacklist;
+      NGIT_BLACKLIST_AUTO_RESTORE =
+        if cfg.blacklistAutoRestore then "true" else "false";
       NGIT_EVENT_BLACKLIST = concatStringsSep "," cfg.eventBlacklist;
       NGIT_LOG_LEVEL = cfg.logLevel;
       NGIT_GRASP06_ENABLE = if cfg.grasp06Enable then "true" else "false";

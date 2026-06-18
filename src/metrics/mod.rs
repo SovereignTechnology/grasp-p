@@ -46,6 +46,20 @@ lazy_static! {
             .expect("register blacklist deletion metric");
         metric
     };
+    static ref BLACKLIST_STARTUP_RESTORE_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_blacklist_startup_restore_total",
+                "Blacklist startup restore operations by result and reason",
+            ),
+            &["result", "reason"],
+        )
+        .expect("build blacklist startup restore metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register blacklist startup restore metric");
+        metric
+    };
     static ref HOLDING_CLEANUP_RUNS_TOTAL: Counter = {
         let metric = Counter::with_opts(Opts::new(
             "ngit_holding_cleanup_runs_total",
@@ -141,6 +155,30 @@ pub fn record_blacklist_deletion_success(phase: &str) {
 pub fn record_blacklist_deletion_failure(phase: &str) {
     BLACKLIST_DELETIONS_TOTAL
         .with_label_values(&[phase, "failed"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_attempt() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["attempted", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_success() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["succeeded", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_failure() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["failed", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_skipped(reason: &str) {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["skipped", reason])
         .inc();
 }
 

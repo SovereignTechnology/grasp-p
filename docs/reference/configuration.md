@@ -996,6 +996,40 @@ Blacklist does **not** affect NIP-11 metadata:
 - Blacklist is transparent to clients (rejected with specific reason)
 - Operators can use blacklist without advertising curation
 
+#### `NGIT_BLACKLIST_AUTO_RESTORE`
+
+**Description:** On startup, restore repositories previously deleted by blacklist parity when they are no longer blacklisted and still within holding retention  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No  
+**CLI:** `--blacklist-auto-restore`
+
+**Behavior:**
+
+- When `false` (default): startup runs delete-only parity reconciliation for blacklist/whitelist; unblacklisted repositories in holding are restored only by existing recovery triggers (for example re-announcement).
+- When `true`: startup also scans holding metadata with `holding-source=blacklist`, deduplicates owner+identifier scopes, and attempts restore for scopes that:
+  - are still within `NGIT_HOLDING_RETENTION_SECS`, and
+  - no longer match `NGIT_REPOSITORY_BLACKLIST`.
+- Scopes that are still blacklisted are skipped (not restored).
+
+**Startup ordering:**
+
+1. Blacklist parity delete
+2. Blacklist auto-restore (if enabled)
+3. Whitelist parity delete
+
+This ordering keeps startup reconciliation deterministic when multiple policies interact.
+
+**Examples:**
+
+```bash
+# Enable startup auto-restore for unblacklisted repos
+NGIT_BLACKLIST_AUTO_RESTORE=true
+
+# Default behavior
+NGIT_BLACKLIST_AUTO_RESTORE=false
+```
+
 ---
 
 ### Event Blacklist
