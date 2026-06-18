@@ -4,14 +4,16 @@ mod common;
 
 use common::{
     announcement_coordinate, build_deletion, publish_served_announcement_for_identifier,
-    publish_served_repo, publish_served_repo_with_maintainers,
-    publish_served_repo_with_state_event, TestRelay,
+    publish_served_repo, publish_served_repo_with_maintainers, publish_served_repo_with_state_event,
+    create_pr_event, create_state_event, create_test_repo_with_commit, push_to_relay,
+    CommitVariant, TestRelay,
 };
 use grasp_audit::{AuditClient, AuditConfig};
 use ngit_grasp::nostr::holding::{
     HoldingStore, DEFAULT_RETENTION, HOLDING_ARCHIVE_PATH_TAG, HOLDING_METADATA_KIND,
 };
 use nostr_sdk::prelude::*;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -52,6 +54,426 @@ fn build_reannouncement(client: &AuditClient, relay: &TestRelay, repo_id: &str) 
         .tag(Tag::custom("relays", vec![relay_url]))
         .build(client.keys())
         .expect("build re-announcement")
+}
+
+fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .expect("run git command in repository")
+}
+
+fn run_git_bare(repo_path: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(["--git-dir", repo_path.to_str().expect("repo path utf8")])
+        .args(args)
+        .output()
+        .expect("run git command against bare repository")
+}
+
+fn bare_ref_value(repo_path: &Path, ref_name: &str) -> Option<String> {
+    let output = run_git_bare(repo_path, &["rev-parse", "--verify", ref_name]);
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn set_bare_ref(repo_path: &Path, ref_name: &str, commit: &str) {
+    let output = run_git_bare(repo_path, &["update-ref", ref_name, commit]);
+    assert!(
+        output.status.success(),
+        "failed to set bare ref {}: {}",
+        ref_name,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct PromotionRecoveryFixture {
+    relay: TestRelay,
+    client: AuditClient,
+    repo_id: String,
+    old_state_event: Event,
+    issue: Event,
+    pr: Event,
+    pr_update: Event,
+    reannouncement: Event,
+    repo_path: PathBuf,
+    archive_path: PathBuf,
+    archive_backup: Vec<u8>,
+}
+
+async fn setup_parked_announcement_with_failed_ingest_recovery(
+    test_name: &str,
+    delete_state_with_tombstone: bool,
+) -> PromotionRecoveryFixture {
+    let relay = TestRelay::start_with_lmdb().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create client");
+
+    let (announcement, repo_id, old_state_event) =
+        publish_served_repo_with_state_event(&client, test_name).await;
+    let issue = client
+        .create_issue(&announcement, "promotion recovery issue", "body", vec![])
+        .expect("build issue");
+    client.send_event(issue.clone()).await.expect("send issue");
+
+    let repo_path = relay
+        .git_data_path()
+        .join(client.public_key().to_bech32().expect("npub"))
+        .join(format!("{}.git", repo_id));
+    let main_commit = bare_ref_value(&repo_path, "refs/heads/main").expect("read main ref");
+
+    let announcement_coord = announcement_coordinate(&announcement, &repo_id);
+    let pr = create_pr_event(
+        client.keys(),
+        &announcement_coord,
+        &main_commit,
+        "promotion recovery pr",
+    )
+    .expect("build pr");
+    let pr_update = client
+        .event_builder(Kind::GitPullRequestUpdate, "promotion recovery pr update")
+        .tag(Tag::custom("a", vec![announcement_coord.clone()]))
+        .tag(Tag::custom("c", vec![main_commit.clone()]))
+        .build(client.keys())
+        .expect("build pr update");
+    client.send_event(pr.clone()).await.expect("send pr");
+    client
+        .send_event(pr_update.clone())
+        .await
+        .expect("send pr update");
+
+    set_bare_ref(&repo_path, &format!("refs/nostr/{}", pr.id.to_hex()), &main_commit);
+    set_bare_ref(
+        &repo_path,
+        &format!("refs/nostr/{}", pr_update.id.to_hex()),
+        &main_commit,
+    );
+
+    if delete_state_with_tombstone {
+        let state_coord = format!("30618:{}:{}", client.public_key().to_hex(), repo_id);
+        client
+            .send_event(build_deletion(
+                &client,
+                &[],
+                std::slice::from_ref(&state_coord),
+            ))
+            .await
+            .expect("delete old state by coordinate");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&announcement_coord),
+        ))
+        .await
+        .expect("delete announcement coordinate");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let store = open_holding(&relay).await;
+    let archive_rel = store
+        .metadata_for_event(&announcement.id)
+        .await
+        .into_iter()
+        .find(|e| e.kind == Kind::from(HOLDING_METADATA_KIND))
+        .and_then(|e| metadata_tag_value(&e, HOLDING_ARCHIVE_PATH_TAG))
+        .expect("archive relative path in metadata");
+    let archive_path = relay.git_data_path().join(".archive").join(archive_rel);
+    let archive_backup = std::fs::read(&archive_path).expect("read archive backup bytes");
+
+    std::fs::write(&archive_path, b"corrupt archive bytes")
+        .expect("corrupt archive to force ingest-time recovery failure");
+    if repo_path.exists() {
+        std::fs::remove_dir_all(&repo_path).expect("remove live repo after deletion");
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let reannouncement = build_reannouncement(&client, &relay, &repo_id);
+    client
+        .send_event(reannouncement.clone())
+        .await
+        .expect("send re-announcement expected to park in purgatory");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    assert!(
+        !client
+            .is_event_on_relay(reannouncement.id)
+            .await
+            .expect("query parked re-announcement"),
+        "corrupt archive should keep re-announcement parked in purgatory"
+    );
+
+    PromotionRecoveryFixture {
+        relay,
+        client,
+        repo_id,
+        old_state_event,
+        issue,
+        pr,
+        pr_update,
+        reannouncement,
+        repo_path,
+        archive_path,
+        archive_backup,
+    }
+}
+
+async fn submit_new_state_and_push_for_promotion(
+    fixture: &PromotionRecoveryFixture,
+    state_label: &str,
+) -> Event {
+    let temp_dir = tempfile::tempdir().expect("create temp repo for promotion");
+    let commit_hash = create_test_repo_with_commit(temp_dir.path(), CommitVariant::StateTest)
+        .expect("create promotion commit");
+
+    let relay_url = fixture.relay.url().to_string();
+    let relay_domain = relay_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+    let npub = fixture
+        .client
+        .public_key()
+        .to_bech32()
+        .expect("npub for promotion push");
+    let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, fixture.repo_id);
+
+    let state_event = create_state_event(
+        fixture.client.keys(),
+        &fixture.repo_id,
+        &[("main", commit_hash.as_str())],
+        &[],
+        &[clone_url.as_str()],
+        &[relay_url.as_str()],
+    )
+    .unwrap_or_else(|e| panic!("build {state_label} state event: {e}"));
+
+    fixture
+        .client
+        .send_event_and_note_purgatory(state_event.clone())
+        .await
+        .unwrap_or_else(|e| panic!("send {state_label} state event: {e}"));
+
+    let status = run_git_in_repo(temp_dir.path(), &["branch", "-M", "main"]);
+    assert!(
+        status.status.success(),
+        "rename branch for promotion push: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    push_to_relay(temp_dir.path(), &relay_domain, &npub, &fixture.repo_id)
+        .unwrap_or_else(|e| panic!("push {state_label} state commit for promotion: {e}"));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    state_event
+}
+
+#[tokio::test]
+async fn purgatory_promotion_restores_events_and_pr_git_archive_data() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-success",
+        false,
+    )
+    .await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before promotion");
+
+    let promoted_state =
+        submit_new_state_and_push_for_promotion(&fixture, "promotion-success").await;
+
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.reannouncement.id)
+        .await
+        .expect("query promoted re-announcement"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.issue.id)
+        .await
+        .expect("query restored issue after promotion"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.pr.id)
+        .await
+        .expect("query restored pr after promotion"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.pr_update.id)
+        .await
+        .expect("query restored pr update after promotion"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(promoted_state.id)
+        .await
+        .expect("query promoted new state"));
+
+    let pr_ref = format!("refs/nostr/{}", fixture.pr.id.to_hex());
+    let pr_update_ref = format!("refs/nostr/{}", fixture.pr_update.id.to_hex());
+    assert!(
+        bare_ref_value(&fixture.repo_path, &pr_ref).is_some(),
+        "promotion recovery should restore PR git ref from archive"
+    );
+    assert!(
+        bare_ref_value(&fixture.repo_path, &pr_update_ref).is_some(),
+        "promotion recovery should restore PR update git ref from archive"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn purgatory_promotion_recovery_respects_state_tombstones() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-tombstone",
+        true,
+    )
+    .await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before tombstone promotion");
+
+    let promoted_state =
+        submit_new_state_and_push_for_promotion(&fixture, "promotion-tombstone").await;
+
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.reannouncement.id)
+        .await
+        .expect("query promoted re-announcement"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(promoted_state.id)
+        .await
+        .expect("query promoted new state"));
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.old_state_event.id)
+            .await
+            .expect("query tombstoned old state"),
+        "tombstoned state must not resurrect during recovery"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-idempotent",
+        false,
+    )
+    .await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before idempotent promotion");
+
+    let first_state = submit_new_state_and_push_for_promotion(&fixture, "idempotent-first").await;
+
+    // Trigger another post-promotion write flow; recovery should remain a no-op.
+    let second_reannouncement = build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
+    fixture
+        .client
+        .send_event(second_reannouncement.clone())
+        .await
+        .expect("send second re-announcement after promotion");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.issue.id)
+        .await
+        .expect("query issue after repeated promotion"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.pr.id)
+        .await
+        .expect("query pr after repeated promotion"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(first_state.id)
+        .await
+        .expect("query first promoted state"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(second_reannouncement.id)
+        .await
+        .expect("query second re-announcement after recovery"));
+
+    let pending = open_holding(&fixture.relay)
+        .await
+        .eligible_recovery_records(
+            &fixture.client.public_key().to_hex(),
+            &fixture.repo_id,
+            Timestamp::now(),
+            DEFAULT_RETENTION,
+        )
+        .await;
+    assert!(
+        pending.is_empty(),
+        "repeated promotion must keep recovery metadata drained"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
+async fn promotion_with_missing_or_invalid_recovery_artifacts_is_deterministic() {
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-fallback",
+        false,
+    )
+    .await;
+
+    let promoted_state = submit_new_state_and_push_for_promotion(&fixture, "promotion-fallback").await;
+
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.reannouncement.id)
+        .await
+        .expect("query promoted re-announcement"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(promoted_state.id)
+        .await
+        .expect("query promoted state in fallback path"));
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.issue.id)
+            .await
+            .expect("query issue in fallback path"),
+        "failed recovery should deterministically avoid partial event resurrection"
+    );
+
+    let pr_ref = format!("refs/nostr/{}", fixture.pr.id.to_hex());
+    assert!(
+        bare_ref_value(&fixture.repo_path, &pr_ref).is_none(),
+        "without archive restore, PR git ref must remain absent"
+    );
+
+    let pending = open_holding(&fixture.relay)
+        .await
+        .eligible_recovery_records(
+            &fixture.client.public_key().to_hex(),
+            &fixture.repo_id,
+            Timestamp::now(),
+            DEFAULT_RETENTION,
+        )
+        .await;
+    assert!(
+        !pending.is_empty(),
+        "failed recovery should leave deterministic holding records for future retries"
+    );
+
+    fixture.relay.stop().await;
 }
 
 #[tokio::test]

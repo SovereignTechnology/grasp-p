@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{collections::BTreeSet, fs::File};
+use std::{collections::BTreeSet, fs::File, process::Command};
 
 use flate2::read::GzDecoder;
 use nostr::nips::nip19::ToBech32;
@@ -126,6 +126,10 @@ impl Nip34WritePolicy {
     /// Get a reference to the replaceable-history store.
     pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {
         &self.ctx.history
+    }
+
+    pub fn tombstones(&self) -> &crate::nostr::tombstones::Tombstones {
+        &self.ctx.tombstones
     }
 
     /// Startup-only blacklist parity pass.
@@ -1278,9 +1282,6 @@ impl Nip34WritePolicy {
         identifier: &str,
     ) -> anyhow::Result<bool> {
         let target_repo = self.repo_path_for_owner_and_identifier(owner_path_component, identifier);
-        if target_repo.is_dir() {
-            return Ok(false);
-        }
 
         let owner_dir = target_repo
             .parent()
@@ -1309,7 +1310,7 @@ impl Nip34WritePolicy {
             )
         })?;
 
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<bool> {
             let archive_file = File::open(archive_path).map_err(|e| {
                 anyhow::anyhow!("failed to open archive {}: {}", archive_path.display(), e)
             })?;
@@ -1333,21 +1334,89 @@ impl Nip34WritePolicy {
                 ));
             }
 
-            std::fs::rename(&extracted_repo, &target_repo).map_err(|e| {
+            if target_repo.is_dir() {
+                return Self::restore_archived_nostr_refs(&extracted_repo, &target_repo);
+            }
+
+            std::fs::rename(&extracted_repo, &target_repo)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to move restored repository {} -> {}: {}",
+                        extracted_repo.display(),
+                        target_repo.display(),
+                        e
+                    )
+                })
+                .map(|_| true)
+        })();
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        result
+    }
+
+    fn restore_archived_nostr_refs(source_repo: &Path, target_repo: &Path) -> anyhow::Result<bool> {
+        let source_repo_str = source_repo
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid source repo path {}", source_repo.display()))?;
+
+        let list_output = Command::new("git")
+            .args([
+                "--git-dir",
+                source_repo_str,
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/nostr/",
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to list archived refs/nostr: {e}"))?;
+
+        if !list_output.status.success() {
+            let stderr = String::from_utf8_lossy(&list_output.stderr);
+            return Err(anyhow::anyhow!(
+                "failed listing archived refs/nostr from {}: {}",
+                source_repo.display(),
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        let mut restored_any = false;
+
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let Some((oid, ref_name)) = line.split_once(' ') else {
+                continue;
+            };
+
+            if !crate::git::oid_exists(target_repo, oid) {
+                let fetch_output = Command::new("git")
+                    .args(["fetch", source_repo_str, oid])
+                    .current_dir(target_repo)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("failed to fetch archived OID {oid}: {e}"))?;
+                if !fetch_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+                    return Err(anyhow::anyhow!(
+                        "failed fetching archived OID {} into {}: {}",
+                        oid,
+                        target_repo.display(),
+                        stderr
+                    ));
+                }
+            }
+
+            crate::git::update_ref(target_repo, ref_name, oid).map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to move restored repository {} -> {}: {}",
-                    extracted_repo.display(),
+                    "failed to restore archived ref {} -> {} into {}: {}",
+                    ref_name,
+                    oid,
                     target_repo.display(),
                     e
                 )
             })?;
+            restored_any = true;
+        }
 
-            Ok(())
-        })();
-
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        result?;
-        Ok(true)
+        Ok(restored_any)
     }
 
     async fn restore_events_from_holding(
@@ -1366,6 +1435,19 @@ impl Nip34WritePolicy {
 
             match self.ctx.holding.archived_event(&event_id).await {
                 Ok(Some(event)) => {
+                    if self.recovery_blocked_by_tombstone(&event).await {
+                        tracing::info!(
+                            event_id = %event.id.to_hex(),
+                            kind = event.kind.as_u16(),
+                            author = %event.pubkey.to_hex(),
+                            "Recovery skipped event blocked by tombstone semantics"
+                        );
+                        // Tombstoned entries are intentionally non-restorable; clean up
+                        // their holding metadata to keep repeated recovery attempts idempotent.
+                        restorable.push(record.clone());
+                        continue;
+                    }
+
                     let already_exists = match self.ctx.database.event_by_id(&event_id).await {
                         Ok(Some(_)) => true,
                         Ok(None) => false,
@@ -1417,7 +1499,41 @@ impl Nip34WritePolicy {
         (restorable, blocked)
     }
 
-    async fn maybe_recover_deleted_repository(&self, event: &Event, identifier: &str) -> bool {
+    async fn recovery_blocked_by_tombstone(&self, event: &Event) -> bool {
+        if self.ctx.tombstones.is_pubkey_vanished(&event.pubkey).await {
+            return true;
+        }
+
+        if self
+            .ctx
+            .tombstones
+            .is_event_deleted(&event.id, &event.pubkey)
+            .await
+        {
+            return true;
+        }
+
+        if event.kind.is_replaceable() || event.kind.is_addressable() {
+            if let Some(coord) = Self::event_coordinate(event) {
+                if self
+                    .ctx
+                    .tombstones
+                    .is_coordinate_deleted(&coord, event.created_at)
+                    .await
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub(crate) async fn maybe_recover_deleted_repository(
+        &self,
+        event: &Event,
+        identifier: &str,
+    ) -> bool {
         let owner_hex = event.pubkey.to_hex();
         let records = self
             .ctx
@@ -1570,7 +1686,7 @@ impl Nip34WritePolicy {
             archive_tracked = selected_archive_rel.is_some(),
             archive_restored = archive_restored,
             git_ready = git_ready,
-            "Recovery workflow completed for re-announcement"
+            "Recovery workflow completed"
         );
 
         let partial = !blocked_records.is_empty() || !git_ready;
