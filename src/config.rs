@@ -4,6 +4,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Whitelist entry for repository/archive filtering
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -428,6 +429,22 @@ pub struct Config {
     #[arg(long, env = "NGIT_NAUGHTY_LIST_EXPIRATION_HOURS", default_value_t = 12)]
     pub naughty_list_expiration_hours: u64,
 
+    /// Retention window in seconds for deleted events kept in holding DB.
+    #[arg(
+        long,
+        env = "NGIT_HOLDING_RETENTION_SECS",
+        default_value_t = crate::nostr::holding::DEFAULT_RETENTION.as_secs()
+    )]
+    pub holding_retention_secs: u64,
+
+    /// Interval in seconds between background holding cleanup passes.
+    #[arg(
+        long,
+        env = "NGIT_HOLDING_CLEANUP_INTERVAL_SECS",
+        default_value_t = crate::nostr::holding::DEFAULT_CLEANUP_INTERVAL.as_secs()
+    )]
+    pub holding_cleanup_interval_secs: u64,
+
     /// Enable GRASP-05 archive mode: accept all announcements regardless of listing (WARNING: storage risk)
     #[arg(long, env = "NGIT_ARCHIVE_ALL", default_value_t = false)]
     pub archive_all: bool,
@@ -661,6 +678,18 @@ impl Config {
         // Validate repository whitelist configuration
         let repository_whitelist = WhitelistEntry::parse_whitelist(&self.repository_whitelist);
 
+        if self.holding_retention_secs == 0 {
+            return Err(anyhow!(
+                "NGIT_HOLDING_RETENTION_SECS must be greater than 0"
+            ));
+        }
+
+        if self.holding_cleanup_interval_secs == 0 {
+            return Err(anyhow!(
+                "NGIT_HOLDING_CLEANUP_INTERVAL_SECS must be greater than 0"
+            ));
+        }
+
         // Fatal error: repository_whitelist with archive_read_only=true (incompatible)
         if !repository_whitelist.is_empty() {
             let read_only = self.archive_read_only.unwrap_or(archive_enabled);
@@ -751,6 +780,16 @@ impl Config {
         EventBlacklistConfig { blacklisted_npubs }
     }
 
+    /// Holding DB retention as a duration.
+    pub fn holding_retention(&self) -> Duration {
+        Duration::from_secs(self.holding_retention_secs)
+    }
+
+    /// Holding DB periodic cleanup interval as a duration.
+    pub fn holding_cleanup_interval(&self) -> Duration {
+        Duration::from_secs(self.holding_cleanup_interval_secs)
+    }
+
     /// Create config for testing
     #[cfg(test)]
     pub fn for_testing() -> Self {
@@ -781,6 +820,9 @@ impl Config {
             rejected_hot_cache_duration_secs: 120,
             rejected_cold_index_expiry_secs: 604800,
             naughty_list_expiration_hours: 12,
+            holding_retention_secs: crate::nostr::holding::DEFAULT_RETENTION.as_secs(),
+            holding_cleanup_interval_secs: crate::nostr::holding::DEFAULT_CLEANUP_INTERVAL
+                .as_secs(),
             archive_all: false,
             archive_whitelist: String::new(),
             archive_grasp_services: String::new(),

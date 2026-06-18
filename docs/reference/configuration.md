@@ -492,6 +492,58 @@ NGIT_REJECTED_COLD_INDEX_EXPIRY_SECS=1209600
 
 ---
 
+### Holding DB Cleanup Configuration
+
+These options control retention and cleanup cadence for deleted events archived in the holding database.
+
+#### `NGIT_HOLDING_RETENTION_SECS`
+
+**Description:** How long deleted events are retained in the holding DB before expiration cleanup removes them  
+**Type:** Integer (seconds)  
+**Default:** `7776000` (90 days)  
+**Required:** No
+
+**Examples:**
+
+```bash
+# Default: 90 days
+NGIT_HOLDING_RETENTION_SECS=7776000
+
+# Short retention (30 days)
+NGIT_HOLDING_RETENTION_SECS=2592000
+```
+
+**Notes:**
+
+- Must be greater than 0
+- Used by both startup catch-up cleanup and periodic cleanup passes
+
+---
+
+#### `NGIT_HOLDING_CLEANUP_INTERVAL_SECS`
+
+**Description:** Interval between periodic holding DB expiration cleanup passes  
+**Type:** Integer (seconds)  
+**Default:** `86400` (24 hours)  
+**Required:** No
+
+**Examples:**
+
+```bash
+# Default: daily cleanup
+NGIT_HOLDING_CLEANUP_INTERVAL_SECS=86400
+
+# Every 6 hours
+NGIT_HOLDING_CLEANUP_INTERVAL_SECS=21600
+```
+
+**Notes:**
+
+- Must be greater than 0
+- Smaller values clean up expired records sooner at the cost of more background work
+
+---
+
 ### GRASP-05 Archive Configuration
 
 These options enable archive/mirror/backup mode per the GRASP-05 specification.

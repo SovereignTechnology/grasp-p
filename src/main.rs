@@ -399,11 +399,10 @@ async fn run_relay(config: Config) -> Result<()> {
         // 1) startup catch-up pass (runs once)
         // 2) periodic background cleanup pass
         let holding_cleanup_store = relay_with_db.holding.clone();
+        let holding_retention = config.holding_retention();
+        let holding_cleanup_interval = config.holding_cleanup_interval();
         match holding_cleanup_store
-            .cleanup_expired(
-                nostr_sdk::prelude::Timestamp::now(),
-                nostr::holding::DEFAULT_RETENTION,
-            )
+            .cleanup_expired(nostr_sdk::prelude::Timestamp::now(), holding_retention)
             .await
         {
             Ok(stats) => {
@@ -423,7 +422,6 @@ async fn run_relay(config: Config) -> Result<()> {
         }
 
         let (holding_cleanup_shutdown_tx, mut holding_cleanup_shutdown_rx) = watch::channel(false);
-        let holding_cleanup_interval = nostr::holding::DEFAULT_CLEANUP_INTERVAL;
         let holding_cleanup_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval_at(
                 tokio::time::Instant::now() + holding_cleanup_interval,
@@ -434,10 +432,7 @@ async fn run_relay(config: Config) -> Result<()> {
                 tokio::select! {
                     _ = interval.tick() => {
                         match holding_cleanup_store
-                            .cleanup_expired(
-                                nostr_sdk::prelude::Timestamp::now(),
-                                nostr::holding::DEFAULT_RETENTION,
-                            )
+                            .cleanup_expired(nostr_sdk::prelude::Timestamp::now(), holding_retention)
                             .await
                         {
                             Ok(stats) => {
@@ -466,8 +461,8 @@ async fn run_relay(config: Config) -> Result<()> {
             }
         });
         info!(
-            retention_secs = nostr::holding::DEFAULT_RETENTION.as_secs(),
-            interval_secs = nostr::holding::DEFAULT_CLEANUP_INTERVAL.as_secs(),
+            retention_secs = holding_retention.as_secs(),
+            interval_secs = holding_cleanup_interval.as_secs(),
             "Holding cleanup task started"
         );
 

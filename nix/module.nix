@@ -178,6 +178,20 @@ let
         description = "Hours before removing relay from naughty list";
       };
 
+      holdingRetentionSecs = mkOption {
+        type = types.int;
+        default = 7776000;
+        description =
+          "Retention window in seconds for deleted events in holding DB (default: 90 days)";
+      };
+
+      holdingCleanupIntervalSecs = mkOption {
+        type = types.int;
+        default = 86400;
+        description =
+          "Interval in seconds between holding DB cleanup passes (default: 24 hours)";
+      };
+
       archiveAll = mkOption {
         type = types.bool;
         default = false;
@@ -369,6 +383,9 @@ let
         toString cfg.rejectedColdIndexExpirySecs;
       NGIT_NAUGHTY_LIST_EXPIRATION_HOURS =
         toString cfg.naughtyListExpirationHours;
+      NGIT_HOLDING_RETENTION_SECS = toString cfg.holdingRetentionSecs;
+      NGIT_HOLDING_CLEANUP_INTERVAL_SECS =
+        toString cfg.holdingCleanupIntervalSecs;
       NGIT_ARCHIVE_ALL = if cfg.archiveAll then "true" else "false";
       NGIT_ARCHIVE_WHITELIST = concatStringsSep "," cfg.archiveWhitelist;
       NGIT_ARCHIVE_GRASP_SERVICES =
