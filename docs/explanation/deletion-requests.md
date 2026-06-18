@@ -245,17 +245,43 @@ Archive files are removed during holding expiry cleanup (`src/nostr/holding.rs:5
 
 ## Recovery workflow
 
-Recovery is triggered by accepted re-announcement or promotion out of purgatory
-for the same `owner+identifier` scope (`src/nostr/builder.rs:297`,
-`src/nostr/builder.rs:1319`).
+Recovery has **two distinct triggers** for the same `owner+identifier` scope.
 
 Recovery and rollback are complementary:
 
 - **Rollback (`e`-path only)** handles deletion-time transition to previous
   known-valid state.
 - **Recovery** handles restoring deleted/archived repository payload and git
-  artifacts when announcements are republished or promoted back out of
-  purgatory.
+  artifacts in either trigger path below.
+
+### Trigger A: re-announcement recovery (announcement was deleted)
+
+When a repository was deleted via announcement deletion and a new announcement
+arrives, ngit-grasp performs recovery check **before** parking that announcement
+in purgatory:
+
+1. Accept incoming 30617 candidate.
+2. Check holding/archive eligibility for same `owner+identifier`.
+3. If eligible and recoverable, restore git archive + deleted events and keep
+   normal served path.
+4. If not recoverable, continue with normal purgatory flow.
+
+This corresponds to the pre-purgatory recovery check in announcement handling
+(`src/nostr/builder.rs:297`, `src/nostr/builder.rs:349`).
+
+### Trigger B: promotion recovery (state was deleted)
+
+When announcement serving is parked after state deletion:
+
+1. Announcement scope is in purgatory.
+2. Wait for a **new valid authorized state event** (not covered by existing
+   tombstone semantics) and matching git-servable conditions.
+3. On promotion out of purgatory, run restore hook to recover repository events
+   and archived PR/review git data from holding/archive.
+4. Run normal git/state alignment and resume served state.
+
+This is a separate trigger from re-announcement and happens at promotion time,
+not at initial announcement receipt.
 
 Eligibility (`src/nostr/holding.rs:315`):
 
@@ -263,7 +289,8 @@ Eligibility (`src/nostr/holding.rs:315`):
 - parseable `holding-deleted-at`,
 - still within retention window.
 
-Recovery behavior (`src/nostr/builder.rs:1336`):
+Recovery behavior (both triggers, `src/nostr/builder.rs:1319`,
+`src/nostr/builder.rs:1336`):
 
 - restore git archive when path is valid and archive is readable,
 - restore holding payload events into main DB,
