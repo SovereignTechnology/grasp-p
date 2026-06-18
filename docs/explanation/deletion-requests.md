@@ -587,46 +587,41 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ## Future Enhancements
 
-### GRASP-05 Archive Mode
-Once GRASP-05 is specified, `deletion_request_disrespector` mode can form the foundation for archive relay requirements.
+Outstanding enhancements identified from b905 + ddbf follow-up work:
 
-### Selective Disrespect
-Allow configuration to disrespect deletions only for specific criteria:
-- Popular repositories (e.g., >N PRs)
-- Repositories with community contributions
-- Specific identifiers (allowlist)
+### Archive-mode roadmap
+- **GRASP-05 archive mode integration:** formalize archival relay requirements on top of `deletion_request_disrespector`.
+- **Selective disrespect:** policy-based disrespect for specific criteria (e.g. popularity, community contribution, identifier allowlist).
+- **Distributed archive coordination:** cross-relay replication for redundancy of deleted content.
 
-### Distributed Archive Network
-Coordinate between archival relays to ensure redundant preservation of deleted content.
+### Cleanup and deletion engine hardening
+- **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
+- **rust-nostr deletion behavior verification:** fully validate/lock down backend deletion behavior so disrespector mode is guaranteed at library level.
+- **Large-scale + edge-case analysis:** document/validate max-depth behavior, large dependency graphs, and memory/performance characteristics.
+- **Concurrency/race handling:** deletion during active sync, concurrent shared-repo deletes, and archival locking strategy.
 
-### Recovery Notifications
-Notify repository owner when content is recovered from holding database, allowing them to confirm or re-delete.
+### Blacklist lifecycle improvements
+- **Dynamic blacklist updates:** apply blacklist additions/removals without restart.
+- **Automatic blacklist recovery (optional policy):** configurable auto-restore for unblacklisted repos within retention.
+- **Dedicated restore CLI:** explicit operator restore commands with clear scope selection and outcomes.
 
-### Dynamic Blacklist Updates
-Currently blacklist changes only take effect on startup. Future enhancement:
-- Monitor configuration file for changes
-- Apply blacklist additions immediately (trigger deletion)
-- Apply blacklist removals immediately (optional auto-recovery)
-- Requires careful concurrency design
+### Operator controls and UX
+- **Enhanced manual ejection:** batch operations, selective ejection (events vs git archive), export-before-eject, richer operator audit metadata.
+- **Recovery notifications:** notify owner when content is restored, so they can confirm or re-delete.
+- **Holding-area management UI:** optional web/admin UX for archive and holding lifecycle operations.
 
-### Dedicated Restore CLI
-Current restoration relies on normal recovery flows. Future enhancement:
-- Add explicit operator restore command(s)
-- Improve operator UX for selecting restore scope and reporting outcomes
+### Delayed archival strategy (active repositories)
+- Add optional grace/delay workflow for high-activity repositories before archival execution.
+- Support cancellation windows, notification issue creation, and schedulable delayed archival operations.
+- Expose policy knobs (notification delay, archive delay, activity/creator thresholds).
 
-### Automatic Blacklist Recovery
-Currently removing from blacklist requires manual restoration. Future enhancement:
-- Detect unblacklisted repos in holding area on startup
-- Automatically restore if within retention period
-- Configurable policy: auto-restore vs manual-only
+### Advanced deletion semantics
+- **Event-ID deletion behavior (`e` target):** for replaceable/addressable state, prefer rollback to prior valid version rather than immediate cascade where applicable.
+- **PR deletion policy refinement:** define final behavior for deleting PR-related events without unintended dependent-data loss.
 
-### Enhanced Manual Ejection
-Current design includes basic manual ejection. Future enhancements:
-- Web UI for holding area management
-- Batch ejection operations
-- Selective ejection (events only, keep git archive)
-- Export before ejection (backup)
-- Enhanced audit logging with operator identity
+### Monitoring and integration follow-up
+- Expand deletion/archival/recovery metrics and provide dashboard + alerting guidance.
+- Re-verify compatibility with evolving master-branch features (purgatory persistence, defensive controls, rejected-event indexing).
 
 ## Conclusion
 
