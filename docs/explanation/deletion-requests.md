@@ -367,6 +367,10 @@ reconciled (for announcements that list this relay service but no longer match
 When `NGIT_BLACKLIST_AUTO_RESTORE=true`, startup also runs a blacklist restore
 pass between blacklist parity delete and whitelist parity delete.
 
+Startup also runs a whitelist restore pass after whitelist parity delete. This
+restores holding scopes tagged `holding-source=whitelist` when they now match
+`repository_whitelist` (while still respecting blacklist precedence).
+
 **Future Enhancement (Dynamic Updates):**
 - Watch for configuration file changes
 - Trigger deletion/restore immediately on blacklist addition/removal

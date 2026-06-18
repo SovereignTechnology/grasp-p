@@ -60,6 +60,20 @@ lazy_static! {
             .expect("register blacklist startup restore metric");
         metric
     };
+    static ref WHITELIST_STARTUP_RESTORE_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_whitelist_startup_restore_total",
+                "Whitelist startup restore operations by result and reason",
+            ),
+            &["result", "reason"],
+        )
+        .expect("build whitelist startup restore metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register whitelist startup restore metric");
+        metric
+    };
     static ref HOLDING_CLEANUP_RUNS_TOTAL: Counter = {
         let metric = Counter::with_opts(Opts::new(
             "ngit_holding_cleanup_runs_total",
@@ -178,6 +192,30 @@ pub fn record_blacklist_startup_restore_failure() {
 
 pub fn record_blacklist_startup_restore_skipped(reason: &str) {
     BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["skipped", reason])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_attempt() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["attempted", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_success() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["succeeded", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_failure() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["failed", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_skipped(reason: &str) {
+    WHITELIST_STARTUP_RESTORE_TOTAL
         .with_label_values(&["skipped", reason])
         .inc();
 }

@@ -76,6 +76,15 @@ pub struct BlacklistRestoreStats {
     pub skipped_scopes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WhitelistRestoreStats {
+    pub scanned_scopes: usize,
+    pub attempted_restores: usize,
+    pub successful_restores: usize,
+    pub failed_restores: usize,
+    pub skipped_scopes: usize,
+}
+
 impl std::fmt::Debug for Nip34WritePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Nip34WritePolicy")
@@ -427,6 +436,118 @@ impl Nip34WritePolicy {
                     identifier = %scope.identifier,
                     reason = "recovery_pipeline_failed",
                     "Blacklist startup restore: recovery pipeline failed"
+                );
+            }
+        }
+
+        stats
+    }
+
+    /// Startup-only whitelist restore pass.
+    ///
+    /// Scans holding metadata for scopes deleted by whitelist parity and restores
+    /// owner+identifier scopes that now match `repository_whitelist`, are not
+    /// blacklisted, and are still inside holding retention.
+    pub async fn run_startup_whitelist_restore_pass(&self) -> WhitelistRestoreStats {
+        let whitelist = self.ctx.config.repository_config();
+        if !whitelist.enabled() {
+            return WhitelistRestoreStats::default();
+        }
+
+        let now = Timestamp::now();
+        let retention = self.ctx.config.holding_retention();
+        let scopes = self
+            .ctx
+            .holding
+            .eligible_recovery_scopes_by_source(DeletionSource::Whitelist, now, retention)
+            .await;
+
+        let blacklist = self.ctx.config.blacklist_config();
+        let mut stats = WhitelistRestoreStats {
+            scanned_scopes: scopes.len(),
+            ..WhitelistRestoreStats::default()
+        };
+
+        for scope in scopes {
+            let owner_pubkey = match PublicKey::from_hex(&scope.owner_pubkey_hex) {
+                Ok(pubkey) => pubkey,
+                Err(e) => {
+                    stats.skipped_scopes += 1;
+                    crate::metrics::record_whitelist_startup_restore_skipped("invalid_owner");
+                    tracing::warn!(
+                        owner = %scope.owner_pubkey_hex,
+                        identifier = %scope.identifier,
+                        reason = "invalid_owner",
+                        error = %e,
+                        "Whitelist startup restore: skipping scope"
+                    );
+                    continue;
+                }
+            };
+
+            let owner_npub = match owner_pubkey.to_bech32() {
+                Ok(npub) => npub,
+                Err(e) => {
+                    stats.skipped_scopes += 1;
+                    crate::metrics::record_whitelist_startup_restore_skipped("owner_bech32_failed");
+                    tracing::warn!(
+                        owner = %scope.owner_pubkey_hex,
+                        identifier = %scope.identifier,
+                        reason = "owner_bech32_failed",
+                        error = %e,
+                        "Whitelist startup restore: skipping scope"
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(reason) = blacklist.check(&owner_npub, &scope.identifier) {
+                stats.skipped_scopes += 1;
+                crate::metrics::record_whitelist_startup_restore_skipped("still_blacklisted");
+                tracing::info!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = %reason,
+                    "Whitelist startup restore: skipping scope still blacklisted"
+                );
+                continue;
+            }
+
+            if !whitelist.matches(&owner_npub, &scope.identifier) {
+                stats.skipped_scopes += 1;
+                crate::metrics::record_whitelist_startup_restore_skipped("not_whitelisted");
+                tracing::info!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = "not_whitelisted",
+                    "Whitelist startup restore: skipping scope"
+                );
+                continue;
+            }
+
+            stats.attempted_restores += 1;
+            crate::metrics::record_whitelist_startup_restore_attempt();
+
+            if self
+                .maybe_recover_deleted_repository_for_scope(&owner_pubkey, &scope.identifier)
+                .await
+            {
+                stats.successful_restores += 1;
+                crate::metrics::record_whitelist_startup_restore_success();
+                tracing::info!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = "now_whitelisted_within_retention",
+                    "Whitelist startup restore: restored repository scope"
+                );
+            } else {
+                stats.failed_restores += 1;
+                crate::metrics::record_whitelist_startup_restore_failure();
+                tracing::error!(
+                    owner = %scope.owner_pubkey_hex,
+                    identifier = %scope.identifier,
+                    reason = "recovery_pipeline_failed",
+                    "Whitelist startup restore: recovery pipeline failed"
                 );
             }
         }

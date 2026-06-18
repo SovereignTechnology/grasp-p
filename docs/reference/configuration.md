@@ -1006,17 +1006,23 @@ Blacklist does **not** affect NIP-11 metadata:
 
 **Behavior:**
 
-- When `false` (default): startup runs delete-only parity reconciliation for blacklist/whitelist; unblacklisted repositories in holding are restored only by existing recovery triggers (for example re-announcement).
+- When `false` (default): startup does not run blacklist-source auto-restore; unblacklisted repositories in holding are restored only by existing recovery triggers (for example re-announcement).
 - When `true`: startup also scans holding metadata with `holding-source=blacklist`, deduplicates owner+identifier scopes, and attempts restore for scopes that:
   - are still within `NGIT_HOLDING_RETENTION_SECS`, and
   - no longer match `NGIT_REPOSITORY_BLACKLIST`.
 - Scopes that are still blacklisted are skipped (not restored).
+
+**Related startup behavior (always on when repository whitelist is enabled):**
+
+- Startup scans holding metadata with `holding-source=whitelist` and attempts restore for scopes that are within retention, now match `NGIT_REPOSITORY_WHITELIST`, and are not blacklisted.
+- Scopes still not matching `NGIT_REPOSITORY_WHITELIST` are skipped.
 
 **Startup ordering:**
 
 1. Blacklist parity delete
 2. Blacklist auto-restore (if enabled)
 3. Whitelist parity delete
+4. Whitelist restore (for scopes now matching `NGIT_REPOSITORY_WHITELIST`)
 
 This ordering keeps startup reconciliation deterministic when multiple policies interact.
 
