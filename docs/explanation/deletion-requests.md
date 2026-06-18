@@ -95,38 +95,21 @@ For `e`-target deletes of active state:
 3. If candidate exists: restore that state as active and immediately re-align
    git refs to match the restored state.
 4. If candidate does not exist: transition to deletion + purgatory parking
-   lifecycle (described below).
+   lifecycle.
 
 For `a`-coordinate deletes of state:
 
 1. Apply NIP-09 coordinate cutoff semantics (`<= deletion.created_at`).
-2. Never restore from history for this path.
+2. Never restore deleted `<= cutoff` versions from history for this path.
 3. Re-align refs based only on surviving authorized main-DB state.
-4. If no state survives cutoff, transition to deletion + purgatory parking
-   lifecycle.
+4. If no alternative valid authorized state event is found, follow repository
+   deletion flow, then add announcement scope to purgatory so the repository can
+   immediately accept a new state and trigger full restore on promotion (events
+   + archived PR/review git data from holding; see Recovery workflow).
 
 This guarantees an old `a` delete cannot clobber a newer active state, and a
 current `a` delete cannot resurrect a state version that the same tombstone
 declared deleted.
-
-### 1b) Deletion + purgatory parking lifecycle (no rollback candidate available)
-
-When deletion removes active state and no previous valid state exists, ngit-grasp
-reuses existing deletion and purgatory machinery instead of a separate timed
-`NO_ACTIVE_STATE` state machine:
-
-1. Follow normal deletion workflow for now-unservable repository scope
-   (move affected events to holding, clear served refs/state).
-2. Remove announcement from live serving/indexed set as part of deletion flow.
-3. Insert announcement scope into purgatory so the repository is parked and
-   visible to promotion logic, with an empty/non-served git ref surface.
-4. No dedicated lifecycle deadline is required.
-5. On later valid promotion (state/announcement conditions met), run restore
-   hook to recover repository events and archived git PR/review data from
-   holding/archive, then perform normal git/state alignment.
-
-This keeps behavior aligned with existing deletion + purgatory semantics while
-preserving the core consistency invariant.
 
 ### 2) Disrespector mode (archival NIP-09 behavior)
 
