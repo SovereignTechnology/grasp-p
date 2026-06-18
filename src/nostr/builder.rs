@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{collections::BTreeSet, fs::File};
+use std::{collections::BTreeSet, fs::File, process::Command};
 
 use flate2::read::GzDecoder;
 use nostr::nips::nip19::ToBech32;
@@ -18,6 +18,7 @@ use tar::Archive as TarArchive;
 
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::RecoveryMetadataRecord;
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
@@ -72,6 +73,7 @@ impl Nip34WritePolicy {
         database: SharedDatabase,
         tombstones: crate::nostr::tombstones::Tombstones,
         holding: crate::nostr::holding::HoldingStore,
+        history: crate::nostr::history::ReplaceableHistoryStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: std::sync::Arc<crate::purgatory::Purgatory>,
         config: crate::config::Config,
@@ -82,6 +84,7 @@ impl Nip34WritePolicy {
             database,
             tombstones,
             holding,
+            history,
             git_data_path,
             purgatory,
             config.clone(),
@@ -118,6 +121,15 @@ impl Nip34WritePolicy {
     /// Get a reference to the holding store for retention cleanup orchestration.
     pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
         &self.ctx.holding
+    }
+
+    /// Get a reference to the replaceable-history store.
+    pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {
+        &self.ctx.history
+    }
+
+    pub fn tombstones(&self) -> &crate::nostr::tombstones::Tombstones {
+        &self.ctx.tombstones
     }
 
     /// Startup-only blacklist parity pass.
@@ -305,6 +317,8 @@ impl Nip34WritePolicy {
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
 
+                        self.capture_superseded_replaceable_history(event).await;
+
                         WritePolicyResult::Accept
                     }
                     Err(e) => {
@@ -357,6 +371,7 @@ impl Nip34WritePolicy {
                             e
                         );
                     }
+                    self.capture_superseded_replaceable_history(event).await;
                     return WritePolicyResult::Accept;
                 }
 
@@ -367,7 +382,6 @@ impl Nip34WritePolicy {
                             "Accepted announcement to purgatory: {} (waiting for git data)",
                             event_id_str
                         );
-
                         accepted_purgatory("won't be served until git data arrives")
                     }
                     Err(e) => {
@@ -384,6 +398,12 @@ impl Nip34WritePolicy {
                 // Parse announcement to get details for logging
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
+                        // Phase 5 recovery trigger: any accepted announcement route
+                        // (including maintainer acceptance) can restore eligible
+                        // holding/archive state for this owner+identifier.
+                        self.maybe_recover_deleted_repository(event, &announcement.identifier)
+                            .await;
+
                         tracing::info!(
                             "Accepted maintainer announcement {} (author {} is listed as maintainer for {})",
                             event_id_str,
@@ -395,6 +415,8 @@ impl Nip34WritePolicy {
                         // Check purgatory for state events that might now be authorized
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
+
+                        self.capture_superseded_replaceable_history(event).await;
 
                         WritePolicyResult::Accept
                     }
@@ -441,10 +463,15 @@ impl Nip34WritePolicy {
                 // Process state alignment asynchronously
                 match self
                     .state_policy
-                    .process_state_event(event, is_synced)
+                    .process_state_event(event, is_synced, Some(self))
                     .await
                 {
-                    Ok(poilicy_result) => poilicy_result,
+                    Ok(policy_result) => {
+                        if Self::event_persists_to_main_db(&policy_result) {
+                            self.capture_superseded_replaceable_history(event).await;
+                        }
+                        policy_result
+                    }
                     Err(e) => {
                         let npub = event
                             .pubkey
@@ -653,7 +680,7 @@ impl Nip34WritePolicy {
             // Re-evaluate authorization with the new announcement
             match self
                 .state_policy
-                .process_state_event(&entry.event, false)
+                .process_state_event(&entry.event, false, Some(self))
                 .await
             {
                 Ok(WritePolicyResult::Accept) => {
@@ -844,6 +871,83 @@ impl Nip34WritePolicy {
         ))
     }
 
+    fn extract_addressable_identifier(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "d" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn should_capture_replaceable_history(kind: Kind) -> bool {
+        kind == Kind::GitRepoAnnouncement || kind == Kind::RepoState
+    }
+
+    fn event_persists_to_main_db(result: &WritePolicyResult) -> bool {
+        matches!(result, WritePolicyResult::Accept)
+    }
+
+    async fn capture_superseded_replaceable_history(&self, incoming: &Event) {
+        if !Self::should_capture_replaceable_history(incoming.kind) {
+            return;
+        }
+
+        let Some(coordinate) = Self::event_coordinate(incoming) else {
+            return;
+        };
+
+        let Some(identifier) = Self::extract_addressable_identifier(incoming) else {
+            tracing::warn!(
+                event_id = %incoming.id.to_hex(),
+                kind = incoming.kind.as_u16(),
+                "Skipping history capture for addressable event without d tag"
+            );
+            return;
+        };
+
+        let filter = Filter::new()
+            .kind(incoming.kind)
+            .author(incoming.pubkey)
+            .identifier(identifier);
+
+        let existing = match self.ctx.database.query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    event_id = %incoming.id.to_hex(),
+                    coordinate = %coordinate,
+                    "Failed querying existing events for history capture"
+                );
+                return;
+            }
+        };
+
+        for superseded in existing {
+            if superseded.id == incoming.id || superseded.created_at >= incoming.created_at {
+                continue;
+            }
+
+            if let Err(e) = self
+                .ctx
+                .history
+                .archive_superseded_event(&superseded, incoming, &coordinate)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    superseded_event_id = %superseded.id.to_hex(),
+                    replaced_by = %incoming.id.to_hex(),
+                    coordinate = %coordinate,
+                    "Failed to archive superseded replaceable/addressable event"
+                );
+            }
+        }
+    }
+
     /// Handle a NIP-62 request-to-vanish (kind 62).
     ///
     /// Reproduces the LMDB backend's vanish behaviour now that we run with
@@ -1007,6 +1111,8 @@ pub struct RelayWithDatabase {
     pub write_policy: Nip34WritePolicy,
     /// Holding store used for deletion archival + expiry cleanup
     pub holding: crate::nostr::holding::HoldingStore,
+    /// Replaceable-history store used for rollback history capture.
+    pub history: crate::nostr::history::ReplaceableHistoryStore,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
@@ -1033,10 +1139,11 @@ pub async fn create_relay(
     // would silently hard-delete events and block re-submission via its own
     // internal tables that we cannot inspect, conflicting with our purgatory /
     // bare-repo bookkeeping.
-    let (database, tombstones, holding): (
+    let (database, tombstones, holding, history): (
         SharedDatabase,
         crate::nostr::tombstones::Tombstones,
         crate::nostr::holding::HoldingStore,
+        ReplaceableHistoryStore,
     ) = match config.database_backend {
         DatabaseBackend::Memory => {
             tracing::info!("Using in-memory database (no persistence)");
@@ -1056,6 +1163,7 @@ pub async fn create_relay(
                 Arc::new(db),
                 crate::nostr::tombstones::Tombstones::in_memory(),
                 crate::nostr::holding::HoldingStore::in_memory(),
+                ReplaceableHistoryStore::in_memory(),
             )
         }
         DatabaseBackend::Lmdb => {
@@ -1086,7 +1194,8 @@ pub async fn create_relay(
                 Path::new(&config.effective_git_data_path()),
             )
             .await?;
-            (Arc::new(db), tombstones, holding)
+            let history = ReplaceableHistoryStore::open_lmdb(db_path).await?;
+            (Arc::new(db), tombstones, holding, history)
         }
     };
 
@@ -1119,6 +1228,7 @@ pub async fn create_relay(
         database.clone(),
         tombstones,
         holding.clone(),
+        history.clone(),
         &git_data_path,
         purgatory,
         config.clone(),
@@ -1151,6 +1261,7 @@ pub async fn create_relay(
         database,
         write_policy,
         holding,
+        history,
     })
 }
 
@@ -1177,9 +1288,6 @@ impl Nip34WritePolicy {
         identifier: &str,
     ) -> anyhow::Result<bool> {
         let target_repo = self.repo_path_for_owner_and_identifier(owner_path_component, identifier);
-        if target_repo.is_dir() {
-            return Ok(false);
-        }
 
         let owner_dir = target_repo
             .parent()
@@ -1208,7 +1316,7 @@ impl Nip34WritePolicy {
             )
         })?;
 
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<bool> {
             let archive_file = File::open(archive_path).map_err(|e| {
                 anyhow::anyhow!("failed to open archive {}: {}", archive_path.display(), e)
             })?;
@@ -1232,21 +1340,89 @@ impl Nip34WritePolicy {
                 ));
             }
 
-            std::fs::rename(&extracted_repo, &target_repo).map_err(|e| {
+            if target_repo.is_dir() {
+                return Self::restore_archived_nostr_refs(&extracted_repo, &target_repo);
+            }
+
+            std::fs::rename(&extracted_repo, &target_repo)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to move restored repository {} -> {}: {}",
+                        extracted_repo.display(),
+                        target_repo.display(),
+                        e
+                    )
+                })
+                .map(|_| true)
+        })();
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        result
+    }
+
+    fn restore_archived_nostr_refs(source_repo: &Path, target_repo: &Path) -> anyhow::Result<bool> {
+        let source_repo_str = source_repo
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid source repo path {}", source_repo.display()))?;
+
+        let list_output = Command::new("git")
+            .args([
+                "--git-dir",
+                source_repo_str,
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/nostr/",
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to list archived refs/nostr: {e}"))?;
+
+        if !list_output.status.success() {
+            let stderr = String::from_utf8_lossy(&list_output.stderr);
+            return Err(anyhow::anyhow!(
+                "failed listing archived refs/nostr from {}: {}",
+                source_repo.display(),
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        let mut restored_any = false;
+
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let Some((oid, ref_name)) = line.split_once(' ') else {
+                continue;
+            };
+
+            if !crate::git::oid_exists(target_repo, oid) {
+                let fetch_output = Command::new("git")
+                    .args(["fetch", source_repo_str, oid])
+                    .current_dir(target_repo)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("failed to fetch archived OID {oid}: {e}"))?;
+                if !fetch_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+                    return Err(anyhow::anyhow!(
+                        "failed fetching archived OID {} into {}: {}",
+                        oid,
+                        target_repo.display(),
+                        stderr
+                    ));
+                }
+            }
+
+            crate::git::update_ref(target_repo, ref_name, oid).map_err(|e| {
                 anyhow::anyhow!(
-                    "failed to move restored repository {} -> {}: {}",
-                    extracted_repo.display(),
+                    "failed to restore archived ref {} -> {} into {}: {}",
+                    ref_name,
+                    oid,
                     target_repo.display(),
                     e
                 )
             })?;
+            restored_any = true;
+        }
 
-            Ok(())
-        })();
-
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        result?;
-        Ok(true)
+        Ok(restored_any)
     }
 
     async fn restore_events_from_holding(
@@ -1265,6 +1441,19 @@ impl Nip34WritePolicy {
 
             match self.ctx.holding.archived_event(&event_id).await {
                 Ok(Some(event)) => {
+                    if self.recovery_blocked_by_tombstone(&event).await {
+                        tracing::info!(
+                            event_id = %event.id.to_hex(),
+                            kind = event.kind.as_u16(),
+                            author = %event.pubkey.to_hex(),
+                            "Recovery skipped event blocked by tombstone semantics"
+                        );
+                        // Tombstoned entries are intentionally non-restorable; clean up
+                        // their holding metadata to keep repeated recovery attempts idempotent.
+                        restorable.push(record.clone());
+                        continue;
+                    }
+
                     let already_exists = match self.ctx.database.event_by_id(&event_id).await {
                         Ok(Some(_)) => true,
                         Ok(None) => false,
@@ -1316,7 +1505,41 @@ impl Nip34WritePolicy {
         (restorable, blocked)
     }
 
-    async fn maybe_recover_deleted_repository(&self, event: &Event, identifier: &str) -> bool {
+    async fn recovery_blocked_by_tombstone(&self, event: &Event) -> bool {
+        if self.ctx.tombstones.is_pubkey_vanished(&event.pubkey).await {
+            return true;
+        }
+
+        if self
+            .ctx
+            .tombstones
+            .is_event_deleted(&event.id, &event.pubkey)
+            .await
+        {
+            return true;
+        }
+
+        if event.kind.is_replaceable() || event.kind.is_addressable() {
+            if let Some(coord) = Self::event_coordinate(event) {
+                if self
+                    .ctx
+                    .tombstones
+                    .is_coordinate_deleted(&coord, event.created_at)
+                    .await
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub(crate) async fn maybe_recover_deleted_repository(
+        &self,
+        event: &Event,
+        identifier: &str,
+    ) -> bool {
         let owner_hex = event.pubkey.to_hex();
         let records = self
             .ctx
@@ -1469,7 +1692,7 @@ impl Nip34WritePolicy {
             archive_tracked = selected_archive_rel.is_some(),
             archive_restored = archive_restored,
             git_ready = git_ready,
-            "Recovery workflow completed for re-announcement"
+            "Recovery workflow completed"
         );
 
         let partial = !blocked_records.is_empty() || !git_ready;

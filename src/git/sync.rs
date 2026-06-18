@@ -879,6 +879,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
+        write_policy,
     )
     .await;
     result.merge(state_result);
@@ -945,6 +946,7 @@ async fn process_purgatory_state_events(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
+    write_policy: Option<&Nip34WritePolicy>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -1134,6 +1136,13 @@ async fn process_purgatory_state_events(
                             continue;
                         }
                         let owner = &announcement.event.pubkey;
+                        if let (Some(wp), Some(entry)) =
+                            (write_policy, purgatory.find_announcement(owner, identifier))
+                        {
+                            wp.maybe_recover_deleted_repository(&entry.event, identifier)
+                                .await;
+                        }
+
                         if let Some(ann_event) = purgatory.promote_announcement(owner, identifier) {
                             match database.save_event(&ann_event).await {
                                 Ok(_) => {
@@ -1436,6 +1445,14 @@ async fn process_purgatory_announcements(
             return result;
         }
     };
+
+    if let (Some(wp), Some(entry)) = (
+        write_policy,
+        purgatory.find_announcement(&owner, identifier),
+    ) {
+        wp.maybe_recover_deleted_repository(&entry.event, identifier)
+            .await;
+    }
 
     // Check if there's an announcement in purgatory for this owner and identifier
     let announcement_event = purgatory.promote_announcement(&owner, identifier);
