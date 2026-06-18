@@ -2,7 +2,9 @@
 
 ## Overview
 
-ngit-grasp will implement optional support for NIP-09 deletion requests, allowing repository owners to remove their repositories from the relay while providing safeguards against the "left-pad problem" through configurable archival behavior.
+ngit-grasp implements optional support for NIP-09 deletion requests, allowing
+repository owners to remove their repositories from the relay while giving
+operators configurable archival behavior for left-pad resilience.
 
 ## The Left-Pad Problem
 
@@ -73,10 +75,10 @@ The deletion system uses three separate data stores:
 - **Manual ejection:** Operator force-deletes before retention expires
   - Use case: Large repos consuming excessive storage
   - Use case: Confirmed malware requiring immediate permanent deletion
-  - Mechanism: CLI command or admin tool (design in Phase 6)
+  - Mechanism: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
   - Logged for audit trail
 - **Manual restoration:** Operator restores blacklisted repo after removal from blacklist
-  - Future: May support automatic restoration
+  - Currently no dedicated restore CLI (restore happens through normal recovery paths)
 
 ## Deletion Flow
 
@@ -96,6 +98,7 @@ The deletion system uses three separate data stores:
 5. Move events to holding database:
    - Announcement
    - All dependent events (cascade delete)
+   - Deletion metadata for retention/cleanup/recovery
    ↓
 6. Delete events from main database
    ↓
@@ -133,7 +136,10 @@ When a repository is added to `NGIT_REPOSITORY_BLACKLIST`, the same deletion flo
 - Metadata marks deletion as blacklist-triggered
 - `deletion_request_disrespector` does NOT prevent blacklist deletion (see below)
 
-**Future:** When dynamic blacklist updates are supported, deletion will trigger immediately on config change instead of waiting for restart.
+**Current scope:** startup reconciliation only.
+
+**Future:** When dynamic blacklist updates are supported, deletion can trigger
+immediately on config change instead of waiting for restart.
 
 ### Archival Mode (Disrespector)
 
@@ -164,8 +170,7 @@ processing is disabled (`process_nip09(false)`); ngit-grasp owns deletion
 handling in [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs), which
 short-circuits when `deletion_request_disrespector` is set — storing but not
 acting on the kind-5 request. NIP-09 is omitted from the NIP-11
-`supported_nips` list in this mode. The git-archival / holding-DB pieces of the
-broader design remain planned.
+`supported_nips` list in this mode.
 
 ## Recovery Mechanism
 
@@ -195,11 +200,18 @@ Scenario: Owner deletes repository, then changes their mind
    - Return: "New repository created"
 ```
 
+### Promotion Recovery (Deleted Active State)
+
+When deletion removes the currently served state and announcement serving is
+parked in purgatory, a later valid state promotion can trigger recovery for the
+same owner+identifier scope (restoring archived events/git before normal serving
+resumes).
+
 ### Blacklist Recovery
 
 When a repository is removed from the blacklist:
 
-**Option 1: Manual Restoration (Initial Implementation)**
+**Option 1: Manual Restoration (Current Behavior)**
 - Operator removes from blacklist config
 - Operator manually restores from holding DB if desired
 - Provides explicit control over recovery decisions
@@ -209,7 +221,7 @@ When a repository is removed from the blacklist:
 - Automatically restore to main DB if within retention period
 - Requires careful design to prevent unwanted restorations
 
-**Decision:** Start with manual restoration, evaluate automatic restoration in Phase 6.
+**Current behavior:** manual restoration workflows only.
 
 ### Manual Ejection from Holding Area
 
@@ -220,9 +232,8 @@ Operators need ability to **force-delete** items from holding area before retent
 2. Confirmed malware/abuse that shouldn't be recoverable
 3. Legal/compliance requirements for immediate permanent deletion
 
-**Mechanism (TBD in Phase 6):**
-- Admin CLI command: `ngit-grasp eject <npub>/<identifier>`
-- Or database operation with proper tooling
+**Mechanism (implemented):**
+- Admin CLI command: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
 - Immediately delete from holding DB and archive filesystem
 - Log operation for audit trail
 - Metric: `ngit_manual_ejections_total`
@@ -274,7 +285,7 @@ Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
 
 ### Detection and Timing
 
-**Initial Implementation (Startup Scan):**
+**Current Behavior (Startup Scan):**
 ```
 1. Relay starts up
 2. Load blacklist configuration
@@ -282,6 +293,10 @@ Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
 4. For each match: archive → holding DB → delete from main
 5. Continue normal operation
 ```
+
+In the same startup parity pass, repository whitelist mismatches are also
+reconciled (for announcements that list this relay service but no longer match
+`repository_whitelist`).
 
 **Future Enhancement (Dynamic Updates):**
 - Watch for configuration file changes
@@ -403,12 +418,12 @@ When `true`, relay ignores **NIP-09 deletion requests** and acts as an archival 
 - Backup/mirror relays
 - GRASP-05 archive mode (future)
 
-### archive_retention_secs
+### holding_retention_secs
 
 **Type:** `u64`  
 **Default:** `7776000` (90 days in seconds)  
-**CLI:** `--archive-retention-secs`  
-**Env:** `NGIT_ARCHIVE_RETENTION_SECS`
+**CLI:** `--holding-retention-secs`  
+**Env:** `NGIT_HOLDING_RETENTION_SECS`
 
 **Description:**
 How long to retain archived events and git data before permanent deletion. Provides recovery window for accidental deletions.
@@ -421,7 +436,8 @@ How long to retain archived events and git data before permanent deletion. Provi
 
 **Notes:**
 - Configurable in seconds for testing flexibility
-- Background cleanup task runs daily (configuration for testing interval TBD in Phase 6)
+- Background cleanup task runs on `NGIT_HOLDING_CLEANUP_INTERVAL_SECS`
+  (default daily)
 - Check occurs on startup to handle offline periods
 - **Testing Challenge:** Daily cleanup doesn't work well with 3-5 second retention for tests - alternative timing strategy needed
 
@@ -449,8 +465,8 @@ This allows clients to discover whether a relay respects deletion requests.
 ### Attack Vectors
 
 **DoS via Deletion Spam:**
-- Mitigation: Deletion requests only processed if announcement exists
-- Mitigation: Idempotent (deleting already-deleted announcement is no-op)
+- Mitigation: ownership checks + normal admission validation
+- Mitigation: idempotent delete paths for already-deleted targets
 
 **Archive Disk Exhaustion:**
 - Mitigation: Background cleanup enforces retention limits
@@ -471,17 +487,14 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ## Monitoring & Metrics
 
-**Prometheus Metrics (Planned):**
-- `ngit_deletion_requests_total` - Count of NIP-09 deletion requests received
-- `ngit_deletion_requests_processed` - Count actually processed (disrespector mode = 0)
-- `ngit_blacklist_deletions_total` - Count of blacklist-triggered deletions
-- `ngit_holding_database_events` - Current event count in holding DB
-- `ngit_holding_database_size_bytes` - Holding DB disk usage
-- `ngit_archive_files_total` - Count of archive tar.gz files
-- `ngit_archive_size_bytes` - Total archive disk usage
-- `ngit_recoveries_total` - Count of successful automatic recoveries
-- `ngit_permanent_deletions_total` - Count of events permanently deleted (post-retention)
-- `ngit_manual_ejections_total` - Count of operator-initiated ejections from holding area
+**Prometheus Metrics (Currently Exposed):**
+- `ngit_blacklist_deletions_total{phase,result}`
+- `ngit_holding_cleanup_runs_total`
+- `ngit_holding_cleanup_deleted_total{type}`
+- `ngit_holding_cleanup_last_run_deleted{type}`
+- `ngit_recovery_total{result}`
+- `ngit_manual_ejections_total`
+- `ngit_manual_ejection_deleted_total{type}`
 
 ## Testing Strategy
 
@@ -535,6 +548,11 @@ Currently blacklist changes only take effect on startup. Future enhancement:
 - Apply blacklist additions immediately (trigger deletion)
 - Apply blacklist removals immediately (optional auto-recovery)
 - Requires careful concurrency design
+
+### Dedicated Restore CLI
+Current restoration relies on normal recovery flows. Future enhancement:
+- Add explicit operator restore command(s)
+- Improve operator UX for selecting restore scope and reporting outcomes
 
 ### Automatic Blacklist Recovery
 Currently removing from blacklist requires manual restoration. Future enhancement:
