@@ -114,6 +114,60 @@ data during the retention window.
   - Use case: Confirmed malware requiring immediate permanent deletion
   - Mechanism: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
   - Logged for audit trail
+- **Unified maintenance cleanup (migration repair + fs/db reconcile):**
+  - Mechanism: `ngit-grasp maintenance cleanup`
+  - Dry-run by default; add `--execute` for safe repair actions
+  - Destructive actions are opt-in:
+    - `--prune-orphans` deletes non-empty orphan git dirs
+    - `--prune-missing-git` deletes unresolved announcement/state scopes with missing git data
+    - optional `--prune-after <duration>` gates destructive actions by age
+
+### Maintenance Cleanup Command (safe vs destructive)
+
+`ngit-grasp maintenance cleanup` runs three ordered passes:
+
+1. `cascade-reconcile` — remove orphaned dependent events that are no longer anchored by surviving 30617 announcements (includes legacy LMDB drift repair).
+2. `state-realign` — re-apply authorized 30618 state to git refs where the git objects are available.
+3. `repo-fs-reconcile` — reconcile filesystem and DB repository layout (includes prior `cleanup-empty-repos` logic).
+
+The command prints per-pass counters and samples, including explicit degraded cases:
+
+> `valid 30618 exists but git data missing`
+
+Those degraded cases are **reported** by default and under `--execute`; they are
+only deleted when `--prune-missing-git` is supplied (and age-gated when
+`--prune-after` is set).
+
+| Invocation | Mutations allowed |
+|---|---|
+| `maintenance cleanup` | none (dry-run only) |
+| `maintenance cleanup --execute` | safe repairs only (cascade orphan cleanup, state realign, empty orphan dir removal) |
+| `maintenance cleanup --execute --prune-orphans` | above + delete non-empty orphan repos |
+| `maintenance cleanup --execute --prune-missing-git` | above + delete unresolved missing-git announcement/state scopes |
+| `maintenance cleanup --execute --prune-orphans --prune-missing-git --prune-after 7d` | same destructive actions, only when older than retention threshold |
+
+### Migration from `cleanup-empty-repos`
+
+`cleanup-empty-repos` is retained as a compatibility wrapper but now routes
+through the shared maintenance engine internals.
+
+Recommended operator migration:
+
+```text
+# 1) inspect first
+ngit-grasp maintenance cleanup --relay-data-path /var/lib/ngit-grasp/relay \
+                               --git-data-path   /var/lib/ngit-grasp/git
+
+# 2) apply safe repairs
+ngit-grasp maintenance cleanup --execute --relay-data-path /var/lib/ngit-grasp/relay \
+                                         --git-data-path   /var/lib/ngit-grasp/git
+
+# 3) optional destructive pruning after retention window
+ngit-grasp maintenance cleanup --execute --prune-orphans --prune-missing-git \
+                               --prune-after 7d \
+                               --relay-data-path /var/lib/ngit-grasp/relay \
+                               --git-data-path   /var/lib/ngit-grasp/git
+```
 - **Blacklist restoration policy:** optional startup auto-restore
   - Controlled by `NGIT_BLACKLIST_AUTO_RESTORE` (default `false`)
   - Restores only `holding-source=blacklist` scopes that are now unblacklisted

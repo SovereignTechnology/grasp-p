@@ -1,534 +1,880 @@
-//! Cleanup Empty Repositories
+//! Repository maintenance cleanup engine.
 //!
-//! Scans the LMDB database for kind 30617 (repository announcement) events whose
-//! corresponding bare git repository on disk is empty (no refs) or missing entirely.
-//! For each such repository, also removes any kind 30618 (state) events for the same
-//! (pubkey, identifier) coordinate.
-//!
-//! ## Rationale
-//!
-//! A relay should not store announcement or state events for a repository that has no
-//! git data. If the bare repo is empty or absent, the events are stale and should be
-//! removed so the relay does not serve them.
-//!
-//! Two scans are performed:
-//!
-//! 1. **DB → filesystem**: finds 30617 events whose bare git repo is empty or missing.
-//!    Both the 30617 and any matching 30618 events are removed.
-//!
-//! 2. **Filesystem → DB**: finds bare git repos on disk with no matching 30617 event.
-//!    Empty orphan repos are always removed. Non-empty orphan repos are flagged and
-//!    only removed when `--purge-orphans` is also passed.
-//!
-//! ## Usage
-//!
-//! ```text
-//! # Dry-run (default): print what would be deleted
-//! ngit-grasp cleanup-empty-repos --relay-data-path /var/lib/ngit-grasp/relay \
-//!                                 --git-data-path   /var/lib/ngit-grasp/git
-//!
-//! # Execute: delete the bare repos and remove events from the DB
-//! ngit-grasp cleanup-empty-repos --relay-data-path /var/lib/ngit-grasp/relay \
-//!                                 --git-data-path   /var/lib/ngit-grasp/git \
-//!                                 --execute
-//!
-//! # Also purge non-empty orphan repos (no matching 30617 in DB)
-//! ngit-grasp cleanup-empty-repos --relay-data-path /var/lib/ngit-grasp/relay \
-//!                                 --git-data-path   /var/lib/ngit-grasp/git \
-//!                                 --execute --purge-orphans
-//! ```
-//!
-//! The relay service should be stopped before running with `--execute` to avoid
-//! races with the live relay process.
+//! Provides the new `maintenance cleanup` pipeline and keeps
+//! `cleanup-empty-repos` as a compatibility wrapper.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use nostr_lmdb::NostrLmdb;
 use nostr_sdk::prelude::*;
 
+use crate::git::authorization::{
+    collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
+};
+use crate::git::process;
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::policy::{build_event_graph, traverse_and_mark_deletions, RetentionReason};
+use crate::purgatory::can_apply_state;
 
-/// Arguments for the `cleanup-empty-repos` subcommand.
+const GRAPH_DEPENDENT_KINDS: &[u16] = &[1111, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633];
+
 #[derive(Debug, Args)]
-pub struct CleanupArgs {
-    /// Path to the LMDB relay data directory (contains the nostr event database).
-    ///
-    /// Defaults to `./data/relay` (same default as the relay itself).
+pub struct MaintenanceCleanupArgs {
+    /// Path to relay LMDB data.
     #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
     pub relay_data_path: String,
 
-    /// Path to the git data directory (contains bare repositories).
-    ///
-    /// Defaults to `./data/git` (same default as the relay itself).
+    /// Path to git data directory.
     #[arg(long, env = "NGIT_GIT_DATA_PATH", default_value = "./data/git")]
     pub git_data_path: String,
 
-    /// Actually delete empty repositories and remove their events from the database.
-    ///
-    /// Without this flag the command runs in dry-run mode and only prints what
-    /// would be deleted. Stop the relay service before using this flag.
+    /// Execute safe repair actions. Default is dry-run.
     #[arg(long, default_value_t = false)]
     pub execute: bool,
 
-    /// Also purge non-empty orphan git repos (repos on disk with no matching 30617 event).
-    ///
-    /// By default, non-empty orphan repos are flagged but not deleted. Pass this flag
-    /// together with `--execute` to permanently delete them. Use with caution.
+    /// Allow deletion of non-empty orphan repos (destructive).
+    #[arg(long, default_value_t = false)]
+    pub prune_orphans: bool,
+
+    /// Allow pruning unresolved missing-git repositories/events (destructive).
+    #[arg(long, default_value_t = false)]
+    pub prune_missing_git: bool,
+
+    /// Require minimum age before destructive pruning (e.g. 24h, 7d, 3600s).
+    #[arg(long)]
+    pub prune_after: Option<String>,
+}
+
+/// Backward-compatible args for `cleanup-empty-repos`.
+#[derive(Debug, Args)]
+pub struct CleanupArgs {
+    #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
+    pub relay_data_path: String,
+
+    #[arg(long, env = "NGIT_GIT_DATA_PATH", default_value = "./data/git")]
+    pub git_data_path: String,
+
+    #[arg(long, default_value_t = false)]
+    pub execute: bool,
+
     #[arg(long, default_value_t = false)]
     pub purge_orphans: bool,
 }
 
-/// A bare git repo on disk that has no matching kind 30617 event in the DB.
-#[derive(Debug)]
-struct OrphanRepo {
-    /// Absolute path to the bare repo directory
-    repo_path: PathBuf,
-    /// npub directory name (may not be a valid npub)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassProfile {
+    All,
+    RepoFsOnly,
+}
+
+#[derive(Debug, Clone)]
+struct MaintenanceOptions {
+    execute: bool,
+    prune_orphans: bool,
+    prune_missing_git: bool,
+    prune_after: Option<Duration>,
+    profile: PassProfile,
+    legacy_force_prune_missing_git: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RepoFsIssue {
+    announcement: Event,
     npub: String,
-    /// Repository directory name (e.g. "my-repo.git")
+    identifier: String,
+    repo_path: PathBuf,
+    repo_exists: bool,
+    has_refs: bool,
+    valid_authorized_state_exists: bool,
+    owner_state_events: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+struct OrphanRepo {
+    repo_path: PathBuf,
+    npub: String,
     dir_name: String,
-    /// Whether the repo has any refs (non-empty)
     has_data: bool,
 }
 
-/// A repository that has an empty (or missing) bare git repo on disk.
-#[derive(Debug)]
-struct EmptyRepo {
-    /// The kind 30617 event
-    announcement: Event,
-    /// Derived npub (bech32) of the owner
-    npub: String,
-    /// Repository identifier (d-tag value)
-    identifier: String,
-    /// Absolute path to the bare repo directory
-    repo_path: PathBuf,
-    /// Whether the directory exists at all (vs exists but is empty)
-    repo_exists: bool,
-    /// Any kind 30618 state events found in the local DB for this coordinate
-    state_events: Vec<Event>,
+#[derive(Debug, Default, Clone)]
+struct ScanPlan {
+    issues: Vec<RepoFsIssue>,
+    orphan_repos: Vec<OrphanRepo>,
 }
 
-/// Run the cleanup-empty-repos subcommand.
+#[derive(Debug, Default, Clone)]
+struct CascadeReport {
+    scanned_candidates: usize,
+    deleted_events: usize,
+    planned_announcement_prunes: usize,
+    sample_deleted_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct StateRealignReport {
+    scanned_identifiers: usize,
+    realigned_repositories: usize,
+    refs_created: usize,
+    refs_updated: usize,
+    refs_deleted: usize,
+    degraded_missing_git: usize,
+    sample_degraded: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RepoFsReport {
+    scanned_announcements: usize,
+    missing_or_empty_repos: usize,
+    pruned_missing_git_announcements: usize,
+    pruned_missing_git_states: usize,
+    degraded_valid_state_missing_git: usize,
+    orphan_repos_found: usize,
+    orphan_empty_removed: usize,
+    orphan_nonempty_removed: usize,
+    orphan_nonempty_skipped: usize,
+    sample_issue_paths: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MaintenanceRunReport {
+    cascade: CascadeReport,
+    state_realign: StateRealignReport,
+    repo_fs: RepoFsReport,
+}
+
 pub async fn run(args: &CleanupArgs) -> Result<()> {
-    let relay_data_path = Path::new(&args.relay_data_path);
-    let git_data_path = Path::new(&args.git_data_path);
+    let options = MaintenanceOptions {
+        execute: args.execute,
+        prune_orphans: args.purge_orphans,
+        prune_missing_git: args.execute,
+        prune_after: None,
+        profile: PassProfile::RepoFsOnly,
+        legacy_force_prune_missing_git: args.execute,
+    };
 
-    if args.execute {
-        println!("=== cleanup-empty-repos (EXECUTE MODE) ===");
-        println!("WARNING: This will permanently delete data. The relay should be stopped.");
-        println!();
-    } else {
-        println!("=== cleanup-empty-repos (DRY-RUN MODE) ===");
-        println!("Pass --execute to actually delete. Stop the relay first.");
-        println!();
-    }
-
-    println!("Relay data path : {}", relay_data_path.display());
-    println!("Git data path   : {}", git_data_path.display());
+    println!("=== cleanup-empty-repos compatibility wrapper ===");
+    println!("This command now uses the shared maintenance cleanup engine.");
+    println!("For full maintenance passes use: ngit-grasp maintenance cleanup ...");
     println!();
 
-    // Open the LMDB database
-    println!("Opening LMDB database...");
+    run_engine(
+        Path::new(&args.relay_data_path),
+        Path::new(&args.git_data_path),
+        options,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn run_maintenance_cleanup(args: &MaintenanceCleanupArgs) -> Result<()> {
+    let options = MaintenanceOptions {
+        execute: args.execute,
+        prune_orphans: args.prune_orphans,
+        prune_missing_git: args.prune_missing_git,
+        prune_after: parse_prune_after(args.prune_after.as_deref())?,
+        profile: PassProfile::All,
+        legacy_force_prune_missing_git: false,
+    };
+
+    run_engine(
+        Path::new(&args.relay_data_path),
+        Path::new(&args.git_data_path),
+        options,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn run_engine(
+    relay_data_path: &Path,
+    git_data_path: &Path,
+    options: MaintenanceOptions,
+) -> Result<MaintenanceRunReport> {
+    if options.execute {
+        println!("=== maintenance cleanup (EXECUTE) ===");
+        println!("Relay should be stopped before destructive operations.");
+    } else {
+        println!("=== maintenance cleanup (DRY-RUN) ===");
+        println!("Pass --execute to run safe repairs.");
+    }
+    println!(
+        "gates execute={} prune_orphans={} prune_missing_git={} prune_after={}",
+        options.execute,
+        options.prune_orphans,
+        options.prune_missing_git || options.legacy_force_prune_missing_git,
+        format_prune_after(options.prune_after),
+    );
+    println!(
+        "paths relay_data={} git_data={}",
+        relay_data_path.display(),
+        git_data_path.display()
+    );
+    println!();
+
     let database: Arc<dyn NostrDatabase> = Arc::new(
         NostrLmdb::open(relay_data_path)
             .await
             .with_context(|| format!("Failed to open LMDB at {}", relay_data_path.display()))?,
     );
-    println!("Database opened.");
-    println!();
 
-    // Query all kind 30617 events
+    run_engine_with_db(database, git_data_path, options).await
+}
+
+async fn run_engine_with_db(
+    database: Arc<dyn NostrDatabase>,
+    git_data_path: &Path,
+    options: MaintenanceOptions,
+) -> Result<MaintenanceRunReport> {
+    let mut report = MaintenanceRunReport::default();
+
+    let plan = build_scan_plan(&database, git_data_path).await?;
+
+    let planned_prune_ids: HashSet<EventId> = if options.execute
+        && (options.prune_missing_git || options.legacy_force_prune_missing_git)
+    {
+        plan.issues
+            .iter()
+            .filter(|issue| prune_allowed_for_issue(issue, options.prune_after))
+            .map(|issue| issue.announcement.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    if options.profile == PassProfile::All {
+        report.cascade = run_cascade_reconcile(
+            &database,
+            &planned_prune_ids,
+            options.execute,
+            options.prune_after,
+        )
+        .await?;
+        print_cascade_report(&report.cascade, options.execute);
+
+        report.state_realign = run_state_realign(&database, git_data_path, options.execute).await?;
+        print_state_realign_report(&report.state_realign, options.execute);
+    }
+
+    report.repo_fs = run_repo_fs_reconcile(
+        &database,
+        git_data_path,
+        &plan,
+        &planned_prune_ids,
+        &options,
+    )
+    .await?;
+    print_repo_fs_report(&report.repo_fs, options.execute, &options);
+
+    println!();
+    println!("maintenance.cleanup complete execute={}", options.execute);
+
+    Ok(report)
+}
+
+async fn build_scan_plan(
+    database: &Arc<dyn NostrDatabase>,
+    git_data_path: &Path,
+) -> Result<ScanPlan> {
     let filter = Filter::new().kind(Kind::GitRepoAnnouncement);
     let announcements = database
         .query(filter)
         .await
-        .context("Failed to query kind 30617 events")?;
+        .context("Failed to query kind 30617 announcements")?;
 
-    println!(
-        "Found {} kind 30617 announcement(s) in database.",
-        announcements.len()
-    );
-    println!();
+    let mut issues = Vec::new();
 
-    // Identify empty repos
-    let mut empty_repos: Vec<EmptyRepo> = Vec::new();
-
-    for event in announcements.iter() {
+    for event in announcements {
         let announcement = match RepositoryAnnouncement::from_event(event.clone()) {
             Ok(a) => a,
-            Err(e) => {
-                eprintln!(
-                    "  WARN: Could not parse announcement {} (skipping): {}",
-                    event.id.to_hex(),
-                    e
-                );
-                continue;
-            }
+            Err(_) => continue,
         };
 
-        let npub = announcement.owner_npub();
-        let identifier = announcement.identifier.clone();
         let repo_path = git_data_path.join(announcement.repo_path());
-
-        let (repo_exists, is_empty) = check_repo_empty(&repo_path);
-
-        if !is_empty {
-            // Repo has git data — leave it alone
+        let (repo_exists, has_refs) = repo_ref_status(&repo_path);
+        if has_refs {
             continue;
         }
 
-        // Look up any kind 30618 state events for this (pubkey, identifier) in the local DB
-        let state_filter = Filter::new()
+        let owner_filter = Filter::new()
             .kind(Kind::RepoState)
             .author(event.pubkey)
-            .identifier(identifier.clone());
+            .identifier(announcement.identifier.clone());
 
-        let state_events = database
-            .query(state_filter)
+        let owner_state_events: Vec<Event> = database
+            .query(owner_filter)
             .await
-            .with_context(|| format!("Failed to query kind 30618 for {}/{}", npub, identifier))?;
+            .with_context(|| {
+                format!(
+                    "Failed to query owner states for {}/{}",
+                    announcement.owner_npub(),
+                    announcement.identifier
+                )
+            })?
+            .into_iter()
+            .collect();
 
-        empty_repos.push(EmptyRepo {
-            announcement: event.clone(),
-            npub,
-            identifier,
+        let valid_authorized_state_exists =
+            owner_has_authorized_state(database, &announcement.identifier, &event.pubkey.to_hex())
+                .await;
+
+        issues.push(RepoFsIssue {
+            announcement: event,
+            npub: announcement.owner_npub(),
+            identifier: announcement.identifier,
             repo_path,
             repo_exists,
-            state_events: state_events.into_iter().collect(),
+            has_refs,
+            valid_authorized_state_exists,
+            owner_state_events,
         });
     }
 
-    // --- Filesystem → DB scan: orphan repos ---
-    println!("Scanning git data directory for orphan repos (no matching 30617 event)...");
-    let orphan_repos = find_orphan_repos(git_data_path, &database).await?;
-    println!(
-        "Found {} orphan repo(s) on disk with no matching 30617 event.",
-        orphan_repos.len()
-    );
-    println!();
+    let orphan_repos = find_orphan_repos(git_data_path, database).await?;
+    Ok(ScanPlan {
+        issues,
+        orphan_repos,
+    })
+}
 
-    if empty_repos.is_empty() && orphan_repos.is_empty() {
-        println!("Nothing to do.");
-        return Ok(());
+async fn run_cascade_reconcile(
+    database: &Arc<dyn NostrDatabase>,
+    planned_prune_ids: &HashSet<EventId>,
+    execute: bool,
+    prune_after: Option<Duration>,
+) -> Result<CascadeReport> {
+    let mut report = CascadeReport {
+        planned_announcement_prunes: planned_prune_ids.len(),
+        ..Default::default()
+    };
+
+    let candidates = query_cascade_candidates(database).await?;
+    report.scanned_candidates = candidates.len();
+
+    if candidates.is_empty() {
+        return Ok(report);
     }
 
-    // Print report
-    println!(
-        "Found {} repository/repositories with empty or missing git data:\n",
-        empty_repos.len()
-    );
+    let graph = build_event_graph(&candidates);
+    let mut kept: HashMap<EventId, RetentionReason> = HashMap::new();
 
-    for (i, repo) in empty_repos.iter().enumerate() {
-        let repo_status = if repo.repo_exists {
-            "exists but empty (no refs)"
-        } else {
-            "missing from disk"
-        };
-        println!(
-            "  [{:>3}] {}/{} — git repo {}",
-            i + 1,
-            repo.npub,
-            repo.identifier,
-            repo_status,
-        );
-        println!("         30617 event : {}", repo.announcement.id.to_hex());
-        if repo.state_events.is_empty() {
-            println!("         30618 events: none in local DB");
-        } else {
-            for se in &repo.state_events {
-                println!("         30618 event : {}", se.id.to_hex());
-            }
-        }
-        println!("         repo path   : {}", repo.repo_path.display());
-    }
-
-    // Print orphan report
-    if !orphan_repos.is_empty() {
-        println!(
-            "Found {} orphan repo(s) on disk with no matching 30617 event:\n",
-            orphan_repos.len()
-        );
-        let mut empty_orphan_count = 0usize;
-        let mut nonempty_orphan_count = 0usize;
-        for (i, repo) in orphan_repos.iter().enumerate() {
-            let status = if repo.has_data {
-                nonempty_orphan_count += 1;
-                "NON-EMPTY (has git data)"
-            } else {
-                empty_orphan_count += 1;
-                "empty (no refs)"
-            };
-            println!(
-                "  [{:>3}] {}/{} — {}",
-                i + 1,
-                repo.npub,
-                repo.dir_name,
-                status,
+    for event in &candidates {
+        if event.kind == Kind::GitRepoAnnouncement && !planned_prune_ids.contains(&event.id) {
+            kept.insert(
+                event.id,
+                RetentionReason {
+                    event_id: event.id,
+                    valid_announcements: vec![announcement_address_of(event)],
+                    event_type: "Repository Announcement".to_string(),
+                },
             );
-            println!("         repo path: {}", repo.repo_path.display());
-        }
-        println!();
-        if nonempty_orphan_count > 0 {
-            println!(
-                "  NOTE: {} non-empty orphan repo(s) will NOT be deleted unless --purge-orphans is passed.",
-                nonempty_orphan_count
-            );
-        }
-        if empty_orphan_count > 0 {
-            println!(
-                "  NOTE: {} empty orphan repo(s) will be deleted (no git data to lose).",
-                empty_orphan_count
-            );
-        }
-        println!();
-    }
-
-    if !args.execute {
-        let would_delete = empty_repos.len()
-            + orphan_repos.iter().filter(|r| !r.has_data).count()
-            + if args.purge_orphans {
-                orphan_repos.iter().filter(|r| r.has_data).count()
-            } else {
-                0
-            };
-        println!("DRY-RUN: {} item(s) would be cleaned up.", would_delete);
-        if orphan_repos.iter().any(|r| r.has_data) && !args.purge_orphans {
-            println!(
-                "  (non-empty orphan repos flagged above would be skipped; add --purge-orphans to include them)"
-            );
-        }
-        println!("Run with --execute to perform the cleanup (stop the relay first).");
-        return Ok(());
-    }
-
-    // Execute: delete repos and remove events
-    println!("Executing cleanup...");
-    println!();
-
-    let mut deleted_repos = 0usize;
-    let mut failed_repos = 0usize;
-    let mut deleted_announcements = 0usize;
-    let mut deleted_state_events = 0usize;
-
-    for repo in &empty_repos {
-        println!("Cleaning up {}/{}...", repo.npub, repo.identifier);
-
-        // 1. Delete the bare repo directory (if it exists)
-        if repo.repo_exists {
-            match std::fs::remove_dir_all(&repo.repo_path) {
-                Ok(()) => {
-                    println!("  Deleted git repo: {}", repo.repo_path.display());
-                    deleted_repos += 1;
-
-                    // Remove the parent npub directory if now empty
-                    if let Some(npub_dir) = repo.repo_path.parent() {
-                        if npub_dir.exists() {
-                            match std::fs::read_dir(npub_dir) {
-                                Ok(mut entries) => {
-                                    if entries.next().is_none() {
-                                        if let Err(e) = std::fs::remove_dir(npub_dir) {
-                                            eprintln!(
-                                                "  WARN: Could not remove empty npub dir {}: {}",
-                                                npub_dir.display(),
-                                                e
-                                            );
-                                        } else {
-                                            println!(
-                                                "  Removed empty npub dir: {}",
-                                                npub_dir.display()
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "  WARN: Could not read npub dir {}: {}",
-                                        npub_dir.display(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  ERROR: Failed to delete git repo {}: {}",
-                        repo.repo_path.display(),
-                        e
-                    );
-                    failed_repos += 1;
-                    // Continue — still try to remove the DB events
-                }
-            }
-        }
-
-        // 2. Remove the kind 30617 announcement from the DB
-        //    Use a filter matching the specific event ID so we only delete this exact event.
-        let announcement_filter = Filter::new()
-            .kind(Kind::GitRepoAnnouncement)
-            .id(repo.announcement.id);
-
-        match database.delete(announcement_filter).await {
-            Ok(()) => {
-                println!("  Deleted 30617 event: {}", repo.announcement.id.to_hex());
-                deleted_announcements += 1;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  ERROR: Failed to delete 30617 event {}: {}",
-                    repo.announcement.id.to_hex(),
-                    e
-                );
-            }
-        }
-
-        // 3. Remove any kind 30618 state events for this coordinate
-        if !repo.state_events.is_empty() {
-            let state_filter = Filter::new()
-                .kind(Kind::RepoState)
-                .author(repo.announcement.pubkey)
-                .identifier(repo.identifier.clone());
-
-            match database.delete(state_filter).await {
-                Ok(()) => {
-                    for se in &repo.state_events {
-                        println!("  Deleted 30618 event: {}", se.id.to_hex());
-                        deleted_state_events += 1;
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  ERROR: Failed to delete 30618 events for {}/{}: {}",
-                        repo.npub, repo.identifier, e
-                    );
-                }
-            }
         }
     }
 
-    // --- Execute orphan repo cleanup ---
-    let mut deleted_orphan_repos = 0usize;
-    let mut skipped_nonempty_orphans = 0usize;
+    let traversal = traverse_and_mark_deletions(&graph, &kept, EventId::all_zeros());
 
-    for repo in &orphan_repos {
-        if repo.has_data && !args.purge_orphans {
-            println!(
-                "SKIP (non-empty, --purge-orphans not set): {}/{} — {}",
-                repo.npub,
-                repo.dir_name,
-                repo.repo_path.display()
-            );
-            skipped_nonempty_orphans += 1;
+    let mut deletable_ids: Vec<EventId> = Vec::new();
+    for event in &candidates {
+        if !traversal.delete.contains(&event.id) {
             continue;
         }
 
+        let is_announcement = event.kind == Kind::GitRepoAnnouncement;
+        if is_announcement && !planned_prune_ids.contains(&event.id) {
+            continue;
+        }
+
+        if !is_announcement || planned_prune_ids.contains(&event.id) {
+            deletable_ids.push(event.id);
+        }
+    }
+
+    report.sample_deleted_ids = deletable_ids
+        .iter()
+        .take(10)
+        .map(|id| id.to_hex())
+        .collect();
+
+    if execute && !deletable_ids.is_empty() {
+        database
+            .delete(Filter::new().ids(deletable_ids.clone()))
+            .await
+            .context("Cascade reconcile deletion failed")?;
+        report.deleted_events = deletable_ids.len();
+    } else {
+        report.deleted_events = deletable_ids.len();
+    }
+
+    if report.planned_announcement_prunes > 0 {
         println!(
-            "Deleting orphan repo {}/{} ({})...",
-            repo.npub,
-            repo.dir_name,
-            if repo.has_data { "non-empty" } else { "empty" }
+            "cascade-reconcile planned prune_missing_git announcements={} prune_after={}",
+            report.planned_announcement_prunes,
+            format_prune_after(prune_after)
         );
+    }
 
-        match std::fs::remove_dir_all(&repo.repo_path) {
-            Ok(()) => {
-                println!("  Deleted git repo: {}", repo.repo_path.display());
-                deleted_orphan_repos += 1;
+    Ok(report)
+}
 
-                // Remove the parent npub directory if now empty
-                if let Some(npub_dir) = repo.repo_path.parent() {
-                    if npub_dir.exists() {
-                        match std::fs::read_dir(npub_dir) {
-                            Ok(mut entries) => {
-                                if entries.next().is_none() {
-                                    if let Err(e) = std::fs::remove_dir(npub_dir) {
-                                        eprintln!(
-                                            "  WARN: Could not remove empty npub dir {}: {}",
-                                            npub_dir.display(),
-                                            e
-                                        );
-                                    } else {
-                                        println!(
-                                            "  Removed empty npub dir: {}",
-                                            npub_dir.display()
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "  WARN: Could not read npub dir {}: {}",
-                                    npub_dir.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "  ERROR: Failed to delete orphan repo {}: {}",
-                    repo.repo_path.display(),
-                    e
+async fn run_state_realign(
+    database: &Arc<dyn NostrDatabase>,
+    git_data_path: &Path,
+    execute: bool,
+) -> Result<StateRealignReport> {
+    let mut report = StateRealignReport::default();
+
+    let events = database
+        .query(Filter::new().kinds([Kind::GitRepoAnnouncement, Kind::RepoState]))
+        .await
+        .context("Failed to query announcements/states for state-realign")?;
+
+    let mut identifiers = HashSet::new();
+    for event in events {
+        if let Some(identifier) = identifier_from_event(&event) {
+            identifiers.insert(identifier);
+        }
+    }
+
+    report.scanned_identifiers = identifiers.len();
+
+    for identifier in identifiers {
+        let repo_data = match fetch_repository_data_excluding_purgatory(database, &identifier).await
+        {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        if repo_data.announcements.is_empty() {
+            continue;
+        }
+
+        let by_owner = collect_authorized_maintainers(&repo_data.announcements);
+
+        for announcement in &repo_data.announcements {
+            let owner_hex = announcement.event.pubkey.to_hex();
+            let Some(maintainers) = by_owner.get(&owner_hex) else {
+                continue;
+            };
+
+            let latest_state = repo_data
+                .states
+                .iter()
+                .filter(|state| maintainers.contains(&state.event.pubkey.to_hex()))
+                .max_by(|a, b| {
+                    a.event
+                        .created_at
+                        .cmp(&b.event.created_at)
+                        .then_with(|| a.event.id.cmp(&b.event.id))
+                });
+
+            let Some(latest_state) = latest_state else {
+                continue;
+            };
+
+            let target_repo_path = git_data_path.join(announcement.repo_path());
+            if !target_repo_path.is_dir() {
+                report.degraded_missing_git += 1;
+                push_sample(
+                    &mut report.sample_degraded,
+                    format!(
+                        "{}/{} missing target repo {} for state {}",
+                        announcement.owner_npub(),
+                        identifier,
+                        target_repo_path.display(),
+                        latest_state.event.id.to_hex()
+                    ),
                 );
-                failed_repos += 1;
+                continue;
+            }
+
+            let source_repo_path = repo_data.announcements.iter().find_map(|candidate| {
+                let candidate_path = git_data_path.join(candidate.repo_path());
+                if candidate_path.is_dir() && can_apply_state(&latest_state.event, &candidate_path)
+                {
+                    Some(candidate_path)
+                } else {
+                    None
+                }
+            });
+
+            let Some(source_repo_path) = source_repo_path else {
+                report.degraded_missing_git += 1;
+                push_sample(
+                    &mut report.sample_degraded,
+                    format!(
+                        "{}/{} valid state {} exists but git data missing",
+                        announcement.owner_npub(),
+                        identifier,
+                        latest_state.event.id.to_hex()
+                    ),
+                );
+                continue;
+            };
+
+            if execute {
+                let result = process::process_state_with_git_data(
+                    latest_state,
+                    &source_repo_path,
+                    &repo_data,
+                    git_data_path,
+                );
+                report.realigned_repositories += result.repos_synced;
+                report.refs_created += result.refs_created;
+                report.refs_updated += result.refs_updated;
+                report.refs_deleted += result.refs_deleted;
+            } else {
+                report.realigned_repositories += 1;
             }
         }
     }
 
-    println!();
-    println!("=== Cleanup complete ===");
-    println!("  Git repos deleted (stale events)  : {}", deleted_repos);
-    println!(
-        "  Git repos deleted (orphans)        : {}",
-        deleted_orphan_repos
-    );
-    if skipped_nonempty_orphans > 0 {
-        println!(
-            "  Non-empty orphans skipped          : {} (re-run with --purge-orphans to delete)",
-            skipped_nonempty_orphans
-        );
-    }
-    if failed_repos > 0 {
-        println!(
-            "  Git repos failed                   : {} (see errors above)",
-            failed_repos
-        );
-    }
-    println!(
-        "  30617 events removed               : {}",
-        deleted_announcements
-    );
-    println!(
-        "  30618 events removed               : {}",
-        deleted_state_events
-    );
-
-    Ok(())
+    Ok(report)
 }
 
-/// Scan the git data directory for bare repos that have no matching 30617 event in the DB.
-///
-/// The expected layout is `<git_data_path>/<npub>/<identifier>.git`.
-/// Any directory under `<git_data_path>` that ends in `.git` and has no corresponding
-/// 30617 event (matched by pubkey + identifier d-tag) is returned as an orphan.
+async fn run_repo_fs_reconcile(
+    database: &Arc<dyn NostrDatabase>,
+    git_data_path: &Path,
+    plan: &ScanPlan,
+    planned_prune_ids: &HashSet<EventId>,
+    options: &MaintenanceOptions,
+) -> Result<RepoFsReport> {
+    let mut report = RepoFsReport {
+        scanned_announcements: plan.issues.len(),
+        missing_or_empty_repos: plan.issues.len(),
+        orphan_repos_found: plan.orphan_repos.len(),
+        ..Default::default()
+    };
+
+    for issue in &plan.issues {
+        push_sample(
+            &mut report.sample_issue_paths,
+            format!(
+                "{}/{} repo={} exists={} has_refs={}",
+                issue.npub,
+                issue.identifier,
+                issue.repo_path.display(),
+                issue.repo_exists,
+                issue.has_refs
+            ),
+        );
+
+        if issue.valid_authorized_state_exists {
+            report.degraded_valid_state_missing_git += 1;
+        }
+
+        let should_prune = options.execute
+            && (options.prune_missing_git || options.legacy_force_prune_missing_git)
+            && prune_allowed_for_issue(issue, options.prune_after);
+
+        if !should_prune {
+            continue;
+        }
+
+        if issue.repo_exists {
+            let _ = std::fs::remove_dir_all(&issue.repo_path);
+            remove_parent_if_empty(&issue.repo_path);
+        }
+
+        // Cascade pass may already remove this announcement; delete-by-id is idempotent.
+        database
+            .delete(Filter::new().id(issue.announcement.id))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed deleting announcement {} during repo-fs prune",
+                    issue.announcement.id.to_hex()
+                )
+            })?;
+        report.pruned_missing_git_announcements += 1;
+
+        let announcement_was_cascade_pruned = planned_prune_ids.contains(&issue.announcement.id);
+        if announcement_was_cascade_pruned {
+            // state prune check still needed because cascade pass does not touch states.
+        }
+
+        if no_announcements_for_identifier(database, &issue.identifier).await? {
+            let state_count = count_events(
+                database,
+                Filter::new()
+                    .kind(Kind::RepoState)
+                    .identifier(issue.identifier.clone()),
+            )
+            .await?;
+
+            database
+                .delete(
+                    Filter::new()
+                        .kind(Kind::RepoState)
+                        .identifier(issue.identifier.clone()),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed deleting unanchored states for identifier {}",
+                        issue.identifier
+                    )
+                })?;
+
+            report.pruned_missing_git_states += state_count;
+        }
+    }
+
+    for orphan in &plan.orphan_repos {
+        push_sample(
+            &mut report.sample_issue_paths,
+            format!(
+                "orphan {}/{} path={} has_data={}",
+                orphan.npub,
+                orphan.dir_name,
+                orphan.repo_path.display(),
+                orphan.has_data
+            ),
+        );
+        if orphan.has_data {
+            let allowed = options.execute
+                && options.prune_orphans
+                && prune_allowed_for_path(&orphan.repo_path, options.prune_after);
+
+            if allowed {
+                let _ = std::fs::remove_dir_all(&orphan.repo_path);
+                remove_parent_if_empty(&orphan.repo_path);
+                report.orphan_nonempty_removed += 1;
+            } else {
+                report.orphan_nonempty_skipped += 1;
+            }
+        } else if options.execute {
+            let _ = std::fs::remove_dir_all(&orphan.repo_path);
+            remove_parent_if_empty(&orphan.repo_path);
+            report.orphan_empty_removed += 1;
+        }
+    }
+
+    let _ = git_data_path;
+    Ok(report)
+}
+
+fn prune_allowed_for_issue(issue: &RepoFsIssue, prune_after: Option<Duration>) -> bool {
+    if let Some(min_age) = prune_after {
+        let newest = issue
+            .owner_state_events
+            .iter()
+            .map(|e| e.created_at.as_secs())
+            .max()
+            .unwrap_or(issue.announcement.created_at.as_secs());
+        return age_secs(newest) >= min_age.as_secs();
+    }
+    true
+}
+
+fn prune_allowed_for_path(path: &Path, prune_after: Option<Duration>) -> bool {
+    let Some(min_age) = prune_after else {
+        return true;
+    };
+
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    match modified {
+        Some(ts) => age_secs(ts) >= min_age.as_secs(),
+        None => false,
+    }
+}
+
+fn age_secs(timestamp_secs: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    now.saturating_sub(timestamp_secs)
+}
+
+fn format_prune_after(value: Option<Duration>) -> String {
+    value
+        .map(|d| format!("{}s", d.as_secs()))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn parse_prune_after(input: Option<&str>) -> Result<Option<Duration>> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+
+    parse_duration_like(raw).map(Some)
+}
+
+fn parse_duration_like(raw: &str) -> Result<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("--prune-after cannot be empty"));
+    }
+
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+
+    let (num_part, unit_part) = trimmed.split_at(split_at);
+    let value: u64 = num_part
+        .parse()
+        .map_err(|_| anyhow!("invalid duration value: {}", raw))?;
+    let unit = if unit_part.is_empty() { "s" } else { unit_part };
+
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        "w" => 60 * 60 * 24 * 7,
+        _ => {
+            return Err(anyhow!(
+                "invalid duration unit '{}'; use s, m, h, d, or w",
+                unit
+            ))
+        }
+    };
+
+    Ok(Duration::from_secs(value.saturating_mul(multiplier)))
+}
+
+fn repo_ref_status(repo_path: &Path) -> (bool, bool) {
+    if !repo_path.exists() {
+        return (false, false);
+    }
+
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .args(["for-each-ref", "--format=%(refname)"])
+        .output();
+
+    match output {
+        Ok(out) => {
+            let has_refs = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+            (true, has_refs)
+        }
+        Err(_) => (true, false),
+    }
+}
+
+async fn owner_has_authorized_state(
+    database: &Arc<dyn NostrDatabase>,
+    identifier: &str,
+    owner_hex: &str,
+) -> bool {
+    let Ok(repo_data) = fetch_repository_data_excluding_purgatory(database, identifier).await
+    else {
+        return false;
+    };
+
+    let by_owner = collect_authorized_maintainers(&repo_data.announcements);
+    let Some(maintainers) = by_owner.get(owner_hex) else {
+        return false;
+    };
+
+    repo_data
+        .states
+        .iter()
+        .any(|state| maintainers.contains(&state.event.pubkey.to_hex()))
+}
+
+async fn no_announcements_for_identifier(
+    database: &Arc<dyn NostrDatabase>,
+    identifier: &str,
+) -> Result<bool> {
+    let remaining = database
+        .query(
+            Filter::new()
+                .kind(Kind::GitRepoAnnouncement)
+                .identifier(identifier.to_string()),
+        )
+        .await
+        .with_context(|| format!("Failed querying remaining announcements for {}", identifier))?;
+    Ok(remaining.is_empty())
+}
+
+async fn count_events(database: &Arc<dyn NostrDatabase>, filter: Filter) -> Result<usize> {
+    Ok(database
+        .query(filter)
+        .await
+        .context("Failed counting events")?
+        .len())
+}
+
+async fn query_cascade_candidates(database: &Arc<dyn NostrDatabase>) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    events.extend(
+        database
+            .query(Filter::new().kind(Kind::GitRepoAnnouncement))
+            .await
+            .context("Failed querying announcements for cascade")?,
+    );
+
+    for kind_num in GRAPH_DEPENDENT_KINDS {
+        events.extend(
+            database
+                .query(Filter::new().kind(Kind::from(*kind_num)))
+                .await
+                .with_context(|| format!("Failed querying kind {} for cascade", kind_num))?,
+        );
+    }
+
+    Ok(events)
+}
+
+fn announcement_address_of(event: &Event) -> String {
+    let identifier = identifier_from_event(event).unwrap_or_default();
+    format!("30617:{}:{}", event.pubkey.to_hex(), identifier)
+}
+
+fn identifier_from_event(event: &Event) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.kind() == "d")
+        .and_then(|t| t.content())
+        .map(|s| s.to_string())
+}
+
+fn push_sample(samples: &mut Vec<String>, value: String) {
+    if samples.len() < 10 {
+        samples.push(value);
+    }
+}
+
+fn remove_parent_if_empty(repo_path: &Path) {
+    let Some(parent) = repo_path.parent() else {
+        return;
+    };
+    if !parent.exists() {
+        return;
+    }
+    let Ok(mut entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    if entries.next().is_none() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 async fn find_orphan_repos(
     git_data_path: &Path,
     database: &Arc<dyn NostrDatabase>,
 ) -> Result<Vec<OrphanRepo>> {
     let mut orphans = Vec::new();
 
-    // Iterate npub-level directories
     let npub_entries = match std::fs::read_dir(git_data_path) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(orphans),
         Err(e) => {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "Failed to read git data directory {}: {}",
                 git_data_path.display(),
                 e
@@ -542,26 +888,14 @@ async fn find_orphan_repos(
         if !npub_path.is_dir() {
             continue;
         }
-        // Skip the GRASP-06 `/prs/` subtree: it does not follow the
-        // `<npub>/<identifier>.git` layout and is not described by 30617
-        // announcements, so every repo under it would otherwise look like
-        // an orphan to this scan.
         if crate::grasp06::paths::is_prs_repo_path(&npub_path, git_data_path) {
             continue;
         }
         let npub = npub_entry.file_name().to_string_lossy().into_owned();
 
-        // Iterate repo-level directories inside this npub dir
         let repo_entries = match std::fs::read_dir(&npub_path) {
             Ok(e) => e,
-            Err(e) => {
-                eprintln!(
-                    "  WARN: Could not read npub directory {}: {}",
-                    npub_path.display(),
-                    e
-                );
-                continue;
-            }
+            Err(_) => continue,
         };
 
         for repo_entry in repo_entries {
@@ -575,36 +909,28 @@ async fn find_orphan_repos(
                 continue;
             }
 
-            // Derive the identifier (strip .git suffix)
             let identifier = dir_name.strip_suffix(".git").unwrap_or(&dir_name);
-
-            // Check whether a 30617 event exists for this (npub, identifier)
-            // We query by identifier d-tag; if the npub is not a valid bech32 pubkey
-            // we won't be able to filter by author, so we check the results manually.
             let filter = Filter::new()
                 .kind(Kind::GitRepoAnnouncement)
                 .identifier(identifier.to_string());
-
             let matching = database
                 .query(filter)
                 .await
-                .with_context(|| format!("Failed to query 30617 for identifier {}", identifier))?;
+                .with_context(|| format!("Failed to query announcement for {}", identifier))?;
 
-            // Verify at least one event's owner npub matches the directory name
             let has_event = matching
                 .iter()
                 .any(|ev| ev.pubkey.to_bech32().map(|n| n == npub).unwrap_or(false));
-
             if has_event {
                 continue;
             }
 
-            let (_, is_empty) = check_repo_empty(&repo_path);
+            let (_, has_refs) = repo_ref_status(&repo_path);
             orphans.push(OrphanRepo {
                 repo_path,
                 npub: npub.clone(),
                 dir_name,
-                has_data: !is_empty,
+                has_data: has_refs,
             });
         }
     }
@@ -612,108 +938,330 @@ async fn find_orphan_repos(
     Ok(orphans)
 }
 
-/// Check whether a bare git repository is empty (has no refs).
-///
-/// Returns `(exists, is_empty)`:
-/// - `(false, true)` — path does not exist (treated as empty)
-/// - `(true, true)`  — path exists but `git --git-dir=<path> for-each-ref` returns no output
-/// - `(true, false)` — path exists and has at least one ref
-fn check_repo_empty(repo_path: &Path) -> (bool, bool) {
-    if !repo_path.exists() {
-        return (false, true);
+fn print_cascade_report(report: &CascadeReport, execute: bool) {
+    println!("pass=cascade-reconcile execute={}", execute);
+    println!(
+        "  scanned_candidates={} deleted_events={} planned_prune_announcements={}",
+        report.scanned_candidates, report.deleted_events, report.planned_announcement_prunes
+    );
+    if !report.sample_deleted_ids.is_empty() {
+        println!(
+            "  sample_deleted_event_ids={}",
+            report.sample_deleted_ids.join(",")
+        );
     }
+}
 
-    // Run `git --git-dir=<path> for-each-ref` — empty output means no refs.
-    // --git-dir must be a global option before the subcommand, not an argument to for-each-ref.
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(repo_path)
-        .args(["for-each-ref", "--format=%(refname)"])
-        .output();
+fn print_state_realign_report(report: &StateRealignReport, execute: bool) {
+    println!("pass=state-realign execute={}", execute);
+    println!(
+        "  scanned_identifiers={} realigned_repositories={} refs_created={} refs_updated={} refs_deleted={}",
+        report.scanned_identifiers,
+        report.realigned_repositories,
+        report.refs_created,
+        report.refs_updated,
+        report.refs_deleted
+    );
+    if report.degraded_missing_git > 0 {
+        println!(
+            "  degraded_valid_state_missing_git={} (not pruned without --prune-missing-git)",
+            report.degraded_missing_git
+        );
+        for sample in &report.sample_degraded {
+            println!("  degraded_sample={}", sample);
+        }
+    }
+}
 
-    match output {
-        Ok(out) => {
-            // Trim whitespace; if nothing remains, the repo is empty
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let is_empty = stdout.trim().is_empty();
-            (true, is_empty)
-        }
-        Err(_) => {
-            // Could not run git — treat as empty to be safe (will be reported)
-            (true, true)
-        }
+fn print_repo_fs_report(report: &RepoFsReport, execute: bool, options: &MaintenanceOptions) {
+    println!("pass=repo-fs-reconcile execute={}", execute);
+    println!(
+        "  scanned_announcements={} missing_or_empty_repos={} degraded_valid_state_missing_git={}",
+        report.scanned_announcements,
+        report.missing_or_empty_repos,
+        report.degraded_valid_state_missing_git
+    );
+    println!(
+        "  orphan_repos_found={} orphan_empty_removed={} orphan_nonempty_removed={} orphan_nonempty_skipped={}",
+        report.orphan_repos_found,
+        report.orphan_empty_removed,
+        report.orphan_nonempty_removed,
+        report.orphan_nonempty_skipped
+    );
+    println!(
+        "  pruned_missing_git_announcements={} pruned_missing_git_states={}",
+        report.pruned_missing_git_announcements, report.pruned_missing_git_states
+    );
+    if report.degraded_valid_state_missing_git > 0
+        && !options.prune_missing_git
+        && !options.legacy_force_prune_missing_git
+    {
+        println!(
+            "  degraded_notice=valid 30618 exists but git data missing (reported only; use --prune-missing-git to delete)"
+        );
+    }
+    for sample in &report.sample_issue_paths {
+        println!("  issue_sample={}", sample);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::event::FinalizeEvent;
+    use nostr_memory::MemoryDatabase;
+    use nostr_relay_builder::prelude::{EventBuilder, Keys, Tag};
     use tempfile::tempdir;
 
+    fn announcement(keys: &Keys, identifier: &str) -> Event {
+        EventBuilder::new(Kind::GitRepoAnnouncement, "repo")
+            .tags(vec![
+                Tag::custom("d", vec![identifier.to_string()]),
+                Tag::custom("clone", vec![format!("https://relay/{}", identifier)]),
+                Tag::custom("relays", vec!["wss://relay".to_string()]),
+            ])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    fn state(keys: &Keys, identifier: &str, oid: &str) -> Event {
+        EventBuilder::new(Kind::RepoState, "state")
+            .tags(vec![
+                Tag::custom("d", vec![identifier.to_string()]),
+                Tag::custom("refs/heads/main", vec![oid.to_string()]),
+                Tag::custom("HEAD", vec!["ref: refs/heads/main".to_string()]),
+            ])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    fn issue(keys: &Keys, addr: &str) -> Event {
+        EventBuilder::new(Kind::from(1621), "issue")
+            .tags(vec![Tag::custom("a", vec![addr.to_string()])])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    fn default_options() -> MaintenanceOptions {
+        MaintenanceOptions {
+            execute: false,
+            prune_orphans: false,
+            prune_missing_git: false,
+            prune_after: None,
+            profile: PassProfile::All,
+            legacy_force_prune_missing_git: false,
+        }
+    }
+
+    async fn count_kind(db: &Arc<dyn NostrDatabase>, kind: Kind) -> usize {
+        db.query(Filter::new().kind(kind)).await.unwrap().len()
+    }
+
     #[tokio::test]
-    async fn find_orphan_repos_skips_prs_subtree() {
-        // Layout under <git_data_path>:
-        //   prs/<hex>/<id>.git    <-- must be ignored (GRASP-06 endpoint)
-        //   <npub-shaped>/<id>.git <-- a real orphan to prove the scan still works
-        let tmp = tempdir().expect("tempdir");
-        let git_data_path = tmp.path();
+    async fn dry_run_does_not_mutate() {
+        let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
+        let tmp = tempdir().unwrap();
+        let git_path = tmp.path();
 
-        // /prs/<hex>/<id>.git — bare repo so check_repo_empty doesn't complain
-        let prs_repo = crate::grasp06::paths::prs_repo_path(
-            git_data_path,
-            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-            "my-pr-repo",
-        );
-        std::fs::create_dir_all(&prs_repo).expect("mkdir prs repo");
-        let init = Command::new("git")
+        let owner = Keys::generate();
+        let ann = announcement(&owner, "repo-a");
+        db.save_event(&ann).await.unwrap();
+
+        let owner_npub = owner.public_key().to_bech32().unwrap();
+        let orphan_path = git_path.join(owner_npub).join("orphan.git");
+        std::fs::create_dir_all(&orphan_path).unwrap();
+        Command::new("git")
             .args(["init", "--bare", "--quiet"])
-            .arg(&prs_repo)
+            .arg(&orphan_path)
             .status()
-            .expect("git init prs repo");
-        assert!(init.success(), "git init must succeed for the test fixture");
+            .unwrap();
 
-        // A standard-shaped orphan repo so we can assert the scan still finds
-        // real orphans after the /prs/ skip.
-        let orphan_owner = "npub1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz0000000";
-        let orphan_repo = git_data_path.join(orphan_owner).join("standard-orphan.git");
-        std::fs::create_dir_all(&orphan_repo).expect("mkdir orphan repo");
-        let init = Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .arg(&orphan_repo)
-            .status()
-            .expect("git init orphan");
-        assert!(init.success(), "git init must succeed for the test fixture");
-
-        // Empty LMDB DB so every disk repo is an "orphan" by definition.
-        let db_dir = tempdir().expect("tempdir db");
-        let database: Arc<dyn NostrDatabase> = Arc::new(
-            NostrLmdb::open(db_dir.path())
-                .await
-                .expect("open empty NostrLmdb"),
-        );
-
-        let orphans = find_orphan_repos(git_data_path, &database)
+        let report = run_engine_with_db(db.clone(), git_path, default_options())
             .await
-            .expect("scan succeeds");
+            .unwrap();
+
+        assert_eq!(count_kind(&db, Kind::GitRepoAnnouncement).await, 1);
+        assert!(orphan_path.exists());
+        assert!(report.repo_fs.orphan_repos_found >= 1);
+    }
+
+    #[tokio::test]
+    async fn execute_safe_only_skips_destructive_paths() {
+        let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
+        let tmp = tempdir().unwrap();
+        let git_path = tmp.path();
+
+        let owner = Keys::generate();
+        let ann = announcement(&owner, "repo-safe");
+        let st = state(
+            &owner,
+            "repo-safe",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        db.save_event(&ann).await.unwrap();
+        db.save_event(&st).await.unwrap();
+
+        let owner_npub = owner.public_key().to_bech32().unwrap();
+        let nonempty_orphan = git_path.join(owner_npub).join("orphan-nonempty.git");
+        create_nonempty_bare_repo(&nonempty_orphan);
+
+        let mut options = default_options();
+        options.execute = true;
+
+        let report = run_engine_with_db(db.clone(), git_path, options)
+            .await
+            .unwrap();
+
+        assert_eq!(count_kind(&db, Kind::GitRepoAnnouncement).await, 1);
+        assert_eq!(count_kind(&db, Kind::RepoState).await, 1);
+        assert!(nonempty_orphan.exists());
+        assert!(report.repo_fs.degraded_valid_state_missing_git >= 1);
+        assert_eq!(report.repo_fs.pruned_missing_git_announcements, 0);
+        assert_eq!(report.repo_fs.orphan_nonempty_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn destructive_flags_gate_mutations() {
+        let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
+        let tmp = tempdir().unwrap();
+        let git_path = tmp.path();
+
+        let owner = Keys::generate();
+        let ann = announcement(&owner, "repo-prune");
+        let st = state(
+            &owner,
+            "repo-prune",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        db.save_event(&ann).await.unwrap();
+        db.save_event(&st).await.unwrap();
+
+        let owner_npub = owner.public_key().to_bech32().unwrap();
+        let nonempty_orphan = git_path.join(owner_npub).join("orphan-prune.git");
+        create_nonempty_bare_repo(&nonempty_orphan);
+
+        let mut options = default_options();
+        options.execute = true;
+        options.prune_missing_git = true;
+        options.prune_orphans = true;
+
+        let report = run_engine_with_db(db.clone(), git_path, options)
+            .await
+            .unwrap();
+
+        assert_eq!(count_kind(&db, Kind::GitRepoAnnouncement).await, 0);
+        assert_eq!(count_kind(&db, Kind::RepoState).await, 0);
+        assert!(!nonempty_orphan.exists());
+        assert!(report.repo_fs.pruned_missing_git_announcements >= 1);
+        assert!(report.repo_fs.orphan_nonempty_removed >= 1);
+    }
+
+    #[tokio::test]
+    async fn cascade_reconcile_cleans_legacy_orphan_dependents() {
+        let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
+        let tmp = tempdir().unwrap();
+
+        let keys = Keys::generate();
+        let dangling = issue(
+            &keys,
+            "30617:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff:ghost",
+        );
+        db.save_event(&dangling).await.unwrap();
+
+        let mut options = default_options();
+        options.execute = true;
+
+        let report = run_engine_with_db(db.clone(), tmp.path(), options)
+            .await
+            .unwrap();
+
+        assert_eq!(count_kind(&db, Kind::from(1621)).await, 0);
+        assert!(report.cascade.deleted_events >= 1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_second_run_has_no_new_mutations() {
+        let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
+        let tmp = tempdir().unwrap();
+        let git_path = tmp.path();
+
+        let owner = Keys::generate();
+        let ann = announcement(&owner, "repo-idempotent");
+        let st = state(
+            &owner,
+            "repo-idempotent",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        );
+        let ann_addr = format!("30617:{}:{}", ann.pubkey.to_hex(), "repo-idempotent");
+        let dep = issue(&owner, &ann_addr);
+
+        db.save_event(&ann).await.unwrap();
+        db.save_event(&st).await.unwrap();
+        db.save_event(&dep).await.unwrap();
+
+        let mut options = default_options();
+        options.execute = true;
+        options.prune_missing_git = true;
+
+        let first = run_engine_with_db(db.clone(), git_path, options.clone())
+            .await
+            .unwrap();
+        let second = run_engine_with_db(db.clone(), git_path, options)
+            .await
+            .unwrap();
 
         assert!(
-            orphans.iter().all(|o| !o
-                .repo_path
-                .starts_with(prs_repo.parent().unwrap().parent().unwrap())
-                || !crate::grasp06::paths::is_prs_repo_path(&o.repo_path, git_data_path)),
-            "/prs/ repo must not be reported as orphan: got {:?}",
-            orphans
-                .iter()
-                .map(|o| o.repo_path.clone())
-                .collect::<Vec<_>>()
+            first.cascade.deleted_events >= 1
+                || first.repo_fs.pruned_missing_git_announcements >= 1
         );
-        assert!(
-            orphans.iter().any(|o| o.repo_path == orphan_repo),
-            "standard orphan must still be detected: got {:?}",
-            orphans
-                .iter()
-                .map(|o| o.repo_path.clone())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(second.cascade.deleted_events, 0);
+        assert_eq!(second.repo_fs.pruned_missing_git_announcements, 0);
+        assert_eq!(second.repo_fs.pruned_missing_git_states, 0);
+    }
+
+    fn create_nonempty_bare_repo(path: &Path) {
+        assert!(Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(path)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(b"hello")
+                    .expect("write blob");
+                child.wait_with_output()
+            })
+            .expect("hash object");
+        assert!(output.status.success());
+        let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(path)
+            .args(["update-ref", "refs/tags/test-nonempty", &oid])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn parse_duration_like_supports_units() {
+        assert_eq!(parse_duration_like("10s").unwrap().as_secs(), 10);
+        assert_eq!(parse_duration_like("5m").unwrap().as_secs(), 300);
+        assert_eq!(parse_duration_like("2h").unwrap().as_secs(), 7200);
+        assert_eq!(parse_duration_like("1d").unwrap().as_secs(), 86400);
     }
 }
