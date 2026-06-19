@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -12,7 +11,7 @@ use nostr_relay_builder::prelude::Event;
 use super::{accepted_purgatory, duplicate, reject_invalid, reject_restricted, PolicyContext};
 use crate::git;
 use crate::git::authorization::fetch_repository_data_with_purgatory;
-use crate::nostr::deletion::DeletionService;
+use crate::git::sync::PurgatoryPromotionServices;
 use crate::nostr::events::{validate_state, RepositoryAnnouncement, RepositoryState};
 
 /// Result of state policy evaluation
@@ -54,7 +53,7 @@ impl StatePolicy {
         &self,
         event: &Event,
         is_synced: bool,
-        deletion_service: Option<&DeletionService>,
+        promotion_services: PurgatoryPromotionServices<'_>,
     ) -> Result<WritePolicyResult> {
         // Parse state to get HEAD and branch info
         let state =
@@ -218,44 +217,26 @@ impl StatePolicy {
             }
 
             // After copying OIDs to other owner repos, promote any purgatory announcements
-            // for those repos. This handles the case where two maintainers push to the same
-            // identifier on the same relay with identical commit hashes: the second maintainer's
-            // announcement sits in purgatory, and when their state event arrives the relay copies
-            // commits from the first maintainer's repo — but without this call the announcement
-            // would stay in purgatory indefinitely.
+            // for repos that became populated by the copy.
             let local_relay = self.ctx.get_local_relay();
-            let empty_oids: HashSet<String> = HashSet::new();
-            for announcement in &db_repo_data.announcements {
-                let target_repo_path = self.ctx.git_data_path.join(announcement.repo_path());
-                if target_repo_path != repo_with_git_data {
-                    // OIDs were copied to this repo by process_state_with_git_data;
-                    // check if there's a purgatory announcement waiting for it.
-                    let promotion_services = deletion_service
-                        .map(|deletion| {
-                            crate::git::sync::PurgatoryPromotionServices::RecoveryOnly { deletion }
-                        })
-                        .unwrap_or_default();
+            let promotion_result = crate::git::sync::process_repos_populated_by_state_copy(
+                &repo_with_git_data,
+                &db_repo_data,
+                &self.ctx.database,
+                local_relay.as_ref(),
+                &self.ctx.purgatory,
+                &self.ctx.git_data_path,
+                promotion_services,
+            )
+            .await;
 
-                    if let Err(e) = crate::git::sync::process_newly_available_git_data(
-                        &target_repo_path,
-                        &empty_oids,
-                        &self.ctx.database,
-                        local_relay.as_ref(),
-                        &self.ctx.purgatory,
-                        &self.ctx.git_data_path,
-                        promotion_services,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            identifier = %state.identifier,
-                            event_id = %event.id,
-                            repo_path = %target_repo_path.display(),
-                            error = %e,
-                            "Failed to process purgatory announcements for target repo after git sync copy"
-                        );
-                    }
-                }
+            for error in promotion_result.errors {
+                tracing::warn!(
+                    identifier = %state.identifier,
+                    event_id = %event.id,
+                    error = %error,
+                    "Error processing purgatory announcements for repos populated by state copy"
+                );
             }
 
             // Event will be saved and broadcast by relay builder

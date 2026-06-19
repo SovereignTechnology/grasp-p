@@ -969,6 +969,57 @@ pub async fn process_newly_available_git_data(
     Ok(result)
 }
 
+/// Process purgatory promotions for owner repos populated by state-event OID copies.
+///
+/// [`crate::git::process::process_state_with_git_data`] copies OIDs from the
+/// source repo to other authorized owner repos for the same identifier. Those
+/// target repos may now satisfy purgatory announcements even though no direct
+/// push or fetch happened for the target repo path. This helper runs the normal
+/// newly-available-git-data pipeline for each populated target repo so promotion
+/// behavior stays centralized in this module.
+pub async fn process_repos_populated_by_state_copy(
+    source_repo_path: &Path,
+    repo_data: &RepositoryData,
+    database: &SharedDatabase,
+    local_relay: Option<&nostr_relay_builder::LocalRelay>,
+    purgatory: &Purgatory,
+    git_data_path: &Path,
+    promotion_services: PurgatoryPromotionServices<'_>,
+) -> ProcessResult {
+    let empty_oids: HashSet<String> = HashSet::new();
+    let mut aggregate = ProcessResult::default();
+
+    for announcement in &repo_data.announcements {
+        let target_repo_path = git_data_path.join(announcement.repo_path());
+        if target_repo_path == source_repo_path {
+            continue;
+        }
+
+        match process_newly_available_git_data(
+            &target_repo_path,
+            &empty_oids,
+            database,
+            local_relay,
+            purgatory,
+            git_data_path,
+            promotion_services,
+        )
+        .await
+        {
+            Ok(result) => aggregate.merge(result),
+            Err(e) => {
+                aggregate.errors.push(format!(
+                    "Failed to process purgatory announcements for repo {}: {}",
+                    target_repo_path.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    aggregate
+}
+
 /// Process state events from purgatory that can now be applied.
 ///
 /// This checks if we have all the git OIDs needed to apply each state event.

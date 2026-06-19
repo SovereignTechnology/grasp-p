@@ -15,6 +15,7 @@ use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
+use crate::git::sync::PurgatoryPromotionServices;
 use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
@@ -403,7 +404,13 @@ impl Nip34WritePolicy {
                 // Process state alignment asynchronously
                 match self
                     .state_policy
-                    .process_state_event(event, is_synced, Some(self.deletion()))
+                    .process_state_event(
+                        event,
+                        is_synced,
+                        PurgatoryPromotionServices::RecoveryOnly {
+                            deletion: self.deletion(),
+                        },
+                    )
                     .await
                 {
                     Ok(policy_result) => {
@@ -622,7 +629,13 @@ impl Nip34WritePolicy {
             // Re-evaluate authorization with the new announcement
             match self
                 .state_policy
-                .process_state_event(&entry.event, false, Some(self.deletion()))
+                .process_state_event(
+                    &entry.event,
+                    false,
+                    PurgatoryPromotionServices::RecoveryOnly {
+                        deletion: self.deletion(),
+                    },
+                )
                 .await
             {
                 Ok(WritePolicyResult::Accept) => {
