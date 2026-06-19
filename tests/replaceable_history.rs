@@ -74,7 +74,11 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
         .expect("create audit client");
 
     let (_announcement, repo_id) = publish_served_repo(&client, "history-30618").await;
-    let base_ts = Timestamp::now();
+    // The fixture published by `publish_served_repo` already saved a 30618
+    // for this coordinate. Use a deterministic later timestamp so this test's
+    // "old" version is always a valid replacement instead of racing the
+    // fixture event within the same one-second Nostr timestamp bucket.
+    let base_ts = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
     let old_state = build_state_version(&client, &repo_id, base_ts, "state-v1");
     let new_state = build_state_version(
         &client,
@@ -96,7 +100,10 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
     let coordinate = format!("30618:{}:{}", client.public_key().to_hex(), repo_id);
     let history = open_history(relay.relay_data_path()).await;
     let records = history
-        .superseded_records_for_coordinate_before(&coordinate, Timestamp::now())
+        .superseded_records_for_coordinate_before(
+            &coordinate,
+            Timestamp::from_secs(new_state.created_at.as_secs() + 1),
+        )
         .await;
 
     assert!(
@@ -244,7 +251,9 @@ async fn serving_behavior_unchanged_latest_version_is_still_served() {
         .expect("create audit client");
 
     let (_announcement, repo_id) = publish_served_repo(&client, "history-serving").await;
-    let base_ts = Timestamp::now();
+    // The helper publishes an initial 30618 for this coordinate. Ensure the
+    // state versions created here are strictly newer than that fixture event.
+    let base_ts = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
     let old_state = build_state_version(&client, &repo_id, base_ts, "state-old");
     let new_state = build_state_version(
         &client,

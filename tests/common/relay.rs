@@ -16,19 +16,21 @@ use nostr_sdk::prelude::ToBech32;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
 use crate::common::port::{self, PortReservation};
 
-/// How long to wait for the spawned ngit-grasp subprocess to accept TCP
-/// connections before giving up on a single attempt.
+/// How long to wait for the spawned ngit-grasp subprocess to handle HTTP
+/// requests before giving up on a single attempt.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to retry the TCP probe while waiting for readiness.
 const READY_POLL: Duration = Duration::from_millis(100);
-/// Extra grace after the listener accepts before declaring the relay
-/// ready. Mirrors the existing fixture; without it the first WebSocket
-/// upgrade can race the handler wiring.
+/// Extra grace after the HTTP service responds before declaring the relay
+/// ready.
 const READY_GRACE: Duration = Duration::from_millis(100);
+/// Per-attempt timeout for the HTTP readiness probe once TCP connects.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How many fresh port reservations to attempt before giving up. The
 /// subprocess binds itself from `NGIT_BIND_ADDRESS`, so there is a
 /// microsecond-scale TOCTOU window between [`PortReservation::release`]
@@ -554,10 +556,10 @@ impl TestRelay {
                 }
             }
 
-            match tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await {
-                Ok(_) => {
-                    // Connection successful, relay is ready
-                    // Give it a tiny bit more time to fully initialize
+            match self.probe_http_ready().await {
+                Ok(()) => {
+                    // HTTP service handled a request successfully, so the
+                    // accept loop, Hyper service, and relay wiring are ready.
                     sleep(READY_GRACE).await;
                     return ReadyOutcome::Ready;
                 }
@@ -572,6 +574,45 @@ impl TestRelay {
                 }
             }
         }
+    }
+
+    async fn probe_http_ready(&self) -> std::io::Result<()> {
+        let probe = async {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await?;
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                self.port
+            );
+            stream.write_all(request.as_bytes()).await?;
+
+            let mut response = [0_u8; 64];
+            let read = stream.read(&mut response).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "readiness probe got empty HTTP response",
+                ));
+            }
+
+            let status = String::from_utf8_lossy(&response[..read]);
+            if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200") {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("readiness probe got non-200 response: {status:?}"),
+                ))
+            }
+        };
+
+        tokio::time::timeout(READY_PROBE_TIMEOUT, probe)
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP readiness probe timed out",
+                ))
+            })
     }
 
     /// Stop the relay
