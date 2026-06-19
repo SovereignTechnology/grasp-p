@@ -537,6 +537,70 @@ async fn purgatory_promotion_recovery_respects_state_tombstones() {
 }
 
 #[tokio::test]
+async fn purgatory_promotion_tombstoned_pr_events_do_not_restore_pr_refs() {
+    let fixture =
+        setup_parked_announcement_with_failed_ingest_recovery("promotion-recovery-pr-tombstones", false)
+            .await;
+
+    fixture
+        .client
+        .send_event(build_deletion(
+            &fixture.client,
+            &[fixture.pr.id, fixture.pr_update.id],
+            &[],
+        ))
+        .await
+        .expect("submit PR tombstone deletion request before promotion");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    std::fs::write(&fixture.archive_path, &fixture.archive_backup)
+        .expect("restore archive bytes before PR tombstone promotion");
+
+    let promoted_state =
+        submit_new_state_and_push_for_promotion(&fixture, "promotion-pr-tombstone").await;
+
+    assert!(fixture
+        .client
+        .is_event_on_relay(fixture.reannouncement.id)
+        .await
+        .expect("query promoted re-announcement"));
+    assert!(fixture
+        .client
+        .is_event_on_relay(promoted_state.id)
+        .await
+        .expect("query promoted new state"));
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.pr.id)
+            .await
+            .expect("query tombstoned pr"),
+        "tombstoned PR must not resurrect during recovery"
+    );
+    assert!(
+        !fixture
+            .client
+            .is_event_on_relay(fixture.pr_update.id)
+            .await
+            .expect("query tombstoned pr update"),
+        "tombstoned PR update must not resurrect during recovery"
+    );
+
+    let pr_ref = format!("refs/nostr/{}", fixture.pr.id.to_hex());
+    let pr_update_ref = format!("refs/nostr/{}", fixture.pr_update.id.to_hex());
+    assert!(
+        bare_ref_value(&fixture.repo_path, &pr_ref).is_none(),
+        "tombstoned PR should have refs/nostr entry cleaned during recovery"
+    );
+    assert!(
+        bare_ref_value(&fixture.repo_path, &pr_update_ref).is_none(),
+        "tombstoned PR update should have refs/nostr entry cleaned during recovery"
+    );
+
+    fixture.relay.stop().await;
+}
+
+#[tokio::test]
 async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
     let fixture = setup_parked_announcement_with_failed_ingest_recovery(
         "promotion-recovery-idempotent",

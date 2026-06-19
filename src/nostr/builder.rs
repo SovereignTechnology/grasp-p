@@ -1771,6 +1771,13 @@ impl Nip34WritePolicy {
     }
 
     fn pr_event_identifiers(event: &Event) -> BTreeSet<String> {
+        Self::pr_event_announcement_scopes(event)
+            .into_iter()
+            .map(|(_, identifier)| identifier)
+            .collect()
+    }
+
+    fn pr_event_announcement_scopes(event: &Event) -> BTreeSet<(PublicKey, String)> {
         event
             .tags
             .iter()
@@ -1785,13 +1792,21 @@ impl Nip34WritePolicy {
                     return None;
                 }
 
-                Some(coord[2].to_string())
+                let owner = PublicKey::from_hex(coord[1]).ok()?;
+                Some((owner, coord[2].to_string()))
             })
             .collect()
     }
 
     async fn pr_target_repo_paths_for_recovery(&self, event: &Event) -> BTreeSet<PathBuf> {
         let mut paths = BTreeSet::new();
+
+        for (owner, identifier) in Self::pr_event_announcement_scopes(event) {
+            paths.insert(self.repo_path_for_owner_and_identifier(
+                &Self::owner_directory_component(&owner),
+                &identifier,
+            ));
+        }
 
         for identifier in Self::pr_event_identifiers(event) {
             let Ok(repo_data) =
@@ -1876,6 +1891,34 @@ impl Nip34WritePolicy {
         Ok(restored_any)
     }
 
+    async fn cleanup_pr_git_refs_for_tombstoned_event(&self, event: &Event) {
+        if !matches!(
+            event.kind,
+            Kind::GitPullRequest | Kind::GitPullRequestUpdate
+        ) {
+            return;
+        }
+
+        let ref_name = format!("refs/nostr/{}", event.id.to_hex());
+        let repo_paths = self.pr_target_repo_paths_for_recovery(event).await;
+
+        for repo_path in repo_paths {
+            if !repo_path.is_dir() {
+                continue;
+            }
+
+            if let Err(e) = crate::git::delete_ref(&repo_path, &ref_name) {
+                tracing::debug!(
+                    event_id = %event.id.to_hex(),
+                    repo = %repo_path.display(),
+                    ref_name = %ref_name,
+                    error = %e,
+                    "Recovery tombstone cleanup: PR git ref not deleted for this repository"
+                );
+            }
+        }
+    }
+
     async fn restore_events_from_holding(
         &self,
         records: &[RecoveryMetadataRecord],
@@ -1893,6 +1936,7 @@ impl Nip34WritePolicy {
             match self.ctx.holding.archived_event(&event_id).await {
                 Ok(Some(event)) => {
                     if self.recovery_blocked_by_tombstone(&event).await {
+                        self.cleanup_pr_git_refs_for_tombstoned_event(&event).await;
                         tracing::info!(
                             event_id = %event.id.to_hex(),
                             kind = event.kind.as_u16(),
