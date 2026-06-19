@@ -1,7 +1,9 @@
 /// Nostr Relay Builder Configuration
 ///
-/// This module integrates nostr-relay-builder with NIP-34 validation logic
-/// using modular sub-policies for each event type.
+/// Wires nostr-relay-builder with NIP-34 admission/routing policy.
+/// Deletion behaviour is owned by the `deletion` subsystem
+/// (`crate::nostr::deletion`); this module holds only thin delegation
+/// accessors and the top-level `admit_event` dispatch.
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -13,10 +15,7 @@ use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
-use crate::nostr::deletion::{
-    BlacklistParityStats, BlacklistRestoreStats, DeletionContext, DeletionService,
-    WhitelistParityStats, WhitelistRestoreStats,
-};
+use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::{LifecycleReadGuard, LifecycleWriteGuard};
@@ -29,16 +28,21 @@ use crate::nostr::policy::{
 /// Type alias for the shared database used by the relay
 pub type SharedDatabase = Arc<dyn NostrDatabase>;
 
-/// NIP-34 Write Policy with Full GRASP-01 Event Validation
+/// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
-/// Validates all events according to GRASP-01 specification using modular sub-policies:
-/// - `AnnouncementPolicy` - Repository announcement validation
-/// - `StatePolicy` - State event validation + ref alignment
-/// - `PrEventPolicy` - PR/PR Update validation
-/// - `RelatedEventPolicy` - Forward/backward reference checking
-/// - `DeletionPolicy` - NIP-09 event deletion request handling
+/// Acts as the top-level admission gate and router.  Each incoming event is:
+/// 1. Checked against the event blacklist.
+/// 2. Passed through the deletion gate (`DeletionService::gate`).
+/// 3. Dispatched to the appropriate sub-policy:
+///    - `AnnouncementPolicy` — repository announcement validation
+///    - `StatePolicy`        — state event validation + ref alignment
+///    - `PrEventPolicy`      — PR / PR-Update validation
+///    - `RelatedEventPolicy` — forward/backward reference checking
+///    - `DeletionService`    — NIP-09 deletion and NIP-62 vanish handling
 ///
-/// Uses stateful database queries to check event relationships.
+/// Deletion logic (cascade, holding, archive, recovery, startup passes) lives
+/// entirely in `crate::nostr::deletion`.  This struct exposes a `deletion()`
+/// accessor for callers that need to reach those operations directly.
 #[derive(Clone)]
 pub struct Nip34WritePolicy {
     ctx: PolicyContext,
@@ -172,49 +176,20 @@ impl Nip34WritePolicy {
             .await
     }
 
-    /// Startup-only blacklist parity pass.
-    ///
-    /// Scans already-stored kind-30617 announcements, identifies entries
-    /// matching `repository_blacklist`, and applies the same deletion pipeline as
-    /// NIP-09 (cascade + holding/archive) but with `DeletionSource::Blacklist`.
-    pub async fn run_startup_blacklist_parity_pass(&self) -> BlacklistParityStats {
-        self.deletion.run_startup_blacklist_parity_pass().await
-    }
-
-    /// Startup-only whitelist parity pass.
-    ///
-    /// Scans already-stored kind-30617 announcements that list this relay's
-    /// service domain and removes repositories that no longer match
-    /// `repository_whitelist`, using the same cascade + holding/archive flow as
-    /// NIP-09 but with `DeletionSource::Whitelist`.
-    pub async fn run_startup_whitelist_parity_pass(&self) -> WhitelistParityStats {
-        self.deletion.run_startup_whitelist_parity_pass().await
-    }
-
-    /// Startup-only blacklist restore pass.
-    ///
-    /// Scans holding metadata for scopes deleted by blacklist parity and restores
-    /// owner+identifier scopes that are no longer blacklisted and still inside
-    /// holding retention.
-    pub async fn run_startup_blacklist_restore_pass(&self) -> BlacklistRestoreStats {
-        self.deletion.run_startup_blacklist_restore_pass().await
-    }
-
-    /// Startup-only whitelist restore pass.
-    ///
-    /// Scans holding metadata for scopes deleted by whitelist parity and restores
-    /// owner+identifier scopes that now match `repository_whitelist`, are not
-    /// blacklisted, and are still inside holding retention.
-    pub async fn run_startup_whitelist_restore_pass(&self) -> WhitelistRestoreStats {
-        self.deletion.run_startup_whitelist_restore_pass().await
-    }
-
     /// Set the local relay for purgatory notifications.
     ///
     /// This must be called after the relay is created since the relay depends
     /// on this policy, but purgatory sync needs the relay to notify subscribers.
     pub fn set_local_relay(&self, relay: nostr_relay_builder::LocalRelay) {
         self.ctx.set_local_relay(relay);
+    }
+
+    /// Access the deletion subsystem directly.
+    ///
+    /// Exposes startup passes, recovery, and lifecycle locks without requiring
+    /// delegation wrappers on this struct.
+    pub fn deletion(&self) -> &DeletionService {
+        &self.deletion
     }
 
     /// Extract repository identifier from event's 'd' tag.
@@ -1198,19 +1173,4 @@ pub async fn create_relay(
         holding,
         history,
     })
-}
-
-impl Nip34WritePolicy {
-    /// Trigger recovery for a repository scope identified by the announcement event.
-    ///
-    /// Thin delegating wrapper — recovery logic lives in `DeletionService`.
-    pub(crate) async fn maybe_recover_deleted_repository(
-        &self,
-        event: &Event,
-        identifier: &str,
-    ) -> bool {
-        self.deletion
-            .maybe_recover_deleted_repository(event, identifier)
-            .await
-    }
 }

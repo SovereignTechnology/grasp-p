@@ -1139,7 +1139,8 @@ async fn process_purgatory_state_events(
                         if let (Some(wp), Some(entry)) =
                             (write_policy, purgatory.find_announcement(owner, identifier))
                         {
-                            wp.maybe_recover_deleted_repository(&entry.event, identifier)
+                            wp.deletion()
+                                .maybe_recover_deleted_repository(&entry.event, identifier)
                                 .await;
                         }
 
@@ -1450,7 +1451,8 @@ async fn process_purgatory_announcements(
         write_policy,
         purgatory.find_announcement(&owner, identifier),
     ) {
-        wp.maybe_recover_deleted_repository(&entry.event, identifier)
+        wp.deletion()
+            .maybe_recover_deleted_repository(&entry.event, identifier)
             .await;
     }
 

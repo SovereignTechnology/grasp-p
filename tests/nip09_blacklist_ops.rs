@@ -143,7 +143,7 @@ async fn startup_blacklist_scan_deletes_matching_repositories_via_holding_archiv
     config.repository_blacklist = owner_npub;
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.matched_announcements, 1);
     assert_eq!(stats.successful_deletions, 1);
@@ -220,7 +220,7 @@ async fn blacklist_startup_deletion_runs_even_when_disrespector_is_enabled() {
     };
 
     let policy = make_policy(config, db.clone(), holding, git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.successful_deletions, 1);
     assert!(
@@ -251,7 +251,7 @@ async fn startup_blacklist_scan_leaves_non_matching_repositories_untouched() {
     config.repository_blacklist = "different-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.matched_announcements, 0);
     assert!(
@@ -300,7 +300,7 @@ async fn startup_whitelist_scan_deletes_non_matching_repositories_via_holding_ar
     config.repository_whitelist = "allowed-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_whitelist_parity_pass().await;
+    let stats = policy.deletion().run_startup_whitelist_parity_pass().await;
 
     assert_eq!(stats.mismatched_announcements, 1);
     assert_eq!(stats.successful_deletions, 1);
@@ -350,7 +350,7 @@ async fn startup_whitelist_scan_leaves_matching_repositories_untouched() {
     config.repository_whitelist = "matching-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_whitelist_parity_pass().await;
+    let stats = policy.deletion().run_startup_whitelist_parity_pass().await;
 
     assert_eq!(stats.mismatched_announcements, 0);
     assert!(
@@ -401,7 +401,10 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_whitelist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_whitelist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     if repo_path.exists() {
@@ -433,7 +436,10 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 1);
     assert_eq!(restore_stats.successful_restores, 1);
@@ -488,7 +494,10 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
     );
     assert_eq!(success_after, success_before + 1.0);
 
-    let second_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let second_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(second_stats.scanned_scopes, 0);
     assert_eq!(second_stats.attempted_restores, 0);
     assert_eq!(second_stats.successful_restores, 0);
@@ -531,7 +540,10 @@ async fn startup_whitelist_restore_skips_scopes_still_not_whitelisted() {
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_whitelist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_whitelist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     let restore_policy = make_policy(
@@ -545,7 +557,10 @@ async fn startup_whitelist_restore_skips_scopes_still_not_whitelisted() {
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 0);
     assert_eq!(restore_stats.successful_restores, 0);
@@ -608,7 +623,10 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_blacklist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     if repo_path.exists() {
@@ -640,7 +658,10 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 1);
     assert_eq!(restore_stats.successful_restores, 1);
@@ -695,7 +716,10 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
     );
     assert_eq!(success_after, success_before + 1.0);
 
-    let second_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let second_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(second_stats.scanned_scopes, 0);
     assert_eq!(second_stats.attempted_restores, 0);
     assert_eq!(second_stats.successful_restores, 0);
@@ -737,7 +761,10 @@ async fn startup_blacklist_restore_skips_scopes_still_blacklisted() {
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_blacklist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     let restore_policy = make_policy(
@@ -752,7 +779,10 @@ async fn startup_blacklist_restore_skips_scopes_still_blacklisted() {
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 0);
     assert_eq!(restore_stats.successful_restores, 0);
@@ -869,7 +899,7 @@ async fn metrics_increment_on_blacklist_cleanup_recovery_and_manual_ejection_pat
         ..base_config()
     };
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let _ = policy.run_startup_blacklist_parity_pass().await;
+    let _ = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     // Holding cleanup path
     let stale = EventBuilder::new(Kind::TextNote, "stale")

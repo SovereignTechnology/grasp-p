@@ -266,6 +266,7 @@ async fn run_relay(config: Config) -> Result<()> {
         //    matching repository_whitelist and still within holding retention)
         let blacklist_stats = relay_with_db
             .write_policy
+            .deletion()
             .run_startup_blacklist_parity_pass()
             .await;
         if blacklist_stats.scanned_announcements > 0 || blacklist_stats.matched_announcements > 0 {
@@ -281,6 +282,7 @@ async fn run_relay(config: Config) -> Result<()> {
 
         let blacklist_restore_stats = relay_with_db
             .write_policy
+            .deletion()
             .run_startup_blacklist_restore_pass()
             .await;
         if blacklist_restore_stats.scanned_scopes > 0
@@ -298,6 +300,7 @@ async fn run_relay(config: Config) -> Result<()> {
 
         let whitelist_stats = relay_with_db
             .write_policy
+            .deletion()
             .run_startup_whitelist_parity_pass()
             .await;
         if whitelist_stats.scanned_announcements > 0 || whitelist_stats.mismatched_announcements > 0
@@ -314,6 +317,7 @@ async fn run_relay(config: Config) -> Result<()> {
 
         let whitelist_restore_stats = relay_with_db
             .write_policy
+            .deletion()
             .run_startup_whitelist_restore_pass()
             .await;
         if whitelist_restore_stats.scanned_scopes > 0
