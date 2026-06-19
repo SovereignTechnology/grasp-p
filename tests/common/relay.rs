@@ -24,7 +24,7 @@ use crate::common::port::{self, PortReservation};
 /// How long to wait for the spawned ngit-grasp subprocess to handle HTTP
 /// requests before giving up on a single attempt.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often to retry the TCP probe while waiting for readiness.
+/// How often to retry the HTTP probe while waiting for readiness.
 const READY_POLL: Duration = Duration::from_millis(100);
 /// Extra grace after the HTTP service responds before declaring the relay
 /// ready.
@@ -537,17 +537,18 @@ impl TestRelay {
         &self.relay_data_path
     }
 
-    /// Probe the listener with async TCP connects until it accepts,
-    /// while concurrently watching for the subprocess to exit early
-    /// (the signature of a lost port-bind race). Without the early-exit
-    /// check we'd burn the full [`READY_TIMEOUT`] on a process that's
-    /// already dead.
+    /// Probe the relay with a real HTTP request until it responds 200,
+    /// while concurrently watching for the subprocess to exit early (the
+    /// signature of a lost port-bind race). A raw TCP connect can succeed
+    /// before Hyper has installed the service that accepts test clients,
+    /// so HTTP readiness is the point where WebSocket clients may safely
+    /// begin racing the relay.
     async fn wait_for_ready_or_early_exit(&mut self) -> ReadyOutcome {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            // Check whether the subprocess has already exited. If so the
-            // TCP probe will never succeed — bail immediately so the
-            // caller can retry with a fresh port.
+            // Check whether the subprocess has already exited. If so no
+            // readiness probe can succeed — bail immediately so the caller
+            // can retry with a fresh port.
             match self.process.try_wait() {
                 Ok(Some(status)) => return ReadyOutcome::EarlyExit { status },
                 Ok(None) => { /* still running */ }
@@ -579,6 +580,9 @@ impl TestRelay {
     async fn probe_http_ready(&self) -> std::io::Result<()> {
         let probe = async {
             let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await?;
+            // Use the relay's HTTP handler rather than a bare TCP connect:
+            // this verifies the accept loop and Hyper service are both live,
+            // which is what the immediately-following WebSocket tests need.
             let request = format!(
                 "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
                 self.port

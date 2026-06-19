@@ -74,10 +74,11 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
         .expect("create audit client");
 
     let (_announcement, repo_id) = publish_served_repo(&client, "history-30618").await;
-    // The fixture published by `publish_served_repo` already saved a 30618
-    // for this coordinate. Use a deterministic later timestamp so this test's
-    // "old" version is always a valid replacement instead of racing the
-    // fixture event within the same one-second Nostr timestamp bucket.
+    // `publish_served_repo` already saved a 30618 for this coordinate. Nostr
+    // replaceable ordering is only second-granular, so a same-second "old"
+    // event can be rejected instead of superseding the fixture event. Start the
+    // test sequence in a deterministic future second to make both replacements
+    // strictly newer.
     let base_ts = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
     let old_state = build_state_version(&client, &repo_id, base_ts, "state-v1");
     let new_state = build_state_version(
@@ -102,6 +103,9 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
     let records = history
         .superseded_records_for_coordinate_before(
             &coordinate,
+            // The deterministic future timestamps can be ahead of wall-clock
+            // `Timestamp::now()`, so query just after the newest test event
+            // rather than using "now" as the history cutoff.
             Timestamp::from_secs(new_state.created_at.as_secs() + 1),
         )
         .await;
@@ -251,8 +255,9 @@ async fn serving_behavior_unchanged_latest_version_is_still_served() {
         .expect("create audit client");
 
     let (_announcement, repo_id) = publish_served_repo(&client, "history-serving").await;
-    // The helper publishes an initial 30618 for this coordinate. Ensure the
-    // state versions created here are strictly newer than that fixture event.
+    // `publish_served_repo` already saved a 30618 for this coordinate. Keep the
+    // explicit state sequence in future seconds so the relay's second-granular
+    // replaceable ordering cannot tie it with the fixture event.
     let base_ts = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
     let old_state = build_state_version(&client, &repo_id, base_ts, "state-old");
     let new_state = build_state_version(
