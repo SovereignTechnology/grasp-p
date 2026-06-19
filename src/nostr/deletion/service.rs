@@ -4,7 +4,7 @@ use nostr_relay_builder::prelude::{
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::policy::{reject_error, reject_invalid};
+use crate::nostr::policy::{reject_error, reject_invalid, AnnouncementResult};
 
 use super::{DeletionContext, DeletionPolicy};
 
@@ -116,6 +116,10 @@ impl DeletionService {
         );
 
         WritePolicyResult::Accept
+    }
+
+    pub(crate) fn admission_hooks(&self) -> DeletionAdmissionHooks<'_> {
+        DeletionAdmissionHooks { deletion: self }
     }
 
     /// Runtime de-list parity path for already-served repositories.
@@ -373,6 +377,87 @@ impl DeletionService {
                         .remove_state_event(&identifier, &entry.event.id);
                 }
             }
+        }
+    }
+}
+
+pub(crate) struct DeletionAdmissionHooks<'a> {
+    deletion: &'a DeletionService,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnnouncementAdmissionHookResult {
+    recovered_repository: bool,
+}
+
+impl AnnouncementAdmissionHookResult {
+    pub(crate) fn recovered_repository(&self) -> bool {
+        self.recovered_repository
+    }
+}
+
+impl DeletionAdmissionHooks<'_> {
+    /// Run deletion-owned side effects caused by announcement admission.
+    ///
+    /// The write policy decides routing/admission; this hook keeps runtime
+    /// de-list parity, deleted-repository recovery, and replaceable history
+    /// capture in the deletion facade.
+    pub(crate) async fn on_announcement_admission(
+        &self,
+        event: &Event,
+        result: &AnnouncementResult,
+    ) -> AnnouncementAdmissionHookResult {
+        let mut hook_result = AnnouncementAdmissionHookResult::default();
+
+        match result {
+            AnnouncementResult::Accept
+            | AnnouncementResult::AcceptArchive
+            | AnnouncementResult::AcceptMaintainer => {
+                self.deletion
+                    .maybe_apply_runtime_delist_deletion(event)
+                    .await;
+
+                if let Ok(announcement) = RepositoryAnnouncement::from_event(event.clone()) {
+                    hook_result.recovered_repository = self
+                        .deletion
+                        .maybe_recover_deleted_repository(event, &announcement.identifier)
+                        .await;
+
+                    self.deletion
+                        .capture_superseded_replaceable_history(event)
+                        .await;
+                }
+            }
+            AnnouncementResult::AcceptPurgatory => {
+                if let Ok(announcement) = RepositoryAnnouncement::from_event(event.clone()) {
+                    hook_result.recovered_repository = self
+                        .deletion
+                        .maybe_recover_deleted_repository(event, &announcement.identifier)
+                        .await;
+
+                    if hook_result.recovered_repository {
+                        self.deletion
+                            .capture_superseded_replaceable_history(event)
+                            .await;
+                    }
+                }
+            }
+            AnnouncementResult::Reject(_) => {
+                self.deletion
+                    .maybe_apply_runtime_delist_deletion(event)
+                    .await;
+            }
+        }
+
+        hook_result
+    }
+
+    /// Run deletion-owned side effects caused by state admission.
+    pub(crate) async fn on_state_admission(&self, event: &Event, result: &WritePolicyResult) {
+        if matches!(result, WritePolicyResult::Accept) {
+            self.deletion
+                .capture_superseded_replaceable_history(event)
+                .await;
         }
     }
 }

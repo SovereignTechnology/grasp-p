@@ -233,15 +233,17 @@ impl Nip34WritePolicy {
     async fn handle_announcement(&self, event: &Event) -> WritePolicyResult {
         let event_id_str = event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex());
 
-        match self.announcement_policy.validate(event).await {
+        let admission = self.announcement_policy.validate(event).await;
+        let deletion_hooks = self.deletion.admission_hooks();
+        let deletion_hook_result = deletion_hooks
+            .on_announcement_admission(event, &admission)
+            .await;
+
+        match admission {
             AnnouncementResult::Accept | AnnouncementResult::AcceptArchive => {
                 // Parse announcement to get repository details
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
-                        self.deletion
-                            .maybe_apply_runtime_delist_deletion(event)
-                            .await;
-
                         // Try to create bare repository if it doesn't exist
                         if let Err(e) = self
                             .announcement_policy
@@ -255,23 +257,11 @@ impl Nip34WritePolicy {
                             // Note: We still accept the event even if repo creation fails
                         }
 
-                        // Phase 5 recovery trigger: accepted re-announcement for
-                        // same owner+identifier can restore holding/archive state.
-                        self.deletion
-                            .maybe_recover_deleted_repository(event, &announcement.identifier)
-                            .await;
-
                         tracing::debug!("Accepted repository announcement: {}", event_id_str);
 
                         // Check purgatory for state events that might now be authorized
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
-
-                        self.prepare_accepted_event_persistence(
-                            event,
-                            SaveContext::DirectWritePolicyAcceptance,
-                        )
-                        .await;
 
                         WritePolicyResult::Accept
                     }
@@ -304,13 +294,7 @@ impl Nip34WritePolicy {
                     }
                 };
 
-                // Phase 5 recovery trigger for deleted repos: if eligible holding
-                // state exists, restore and accept immediately (no purgatory wait).
-                let recovered = self
-                    .deletion
-                    .maybe_recover_deleted_repository(event, &announcement.identifier)
-                    .await;
-                if recovered {
+                if deletion_hook_result.recovered_repository() {
                     tracing::info!(
                         identifier = %announcement.identifier,
                         event_id = %event_id_str,
@@ -326,11 +310,6 @@ impl Nip34WritePolicy {
                             e
                         );
                     }
-                    self.prepare_accepted_event_persistence(
-                        event,
-                        SaveContext::DirectWritePolicyAcceptance,
-                    )
-                    .await;
                     return WritePolicyResult::Accept;
                 }
 
@@ -357,17 +336,6 @@ impl Nip34WritePolicy {
                 // Parse announcement to get details for logging
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
-                        self.deletion
-                            .maybe_apply_runtime_delist_deletion(event)
-                            .await;
-
-                        // Phase 5 recovery trigger: any accepted announcement route
-                        // (including maintainer acceptance) can restore eligible
-                        // holding/archive state for this owner+identifier.
-                        self.deletion
-                            .maybe_recover_deleted_repository(event, &announcement.identifier)
-                            .await;
-
                         tracing::info!(
                             "Accepted maintainer announcement {} (author {} is listed as maintainer for {})",
                             event_id_str,
@@ -379,12 +347,6 @@ impl Nip34WritePolicy {
                         // Check purgatory for state events that might now be authorized
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
-
-                        self.prepare_accepted_event_persistence(
-                            event,
-                            SaveContext::DirectWritePolicyAcceptance,
-                        )
-                        .await;
 
                         WritePolicyResult::Accept
                     }
@@ -410,9 +372,6 @@ impl Nip34WritePolicy {
                 }
             }
             AnnouncementResult::Reject(reason) => {
-                self.deletion
-                    .maybe_apply_runtime_delist_deletion(event)
-                    .await;
                 tracing::warn!(
                     "Rejected repository announcement {}: {}",
                     event_id_str,
@@ -440,13 +399,10 @@ impl Nip34WritePolicy {
                     .await
                 {
                     Ok(policy_result) => {
-                        if Self::event_persists_to_main_db(&policy_result) {
-                            self.prepare_accepted_event_persistence(
-                                event,
-                                SaveContext::DirectWritePolicyAcceptance,
-                            )
+                        self.deletion
+                            .admission_hooks()
+                            .on_state_admission(event, &policy_result)
                             .await;
-                        }
                         policy_result
                     }
                     Err(e) => {
@@ -758,10 +714,6 @@ impl Nip34WritePolicy {
                 reject_error(format!("Database query failed: {}", e))
             }
         }
-    }
-
-    fn event_persists_to_main_db(result: &WritePolicyResult) -> bool {
-        matches!(result, WritePolicyResult::Accept)
     }
 }
 
