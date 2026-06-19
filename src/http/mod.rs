@@ -29,6 +29,7 @@ use crate::grasp06::receive::RepoInitLocks;
 use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::lifecycle::RepositoryLifecycle;
+use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
@@ -526,6 +527,13 @@ impl Service<Request<Incoming>> for HttpService {
                                 .await,
                         );
 
+                        let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
+                            &write_policy,
+                            &rejected_events_index,
+                            &database,
+                            Some(&relay),
+                        );
+
                         let result = git::handlers::handle_receive_pack(
                             repo_path,
                             body_bytes.clone(),
@@ -536,9 +544,8 @@ impl Service<Request<Incoming>> for HttpService {
                             purgatory.clone(),
                             &git_data_path,
                             git_protocol.as_deref(),
-                            write_policy.clone(),
-                            rejected_events_index.clone(),
                             repo_lifecycle_guard,
+                            Some(&promotion_hooks),
                         )
                         .await;
 
