@@ -446,7 +446,7 @@ impl Service<Request<Incoming>> for HttpService {
                                 let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
                                     Ok(owner_pk) => Some(
                                         write_policy
-                                            .lock_repository_lifecycle(
+                                            .read_repository_lifecycle(
                                                 &owner_pk.to_hex(),
                                                 &identifier,
                                             )
@@ -480,7 +480,7 @@ impl Service<Request<Incoming>> for HttpService {
                         let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
                             Ok(owner_pk) => Some(
                                 write_policy
-                                    .lock_repository_lifecycle(&owner_pk.to_hex(), &identifier)
+                                    .read_repository_lifecycle(&owner_pk.to_hex(), &identifier)
                                     .await,
                             ),
                             Err(_) => None,
@@ -518,7 +518,7 @@ impl Service<Request<Incoming>> for HttpService {
 
                         let repo_lifecycle_guard = Some(
                             write_policy
-                                .lock_repository_lifecycle(&owner_pubkey_hex, &identifier)
+                                .write_repository_lifecycle(&owner_pubkey_hex, &identifier)
                                 .await,
                         );
 

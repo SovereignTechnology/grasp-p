@@ -18,7 +18,7 @@ use super::subprocess::GitSubprocess;
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
 use crate::git::sync::process_newly_available_git_data;
 use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
-use crate::nostr::holding::LifecycleGuard;
+use crate::nostr::holding::LifecycleWriteGuard;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -260,7 +260,7 @@ pub async fn handle_receive_pack(
     git_protocol: Option<&str>,
     write_policy: Arc<Nip34WritePolicy>,
     rejected_events_index: Arc<RejectedEventsIndex>,
-    repo_lifecycle_guard: Option<LifecycleGuard>,
+    repo_lifecycle_guard: Option<LifecycleWriteGuard>,
 ) -> Result<Response<Full<Bytes>>, GitError> {
     debug!("Handling receive-pack for {:?}", repo_path);
 

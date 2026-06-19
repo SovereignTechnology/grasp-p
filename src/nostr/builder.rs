@@ -19,7 +19,9 @@ use tar::Archive as TarArchive;
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
-use crate::nostr::holding::{DeletionSource, LifecycleGuard, RecoveryMetadataRecord};
+use crate::nostr::holding::{
+    DeletionSource, LifecycleReadGuard, LifecycleWriteGuard, RecoveryMetadataRecord,
+};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
@@ -159,21 +161,35 @@ impl Nip34WritePolicy {
         &self.ctx.tombstones
     }
 
-    /// Acquire the repository lifecycle lock used by deletion, recovery,
-    /// holding cleanup, manual ejection, and Git Smart HTTP serving.
+    /// Acquire a shared repository lifecycle lock used by Git Smart HTTP read
+    /// paths (`info/refs` and `git-upload-pack`).
     ///
-    /// Callers must take this before touching the main DB / tombstones / holding
-    /// DB / archive files / bare repository filesystem for a specific
-    /// `(owner_pubkey_hex, identifier)` scope. It is intentionally per-repo (not
-    /// global) so unrelated repositories keep operating concurrently.
-    pub async fn lock_repository_lifecycle(
+    pub async fn read_repository_lifecycle(
         &self,
         owner_pubkey_hex: &str,
         identifier: &str,
-    ) -> LifecycleGuard {
+    ) -> LifecycleReadGuard {
         self.ctx
             .holding
-            .lock_recovery_scope(owner_pubkey_hex, identifier)
+            .read_recovery_scope(owner_pubkey_hex, identifier)
+            .await
+    }
+
+    /// Acquire an exclusive repository lifecycle lock used by deletion,
+    /// recovery, holding cleanup, manual ejection, and `git-receive-pack`.
+    ///
+    /// Callers must take this before mutating the main DB / tombstones / holding
+    /// DB / archive files / bare repository filesystem for a specific
+    /// `(owner_pubkey_hex, identifier)` scope. It is intentionally per-repo (not
+    /// global) so unrelated repositories keep operating concurrently.
+    pub async fn write_repository_lifecycle(
+        &self,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> LifecycleWriteGuard {
+        self.ctx
+            .holding
+            .write_recovery_scope(owner_pubkey_hex, identifier)
             .await
     }
 
@@ -2189,7 +2205,7 @@ impl Nip34WritePolicy {
         let _lifecycle_guard = self
             .ctx
             .holding
-            .lock_recovery_scope(&owner_hex, identifier)
+            .write_recovery_scope(&owner_hex, identifier)
             .await;
         let records = self
             .ctx

@@ -179,13 +179,14 @@ impl DeletionPolicy {
 
         // Lifecycle lock discipline: acquire per `(owner, identifier)` locks
         // before mutating tombstones, main DB, holding DB, archives, repository
-        // directories, or purgatory. Normal Git Smart HTTP push/fetch handlers
-        // take the same lock for the served repository, so delete/archive/restore
-        // cannot remove or replace a bare repo while Git is using it.
+        // directories, or purgatory. Git Smart HTTP fetch/info-refs handlers
+        // take shared read locks and push handlers take the same write lock for
+        // the served repository, so delete/archive/restore cannot remove or
+        // replace a bare repo while Git is using it.
         let _lifecycle_guards = self
             .ctx
             .holding
-            .lock_recovery_scopes(self.deletion_recovery_scopes(event).await)
+            .write_recovery_scopes(self.deletion_recovery_scopes(event).await)
             .await;
 
         let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
