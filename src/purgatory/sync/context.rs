@@ -523,7 +523,7 @@ impl SyncContext for RealSyncContext {
         let promotion_hooks = self
             .write_policy
             .as_ref()
-            .map(|wp| NostrPurgatoryPromotionHooks::recovery_only(wp.deletion()));
+            .map(NostrPurgatoryPromotionHooks::recovery_only);
         let promotion_hooks = promotion_hooks
             .as_ref()
             .map(|hooks| hooks as &dyn PurgatoryPromotionHooks);

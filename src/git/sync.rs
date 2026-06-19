@@ -833,6 +833,10 @@ pub fn extract_identifier_from_pr_event(event: &Event) -> Option<String> {
 /// git/purgatory lifecycle events.
 #[async_trait]
 pub trait PurgatoryPromotionHooks: Send + Sync {
+    /// Called immediately before an accepted purgatory event is saved to the
+    /// main database.
+    async fn before_event_saved(&self, _event: &Event, _context: PurgatorySaveContext) {}
+
     /// Called immediately before a purgatory announcement is promoted.
     async fn before_announcement_promote(&self, _event: &Event, _identifier: &str) {}
 
@@ -844,6 +848,31 @@ pub trait PurgatoryPromotionHooks: Send + Sync {
 
     /// Called after a PR event has been saved to the main database.
     async fn after_pr_saved(&self, _event: &Event) {}
+}
+
+/// Neutral save context for purgatory events promoted by git sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgatorySaveContext {
+    State,
+    Announcement,
+    Pr,
+}
+
+async fn save_promoted_event(
+    database: &SharedDatabase,
+    event: &Event,
+    context: PurgatorySaveContext,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
+) -> anyhow::Result<()> {
+    if let Some(hooks) = promotion_hooks {
+        hooks.before_event_saved(event, context).await;
+    }
+
+    database
+        .save_event(event)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to save promoted event {}: {e}", event.id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1152,7 +1181,14 @@ async fn process_purgatory_state_events(
             );
         } else {
             // Save to database
-            match database.save_event(&entry.event).await {
+            match save_promoted_event(
+                database,
+                &entry.event,
+                PurgatorySaveContext::State,
+                promotion_hooks,
+            )
+            .await
+            {
                 Ok(_) => {
                     info!(
                         identifier = %identifier,
@@ -1220,7 +1256,14 @@ async fn process_purgatory_state_events(
                         }
 
                         if let Some(ann_event) = purgatory.promote_announcement(owner, identifier) {
-                            match database.save_event(&ann_event).await {
+                            match save_promoted_event(
+                                database,
+                                &ann_event,
+                                PurgatorySaveContext::Announcement,
+                                promotion_hooks,
+                            )
+                            .await
+                            {
                                 Ok(_) => {
                                     info!(
                                         identifier = %identifier,
@@ -1428,7 +1471,8 @@ async fn process_purgatory_pr_events(
         result.errors.extend(process_result.errors);
 
         // Save event to database
-        match database.save_event(event).await {
+        match save_promoted_event(database, event, PurgatorySaveContext::Pr, promotion_hooks).await
+        {
             Ok(_) => {
                 info!(
                     identifier = %identifier,
@@ -1540,7 +1584,14 @@ async fn process_purgatory_announcements(
 
     if let Some(event) = announcement_event {
         // Save to database
-        match database.save_event(&event).await {
+        match save_promoted_event(
+            database,
+            &event,
+            PurgatorySaveContext::Announcement,
+            promotion_hooks,
+        )
+        .await
+        {
             Ok(_) => {
                 info!(
                     identifier = %identifier,

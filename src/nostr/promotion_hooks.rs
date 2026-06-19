@@ -14,29 +14,27 @@ use nostr_relay_builder::LocalRelay;
 use nostr_sdk::prelude::PublicKey;
 use tracing::{debug, info, warn};
 
-use crate::git::sync::PurgatoryPromotionHooks;
+use crate::git::sync::{PurgatoryPromotionHooks, PurgatorySaveContext};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::deletion::DeletionService;
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::SharedDatabase;
+use crate::nostr::persistence::SaveContext;
 use crate::sync::rejected_index::{EventType, RejectedEventsIndex};
 
 pub struct NostrPurgatoryPromotionHooks<'a> {
     deletion: &'a DeletionService,
     write_policy: Option<&'a Nip34WritePolicy>,
     rejected_events_index: Option<&'a Arc<RejectedEventsIndex>>,
-    database: Option<&'a SharedDatabase>,
     local_relay: Option<&'a LocalRelay>,
 }
 
 impl<'a> NostrPurgatoryPromotionHooks<'a> {
-    /// Run deletion recovery hooks only.
-    pub fn recovery_only(deletion: &'a DeletionService) -> Self {
+    /// Run deletion recovery and accepted-event persistence hooks only.
+    pub fn recovery_only(write_policy: &'a Nip34WritePolicy) -> Self {
         Self {
-            deletion,
-            write_policy: None,
+            deletion: write_policy.deletion(),
+            write_policy: Some(write_policy),
             rejected_events_index: None,
-            database: None,
             local_relay: None,
         }
     }
@@ -45,14 +43,12 @@ impl<'a> NostrPurgatoryPromotionHooks<'a> {
     pub fn git_push(
         write_policy: &'a Nip34WritePolicy,
         rejected_events_index: &'a Arc<RejectedEventsIndex>,
-        database: &'a SharedDatabase,
         local_relay: Option<&'a LocalRelay>,
     ) -> Self {
         Self {
             deletion: write_policy.deletion(),
             write_policy: Some(write_policy),
             rejected_events_index: Some(rejected_events_index),
-            database: Some(database),
             local_relay,
         }
     }
@@ -60,6 +56,22 @@ impl<'a> NostrPurgatoryPromotionHooks<'a> {
 
 #[async_trait]
 impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
+    async fn before_event_saved(&self, event: &Event, context: PurgatorySaveContext) {
+        let Some(write_policy) = self.write_policy else {
+            return;
+        };
+
+        let context = match context {
+            PurgatorySaveContext::State => SaveContext::PurgatoryStatePromotion,
+            PurgatorySaveContext::Announcement => SaveContext::PurgatoryAnnouncementPromotion,
+            PurgatorySaveContext::Pr => SaveContext::PurgatoryPrPromotion,
+        };
+
+        write_policy
+            .prepare_accepted_event_persistence(event, context)
+            .await;
+    }
+
     async fn before_announcement_promote(&self, event: &Event, identifier: &str) {
         self.deletion
             .maybe_recover_deleted_repository(event, identifier)
@@ -67,10 +79,9 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
     }
 
     async fn after_announcement_saved(&self, event: &Event) {
-        let (Some(write_policy), Some(rejected_events_index), Some(database), Some(relay)) = (
+        let (Some(write_policy), Some(rejected_events_index), Some(relay)) = (
             self.write_policy,
             self.rejected_events_index,
-            self.database,
             self.local_relay,
         ) else {
             return;
@@ -121,7 +132,10 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
 
                         match write_policy.admit_event(&hot_event, &dummy_addr).await {
                             WritePolicyResult::Accept => {
-                                match database.save_event(&hot_event).await {
+                                match write_policy
+                                    .save_accepted_event(&hot_event, SaveContext::HotCacheReprocess)
+                                    .await
+                                {
                                     Ok(_) => {
                                         relay.notify_event(hot_event.clone());
                                         info!(

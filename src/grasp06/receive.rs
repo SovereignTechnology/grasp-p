@@ -353,7 +353,6 @@ pub async fn handle_prs_receive_pack(
         let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
             &write_policy,
             &rejected_events_index,
-            &database,
             Some(&relay),
         );
 

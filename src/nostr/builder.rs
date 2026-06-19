@@ -19,6 +19,7 @@ use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::lifecycle::RepositoryLifecycle;
+use crate::nostr::persistence::{EventPersistence, SaveContext};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
@@ -150,6 +151,29 @@ impl Nip34WritePolicy {
         &self.deletion
     }
 
+    fn event_persistence(&self) -> EventPersistence<'_> {
+        EventPersistence::new(&self.ctx.database, &self.deletion)
+    }
+
+    /// Run central persistence hooks for an accepted event whose actual save is
+    /// performed by the relay builder after policy acceptance.
+    pub async fn prepare_accepted_event_persistence(&self, event: &Event, context: SaveContext) {
+        self.event_persistence()
+            .before_accepted_event_persisted(event, context)
+            .await;
+    }
+
+    /// Save an already-admitted event through the central accepted-event path.
+    pub async fn save_accepted_event(
+        &self,
+        event: &Event,
+        context: SaveContext,
+    ) -> anyhow::Result<()> {
+        self.event_persistence()
+            .save_accepted_event(event, context)
+            .await
+    }
+
     /// Extract repository identifier from event's 'd' tag.
     ///
     /// Used for structured logging when parsing fails - we try to extract
@@ -243,9 +267,11 @@ impl Nip34WritePolicy {
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
 
-                        self.deletion
-                            .capture_superseded_replaceable_history(event)
-                            .await;
+                        self.prepare_accepted_event_persistence(
+                            event,
+                            SaveContext::DirectWritePolicyAcceptance,
+                        )
+                        .await;
 
                         WritePolicyResult::Accept
                     }
@@ -300,9 +326,11 @@ impl Nip34WritePolicy {
                             e
                         );
                     }
-                    self.deletion
-                        .capture_superseded_replaceable_history(event)
-                        .await;
+                    self.prepare_accepted_event_persistence(
+                        event,
+                        SaveContext::DirectWritePolicyAcceptance,
+                    )
+                    .await;
                     return WritePolicyResult::Accept;
                 }
 
@@ -352,9 +380,11 @@ impl Nip34WritePolicy {
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
 
-                        self.deletion
-                            .capture_superseded_replaceable_history(event)
-                            .await;
+                        self.prepare_accepted_event_persistence(
+                            event,
+                            SaveContext::DirectWritePolicyAcceptance,
+                        )
+                        .await;
 
                         WritePolicyResult::Accept
                     }
@@ -401,7 +431,7 @@ impl Nip34WritePolicy {
     async fn handle_state(&self, event: &Event, is_synced: bool) -> WritePolicyResult {
         match self.state_policy.validate(event) {
             StateResult::Accept => {
-                let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self.deletion());
+                let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self);
 
                 // Process state alignment asynchronously
                 match self
@@ -411,9 +441,11 @@ impl Nip34WritePolicy {
                 {
                     Ok(policy_result) => {
                         if Self::event_persists_to_main_db(&policy_result) {
-                            self.deletion
-                                .capture_superseded_replaceable_history(event)
-                                .await;
+                            self.prepare_accepted_event_persistence(
+                                event,
+                                SaveContext::DirectWritePolicyAcceptance,
+                            )
+                            .await;
                         }
                         policy_result
                     }
@@ -622,7 +654,7 @@ impl Nip34WritePolicy {
         );
 
         for entry in state_events {
-            let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self.deletion());
+            let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self);
 
             // Re-evaluate authorization with the new announcement
             match self

@@ -4,6 +4,7 @@ pub mod events;
 pub mod history;
 pub mod holding;
 pub mod lifecycle;
+pub mod persistence;
 pub mod policy;
 pub mod promotion_hooks;
 pub mod tombstones;

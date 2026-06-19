@@ -530,7 +530,6 @@ impl Service<Request<Incoming>> for HttpService {
                         let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
                             &write_policy,
                             &rejected_events_index,
-                            &database,
                             Some(&relay),
                         );
 
