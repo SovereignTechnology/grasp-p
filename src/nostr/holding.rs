@@ -4,17 +4,20 @@
 //! - copy/move deleted events out of the main DB into a dedicated holding DB,
 //! - persist minimal per-event metadata for later retention/recovery phases.
 
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, io::ErrorKind};
 
+use dashmap::DashMap;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::{
     Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// Directory name (under `relay_data_path`) for the LMDB holding database.
 pub const HOLDING_DIR: &str = "holding";
@@ -70,6 +73,19 @@ pub struct HoldingStore {
     db: Arc<dyn NostrDatabase>,
     metadata_signer: Keys,
     archive_root: Option<PathBuf>,
+    /// Shared per-repository lifecycle mutexes.
+    ///
+    /// Lock ordering invariant for deletion/recovery/cleanup paths: acquire all
+    /// required `(owner_pubkey_hex, identifier)` lifecycle locks first (sorted
+    /// lexicographically), then touch main DB / tombstones / holding DB /
+    /// repository filesystem / archive filesystem. Never acquire a lifecycle
+    /// lock while holding a lower-level lock or a purgatory map entry reference.
+    /// A matching lock file under `.lifecycle-locks/` extends the invariant to
+    /// short-lived CLI operations such as `holding-eject`, which run in a
+    /// separate process and cannot share this in-memory map. This serialises
+    /// delete, restore, cleanup, manual eject, and Git Smart HTTP operations per
+    /// repository without a process-wide global lock.
+    lifecycle_locks: Arc<DashMap<RecoveryScope, Arc<AsyncMutex<()>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +93,7 @@ pub struct ExpiredMetadataRecord {
     pub metadata_event_id: EventId,
     pub archived_event_id: Option<EventId>,
     pub archive_relative_path: Option<String>,
+    pub recovery_scope: Option<RecoveryScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +103,27 @@ pub struct RecoveryMetadataRecord {
     pub archive_relative_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
 pub struct RecoveryScope {
     pub owner_pubkey_hex: String,
     pub identifier: String,
+}
+
+pub struct LifecycleGuard {
+    _memory_guard: OwnedMutexGuard<()>,
+    lock_path: Option<PathBuf>,
+}
+
+impl Drop for LifecycleGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.lock_path {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), error = %e, "Failed to remove lifecycle lock file");
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,6 +173,7 @@ impl HoldingStore {
             db: Arc::new(db),
             metadata_signer: Keys::generate(),
             archive_root: Some(git_data_path.join(".archive")),
+            lifecycle_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -147,6 +182,86 @@ impl HoldingStore {
             db: Arc::new(MemoryDatabase::unbounded()),
             metadata_signer: Keys::generate(),
             archive_root: None,
+            lifecycle_locks: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub async fn lock_recovery_scope(
+        &self,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> LifecycleGuard {
+        self.lock_recovery_scopes(vec![RecoveryScope {
+            owner_pubkey_hex: owner_pubkey_hex.to_string(),
+            identifier: identifier.to_string(),
+        }])
+        .await
+        .pop()
+        .expect("single lifecycle lock requested")
+    }
+
+    pub async fn lock_recovery_scopes(
+        &self,
+        scopes: impl IntoIterator<Item = RecoveryScope>,
+    ) -> Vec<LifecycleGuard> {
+        let mut scopes: Vec<_> = scopes.into_iter().collect();
+        scopes.sort();
+        scopes.dedup();
+
+        let mut guards = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            let lock = self
+                .lifecycle_locks
+                .entry(scope.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .value()
+                .clone();
+            let memory_guard = lock.lock_owned().await;
+            let lock_path = self.acquire_scope_file_lock(&scope).await;
+            guards.push(LifecycleGuard {
+                _memory_guard: memory_guard,
+                lock_path,
+            });
+        }
+        guards
+    }
+
+    async fn acquire_scope_file_lock(&self, scope: &RecoveryScope) -> Option<PathBuf> {
+        let root = self.archive_root.as_ref()?;
+        let lock_dir = root
+            .parent()
+            .map(|parent| parent.join(".lifecycle-locks"))
+            .unwrap_or_else(|| root.join(".lifecycle-locks"));
+        if let Err(e) = std::fs::create_dir_all(&lock_dir) {
+            tracing::warn!(path = %lock_dir.display(), error = %e, "Failed to create lifecycle lock directory");
+            return None;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        scope.hash(&mut hasher);
+        let lock_path = lock_dir.join(format!("{:016x}.lock", hasher.finish()));
+
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Some(lock_path),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        owner = %scope.owner_pubkey_hex,
+                        identifier = %scope.identifier,
+                        path = %lock_path.display(),
+                        error = %e,
+                        "Failed to acquire lifecycle lock file; continuing with in-process lock only"
+                    );
+                    return None;
+                }
+            }
         }
     }
 
@@ -612,6 +727,7 @@ impl HoldingStore {
                         metadata_event_id: metadata_event.id,
                         archived_event_id: Self::parse_archived_event_id(&metadata_event),
                         archive_relative_path: Self::parse_archive_relative_path(&metadata_event),
+                        recovery_scope: Self::parse_recovery_scope(&metadata_event),
                     })
                 } else {
                     None
@@ -723,6 +839,13 @@ impl HoldingStore {
         };
 
         for record in expired {
+            let _scope_guard = match &record.recovery_scope {
+                Some(scope) => Some(
+                    self.lock_recovery_scope(&scope.owner_pubkey_hex, &scope.identifier)
+                        .await,
+                ),
+                None => None,
+            };
             let (metadata_deleted, event_deleted, archive_deleted) =
                 self.delete_expired_record(record).await?;
             if metadata_deleted {
@@ -755,6 +878,7 @@ impl HoldingStore {
         owner_pubkey_hex: &str,
         identifier: &str,
     ) -> anyhow::Result<ManualEjectionStats> {
+        let _scope_guard = self.lock_recovery_scope(owner_pubkey_hex, identifier).await;
         let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
         let metadata_events = self.db.query(filter).await.map_err(|e| {
             anyhow::anyhow!("Failed to query holding metadata for manual ejection: {e}")
@@ -1028,5 +1152,66 @@ mod tests {
             .await
             .expect("delete stale recovery record again");
         assert_eq!(second, (false, false));
+    }
+
+    #[tokio::test]
+    async fn cleanup_and_manual_eject_same_scope_are_idempotent_under_contention() {
+        let store = HoldingStore::in_memory();
+        let owner_hex = Keys::generate().public_key().to_hex();
+        let identifier = "contended-repo";
+
+        for i in 0..2 {
+            let event = test_event(&format!("expired-{i}"), Timestamp::from_secs(10 + i));
+            store
+                .archive_event(
+                    &event,
+                    &HoldingMetadata {
+                        deleted_at: Timestamp::from_secs(20),
+                        source: DeletionSource::Nip09,
+                        coordinate: Some(format!("30617:{}:{}", owner_hex, identifier)),
+                        identifier: Some(identifier.to_string()),
+                        owner_pubkey: Some(owner_hex.clone()),
+                        git_archive: None,
+                    },
+                )
+                .await
+                .expect("archive event");
+        }
+
+        let cleanup_store = store.clone();
+        let eject_store = store.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_store
+                .cleanup_expired(Timestamp::from_secs(10_000), Duration::from_secs(1))
+                .await
+                .expect("cleanup succeeds")
+        });
+        let eject = tokio::spawn({
+            let owner_hex = owner_hex.clone();
+            let identifier = identifier.to_string();
+            async move {
+                eject_store
+                    .manual_eject_repository(&owner_hex, &identifier)
+                    .await
+                    .expect("manual eject succeeds")
+            }
+        });
+
+        let cleanup_stats = cleanup.await.expect("cleanup task joins");
+        let eject_stats = eject.await.expect("eject task joins");
+
+        assert_eq!(
+            cleanup_stats.metadata_deleted + eject_stats.metadata_deleted,
+            2
+        );
+        assert!(store
+            .eligible_recovery_records(
+                &owner_hex,
+                identifier,
+                Timestamp::from_secs(10_000),
+                Duration::from_secs(10_000),
+            )
+            .await
+            .is_empty());
     }
 }

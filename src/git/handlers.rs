@@ -18,6 +18,7 @@ use super::subprocess::GitSubprocess;
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
 use crate::git::sync::process_newly_available_git_data;
 use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::holding::LifecycleGuard;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -259,6 +260,7 @@ pub async fn handle_receive_pack(
     git_protocol: Option<&str>,
     write_policy: Arc<Nip34WritePolicy>,
     rejected_events_index: Arc<RejectedEventsIndex>,
+    repo_lifecycle_guard: Option<LifecycleGuard>,
 ) -> Result<Response<Full<Bytes>>, GitError> {
     debug!("Handling receive-pack for {:?}", repo_path);
 
@@ -349,6 +351,7 @@ pub async fn handle_receive_pack(
     })?;
 
     if !status.success() {
+        drop(repo_lifecycle_guard);
         let stderr_str = String::from_utf8_lossy(&stderr_output);
 
         // Check if this is a git protocol error (exit code 128 with stderr)
@@ -368,6 +371,14 @@ pub async fn handle_receive_pack(
         error!("Git receive-pack failed: {}", stderr_str);
         return Err(GitError::GitFailed(status.code()));
     }
+
+    // Release the repository lifecycle lock once git-receive-pack itself has
+    // finished. The lock's purpose is to keep deletion/archive/restore from
+    // removing or replacing the bare repository while Git is actively reading or
+    // writing it. Post-push purgatory promotion may re-enter recovery paths that
+    // take the same lock, so holding it beyond the subprocess boundary would
+    // deadlock.
+    drop(repo_lifecycle_guard);
 
     // Process newly available git data using the unified function
     // This handles:

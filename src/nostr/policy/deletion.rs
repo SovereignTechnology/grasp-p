@@ -49,7 +49,7 @@ use crate::git::authorization::{
 };
 use crate::git::process;
 use crate::nostr::events::RepositoryState;
-use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
+use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata, RecoveryScope};
 use crate::nostr::policy::reject_invalid;
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
@@ -75,6 +75,10 @@ const GRAPH_DEPENDENT_KINDS: &[u16] = &[
     1632, // patch status
     1633, // repository status
 ];
+
+const MAX_DELETION_TARGET_TAGS: usize = 2048;
+const MAX_CASCADE_CANDIDATE_EVENTS: usize = 50_000;
+const MAX_CASCADE_ORPHAN_DELETES: usize = 20_000;
 
 /// Policy for handling NIP-09 event deletion requests
 #[derive(Clone)]
@@ -130,6 +134,24 @@ impl DeletionPolicy {
             return WritePolicyResult::Accept;
         }
 
+        let target_tag_count = event
+            .tags
+            .iter()
+            .filter(|tag| {
+                let v = tag.as_slice();
+                v.len() >= 2 && (v[0] == "e" || v[0] == "a")
+            })
+            .count();
+        if target_tag_count > MAX_DELETION_TARGET_TAGS {
+            tracing::warn!(
+                event_id = %event.id.to_hex(),
+                target_tag_count,
+                max = MAX_DELETION_TARGET_TAGS,
+                "Rejected NIP-09 deletion with too many targets"
+            );
+            return reject_invalid("too many deletion targets");
+        }
+
         // Validate authorship of all targets first. If any `e`-tag target exists
         // in the main DB and is owned by someone else, the whole deletion is
         // invalid (mirrors the backend's `handle_deletion_event` returning
@@ -154,6 +176,17 @@ impl DeletionPolicy {
                 }
             }
         }
+
+        // Lifecycle lock discipline: acquire per `(owner, identifier)` locks
+        // before mutating tombstones, main DB, holding DB, archives, repository
+        // directories, or purgatory. Normal Git Smart HTTP push/fetch handlers
+        // take the same lock for the served repository, so delete/archive/restore
+        // cannot remove or replace a bare repo while Git is using it.
+        let _lifecycle_guards = self
+            .ctx
+            .holding
+            .lock_recovery_scopes(self.deletion_recovery_scopes(event).await)
+            .await;
 
         let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
@@ -298,6 +331,40 @@ impl DeletionPolicy {
         let kind_num = parts[0].parse::<u16>().ok()?;
         let pubkey = PublicKey::from_hex(parts[1]).ok()?;
         Some((Kind::from(kind_num), pubkey, parts[2].to_string()))
+    }
+
+    async fn deletion_recovery_scopes(&self, event: &Event) -> Vec<RecoveryScope> {
+        let mut scopes = BTreeSet::new();
+
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, owner, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if owner != event.pubkey {
+                continue;
+            }
+            if matches!(kind, Kind::GitRepoAnnouncement | Kind::RepoState) {
+                scopes.insert(RecoveryScope {
+                    owner_pubkey_hex: owner.to_hex(),
+                    identifier,
+                });
+            }
+        }
+
+        for id in Self::e_tag_ids(event) {
+            if let Ok(Some(target)) = self.ctx.database.event_by_id(&id).await {
+                if target.pubkey == event.pubkey {
+                    if let Some(identifier) = identifier_from_event(&target) {
+                        scopes.insert(RecoveryScope {
+                            owner_pubkey_hex: target.pubkey.to_hex(),
+                            identifier,
+                        });
+                    }
+                }
+            }
+        }
+
+        scopes.into_iter().collect()
     }
 
     async fn latest_event_for_coordinate(
@@ -797,6 +864,24 @@ impl DeletionPolicy {
             }
         };
 
+        if candidates.len() > MAX_CASCADE_CANDIDATE_EVENTS {
+            tracing::warn!(
+                announcement = %announcement_addr,
+                candidates = candidates.len(),
+                max = MAX_CASCADE_CANDIDATE_EVENTS,
+                "Cascade deletion candidate set exceeds limit; falling back to coordinate-only deletion"
+            );
+            self.delete_coordinate_from_main_db(
+                author,
+                announcement_addr,
+                deletion_created_at,
+                &mut moved_ids,
+                source,
+            )
+            .await;
+            return;
+        }
+
         let graph = super::build_event_graph(&candidates);
 
         // The set of candidate event ids we feed into re-evaluation. The
@@ -883,6 +968,23 @@ impl DeletionPolicy {
 
         // Step 5a: hard-delete the orphaned dependent events by id.
         let orphan_ids: Vec<EventId> = traversal.delete.into_iter().collect();
+        if orphan_ids.len() > MAX_CASCADE_ORPHAN_DELETES {
+            tracing::warn!(
+                announcement = %announcement_addr,
+                orphan_deletes = orphan_ids.len(),
+                max = MAX_CASCADE_ORPHAN_DELETES,
+                "Cascade deletion orphan set exceeds limit; deleting announcement coordinate only"
+            );
+            self.delete_coordinate_from_main_db(
+                author,
+                announcement_addr,
+                deletion_created_at,
+                &mut moved_ids,
+                source,
+            )
+            .await;
+            return;
+        }
         if !orphan_ids.is_empty() {
             tracing::debug!(
                 count = orphan_ids.len(),
@@ -2030,6 +2132,30 @@ mod tests {
         let result = policy.handle(&deletion).await;
 
         assert!(matches!(result, WritePolicyResult::Accept));
+    }
+
+    #[tokio::test]
+    async fn deletion_with_excessive_target_tags_is_rejected() {
+        let ctx = make_context();
+        let keys = Keys::generate();
+        let tags = (0..=MAX_DELETION_TARGET_TAGS)
+            .map(|i| {
+                Tag::custom(
+                    "a",
+                    vec![format!("30617:{}:repo-{i}", keys.public_key().to_hex())],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(tags)
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx);
+        let result = policy.handle(&deletion).await;
+
+        assert!(matches!(result, WritePolicyResult::Reject { .. }));
     }
 
     #[tokio::test]

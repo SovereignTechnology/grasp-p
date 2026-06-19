@@ -443,6 +443,17 @@ impl Service<Request<Incoming>> for HttpService {
 
                         match service {
                             Some(svc) => {
+                                let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
+                                    Ok(owner_pk) => Some(
+                                        write_policy
+                                            .lock_repository_lifecycle(
+                                                &owner_pk.to_hex(),
+                                                &identifier,
+                                            )
+                                            .await,
+                                    ),
+                                    Err(_) => None,
+                                };
                                 let result = git::handlers::handle_info_refs(
                                     repo_path,
                                     svc,
@@ -466,6 +477,14 @@ impl Service<Request<Incoming>> for HttpService {
 
                     // POST /git-upload-pack (clone/fetch)
                     (m, "git-upload-pack") if m == Method::POST => {
+                        let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
+                            Ok(owner_pk) => Some(
+                                write_policy
+                                    .lock_repository_lifecycle(&owner_pk.to_hex(), &identifier)
+                                    .await,
+                            ),
+                            Err(_) => None,
+                        };
                         let result = git::handlers::handle_upload_pack(
                             repo_path,
                             body_bytes,
@@ -497,6 +516,12 @@ impl Service<Request<Incoming>> for HttpService {
                             }
                         };
 
+                        let repo_lifecycle_guard = Some(
+                            write_policy
+                                .lock_repository_lifecycle(&owner_pubkey_hex, &identifier)
+                                .await,
+                        );
+
                         let result = git::handlers::handle_receive_pack(
                             repo_path,
                             body_bytes.clone(),
@@ -509,6 +534,7 @@ impl Service<Request<Incoming>> for HttpService {
                             git_protocol.as_deref(),
                             write_policy.clone(),
                             rejected_events_index.clone(),
+                            repo_lifecycle_guard,
                         )
                         .await;
 
