@@ -8,7 +8,7 @@ use super::{DeletionContext, DeletionPolicy};
 
 #[derive(Clone)]
 pub struct DeletionService {
-    ctx: DeletionContext,
+    pub(super) ctx: DeletionContext,
     policy: DeletionPolicy,
 }
 
