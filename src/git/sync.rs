@@ -828,6 +828,42 @@ pub fn extract_identifier_from_pr_event(event: &Event) -> Option<String> {
 ///
 /// # Returns
 /// A `ProcessResult` describing what was processed
+#[derive(Clone, Copy, Default)]
+pub enum PurgatoryPromotionServices<'a> {
+    /// No deletion recovery hooks or git-push hot-cache reprocessing.
+    #[default]
+    None,
+    /// Promotion path can run deletion recovery, but hot-cache maintainer
+    /// reprocessing is handled elsewhere (for example purgatory sync).
+    RecoveryOnly { deletion: &'a DeletionService },
+    /// Git push path: recovery plus maintainer hot-cache reprocessing.
+    GitPush {
+        write_policy: &'a Nip34WritePolicy,
+        deletion: &'a DeletionService,
+        rejected_events_index: &'a Arc<RejectedEventsIndex>,
+    },
+}
+
+impl<'a> PurgatoryPromotionServices<'a> {
+    fn deletion(self) -> Option<&'a DeletionService> {
+        match self {
+            Self::None => None,
+            Self::RecoveryOnly { deletion } | Self::GitPush { deletion, .. } => Some(deletion),
+        }
+    }
+
+    fn git_push_reprocessing(self) -> Option<(&'a Nip34WritePolicy, &'a Arc<RejectedEventsIndex>)> {
+        match self {
+            Self::GitPush {
+                write_policy,
+                rejected_events_index,
+                ..
+            } => Some((write_policy, rejected_events_index)),
+            Self::None | Self::RecoveryOnly { .. } => None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn process_newly_available_git_data(
     source_repo_path: &Path,
@@ -836,9 +872,7 @@ pub async fn process_newly_available_git_data(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    write_policy: Option<&Nip34WritePolicy>,
-    deletion_service: Option<&DeletionService>,
-    rejected_events_index: Option<&Arc<RejectedEventsIndex>>,
+    promotion_services: PurgatoryPromotionServices<'_>,
 ) -> anyhow::Result<ProcessResult> {
     let mut result = ProcessResult::default();
 
@@ -868,9 +902,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
-        write_policy,
-        deletion_service,
-        rejected_events_index,
+        promotion_services,
     )
     .await;
     result.merge(announcement_result);
@@ -883,7 +915,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
-        deletion_service,
+        promotion_services.deletion(),
     )
     .await;
     result.merge(state_result);
@@ -1406,7 +1438,7 @@ async fn process_purgatory_pr_events(
 /// When git data arrives for a repository, any announcements in purgatory
 /// for that repository should be promoted to the database and served to clients.
 ///
-/// When `write_policy` and `rejected_events_index` are provided (git push path),
+/// When git-push promotion services are provided,
 /// any maintainer announcements sitting in the hot cache are re-processed immediately
 /// after the owner announcement is promoted, so they don't wait for the next sync cycle.
 #[allow(clippy::too_many_arguments)]
@@ -1417,9 +1449,7 @@ async fn process_purgatory_announcements(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    write_policy: Option<&Nip34WritePolicy>,
-    deletion_service: Option<&DeletionService>,
-    rejected_events_index: Option<&Arc<RejectedEventsIndex>>,
+    promotion_services: PurgatoryPromotionServices<'_>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -1453,7 +1483,7 @@ async fn process_purgatory_announcements(
     };
 
     if let (Some(ds), Some(entry)) = (
-        deletion_service,
+        promotion_services.deletion(),
         purgatory.find_announcement(&owner, identifier),
     ) {
         ds.maybe_recover_deleted_repository(&entry.event, identifier)
@@ -1494,11 +1524,10 @@ async fn process_purgatory_announcements(
                 // didn't exist in the DB yet. Now that the owner announcement is saved,
                 // we must invalidate and re-process those cached events immediately.
                 //
-                // This only applies on the git push path (write_policy + rejected_events_index
-                // are Some). The purgatory sync path already handles this via
+                // This only applies on the git push path. The purgatory sync path already handles this via
                 // SyncManager::process_event_static.
-                if let (Some(wp), Some(rei), Some(relay)) =
-                    (write_policy, rejected_events_index, local_relay)
+                if let (Some((wp, rei)), Some(relay)) =
+                    (promotion_services.git_push_reprocessing(), local_relay)
                 {
                     use crate::nostr::events::RepositoryAnnouncement;
                     use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};

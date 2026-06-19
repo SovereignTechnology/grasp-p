@@ -230,6 +230,12 @@ impl StatePolicy {
                 if target_repo_path != repo_with_git_data {
                     // OIDs were copied to this repo by process_state_with_git_data;
                     // check if there's a purgatory announcement waiting for it.
+                    let promotion_services = deletion_service
+                        .map(|deletion| {
+                            crate::git::sync::PurgatoryPromotionServices::RecoveryOnly { deletion }
+                        })
+                        .unwrap_or_default();
+
                     if let Err(e) = crate::git::sync::process_newly_available_git_data(
                         &target_repo_path,
                         &empty_oids,
@@ -237,9 +243,7 @@ impl StatePolicy {
                         local_relay.as_ref(),
                         &self.ctx.purgatory,
                         &self.ctx.git_data_path,
-                        None,
-                        deletion_service,
-                        None,
+                        promotion_services,
                     )
                     .await
                     {

@@ -87,21 +87,11 @@ impl Nip34WritePolicy {
             repo_init_locks.clone(),
         );
 
-        let ctx = PolicyContext::new(
-            domain,
-            database,
-            tombstones,
-            holding,
-            history,
-            git_data_path,
-            purgatory,
-            config.clone(),
-            repo_init_locks,
-        );
+        let ctx = PolicyContext::new(domain, database, git_data_path, purgatory, config.clone());
         Self {
             announcement_policy: AnnouncementPolicy::new(ctx.clone(), config.clone()),
             state_policy: StatePolicy::new(ctx.clone()),
-            pr_event_policy: PrEventPolicy::new(ctx.clone()),
+            pr_event_policy: PrEventPolicy::new(ctx.clone(), repo_init_locks),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
             deletion: DeletionService::new(deletion_ctx),
             ctx,
@@ -254,7 +244,9 @@ impl Nip34WritePolicy {
                 // Parse announcement to get repository details
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
-                        self.maybe_apply_runtime_delist_deletion(event).await;
+                        self.deletion
+                            .maybe_apply_runtime_delist_deletion(event)
+                            .await;
 
                         // Try to create bare repository if it doesn't exist
                         if let Err(e) = self
@@ -281,7 +273,9 @@ impl Nip34WritePolicy {
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
 
-                        self.capture_superseded_replaceable_history(event).await;
+                        self.deletion
+                            .capture_superseded_replaceable_history(event)
+                            .await;
 
                         WritePolicyResult::Accept
                     }
@@ -336,7 +330,9 @@ impl Nip34WritePolicy {
                             e
                         );
                     }
-                    self.capture_superseded_replaceable_history(event).await;
+                    self.deletion
+                        .capture_superseded_replaceable_history(event)
+                        .await;
                     return WritePolicyResult::Accept;
                 }
 
@@ -363,7 +359,9 @@ impl Nip34WritePolicy {
                 // Parse announcement to get details for logging
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
-                        self.maybe_apply_runtime_delist_deletion(event).await;
+                        self.deletion
+                            .maybe_apply_runtime_delist_deletion(event)
+                            .await;
 
                         // Phase 5 recovery trigger: any accepted announcement route
                         // (including maintainer acceptance) can restore eligible
@@ -384,7 +382,9 @@ impl Nip34WritePolicy {
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
                             .await;
 
-                        self.capture_superseded_replaceable_history(event).await;
+                        self.deletion
+                            .capture_superseded_replaceable_history(event)
+                            .await;
 
                         WritePolicyResult::Accept
                     }
@@ -410,109 +410,15 @@ impl Nip34WritePolicy {
                 }
             }
             AnnouncementResult::Reject(reason) => {
-                self.maybe_apply_runtime_delist_deletion(event).await;
+                self.deletion
+                    .maybe_apply_runtime_delist_deletion(event)
+                    .await;
                 tracing::warn!(
                     "Rejected repository announcement {}: {}",
                     event_id_str,
                     reason
                 );
                 reject_invalid(reason)
-            }
-        }
-    }
-
-    /// Runtime de-list parity path for already-served repositories.
-    ///
-    /// When a newer replacement announcement for the same owner+identifier no
-    /// longer lists this relay's service, trigger the normal cascade
-    /// delete->holding/archive flow for the currently served announcement.
-    ///
-    /// This mirrors startup whitelist/blacklist parity behavior, but runs at
-    /// write time so service removals are enforced immediately.
-    async fn maybe_apply_runtime_delist_deletion(&self, incoming: &Event) {
-        let incoming_announcement = match RepositoryAnnouncement::from_event(incoming.clone()) {
-            Ok(announcement) => announcement,
-            Err(_) => return,
-        };
-
-        // This path is only for announcements that REMOVE this relay listing.
-        if incoming_announcement.lists_service(&self.ctx.domain) {
-            return;
-        }
-
-        let filter = Filter::new()
-            .kind(Kind::GitRepoAnnouncement)
-            .author(incoming.pubkey)
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                incoming_announcement.identifier.clone(),
-            );
-
-        let current = match self.ctx.database.query(filter).await {
-            Ok(events) => events.into_iter().max_by_key(|event| event.created_at),
-            Err(e) => {
-                tracing::warn!(
-                    owner = %incoming.pubkey.to_hex(),
-                    identifier = %incoming_announcement.identifier,
-                    error = %e,
-                    "Runtime de-list parity: failed querying existing announcement"
-                );
-                None
-            }
-        };
-
-        let Some(current) = current else {
-            return;
-        };
-
-        // Not newer than what we already serve -> no runtime parity action.
-        if incoming.created_at <= current.created_at {
-            return;
-        }
-
-        let current_announcement = match RepositoryAnnouncement::from_event(current.clone()) {
-            Ok(announcement) => announcement,
-            Err(e) => {
-                tracing::warn!(
-                    event_id = %current.id.to_hex(),
-                    owner = %incoming.pubkey.to_hex(),
-                    identifier = %incoming_announcement.identifier,
-                    error = %e,
-                    "Runtime de-list parity: failed parsing current announcement"
-                );
-                return;
-            }
-        };
-
-        // Safety guard: only run cascade when the currently served announcement
-        // actually lists this relay.
-        if !current_announcement.lists_service(&self.ctx.domain) {
-            return;
-        }
-
-        match self
-            .deletion
-            .apply_whitelist_deletion_for_announcement(&current)
-            .await
-        {
-            Ok(()) => {
-                tracing::info!(
-                    owner = %incoming.pubkey.to_hex(),
-                    identifier = %incoming_announcement.identifier,
-                    replaced_announcement = %current.id.to_hex(),
-                    replacement = %incoming.id.to_hex(),
-                    "Runtime de-list parity: deleted previously served repository"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    owner = %incoming.pubkey.to_hex(),
-                    identifier = %incoming_announcement.identifier,
-                    replaced_announcement = %current.id.to_hex(),
-                    replacement = %incoming.id.to_hex(),
-                    error = %e,
-                    "Runtime de-list parity: deletion flow failed"
-                );
             }
         }
     }
@@ -533,7 +439,9 @@ impl Nip34WritePolicy {
                 {
                     Ok(policy_result) => {
                         if Self::event_persists_to_main_db(&policy_result) {
-                            self.capture_superseded_replaceable_history(event).await;
+                            self.deletion
+                                .capture_superseded_replaceable_history(event)
+                                .await;
                         }
                         policy_result
                     }
@@ -607,7 +515,7 @@ impl Nip34WritePolicy {
         //
         // Note: the database runs with `process_nip09(false)`, so `check_id`
         // only ever returns `Saved` / `NotExistent` here — re-submission of a
-        // deleted PR is already rejected upstream by `deletion_gate`.
+        // deleted PR is already rejected upstream by `DeletionService::gate`.
         match &self.ctx.database.check_id(&event.id).await {
             Ok(DatabaseEventStatus::Saved) => {
                 return duplicate("already have this event");
@@ -846,106 +754,8 @@ impl Nip34WritePolicy {
         }
     }
 
-    /// Build the NIP-01 addressable/replaceable coordinate string
-    /// `<kind>:<pubkey-hex>:<d-identifier>` for an event, matching the format
-    /// used in NIP-09 `a` tags. Returns `None` for non-(addressable/replaceable)
-    /// events.
-    fn event_coordinate(event: &Event) -> Option<String> {
-        if !(event.kind.is_replaceable() || event.kind.is_addressable()) {
-            return None;
-        }
-        let identifier = if event.kind.is_addressable() {
-            event
-                .tags
-                .iter()
-                .find(|t| t.kind() == "d")
-                .and_then(|t| t.content())
-                .unwrap_or("")
-        } else {
-            ""
-        };
-        Some(format!(
-            "{}:{}:{}",
-            event.kind.as_u16(),
-            event.pubkey.to_hex(),
-            identifier
-        ))
-    }
-
-    fn extract_addressable_identifier(event: &Event) -> Option<String> {
-        event.tags.iter().find_map(|tag| {
-            let v = tag.as_slice();
-            if v.len() >= 2 && v[0] == "d" {
-                Some(v[1].clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    fn should_capture_replaceable_history(kind: Kind) -> bool {
-        kind == Kind::GitRepoAnnouncement || kind == Kind::RepoState
-    }
-
     fn event_persists_to_main_db(result: &WritePolicyResult) -> bool {
         matches!(result, WritePolicyResult::Accept)
-    }
-
-    async fn capture_superseded_replaceable_history(&self, incoming: &Event) {
-        if !Self::should_capture_replaceable_history(incoming.kind) {
-            return;
-        }
-
-        let Some(coordinate) = Self::event_coordinate(incoming) else {
-            return;
-        };
-
-        let Some(identifier) = Self::extract_addressable_identifier(incoming) else {
-            tracing::warn!(
-                event_id = %incoming.id.to_hex(),
-                kind = incoming.kind.as_u16(),
-                "Skipping history capture for addressable event without d tag"
-            );
-            return;
-        };
-
-        let filter = Filter::new()
-            .kind(incoming.kind)
-            .author(incoming.pubkey)
-            .identifier(identifier);
-
-        let existing = match self.ctx.database.query(filter).await {
-            Ok(events) => events,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    event_id = %incoming.id.to_hex(),
-                    coordinate = %coordinate,
-                    "Failed querying existing events for history capture"
-                );
-                return;
-            }
-        };
-
-        for superseded in existing {
-            if superseded.id == incoming.id || superseded.created_at >= incoming.created_at {
-                continue;
-            }
-
-            if let Err(e) = self
-                .history()
-                .archive_superseded_event(&superseded, incoming, &coordinate)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    superseded_event_id = %superseded.id.to_hex(),
-                    replaced_by = %incoming.id.to_hex(),
-                    coordinate = %coordinate,
-                    "Failed to archive superseded replaceable/addressable event"
-                );
-            }
-        }
     }
 }
 

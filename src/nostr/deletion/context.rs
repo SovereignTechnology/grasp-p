@@ -1,6 +1,5 @@
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::HoldingStore;
-use crate::nostr::policy::PolicyContext;
 use crate::nostr::tombstones::Tombstones;
 use crate::nostr::SharedDatabase;
 use crate::{config::Config, grasp06::receive::RepoInitLocks, purgatory::Purgatory};
@@ -50,20 +49,6 @@ impl DeletionContext {
         }
     }
 
-    pub fn from_policy_context(policy_ctx: &PolicyContext) -> Self {
-        Self {
-            domain: policy_ctx.domain.clone(),
-            database: policy_ctx.database.clone(),
-            tombstones: policy_ctx.tombstones.clone(),
-            holding: policy_ctx.holding.clone(),
-            history: policy_ctx.history.clone(),
-            git_data_path: policy_ctx.git_data_path.clone(),
-            purgatory: policy_ctx.purgatory.clone(),
-            config: policy_ctx.config.clone(),
-            repo_init_locks: policy_ctx.repo_init_locks.clone(),
-        }
-    }
-
     pub fn domain(&self) -> &str {
         &self.domain
     }
@@ -98,11 +83,5 @@ impl DeletionContext {
 
     pub fn repo_init_locks(&self) -> &RepoInitLocks {
         &self.repo_init_locks
-    }
-}
-
-impl From<PolicyContext> for DeletionContext {
-    fn from(policy_ctx: PolicyContext) -> Self {
-        Self::from_policy_context(&policy_ctx)
     }
 }

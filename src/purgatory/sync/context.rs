@@ -515,9 +515,19 @@ impl SyncContext for RealSyncContext {
         new_oids: &HashSet<String>,
     ) -> Result<ProcessResult> {
         // Delegate to the unified function from git::sync.
-        // Pass configured write_policy for promotion-time recovery hooks.
-        // Keep rejected_events_index as None: the purgatory sync path already handles
-        // hot-cache re-processing via SyncManager::process_event_static.
+        // Pass configured deletion service for promotion-time recovery hooks.
+        // Keep git-push reprocessing disabled: the purgatory sync path already
+        // handles hot-cache re-processing via SyncManager::process_event_static.
+        let promotion_services = self
+            .write_policy
+            .as_ref()
+            .map(
+                |wp| crate::git::sync::PurgatoryPromotionServices::RecoveryOnly {
+                    deletion: wp.deletion(),
+                },
+            )
+            .unwrap_or_default();
+
         let result = crate::git::sync::process_newly_available_git_data(
             source_repo_path,
             new_oids,
@@ -525,9 +535,7 @@ impl SyncContext for RealSyncContext {
             self.local_relay.as_ref(),
             &self.purgatory,
             &self.git_data_path,
-            self.write_policy.as_ref(),
-            self.write_policy.as_ref().map(|wp| wp.deletion()),
-            None,
+            promotion_services,
         )
         .await?;
 

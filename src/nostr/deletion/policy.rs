@@ -25,7 +25,8 @@
 ///   to do this for us), and
 /// - records the deletion request in the persistent [`Tombstones`] store so
 ///   re-submission of the deleted event/coordinate stays rejected across
-///   restarts (the resubmission gate in `builder.rs` consults this store).
+///   restarts (the deletion gate in [`DeletionService`](super::DeletionService)
+///   consults this store).
 ///
 /// Author ownership is enforced before any main-DB deletion or tombstone
 /// recording: only the original author may delete their event.
@@ -183,15 +184,25 @@ impl DeletionPolicy {
 
         // Lifecycle lock discipline: acquire per `(owner, identifier)` locks
         // before mutating tombstones, main DB, holding DB, archives, repository
-        // directories, or purgatory. Git Smart HTTP fetch/info-refs handlers
-        // take shared read locks and push handlers take the same write lock for
-        // the served repository, so delete/archive/restore cannot remove or
-        // replace a bare repo while Git is using it.
+        // directories, or purgatory. Git Smart HTTP fetch/info-refs and push
+        // handlers take shared read locks for the served repository, so
+        // delete/archive/restore cannot remove or replace a bare repo while Git
+        // is using it.
         let _lifecycle_guards = self
             .ctx
             .holding
             .write_recovery_scopes(self.deletion_recovery_scopes(event).await)
             .await;
+
+        // Record the deletion before destructive work so a tombstone write
+        // failure rejects the deletion request without already having removed
+        // targets from purgatory/main DB/holding/archive state. Subsequent
+        // destructive steps are best-effort and log their own failures; the
+        // tombstone is the durable operation marker and resubmission gate source.
+        if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
+            tracing::error!(error = %e, "Failed to record deletion tombstone");
+            return reject_error(format!("internal error recording deletion: {e}"));
+        }
 
         let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
@@ -212,12 +223,6 @@ impl DeletionPolicy {
 
         for identifier in identifiers_to_realign {
             self.realign_identifier_state(&identifier).await;
-        }
-
-        // Record the deletion so future re-submission is rejected.
-        if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
-            tracing::error!(error = %e, "Failed to record deletion tombstone");
-            return reject_error(format!("internal error recording deletion: {e}"));
         }
 
         // Accept the deletion event itself so it is stored.
@@ -1942,28 +1947,51 @@ fn owner_directory_component(pubkey: &PublicKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nostr::policy::PolicyContext;
+    use crate::grasp06::receive::new_repo_init_locks;
+    use crate::nostr::history::ReplaceableHistoryStore;
+    use crate::nostr::holding::HoldingStore;
+    use crate::nostr::tombstones::Tombstones;
     use crate::purgatory::Purgatory;
     use nostr_relay_builder::prelude::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn make_context() -> PolicyContext {
+    fn make_context() -> DeletionContext {
         let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
         let config = crate::config::Config::for_testing();
-        PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
+        DeletionContext::new(
+            "test.example.com",
+            db,
+            Tombstones::in_memory(),
+            HoldingStore::in_memory(),
+            ReplaceableHistoryStore::in_memory(),
+            PathBuf::new(),
+            purgatory,
+            config,
+            new_repo_init_locks(),
+        )
     }
 
-    fn make_disrespector_context() -> PolicyContext {
+    fn make_disrespector_context() -> DeletionContext {
         let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
         let config = crate::config::Config {
             deletion_request_disrespector: true,
             ..crate::config::Config::for_testing()
         };
-        PolicyContext::new_for_test("test.example.com", db, PathBuf::new(), purgatory, config)
+        DeletionContext::new(
+            "test.example.com",
+            db,
+            Tombstones::in_memory(),
+            HoldingStore::in_memory(),
+            ReplaceableHistoryStore::in_memory(),
+            PathBuf::new(),
+            purgatory,
+            config,
+            new_repo_init_locks(),
+        )
     }
 
     fn make_announcement_event(keys: &Keys, identifier: &str) -> Event {
@@ -1976,7 +2004,7 @@ mod tests {
             .unwrap()
     }
 
-    fn add_to_purgatory(ctx: &PolicyContext, event: &Event, identifier: &str) {
+    fn add_to_purgatory(ctx: &DeletionContext, event: &Event, identifier: &str) {
         ctx.purgatory.add_announcement(
             event.clone(),
             identifier.to_string(),
@@ -2016,6 +2044,12 @@ mod tests {
             !ctx.purgatory
                 .has_purgatory_announcement(&keys.public_key(), identifier),
             "Purgatory entry should have been removed"
+        );
+        assert!(
+            ctx.tombstones
+                .is_event_deleted(&announcement.id, &keys.public_key())
+                .await,
+            "accepted deletion must persist a tombstone as the durable operation marker"
         );
     }
 
@@ -2287,12 +2321,16 @@ mod tests {
             domain: "test.example.com".to_string(),
             ..crate::config::Config::for_testing()
         };
-        let ctx = PolicyContext::new_for_test(
+        let ctx = DeletionContext::new(
             "test.example.com",
             db,
+            Tombstones::in_memory(),
+            HoldingStore::in_memory(),
+            ReplaceableHistoryStore::in_memory(),
             git_data_path.clone(),
             purgatory,
             config,
+            new_repo_init_locks(),
         );
 
         let signer = Keys::generate();

@@ -16,7 +16,7 @@ use super::protocol::{GitService, PktLine};
 use super::subprocess::GitSubprocess;
 
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
-use crate::git::sync::process_newly_available_git_data;
+use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionServices};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::holding::LifecycleReadGuard;
 use crate::nostr::SharedDatabase;
@@ -408,9 +408,11 @@ pub async fn handle_receive_pack(
         Some(&relay),
         &purgatory,
         git_data_path_buf,
-        Some(&write_policy),
-        Some(write_policy.deletion()),
-        Some(&rejected_events_index),
+        PurgatoryPromotionServices::GitPush {
+            write_policy: &write_policy,
+            deletion: write_policy.deletion(),
+            rejected_events_index: &rejected_events_index,
+        },
     )
     .await
     {

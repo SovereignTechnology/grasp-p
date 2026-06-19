@@ -67,7 +67,7 @@ use crate::git::authorization::{
 use crate::git::handlers::{build_git_protocol_error_response, is_git_protocol_error, GitError};
 use crate::git::protocol::GitService;
 use crate::git::subprocess::GitSubprocess;
-use crate::git::sync::process_newly_available_git_data;
+use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionServices};
 use crate::git::{delete_ref, list_refs};
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
@@ -356,9 +356,11 @@ pub async fn handle_prs_receive_pack(
             Some(&relay),
             &purgatory,
             Path::new(git_data_path),
-            Some(&write_policy),
-            Some(write_policy.deletion()),
-            Some(&rejected_events_index),
+            PurgatoryPromotionServices::GitPush {
+                write_policy: &write_policy,
+                deletion: write_policy.deletion(),
+                rejected_events_index: &rejected_events_index,
+            },
         )
         .await
         {

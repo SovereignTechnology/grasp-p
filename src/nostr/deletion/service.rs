@@ -1,6 +1,9 @@
 use anyhow::Result;
-use nostr_relay_builder::prelude::{nip62, Event, PublicKey, WritePolicyResult};
+use nostr_relay_builder::prelude::{
+    nip62, Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag, WritePolicyResult,
+};
 
+use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::holding::{LifecycleReadGuard, LifecycleWriteGuard};
 use crate::nostr::policy::{reject_error, reject_invalid};
 
@@ -116,6 +119,158 @@ impl DeletionService {
         WritePolicyResult::Accept
     }
 
+    /// Runtime de-list parity path for already-served repositories.
+    ///
+    /// When a newer replacement announcement for the same owner+identifier no
+    /// longer lists this relay's service, trigger the normal cascade
+    /// delete->holding/archive flow for the currently served announcement.
+    ///
+    /// This mirrors startup whitelist/blacklist parity behavior, but runs at
+    /// write time so service removals are enforced immediately.
+    pub async fn maybe_apply_runtime_delist_deletion(&self, incoming: &Event) {
+        let incoming_announcement = match RepositoryAnnouncement::from_event(incoming.clone()) {
+            Ok(announcement) => announcement,
+            Err(_) => return,
+        };
+
+        // This path is only for announcements that REMOVE this relay listing.
+        if incoming_announcement.lists_service(self.ctx.domain()) {
+            return;
+        }
+
+        let filter = Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(incoming.pubkey)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                incoming_announcement.identifier.clone(),
+            );
+
+        let current = match self.ctx.database().query(filter).await {
+            Ok(events) => events.into_iter().max_by_key(|event| event.created_at),
+            Err(e) => {
+                tracing::warn!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    error = %e,
+                    "Runtime de-list parity: failed querying existing announcement"
+                );
+                None
+            }
+        };
+
+        let Some(current) = current else {
+            return;
+        };
+
+        // Not newer than what we already serve -> no runtime parity action.
+        if incoming.created_at <= current.created_at {
+            return;
+        }
+
+        let current_announcement = match RepositoryAnnouncement::from_event(current.clone()) {
+            Ok(announcement) => announcement,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %current.id.to_hex(),
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    error = %e,
+                    "Runtime de-list parity: failed parsing current announcement"
+                );
+                return;
+            }
+        };
+
+        // Safety guard: only run cascade when the currently served announcement
+        // actually lists this relay.
+        if !current_announcement.lists_service(self.ctx.domain()) {
+            return;
+        }
+
+        match self
+            .apply_whitelist_deletion_for_announcement(&current)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    replaced_announcement = %current.id.to_hex(),
+                    replacement = %incoming.id.to_hex(),
+                    "Runtime de-list parity: deleted previously served repository"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    replaced_announcement = %current.id.to_hex(),
+                    replacement = %incoming.id.to_hex(),
+                    error = %e,
+                    "Runtime de-list parity: deletion flow failed"
+                );
+            }
+        }
+    }
+
+    pub async fn capture_superseded_replaceable_history(&self, incoming: &Event) {
+        if !Self::should_capture_replaceable_history(incoming.kind) {
+            return;
+        }
+
+        let Some(coordinate) = Self::event_coordinate(incoming) else {
+            return;
+        };
+
+        let Some(identifier) = Self::extract_addressable_identifier(incoming) else {
+            tracing::warn!(
+                event_id = %incoming.id.to_hex(),
+                kind = incoming.kind.as_u16(),
+                "Skipping history capture for addressable event without d tag"
+            );
+            return;
+        };
+
+        let filter = Filter::new()
+            .kind(incoming.kind)
+            .author(incoming.pubkey)
+            .identifier(identifier);
+
+        let existing = match self.ctx.database().query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    event_id = %incoming.id.to_hex(),
+                    coordinate = %coordinate,
+                    "Failed querying existing events for history capture"
+                );
+                return;
+            }
+        };
+
+        for superseded in existing {
+            if superseded.id == incoming.id || superseded.created_at >= incoming.created_at {
+                continue;
+            }
+
+            if let Err(e) = self
+                .history()
+                .archive_superseded_event(&superseded, incoming, &coordinate)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    superseded_event_id = %superseded.id.to_hex(),
+                    replaced_by = %incoming.id.to_hex(),
+                    coordinate = %coordinate,
+                    "Failed to archive superseded replaceable/addressable event"
+                );
+            }
+        }
+    }
+
     pub async fn read_repository_lifecycle(
         &self,
         owner_pubkey_hex: &str,
@@ -188,6 +343,21 @@ impl DeletionService {
             event.pubkey.to_hex(),
             identifier
         ))
+    }
+
+    fn extract_addressable_identifier(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "d" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn should_capture_replaceable_history(kind: Kind) -> bool {
+        kind == Kind::GitRepoAnnouncement || kind == Kind::RepoState
     }
 
     fn evict_author_from_purgatory(&self, author: &PublicKey) {
