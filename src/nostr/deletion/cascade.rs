@@ -7,11 +7,11 @@ use nostr_relay_builder::prelude::{
 use super::policy::{
     announcement_address_of, identifier_from_event, owner_directory_component, DeletionPolicy,
 };
-use crate::nostr::holding::{DeletionSource, HoldingMetadata};
-use crate::nostr::policy::{
+use super::{
     build_event_graph, reevaluate_events_without_announcement, traverse_and_mark_deletions,
     RetentionReason,
 };
+use crate::nostr::holding::{DeletionSource, HoldingMetadata};
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
 /// state event) that participate in the repository dependency graph. These are
@@ -38,16 +38,16 @@ impl DeletionPolicy {
     ///
     /// 1. Query the candidate event set (the announcement's siblings + all
     ///    NIP-34 dependent events) and build the dependency graph via
-    ///    [`crate::nostr::policy::build_event_graph`] (a/e/q tag edges).
+    ///    [`crate::nostr::deletion::build_event_graph`] (a/e/q tag edges).
     /// 2. Re-evaluate the candidate events WITHOUT the deleted announcement but
     ///    WITH every OTHER maintainer's announcement for the same identifier via
-    ///    [`crate::nostr::policy::reevaluate_events_without_announcement`], yielding the
+    ///    [`crate::nostr::deletion::reevaluate_events_without_announcement`], yielding the
     ///    kept/deleted split (multi-maintainer retention).
     /// 3. Add every surviving announcement (a different identifier, or the same
     ///    identifier authored by a different maintainer) to the kept set so the
     ///    traversal keeps everything still anchored to a live announcement.
     /// 4. Traverse the graph from the kept announcements via
-    ///    [`crate::nostr::policy::traverse_and_mark_deletions`] to compute the final orphan
+    ///    [`crate::nostr::deletion::traverse_and_mark_deletions`] to compute the final orphan
     ///    set (events unreachable from any surviving announcement).
     /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
     ///    itself from the main DB.
