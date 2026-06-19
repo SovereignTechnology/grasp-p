@@ -15,7 +15,7 @@ use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
-use crate::nostr::deletion::{DeletionContext, DeletionService};
+use crate::nostr::deletion::{DeletionContext, DeletionRuntime, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::lifecycle::RepositoryLifecycle;
@@ -791,6 +791,8 @@ pub struct RelayWithDatabase {
     pub lifecycle: RepositoryLifecycle,
     /// Replaceable-history store used for rollback history capture.
     pub history: crate::nostr::history::ReplaceableHistoryStore,
+    /// Runtime facade for deletion startup tasks and background cleanup.
+    pub deletion_runtime: DeletionRuntime,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
@@ -932,6 +934,13 @@ pub async fn create_relay(
 
     let relay = builder.build();
 
+    let deletion_runtime = DeletionRuntime::new(
+        write_policy.deletion().clone(),
+        holding.clone(),
+        config.holding_retention(),
+        config.holding_cleanup_interval(),
+    );
+
     tracing::info!(
         "Relay configured with GRASP-01 validation for domain: {}",
         config.domain
@@ -944,5 +953,6 @@ pub async fn create_relay(
         holding,
         lifecycle,
         history,
+        deletion_runtime,
     })
 }

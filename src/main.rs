@@ -3,9 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use nostr_sdk::prelude::PublicKey;
 use tokio::signal;
-use tokio::sync::watch;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -43,26 +41,7 @@ enum Cli {
     /// Permanently eject deleted repository data from holding/archive stores.
     ///
     /// This is an operator/admin maintenance command and is idempotent.
-    HoldingEject(HoldingEjectArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct HoldingEjectArgs {
-    /// Owner pubkey (npub or hex) for the repository scope to eject.
-    #[arg(long)]
-    owner: String,
-
-    /// Repository identifier (`d` tag value).
-    #[arg(long)]
-    identifier: String,
-
-    /// Relay data path containing the holding LMDB directory.
-    #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
-    relay_data_path: String,
-
-    /// Git data path containing the `.archive` subtree.
-    #[arg(long, env = "NGIT_GIT_DATA_PATH", default_value = "./data/git")]
-    git_data_path: String,
+    HoldingEject(nostr::deletion::HoldingEjectArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -108,7 +87,7 @@ async fn main() -> Result<()> {
                 cleanup_empty_repos::run_maintenance_cleanup(&cleanup_args).await
             }
         },
-        Cli::HoldingEject(eject_args) => run_holding_eject(eject_args).await,
+        Cli::HoldingEject(eject_args) => nostr::deletion::run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
             // Finish initialising the Config (load relay owner key if not provided).
@@ -121,33 +100,6 @@ async fn main() -> Result<()> {
             run_relay(config).await
         }
     }
-}
-
-async fn run_holding_eject(args: HoldingEjectArgs) -> Result<()> {
-    let owner_hex = PublicKey::parse(&args.owner)
-        .map(|pk| pk.to_hex())
-        .map_err(|e| anyhow::anyhow!("invalid --owner pubkey '{}': {}", args.owner, e))?;
-
-    let holding = nostr::holding::HoldingStore::open_lmdb(
-        std::path::Path::new(&args.relay_data_path),
-        std::path::Path::new(&args.git_data_path),
-    )
-    .await?;
-
-    let stats = holding
-        .manual_eject_repository(&owner_hex, &args.identifier)
-        .await?;
-
-    println!(
-        "Holding ejection complete: owner={} identifier={} metadata_deleted={} payload_deleted={} archive_files_deleted={}",
-        owner_hex,
-        args.identifier,
-        stats.metadata_deleted,
-        stats.archived_events_deleted,
-        stats.archive_files_deleted
-    );
-
-    Ok(())
 }
 
 async fn run_relay(config: Config) -> Result<()> {
@@ -256,64 +208,8 @@ async fn run_relay(config: Config) -> Result<()> {
             .write_policy
             .set_local_relay(relay_with_db.relay.clone());
 
-        let startup_reconciliation = relay_with_db
-            .write_policy
-            .deletion()
-            .run_startup_reconciliation()
-            .await;
-
-        let blacklist_stats = startup_reconciliation.blacklist_parity;
-        if blacklist_stats.scanned_announcements > 0 || blacklist_stats.matched_announcements > 0 {
-            info!(
-                scanned = blacklist_stats.scanned_announcements,
-                matched = blacklist_stats.matched_announcements,
-                attempted = blacklist_stats.attempted_deletions,
-                succeeded = blacklist_stats.successful_deletions,
-                failed = blacklist_stats.failed_deletions,
-                "Startup blacklist parity pass completed"
-            );
-        }
-
-        let blacklist_restore_stats = startup_reconciliation.blacklist_restore;
-        if blacklist_restore_stats.scanned_scopes > 0
-            || blacklist_restore_stats.attempted_restores > 0
-        {
-            info!(
-                scanned_scopes = blacklist_restore_stats.scanned_scopes,
-                attempted = blacklist_restore_stats.attempted_restores,
-                succeeded = blacklist_restore_stats.successful_restores,
-                failed = blacklist_restore_stats.failed_restores,
-                skipped = blacklist_restore_stats.skipped_scopes,
-                "Startup blacklist restore pass completed"
-            );
-        }
-
-        let whitelist_stats = startup_reconciliation.whitelist_parity;
-        if whitelist_stats.scanned_announcements > 0 || whitelist_stats.mismatched_announcements > 0
-        {
-            info!(
-                scanned = whitelist_stats.scanned_announcements,
-                mismatched = whitelist_stats.mismatched_announcements,
-                attempted = whitelist_stats.attempted_deletions,
-                succeeded = whitelist_stats.successful_deletions,
-                failed = whitelist_stats.failed_deletions,
-                "Startup whitelist parity pass completed"
-            );
-        }
-
-        let whitelist_restore_stats = startup_reconciliation.whitelist_restore;
-        if whitelist_restore_stats.scanned_scopes > 0
-            || whitelist_restore_stats.attempted_restores > 0
-        {
-            info!(
-                scanned_scopes = whitelist_restore_stats.scanned_scopes,
-                attempted = whitelist_restore_stats.attempted_restores,
-                succeeded = whitelist_restore_stats.successful_restores,
-                failed = whitelist_restore_stats.failed_restores,
-                skipped = whitelist_restore_stats.skipped_scopes,
-                "Startup whitelist restore pass completed"
-            );
-        }
+        let deletion_runtime = relay_with_db.deletion_runtime.clone();
+        deletion_runtime.run_startup_tasks().await;
 
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling
@@ -449,76 +345,7 @@ async fn run_relay(config: Config) -> Result<()> {
         // Start HTTP server with integrated relay and database
         info!("Starting HTTP server on {}", config.bind_address);
 
-        // Holding DB expiry engine:
-        // 1) startup catch-up pass (runs once)
-        // 2) periodic background cleanup pass
-        let holding_cleanup_store = relay_with_db.holding.clone();
-        let holding_retention = config.holding_retention();
-        let holding_cleanup_interval = config.holding_cleanup_interval();
-        match holding_cleanup_store
-            .cleanup_expired(nostr_sdk::prelude::Timestamp::now(), holding_retention)
-            .await
-        {
-            Ok(stats) => {
-                if stats.expired_records > 0 {
-                    info!(
-                        examined = stats.metadata_examined,
-                        expired = stats.expired_records,
-                        metadata_deleted = stats.metadata_deleted,
-                        archived_events_deleted = stats.archived_events_deleted,
-                        "Holding cleanup startup catch-up completed"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Holding cleanup startup catch-up failed");
-            }
-        }
-
-        let (holding_cleanup_shutdown_tx, mut holding_cleanup_shutdown_rx) = watch::channel(false);
-        let holding_cleanup_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + holding_cleanup_interval,
-                holding_cleanup_interval,
-            );
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        match holding_cleanup_store
-                            .cleanup_expired(nostr_sdk::prelude::Timestamp::now(), holding_retention)
-                            .await
-                        {
-                            Ok(stats) => {
-                                if stats.expired_records > 0 {
-                                    info!(
-                                        examined = stats.metadata_examined,
-                                        expired = stats.expired_records,
-                                        metadata_deleted = stats.metadata_deleted,
-                                        archived_events_deleted = stats.archived_events_deleted,
-                                        "Holding cleanup periodic pass completed"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Holding cleanup periodic pass failed");
-                            }
-                        }
-                    }
-                    changed = holding_cleanup_shutdown_rx.changed() => {
-                        if changed.is_ok() && *holding_cleanup_shutdown_rx.borrow() {
-                            info!("Holding cleanup task received shutdown signal");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        info!(
-            retention_secs = holding_retention.as_secs(),
-            interval_secs = holding_cleanup_interval.as_secs(),
-            "Holding cleanup task started"
-        );
+        let deletion_cleanup = deletion_runtime.spawn_cleanup_task();
 
         // Wrap write_policy in Arc for sharing between HTTP server connections
         let http_write_policy = Arc::new(relay_with_db.write_policy.clone());
@@ -575,11 +402,7 @@ async fn run_relay(config: Config) -> Result<()> {
             }
         }
 
-        // Stop holding cleanup task cleanly.
-        let _ = holding_cleanup_shutdown_tx.send(true);
-        if let Err(e) = holding_cleanup_task.await {
-            warn!(error = %e, "Holding cleanup task join failed during shutdown");
-        }
+        deletion_cleanup.shutdown().await;
 
         // Save purgatory state to disk
         let purgatory_save_path = PathBuf::from(&git_data_path).join("purgatory-state.json");
