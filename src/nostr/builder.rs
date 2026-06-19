@@ -15,7 +15,6 @@ use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
-use crate::git::sync::PurgatoryPromotionServices;
 use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
@@ -25,6 +24,7 @@ use crate::nostr::policy::{
     AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
     RelatedEventPolicy, StatePolicy, StateResult,
 };
+use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::nostr::SharedDatabase;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
@@ -401,16 +401,12 @@ impl Nip34WritePolicy {
     async fn handle_state(&self, event: &Event, is_synced: bool) -> WritePolicyResult {
         match self.state_policy.validate(event) {
             StateResult::Accept => {
+                let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self.deletion());
+
                 // Process state alignment asynchronously
                 match self
                     .state_policy
-                    .process_state_event(
-                        event,
-                        is_synced,
-                        PurgatoryPromotionServices::RecoveryOnly {
-                            deletion: self.deletion(),
-                        },
-                    )
+                    .process_state_event(event, is_synced, Some(&promotion_hooks))
                     .await
                 {
                     Ok(policy_result) => {
@@ -626,16 +622,12 @@ impl Nip34WritePolicy {
         );
 
         for entry in state_events {
+            let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self.deletion());
+
             // Re-evaluate authorization with the new announcement
             match self
                 .state_policy
-                .process_state_event(
-                    &entry.event,
-                    false,
-                    PurgatoryPromotionServices::RecoveryOnly {
-                        deletion: self.deletion(),
-                    },
-                )
+                .process_state_event(&entry.event, false, Some(&promotion_hooks))
                 .await
             {
                 Ok(WritePolicyResult::Accept) => {

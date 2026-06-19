@@ -32,9 +32,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use async_trait::async_trait;
 use nostr_sdk::prelude::Event;
 
 use crate::git::authorization::{
@@ -42,12 +42,9 @@ use crate::git::authorization::{
     fetch_repository_data_with_purgatory, RepositoryData,
 };
 use crate::git::{self, oid_exists};
-use crate::nostr::builder::Nip34WritePolicy;
-use crate::nostr::deletion::DeletionService;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::{can_apply_state, Purgatory};
-use crate::sync::rejected_index::RejectedEventsIndex;
 
 /// Result of processing newly available git data.
 ///
@@ -828,40 +825,25 @@ pub fn extract_identifier_from_pr_event(event: &Event) -> Option<String> {
 ///
 /// # Returns
 /// A `ProcessResult` describing what was processed
-#[derive(Clone, Copy, Default)]
-pub enum PurgatoryPromotionServices<'a> {
-    /// No deletion recovery hooks or git-push hot-cache reprocessing.
-    #[default]
-    None,
-    /// Promotion path can run deletion recovery, but hot-cache maintainer
-    /// reprocessing is handled elsewhere (for example purgatory sync).
-    RecoveryOnly { deletion: &'a DeletionService },
-    /// Git push path: recovery plus maintainer hot-cache reprocessing.
-    GitPush {
-        write_policy: &'a Nip34WritePolicy,
-        deletion: &'a DeletionService,
-        rejected_events_index: &'a Arc<RejectedEventsIndex>,
-    },
-}
+/// Neutral lifecycle hooks for purgatory promotion.
+///
+/// This trait is owned by `git::sync` so this module can report promotion
+/// lifecycle events without depending on Nostr write policy, deletion recovery,
+/// or hot-cache internals. Higher layers may implement these hooks to react to
+/// git/purgatory lifecycle events.
+#[async_trait]
+pub trait PurgatoryPromotionHooks: Send + Sync {
+    /// Called immediately before a purgatory announcement is promoted.
+    async fn before_announcement_promote(&self, _event: &Event, _identifier: &str) {}
 
-impl<'a> PurgatoryPromotionServices<'a> {
-    fn deletion(self) -> Option<&'a DeletionService> {
-        match self {
-            Self::None => None,
-            Self::RecoveryOnly { deletion } | Self::GitPush { deletion, .. } => Some(deletion),
-        }
-    }
+    /// Called after an announcement has been saved to the main database.
+    async fn after_announcement_saved(&self, _event: &Event) {}
 
-    fn git_push_reprocessing(self) -> Option<(&'a Nip34WritePolicy, &'a Arc<RejectedEventsIndex>)> {
-        match self {
-            Self::GitPush {
-                write_policy,
-                rejected_events_index,
-                ..
-            } => Some((write_policy, rejected_events_index)),
-            Self::None | Self::RecoveryOnly { .. } => None,
-        }
-    }
+    /// Called after a state event has been saved to the main database.
+    async fn after_state_saved(&self, _event: &Event) {}
+
+    /// Called after a PR event has been saved to the main database.
+    async fn after_pr_saved(&self, _event: &Event) {}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -872,7 +854,7 @@ pub async fn process_newly_available_git_data(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    promotion_services: PurgatoryPromotionServices<'_>,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> anyhow::Result<ProcessResult> {
     let mut result = ProcessResult::default();
 
@@ -902,7 +884,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
-        promotion_services,
+        promotion_hooks,
     )
     .await;
     result.merge(announcement_result);
@@ -915,7 +897,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
-        promotion_services.deletion(),
+        promotion_hooks,
     )
     .await;
     result.merge(state_result);
@@ -928,6 +910,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
+        promotion_hooks,
     )
     .await;
     result.merge(pr_outcome.result);
@@ -984,7 +967,7 @@ pub async fn process_repos_populated_by_state_copy(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    promotion_services: PurgatoryPromotionServices<'_>,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> ProcessResult {
     let empty_oids: HashSet<String> = HashSet::new();
     let mut aggregate = ProcessResult::default();
@@ -1002,7 +985,7 @@ pub async fn process_repos_populated_by_state_copy(
             local_relay,
             purgatory,
             git_data_path,
-            promotion_services,
+            promotion_hooks,
         )
         .await
         {
@@ -1033,7 +1016,7 @@ async fn process_purgatory_state_events(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    deletion_service: Option<&DeletionService>,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -1178,6 +1161,10 @@ async fn process_purgatory_state_events(
                         "Saved purgatory state event to database"
                     );
 
+                    if let Some(hooks) = promotion_hooks {
+                        hooks.after_state_saved(&entry.event).await;
+                    }
+
                     // Notify WebSocket subscribers
                     if let Some(relay) = local_relay {
                         if relay.notify_event(entry.event.clone()) {
@@ -1223,11 +1210,12 @@ async fn process_purgatory_state_events(
                             continue;
                         }
                         let owner = &announcement.event.pubkey;
-                        if let (Some(ds), Some(entry)) = (
-                            deletion_service,
+                        if let (Some(hooks), Some(entry)) = (
+                            promotion_hooks,
                             purgatory.find_announcement(owner, identifier),
                         ) {
-                            ds.maybe_recover_deleted_repository(&entry.event, identifier)
+                            hooks
+                                .before_announcement_promote(&entry.event, identifier)
                                 .await;
                         }
 
@@ -1240,6 +1228,9 @@ async fn process_purgatory_state_events(
                                         event_id = %ann_event.id,
                                         "Promoted purgatory announcement for owner whose repo received OIDs via state event copy"
                                     );
+                                    if let Some(hooks) = promotion_hooks {
+                                        hooks.after_announcement_saved(&ann_event).await;
+                                    }
                                     if let Some(relay) = local_relay {
                                         relay.notify_event(ann_event.clone());
                                     }
@@ -1361,6 +1352,7 @@ async fn process_purgatory_pr_events(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> PrProcessingOutcome {
     let mut result = ProcessResult::default();
     let mut released: Vec<(Event, String)> = Vec::new();
@@ -1444,6 +1436,10 @@ async fn process_purgatory_pr_events(
                     "Saved purgatory PR event to database"
                 );
 
+                if let Some(hooks) = promotion_hooks {
+                    hooks.after_pr_saved(event).await;
+                }
+
                 // Notify WebSocket subscribers
                 if let Some(relay) = local_relay {
                     if relay.notify_event(event.clone()) {
@@ -1489,9 +1485,6 @@ async fn process_purgatory_pr_events(
 /// When git data arrives for a repository, any announcements in purgatory
 /// for that repository should be promoted to the database and served to clients.
 ///
-/// When git-push promotion services are provided,
-/// any maintainer announcements sitting in the hot cache are re-processed immediately
-/// after the owner announcement is promoted, so they don't wait for the next sync cycle.
 #[allow(clippy::too_many_arguments)]
 async fn process_purgatory_announcements(
     identifier: &str,
@@ -1500,7 +1493,7 @@ async fn process_purgatory_announcements(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    promotion_services: PurgatoryPromotionServices<'_>,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -1533,11 +1526,12 @@ async fn process_purgatory_announcements(
         }
     };
 
-    if let (Some(ds), Some(entry)) = (
-        promotion_services.deletion(),
+    if let (Some(hooks), Some(entry)) = (
+        promotion_hooks,
         purgatory.find_announcement(&owner, identifier),
     ) {
-        ds.maybe_recover_deleted_repository(&entry.event, identifier)
+        hooks
+            .before_announcement_promote(&entry.event, identifier)
             .await;
     }
 
@@ -1554,6 +1548,10 @@ async fn process_purgatory_announcements(
                     "Promoted announcement from purgatory to database"
                 );
 
+                if let Some(hooks) = promotion_hooks {
+                    hooks.after_announcement_saved(&event).await;
+                }
+
                 // Notify WebSocket subscribers
                 if let Some(relay) = local_relay {
                     if relay.notify_event(event.clone()) {
@@ -1566,102 +1564,6 @@ async fn process_purgatory_announcements(
                 }
 
                 result.announcements_released += 1;
-
-                // Re-process any maintainer announcements sitting in the hot cache.
-                //
-                // When an owner announcement is promoted from purgatory via a git push,
-                // maintainer announcements that arrived earlier (via relay sync) may have
-                // been rejected and stored in the hot cache because the owner announcement
-                // didn't exist in the DB yet. Now that the owner announcement is saved,
-                // we must invalidate and re-process those cached events immediately.
-                //
-                // This only applies on the git push path. The purgatory sync path already handles this via
-                // SyncManager::process_event_static.
-                if let (Some((wp, rei)), Some(relay)) =
-                    (promotion_services.git_push_reprocessing(), local_relay)
-                {
-                    use crate::nostr::events::RepositoryAnnouncement;
-                    use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};
-                    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-                    if let Ok(announcement) = RepositoryAnnouncement::from_event(event.clone()) {
-                        if !announcement.maintainers.is_empty() {
-                            debug!(
-                                identifier = %identifier,
-                                event_id = %event.id,
-                                maintainer_count = announcement.maintainers.len(),
-                                "Owner announcement promoted via git push, checking hot cache for rejected maintainer announcements"
-                            );
-
-                            for maintainer_hex in &announcement.maintainers {
-                                match nostr_sdk::prelude::PublicKey::from_hex(maintainer_hex) {
-                                    Ok(maintainer_pubkey) => {
-                                        let (removed, hot_events) = rei.invalidate_and_get(
-                                            &maintainer_pubkey,
-                                            &announcement.identifier,
-                                            Some(crate::sync::rejected_index::EventType::Announcement),
-                                        );
-
-                                        if removed > 0 {
-                                            info!(
-                                                maintainer = %maintainer_hex,
-                                                identifier = %announcement.identifier,
-                                                removed_from_cold_index = removed,
-                                                hot_cache_events = hot_events.len(),
-                                                "Invalidated rejected maintainer announcements after git push promotion"
-                                            );
-                                        }
-
-                                        // Re-process events from hot cache
-                                        let dummy_addr =
-                                            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-                                        for hot_event in hot_events {
-                                            info!(
-                                                event_id = %hot_event.id,
-                                                maintainer = %maintainer_hex,
-                                                identifier = %announcement.identifier,
-                                                "Re-processing maintainer announcement from hot cache after git push promotion"
-                                            );
-                                            match wp.admit_event(&hot_event, &dummy_addr).await {
-                                                WritePolicyResult::Accept => {
-                                                    match database.save_event(&hot_event).await {
-                                                        Ok(_) => {
-                                                            relay.notify_event(hot_event.clone());
-                                                            info!(
-                                                                event_id = %hot_event.id,
-                                                                "Maintainer announcement accepted and saved on re-processing"
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(
-                                                                event_id = %hot_event.id,
-                                                                error = %e,
-                                                                "Failed to save re-processed maintainer announcement"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                _ => {
-                                                    warn!(
-                                                        event_id = %hot_event.id,
-                                                        "Maintainer announcement still rejected on re-processing"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            maintainer_hex = %maintainer_hex,
-                                            error = %e,
-                                            "Invalid maintainer public key in promoted announcement"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
             Err(e) => {
                 warn!(

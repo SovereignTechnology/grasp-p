@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::authorization::RepositoryData;
+use crate::git::sync::PurgatoryPromotionHooks;
+use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 
 /// Result of processing newly available git data.
 ///
@@ -518,15 +520,13 @@ impl SyncContext for RealSyncContext {
         // Pass configured deletion service for promotion-time recovery hooks.
         // Keep git-push reprocessing disabled: the purgatory sync path already
         // handles hot-cache re-processing via SyncManager::process_event_static.
-        let promotion_services = self
+        let promotion_hooks = self
             .write_policy
             .as_ref()
-            .map(
-                |wp| crate::git::sync::PurgatoryPromotionServices::RecoveryOnly {
-                    deletion: wp.deletion(),
-                },
-            )
-            .unwrap_or_default();
+            .map(|wp| NostrPurgatoryPromotionHooks::recovery_only(wp.deletion()));
+        let promotion_hooks = promotion_hooks
+            .as_ref()
+            .map(|hooks| hooks as &dyn PurgatoryPromotionHooks);
 
         let result = crate::git::sync::process_newly_available_git_data(
             source_repo_path,
@@ -535,7 +535,7 @@ impl SyncContext for RealSyncContext {
             self.local_relay.as_ref(),
             &self.purgatory,
             &self.git_data_path,
-            promotion_services,
+            promotion_hooks,
         )
         .await?;
 

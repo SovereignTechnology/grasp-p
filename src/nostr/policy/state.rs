@@ -11,7 +11,7 @@ use nostr_relay_builder::prelude::Event;
 use super::{accepted_purgatory, duplicate, reject_invalid, reject_restricted, PolicyContext};
 use crate::git;
 use crate::git::authorization::fetch_repository_data_with_purgatory;
-use crate::git::sync::PurgatoryPromotionServices;
+use crate::git::sync::PurgatoryPromotionHooks;
 use crate::nostr::events::{validate_state, RepositoryAnnouncement, RepositoryState};
 
 /// Result of state policy evaluation
@@ -53,7 +53,7 @@ impl StatePolicy {
         &self,
         event: &Event,
         is_synced: bool,
-        promotion_services: PurgatoryPromotionServices<'_>,
+        promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
     ) -> Result<WritePolicyResult> {
         // Parse state to get HEAD and branch info
         let state =
@@ -226,7 +226,7 @@ impl StatePolicy {
                 local_relay.as_ref(),
                 &self.ctx.purgatory,
                 &self.ctx.git_data_path,
-                promotion_services,
+                promotion_hooks,
             )
             .await;
 
