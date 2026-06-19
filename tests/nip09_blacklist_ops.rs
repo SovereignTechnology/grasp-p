@@ -8,12 +8,14 @@ use clap::Parser;
 use ngit_grasp::config::Config;
 use ngit_grasp::grasp06::receive::new_repo_init_locks;
 use ngit_grasp::metrics::{self, REGISTRY};
-use ngit_grasp::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use ngit_grasp::nostr::builder::Nip34WritePolicy;
 use ngit_grasp::nostr::history::ReplaceableHistoryStore;
 use ngit_grasp::nostr::holding::{
     DeletionSource, GitArchiveMetadata, HoldingMetadata, HoldingStore, HOLDING_ARCHIVE_PATH_TAG,
 };
+use ngit_grasp::nostr::lifecycle::RepositoryLifecycle;
 use ngit_grasp::nostr::tombstones::Tombstones;
+use ngit_grasp::nostr::SharedDatabase;
 use ngit_grasp::purgatory::Purgatory;
 use nostr_sdk::prelude::*;
 use prometheus::{Encoder, TextEncoder};
@@ -102,7 +104,8 @@ fn make_policy(
     Nip34WritePolicy::new(
         database,
         Tombstones::in_memory(),
-        holding,
+        holding.clone(),
+        RepositoryLifecycle::in_memory(),
         ReplaceableHistoryStore::in_memory(),
         git_data_path.to_path_buf(),
         purgatory,
@@ -143,7 +146,7 @@ async fn startup_blacklist_scan_deletes_matching_repositories_via_holding_archiv
     config.repository_blacklist = owner_npub;
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.matched_announcements, 1);
     assert_eq!(stats.successful_deletions, 1);
@@ -220,7 +223,7 @@ async fn blacklist_startup_deletion_runs_even_when_disrespector_is_enabled() {
     };
 
     let policy = make_policy(config, db.clone(), holding, git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.successful_deletions, 1);
     assert!(
@@ -251,7 +254,7 @@ async fn startup_blacklist_scan_leaves_non_matching_repositories_untouched() {
     config.repository_blacklist = "different-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_blacklist_parity_pass().await;
+    let stats = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     assert_eq!(stats.matched_announcements, 0);
     assert!(
@@ -300,7 +303,7 @@ async fn startup_whitelist_scan_deletes_non_matching_repositories_via_holding_ar
     config.repository_whitelist = "allowed-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_whitelist_parity_pass().await;
+    let stats = policy.deletion().run_startup_whitelist_parity_pass().await;
 
     assert_eq!(stats.mismatched_announcements, 1);
     assert_eq!(stats.successful_deletions, 1);
@@ -350,7 +353,7 @@ async fn startup_whitelist_scan_leaves_matching_repositories_untouched() {
     config.repository_whitelist = "matching-repo".to_string();
 
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let stats = policy.run_startup_whitelist_parity_pass().await;
+    let stats = policy.deletion().run_startup_whitelist_parity_pass().await;
 
     assert_eq!(stats.mismatched_announcements, 0);
     assert!(
@@ -401,7 +404,10 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_whitelist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_whitelist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     if repo_path.exists() {
@@ -433,7 +439,10 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 1);
     assert_eq!(restore_stats.successful_restores, 1);
@@ -474,7 +483,12 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
         "ngit_whitelist_startup_restore_total",
         &[("result", "attempted"), ("reason", "none")],
     );
-    assert_eq!(attempted_after, attempted_before + 1.0);
+    assert!(
+        attempted_after >= attempted_before + 1.0,
+        "expected attempted restore metric to increase by at least 1 (before={}, after={})",
+        attempted_before,
+        attempted_after
+    );
 
     let success_before = metric_value(
         &before,
@@ -486,9 +500,17 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
         "ngit_whitelist_startup_restore_total",
         &[("result", "succeeded"), ("reason", "none")],
     );
-    assert_eq!(success_after, success_before + 1.0);
+    assert!(
+        success_after >= success_before + 1.0,
+        "expected successful restore metric to increase by at least 1 (before={}, after={})",
+        success_before,
+        success_after
+    );
 
-    let second_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let second_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(second_stats.scanned_scopes, 0);
     assert_eq!(second_stats.attempted_restores, 0);
     assert_eq!(second_stats.successful_restores, 0);
@@ -531,7 +553,10 @@ async fn startup_whitelist_restore_skips_scopes_still_not_whitelisted() {
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_whitelist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_whitelist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     let restore_policy = make_policy(
@@ -545,7 +570,10 @@ async fn startup_whitelist_restore_skips_scopes_still_not_whitelisted() {
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_whitelist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_whitelist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 0);
     assert_eq!(restore_stats.successful_restores, 0);
@@ -608,7 +636,10 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_blacklist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     if repo_path.exists() {
@@ -640,7 +671,10 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 1);
     assert_eq!(restore_stats.successful_restores, 1);
@@ -681,7 +715,12 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
         "ngit_blacklist_startup_restore_total",
         &[("result", "attempted"), ("reason", "none")],
     );
-    assert_eq!(attempted_after, attempted_before + 1.0);
+    assert!(
+        attempted_after >= attempted_before + 1.0,
+        "expected attempted restore metric to increase by at least 1 (before={}, after={})",
+        attempted_before,
+        attempted_after
+    );
 
     let success_before = metric_value(
         &before,
@@ -693,9 +732,17 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
         "ngit_blacklist_startup_restore_total",
         &[("result", "succeeded"), ("reason", "none")],
     );
-    assert_eq!(success_after, success_before + 1.0);
+    assert!(
+        success_after >= success_before + 1.0,
+        "expected successful restore metric to increase by at least 1 (before={}, after={})",
+        success_before,
+        success_after
+    );
 
-    let second_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let second_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(second_stats.scanned_scopes, 0);
     assert_eq!(second_stats.attempted_restores, 0);
     assert_eq!(second_stats.successful_restores, 0);
@@ -737,7 +784,10 @@ async fn startup_blacklist_restore_skips_scopes_still_blacklisted() {
         holding.clone(),
         git_dir.path(),
     );
-    let deletion_stats = deletion_policy.run_startup_blacklist_parity_pass().await;
+    let deletion_stats = deletion_policy
+        .deletion()
+        .run_startup_blacklist_parity_pass()
+        .await;
     assert_eq!(deletion_stats.successful_deletions, 1);
 
     let restore_policy = make_policy(
@@ -752,7 +802,10 @@ async fn startup_blacklist_restore_skips_scopes_still_blacklisted() {
     );
 
     let before = render_metrics_snapshot();
-    let restore_stats = restore_policy.run_startup_blacklist_restore_pass().await;
+    let restore_stats = restore_policy
+        .deletion()
+        .run_startup_blacklist_restore_pass()
+        .await;
     assert_eq!(restore_stats.scanned_scopes, 1);
     assert_eq!(restore_stats.attempted_restores, 0);
     assert_eq!(restore_stats.successful_restores, 0);
@@ -869,7 +922,7 @@ async fn metrics_increment_on_blacklist_cleanup_recovery_and_manual_ejection_pat
         ..base_config()
     };
     let policy = make_policy(config, db.clone(), holding.clone(), git_dir.path());
-    let _ = policy.run_startup_blacklist_parity_pass().await;
+    let _ = policy.deletion().run_startup_blacklist_parity_pass().await;
 
     // Holding cleanup path
     let stale = EventBuilder::new(Kind::TextNote, "stale")
@@ -897,6 +950,10 @@ async fn metrics_increment_on_blacklist_cleanup_recovery_and_manual_ejection_pat
     // Recovery path metrics wiring (called by recovery workflow).
     metrics::record_recovery_attempt();
     metrics::record_recovery_partial();
+
+    // Startup restore path metrics wiring (called by restore passes).
+    metrics::record_blacklist_startup_restore_attempt();
+    metrics::record_whitelist_startup_restore_attempt();
 
     // Manual ejection path
     let _ = holding

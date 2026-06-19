@@ -173,13 +173,32 @@ The [`Nip34WritePolicy`](src/nostr/builder.rs:51) is the core event validation l
 /// - Forward references are supported (events referenced by accepted events)
 /// - Orphan events with no valid references are rejected
 pub struct Nip34WritePolicy {
-    domain: String,
-    database: SharedDatabase,
-    git_data_path: PathBuf,
+    ctx: PolicyContext,
+    announcement_policy: AnnouncementPolicy,
+    state_policy: StatePolicy,
+    pr_event_policy: PrEventPolicy,
+    related_event_policy: RelatedEventPolicy,
+    deletion: DeletionService,
 }
 ```
 
 See [`src/nostr/builder.rs:38-78`](src/nostr/builder.rs:38-78) for the full policy struct.
+
+#### [`lifecycle.rs`](src/nostr/lifecycle.rs) - Repository Lifecycle Coordination
+
+`RepositoryLifecycle` is the shared facade for per-repository lifecycle locks.
+Git Smart HTTP serving takes shared read locks through this facade, while
+deletion and recovery take exclusive write locks through the same facade. The
+lock map and lock-file support are owned by the lifecycle module itself, so
+repository runtime coordination is independent of holding/deletion storage.
+
+```text
+HTTP git serving  -> RepositoryLifecycle
+Deletion/recovery -> RepositoryLifecycle
+Holding cleanup   -> RepositoryLifecycle
+Manual ejection   -> RepositoryLifecycle
+RepositoryLifecycle -> RepositoryLifecycleLocks
+```
 
 #### [`events.rs`](src/nostr/events.rs) - Event Parsing
 
@@ -285,7 +304,8 @@ See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:
 
 **Main.rs** ([`src/main.rs`](../../src/main.rs)):
 - Creates `Arc<Purgatory>` at startup
-- Passes to both write policy and git handlers
+- Passes purgatory to both write policy and git handlers
+- Passes `RepositoryLifecycle` directly to HTTP git serving and deletion/recovery
 - Spawns background cleanup task (60-second interval)
 
 #### Thread Safety

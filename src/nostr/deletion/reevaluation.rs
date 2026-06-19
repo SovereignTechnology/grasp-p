@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr_relay_builder::prelude::{Event, EventId, Filter, Kind};
 
-use super::SharedDatabase;
+use crate::nostr::SharedDatabase;
 
 /// Result of re-evaluating events after an announcement deletion
 #[derive(Debug, Clone)]

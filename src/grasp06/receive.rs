@@ -71,7 +71,9 @@ use crate::git::sync::process_newly_available_git_data;
 use crate::git::{delete_ref, list_refs};
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -348,6 +350,12 @@ pub async fn handle_prs_receive_pack(
             .map(|(_, new_oid, _)| new_oid.clone())
             .collect();
 
+        let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
+            &write_policy,
+            &rejected_events_index,
+            Some(&relay),
+        );
+
         if let Err(e) = process_newly_available_git_data(
             &repo_path,
             &new_oids,
@@ -355,8 +363,7 @@ pub async fn handle_prs_receive_pack(
             Some(&relay),
             &purgatory,
             Path::new(git_data_path),
-            Some(&write_policy),
-            Some(&rejected_events_index),
+            Some(&promotion_hooks),
         )
         .await
         {

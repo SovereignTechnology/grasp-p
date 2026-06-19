@@ -4,20 +4,19 @@
 //! - copy/move deleted events out of the main DB into a dedicated holding DB,
 //! - persist minimal per-event metadata for later retention/recovery phases.
 
-use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, io::ErrorKind};
 
-use dashmap::DashMap;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::{
     Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
+
+use crate::nostr::lifecycle::RecoveryScope;
 
 /// Directory name (under `relay_data_path`) for the LMDB holding database.
 pub const HOLDING_DIR: &str = "holding";
@@ -73,19 +72,6 @@ pub struct HoldingStore {
     db: Arc<dyn NostrDatabase>,
     metadata_signer: Keys,
     archive_root: Option<PathBuf>,
-    /// Shared per-repository lifecycle read/write locks.
-    ///
-    /// Lock ordering invariant for deletion/recovery/cleanup paths: acquire all
-    /// required `(owner_pubkey_hex, identifier)` lifecycle locks first (sorted
-    /// lexicographically), then touch main DB / tombstones / holding DB /
-    /// repository filesystem / archive filesystem. Never acquire a lifecycle
-    /// lock while holding a lower-level lock or a purgatory map entry reference.
-    /// A matching lock file under `.lifecycle-locks/` extends the invariant to
-    /// short-lived CLI write operations such as `holding-eject`, which run in a
-    /// separate process and cannot share this in-memory map. Read-side Git Smart
-    /// HTTP operations share the in-memory read lock only, while write-side
-    /// operations also take the lock file.
-    lifecycle_locks: Arc<DashMap<RecoveryScope, Arc<AsyncRwLock<()>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,33 +87,6 @@ pub struct RecoveryMetadataRecord {
     pub metadata_event_id: EventId,
     pub archived_event_id: Option<EventId>,
     pub archive_relative_path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
-pub struct RecoveryScope {
-    pub owner_pubkey_hex: String,
-    pub identifier: String,
-}
-
-pub struct LifecycleReadGuard {
-    _memory_guard: OwnedRwLockReadGuard<()>,
-}
-
-pub struct LifecycleWriteGuard {
-    _memory_guard: OwnedRwLockWriteGuard<()>,
-    lock_path: Option<PathBuf>,
-}
-
-impl Drop for LifecycleWriteGuard {
-    fn drop(&mut self) {
-        if let Some(path) = &self.lock_path {
-            if let Err(e) = std::fs::remove_file(path) {
-                if e.kind() != ErrorKind::NotFound {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed to remove lifecycle lock file");
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,7 +136,6 @@ impl HoldingStore {
             db: Arc::new(db),
             metadata_signer: Keys::generate(),
             archive_root: Some(git_data_path.join(".archive")),
-            lifecycle_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -186,106 +144,6 @@ impl HoldingStore {
             db: Arc::new(MemoryDatabase::unbounded()),
             metadata_signer: Keys::generate(),
             archive_root: None,
-            lifecycle_locks: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub async fn read_recovery_scope(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleReadGuard {
-        let scope = RecoveryScope {
-            owner_pubkey_hex: owner_pubkey_hex.to_string(),
-            identifier: identifier.to_string(),
-        };
-        let lock = self
-            .lifecycle_locks
-            .entry(scope)
-            .or_insert_with(|| Arc::new(AsyncRwLock::new(())))
-            .value()
-            .clone();
-        LifecycleReadGuard {
-            _memory_guard: lock.read_owned().await,
-        }
-    }
-
-    pub async fn write_recovery_scope(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleWriteGuard {
-        self.write_recovery_scopes(vec![RecoveryScope {
-            owner_pubkey_hex: owner_pubkey_hex.to_string(),
-            identifier: identifier.to_string(),
-        }])
-        .await
-        .pop()
-        .expect("single lifecycle lock requested")
-    }
-
-    pub async fn write_recovery_scopes(
-        &self,
-        scopes: impl IntoIterator<Item = RecoveryScope>,
-    ) -> Vec<LifecycleWriteGuard> {
-        let mut scopes: Vec<_> = scopes.into_iter().collect();
-        scopes.sort();
-        scopes.dedup();
-
-        let mut guards = Vec::with_capacity(scopes.len());
-        for scope in scopes {
-            let lock = self
-                .lifecycle_locks
-                .entry(scope.clone())
-                .or_insert_with(|| Arc::new(AsyncRwLock::new(())))
-                .value()
-                .clone();
-            let memory_guard = lock.write_owned().await;
-            let lock_path = self.acquire_scope_file_lock(&scope).await;
-            guards.push(LifecycleWriteGuard {
-                _memory_guard: memory_guard,
-                lock_path,
-            });
-        }
-        guards
-    }
-
-    async fn acquire_scope_file_lock(&self, scope: &RecoveryScope) -> Option<PathBuf> {
-        let root = self.archive_root.as_ref()?;
-        let lock_dir = root
-            .parent()
-            .map(|parent| parent.join(".lifecycle-locks"))
-            .unwrap_or_else(|| root.join(".lifecycle-locks"));
-        if let Err(e) = std::fs::create_dir_all(&lock_dir) {
-            tracing::warn!(path = %lock_dir.display(), error = %e, "Failed to create lifecycle lock directory");
-            return None;
-        }
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        scope.hash(&mut hasher);
-        let lock_path = lock_dir.join(format!("{:016x}.lock", hasher.finish()));
-
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Some(lock_path),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        owner = %scope.owner_pubkey_hex,
-                        identifier = %scope.identifier,
-                        path = %lock_path.display(),
-                        error = %e,
-                        "Failed to acquire lifecycle lock file; continuing with in-process lock only"
-                    );
-                    return None;
-                }
-            }
         }
     }
 
@@ -847,6 +705,27 @@ impl HoldingStore {
         now: Timestamp,
         retention: Duration,
     ) -> anyhow::Result<CleanupStats> {
+        self.cleanup_expired_inner(now, retention, None).await
+    }
+
+    /// Cleanup pass for expired holding records using repository lifecycle
+    /// write locks before deleting scoped repository artifacts.
+    pub async fn cleanup_expired_with_lifecycle(
+        &self,
+        lifecycle: &crate::nostr::lifecycle::RepositoryLifecycle,
+        now: Timestamp,
+        retention: Duration,
+    ) -> anyhow::Result<CleanupStats> {
+        self.cleanup_expired_inner(now, retention, Some(lifecycle))
+            .await
+    }
+
+    async fn cleanup_expired_inner(
+        &self,
+        now: Timestamp,
+        retention: Duration,
+        lifecycle: Option<&crate::nostr::lifecycle::RepositoryLifecycle>,
+    ) -> anyhow::Result<CleanupStats> {
         let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
         let metadata_examined = self
             .db
@@ -864,10 +743,14 @@ impl HoldingStore {
 
         for record in expired {
             let _scope_guard = match &record.recovery_scope {
-                Some(scope) => Some(
-                    self.write_recovery_scope(&scope.owner_pubkey_hex, &scope.identifier)
-                        .await,
-                ),
+                Some(scope) => match lifecycle {
+                    Some(lifecycle) => Some(
+                        lifecycle
+                            .write_repository(&scope.owner_pubkey_hex, &scope.identifier)
+                            .await,
+                    ),
+                    None => None,
+                },
                 None => None,
             };
             let (metadata_deleted, event_deleted, archive_deleted) =
@@ -902,9 +785,36 @@ impl HoldingStore {
         owner_pubkey_hex: &str,
         identifier: &str,
     ) -> anyhow::Result<ManualEjectionStats> {
-        let _scope_guard = self
-            .write_recovery_scope(owner_pubkey_hex, identifier)
-            .await;
+        self.manual_eject_repository_inner(None, owner_pubkey_hex, identifier)
+            .await
+    }
+
+    /// Permanently eject all holding/archive artifacts while holding the
+    /// repository lifecycle write lock for the affected scope.
+    pub async fn manual_eject_repository_with_lifecycle(
+        &self,
+        lifecycle: &crate::nostr::lifecycle::RepositoryLifecycle,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> anyhow::Result<ManualEjectionStats> {
+        self.manual_eject_repository_inner(Some(lifecycle), owner_pubkey_hex, identifier)
+            .await
+    }
+
+    async fn manual_eject_repository_inner(
+        &self,
+        lifecycle: Option<&crate::nostr::lifecycle::RepositoryLifecycle>,
+        owner_pubkey_hex: &str,
+        identifier: &str,
+    ) -> anyhow::Result<ManualEjectionStats> {
+        let _scope_guard = match lifecycle {
+            Some(lifecycle) => Some(
+                lifecycle
+                    .write_repository(owner_pubkey_hex, identifier)
+                    .await,
+            ),
+            None => None,
+        };
         let filter = Filter::new().kind(Kind::from(HOLDING_METADATA_KIND));
         let metadata_events = self.db.query(filter).await.map_err(|e| {
             anyhow::anyhow!("Failed to query holding metadata for manual ejection: {e}")
@@ -1002,135 +912,6 @@ mod tests {
             .custom_created_at(created_at)
             .finalize(&Keys::generate())
             .expect("build test event")
-    }
-
-    #[tokio::test]
-    async fn lifecycle_read_locks_can_be_held_concurrently() {
-        let store = HoldingStore::in_memory();
-        let owner_hex = Keys::generate().public_key().to_hex();
-        let identifier = "popular-repo";
-
-        let first_guard = store.read_recovery_scope(&owner_hex, identifier).await;
-        let second_guard = tokio::time::timeout(
-            Duration::from_millis(100),
-            store.read_recovery_scope(&owner_hex, identifier),
-        )
-        .await
-        .expect("second read lock should not wait behind first read lock");
-
-        drop(second_guard);
-        drop(first_guard);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_push_and_fetch_read_locks_can_overlap() {
-        let store = HoldingStore::in_memory();
-        let owner_hex = Keys::generate().public_key().to_hex();
-        let identifier = "push-fetch-overlap";
-
-        let push_guard = store.read_recovery_scope(&owner_hex, identifier).await;
-        let fetch_guard = tokio::time::timeout(
-            Duration::from_millis(100),
-            store.read_recovery_scope(&owner_hex, identifier),
-        )
-        .await
-        .expect("fetch lifecycle read lock should not wait behind push lifecycle read lock");
-
-        drop(fetch_guard);
-        drop(push_guard);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_write_lock_waits_for_active_read_lock() {
-        let store = HoldingStore::in_memory();
-        let owner_hex = Keys::generate().public_key().to_hex();
-        let identifier = "read-before-delete";
-
-        let read_guard = store.read_recovery_scope(&owner_hex, identifier).await;
-        let writer_store = store.clone();
-        let writer_owner = owner_hex.clone();
-        let writer_identifier = identifier.to_string();
-        let (writer_acquired_tx, writer_acquired_rx) = tokio::sync::oneshot::channel();
-
-        let writer = tokio::spawn(async move {
-            let guard = writer_store
-                .write_recovery_scope(&writer_owner, &writer_identifier)
-                .await;
-            let _ = writer_acquired_tx.send(());
-            guard
-        });
-
-        tokio::time::timeout(Duration::from_millis(100), writer_acquired_rx)
-            .await
-            .expect_err("write lock should wait while read lock is active");
-
-        drop(read_guard);
-        let write_guard = tokio::time::timeout(Duration::from_secs(1), writer)
-            .await
-            .expect("write lock should acquire after read lock drops")
-            .expect("writer task should join");
-        drop(write_guard);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_queued_write_blocks_new_read_lock() {
-        let store = HoldingStore::in_memory();
-        let owner_hex = Keys::generate().public_key().to_hex();
-        let identifier = "delete-waits-fairly";
-
-        let first_read_guard = store.read_recovery_scope(&owner_hex, identifier).await;
-
-        let writer_store = store.clone();
-        let writer_owner = owner_hex.clone();
-        let writer_identifier = identifier.to_string();
-        let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
-        let (writer_acquired_tx, writer_acquired_rx) = tokio::sync::oneshot::channel();
-        let (release_writer_tx, release_writer_rx) = tokio::sync::oneshot::channel();
-
-        let writer = tokio::spawn(async move {
-            let _ = writer_started_tx.send(());
-            let guard = writer_store
-                .write_recovery_scope(&writer_owner, &writer_identifier)
-                .await;
-            let _ = writer_acquired_tx.send(());
-            let _ = release_writer_rx.await;
-            drop(guard);
-        });
-
-        writer_started_rx
-            .await
-            .expect("writer task should start before second reader");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let reader_store = store.clone();
-        let reader_owner = owner_hex.clone();
-        let reader_identifier = identifier.to_string();
-        let (second_read_acquired_tx, second_read_acquired_rx) = tokio::sync::oneshot::channel();
-        let second_reader = tokio::spawn(async move {
-            let guard = reader_store
-                .read_recovery_scope(&reader_owner, &reader_identifier)
-                .await;
-            let _ = second_read_acquired_tx.send(());
-            guard
-        });
-
-        tokio::time::timeout(Duration::from_millis(100), second_read_acquired_rx)
-            .await
-            .expect_err("new read lock should wait behind queued writer");
-
-        drop(first_read_guard);
-        tokio::time::timeout(Duration::from_secs(1), writer_acquired_rx)
-            .await
-            .expect("writer should acquire after active reader drops")
-            .expect("writer should report acquisition");
-
-        let _ = release_writer_tx.send(());
-        writer.await.expect("writer task should join");
-        let second_read_guard = tokio::time::timeout(Duration::from_secs(1), second_reader)
-            .await
-            .expect("second read should acquire after writer releases")
-            .expect("second reader task should join");
-        drop(second_read_guard);
     }
 
     #[tokio::test]

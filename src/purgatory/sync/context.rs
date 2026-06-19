@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::authorization::RepositoryData;
+use crate::git::sync::PurgatoryPromotionHooks;
+use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 
 /// Result of processing newly available git data.
 ///
@@ -193,8 +195,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::nostr::builder::Nip34WritePolicy;
-use crate::nostr::builder::SharedDatabase;
 use crate::nostr::events::RepositoryState;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::naughty_list::NaughtyListTracker;
 
@@ -515,9 +517,17 @@ impl SyncContext for RealSyncContext {
         new_oids: &HashSet<String>,
     ) -> Result<ProcessResult> {
         // Delegate to the unified function from git::sync.
-        // Pass configured write_policy for promotion-time recovery hooks.
-        // Keep rejected_events_index as None: the purgatory sync path already handles
-        // hot-cache re-processing via SyncManager::process_event_static.
+        // Pass configured deletion service for promotion-time recovery hooks.
+        // Keep git-push reprocessing disabled: the purgatory sync path already
+        // handles hot-cache re-processing via SyncManager::process_event_static.
+        let promotion_hooks = self
+            .write_policy
+            .as_ref()
+            .map(NostrPurgatoryPromotionHooks::recovery_only);
+        let promotion_hooks = promotion_hooks
+            .as_ref()
+            .map(|hooks| hooks as &dyn PurgatoryPromotionHooks);
+
         let result = crate::git::sync::process_newly_available_git_data(
             source_repo_path,
             new_oids,
@@ -525,8 +535,7 @@ impl SyncContext for RealSyncContext {
             self.local_relay.as_ref(),
             &self.purgatory,
             &self.git_data_path,
-            self.write_policy.as_ref(),
-            None,
+            promotion_hooks,
         )
         .await?;
 

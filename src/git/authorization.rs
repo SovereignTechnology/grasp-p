@@ -35,8 +35,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::nostr::builder::SharedDatabase;
 use crate::nostr::events::{RepositoryAnnouncement, RepositoryState};
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use nostr_sdk::prelude::{Kind, PublicKey};
 

@@ -16,11 +16,10 @@ use super::protocol::{GitService, PktLine};
 use super::subprocess::GitSubprocess;
 
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
-use crate::git::sync::process_newly_available_git_data;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
-use crate::nostr::holding::LifecycleReadGuard;
+use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionHooks};
+use crate::nostr::lifecycle::LifecycleReadGuard;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
-use crate::sync::rejected_index::RejectedEventsIndex;
 
 /// Handle GET /info/refs?service=git-{upload,receive}-pack
 ///
@@ -258,9 +257,8 @@ pub async fn handle_receive_pack(
     purgatory: Arc<Purgatory>,
     git_data_path: &str,
     git_protocol: Option<&str>,
-    write_policy: Arc<Nip34WritePolicy>,
-    rejected_events_index: Arc<RejectedEventsIndex>,
     repo_lifecycle_guard: Option<LifecycleReadGuard>,
+    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> Result<Response<Full<Bytes>>, GitError> {
     debug!("Handling receive-pack for {:?}", repo_path);
 
@@ -407,8 +405,7 @@ pub async fn handle_receive_pack(
         Some(&relay),
         &purgatory,
         git_data_path_buf,
-        Some(&write_policy),
-        Some(&rejected_events_index),
+        promotion_hooks,
     )
     .await
     {
