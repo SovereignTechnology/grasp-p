@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod deletion;
 pub mod events;
 pub mod history;
 pub mod holding;

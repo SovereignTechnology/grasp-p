@@ -17,6 +17,7 @@ use nostr_relay_builder::prelude::*;
 use tar::Archive as TarArchive;
 
 use crate::config::{Config, DatabaseBackend};
+use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::{
@@ -24,8 +25,8 @@ use crate::nostr::holding::{
 };
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
-    AnnouncementPolicy, AnnouncementResult, DeletionPolicy, PolicyContext, PrEventPolicy,
-    ReferenceResult, RelatedEventPolicy, StatePolicy, StateResult,
+    AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
+    RelatedEventPolicy, StatePolicy, StateResult,
 };
 
 /// Type alias for the shared database used by the relay
@@ -48,7 +49,7 @@ pub struct Nip34WritePolicy {
     state_policy: StatePolicy,
     pr_event_policy: PrEventPolicy,
     related_event_policy: RelatedEventPolicy,
-    deletion_policy: DeletionPolicy,
+    deletion: DeletionService,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -125,7 +126,7 @@ impl Nip34WritePolicy {
             state_policy: StatePolicy::new(ctx.clone()),
             pr_event_policy: PrEventPolicy::new(ctx.clone()),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
-            deletion_policy: DeletionPolicy::new(ctx.clone()),
+            deletion: DeletionService::new(DeletionContext::from_policy_context(ctx.clone())),
             ctx,
         }
     }
@@ -150,16 +151,16 @@ impl Nip34WritePolicy {
 
     /// Get a reference to the holding store for retention cleanup orchestration.
     pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
-        &self.ctx.holding
+        self.deletion.holding()
     }
 
     /// Get a reference to the replaceable-history store.
     pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {
-        &self.ctx.history
+        self.deletion.history()
     }
 
     pub fn tombstones(&self) -> &crate::nostr::tombstones::Tombstones {
-        &self.ctx.tombstones
+        self.deletion.tombstones()
     }
 
     /// Acquire a shared repository lifecycle lock used by Git Smart HTTP
@@ -174,9 +175,8 @@ impl Nip34WritePolicy {
         owner_pubkey_hex: &str,
         identifier: &str,
     ) -> LifecycleReadGuard {
-        self.ctx
-            .holding
-            .read_recovery_scope(owner_pubkey_hex, identifier)
+        self.deletion
+            .read_repository_lifecycle(owner_pubkey_hex, identifier)
             .await
     }
 
@@ -192,9 +192,8 @@ impl Nip34WritePolicy {
         owner_pubkey_hex: &str,
         identifier: &str,
     ) -> LifecycleWriteGuard {
-        self.ctx
-            .holding
-            .write_recovery_scope(owner_pubkey_hex, identifier)
+        self.deletion
+            .write_repository_lifecycle(owner_pubkey_hex, identifier)
             .await
     }
 
@@ -254,7 +253,7 @@ impl Nip34WritePolicy {
             crate::metrics::record_blacklist_deletion_attempt("startup");
 
             match self
-                .deletion_policy
+                .deletion
                 .apply_blacklist_deletion_for_announcement(&announcement)
                 .await
             {
@@ -354,7 +353,7 @@ impl Nip34WritePolicy {
             stats.attempted_deletions += 1;
 
             match self
-                .deletion_policy
+                .deletion
                 .apply_whitelist_deletion_for_announcement(&announcement)
                 .await
             {
@@ -900,7 +899,7 @@ impl Nip34WritePolicy {
         }
 
         match self
-            .deletion_policy
+            .deletion
             .apply_whitelist_deletion_for_announcement(&current)
             .await
         {
@@ -1255,70 +1254,6 @@ impl Nip34WritePolicy {
         }
     }
 
-    /// Deletion / vanish gate run before kind-specific handling.
-    ///
-    /// Reproduces the rejection the relay-builder's `check_id` gate used to
-    /// provide when the LMDB backend auto-processed NIP-09/NIP-62. Returns
-    /// `Some(rejection)` if the event must be rejected, `None` to continue.
-    ///
-    /// Checks, in the same order the backend used:
-    /// 1. author pubkey has requested to vanish from this relay
-    /// 2. the event id was deleted by a recorded kind-5 (`e` tag)
-    /// 3. the event's replaceable/addressable coordinate was deleted by a
-    ///    recorded kind-5 (`a` tag) at or after this event's `created_at`
-    ///
-    /// Fresh kind-5 / kind-62 events pass this gate naturally: their tombstone
-    /// is only recorded *after* successful handling, so they are not yet in the
-    /// store when the gate runs.
-    async fn deletion_gate(&self, event: &Event) -> Option<WritePolicyResult> {
-        // 1. Vanished pubkey
-        if self.ctx.tombstones.is_pubkey_vanished(&event.pubkey).await {
-            tracing::debug!(
-                event_id = %event.id.to_hex(),
-                author = %event.pubkey.to_hex(),
-                "Rejected event from vanished pubkey"
-            );
-            return Some(reject_invalid("this pubkey has requested to vanish"));
-        }
-
-        // 2. Deleted event id (author-bound: only the event's own author may
-        //    have deleted it)
-        if self
-            .ctx
-            .tombstones
-            .is_event_deleted(&event.id, &event.pubkey)
-            .await
-        {
-            tracing::debug!(
-                event_id = %event.id.to_hex(),
-                "Rejected re-submission of deleted event"
-            );
-            return Some(reject_invalid("this event is deleted"));
-        }
-
-        // 3. Deleted coordinate (replaceable / addressable events only)
-        if event.kind.is_replaceable() || event.kind.is_addressable() {
-            let coordinate = Self::event_coordinate(event);
-            if let Some(coord) = coordinate {
-                if self
-                    .ctx
-                    .tombstones
-                    .is_coordinate_deleted(&coord, event.created_at)
-                    .await
-                {
-                    tracing::debug!(
-                        event_id = %event.id.to_hex(),
-                        coordinate = %coord,
-                        "Rejected event whose coordinate was deleted"
-                    );
-                    return Some(reject_invalid("this event is deleted"));
-                }
-            }
-        }
-
-        None
-    }
-
     /// Build the NIP-01 addressable/replaceable coordinate string
     /// `<kind>:<pubkey-hex>:<d-identifier>` for an event, matching the format
     /// used in NIP-09 `a` tags. Returns `None` for non-(addressable/replaceable)
@@ -1406,8 +1341,7 @@ impl Nip34WritePolicy {
             }
 
             if let Err(e) = self
-                .ctx
-                .history
+                .history()
                 .archive_superseded_event(&superseded, incoming, &coordinate)
                 .await
             {
@@ -1418,98 +1352,6 @@ impl Nip34WritePolicy {
                     coordinate = %coordinate,
                     "Failed to archive superseded replaceable/addressable event"
                 );
-            }
-        }
-    }
-
-    /// Handle a NIP-62 request-to-vanish (kind 62).
-    ///
-    /// Reproduces the LMDB backend's vanish behaviour now that we run with
-    /// `process_nip62(false)`:
-    /// - record the vanish request in the persistent tombstone store so future
-    ///   events from this pubkey are rejected (the [`deletion_gate`]),
-    /// - hard-delete the author's events from the main database,
-    /// - evict any of the author's purgatory entries and delete their bare repos.
-    ///
-    /// Only requests targeting this relay (or `ALL_RELAYS`) are honoured; the
-    /// signer is implicitly the pubkey being vanished, so author validation is
-    /// inherent.
-    async fn handle_vanish(&self, event: &Event) -> WritePolicyResult {
-        use nostr_relay_builder::prelude::nip62;
-
-        // Only honour requests that target this relay (or all relays). We do not
-        // configure a relay_url on the database, matching the historical
-        // behaviour where only ALL_RELAYS requests were actioned; but we accept
-        // (store) any well-formed kind-62 so clients get an OK.
-        let targets_relay = nip62::is_valid_vanish_request_for_relay(event.tags.as_slice(), None);
-
-        if !targets_relay {
-            tracing::debug!(
-                author = %event.pubkey.to_hex(),
-                "kind-62 vanish request does not target this relay; storing without action"
-            );
-            return WritePolicyResult::Accept;
-        }
-
-        let author = event.pubkey;
-
-        // 1. Record the vanish so re-submission of the author's events is blocked.
-        if let Err(e) = self.ctx.tombstones.record_vanish(event).await {
-            tracing::error!(error = %e, author = %author.to_hex(), "Failed to record vanish tombstone");
-            return reject_error(format!("internal error recording vanish: {e}"));
-        }
-
-        // 2. Hard-delete the author's events from the main database.
-        let filter = Filter::new().author(author);
-        if let Err(e) = self.ctx.database.delete(filter).await {
-            tracing::error!(error = %e, author = %author.to_hex(), "Failed to delete vanished author's events");
-            return reject_error(format!("internal error processing vanish: {e}"));
-        }
-
-        // 3. Evict the author's purgatory entries (and their bare repos).
-        self.evict_author_from_purgatory(&author);
-
-        tracing::info!(
-            author = %author.to_hex(),
-            "Processed NIP-62 request to vanish: deleted author's events and purgatory entries"
-        );
-
-        WritePolicyResult::Accept
-    }
-
-    /// Remove all purgatory entries authored by `author` and delete any bare
-    /// repositories backing purgatory announcements they owned.
-    fn evict_author_from_purgatory(&self, author: &nostr_relay_builder::prelude::PublicKey) {
-        // Announcements owned by this author.
-        for (repo_id, _) in self.ctx.purgatory.announcements_for_sync() {
-            // repo_id format: "30617:{pubkey_hex}:{identifier}"
-            let parts: Vec<&str> = repo_id.splitn(3, ':').collect();
-            if parts.len() != 3 || parts[1] != author.to_hex() {
-                continue;
-            }
-            let identifier = parts[2];
-            if let Some(entry) = self.ctx.purgatory.find_announcement(author, identifier) {
-                if entry.repo_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&entry.repo_path) {
-                        tracing::warn!(
-                            path = %entry.repo_path.display(),
-                            error = %e,
-                            "Failed to delete bare repository during vanish processing"
-                        );
-                    }
-                }
-            }
-            self.ctx.purgatory.remove_announcement(author, identifier);
-        }
-
-        // State events authored by this author across all identifiers.
-        for identifier in self.ctx.purgatory.get_all_identifiers() {
-            for entry in self.ctx.purgatory.find_state(&identifier) {
-                if entry.author == *author {
-                    self.ctx
-                        .purgatory
-                        .remove_state_event(&identifier, &entry.event.id);
-                }
             }
         }
     }
@@ -1543,7 +1385,7 @@ impl WritePolicy for Nip34WritePolicy {
             // `process_nip62(false)`. We reproduce that rejection here from our
             // own persistent `Tombstones` store so deleted events (and events
             // from vanished pubkeys) stay rejected across restarts.
-            if let Some(rejection) = self.deletion_gate(event).await {
+            if let Some(rejection) = self.deletion.gate(event).await {
                 return rejection;
             }
 
@@ -1567,8 +1409,8 @@ impl WritePolicy for Nip34WritePolicy {
                     );
                     WritePolicyResult::Accept
                 }
-                Kind::EventDeletion => self.deletion_policy.handle(event).await,
-                Kind::RequestToVanish => self.handle_vanish(event).await,
+                Kind::EventDeletion => self.deletion.handle_nip09(event).await,
+                Kind::RequestToVanish => self.deletion.handle_vanish(event).await,
                 _ => self.handle_related_event(event, "Event").await,
             }
         })
@@ -2073,7 +1915,7 @@ impl Nip34WritePolicy {
                 continue;
             };
 
-            match self.ctx.holding.archived_event(&event_id).await {
+            match self.holding().archived_event(&event_id).await {
                 Ok(Some(event)) => {
                     if self.recovery_blocked_by_tombstone(&event).await {
                         self.cleanup_pr_git_refs_for_tombstoned_event(&event).await;
@@ -2163,33 +2005,7 @@ impl Nip34WritePolicy {
     }
 
     async fn recovery_blocked_by_tombstone(&self, event: &Event) -> bool {
-        if self.ctx.tombstones.is_pubkey_vanished(&event.pubkey).await {
-            return true;
-        }
-
-        if self
-            .ctx
-            .tombstones
-            .is_event_deleted(&event.id, &event.pubkey)
-            .await
-        {
-            return true;
-        }
-
-        if event.kind.is_replaceable() || event.kind.is_addressable() {
-            if let Some(coord) = Self::event_coordinate(event) {
-                if self
-                    .ctx
-                    .tombstones
-                    .is_coordinate_deleted(&coord, event.created_at)
-                    .await
-                {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.deletion.gate(event).await.is_some()
     }
 
     pub(crate) async fn maybe_recover_deleted_repository(
@@ -2208,13 +2024,11 @@ impl Nip34WritePolicy {
     ) -> bool {
         let owner_hex = owner_pubkey.to_hex();
         let _lifecycle_guard = self
-            .ctx
-            .holding
-            .write_recovery_scope(&owner_hex, identifier)
+            .deletion
+            .write_repository_lifecycle(&owner_hex, identifier)
             .await;
         let records = self
-            .ctx
-            .holding
+            .holding()
             .eligible_recovery_records(
                 &owner_hex,
                 identifier,
@@ -2252,7 +2066,7 @@ impl Nip34WritePolicy {
         let mut archive_restored = false;
         let mut selected_archive_abs: Option<PathBuf> = None;
         if let Some(rel_path) = &selected_archive_rel {
-            match self.ctx.holding.archive_absolute_path(rel_path) {
+            match self.holding().archive_absolute_path(rel_path) {
                 Some(abs_path) => {
                     selected_archive_abs = Some(abs_path.clone());
                     if !abs_path.exists() {
@@ -2312,7 +2126,7 @@ impl Nip34WritePolicy {
 
         let mut cleaned = 0usize;
         for record in &cleanup_candidates {
-            match self.ctx.holding.delete_recovery_record(record).await {
+            match self.holding().delete_recovery_record(record).await {
                 Ok((metadata_deleted, _payload_deleted)) => {
                     if metadata_deleted {
                         cleaned += 1;
