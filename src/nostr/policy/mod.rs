@@ -5,8 +5,8 @@
 /// - `StatePolicy` - State event validation + ref alignment
 /// - `PrEventPolicy` - PR/PR Update validation
 /// - `RelatedEventPolicy` - Forward/backward reference checking
+/// - Deletion handling lives in `crate::nostr::deletion`
 mod announcement;
-mod deletion;
 mod pr_event;
 mod related;
 mod result;
@@ -26,7 +26,6 @@ pub(crate) use result::{
 };
 
 pub use announcement::{AnnouncementPolicy, AnnouncementResult};
-pub use deletion::DeletionPolicy;
 pub use pr_event::PrEventPolicy;
 pub use related::{ReferenceResult, RelatedEventPolicy};
 pub use state::{StatePolicy, StateResult};

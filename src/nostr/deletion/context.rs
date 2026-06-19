@@ -13,51 +13,96 @@ use std::sync::Arc;
 /// deletion/vanish handling, repository lifecycle locking, and deletion gates.
 #[derive(Clone)]
 pub struct DeletionContext {
-    policy_ctx: PolicyContext,
+    pub domain: String,
+    pub database: SharedDatabase,
+    pub tombstones: Tombstones,
+    pub holding: HoldingStore,
+    pub history: ReplaceableHistoryStore,
+    pub git_data_path: PathBuf,
+    pub purgatory: Arc<Purgatory>,
+    pub config: Config,
+    pub repo_init_locks: RepoInitLocks,
 }
 
 impl DeletionContext {
-    pub fn from_policy_context(policy_ctx: PolicyContext) -> Self {
-        Self { policy_ctx }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        domain: impl Into<String>,
+        database: SharedDatabase,
+        tombstones: Tombstones,
+        holding: HoldingStore,
+        history: ReplaceableHistoryStore,
+        git_data_path: impl Into<PathBuf>,
+        purgatory: Arc<Purgatory>,
+        config: Config,
+        repo_init_locks: RepoInitLocks,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            database,
+            tombstones,
+            holding,
+            history,
+            git_data_path: git_data_path.into(),
+            purgatory,
+            config,
+            repo_init_locks,
+        }
     }
 
-    pub fn policy_context(&self) -> &PolicyContext {
-        &self.policy_ctx
+    pub fn from_policy_context(policy_ctx: &PolicyContext) -> Self {
+        Self {
+            domain: policy_ctx.domain.clone(),
+            database: policy_ctx.database.clone(),
+            tombstones: policy_ctx.tombstones.clone(),
+            holding: policy_ctx.holding.clone(),
+            history: policy_ctx.history.clone(),
+            git_data_path: policy_ctx.git_data_path.clone(),
+            purgatory: policy_ctx.purgatory.clone(),
+            config: policy_ctx.config.clone(),
+            repo_init_locks: policy_ctx.repo_init_locks.clone(),
+        }
     }
 
     pub fn domain(&self) -> &str {
-        &self.policy_ctx.domain
+        &self.domain
     }
 
     pub fn database(&self) -> &SharedDatabase {
-        &self.policy_ctx.database
+        &self.database
     }
 
     pub fn tombstones(&self) -> &Tombstones {
-        &self.policy_ctx.tombstones
+        &self.tombstones
     }
 
     pub fn holding(&self) -> &HoldingStore {
-        &self.policy_ctx.holding
+        &self.holding
     }
 
     pub fn history(&self) -> &ReplaceableHistoryStore {
-        &self.policy_ctx.history
+        &self.history
     }
 
     pub fn git_data_path(&self) -> &PathBuf {
-        &self.policy_ctx.git_data_path
+        &self.git_data_path
     }
 
     pub fn purgatory(&self) -> &Arc<Purgatory> {
-        &self.policy_ctx.purgatory
+        &self.purgatory
     }
 
     pub fn config(&self) -> &Config {
-        &self.policy_ctx.config
+        &self.config
     }
 
     pub fn repo_init_locks(&self) -> &RepoInitLocks {
-        &self.policy_ctx.repo_init_locks
+        &self.repo_init_locks
+    }
+}
+
+impl From<PolicyContext> for DeletionContext {
+    fn from(policy_ctx: PolicyContext) -> Self {
+        Self::from_policy_context(&policy_ctx)
     }
 }

@@ -2,9 +2,9 @@ use anyhow::Result;
 use nostr_relay_builder::prelude::{nip62, Event, PublicKey, WritePolicyResult};
 
 use crate::nostr::holding::{LifecycleReadGuard, LifecycleWriteGuard};
-use crate::nostr::policy::{reject_error, reject_invalid, DeletionPolicy};
+use crate::nostr::policy::{reject_error, reject_invalid};
 
-use super::DeletionContext;
+use super::{DeletionContext, DeletionPolicy};
 
 #[derive(Clone)]
 pub struct DeletionService {
@@ -14,7 +14,7 @@ pub struct DeletionService {
 
 impl DeletionService {
     pub fn new(ctx: DeletionContext) -> Self {
-        let policy = DeletionPolicy::new(ctx.policy_context().clone());
+        let policy = DeletionPolicy::new(ctx.clone());
         Self { ctx, policy }
     }
 

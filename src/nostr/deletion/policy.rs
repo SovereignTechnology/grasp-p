@@ -42,7 +42,7 @@ use nostr_relay_builder::prelude::{
 };
 use tar::Builder as TarBuilder;
 
-use super::{PolicyContext, RetentionReason};
+use super::DeletionContext;
 use crate::git;
 use crate::git::authorization::{
     collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
@@ -50,7 +50,10 @@ use crate::git::authorization::{
 use crate::git::process;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata, RecoveryScope};
-use crate::nostr::policy::reject_invalid;
+use crate::nostr::policy::{
+    build_event_graph, reevaluate_events_without_announcement, reject_error, reject_invalid,
+    traverse_and_mark_deletions, RetentionReason,
+};
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
 /// state event) that participate in the repository dependency graph. These are
@@ -83,7 +86,7 @@ const MAX_CASCADE_ORPHAN_DELETES: usize = 20_000;
 /// Policy for handling NIP-09 event deletion requests
 #[derive(Clone)]
 pub struct DeletionPolicy {
-    ctx: PolicyContext,
+    ctx: DeletionContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -96,7 +99,8 @@ struct ReplaceableRollbackPlan {
 }
 
 impl DeletionPolicy {
-    pub fn new(ctx: PolicyContext) -> Self {
+    pub fn new(ctx: impl Into<DeletionContext>) -> Self {
+        let ctx = ctx.into();
         Self { ctx }
     }
 
@@ -172,7 +176,7 @@ impl DeletionPolicy {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "Database lookup failed during deletion validation");
-                    return super::reject_error(format!("internal error: {e}"));
+                    return reject_error(format!("internal error: {e}"));
                 }
             }
         }
@@ -213,7 +217,7 @@ impl DeletionPolicy {
         // Record the deletion so future re-submission is rejected.
         if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
             tracing::error!(error = %e, "Failed to record deletion tombstone");
-            return super::reject_error(format!("internal error recording deletion: {e}"));
+            return reject_error(format!("internal error recording deletion: {e}"));
         }
 
         // Accept the deletion event itself so it is stored.
@@ -808,16 +812,16 @@ impl DeletionPolicy {
     ///
     /// 1. Query the candidate event set (the announcement's siblings + all
     ///    NIP-34 dependent events) and build the dependency graph via
-    ///    [`super::build_event_graph`] (a/e/q tag edges).
+    ///    [`crate::nostr::policy::build_event_graph`] (a/e/q tag edges).
     /// 2. Re-evaluate the candidate events WITHOUT the deleted announcement but
     ///    WITH every OTHER maintainer's announcement for the same identifier via
-    ///    [`super::reevaluate_events_without_announcement`], yielding the
+    ///    [`crate::nostr::policy::reevaluate_events_without_announcement`], yielding the
     ///    kept/deleted split (multi-maintainer retention).
     /// 3. Add every surviving announcement (a different identifier, or the same
     ///    identifier authored by a different maintainer) to the kept set so the
     ///    traversal keeps everything still anchored to a live announcement.
     /// 4. Traverse the graph from the kept announcements via
-    ///    [`super::traverse_and_mark_deletions`] to compute the final orphan
+    ///    [`crate::nostr::policy::traverse_and_mark_deletions`] to compute the final orphan
     ///    set (events unreachable from any surviving announcement).
     /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
     ///    itself from the main DB.
@@ -880,7 +884,7 @@ impl DeletionPolicy {
             return;
         }
 
-        let graph = super::build_event_graph(&candidates);
+        let graph = build_event_graph(&candidates);
 
         // The set of candidate event ids we feed into re-evaluation. The
         // re-evaluation engine queries each one back from the DB; passing the
@@ -889,7 +893,7 @@ impl DeletionPolicy {
 
         // Step 2: re-evaluate dependents WITHOUT the deleted announcement but
         // WITH any other surviving maintainers' announcements.
-        let reeval = match super::reevaluate_events_without_announcement(
+        let reeval = match reevaluate_events_without_announcement(
             &self.ctx.database,
             announcement_addr,
             &candidate_ids,
@@ -946,8 +950,7 @@ impl DeletionPolicy {
             .map(|e| e.id)
             .unwrap_or_else(EventId::all_zeros);
 
-        let traversal =
-            super::traverse_and_mark_deletions(&graph, &kept_events, deleted_announcement_id);
+        let traversal = traverse_and_mark_deletions(&graph, &kept_events, deleted_announcement_id);
 
         tracing::info!(
             announcement = %announcement_addr,
@@ -1207,7 +1210,7 @@ impl DeletionPolicy {
             .collect();
 
         if !excluded_roots.is_empty() {
-            let graph = super::build_event_graph(&events);
+            let graph = build_event_graph(&events);
             let mut excluded_ids = excluded_roots.clone();
             for root in &excluded_roots {
                 excluded_ids.extend(graph.get_transitive_dependents(root));

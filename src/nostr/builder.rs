@@ -110,8 +110,22 @@ impl Nip34WritePolicy {
         config: crate::config::Config,
         repo_init_locks: crate::grasp06::receive::RepoInitLocks,
     ) -> Self {
+        let git_data_path = git_data_path.into();
+        let domain = config.domain.clone();
+        let deletion_ctx = DeletionContext::new(
+            domain.clone(),
+            database.clone(),
+            tombstones.clone(),
+            holding.clone(),
+            history.clone(),
+            git_data_path.clone(),
+            purgatory.clone(),
+            config.clone(),
+            repo_init_locks.clone(),
+        );
+
         let ctx = PolicyContext::new(
-            &config.domain,
+            domain,
             database,
             tombstones,
             holding,
@@ -126,7 +140,7 @@ impl Nip34WritePolicy {
             state_policy: StatePolicy::new(ctx.clone()),
             pr_event_policy: PrEventPolicy::new(ctx.clone()),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
-            deletion: DeletionService::new(DeletionContext::from_policy_context(ctx.clone())),
+            deletion: DeletionService::new(deletion_ctx),
             ctx,
         }
     }
