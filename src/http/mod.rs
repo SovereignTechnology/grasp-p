@@ -27,7 +27,8 @@ use crate::config::Config;
 use crate::git;
 use crate::grasp06::receive::RepoInitLocks;
 use crate::metrics::Metrics;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 

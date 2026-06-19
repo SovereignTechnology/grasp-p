@@ -1,8 +1,8 @@
-use crate::nostr::builder::SharedDatabase;
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::HoldingStore;
 use crate::nostr::policy::PolicyContext;
 use crate::nostr::tombstones::Tombstones;
+use crate::nostr::SharedDatabase;
 use crate::{config::Config, grasp06::receive::RepoInitLocks, purgatory::Purgatory};
 use std::path::PathBuf;
 use std::sync::Arc;

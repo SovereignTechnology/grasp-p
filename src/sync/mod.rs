@@ -51,7 +51,8 @@ use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::config::Config;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::SharedDatabase;
 use nostr_relay_builder::prelude::LocalRelay;
 
 // =============================================================================

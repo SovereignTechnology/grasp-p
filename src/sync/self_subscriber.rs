@@ -16,7 +16,7 @@ use nostr_sdk::prelude::Timestamp;
 use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::nostr::builder::SharedDatabase;
+use crate::nostr::SharedDatabase;
 
 use super::{AddFilters, RepoSyncIndex, RepoSyncNeeds, SyncLevel};
 

@@ -42,8 +42,10 @@ use crate::git::authorization::{
     fetch_repository_data_with_purgatory, RepositoryData,
 };
 use crate::git::{self, oid_exists};
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::deletion::DeletionService;
 use crate::nostr::events::RepositoryState;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::{can_apply_state, Purgatory};
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -835,6 +837,7 @@ pub async fn process_newly_available_git_data(
     purgatory: &Purgatory,
     git_data_path: &Path,
     write_policy: Option<&Nip34WritePolicy>,
+    deletion_service: Option<&DeletionService>,
     rejected_events_index: Option<&Arc<RejectedEventsIndex>>,
 ) -> anyhow::Result<ProcessResult> {
     let mut result = ProcessResult::default();
@@ -866,6 +869,7 @@ pub async fn process_newly_available_git_data(
         purgatory,
         git_data_path,
         write_policy,
+        deletion_service,
         rejected_events_index,
     )
     .await;
@@ -879,7 +883,7 @@ pub async fn process_newly_available_git_data(
         local_relay,
         purgatory,
         git_data_path,
-        write_policy,
+        deletion_service,
     )
     .await;
     result.merge(state_result);
@@ -946,7 +950,7 @@ async fn process_purgatory_state_events(
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
     purgatory: &Purgatory,
     git_data_path: &Path,
-    write_policy: Option<&Nip34WritePolicy>,
+    deletion_service: Option<&DeletionService>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
 
@@ -1136,11 +1140,11 @@ async fn process_purgatory_state_events(
                             continue;
                         }
                         let owner = &announcement.event.pubkey;
-                        if let (Some(wp), Some(entry)) =
-                            (write_policy, purgatory.find_announcement(owner, identifier))
-                        {
-                            wp.deletion()
-                                .maybe_recover_deleted_repository(&entry.event, identifier)
+                        if let (Some(ds), Some(entry)) = (
+                            deletion_service,
+                            purgatory.find_announcement(owner, identifier),
+                        ) {
+                            ds.maybe_recover_deleted_repository(&entry.event, identifier)
                                 .await;
                         }
 
@@ -1414,6 +1418,7 @@ async fn process_purgatory_announcements(
     purgatory: &Purgatory,
     git_data_path: &Path,
     write_policy: Option<&Nip34WritePolicy>,
+    deletion_service: Option<&DeletionService>,
     rejected_events_index: Option<&Arc<RejectedEventsIndex>>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
@@ -1447,12 +1452,11 @@ async fn process_purgatory_announcements(
         }
     };
 
-    if let (Some(wp), Some(entry)) = (
-        write_policy,
+    if let (Some(ds), Some(entry)) = (
+        deletion_service,
         purgatory.find_announcement(&owner, identifier),
     ) {
-        wp.deletion()
-            .maybe_recover_deleted_repository(&entry.event, identifier)
+        ds.maybe_recover_deleted_repository(&entry.event, identifier)
             .await;
     }
 

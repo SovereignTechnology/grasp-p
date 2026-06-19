@@ -17,8 +17,9 @@ use super::subprocess::GitSubprocess;
 
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
 use crate::git::sync::process_newly_available_git_data;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::holding::LifecycleReadGuard;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -408,6 +409,7 @@ pub async fn handle_receive_pack(
         &purgatory,
         git_data_path_buf,
         Some(&write_policy),
+        Some(write_policy.deletion()),
         Some(&rejected_events_index),
     )
     .await

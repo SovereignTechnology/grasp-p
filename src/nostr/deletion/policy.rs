@@ -830,7 +830,7 @@ impl DeletionPolicy {
     /// [`Self::archive_and_delete_filter`]: every deleted orphan/coordinate
     /// target is moved into holding before main-DB deletion, and announcement
     /// deletions include git archive metadata linkage for cleanup lifecycle.
-    /// Recovery orchestration remains a future phase.
+    /// Recovery orchestration lives in `crate::nostr::deletion::recovery`.
     async fn cascade_delete_announcement(
         &self,
         author: &PublicKey,

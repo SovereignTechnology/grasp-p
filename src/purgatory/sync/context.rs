@@ -193,8 +193,8 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::nostr::builder::Nip34WritePolicy;
-use crate::nostr::builder::SharedDatabase;
 use crate::nostr::events::RepositoryState;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::naughty_list::NaughtyListTracker;
 
@@ -526,6 +526,7 @@ impl SyncContext for RealSyncContext {
             &self.purgatory,
             &self.git_data_path,
             self.write_policy.as_ref(),
+            self.write_policy.as_ref().map(|wp| wp.deletion()),
             None,
         )
         .await?;

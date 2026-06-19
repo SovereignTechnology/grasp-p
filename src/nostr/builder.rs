@@ -2,8 +2,8 @@
 ///
 /// Wires nostr-relay-builder with NIP-34 admission/routing policy.
 /// Deletion behaviour is owned by the `deletion` subsystem
-/// (`crate::nostr::deletion`); this module holds only thin delegation
-/// accessors and the top-level `admit_event` dispatch.
+/// (`crate::nostr::deletion`); this module keeps top-level `admit_event`
+/// dispatch and non-deletion admission/router policy logic.
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -24,9 +24,7 @@ use crate::nostr::policy::{
     AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
     RelatedEventPolicy, StatePolicy, StateResult,
 };
-
-/// Type alias for the shared database used by the relay
-pub type SharedDatabase = Arc<dyn NostrDatabase>;
+use crate::nostr::SharedDatabase;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
@@ -530,7 +528,7 @@ impl Nip34WritePolicy {
                 // Process state alignment asynchronously
                 match self
                     .state_policy
-                    .process_state_event(event, is_synced, Some(self))
+                    .process_state_event(event, is_synced, Some(self.deletion()))
                     .await
                 {
                     Ok(policy_result) => {
@@ -747,7 +745,7 @@ impl Nip34WritePolicy {
             // Re-evaluate authorization with the new announcement
             match self
                 .state_policy
-                .process_state_event(&entry.event, false, Some(self))
+                .process_state_event(&entry.event, false, Some(self.deletion()))
                 .await
             {
                 Ok(WritePolicyResult::Accept) => {
@@ -1044,7 +1042,7 @@ pub async fn create_relay(
     //
     // NIP-09 (deletion) and NIP-62 (request to vanish) auto-processing is
     // explicitly disabled on the main database: ngit-grasp owns this handling
-    // (see `DeletionPolicy`, the kind-62 handler, and the `Tombstones` store).
+    // (see the deletion subsystem facade + `Tombstones` store).
     // Leaving the backend defaults (`true`) would double-process: the backend
     // would silently hard-delete events and block re-submission via its own
     // internal tables that we cannot inspect, conflicting with our purgatory /
@@ -1058,8 +1056,8 @@ pub async fn create_relay(
         DatabaseBackend::Memory => {
             tracing::info!("Using in-memory database (no persistence)");
             // Disable the backend's built-in NIP-09 / NIP-62 auto-processing to
-            // match the LMDB path: ngit-grasp owns this handling (DeletionPolicy,
-            // the kind-62 handler, and the Tombstones store). Leaving the memory
+            // match the LMDB path: ngit-grasp owns this handling (deletion
+            // subsystem + Tombstones store). Leaving the memory
             // backend's defaults (`true`) would silently suppress targeted events
             // at query time the moment a kind-5 is *stored* — which in particular
             // defeats `deletion_request_disrespector` (archival) mode, where the

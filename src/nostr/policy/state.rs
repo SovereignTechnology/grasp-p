@@ -12,7 +12,7 @@ use nostr_relay_builder::prelude::Event;
 use super::{accepted_purgatory, duplicate, reject_invalid, reject_restricted, PolicyContext};
 use crate::git;
 use crate::git::authorization::fetch_repository_data_with_purgatory;
-use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::deletion::DeletionService;
 use crate::nostr::events::{validate_state, RepositoryAnnouncement, RepositoryState};
 
 /// Result of state policy evaluation
@@ -54,7 +54,7 @@ impl StatePolicy {
         &self,
         event: &Event,
         is_synced: bool,
-        recovery_policy: Option<&Nip34WritePolicy>,
+        deletion_service: Option<&DeletionService>,
     ) -> Result<WritePolicyResult> {
         // Parse state to get HEAD and branch info
         let state =
@@ -237,7 +237,8 @@ impl StatePolicy {
                         local_relay.as_ref(),
                         &self.ctx.purgatory,
                         &self.ctx.git_data_path,
-                        recovery_policy,
+                        None,
+                        deletion_service,
                         None,
                     )
                     .await

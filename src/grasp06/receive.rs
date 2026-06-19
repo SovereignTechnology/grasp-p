@@ -71,7 +71,8 @@ use crate::git::sync::process_newly_available_git_data;
 use crate::git::{delete_ref, list_refs};
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -356,6 +357,7 @@ pub async fn handle_prs_receive_pack(
             &purgatory,
             Path::new(git_data_path),
             Some(&write_policy),
+            Some(write_policy.deletion()),
             Some(&rejected_events_index),
         )
         .await
