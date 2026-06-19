@@ -1,5 +1,6 @@
 use crate::nostr::history::ReplaceableHistoryStore;
 use crate::nostr::holding::HoldingStore;
+use crate::nostr::lifecycle::RepositoryLifecycle;
 use crate::nostr::tombstones::Tombstones;
 use crate::nostr::SharedDatabase;
 use crate::{config::Config, grasp06::receive::RepoInitLocks, purgatory::Purgatory};
@@ -9,13 +10,14 @@ use std::sync::Arc;
 /// Deletion-specific context wrapper.
 ///
 /// This provides a dedicated module boundary around dependencies used by
-/// deletion/vanish handling, repository lifecycle locking, and deletion gates.
+/// deletion/vanish handling and deletion gates.
 #[derive(Clone)]
 pub struct DeletionContext {
     pub domain: String,
     pub database: SharedDatabase,
     pub tombstones: Tombstones,
     pub holding: HoldingStore,
+    pub lifecycle: RepositoryLifecycle,
     pub history: ReplaceableHistoryStore,
     pub git_data_path: PathBuf,
     pub purgatory: Arc<Purgatory>,
@@ -30,6 +32,7 @@ impl DeletionContext {
         database: SharedDatabase,
         tombstones: Tombstones,
         holding: HoldingStore,
+        lifecycle: RepositoryLifecycle,
         history: ReplaceableHistoryStore,
         git_data_path: impl Into<PathBuf>,
         purgatory: Arc<Purgatory>,
@@ -41,6 +44,7 @@ impl DeletionContext {
             database,
             tombstones,
             holding,
+            lifecycle,
             history,
             git_data_path: git_data_path.into(),
             purgatory,
@@ -63,6 +67,10 @@ impl DeletionContext {
 
     pub fn holding(&self) -> &HoldingStore {
         &self.holding
+    }
+
+    pub fn lifecycle(&self) -> &RepositoryLifecycle {
+        &self.lifecycle
     }
 
     pub fn history(&self) -> &ReplaceableHistoryStore {

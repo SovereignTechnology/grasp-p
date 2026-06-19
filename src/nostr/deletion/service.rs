@@ -4,7 +4,6 @@ use nostr_relay_builder::prelude::{
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::holding::{LifecycleReadGuard, LifecycleWriteGuard};
 use crate::nostr::policy::{reject_error, reject_invalid};
 
 use super::{DeletionContext, DeletionPolicy};
@@ -271,30 +270,12 @@ impl DeletionService {
         }
     }
 
-    pub async fn read_repository_lifecycle(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleReadGuard {
-        self.ctx
-            .holding()
-            .read_recovery_scope(owner_pubkey_hex, identifier)
-            .await
-    }
-
-    pub async fn write_repository_lifecycle(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleWriteGuard {
-        self.ctx
-            .holding()
-            .write_recovery_scope(owner_pubkey_hex, identifier)
-            .await
-    }
-
     pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
         self.ctx.holding()
+    }
+
+    pub fn lifecycle(&self) -> &crate::nostr::lifecycle::RepositoryLifecycle {
+        self.ctx.lifecycle()
     }
 
     pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {

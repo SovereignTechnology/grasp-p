@@ -136,8 +136,8 @@ impl DeletionPolicy {
         // is using it.
         let _lifecycle_guards = self
             .ctx
-            .holding
-            .write_recovery_scopes(self.deletion_recovery_scopes(event).await)
+            .lifecycle()
+            .write_repositories(self.deletion_recovery_scopes(event).await)
             .await;
 
         // Record the deletion before destructive work so a tombstone write
@@ -231,6 +231,7 @@ mod tests {
     use crate::grasp06::receive::new_repo_init_locks;
     use crate::nostr::history::ReplaceableHistoryStore;
     use crate::nostr::holding::HoldingStore;
+    use crate::nostr::lifecycle::RepositoryLifecycle;
     use crate::nostr::tombstones::Tombstones;
     use crate::purgatory::Purgatory;
     use nostr_relay_builder::prelude::*;
@@ -242,11 +243,13 @@ mod tests {
         let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let purgatory = Arc::new(Purgatory::new(PathBuf::new()));
         let config = crate::config::Config::for_testing();
+        let holding = HoldingStore::in_memory();
         DeletionContext::new(
             "test.example.com",
             db,
             Tombstones::in_memory(),
-            HoldingStore::in_memory(),
+            holding.clone(),
+            RepositoryLifecycle::new(holding),
             ReplaceableHistoryStore::in_memory(),
             PathBuf::new(),
             purgatory,
@@ -262,11 +265,13 @@ mod tests {
             deletion_request_disrespector: true,
             ..crate::config::Config::for_testing()
         };
+        let holding = HoldingStore::in_memory();
         DeletionContext::new(
             "test.example.com",
             db,
             Tombstones::in_memory(),
-            HoldingStore::in_memory(),
+            holding.clone(),
+            RepositoryLifecycle::new(holding),
             ReplaceableHistoryStore::in_memory(),
             PathBuf::new(),
             purgatory,
@@ -602,11 +607,13 @@ mod tests {
             domain: "test.example.com".to_string(),
             ..crate::config::Config::for_testing()
         };
+        let holding = HoldingStore::in_memory();
         let ctx = DeletionContext::new(
             "test.example.com",
             db,
             Tombstones::in_memory(),
-            HoldingStore::in_memory(),
+            holding.clone(),
+            RepositoryLifecycle::new(holding),
             ReplaceableHistoryStore::in_memory(),
             git_data_path.clone(),
             purgatory,

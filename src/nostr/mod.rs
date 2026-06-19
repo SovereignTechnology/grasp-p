@@ -3,6 +3,7 @@ pub mod deletion;
 pub mod events;
 pub mod history;
 pub mod holding;
+pub mod lifecycle;
 pub mod policy;
 pub mod tombstones;
 

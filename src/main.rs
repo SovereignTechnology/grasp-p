@@ -522,6 +522,7 @@ async fn run_relay(config: Config) -> Result<()> {
 
         // Wrap write_policy in Arc for sharing between HTTP server connections
         let http_write_policy = Arc::new(relay_with_db.write_policy.clone());
+        let http_lifecycle = Arc::new(relay_with_db.lifecycle.clone());
 
         // Run server until shutdown signal, then cleanup
         #[cfg(unix)]
@@ -537,6 +538,7 @@ async fn run_relay(config: Config) -> Result<()> {
                     metrics,
                     purgatory,
                     http_write_policy,
+                    http_lifecycle,
                     http_rejected_index,
                     repo_init_locks,
                 ) => {
@@ -561,6 +563,7 @@ async fn run_relay(config: Config) -> Result<()> {
                     metrics,
                     purgatory,
                     http_write_policy,
+                    http_lifecycle,
                     http_rejected_index,
                     repo_init_locks,
                 ) => {

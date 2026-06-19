@@ -28,6 +28,7 @@ use crate::git;
 use crate::grasp06::receive::RepoInitLocks;
 use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::lifecycle::RepositoryLifecycle;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
@@ -118,6 +119,8 @@ struct HttpService {
     purgatory: Arc<Purgatory>,
     /// Write policy for re-processing hot-cache events after git push promotion
     write_policy: Arc<Nip34WritePolicy>,
+    /// Repository lifecycle locks shared with deletion/recovery.
+    lifecycle: Arc<RepositoryLifecycle>,
     /// Rejected events index for hot-cache re-processing after git push promotion
     rejected_events_index: Arc<RejectedEventsIndex>,
     /// Per-path init mutexes for GRASP-06 `/prs/` on-demand bare-repo
@@ -135,6 +138,7 @@ impl HttpService {
         metrics: Option<Arc<Metrics>>,
         purgatory: Arc<Purgatory>,
         write_policy: Arc<Nip34WritePolicy>,
+        lifecycle: Arc<RepositoryLifecycle>,
         rejected_events_index: Arc<RejectedEventsIndex>,
         repo_init_locks: RepoInitLocks,
     ) -> Self {
@@ -146,6 +150,7 @@ impl HttpService {
             metrics,
             purgatory,
             write_policy,
+            lifecycle,
             rejected_events_index,
             repo_init_locks,
         }
@@ -166,6 +171,7 @@ impl Service<Request<Incoming>> for HttpService {
         let database = self.database.clone();
         let purgatory = self.purgatory.clone();
         let write_policy = self.write_policy.clone();
+        let lifecycle = self.lifecycle.clone();
         let rejected_events_index = self.rejected_events_index.clone();
         let repo_init_locks = self.repo_init_locks.clone();
 
@@ -446,11 +452,8 @@ impl Service<Request<Incoming>> for HttpService {
                             Some(svc) => {
                                 let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
                                     Ok(owner_pk) => Some(
-                                        write_policy
-                                            .read_repository_lifecycle(
-                                                &owner_pk.to_hex(),
-                                                &identifier,
-                                            )
+                                        lifecycle
+                                            .read_repository(&owner_pk.to_hex(), &identifier)
                                             .await,
                                     ),
                                     Err(_) => None,
@@ -480,8 +483,8 @@ impl Service<Request<Incoming>> for HttpService {
                     (m, "git-upload-pack") if m == Method::POST => {
                         let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
                             Ok(owner_pk) => Some(
-                                write_policy
-                                    .read_repository_lifecycle(&owner_pk.to_hex(), &identifier)
+                                lifecycle
+                                    .read_repository(&owner_pk.to_hex(), &identifier)
                                     .await,
                             ),
                             Err(_) => None,
@@ -518,8 +521,8 @@ impl Service<Request<Incoming>> for HttpService {
                         };
 
                         let repo_lifecycle_guard = Some(
-                            write_policy
-                                .read_repository_lifecycle(&owner_pubkey_hex, &identifier)
+                            lifecycle
+                                .read_repository(&owner_pubkey_hex, &identifier)
                                 .await,
                         );
 
@@ -807,6 +810,7 @@ fn derive_accept_key(request_key: &[u8]) -> String {
 /// * `metrics` - Optional metrics for Prometheus endpoint
 /// * `purgatory` - Purgatory for event/git coordination
 /// * `write_policy` - Write policy for re-processing hot-cache events after git push promotion
+/// * `lifecycle` - Repository lifecycle locks for Git HTTP serving
 /// * `rejected_events_index` - Rejected events index for hot-cache re-processing
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
@@ -816,6 +820,7 @@ pub async fn run_server(
     metrics: Option<Arc<Metrics>>,
     purgatory: Arc<Purgatory>,
     write_policy: Arc<Nip34WritePolicy>,
+    lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
 ) -> anyhow::Result<()> {
@@ -838,6 +843,7 @@ pub async fn run_server(
             metrics.clone(),
             purgatory.clone(),
             write_policy.clone(),
+            lifecycle.clone(),
             rejected_events_index.clone(),
             repo_init_locks.clone(),
         );

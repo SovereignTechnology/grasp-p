@@ -497,7 +497,8 @@ impl DeletionService {
     ) -> bool {
         let owner_hex = owner_pubkey.to_hex();
         let _lifecycle_guard = self
-            .write_repository_lifecycle(&owner_hex, identifier)
+            .lifecycle()
+            .write_repository(&owner_hex, identifier)
             .await;
         let records = self
             .holding()

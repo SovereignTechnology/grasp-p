@@ -18,7 +18,7 @@ use crate::config::{Config, DatabaseBackend};
 use crate::nostr::deletion::{DeletionContext, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
-use crate::nostr::holding::{LifecycleReadGuard, LifecycleWriteGuard};
+use crate::nostr::lifecycle::RepositoryLifecycle;
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
@@ -67,6 +67,7 @@ impl Nip34WritePolicy {
         database: SharedDatabase,
         tombstones: crate::nostr::tombstones::Tombstones,
         holding: crate::nostr::holding::HoldingStore,
+        lifecycle: RepositoryLifecycle,
         history: crate::nostr::history::ReplaceableHistoryStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: std::sync::Arc<crate::purgatory::Purgatory>,
@@ -80,6 +81,7 @@ impl Nip34WritePolicy {
             database.clone(),
             tombstones.clone(),
             holding.clone(),
+            lifecycle,
             history.clone(),
             git_data_path.clone(),
             purgatory.clone(),
@@ -130,40 +132,6 @@ impl Nip34WritePolicy {
         self.deletion.tombstones()
     }
 
-    /// Acquire a shared repository lifecycle lock used by Git Smart HTTP
-    /// operations (`info/refs`, `git-upload-pack`, and `git-receive-pack`).
-    ///
-    /// The lifecycle lock protects repository existence/replacement/removal;
-    /// Git's own internal locking handles concurrent push/fetch ref and object
-    /// consistency.
-    ///
-    pub async fn read_repository_lifecycle(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleReadGuard {
-        self.deletion
-            .read_repository_lifecycle(owner_pubkey_hex, identifier)
-            .await
-    }
-
-    /// Acquire an exclusive repository lifecycle lock used by deletion,
-    /// recovery, holding cleanup, and manual ejection.
-    ///
-    /// Callers must take this before mutating the main DB / tombstones / holding
-    /// DB / archive files / bare repository filesystem for a specific
-    /// `(owner_pubkey_hex, identifier)` scope. It is intentionally per-repo (not
-    /// global) so unrelated repositories keep operating concurrently.
-    pub async fn write_repository_lifecycle(
-        &self,
-        owner_pubkey_hex: &str,
-        identifier: &str,
-    ) -> LifecycleWriteGuard {
-        self.deletion
-            .write_repository_lifecycle(owner_pubkey_hex, identifier)
-            .await
-    }
-
     /// Set the local relay for purgatory notifications.
     ///
     /// This must be called after the relay is created since the relay depends
@@ -174,8 +142,9 @@ impl Nip34WritePolicy {
 
     /// Access the deletion subsystem directly.
     ///
-    /// Exposes startup passes, recovery, and lifecycle locks without requiring
-    /// delegation wrappers on this struct.
+    /// Exposes startup passes and recovery without requiring delegation wrappers
+    /// on this struct. Repository lifecycle coordination is exposed separately
+    /// through [`RepositoryLifecycle`].
     pub fn deletion(&self) -> &DeletionService {
         &self.deletion
     }
@@ -829,6 +798,8 @@ pub struct RelayWithDatabase {
     pub write_policy: Nip34WritePolicy,
     /// Holding store used for deletion archival + expiry cleanup
     pub holding: crate::nostr::holding::HoldingStore,
+    /// Repository lifecycle locks shared by HTTP serving and deletion/recovery.
+    pub lifecycle: RepositoryLifecycle,
     /// Replaceable-history store used for rollback history capture.
     pub history: crate::nostr::history::ReplaceableHistoryStore,
 }
@@ -941,11 +912,14 @@ pub async fn create_relay(
         );
     }
 
+    let lifecycle = RepositoryLifecycle::new(holding.clone());
+
     // Create write policy with purgatory integration
     let write_policy = Nip34WritePolicy::new(
         database.clone(),
         tombstones,
         holding.clone(),
+        lifecycle.clone(),
         history.clone(),
         &git_data_path,
         purgatory,
@@ -979,6 +953,7 @@ pub async fn create_relay(
         database,
         write_policy,
         holding,
+        lifecycle,
         history,
     })
 }

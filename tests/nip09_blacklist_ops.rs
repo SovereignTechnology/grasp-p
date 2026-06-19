@@ -13,6 +13,7 @@ use ngit_grasp::nostr::history::ReplaceableHistoryStore;
 use ngit_grasp::nostr::holding::{
     DeletionSource, GitArchiveMetadata, HoldingMetadata, HoldingStore, HOLDING_ARCHIVE_PATH_TAG,
 };
+use ngit_grasp::nostr::lifecycle::RepositoryLifecycle;
 use ngit_grasp::nostr::tombstones::Tombstones;
 use ngit_grasp::nostr::SharedDatabase;
 use ngit_grasp::purgatory::Purgatory;
@@ -103,7 +104,8 @@ fn make_policy(
     Nip34WritePolicy::new(
         database,
         Tombstones::in_memory(),
-        holding,
+        holding.clone(),
+        RepositoryLifecycle::new(holding),
         ReplaceableHistoryStore::in_memory(),
         git_data_path.to_path_buf(),
         purgatory,
