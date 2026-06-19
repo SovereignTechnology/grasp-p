@@ -1023,6 +1023,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_push_and_fetch_read_locks_can_overlap() {
+        let store = HoldingStore::in_memory();
+        let owner_hex = Keys::generate().public_key().to_hex();
+        let identifier = "push-fetch-overlap";
+
+        let push_guard = store.read_recovery_scope(&owner_hex, identifier).await;
+        let fetch_guard = tokio::time::timeout(
+            Duration::from_millis(100),
+            store.read_recovery_scope(&owner_hex, identifier),
+        )
+        .await
+        .expect("fetch lifecycle read lock should not wait behind push lifecycle read lock");
+
+        drop(fetch_guard);
+        drop(push_guard);
+    }
+
+    #[tokio::test]
     async fn lifecycle_write_lock_waits_for_active_read_lock() {
         let store = HoldingStore::in_memory();
         let owner_hex = Keys::generate().public_key().to_hex();

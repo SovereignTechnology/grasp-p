@@ -518,7 +518,7 @@ impl Service<Request<Incoming>> for HttpService {
 
                         let repo_lifecycle_guard = Some(
                             write_policy
-                                .write_repository_lifecycle(&owner_pubkey_hex, &identifier)
+                                .read_repository_lifecycle(&owner_pubkey_hex, &identifier)
                                 .await,
                         );
 

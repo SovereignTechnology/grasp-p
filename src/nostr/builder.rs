@@ -161,8 +161,12 @@ impl Nip34WritePolicy {
         &self.ctx.tombstones
     }
 
-    /// Acquire a shared repository lifecycle lock used by Git Smart HTTP read
-    /// paths (`info/refs` and `git-upload-pack`).
+    /// Acquire a shared repository lifecycle lock used by Git Smart HTTP
+    /// operations (`info/refs`, `git-upload-pack`, and `git-receive-pack`).
+    ///
+    /// The lifecycle lock protects repository existence/replacement/removal;
+    /// Git's own internal locking handles concurrent push/fetch ref and object
+    /// consistency.
     ///
     pub async fn read_repository_lifecycle(
         &self,
@@ -176,7 +180,7 @@ impl Nip34WritePolicy {
     }
 
     /// Acquire an exclusive repository lifecycle lock used by deletion,
-    /// recovery, holding cleanup, manual ejection, and `git-receive-pack`.
+    /// recovery, holding cleanup, and manual ejection.
     ///
     /// Callers must take this before mutating the main DB / tombstones / holding
     /// DB / archive files / bare repository filesystem for a specific
