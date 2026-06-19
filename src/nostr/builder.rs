@@ -18,6 +18,7 @@ use crate::config::{Config, DatabaseBackend};
 use crate::nostr::deletion::{DeletionContext, DeletionRuntime, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::history::ReplaceableHistoryStore;
+use crate::nostr::holding::HoldingStore;
 use crate::nostr::lifecycle::RepositoryLifecycle;
 use crate::nostr::persistence::{EventPersistence, SaveContext};
 use crate::nostr::policy::{
@@ -26,6 +27,7 @@ use crate::nostr::policy::{
     RelatedEventPolicy, StatePolicy, StateResult,
 };
 use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
+use crate::nostr::tombstones::Tombstones;
 use crate::nostr::SharedDatabase;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
@@ -777,34 +779,43 @@ impl WritePolicy for Nip34WritePolicy {
     }
 }
 
-/// Result of creating a relay - includes relay, database, and write policy
-pub struct RelayWithDatabase {
-    /// The local relay instance
-    pub relay: LocalRelay,
-    /// The database Arc that can be used for direct queries
+/// Storage handles shared by the relay runtime and HTTP/runtime services.
+pub struct RelayStores {
+    /// Main relay database used for event queries and persistence.
     pub database: SharedDatabase,
-    /// The write policy used for event validation
-    pub write_policy: Nip34WritePolicy,
+    /// Persistent NIP-09/NIP-62 tombstone store.
+    pub tombstones: Tombstones,
     /// Holding store used for deletion archival + expiry cleanup
-    pub holding: crate::nostr::holding::HoldingStore,
-    /// Repository lifecycle locks shared by HTTP serving and deletion/recovery.
-    pub lifecycle: RepositoryLifecycle,
+    pub holding: HoldingStore,
     /// Replaceable-history store used for rollback history capture.
-    pub history: crate::nostr::history::ReplaceableHistoryStore,
+    pub history: ReplaceableHistoryStore,
+}
+
+/// Runtime components produced when constructing the local relay.
+pub struct RelayRuntime {
+    /// The local relay instance.
+    pub relay: LocalRelay,
+    /// The write policy used for event admission, routing, and persistence.
+    pub write_policy: Nip34WritePolicy,
+    /// Deletion service shared with write policy for NIP-09/NIP-62 operations.
+    pub deletion: DeletionService,
     /// Runtime facade for deletion startup tasks and background cleanup.
     pub deletion_runtime: DeletionRuntime,
+    /// Repository lifecycle locks shared by HTTP serving and deletion/recovery.
+    pub lifecycle: RepositoryLifecycle,
+    /// Storage handles used by the relay runtime.
+    pub stores: RelayStores,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
 ///
-/// Returns a `RelayWithDatabase` struct containing:
-/// - The `LocalRelay` for handling WebSocket connections
-/// - The `SharedDatabase` for direct database queries (e.g., push authorization)
+/// Returns a `RelayRuntime` struct containing the relay, write policy, deletion
+/// runtime, lifecycle locks, and storage handles used by HTTP/runtime services.
 pub async fn create_relay(
     config: &Config,
     purgatory: Arc<crate::purgatory::Purgatory>,
     repo_init_locks: crate::grasp06::receive::RepoInitLocks,
-) -> Result<RelayWithDatabase> {
+) -> Result<RelayRuntime> {
     tracing::info!("Configuring nostr relay with GRASP-01 validation...");
 
     // Determine database path
@@ -821,8 +832,8 @@ pub async fn create_relay(
     // bare-repo bookkeeping.
     let (database, tombstones, holding, history): (
         SharedDatabase,
-        crate::nostr::tombstones::Tombstones,
-        crate::nostr::holding::HoldingStore,
+        Tombstones,
+        HoldingStore,
         ReplaceableHistoryStore,
     ) = match config.database_backend {
         DatabaseBackend::Memory => {
@@ -841,8 +852,8 @@ pub async fn create_relay(
                 .build();
             (
                 Arc::new(db),
-                crate::nostr::tombstones::Tombstones::in_memory(),
-                crate::nostr::holding::HoldingStore::in_memory(),
+                Tombstones::in_memory(),
+                HoldingStore::in_memory(),
                 ReplaceableHistoryStore::in_memory(),
             )
         }
@@ -868,12 +879,10 @@ pub async fn create_relay(
                         e
                     )
                 })?;
-            let tombstones = crate::nostr::tombstones::Tombstones::open_lmdb(db_path).await?;
-            let holding = crate::nostr::holding::HoldingStore::open_lmdb(
-                db_path,
-                Path::new(&config.effective_git_data_path()),
-            )
-            .await?;
+            let tombstones = Tombstones::open_lmdb(db_path).await?;
+            let holding =
+                HoldingStore::open_lmdb(db_path, Path::new(&config.effective_git_data_path()))
+                    .await?;
             let history = ReplaceableHistoryStore::open_lmdb(db_path).await?;
             (Arc::new(db), tombstones, holding, history)
         }
@@ -911,7 +920,7 @@ pub async fn create_relay(
     // Create write policy with purgatory integration
     let write_policy = Nip34WritePolicy::new(
         database.clone(),
-        tombstones,
+        tombstones.clone(),
         holding.clone(),
         lifecycle.clone(),
         history.clone(),
@@ -949,13 +958,19 @@ pub async fn create_relay(
         config.domain
     );
 
-    Ok(RelayWithDatabase {
+    let deletion = write_policy.deletion().clone();
+
+    Ok(RelayRuntime {
         relay,
-        database,
         write_policy,
-        holding,
-        lifecycle,
-        history,
+        deletion,
         deletion_runtime,
+        lifecycle,
+        stores: RelayStores {
+            database,
+            tombstones,
+            holding,
+            history,
+        },
     })
 }
