@@ -1,6 +1,11 @@
+mod archival;
+mod cascade;
 mod context;
 mod policy;
+mod pr_refs;
+mod purgatory;
 mod recovery;
+mod rollback;
 mod service;
 mod startup;
 
