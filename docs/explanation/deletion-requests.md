@@ -661,11 +661,10 @@ work):
 ### Archive-mode policy extensions
 - **Selective disrespect:** policy-based disrespect for specific criteria (e.g. popularity, community contribution, identifier allowlist).
 
-### Cleanup and deletion engine hardening
+### Cleanup and deletion engine follow-up
 - **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
 - **Backend/index behavior verification:** continue validating deletion behavior across backend upgrades, including index consistency when relay-owned deletion paths mutate served data.
 - **Large-scale + edge-case analysis:** document/validate max-depth behavior, large dependency graphs, and memory/performance characteristics.
-- **Concurrency/race handling:** deletion during active sync, concurrent shared-repo deletes, and archival locking strategy.
 
 ### Blacklist lifecycle improvements
 - **Dynamic blacklist updates:** apply blacklist additions/removals without restart.
