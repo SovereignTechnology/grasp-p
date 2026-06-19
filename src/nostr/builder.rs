@@ -98,6 +98,7 @@ impl std::fmt::Debug for Nip34WritePolicy {
 }
 
 impl Nip34WritePolicy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         database: SharedDatabase,
         tombstones: crate::nostr::tombstones::Tombstones,

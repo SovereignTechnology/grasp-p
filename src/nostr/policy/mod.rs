@@ -84,6 +84,7 @@ pub struct PolicyContext {
 }
 
 impl PolicyContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: impl Into<String>,
         database: SharedDatabase,

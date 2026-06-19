@@ -188,10 +188,8 @@ fn clone_url_prs_identifier_for_relay(
     // Scheme: http or https only, case-insensitive.
     let rest = if let Some(r) = strip_prefix_ignore_ascii_case(url, "http://") {
         r
-    } else if let Some(r) = strip_prefix_ignore_ascii_case(url, "https://") {
-        r
     } else {
-        return None;
+        strip_prefix_ignore_ascii_case(url, "https://")?
     };
 
     // Reject query strings and fragments outright.
@@ -200,10 +198,7 @@ fn clone_url_prs_identifier_for_relay(
     }
 
     // Split authority and path on the first `/`.
-    let slash_idx = match rest.find('/') {
-        Some(i) => i,
-        None => return None,
-    };
+    let slash_idx = rest.find('/')?;
     let authority = &rest[..slash_idx];
     let path = &rest[slash_idx..]; // includes leading `/`.
 
@@ -213,10 +208,7 @@ fn clone_url_prs_identifier_for_relay(
 
     let path = path.trim_end_matches('/');
 
-    let inner = match path.strip_prefix(&format!("/{}/", PRS_URL_PREFIX)) {
-        Some(s) => s,
-        None => return None,
-    };
+    let inner = path.strip_prefix(&format!("/{}/", PRS_URL_PREFIX))?;
 
     // Exactly two segments: `<npub>` and `<repo>.git`.
     let segments: Vec<&str> = inner.split('/').collect();
@@ -237,10 +229,7 @@ fn clone_url_prs_identifier_for_relay(
         return None;
     }
 
-    let d_encoded = match repo_segment.strip_suffix(".git") {
-        Some(s) => s,
-        None => return None,
-    };
+    let d_encoded = repo_segment.strip_suffix(".git")?;
     if d_encoded.is_empty() {
         return None;
     }

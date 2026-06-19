@@ -295,10 +295,7 @@ impl DeletionPolicy {
         Self::a_tag_coordinates(event)
             .into_iter()
             .filter_map(|coordinate| {
-                let Some((kind, coord_pubkey, identifier)) = Self::parse_coordinate(&coordinate)
-                else {
-                    return None;
-                };
+                let (kind, coord_pubkey, identifier) = Self::parse_coordinate(&coordinate)?;
 
                 if kind == Kind::RepoState && coord_pubkey == event.pubkey {
                     Some(identifier)

@@ -538,9 +538,11 @@ async fn purgatory_promotion_recovery_respects_state_tombstones() {
 
 #[tokio::test]
 async fn purgatory_promotion_tombstoned_pr_events_do_not_restore_pr_refs() {
-    let fixture =
-        setup_parked_announcement_with_failed_ingest_recovery("promotion-recovery-pr-tombstones", false)
-            .await;
+    let fixture = setup_parked_announcement_with_failed_ingest_recovery(
+        "promotion-recovery-pr-tombstones",
+        false,
+    )
+    .await;
 
     fixture
         .client

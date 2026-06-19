@@ -166,7 +166,7 @@ impl ReplaceableHistoryStore {
             .into_iter()
             .filter_map(|metadata| {
                 let superseded_at = parse_timestamp_tag(&metadata, HISTORY_SUPERSEDED_AT_TAG)
-                    .or_else(|| Some(metadata.created_at));
+                    .or(Some(metadata.created_at));
                 if superseded_at.is_some_and(|ts| ts > before_or_at) {
                     return None;
                 }
