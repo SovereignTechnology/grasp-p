@@ -256,19 +256,13 @@ async fn run_relay(config: Config) -> Result<()> {
             .write_policy
             .set_local_relay(relay_with_db.relay.clone());
 
-        // Startup policy ordering (explicit):
-        // 1) blacklist parity delete (remove currently-blacklisted repos)
-        // 2) blacklist auto-restore (optional, restore previously blacklisted
-        //    repos now unblacklisted and still within holding retention)
-        // 3) whitelist parity delete (final acceptance reconciliation for
-        //    service-listed repos)
-        // 4) whitelist restore (restore previously whitelist-deleted repos now
-        //    matching repository_whitelist and still within holding retention)
-        let blacklist_stats = relay_with_db
+        let startup_reconciliation = relay_with_db
             .write_policy
             .deletion()
-            .run_startup_blacklist_parity_pass()
+            .run_startup_reconciliation()
             .await;
+
+        let blacklist_stats = startup_reconciliation.blacklist_parity;
         if blacklist_stats.scanned_announcements > 0 || blacklist_stats.matched_announcements > 0 {
             info!(
                 scanned = blacklist_stats.scanned_announcements,
@@ -280,11 +274,7 @@ async fn run_relay(config: Config) -> Result<()> {
             );
         }
 
-        let blacklist_restore_stats = relay_with_db
-            .write_policy
-            .deletion()
-            .run_startup_blacklist_restore_pass()
-            .await;
+        let blacklist_restore_stats = startup_reconciliation.blacklist_restore;
         if blacklist_restore_stats.scanned_scopes > 0
             || blacklist_restore_stats.attempted_restores > 0
         {
@@ -298,11 +288,7 @@ async fn run_relay(config: Config) -> Result<()> {
             );
         }
 
-        let whitelist_stats = relay_with_db
-            .write_policy
-            .deletion()
-            .run_startup_whitelist_parity_pass()
-            .await;
+        let whitelist_stats = startup_reconciliation.whitelist_parity;
         if whitelist_stats.scanned_announcements > 0 || whitelist_stats.mismatched_announcements > 0
         {
             info!(
@@ -315,11 +301,7 @@ async fn run_relay(config: Config) -> Result<()> {
             );
         }
 
-        let whitelist_restore_stats = relay_with_db
-            .write_policy
-            .deletion()
-            .run_startup_whitelist_restore_pass()
-            .await;
+        let whitelist_restore_stats = startup_reconciliation.whitelist_restore;
         if whitelist_restore_stats.scanned_scopes > 0
             || whitelist_restore_stats.attempted_restores > 0
         {

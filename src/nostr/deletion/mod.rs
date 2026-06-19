@@ -13,5 +13,6 @@ pub use context::DeletionContext;
 pub use policy::DeletionPolicy;
 pub use service::DeletionService;
 pub use startup::{
-    BlacklistParityStats, BlacklistRestoreStats, WhitelistParityStats, WhitelistRestoreStats,
+    BlacklistParityStats, BlacklistRestoreStats, StartupReconciliationStats, WhitelistParityStats,
+    WhitelistRestoreStats,
 };

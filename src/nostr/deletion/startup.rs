@@ -46,11 +46,41 @@ pub struct WhitelistRestoreStats {
     pub skipped_scopes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartupReconciliationStats {
+    pub blacklist_parity: BlacklistParityStats,
+    pub blacklist_restore: BlacklistRestoreStats,
+    pub whitelist_parity: WhitelistParityStats,
+    pub whitelist_restore: WhitelistRestoreStats,
+}
+
 // ---------------------------------------------------------------------------
 // DeletionService startup pass implementations
 // ---------------------------------------------------------------------------
 
 impl DeletionService {
+    /// Run all startup reconciliation passes in the required order.
+    ///
+    /// Ordering is intentionally owned here so relay startup only depends on a
+    /// single facade while deletion internals decide sequencing:
+    /// 1) blacklist parity delete
+    /// 2) blacklist auto-restore
+    /// 3) whitelist parity delete
+    /// 4) whitelist restore
+    pub async fn run_startup_reconciliation(&self) -> StartupReconciliationStats {
+        let blacklist_parity = self.run_startup_blacklist_parity_pass().await;
+        let blacklist_restore = self.run_startup_blacklist_restore_pass().await;
+        let whitelist_parity = self.run_startup_whitelist_parity_pass().await;
+        let whitelist_restore = self.run_startup_whitelist_restore_pass().await;
+
+        StartupReconciliationStats {
+            blacklist_parity,
+            blacklist_restore,
+            whitelist_parity,
+            whitelist_restore,
+        }
+    }
+
     /// Startup-only blacklist parity pass.
     ///
     /// Scans already-stored kind-30617 announcements, identifies entries
