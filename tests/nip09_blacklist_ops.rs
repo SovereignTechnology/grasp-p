@@ -898,6 +898,10 @@ async fn metrics_increment_on_blacklist_cleanup_recovery_and_manual_ejection_pat
     metrics::record_recovery_attempt();
     metrics::record_recovery_partial();
 
+    // Startup restore path metrics wiring (called by restore passes).
+    metrics::record_blacklist_startup_restore_attempt();
+    metrics::record_whitelist_startup_restore_attempt();
+
     // Manual ejection path
     let _ = holding
         .manual_eject_repository(&owner.public_key().to_hex(), "metrics-blacklist")

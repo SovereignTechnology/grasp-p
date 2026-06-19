@@ -239,19 +239,7 @@ impl DeletionService {
     /// Scans holding metadata for scopes deleted by blacklist parity and restores
     /// owner+identifier scopes that are no longer blacklisted and still inside
     /// holding retention.
-    ///
-    /// `recover_scope` is a callback that performs the actual archive/event
-    /// restoration for a given `(owner_pubkey, identifier)` scope.  It is
-    /// supplied by the caller (`Nip34WritePolicy`) so that the recovery/archive
-    /// extraction logic can remain in `builder.rs` for a later refactor phase.
-    pub async fn run_startup_blacklist_restore_pass<F, Fut>(
-        &self,
-        recover_scope: F,
-    ) -> BlacklistRestoreStats
-    where
-        F: Fn(PublicKey, String) -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
+    pub async fn run_startup_blacklist_restore_pass(&self) -> BlacklistRestoreStats {
         if !self.ctx.config.blacklist_auto_restore {
             return BlacklistRestoreStats::default();
         }
@@ -318,7 +306,10 @@ impl DeletionService {
             stats.attempted_restores += 1;
             crate::metrics::record_blacklist_startup_restore_attempt();
 
-            if recover_scope(owner_pubkey, scope.identifier.clone()).await {
+            if self
+                .maybe_recover_deleted_repository_for_scope(&owner_pubkey, &scope.identifier)
+                .await
+            {
                 stats.successful_restores += 1;
                 crate::metrics::record_blacklist_startup_restore_success();
                 tracing::info!(
@@ -347,19 +338,7 @@ impl DeletionService {
     /// Scans holding metadata for scopes deleted by whitelist parity and restores
     /// owner+identifier scopes that now match `repository_whitelist`, are not
     /// blacklisted, and are still inside holding retention.
-    ///
-    /// `recover_scope` is a callback that performs the actual archive/event
-    /// restoration for a given `(owner_pubkey, identifier)` scope.  It is
-    /// supplied by the caller (`Nip34WritePolicy`) so that the recovery/archive
-    /// extraction logic can remain in `builder.rs` for a later refactor phase.
-    pub async fn run_startup_whitelist_restore_pass<F, Fut>(
-        &self,
-        recover_scope: F,
-    ) -> WhitelistRestoreStats
-    where
-        F: Fn(PublicKey, String) -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
+    pub async fn run_startup_whitelist_restore_pass(&self) -> WhitelistRestoreStats {
         let whitelist = self.ctx.config.repository_config();
         if !whitelist.enabled() {
             return WhitelistRestoreStats::default();
@@ -439,7 +418,10 @@ impl DeletionService {
             stats.attempted_restores += 1;
             crate::metrics::record_whitelist_startup_restore_attempt();
 
-            if recover_scope(owner_pubkey, scope.identifier.clone()).await {
+            if self
+                .maybe_recover_deleted_repository_for_scope(&owner_pubkey, &scope.identifier)
+                .await
+            {
                 stats.successful_restores += 1;
                 crate::metrics::record_whitelist_startup_restore_success();
                 tracing::info!(

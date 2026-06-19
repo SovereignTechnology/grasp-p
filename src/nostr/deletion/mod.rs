@@ -1,5 +1,6 @@
 mod context;
 mod policy;
+mod recovery;
 mod service;
 mod startup;
 
