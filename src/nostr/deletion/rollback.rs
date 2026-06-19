@@ -11,7 +11,7 @@ use crate::git::authorization::{
 };
 use crate::git::process;
 use crate::nostr::events::RepositoryState;
-use crate::nostr::holding::RecoveryScope;
+use crate::nostr::lifecycle::RecoveryScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReplaceableRollbackPlan {

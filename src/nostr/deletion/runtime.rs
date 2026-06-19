@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::nostr::holding::HoldingStore;
+use crate::nostr::lifecycle::RepositoryLifecycle;
 
 use super::startup::{
     BlacklistParityStats, BlacklistRestoreStats, StartupReconciliationStats, WhitelistParityStats,
@@ -38,6 +39,7 @@ pub struct HoldingEjectArgs {
 pub struct DeletionRuntime {
     service: DeletionService,
     holding: HoldingStore,
+    lifecycle: RepositoryLifecycle,
     holding_retention: Duration,
     holding_cleanup_interval: Duration,
 }
@@ -50,6 +52,7 @@ impl DeletionRuntime {
         holding_cleanup_interval: Duration,
     ) -> Self {
         Self {
+            lifecycle: service.lifecycle().clone(),
             service,
             holding,
             holding_retention,
@@ -66,6 +69,7 @@ impl DeletionRuntime {
     /// Spawn deletion-owned background maintenance tasks.
     pub fn spawn_cleanup_task(&self) -> DeletionCleanupTask {
         let holding = self.holding.clone();
+        let lifecycle = self.lifecycle.clone();
         let retention = self.holding_retention;
         let interval_duration = self.holding_cleanup_interval;
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -79,7 +83,7 @@ impl DeletionRuntime {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        match holding.cleanup_expired(Timestamp::now(), retention).await {
+                        match holding.cleanup_expired_with_lifecycle(&lifecycle, Timestamp::now(), retention).await {
                             Ok(stats) => {
                                 if stats.expired_records > 0 {
                                     tracing::info!(
@@ -121,7 +125,11 @@ impl DeletionRuntime {
     async fn run_holding_startup_cleanup(&self) {
         match self
             .holding
-            .cleanup_expired(Timestamp::now(), self.holding_retention)
+            .cleanup_expired_with_lifecycle(
+                &self.lifecycle,
+                Timestamp::now(),
+                self.holding_retention,
+            )
             .await
         {
             Ok(stats) => {
@@ -166,9 +174,10 @@ pub async fn run_holding_eject(args: HoldingEjectArgs) -> Result<()> {
         Path::new(&args.git_data_path),
     )
     .await?;
+    let lifecycle = RepositoryLifecycle::for_git_data_path(Path::new(&args.git_data_path));
 
     let stats = holding
-        .manual_eject_repository(&owner_hex, &args.identifier)
+        .manual_eject_repository_with_lifecycle(&lifecycle, &owner_hex, &args.identifier)
         .await?;
 
     println!(

@@ -105,7 +105,7 @@ fn make_policy(
         database,
         Tombstones::in_memory(),
         holding.clone(),
-        RepositoryLifecycle::new(holding),
+        RepositoryLifecycle::in_memory(),
         ReplaceableHistoryStore::in_memory(),
         git_data_path.to_path_buf(),
         purgatory,

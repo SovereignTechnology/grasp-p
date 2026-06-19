@@ -189,14 +189,15 @@ See [`src/nostr/builder.rs:38-78`](src/nostr/builder.rs:38-78) for the full poli
 `RepositoryLifecycle` is the shared facade for per-repository lifecycle locks.
 Git Smart HTTP serving takes shared read locks through this facade, while
 deletion and recovery take exclusive write locks through the same facade. The
-current implementation is backed by `HoldingStore`'s lifecycle lock map and
-lock-file support, but HTTP handlers do not depend on `Nip34WritePolicy` or
-`DeletionService` for lifecycle coordination.
+lock map and lock-file support are owned by the lifecycle module itself, so
+repository runtime coordination is independent of holding/deletion storage.
 
 ```text
 HTTP git serving  -> RepositoryLifecycle
 Deletion/recovery -> RepositoryLifecycle
-RepositoryLifecycle -> HoldingStore lifecycle locks
+Holding cleanup   -> RepositoryLifecycle
+Manual ejection   -> RepositoryLifecycle
+RepositoryLifecycle -> RepositoryLifecycleLocks
 ```
 
 #### [`events.rs`](src/nostr/events.rs) - Event Parsing

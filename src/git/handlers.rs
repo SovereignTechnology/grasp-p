@@ -17,7 +17,7 @@ use super::subprocess::GitSubprocess;
 
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
 use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionHooks};
-use crate::nostr::holding::LifecycleReadGuard;
+use crate::nostr::lifecycle::LifecycleReadGuard;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 

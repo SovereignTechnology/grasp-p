@@ -903,7 +903,10 @@ pub async fn create_relay(
         );
     }
 
-    let lifecycle = RepositoryLifecycle::new(holding.clone());
+    let lifecycle = match config.database_backend {
+        DatabaseBackend::Memory => RepositoryLifecycle::in_memory(),
+        DatabaseBackend::Lmdb => RepositoryLifecycle::for_git_data_path(Path::new(&git_data_path)),
+    };
 
     // Create write policy with purgatory integration
     let write_policy = Nip34WritePolicy::new(
