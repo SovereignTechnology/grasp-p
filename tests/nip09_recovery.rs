@@ -1003,6 +1003,90 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
 }
 
 #[tokio::test]
+async fn replacement_announcement_delisting_this_relay_triggers_runtime_deletion_flow() {
+    let relay = TestRelay::start_with_lmdb().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create client");
+
+    let (announcement, repo_id, state_event) =
+        publish_served_repo_with_state_event(&client, "runtime-delist").await;
+    let issue = client
+        .create_issue(&announcement, "runtime delist issue", "body", vec![])
+        .expect("build issue");
+    client.send_event(issue.clone()).await.expect("send issue");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(client
+        .is_event_on_relay(issue.id)
+        .await
+        .expect("query issue before delist"));
+
+    let replacement_delist = EventBuilder::new(Kind::GitRepoAnnouncement, "delist relay")
+        .tags(vec![
+            Tag::identifier(repo_id.clone()),
+            Tag::custom("name", vec![repo_id.clone()]),
+            Tag::custom(
+                "clone",
+                vec![format!(
+                    "https://example.com/{}/{}.git",
+                    client.public_key().to_hex(),
+                    repo_id
+                )],
+            ),
+            Tag::custom("relays", vec!["wss://example.com".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(announcement.created_at.as_secs() + 30))
+        .finalize(client.keys())
+        .expect("build replacement delist announcement");
+
+    let rejection = client.send_event(replacement_delist.clone()).await;
+    assert!(
+        rejection.is_err(),
+        "replacement delist announcement should be rejected"
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(
+        !client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query original announcement after delist"),
+        "runtime de-list should delete the previously served announcement"
+    );
+    assert!(
+        !client
+            .is_event_on_relay(state_event.id)
+            .await
+            .expect("query state after runtime delist"),
+        "runtime de-list should cascade-delete repository state"
+    );
+    assert!(
+        !client
+            .is_event_on_relay(issue.id)
+            .await
+            .expect("query issue after runtime delist"),
+        "runtime de-list should cascade-delete dependent events"
+    );
+
+    let store = open_holding(&relay).await;
+    assert!(
+        !store.metadata_for_event(&announcement.id).await.is_empty(),
+        "runtime de-list should archive announcement into holding metadata"
+    );
+    assert!(
+        !store.metadata_for_event(&state_event.id).await.is_empty(),
+        "runtime de-list should archive state into holding metadata"
+    );
+    assert!(
+        !store.metadata_for_event(&issue.id).await.is_empty(),
+        "runtime de-list should archive dependent events into holding metadata"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn out_of_retention_reannouncement_behaves_as_fresh_new_repo() {
     let relay = TestRelay::start_with_lmdb().await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())

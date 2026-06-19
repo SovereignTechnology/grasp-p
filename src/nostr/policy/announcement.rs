@@ -76,6 +76,22 @@ impl AnnouncementPolicy {
                             );
                         }
 
+                        // Owner de-list replacement for an already served repo:
+                        // do NOT allow maintainer-exception acceptance to bypass
+                        // de-list enforcement. Let the caller treat this as a
+                        // reject path so runtime deletion parity can run.
+                        let lists_service = announcement.lists_service(&self.config.domain);
+                        if !lists_service {
+                            match self
+                                .has_db_announcement(&event.pubkey, &announcement.identifier)
+                                .await
+                            {
+                                Ok(true) => return AnnouncementResult::Reject(reason),
+                                Ok(false) => {}
+                                Err(_) => return AnnouncementResult::Reject(reason),
+                            }
+                        }
+
                         match self
                             .is_maintainer_in_any_announcement(
                                 &announcement.identifier,

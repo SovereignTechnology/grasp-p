@@ -627,6 +627,8 @@ impl Nip34WritePolicy {
                 // Parse announcement to get repository details
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
+                        self.maybe_apply_runtime_delist_deletion(event).await;
+
                         // Try to create bare repository if it doesn't exist
                         if let Err(e) = self
                             .announcement_policy
@@ -732,6 +734,8 @@ impl Nip34WritePolicy {
                 // Parse announcement to get details for logging
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
+                        self.maybe_apply_runtime_delist_deletion(event).await;
+
                         // Phase 5 recovery trigger: any accepted announcement route
                         // (including maintainer acceptance) can restore eligible
                         // holding/archive state for this owner+identifier.
@@ -776,12 +780,109 @@ impl Nip34WritePolicy {
                 }
             }
             AnnouncementResult::Reject(reason) => {
+                self.maybe_apply_runtime_delist_deletion(event).await;
                 tracing::warn!(
                     "Rejected repository announcement {}: {}",
                     event_id_str,
                     reason
                 );
                 reject_invalid(reason)
+            }
+        }
+    }
+
+    /// Runtime de-list parity path for already-served repositories.
+    ///
+    /// When a newer replacement announcement for the same owner+identifier no
+    /// longer lists this relay's service, trigger the normal cascade
+    /// delete->holding/archive flow for the currently served announcement.
+    ///
+    /// This mirrors startup whitelist/blacklist parity behavior, but runs at
+    /// write time so service removals are enforced immediately.
+    async fn maybe_apply_runtime_delist_deletion(&self, incoming: &Event) {
+        let incoming_announcement = match RepositoryAnnouncement::from_event(incoming.clone()) {
+            Ok(announcement) => announcement,
+            Err(_) => return,
+        };
+
+        // This path is only for announcements that REMOVE this relay listing.
+        if incoming_announcement.lists_service(&self.ctx.domain) {
+            return;
+        }
+
+        let filter = Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(incoming.pubkey)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                incoming_announcement.identifier.clone(),
+            );
+
+        let current = match self.ctx.database.query(filter).await {
+            Ok(events) => events.into_iter().max_by_key(|event| event.created_at),
+            Err(e) => {
+                tracing::warn!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    error = %e,
+                    "Runtime de-list parity: failed querying existing announcement"
+                );
+                None
+            }
+        };
+
+        let Some(current) = current else {
+            return;
+        };
+
+        // Not newer than what we already serve -> no runtime parity action.
+        if incoming.created_at <= current.created_at {
+            return;
+        }
+
+        let current_announcement = match RepositoryAnnouncement::from_event(current.clone()) {
+            Ok(announcement) => announcement,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %current.id.to_hex(),
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    error = %e,
+                    "Runtime de-list parity: failed parsing current announcement"
+                );
+                return;
+            }
+        };
+
+        // Safety guard: only run cascade when the currently served announcement
+        // actually lists this relay.
+        if !current_announcement.lists_service(&self.ctx.domain) {
+            return;
+        }
+
+        match self
+            .deletion_policy
+            .apply_whitelist_deletion_for_announcement(&current)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    replaced_announcement = %current.id.to_hex(),
+                    replacement = %incoming.id.to_hex(),
+                    "Runtime de-list parity: deleted previously served repository"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    owner = %incoming.pubkey.to_hex(),
+                    identifier = %incoming_announcement.identifier,
+                    replaced_announcement = %current.id.to_hex(),
+                    replacement = %incoming.id.to_hex(),
+                    error = %e,
+                    "Runtime de-list parity: deletion flow failed"
+                );
             }
         }
     }
