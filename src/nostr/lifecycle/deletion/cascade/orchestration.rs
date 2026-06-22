@@ -4,7 +4,7 @@ use nostr_relay_builder::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
 };
 
-use super::policy::{
+use super::super::policy::{
     announcement_address_of, identifier_from_event, owner_directory_component, DeletionPolicy,
 };
 use super::{
@@ -57,7 +57,7 @@ impl DeletionPolicy {
     /// target is moved into holding before main-DB deletion, and announcement
     /// deletions include git archive metadata linkage for cleanup lifecycle.
     /// Recovery orchestration lives in `crate::nostr::lifecycle::deletion::recovery`.
-    pub(super) async fn cascade_delete_announcement(
+    pub(in crate::nostr::lifecycle::deletion) async fn cascade_delete_announcement(
         &self,
         author: &PublicKey,
         announcement_addr: &str,
