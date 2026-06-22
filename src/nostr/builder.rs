@@ -1,8 +1,8 @@
 /// Nostr Relay Builder Configuration
 ///
 /// Wires nostr-relay-builder with NIP-34 admission/routing policy.
-/// Deletion behaviour is owned by the `deletion` subsystem
-/// (`crate::nostr::deletion`); this module keeps top-level `admit_event`
+/// Deletion behaviour is owned by the `nostr::lifecycle` subsystem;
+/// this module keeps top-level `admit_event`
 /// dispatch and non-deletion admission/router policy logic.
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -15,11 +15,11 @@ use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
-use crate::nostr::deletion::{DeletionContext, DeletionRuntime, DeletionService};
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::history::ReplaceableHistoryStore;
-use crate::nostr::holding::HoldingStore;
-use crate::nostr::lifecycle::RepositoryLifecycle;
+use crate::nostr::lifecycle::{
+    DeletionContext, DeletionRuntime, DeletionService, HoldingStore, ReplaceableHistoryStore,
+    RepositoryLifecycle, Tombstones,
+};
 use crate::nostr::persistence::{EventPersistence, SaveContext};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
@@ -27,7 +27,6 @@ use crate::nostr::policy::{
     RelatedEventPolicy, StatePolicy, StateResult,
 };
 use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
-use crate::nostr::tombstones::Tombstones;
 use crate::nostr::SharedDatabase;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
@@ -43,7 +42,7 @@ use crate::nostr::SharedDatabase;
 ///    - `DeletionService`    — NIP-09 deletion and NIP-62 vanish handling
 ///
 /// Deletion logic (cascade, holding, archive, recovery, startup passes) lives
-/// entirely in `crate::nostr::deletion`.  This struct exposes a `deletion()`
+/// entirely in `crate::nostr::lifecycle`.  This struct exposes a `deletion()`
 /// accessor for callers that need to reach those operations directly.
 #[derive(Clone)]
 pub struct Nip34WritePolicy {
@@ -69,10 +68,10 @@ impl Nip34WritePolicy {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         database: SharedDatabase,
-        tombstones: crate::nostr::tombstones::Tombstones,
-        holding: crate::nostr::holding::HoldingStore,
+        tombstones: Tombstones,
+        holding: HoldingStore,
         lifecycle: RepositoryLifecycle,
-        history: crate::nostr::history::ReplaceableHistoryStore,
+        history: ReplaceableHistoryStore,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: std::sync::Arc<crate::purgatory::Purgatory>,
         config: crate::config::Config,
@@ -123,16 +122,16 @@ impl Nip34WritePolicy {
     }
 
     /// Get a reference to the holding store for retention cleanup orchestration.
-    pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
+    pub fn holding(&self) -> &HoldingStore {
         self.deletion.holding()
     }
 
     /// Get a reference to the replaceable-history store.
-    pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {
+    pub fn history(&self) -> &ReplaceableHistoryStore {
         self.deletion.history()
     }
 
-    pub fn tombstones(&self) -> &crate::nostr::tombstones::Tombstones {
+    pub fn tombstones(&self) -> &Tombstones {
         self.deletion.tombstones()
     }
 

@@ -303,8 +303,8 @@ fn detect_cycles_dfs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nostr::deletion::graph::{build_event_graph, EventNode};
-    use crate::nostr::deletion::reevaluation::RetentionReason;
+    use crate::nostr::lifecycle::deletion::graph::{build_event_graph, EventNode};
+    use crate::nostr::lifecycle::deletion::reevaluation::RetentionReason;
     use nostr::event::FinalizeEvent;
     use nostr_relay_builder::prelude::{EventBuilder, EventId, Keys, Kind, Tag};
 

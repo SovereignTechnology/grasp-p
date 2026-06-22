@@ -5,7 +5,7 @@
 /// - `StatePolicy` - State event validation + ref alignment
 /// - `PrEventPolicy` - PR/PR Update validation
 /// - `RelatedEventPolicy` - Forward/backward reference checking
-/// - Deletion handling lives in `crate::nostr::deletion`
+/// - Deletion handling lives in `crate::nostr::lifecycle`
 mod announcement;
 mod pr_event;
 mod related;

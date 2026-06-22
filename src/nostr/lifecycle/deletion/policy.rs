@@ -229,10 +229,10 @@ pub(super) fn owner_directory_component(pubkey: &PublicKey) -> String {
 mod tests {
     use super::*;
     use crate::grasp06::receive::new_repo_init_locks;
-    use crate::nostr::history::ReplaceableHistoryStore;
-    use crate::nostr::holding::HoldingStore;
+    use crate::nostr::lifecycle::HoldingStore;
+    use crate::nostr::lifecycle::ReplaceableHistoryStore;
     use crate::nostr::lifecycle::RepositoryLifecycle;
-    use crate::nostr::tombstones::Tombstones;
+    use crate::nostr::lifecycle::Tombstones;
     use crate::purgatory::Purgatory;
     use nostr_relay_builder::prelude::*;
     use std::collections::HashSet;

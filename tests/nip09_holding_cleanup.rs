@@ -1,6 +1,6 @@
 //! Focused integration tests for Phase 3 holding-DB expiry/cleanup behavior.
 
-use ngit_grasp::nostr::holding::{
+use ngit_grasp::nostr::lifecycle::{
     DeletionSource, HoldingMetadata, HoldingStore, DEFAULT_CLEANUP_INTERVAL, DEFAULT_RETENTION,
 };
 use nostr_sdk::prelude::*;

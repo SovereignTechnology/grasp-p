@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::git::sync::{PurgatoryPromotionHooks, PurgatorySaveContext};
 use crate::nostr::builder::Nip34WritePolicy;
-use crate::nostr::deletion::DeletionService;
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::lifecycle::DeletionService;
 use crate::nostr::persistence::SaveContext;
 use crate::sync::rejected_index::{EventType, RejectedEventsIndex};
 

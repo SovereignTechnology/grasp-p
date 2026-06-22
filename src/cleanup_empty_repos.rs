@@ -18,8 +18,8 @@ use crate::git::authorization::{
     collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
 };
 use crate::git::process;
-use crate::nostr::deletion::{build_event_graph, traverse_and_mark_deletions, RetentionReason};
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::lifecycle::{build_event_graph, traverse_and_mark_deletions, RetentionReason};
 use crate::purgatory::can_apply_state;
 
 const GRAPH_DEPENDENT_KINDS: &[u16] = &[1111, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633];

@@ -41,7 +41,7 @@ enum Cli {
     /// Permanently eject deleted repository data from holding/archive stores.
     ///
     /// This is an operator/admin maintenance command and is idempotent.
-    HoldingEject(nostr::deletion::HoldingEjectArgs),
+    HoldingEject(nostr::lifecycle::HoldingEjectArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
                 cleanup_empty_repos::run_maintenance_cleanup(&cleanup_args).await
             }
         },
-        Cli::HoldingEject(eject_args) => nostr::deletion::run_holding_eject(eject_args).await,
+        Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
             // Finish initialising the Config (load relay owner key if not provided).

@@ -7,7 +7,7 @@ use nostr_relay_builder::prelude::{PublicKey, Timestamp};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::nostr::holding::HoldingStore;
+use crate::nostr::lifecycle::HoldingStore;
 use crate::nostr::lifecycle::RepositoryLifecycle;
 
 use super::startup::{

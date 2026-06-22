@@ -4,7 +4,7 @@ mod common;
 
 use common::{publish_served_repo, TestRelay};
 use grasp_audit::{AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
-use ngit_grasp::nostr::history::ReplaceableHistoryStore;
+use ngit_grasp::nostr::lifecycle::ReplaceableHistoryStore;
 use nostr_sdk::prelude::*;
 use std::time::Duration;
 

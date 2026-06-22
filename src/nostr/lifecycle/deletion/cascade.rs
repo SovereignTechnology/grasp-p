@@ -11,7 +11,7 @@ use super::{
     build_event_graph, reevaluate_events_without_announcement, traverse_and_mark_deletions,
     RetentionReason,
 };
-use crate::nostr::holding::{DeletionSource, HoldingMetadata};
+use crate::nostr::lifecycle::{DeletionSource, HoldingMetadata};
 
 /// NIP-34 event kinds (other than the kind-30617 announcement and kind-30618
 /// state event) that participate in the repository dependency graph. These are
@@ -38,16 +38,16 @@ impl DeletionPolicy {
     ///
     /// 1. Query the candidate event set (the announcement's siblings + all
     ///    NIP-34 dependent events) and build the dependency graph via
-    ///    [`crate::nostr::deletion::build_event_graph`] (a/e/q tag edges).
+    ///    [`crate::nostr::lifecycle::deletion::build_event_graph`] (a/e/q tag edges).
     /// 2. Re-evaluate the candidate events WITHOUT the deleted announcement but
     ///    WITH every OTHER maintainer's announcement for the same identifier via
-    ///    [`crate::nostr::deletion::reevaluate_events_without_announcement`], yielding the
+    ///    [`crate::nostr::lifecycle::deletion::reevaluate_events_without_announcement`], yielding the
     ///    kept/deleted split (multi-maintainer retention).
     /// 3. Add every surviving announcement (a different identifier, or the same
     ///    identifier authored by a different maintainer) to the kept set so the
     ///    traversal keeps everything still anchored to a live announcement.
     /// 4. Traverse the graph from the kept announcements via
-    ///    [`crate::nostr::deletion::traverse_and_mark_deletions`] to compute the final orphan
+    ///    [`crate::nostr::lifecycle::deletion::traverse_and_mark_deletions`] to compute the final orphan
     ///    set (events unreachable from any surviving announcement).
     /// 5. Hard-delete the orphaned event ids plus the announcement coordinate
     ///    itself from the main DB.
@@ -56,7 +56,7 @@ impl DeletionPolicy {
     /// [`Self::archive_and_delete_filter`]: every deleted orphan/coordinate
     /// target is moved into holding before main-DB deletion, and announcement
     /// deletions include git archive metadata linkage for cleanup lifecycle.
-    /// Recovery orchestration lives in `crate::nostr::deletion::recovery`.
+    /// Recovery orchestration lives in `crate::nostr::lifecycle::deletion::recovery`.
     pub(super) async fn cascade_delete_announcement(
         &self,
         author: &PublicKey,

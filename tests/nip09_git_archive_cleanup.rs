@@ -4,7 +4,7 @@ mod common;
 
 use common::{announcement_coordinate, build_deletion, publish_served_repo, TestRelay};
 use grasp_audit::{AuditClient, AuditConfig};
-use ngit_grasp::nostr::holding::{
+use ngit_grasp::nostr::lifecycle::{
     HoldingStore, HOLDING_ARCHIVE_PATH_TAG, HOLDING_METADATA_KIND, HOLDING_OWNER_PUBKEY_TAG,
 };
 use nostr_sdk::prelude::*;

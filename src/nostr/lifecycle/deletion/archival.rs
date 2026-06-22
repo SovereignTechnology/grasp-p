@@ -10,7 +10,7 @@ use nostr_relay_builder::prelude::{
 use tar::Builder as TarBuilder;
 
 use super::policy::{identifier_from_event, owner_directory_component, DeletionPolicy};
-use crate::nostr::holding::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
+use crate::nostr::lifecycle::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 
 impl DeletionPolicy {
     /// Hard-delete the targeted events from the main database.

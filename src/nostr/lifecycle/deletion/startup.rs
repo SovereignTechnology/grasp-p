@@ -2,7 +2,7 @@ use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::prelude::{Filter, Kind, PublicKey, Timestamp};
 
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::holding::DeletionSource;
+use crate::nostr::lifecycle::DeletionSource;
 
 use super::DeletionService;
 

@@ -274,7 +274,7 @@ impl DeletionService {
         }
     }
 
-    pub fn holding(&self) -> &crate::nostr::holding::HoldingStore {
+    pub fn holding(&self) -> &crate::nostr::lifecycle::HoldingStore {
         self.ctx.holding()
     }
 
@@ -282,11 +282,11 @@ impl DeletionService {
         self.ctx.lifecycle()
     }
 
-    pub fn history(&self) -> &crate::nostr::history::ReplaceableHistoryStore {
+    pub fn history(&self) -> &crate::nostr::lifecycle::ReplaceableHistoryStore {
         self.ctx.history()
     }
 
-    pub fn tombstones(&self) -> &crate::nostr::tombstones::Tombstones {
+    pub fn tombstones(&self) -> &crate::nostr::lifecycle::Tombstones {
         self.ctx.tombstones()
     }
 

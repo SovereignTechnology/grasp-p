@@ -9,7 +9,7 @@ use common::{
     CommitVariant, TestRelay,
 };
 use grasp_audit::{AuditClient, AuditConfig};
-use ngit_grasp::nostr::holding::{
+use ngit_grasp::nostr::lifecycle::{
     HoldingStore, DEFAULT_RETENTION, HOLDING_ARCHIVE_PATH_TAG, HOLDING_METADATA_KIND,
 };
 use nostr_sdk::prelude::*;

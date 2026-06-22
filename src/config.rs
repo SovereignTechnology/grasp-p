@@ -433,7 +433,7 @@ pub struct Config {
     #[arg(
         long,
         env = "NGIT_HOLDING_RETENTION_SECS",
-        default_value_t = crate::nostr::holding::DEFAULT_RETENTION.as_secs()
+        default_value_t = crate::nostr::lifecycle::DEFAULT_RETENTION.as_secs()
     )]
     pub holding_retention_secs: u64,
 
@@ -441,7 +441,7 @@ pub struct Config {
     #[arg(
         long,
         env = "NGIT_HOLDING_CLEANUP_INTERVAL_SECS",
-        default_value_t = crate::nostr::holding::DEFAULT_CLEANUP_INTERVAL.as_secs()
+        default_value_t = crate::nostr::lifecycle::DEFAULT_CLEANUP_INTERVAL.as_secs()
     )]
     pub holding_cleanup_interval_secs: u64,
 
@@ -825,8 +825,8 @@ impl Config {
             rejected_hot_cache_duration_secs: 120,
             rejected_cold_index_expiry_secs: 604800,
             naughty_list_expiration_hours: 12,
-            holding_retention_secs: crate::nostr::holding::DEFAULT_RETENTION.as_secs(),
-            holding_cleanup_interval_secs: crate::nostr::holding::DEFAULT_CLEANUP_INTERVAL
+            holding_retention_secs: crate::nostr::lifecycle::DEFAULT_RETENTION.as_secs(),
+            holding_cleanup_interval_secs: crate::nostr::lifecycle::DEFAULT_CLEANUP_INTERVAL
                 .as_secs(),
             archive_all: false,
             archive_whitelist: String::new(),

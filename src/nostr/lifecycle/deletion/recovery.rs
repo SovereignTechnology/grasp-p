@@ -18,7 +18,7 @@ use nostr_relay_builder::prelude::{Event, Kind, PublicKey, Timestamp};
 use tar::Archive as TarArchive;
 
 use super::DeletionService;
-use crate::nostr::holding::RecoveryMetadataRecord;
+use crate::nostr::lifecycle::RecoveryMetadataRecord;
 
 // ---------------------------------------------------------------------------
 // Path helpers

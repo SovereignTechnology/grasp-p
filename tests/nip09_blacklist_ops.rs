@@ -9,12 +9,12 @@ use ngit_grasp::config::Config;
 use ngit_grasp::grasp06::receive::new_repo_init_locks;
 use ngit_grasp::metrics::{self, REGISTRY};
 use ngit_grasp::nostr::builder::Nip34WritePolicy;
-use ngit_grasp::nostr::history::ReplaceableHistoryStore;
-use ngit_grasp::nostr::holding::{
+use ngit_grasp::nostr::lifecycle::ReplaceableHistoryStore;
+use ngit_grasp::nostr::lifecycle::RepositoryLifecycle;
+use ngit_grasp::nostr::lifecycle::Tombstones;
+use ngit_grasp::nostr::lifecycle::{
     DeletionSource, GitArchiveMetadata, HoldingMetadata, HoldingStore, HOLDING_ARCHIVE_PATH_TAG,
 };
-use ngit_grasp::nostr::lifecycle::RepositoryLifecycle;
-use ngit_grasp::nostr::tombstones::Tombstones;
 use ngit_grasp::nostr::SharedDatabase;
 use ngit_grasp::purgatory::Purgatory;
 use nostr_sdk::prelude::*;

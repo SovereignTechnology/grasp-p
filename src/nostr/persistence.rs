@@ -7,7 +7,7 @@
 
 use nostr_relay_builder::prelude::Event;
 
-use crate::nostr::deletion::DeletionService;
+use crate::nostr::lifecycle::DeletionService;
 use crate::nostr::SharedDatabase;
 
 /// Where an accepted event is being prepared/saved from.

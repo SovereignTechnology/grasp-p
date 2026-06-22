@@ -9,7 +9,7 @@ use common::{
 };
 
 use grasp_audit::{AuditClient, AuditConfig};
-use ngit_grasp::nostr::holding::HoldingStore;
+use ngit_grasp::nostr::lifecycle::HoldingStore;
 use nostr_sdk::prelude::*;
 use std::time::Duration;
 
