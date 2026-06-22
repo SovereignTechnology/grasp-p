@@ -29,8 +29,8 @@ use crate::grasp06::receive::RepoInitLocks;
 use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::lifecycle::RepositoryLifecycle;
-use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::nostr::SharedDatabase;
+use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 

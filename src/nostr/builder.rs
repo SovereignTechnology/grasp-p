@@ -26,8 +26,8 @@ use crate::nostr::policy::{
     AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
     RelatedEventPolicy, StatePolicy, StateResult,
 };
-use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::nostr::SharedDatabase;
+use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///

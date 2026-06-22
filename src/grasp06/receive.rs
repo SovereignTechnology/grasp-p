@@ -72,8 +72,8 @@ use crate::git::{delete_ref, list_refs};
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
 use crate::nostr::builder::Nip34WritePolicy;
-use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::nostr::SharedDatabase;
+use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 

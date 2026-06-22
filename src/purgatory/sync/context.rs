@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::git::authorization::RepositoryData;
 use crate::git::sync::PurgatoryPromotionHooks;
-use crate::nostr::promotion_hooks::NostrPurgatoryPromotionHooks;
+use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 
 /// Result of processing newly available git data.
 ///
