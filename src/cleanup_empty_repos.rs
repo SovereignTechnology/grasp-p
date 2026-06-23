@@ -3,7 +3,7 @@
 //! Provides the new `maintenance cleanup` pipeline and keeps
 //! `cleanup-empty-repos` as a compatibility wrapper.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -19,13 +19,15 @@ use crate::git::authorization::{
 };
 use crate::git::process;
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::lifecycle::{build_event_graph, traverse_and_mark_deletions, RetentionReason};
+use crate::nostr::lifecycle::plan_cascade_retention_for_deleted_announcements;
 use crate::purgatory::can_apply_state;
-
-const GRAPH_DEPENDENT_KINDS: &[u16] = &[1111, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633];
 
 #[derive(Debug, Args)]
 pub struct MaintenanceCleanupArgs {
+    /// Public relay domain used for GRASP-06 PR-root retention checks.
+    #[arg(long, env = "NGIT_DOMAIN", default_value = "localhost:7334")]
+    pub domain: String,
+
     /// Path to relay LMDB data.
     #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
     pub relay_data_path: String,
@@ -54,6 +56,10 @@ pub struct MaintenanceCleanupArgs {
 /// Backward-compatible args for `cleanup-empty-repos`.
 #[derive(Debug, Args)]
 pub struct CleanupArgs {
+    /// Public relay domain used for GRASP-06 PR-root retention checks.
+    #[arg(long, env = "NGIT_DOMAIN", default_value = "localhost:7334")]
+    pub domain: String,
+
     #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
     pub relay_data_path: String,
 
@@ -75,6 +81,7 @@ enum PassProfile {
 
 #[derive(Debug, Clone)]
 struct MaintenanceOptions {
+    domain: String,
     execute: bool,
     prune_orphans: bool,
     prune_missing_git: bool,
@@ -151,6 +158,7 @@ struct MaintenanceRunReport {
 
 pub async fn run(args: &CleanupArgs) -> Result<()> {
     let options = MaintenanceOptions {
+        domain: args.domain.clone(),
         execute: args.execute,
         prune_orphans: args.purge_orphans,
         prune_missing_git: args.execute,
@@ -175,6 +183,7 @@ pub async fn run(args: &CleanupArgs) -> Result<()> {
 
 pub async fn run_maintenance_cleanup(args: &MaintenanceCleanupArgs) -> Result<()> {
     let options = MaintenanceOptions {
+        domain: args.domain.clone(),
         execute: args.execute,
         prune_orphans: args.prune_orphans,
         prune_missing_git: args.prune_missing_git,
@@ -252,6 +261,7 @@ async fn run_engine_with_db(
         report.cascade = run_cascade_reconcile(
             &database,
             &planned_prune_ids,
+            &options.domain,
             options.execute,
             options.prune_after,
         )
@@ -346,6 +356,7 @@ async fn build_scan_plan(
 async fn run_cascade_reconcile(
     database: &Arc<dyn NostrDatabase>,
     planned_prune_ids: &HashSet<EventId>,
+    domain: &str,
     execute: bool,
     prune_after: Option<Duration>,
 ) -> Result<CascadeReport> {
@@ -354,46 +365,30 @@ async fn run_cascade_reconcile(
         ..Default::default()
     };
 
-    let candidates = query_cascade_candidates(database).await?;
-    report.scanned_candidates = candidates.len();
+    let announcements = query_cascade_announcements(database).await?;
+    report.scanned_candidates = announcements.len();
 
-    if candidates.is_empty() {
+    if announcements.is_empty() {
         return Ok(report);
     }
 
-    let graph = build_event_graph(&candidates);
-    let mut kept: HashMap<EventId, RetentionReason> = HashMap::new();
+    let planned_announcements: Vec<Event> = announcements
+        .iter()
+        .filter(|event| {
+            event.kind == Kind::GitRepoAnnouncement && planned_prune_ids.contains(&event.id)
+        })
+        .cloned()
+        .collect();
 
-    for event in &candidates {
-        if event.kind == Kind::GitRepoAnnouncement && !planned_prune_ids.contains(&event.id) {
-            kept.insert(
-                event.id,
-                RetentionReason {
-                    event_id: event.id,
-                    valid_announcements: vec![announcement_address_of(event)],
-                    event_type: "Repository Announcement".to_string(),
-                },
-            );
-        }
-    }
+    let plan =
+        plan_cascade_retention_for_deleted_announcements(database, &planned_announcements, domain)
+            .await
+            .map_err(|e| anyhow!("Cascade reconcile planning failed: {e}"))?;
 
-    let traversal = traverse_and_mark_deletions(&graph, &kept, EventId::all_zeros());
-
-    let mut deletable_ids: Vec<EventId> = Vec::new();
-    for event in &candidates {
-        if !traversal.delete.contains(&event.id) {
-            continue;
-        }
-
-        let is_announcement = event.kind == Kind::GitRepoAnnouncement;
-        if is_announcement && !planned_prune_ids.contains(&event.id) {
-            continue;
-        }
-
-        if !is_announcement || planned_prune_ids.contains(&event.id) {
-            deletable_ids.push(event.id);
-        }
-    }
+    let mut deletable_ids: Vec<EventId> = plan.orphan_event_ids.into_iter().collect();
+    deletable_ids.extend(planned_announcements.iter().map(|event| event.id));
+    deletable_ids.sort();
+    deletable_ids.dedup();
 
     report.sample_deleted_ids = deletable_ids
         .iter()
@@ -808,30 +803,13 @@ async fn count_events(database: &Arc<dyn NostrDatabase>, filter: Filter) -> Resu
         .len())
 }
 
-async fn query_cascade_candidates(database: &Arc<dyn NostrDatabase>) -> Result<Vec<Event>> {
-    let mut events = Vec::new();
-    events.extend(
-        database
-            .query(Filter::new().kind(Kind::GitRepoAnnouncement))
-            .await
-            .context("Failed querying announcements for cascade")?,
-    );
-
-    for kind_num in GRAPH_DEPENDENT_KINDS {
-        events.extend(
-            database
-                .query(Filter::new().kind(Kind::from(*kind_num)))
-                .await
-                .with_context(|| format!("Failed querying kind {} for cascade", kind_num))?,
-        );
-    }
-
-    Ok(events)
-}
-
-fn announcement_address_of(event: &Event) -> String {
-    let identifier = identifier_from_event(event).unwrap_or_default();
-    format!("30617:{}:{}", event.pubkey.to_hex(), identifier)
+async fn query_cascade_announcements(database: &Arc<dyn NostrDatabase>) -> Result<Vec<Event>> {
+    Ok(database
+        .query(Filter::new().kind(Kind::GitRepoAnnouncement))
+        .await
+        .context("Failed querying announcements for cascade")?
+        .into_iter()
+        .collect())
 }
 
 fn identifier_from_event(event: &Event) -> Option<String> {
@@ -1044,6 +1022,7 @@ mod tests {
 
     fn default_options() -> MaintenanceOptions {
         MaintenanceOptions {
+            domain: "localhost:7334".to_string(),
             execute: false,
             prune_orphans: false,
             prune_missing_git: false,
@@ -1157,26 +1136,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cascade_reconcile_cleans_legacy_orphan_dependents() {
+    async fn cascade_reconcile_deletes_dependents_of_planned_prune() {
         let db: Arc<dyn NostrDatabase> = Arc::new(MemoryDatabase::unbounded());
         let tmp = tempdir().unwrap();
+        let git_path = tmp.path();
 
         let keys = Keys::generate();
-        let dangling = issue(
+        let ann = announcement(&keys, "repo-cascade-prune");
+        let st = state(
             &keys,
-            "30617:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff:ghost",
+            "repo-cascade-prune",
+            "dddddddddddddddddddddddddddddddddddddddd",
         );
-        db.save_event(&dangling).await.unwrap();
+        let ann_addr = format!("30617:{}:{}", ann.pubkey.to_hex(), "repo-cascade-prune");
+        let dep = issue(&keys, &ann_addr);
+
+        db.save_event(&ann).await.unwrap();
+        db.save_event(&st).await.unwrap();
+        db.save_event(&dep).await.unwrap();
 
         let mut options = default_options();
         options.execute = true;
+        options.prune_missing_git = true;
 
-        let report = run_engine_with_db(db.clone(), tmp.path(), options)
+        let report = run_engine_with_db(db.clone(), git_path, options)
             .await
             .unwrap();
 
+        assert_eq!(count_kind(&db, Kind::GitRepoAnnouncement).await, 0);
+        assert_eq!(count_kind(&db, Kind::RepoState).await, 0);
         assert_eq!(count_kind(&db, Kind::from(1621)).await, 0);
-        assert!(report.cascade.deleted_events >= 1);
+        assert!(report.cascade.deleted_events >= 2);
     }
 
     #[tokio::test]

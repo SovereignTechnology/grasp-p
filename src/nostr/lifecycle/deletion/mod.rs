@@ -19,6 +19,4 @@ pub use startup::{
     WhitelistRestoreStats,
 };
 
-pub use cascade::{build_event_graph, EventGraph, EventNode};
-pub use cascade::{reevaluate_events_without_announcement, ReevaluationResult, RetentionReason};
-pub use cascade::{traverse_and_mark_deletions, CircularDependency, TraversalResult};
+pub use cascade::{plan_cascade_retention_for_deleted_announcements, CascadeRetentionPlan};

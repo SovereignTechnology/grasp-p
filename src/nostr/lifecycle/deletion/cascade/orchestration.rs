@@ -29,6 +29,14 @@ struct ParsedAddressRef {
     identifier: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CascadeRetentionPlan {
+    pub kept_event_ids: HashSet<EventId>,
+    pub orphan_event_ids: HashSet<EventId>,
+    pub component_nodes: usize,
+    pub component_edges: usize,
+}
+
 #[derive(Debug, Default)]
 struct CascadeGraph {
     nodes: HashMap<EventId, Event>,
@@ -147,19 +155,14 @@ impl DeletionPolicy {
             return;
         }
 
-        let deleted_announcement_ids: HashSet<EventId> = deletable_announcements
-            .iter()
-            .map(|event| event.id)
-            .collect();
-
-        let seed_event_ids = deleted_announcement_ids.clone();
-        let seed_addresses = HashSet::from([announcement_addr.to_string()]);
-
-        let graph = match self
-            .expand_cascade_graph(seed_event_ids, seed_addresses)
-            .await
+        let plan = match plan_cascade_retention_for_deleted_announcements(
+            &self.ctx.database,
+            &deletable_announcements,
+            &self.ctx.config.domain,
+        )
+        .await
         {
-            Ok(graph) => graph,
+            Ok(plan) => plan,
             Err(e) => {
                 tracing::warn!(error = %e, "Cascade deletion: graph expansion failed; falling back to simple coordinate deletion");
                 self.delete_announcement_coordinate_and_maybe_state(
@@ -175,22 +178,17 @@ impl DeletionPolicy {
             }
         };
 
-        let kept_events =
-            compute_retained_events(&graph, &deleted_announcement_ids, &self.ctx.config.domain);
-        let delete_events =
-            compute_deletable_events(&graph, &kept_events, &deleted_announcement_ids);
-
         tracing::info!(
             announcement = %announcement_addr,
-            component_nodes = graph.nodes.len(),
-            component_edges = graph.edge_count(),
-            kept = kept_events.len(),
-            deleted = delete_events.len(),
+            component_nodes = plan.component_nodes,
+            component_edges = plan.component_edges,
+            kept = plan.kept_event_ids.len(),
+            deleted = plan.orphan_event_ids.len(),
             "Announcement cascade deletion: acceptance reachability complete"
         );
 
         // Hard-delete the orphaned dependent events by id.
-        let orphan_ids: Vec<EventId> = delete_events.into_iter().collect();
+        let orphan_ids: Vec<EventId> = plan.orphan_event_ids.into_iter().collect();
         if orphan_ids.len() > MAX_CASCADE_ORPHAN_DELETES {
             tracing::warn!(
                 announcement = %announcement_addr,
@@ -409,14 +407,6 @@ impl DeletionPolicy {
         .await;
     }
 
-    async fn expand_cascade_graph(
-        &self,
-        seed_event_ids: HashSet<EventId>,
-        seed_addresses: HashSet<String>,
-    ) -> Result<CascadeGraph, CascadeExpansionError> {
-        expand_cascade_graph_from_db(&self.ctx.database, seed_event_ids, seed_addresses).await
-    }
-
     async fn query_address_events_until(
         &self,
         address: &str,
@@ -424,6 +414,43 @@ impl DeletionPolicy {
     ) -> Result<Vec<Event>, String> {
         query_address_events_with_until(&self.ctx.database, address, Some(until)).await
     }
+}
+
+pub async fn plan_cascade_retention_for_deleted_announcements(
+    database: &SharedDatabase,
+    deleted_announcements: &[Event],
+    domain: &str,
+) -> Result<CascadeRetentionPlan, String> {
+    let deleted_announcement_ids: HashSet<EventId> = deleted_announcements
+        .iter()
+        .filter(|event| event.kind == Kind::GitRepoAnnouncement)
+        .map(|event| event.id)
+        .collect();
+
+    if deleted_announcement_ids.is_empty() {
+        return Ok(CascadeRetentionPlan::default());
+    }
+
+    let seed_addresses: HashSet<String> = deleted_announcements
+        .iter()
+        .filter(|event| event.kind == Kind::GitRepoAnnouncement)
+        .map(announcement_address_of)
+        .collect();
+
+    let graph =
+        expand_cascade_graph_from_db(database, deleted_announcement_ids.clone(), seed_addresses)
+            .await
+            .map_err(|e| e.to_string())?;
+    let kept_event_ids = compute_retained_events(&graph, &deleted_announcement_ids, domain);
+    let orphan_event_ids =
+        compute_deletable_events(&graph, &kept_event_ids, &deleted_announcement_ids);
+
+    Ok(CascadeRetentionPlan {
+        kept_event_ids,
+        orphan_event_ids,
+        component_nodes: graph.nodes.len(),
+        component_edges: graph.edge_count(),
+    })
 }
 
 async fn expand_cascade_graph_from_db(
