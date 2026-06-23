@@ -1,4 +1,4 @@
-/// Re-evaluation Engine - Determines event retention after announcement deletion
+/// Legacy Re-evaluation Engine - Determines event retention after announcement deletion
 ///
 /// When a repository announcement is deleted, this module re-evaluates all dependent
 /// events to determine which should be kept (still acceptable through other announcements)
@@ -6,6 +6,9 @@
 ///
 /// This is critical for multi-maintainer scenarios where one maintainer deletes their
 /// announcement but other maintainers' announcements should keep the events alive.
+///
+/// This module is retained for legacy/offline reconciliation callers. The
+/// production NIP-09 announcement cascade algorithm lives in `orchestration.rs`.
 use std::collections::{HashMap, HashSet};
 
 use nostr_relay_builder::prelude::{Event, EventId, Filter, Kind};
@@ -33,6 +36,9 @@ pub struct RetentionReason {
 }
 
 /// Re-evaluate events that were dependent on a deleted announcement
+///
+/// Legacy reconciliation helper. Do not use this as a description of the
+/// production NIP-09 announcement cascade.
 ///
 /// This function determines which events should be kept vs deleted when an
 /// announcement is removed. It checks if events have alternative retention

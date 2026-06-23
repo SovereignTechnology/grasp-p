@@ -1,8 +1,8 @@
-/// Event Dependency Graph Builder
+/// Legacy Event Dependency Graph Builder
 ///
-/// Builds a dependency graph for multi-maintainer deletion scenarios.
-/// Tracks which events depend on which announcements, enabling selective
-/// deletion when one maintainer removes their announcement but others remain.
+/// Builds a dependency graph for offline cleanup reconciliation scenarios.
+/// This module is retained for `cleanup-empty-repos`; it is not used by the
+/// production NIP-09 announcement cascade, which lives in `orchestration.rs`.
 use std::collections::{HashMap, HashSet};
 
 use nostr_relay_builder::prelude::{Event, EventId, Kind};

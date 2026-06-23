@@ -33,7 +33,8 @@ struct ParsedAddressRef {
 struct CascadeGraph {
     nodes: HashMap<EventId, Event>,
     event_to_refs: HashMap<EventId, HashSet<RefKey>>,
-    ref_to_events: HashMap<RefKey, HashSet<EventId>>,
+    identity_to_event_ids: HashMap<RefKey, HashSet<EventId>>,
+    ref_to_referencing_event_ids: HashMap<RefKey, HashSet<EventId>>,
 }
 
 impl CascadeGraph {
@@ -43,19 +44,19 @@ impl CascadeGraph {
 
         self.event_to_refs.insert(event_id, refs.clone());
         for ref_key in refs {
-            self.ref_to_events
+            self.ref_to_referencing_event_ids
                 .entry(ref_key)
                 .or_default()
                 .insert(event_id);
         }
 
         if let Some(address) = event_address(&event) {
-            self.ref_to_events
+            self.identity_to_event_ids
                 .entry(RefKey::Address(address))
                 .or_default()
                 .insert(event_id);
         }
-        self.ref_to_events
+        self.identity_to_event_ids
             .entry(RefKey::Event(event_id))
             .or_default()
             .insert(event_id);
@@ -64,7 +65,10 @@ impl CascadeGraph {
     }
 
     fn edge_count(&self) -> usize {
-        self.event_to_refs.values().map(HashSet::len).sum()
+        self.ref_to_referencing_event_ids
+            .values()
+            .map(HashSet::len)
+            .sum()
     }
 }
 
@@ -120,22 +124,35 @@ impl DeletionPolicy {
         }
         let identifier = parts[2];
 
-        let deleted_announcement_id = self
-            .query_address_events(announcement_addr)
+        let deletable_announcements = match self
+            .query_address_events_until(announcement_addr, deletion_created_at)
             .await
-            .ok()
-            .and_then(|events| {
-                events
-                    .into_iter()
-                    .find(|e| e.kind == Kind::GitRepoAnnouncement)
-            })
-            .map(|event| event.id)
-            .unwrap_or_else(EventId::all_zeros);
+        {
+            Ok(events) => events
+                .into_iter()
+                .filter(|event| event.kind == Kind::GitRepoAnnouncement)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(error = %e, announcement = %announcement_addr, "Cascade deletion: failed to verify announcement versions under deletion cutoff");
+                return;
+            }
+        };
 
-        let mut seed_event_ids = HashSet::new();
-        if deleted_announcement_id != EventId::all_zeros() {
-            seed_event_ids.insert(deleted_announcement_id);
+        if deletable_announcements.is_empty() {
+            tracing::debug!(
+                announcement = %announcement_addr,
+                deletion_created_at = deletion_created_at.as_secs(),
+                "Cascade deletion skipped: no announcement version is deletable under NIP-09 cutoff"
+            );
+            return;
         }
+
+        let deleted_announcement_ids: HashSet<EventId> = deletable_announcements
+            .iter()
+            .map(|event| event.id)
+            .collect();
+
+        let seed_event_ids = deleted_announcement_ids.clone();
         let seed_addresses = HashSet::from([announcement_addr.to_string()]);
 
         let graph = match self
@@ -158,18 +175,10 @@ impl DeletionPolicy {
             }
         };
 
-        let kept_events = compute_retained_events(
-            &graph,
-            announcement_addr,
-            deleted_announcement_id,
-            &self.ctx.config.domain,
-        );
-        let delete_events = compute_deletable_events(
-            &graph,
-            &kept_events,
-            announcement_addr,
-            deleted_announcement_id,
-        );
+        let kept_events =
+            compute_retained_events(&graph, &deleted_announcement_ids, &self.ctx.config.domain);
+        let delete_events =
+            compute_deletable_events(&graph, &kept_events, &deleted_announcement_ids);
 
         tracing::info!(
             announcement = %announcement_addr,
@@ -408,8 +417,12 @@ impl DeletionPolicy {
         expand_cascade_graph_from_db(&self.ctx.database, seed_event_ids, seed_addresses).await
     }
 
-    async fn query_address_events(&self, address: &str) -> Result<Vec<Event>, String> {
-        query_address_events(&self.ctx.database, address).await
+    async fn query_address_events_until(
+        &self,
+        address: &str,
+        until: Timestamp,
+    ) -> Result<Vec<Event>, String> {
+        query_address_events_with_until(&self.ctx.database, address, Some(until)).await
     }
 }
 
@@ -459,7 +472,7 @@ async fn expand_cascade_graph_from_db(
         }
         for address in address_batch {
             loaded.extend(
-                query_address_events(database, &address)
+                query_address_events_with_until(database, &address, None)
                     .await
                     .map_err(CascadeExpansionError::Query)?,
             );
@@ -547,9 +560,10 @@ async fn query_events_by_ids(
         .map_err(|e| CascadeExpansionError::Query(format!("query ids failed: {e}")))
 }
 
-async fn query_address_events(
+async fn query_address_events_with_until(
     database: &SharedDatabase,
     address: &str,
+    until: Option<Timestamp>,
 ) -> Result<Vec<Event>, String> {
     let Some(parsed) = parse_accepted_address_ref(address) else {
         return Ok(Vec::new());
@@ -558,6 +572,9 @@ async fn query_address_events(
     let mut filter = Filter::new().kind(parsed.kind).author(parsed.pubkey);
     if let Some(identifier) = parsed.identifier {
         filter = filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier);
+    }
+    if let Some(until) = until {
+        filter = filter.until(until);
     }
 
     database
@@ -651,21 +668,17 @@ async fn query_tag_variants(
 
 fn compute_retained_events(
     graph: &CascadeGraph,
-    deleted_address: &str,
-    deleted_announcement_id: EventId,
+    deleted_announcement_ids: &HashSet<EventId>,
     domain: &str,
 ) -> HashSet<EventId> {
     let mut kept = HashSet::new();
     let mut vetoed_git_nodes = HashSet::new();
 
     for event in graph.nodes.values() {
-        if event.id == deleted_announcement_id
-            || event_address(event).as_deref() == Some(deleted_address)
-            || vetoed_git_nodes.contains(&event.id)
-        {
+        if deleted_announcement_ids.contains(&event.id) || vetoed_git_nodes.contains(&event.id) {
             continue;
         }
-        if is_independent_anchor(event, deleted_address, domain) {
+        if is_independent_anchor(event, deleted_announcement_ids, domain) {
             kept.insert(event.id);
         }
     }
@@ -677,8 +690,7 @@ fn compute_retained_events(
         for event in graph.nodes.values() {
             if kept.contains(&event.id)
                 || vetoed_git_nodes.contains(&event.id)
-                || event.id == deleted_announcement_id
-                || event_address(event).as_deref() == Some(deleted_address)
+                || deleted_announcement_ids.contains(&event.id)
                 || should_exclude_from_generic_graph(event)
                 || should_not_recurse_through(event)
             {
@@ -742,16 +754,14 @@ fn refs_for_kept_events(graph: &CascadeGraph, kept: &HashSet<EventId>) -> KeptRe
 fn compute_deletable_events(
     graph: &CascadeGraph,
     kept: &HashSet<EventId>,
-    deleted_address: &str,
-    deleted_announcement_id: EventId,
+    deleted_announcement_ids: &HashSet<EventId>,
 ) -> HashSet<EventId> {
     graph
         .nodes
         .values()
         .filter(|event| {
             !kept.contains(&event.id)
-                && event.id != deleted_announcement_id
-                && event_address(event).as_deref() != Some(deleted_address)
+                && !deleted_announcement_ids.contains(&event.id)
                 && !should_exclude_from_generic_graph(event)
                 && !should_not_recurse_through(event)
         })
@@ -759,9 +769,17 @@ fn compute_deletable_events(
         .collect()
 }
 
-fn is_independent_anchor(event: &Event, deleted_address: &str, domain: &str) -> bool {
+fn is_independent_anchor(
+    event: &Event,
+    deleted_announcement_ids: &HashSet<EventId>,
+    domain: &str,
+) -> bool {
     if event.kind == Kind::GitRepoAnnouncement {
-        return event_address(event).as_deref() != Some(deleted_address);
+        return !deleted_announcement_ids.contains(&event.id);
+    }
+
+    if event.kind == Kind::GitUserGraspList {
+        return true;
     }
 
     crate::grasp06::policy::event_names_relays_prs_endpoint(event, domain)
@@ -799,7 +817,7 @@ fn event_references_kept_repo_announcement(
         .into_iter()
         .flatten()
         .any(|ref_key| {
-            graph.ref_to_events.get(ref_key).is_some_and(|ids| {
+            graph.identity_to_event_ids.get(ref_key).is_some_and(|ids| {
                 ids.iter().any(|id| {
                     kept.contains(id)
                         && graph

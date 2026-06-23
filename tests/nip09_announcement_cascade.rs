@@ -246,6 +246,121 @@ async fn test_deleting_patch_by_event_id_does_not_delete_announcement_or_sibling
     assert!(!patch_survived, "patch must be deleted by its e-tag");
 }
 
+/// A stale NIP-09 coordinate deletion must not cascade through the current
+/// announcement. The deletion's created_at predates the announcement, so no
+/// kind-30617 version is actually deletable under NIP-09 replaceable semantics.
+#[tokio::test]
+async fn test_stale_announcement_coordinate_deletion_does_not_cascade() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let (announcement, repo_id) = publish_served_repo(&client, "stale-coordinate-delete").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let issue = client
+        .create_issue(&announcement, "Stale delete issue", "must survive", vec![])
+        .expect("build issue");
+    client
+        .send_event(issue.clone())
+        .await
+        .expect("relay should accept dependent event");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let stale_timestamp = Timestamp::from_secs(announcement.created_at.as_secs().saturating_sub(1));
+    let stale_deletion = client
+        .event_builder(Kind::EventDeletion, "stale delete")
+        .custom_time(stale_timestamp)
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(client.keys())
+        .expect("build stale deletion event");
+    client
+        .send_event(stale_deletion)
+        .await
+        .expect("relay should accept stale deletion request");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let announcement_survived = client
+        .is_event_on_relay(announcement.id)
+        .await
+        .expect("query announcement after stale deletion");
+    let issue_survived = client
+        .is_event_on_relay(issue.id)
+        .await
+        .expect("query issue after stale deletion");
+    relay.stop().await;
+
+    assert!(
+        announcement_survived,
+        "newer announcement must survive stale coordinate deletion"
+    );
+    assert!(
+        issue_survived,
+        "dependent event must not be cascade-deleted when the announcement survives"
+    );
+}
+
+/// Kind 10317 user grasp lists are independently accepted by the write policy,
+/// so cascade retention must treat them as independent anchors even if they are
+/// connected to a deleted repository component.
+#[tokio::test]
+async fn test_user_grasp_list_survives_connected_announcement_cascade() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let (announcement, repo_id) = publish_served_repo(&client, "user-grasp-list-anchor").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let grasp_list = client
+        .event_builder(Kind::GitUserGraspList, "")
+        .tag(Tag::custom("a", vec![coordinate.clone()]))
+        .build(client.keys())
+        .expect("build 10317 user grasp list");
+    client
+        .send_event(grasp_list.clone())
+        .await
+        .expect("relay should accept 10317 user grasp list");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(grasp_list.id)
+            .await
+            .expect("query 10317 before deletion"),
+        "10317 precondition: event must be served before cascade"
+    );
+
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
+    client
+        .send_event(deletion)
+        .await
+        .expect("relay should accept the announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let announcement_survived = client
+        .is_event_on_relay(announcement.id)
+        .await
+        .expect("query announcement after deletion");
+    let grasp_list_survived = client
+        .is_event_on_relay(grasp_list.id)
+        .await
+        .expect("query 10317 after deletion");
+    relay.stop().await;
+
+    assert!(!announcement_survived, "announcement must still be deleted");
+    assert!(
+        grasp_list_survived,
+        "independently accepted 10317 must survive connected announcement cascade"
+    );
+}
+
 /// Deleting a comment by `e` tag must not trigger repository graph cascade:
 /// the parent issue and announcement must survive.
 #[tokio::test]

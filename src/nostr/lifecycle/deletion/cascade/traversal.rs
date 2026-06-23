@@ -1,10 +1,14 @@
-/// Graph Traversal and Circular Dependency Detection
+/// Legacy Graph Traversal and Circular Dependency Detection
 ///
-/// Determines which events to keep vs delete in multi-maintainer scenarios by:
+/// Determines which events to keep vs delete for offline cleanup reconciliation
+/// by:
 /// 1. Starting from kept repository announcements (kind 30617)
 /// 2. Traversing the dependency graph to find all reachable events
 /// 3. Detecting circular dependencies and handling them appropriately
 /// 4. Marking unreachable events for deletion
+///
+/// This module is retained for `cleanup-empty-repos`; it is not used by the
+/// production NIP-09 announcement cascade, which lives in `orchestration.rs`.
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use nostr_relay_builder::prelude::EventId;
@@ -33,6 +37,9 @@ pub struct CircularDependency {
 }
 
 /// Traverse the event graph and mark events for deletion
+///
+/// Legacy reconciliation helper for `cleanup-empty-repos`. Do not use this as a
+/// description of the production NIP-09 announcement cascade.
 ///
 /// This function implements a BFS traversal starting from kept repository announcements,
 /// marking all reachable events as KEEP and unreachable events as DELETE.
