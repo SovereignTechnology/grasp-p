@@ -512,3 +512,370 @@ async fn test_announcement_cascade_traverses_mixed_tag_variants() {
         "announcement deletion should traverse mixed tag variants; survivors: {survivors:?}"
     );
 }
+
+#[tokio::test]
+async fn test_cascade_recurses_to_unknown_kind_via_comment_only_edge() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-unknown-via-comment").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let issue = client
+        .create_issue(&announcement, "Deleted repo issue", "issue body", vec![])
+        .expect("build issue");
+    let comment = client
+        .event_builder(Kind::from(1111), "comment on deleted repo issue")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .build(&keys)
+        .expect("build comment");
+    let kind1 = client
+        .event_builder(Kind::from(1), "kind 1 references only the comment")
+        .tag(Tag::custom("e", vec![comment.id.to_hex()]))
+        .build(&keys)
+        .expect("build kind 1 event");
+
+    for event in [&issue, &comment, &kind1] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept dependent event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("comment", comment.id),
+        ("kind1", kind1.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    for (label, id) in [("issue", issue.id), ("comment", comment.id), ("kind1", kind1.id)] {
+        assert!(
+            !client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event after deletion"),
+            "{label} ({id}) should be deleted when reachable only via deleted repo -> issue -> comment chain"
+        );
+    }
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_unknown_kind_leaf_referenced_only_by_deleted_chain_is_removed() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement, repo_id) = publish_served_repo(&client, "cascade-unknown-leaf").await;
+    let coordinate = announcement_coordinate(&announcement, &repo_id);
+
+    let issue = client
+        .create_issue(&announcement, "Issue for deleted chain", "issue body", vec![])
+        .expect("build issue");
+    let kind1 = client
+        .event_builder(Kind::from(1), "kind 1 note accepted via deleted-chain comment")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .build(&keys)
+        .expect("build kind 1 note");
+    let comment = client
+        .event_builder(Kind::from(1111), "comment quoting kind 1 note")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .tag(Tag::custom("q", vec![kind1.id.to_hex()]))
+        .build(&keys)
+        .expect("build comment quoting kind 1 note");
+
+    for event in [&issue, &kind1, &comment] {
+        client
+            .send_event(event.clone())
+            .await
+            .expect("relay should accept event");
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement", announcement.id),
+        ("issue", issue.id),
+        ("comment", comment.id),
+        ("kind1", kind1.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate),
+        ))
+        .await
+        .expect("relay should accept announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    for (label, id) in [("issue", issue.id), ("comment", comment.id), ("kind1", kind1.id)] {
+        assert!(
+            !client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event after deletion"),
+            "{label} ({id}) should be deleted when its only retained path is through the deleted repo chain"
+        );
+    }
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_unknown_kind_shared_with_retained_repo_is_kept_while_deleted_repo_issue_is_removed() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement_a, repo_id_a) = publish_served_repo(&client, "cascade-shared-repo-a").await;
+    let coordinate_a = announcement_coordinate(&announcement_a, &repo_id_a);
+    let (announcement_b, _repo_id_b) = publish_served_repo(&client, "cascade-shared-repo-b").await;
+
+    let issue_a = client
+        .create_issue(
+            &announcement_a,
+            "Repo A issue",
+            "issue body",
+            vec![],
+        )
+        .expect("build repo A issue");
+    client
+        .send_event(issue_a.clone())
+        .await
+        .expect("relay should accept repo A issue");
+
+    let kind1 = client
+        .event_builder(Kind::from(1), "shared kind 1 note")
+        .tag(Tag::custom("e", vec![issue_a.id.to_hex()]))
+        .build(&keys)
+        .expect("build shared kind 1 note");
+    client
+        .send_event(kind1.clone())
+        .await
+        .expect("relay should accept shared kind 1 note");
+
+    // This extra kind-1 submission exercises the scenario requirement that a
+    // plain kind-1 event should remain acceptable once issue A already exists.
+    let kind1_followup = client
+        .event_builder(Kind::from(1), "kind 1 submitted after repo A issue exists")
+        .tag(Tag::custom("e", vec![issue_a.id.to_hex()]))
+        .build(&keys)
+        .expect("build kind 1 followup");
+    client
+        .send_event(kind1_followup.clone())
+        .await
+        .expect("relay should accept followup kind 1 event");
+
+    let issue_b = client
+        .create_issue(
+            &announcement_b,
+            "Repo B issue",
+            "issue body",
+            vec![Tag::custom("q", vec![kind1.id.to_hex()])],
+        )
+        .expect("build repo B issue");
+    client
+        .send_event(issue_b.clone())
+        .await
+        .expect("relay should accept repo B issue");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement_a", announcement_a.id),
+        ("announcement_b", announcement_b.id),
+        ("issue_a", issue_a.id),
+        ("issue_b", issue_b.id),
+        ("kind1", kind1.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate_a),
+        ))
+        .await
+        .expect("relay should accept repo A announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    assert!(
+        !client
+            .is_event_on_relay(issue_a.id)
+            .await
+            .expect("query repo A issue after deletion"),
+        "issue_A ({}) should be deleted with repo A",
+        issue_a.id
+    );
+    assert!(
+        client
+            .is_event_on_relay(issue_b.id)
+            .await
+            .expect("query repo B issue after deletion"),
+        "issue_B ({}) should remain because repo B is retained",
+        issue_b.id
+    );
+    assert!(
+        client
+            .is_event_on_relay(kind1.id)
+            .await
+            .expect("query shared kind 1 after deletion"),
+        "shared kind1 ({}) should remain because repo B still references it",
+        kind1.id
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_deleted_repo_issue_retained_when_its_comment_is_quoted_in_retained_repo_issue() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+    let keys = client.keys().clone();
+
+    let (announcement_a, repo_id_a) = publish_served_repo(&client, "cascade-quoted-comment-repo-a").await;
+    let coordinate_a = announcement_coordinate(&announcement_a, &repo_id_a);
+    let (announcement_b, _repo_id_b) = publish_served_repo(&client, "cascade-quoted-comment-repo-b").await;
+
+    let issue_a = client
+        .create_issue(&announcement_a, "Repo A issue", "issue body", vec![])
+        .expect("build repo A issue");
+    client
+        .send_event(issue_a.clone())
+        .await
+        .expect("relay should accept repo A issue");
+
+    let comment_a = client
+        .event_builder(Kind::from(1111), "comment on repo A issue")
+        .tag(Tag::custom("e", vec![issue_a.id.to_hex()]))
+        .build(&keys)
+        .expect("build repo A comment");
+    client
+        .send_event(comment_a.clone())
+        .await
+        .expect("relay should accept repo A comment");
+
+    let issue_b = client
+        .create_issue(
+            &announcement_b,
+            "Repo B issue quoting repo A comment",
+            "issue body",
+            vec![Tag::custom("q", vec![comment_a.id.to_hex()])],
+        )
+        .expect("build repo B issue");
+    client
+        .send_event(issue_b.clone())
+        .await
+        .expect("relay should accept repo B issue");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    for (label, id) in [
+        ("announcement_a", announcement_a.id),
+        ("announcement_b", announcement_b.id),
+        ("issue_a", issue_a.id),
+        ("comment_a", comment_a.id),
+        ("issue_b", issue_b.id),
+    ] {
+        assert!(
+            client
+                .is_event_on_relay(id)
+                .await
+                .expect("query event before deletion"),
+            "{label} ({id}) must be served before deletion"
+        );
+    }
+
+    client
+        .send_event(build_deletion(
+            &client,
+            &[],
+            std::slice::from_ref(&coordinate_a),
+        ))
+        .await
+        .expect("relay should accept repo A announcement deletion");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // New requirement: a retained repo conversation quoting comment_A should
+    // keep comment_A reachable, and issue_A should also stay for graph
+    // consistency because comment_A cannot remain without its parent issue.
+    assert!(
+        client
+            .is_event_on_relay(comment_a.id)
+            .await
+            .expect("query repo A comment after deletion"),
+        "comment_A ({}) should remain because retained repo B issue quotes it",
+        comment_a.id
+    );
+    assert!(
+        client
+            .is_event_on_relay(issue_a.id)
+            .await
+            .expect("query repo A issue after deletion"),
+        "issue_A ({}) should remain for reachability consistency from retained comment_A",
+        issue_a.id
+    );
+    assert!(
+        client
+            .is_event_on_relay(issue_b.id)
+            .await
+            .expect("query repo B issue after deletion"),
+        "issue_B ({}) should remain because repo B is retained",
+        issue_b.id
+    );
+
+    relay.stop().await;
+}
