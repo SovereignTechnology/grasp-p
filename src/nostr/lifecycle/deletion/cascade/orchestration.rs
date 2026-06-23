@@ -23,6 +23,12 @@ enum RefKey {
     Address(String),
 }
 
+struct ParsedAddressRef {
+    kind: Kind,
+    pubkey: PublicKey,
+    identifier: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct CascadeGraph {
     nodes: HashMap<EventId, Event>,
@@ -139,9 +145,10 @@ impl DeletionPolicy {
             Ok(graph) => graph,
             Err(e) => {
                 tracing::warn!(error = %e, "Cascade deletion: graph expansion failed; falling back to simple coordinate deletion");
-                self.delete_coordinate_from_main_db(
+                self.delete_announcement_coordinate_and_maybe_state(
                     author,
                     announcement_addr,
+                    identifier,
                     deletion_created_at,
                     &mut moved_ids,
                     source,
@@ -182,9 +189,10 @@ impl DeletionPolicy {
                 max = MAX_CASCADE_ORPHAN_DELETES,
                 "Cascade deletion orphan set exceeds limit; deleting announcement coordinate only"
             );
-            self.delete_coordinate_from_main_db(
+            self.delete_announcement_coordinate_and_maybe_state(
                 author,
                 announcement_addr,
+                identifier,
                 deletion_created_at,
                 &mut moved_ids,
                 source,
@@ -222,21 +230,11 @@ impl DeletionPolicy {
         }
 
         // Step 5b: hard-delete the announcement coordinate itself (up to the
-        // deletion's created_at, per NIP-09), exactly as the simple path does.
-        self.delete_coordinate_from_main_db(
+        // deletion's created_at, per NIP-09), exactly as the simple path does,
+        // then clean state if this identifier is now unanchored.
+        self.delete_announcement_coordinate_and_maybe_state(
             author,
             announcement_addr,
-            deletion_created_at,
-            &mut moved_ids,
-            source,
-        )
-        .await;
-
-        // Step 5c: repository state (30618) is keyed by identifier, not by
-        // graph edges. After deleting this announcement coordinate, delete
-        // state events for the identifier only when no announcement for that
-        // identifier remains in the main DB.
-        self.delete_repo_state_if_identifier_is_unanchored(
             identifier,
             deletion_created_at,
             &mut moved_ids,
@@ -367,6 +365,37 @@ impl DeletionPolicy {
             &metadata,
             moved_ids,
             "unanchored state deletion",
+        )
+        .await;
+    }
+
+    async fn delete_announcement_coordinate_and_maybe_state(
+        &self,
+        author: &PublicKey,
+        announcement_addr: &str,
+        identifier: &str,
+        deletion_created_at: Timestamp,
+        moved_ids: &mut HashSet<EventId>,
+        source: DeletionSource,
+    ) {
+        self.delete_coordinate_from_main_db(
+            author,
+            announcement_addr,
+            deletion_created_at,
+            moved_ids,
+            source,
+        )
+        .await;
+
+        // Repository state (30618) is keyed by identifier, not by graph edges.
+        // After deleting this announcement coordinate, delete state events for
+        // the identifier only when no announcement for that identifier remains
+        // in the main DB. This must also run on coordinate-only fallbacks.
+        self.delete_repo_state_if_identifier_is_unanchored(
+            identifier,
+            deletion_created_at,
+            moved_ids,
+            source,
         )
         .await;
     }
@@ -522,23 +551,13 @@ async fn query_address_events(
     database: &SharedDatabase,
     address: &str,
 ) -> Result<Vec<Event>, String> {
-    let parts: Vec<&str> = address.splitn(3, ':').collect();
-    if parts.len() < 2 {
+    let Some(parsed) = parse_accepted_address_ref(address) else {
         return Ok(Vec::new());
-    }
-    let kind_num = parts[0]
-        .parse::<u16>()
-        .map_err(|e| format!("invalid address kind {address}: {e}"))?;
-    let pubkey = PublicKey::from_hex(parts[1])
-        .map_err(|e| format!("invalid address pubkey {address}: {e}"))?;
+    };
 
-    let kind = Kind::from(kind_num);
-    let mut filter = Filter::new().kind(kind).author(pubkey);
-    if parts.len() == 3 && kind.is_addressable() {
-        filter = filter.custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            parts[2].to_string(),
-        );
+    let mut filter = Filter::new().kind(parsed.kind).author(parsed.pubkey);
+    if let Some(identifier) = parsed.identifier {
+        filter = filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier);
     }
 
     database
@@ -546,6 +565,35 @@ async fn query_address_events(
         .await
         .map(|events| events.into_iter().collect())
         .map_err(|e| format!("query address {address} failed: {e}"))
+}
+
+fn parse_accepted_address_ref(address: &str) -> Option<ParsedAddressRef> {
+    let parts: Vec<&str> = address.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let kind = Kind::from(parts[0].parse::<u16>().ok()?);
+    let pubkey = PublicKey::from_hex(parts[1]).ok()?;
+
+    if kind.is_addressable() {
+        let identifier = parts.get(2)?;
+        return Some(ParsedAddressRef {
+            kind,
+            pubkey,
+            identifier: Some((*identifier).to_string()),
+        });
+    }
+
+    if kind.is_replaceable() && parts.len() == 2 {
+        return Some(ParsedAddressRef {
+            kind,
+            pubkey,
+            identifier: None,
+        });
+    }
+
+    None
 }
 
 async fn query_incoming_event_refs(
@@ -772,7 +820,9 @@ fn extract_accepted_reference_keys(event: &Event) -> HashSet<RefKey> {
         }
         match tag_vec[0].as_str() {
             "a" | "A" => {
-                refs.insert(RefKey::Address(tag_vec[1].to_string()));
+                if parse_accepted_address_ref(&tag_vec[1]).is_some() {
+                    refs.insert(RefKey::Address(tag_vec[1].to_string()));
+                }
             }
             "e" | "E" => {
                 if let Ok(event_id) = EventId::from_hex(&tag_vec[1]) {
@@ -780,7 +830,9 @@ fn extract_accepted_reference_keys(event: &Event) -> HashSet<RefKey> {
                 }
             }
             "q" if tag_vec[1].contains(':') => {
-                refs.insert(RefKey::Address(tag_vec[1].to_string()));
+                if parse_accepted_address_ref(&tag_vec[1]).is_some() {
+                    refs.insert(RefKey::Address(tag_vec[1].to_string()));
+                }
             }
             "q" => {
                 if let Ok(event_id) = EventId::from_hex(&tag_vec[1]) {
