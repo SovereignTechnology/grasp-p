@@ -570,6 +570,8 @@ async fn test_shared_subgraph_survives_when_one_anchor_path_removed() {
         .expect("build top unique A event");
 
     // Shared descendant references both tops and should survive through top_shared.
+    // Under acceptance-reachability cascade, retaining shared_descendant also
+    // retains top_unique_a because a kept node references it.
     let shared_descendant = client_a
         .event_builder(Kind::from(1111), "shared descendant")
         .tag(Tag::custom("e", vec![top_shared.id.to_hex()]))
@@ -577,7 +579,8 @@ async fn test_shared_subgraph_survives_when_one_anchor_path_removed() {
         .build(client_a.keys())
         .expect("build shared descendant");
 
-    // Unique branch descendant should be deleted with top_unique_a.
+    // Once top_unique_a is retained by the shared descendant, this unique
+    // descendant remains acceptable because it references a kept node.
     let unique_descendant = client_a
         .event_builder(Kind::from(1111), "unique descendant")
         .tag(Tag::custom("e", vec![top_unique_a.id.to_hex()]))
@@ -660,15 +663,15 @@ async fn test_shared_subgraph_survives_when_one_anchor_path_removed() {
         "top shared event must survive because anchor B remains"
     );
     assert!(
-        !top_unique_a_survived,
-        "top unique A event must be deleted after A deletion"
+        top_unique_a_survived,
+        "top unique A event must survive because retained shared_descendant references it"
     );
     assert!(
         shared_descendant_survived,
         "shared descendant must survive through still-anchored top_shared path"
     );
     assert!(
-        !unique_descendant_survived,
-        "unique descendant must be deleted with the A-only branch"
+        unique_descendant_survived,
+        "unique descendant must survive because retained top_unique_A remains acceptable"
     );
 }

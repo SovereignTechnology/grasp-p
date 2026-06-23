@@ -205,7 +205,8 @@ pub fn build_event_graph(events: &[Event]) -> EventGraph {
     for event in events {
         let mut node = EventNode::new(event.id, event.kind);
 
-        // Extract references from a/e/q tags
+        // Extract references from e/E/q event-id tags. Address refs are resolved
+        // after every node's address has been indexed.
         for tag in event.tags.iter() {
             let tag_vec = tag.as_slice();
             if tag_vec.is_empty() {
@@ -213,16 +214,16 @@ pub fn build_event_graph(events: &[Event]) -> EventGraph {
             }
 
             match tag_vec[0].as_str() {
-                "e" | "q" if tag_vec.len() >= 2 => {
+                "e" | "E" if tag_vec.len() >= 2 => {
                     // Event reference
                     if let Ok(referenced_id) = EventId::from_hex(&tag_vec[1]) {
                         node.add_reference(referenced_id);
                     }
                 }
-                "a" if tag_vec.len() >= 2 => {
-                    // Address reference - need to find the event with this address
-                    // For now, we'll handle this in a second pass after all nodes are added
-                    // Store the address temporarily (we'll resolve it later)
+                "q" if tag_vec.len() >= 2 && !tag_vec[1].contains(':') => {
+                    if let Ok(referenced_id) = EventId::from_hex(&tag_vec[1]) {
+                        node.add_reference(referenced_id);
+                    }
                 }
                 _ => {}
             }
@@ -235,9 +236,8 @@ pub fn build_event_graph(events: &[Event]) -> EventGraph {
     // Build a map of addresses to event IDs
     let mut address_to_event: HashMap<String, EventId> = HashMap::new();
     for event in events {
-        // Check if this is a replaceable/addressable event (kind 30000-39999)
         let kind_num = event.kind.as_u16();
-        if (30000..=39999).contains(&kind_num) {
+        if (30000..40000).contains(&kind_num) {
             // Extract d-tag to build address
             for tag in event.tags.iter() {
                 let tag_vec = tag.as_slice();
@@ -248,6 +248,9 @@ pub fn build_event_graph(events: &[Event]) -> EventGraph {
                     break;
                 }
             }
+        } else if (10000..20000).contains(&kind_num) {
+            let address = format!("{}:{}", kind_num, event.pubkey.to_hex());
+            address_to_event.insert(address, event.id);
         }
     }
 
@@ -255,7 +258,9 @@ pub fn build_event_graph(events: &[Event]) -> EventGraph {
     for event in events {
         for tag in event.tags.iter() {
             let tag_vec = tag.as_slice();
-            if tag_vec.len() >= 2 && tag_vec[0] == "a" {
+            let is_address_ref = tag_vec.len() >= 2 && matches!(tag_vec[0].as_str(), "a" | "A")
+                || (tag_vec.len() >= 2 && tag_vec[0] == "q" && tag_vec[1].contains(':'));
+            if is_address_ref {
                 let address = &tag_vec[1];
                 if let Some(&referenced_id) = address_to_event.get(address) {
                     graph.add_edge(event.id, referenced_id);

@@ -573,7 +573,11 @@ async fn test_cascade_recurses_to_unknown_kind_via_comment_only_edge() {
 
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    for (label, id) in [("issue", issue.id), ("comment", comment.id), ("kind1", kind1.id)] {
+    for (label, id) in [
+        ("issue", issue.id),
+        ("comment", comment.id),
+        ("kind1", kind1.id),
+    ] {
         assert!(
             !client
                 .is_event_on_relay(id)
@@ -598,10 +602,18 @@ async fn test_unknown_kind_leaf_referenced_only_by_deleted_chain_is_removed() {
     let coordinate = announcement_coordinate(&announcement, &repo_id);
 
     let issue = client
-        .create_issue(&announcement, "Issue for deleted chain", "issue body", vec![])
+        .create_issue(
+            &announcement,
+            "Issue for deleted chain",
+            "issue body",
+            vec![],
+        )
         .expect("build issue");
     let kind1 = client
-        .event_builder(Kind::from(1), "kind 1 note accepted via deleted-chain comment")
+        .event_builder(
+            Kind::from(1),
+            "kind 1 note accepted via deleted-chain comment",
+        )
         .tag(Tag::custom("e", vec![issue.id.to_hex()]))
         .build(&keys)
         .expect("build kind 1 note");
@@ -647,7 +659,11 @@ async fn test_unknown_kind_leaf_referenced_only_by_deleted_chain_is_removed() {
 
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    for (label, id) in [("issue", issue.id), ("comment", comment.id), ("kind1", kind1.id)] {
+    for (label, id) in [
+        ("issue", issue.id),
+        ("comment", comment.id),
+        ("kind1", kind1.id),
+    ] {
         assert!(
             !client
                 .is_event_on_relay(id)
@@ -661,7 +677,7 @@ async fn test_unknown_kind_leaf_referenced_only_by_deleted_chain_is_removed() {
 }
 
 #[tokio::test]
-async fn test_unknown_kind_shared_with_retained_repo_is_kept_while_deleted_repo_issue_is_removed() {
+async fn test_unknown_kind_shared_with_retained_repo_keeps_deleted_repo_issue_reference() {
     let relay = TestRelay::start().await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())
         .await
@@ -673,12 +689,7 @@ async fn test_unknown_kind_shared_with_retained_repo_is_kept_while_deleted_repo_
     let (announcement_b, _repo_id_b) = publish_served_repo(&client, "cascade-shared-repo-b").await;
 
     let issue_a = client
-        .create_issue(
-            &announcement_a,
-            "Repo A issue",
-            "issue body",
-            vec![],
-        )
+        .create_issue(&announcement_a, "Repo A issue", "issue body", vec![])
         .expect("build repo A issue");
     client
         .send_event(issue_a.clone())
@@ -750,11 +761,11 @@ async fn test_unknown_kind_shared_with_retained_repo_is_kept_while_deleted_repo_
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     assert!(
-        !client
+        client
             .is_event_on_relay(issue_a.id)
             .await
             .expect("query repo A issue after deletion"),
-        "issue_A ({}) should be deleted with repo A",
+        "issue_A ({}) should remain because retained kind1 references it",
         issue_a.id
     );
     assert!(
@@ -785,9 +796,11 @@ async fn test_deleted_repo_issue_retained_when_its_comment_is_quoted_in_retained
         .expect("create audit client");
     let keys = client.keys().clone();
 
-    let (announcement_a, repo_id_a) = publish_served_repo(&client, "cascade-quoted-comment-repo-a").await;
+    let (announcement_a, repo_id_a) =
+        publish_served_repo(&client, "cascade-quoted-comment-repo-a").await;
     let coordinate_a = announcement_coordinate(&announcement_a, &repo_id_a);
-    let (announcement_b, _repo_id_b) = publish_served_repo(&client, "cascade-quoted-comment-repo-b").await;
+    let (announcement_b, _repo_id_b) =
+        publish_served_repo(&client, "cascade-quoted-comment-repo-b").await;
 
     let issue_a = client
         .create_issue(&announcement_a, "Repo A issue", "issue body", vec![])
