@@ -7,12 +7,13 @@ mod common;
 
 use common::{
     announcement_coordinate, announcement_served_by_coordinate, build_deletion,
-    publish_served_announcement_with_state_for_identifier, publish_served_repo,
-    publish_served_repo_with_state_event, publish_served_repo_with_state_event_and_maintainers,
-    TestRelay,
+    create_test_repo_with_commit, publish_served_announcement_with_state_for_identifier,
+    publish_served_repo, publish_served_repo_with_state_event,
+    publish_served_repo_with_state_event_and_maintainers, push_to_relay, CommitVariant, TestRelay,
 };
 
 use grasp_audit::{AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
+use ngit_grasp::nostr::lifecycle::HoldingStore;
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::process::Command;
@@ -69,6 +70,32 @@ fn list_repo_refs(repo_path: &std::path::Path) -> HashSet<String> {
         .filter_map(|line| line.split_whitespace().nth(1))
         .map(|s| s.to_string())
         .collect()
+}
+
+async fn open_holding(relay: &TestRelay) -> HoldingStore {
+    HoldingStore::open_lmdb(relay.relay_data_path(), relay.git_data_path())
+        .await
+        .expect("open holding db")
+}
+
+fn metadata_has_tag(event: &Event, key: &str, value: Option<&str>) -> bool {
+    event.tags.iter().any(|tag| {
+        let v = tag.as_slice();
+        v.len() >= 2 && v[0] == key && value.map(|expected| v[1] == expected).unwrap_or(true)
+    })
+}
+
+fn metadata_archive_relative_path(metadata: &[Event]) -> Option<String> {
+    metadata.iter().find_map(|event| {
+        event.tags.iter().find_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == "holding-archive-path" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 /// Deleting an announcement by coordinate must hard-delete the repository state
@@ -456,15 +483,17 @@ async fn test_a_delete_coordinate_cutoff_deletes_active_without_history_resurrec
 }
 
 #[tokio::test]
-async fn test_delete_only_active_state_with_no_history_clears_managed_refs() {
-    let relay = TestRelay::start().await;
+async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_until_new_state_and_git(
+) {
+    let relay = TestRelay::start_with_lmdb().await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())
         .await
         .expect("create audit client");
 
-    let (_announcement, repo_id, original_state) =
+    let (announcement, repo_id, original_state) =
         publish_served_repo_with_state_event(&client, "state-rollback-none").await;
     let owner_repo = repo_path(&relay, &client, &repo_id);
+    let holding = open_holding(&relay).await;
 
     assert!(
         list_repo_refs(&owner_repo).contains("refs/heads/main"),
@@ -477,14 +506,124 @@ async fn test_delete_only_active_state_with_no_history_clears_managed_refs() {
         .expect("send deletion for only active state");
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    let refs_after = list_repo_refs(&owner_repo);
     assert!(
-        !refs_after.iter().any(|r| r.starts_with("refs/heads/")),
-        "no branch refs should remain when there is no active state"
+        !client
+            .is_event_on_relay(original_state.id)
+            .await
+            .expect("query deleted state"),
+        "deleted only-active state must not be served"
     );
     assert!(
-        !refs_after.iter().any(|r| r.starts_with("refs/tags/")),
-        "no tag refs should remain when there is no active state"
+        !client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query announcement after no-active-state transition"),
+        "announcement must not remain served by id when no active state exists"
+    );
+    assert!(
+        !announcement_served_by_coordinate(&client, &announcement, &repo_id).await,
+        "announcement must not remain served by coordinate when no active state exists"
+    );
+
+    let refs_after_delete = list_repo_refs(&owner_repo);
+    assert!(
+        !refs_after_delete
+            .iter()
+            .any(|r| r.starts_with("refs/heads/")),
+        "repo must not serve old live branch refs after no-active-state transition"
+    );
+    assert!(
+        !refs_after_delete
+            .iter()
+            .any(|r| r.starts_with("refs/tags/")),
+        "repo must not serve old live tag refs after no-active-state transition"
+    );
+
+    assert!(
+        holding.has_event(&announcement.id).await,
+        "announcement must be moved to holding during no-active-state transition"
+    );
+    assert!(
+        holding.has_event(&original_state.id).await,
+        "deleted state must be moved to holding"
+    );
+    let announcement_meta = holding.metadata_for_event(&announcement.id).await;
+    assert!(
+        announcement_meta.iter().any(|event| metadata_has_tag(
+            event,
+            "holding-source",
+            Some("nip09")
+        )),
+        "announcement holding metadata must record nip09 source"
+    );
+    let archive_rel = metadata_archive_relative_path(&announcement_meta)
+        .expect("announcement metadata must include git archive path");
+    let archive_abs = relay.git_data_path().join(".archive").join(archive_rel);
+    assert!(
+        archive_abs.exists(),
+        "git archive artifact must exist for no-active-state transition"
+    );
+
+    let temp_dir = tempfile::tempdir().expect("create recovery repo");
+    let recovery_commit =
+        create_test_repo_with_commit(temp_dir.path(), CommitVariant::SecondCommit)
+            .expect("create recovery commit");
+    let recovery_state = client
+        .event_builder(Kind::RepoState, "")
+        .tag(Tag::identifier(&repo_id))
+        .tag(Tag::custom(
+            "refs/heads/main",
+            vec![recovery_commit.clone()],
+        ))
+        .tag(Tag::custom(
+            "HEAD",
+            vec!["ref: refs/heads/main".to_string()],
+        ))
+        .build(client.keys())
+        .expect("build recovery state");
+
+    client
+        .send_event_and_note_purgatory(recovery_state.clone())
+        .await
+        .expect("send recovery state to purgatory");
+    assert!(
+        !client
+            .is_event_on_relay(recovery_state.id)
+            .await
+            .expect("query recovery state before git push"),
+        "new state must wait in purgatory until matching git data arrives"
+    );
+
+    let npub = client.public_key().to_bech32().expect("npub");
+    push_to_relay(temp_dir.path(), &relay.domain(), &npub, &repo_id)
+        .expect("push recovery git data");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    assert!(
+        client
+            .is_event_on_relay(announcement.id)
+            .await
+            .expect("query announcement after recovery promotion"),
+        "announcement should be promoted from purgatory after new matching state+git data arrive"
+    );
+    assert!(
+        client
+            .is_event_on_relay(recovery_state.id)
+            .await
+            .expect("query recovery state after promotion"),
+        "new matching state should be promoted after git data arrives"
+    );
+    assert!(
+        !client
+            .is_event_on_relay(original_state.id)
+            .await
+            .expect("query deleted original state after recovery"),
+        "tombstoned original state must not be restored during recovery"
+    );
+    let refs_after_recovery = list_repo_refs(&owner_repo);
+    assert!(
+        refs_after_recovery.contains("refs/heads/main"),
+        "main ref should be restored from the new valid state"
     );
 
     relay.stop().await;

@@ -486,37 +486,8 @@ impl DeletionPolicy {
                     }
                 }
                 None => {
-                    let refs = match git::list_refs(&target_repo_path) {
-                        Ok(refs) => refs,
-                        Err(e) => {
-                            tracing::warn!(
-                                identifier = %identifier,
-                                owner = %owner_hex,
-                                repo = %target_repo_path.display(),
-                                error = %e,
-                                "Failed to list refs for no-active-state cleanup"
-                            );
-                            continue;
-                        }
-                    };
-
-                    let mut deleted_refs = 0usize;
-                    for (ref_name, _) in refs {
-                        if (ref_name.starts_with("refs/heads/")
-                            || ref_name.starts_with("refs/tags/"))
-                            && git::delete_ref(&target_repo_path, &ref_name).is_ok()
-                        {
-                            deleted_refs += 1;
-                        }
-                    }
-
-                    tracing::info!(
-                        identifier = %identifier,
-                        owner = %owner_hex,
-                        repo = %target_repo_path.display(),
-                        deleted_refs,
-                        "No active authorized state remains; cleared managed refs"
-                    );
+                    self.transition_announcement_scope_to_purgatory(announcement, Timestamp::now())
+                        .await;
                 }
             }
         }

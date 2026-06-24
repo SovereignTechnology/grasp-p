@@ -1,8 +1,134 @@
-use nostr_relay_builder::prelude::Event;
+use std::collections::HashSet;
+use std::process::Command;
+
+use nostr_relay_builder::prelude::{Event, Kind, Timestamp};
 
 use super::policy::DeletionPolicy;
+use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::lifecycle::DeletionSource;
 
 impl DeletionPolicy {
+    /// Move a served announcement scope out of the main DB and back into
+    /// purgatory when deleting state leaves that scope without any valid active
+    /// 30618. This preserves the served-state/git-refs invariant: the stale
+    /// announcement is not served, its current git data is archived using the
+    /// normal announcement deletion path, the live bare repository is replaced
+    /// with an empty purgatory repo, and future promotion must arrive through the
+    /// standard state+git purgatory pipeline.
+    pub(super) async fn transition_announcement_scope_to_purgatory(
+        &self,
+        announcement: &RepositoryAnnouncement,
+        deleted_at: Timestamp,
+    ) {
+        let owner = announcement.event.pubkey;
+        let identifier = announcement.identifier.clone();
+        let coordinate = format!(
+            "{}:{}:{}",
+            Kind::GitRepoAnnouncement.as_u16(),
+            owner.to_hex(),
+            identifier
+        );
+        let repo_path = self.ctx.git_data_path.join(announcement.repo_path());
+        let relays: HashSet<String> = announcement.relays.iter().cloned().collect();
+
+        self.cascade_delete_announcement(&owner, &coordinate, deleted_at, DeletionSource::Nip09)
+            .await;
+
+        match self.ctx.database.event_by_id(&announcement.event.id).await {
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    owner = %owner.to_hex(),
+                    identifier = %identifier,
+                    event_id = %announcement.event.id.to_hex(),
+                    "No-active-state transition left announcement in main DB; preserving live repository"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    owner = %owner.to_hex(),
+                    identifier = %identifier,
+                    event_id = %announcement.event.id.to_hex(),
+                    error = %e,
+                    "No-active-state transition could not verify announcement deletion"
+                );
+                return;
+            }
+        }
+
+        if let Err(e) = Self::replace_live_repo_with_empty_purgatory_repo(&repo_path) {
+            tracing::warn!(
+                owner = %owner.to_hex(),
+                identifier = %identifier,
+                repo = %repo_path.display(),
+                error = %e,
+                "No-active-state transition could not create empty purgatory repository"
+            );
+            return;
+        }
+
+        self.ctx.purgatory.add_announcement(
+            announcement.event.clone(),
+            identifier.clone(),
+            owner,
+            repo_path,
+            relays,
+        );
+
+        tracing::info!(
+            owner = %owner.to_hex(),
+            identifier = %identifier,
+            "No active authorized state remains; moved announcement scope to purgatory"
+        );
+    }
+
+    fn replace_live_repo_with_empty_purgatory_repo(
+        repo_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if repo_path.exists() {
+            std::fs::remove_dir_all(repo_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to remove live bare repository {}: {}",
+                    repo_path.display(),
+                    e
+                )
+            })?;
+        }
+
+        let parent = repo_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid repository path {}", repo_path.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create repository parent {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+
+        let output = Command::new("git")
+            .args([
+                "init",
+                "--bare",
+                repo_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("non-utf8 repository path {}", repo_path.display())
+                })?,
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to execute git init: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git init failed for {}: {}",
+                repo_path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Remove any purgatory entries targeted by this deletion event.
     ///
     /// Handles both reference styles from NIP-09:
