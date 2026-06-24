@@ -114,60 +114,50 @@ data during the retention window.
   - Use case: Confirmed malware requiring immediate permanent deletion
   - Mechanism: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
   - Logged for audit trail
-- **Unified maintenance cleanup (migration repair + fs/db reconcile):**
-  - Mechanism: `ngit-grasp maintenance cleanup`
-  - Dry-run by default; add `--execute` for safe repair actions
-  - Destructive actions are opt-in:
-    - `--prune-orphans` deletes non-empty orphan git dirs
-    - `--prune-missing-git` deletes unresolved announcement/state scopes with missing git data
-    - optional `--prune-after <duration>` gates destructive actions by age
+- **Legacy empty-repository cleanup:**
+  - Mechanism: `ngit-grasp cleanup-empty-repos`
+  - Removes empty git repository directories that no longer have useful backing
+    data.
+  - This is intentionally narrow. A fuller maintenance cleanup command is a
+    planned replacement, not part of the current deletion cascade.
 
 ### Maintenance Cleanup Command (safe vs destructive)
 
-`ngit-grasp maintenance cleanup` runs three ordered passes:
+`ngit-grasp maintenance cleanup` is planned as the replacement for the narrow
+legacy cleanup command. Its intended role is a full repository integrity sweep,
+not reuse of the live NIP-09 deletion-cascade planner.
 
-1. `cascade-reconcile` — remove orphaned main-DB events that are no longer accepted through any surviving repository/reference path (includes legacy LMDB drift repair).
-2. `state-realign` — re-apply authorized 30618 state to git refs where the git objects are available.
-3. `repo-fs-reconcile` — reconcile filesystem and DB repository layout (includes prior `cleanup-empty-repos` logic).
+The command should analyze the full relay/git data set and compute the state the
+relay should keep:
 
-The command prints per-pass counters and samples, including explicit degraded cases:
+1. Start from accepted repository announcements.
+2. Recursively mark repository-related events that remain valid through accepted
+   references.
+3. Independently retain GRASP-06 PR and PR-update events only when their backing
+   git data exists and is consistent.
+4. Treat unmarked repository-related events as cleanup candidates.
+5. Reconcile repository git directories, 30618 state events, PR git data, and
+   PR/PR-update events so served nostr state matches filesystem git data.
 
-> `valid 30618 exists but git data missing`
-
-Those degraded cases are **reported** by default and under `--execute`; they are
-only deleted when `--prune-missing-git` is supplied (and age-gated when
-`--prune-after` is set).
-
-| Invocation | Mutations allowed |
-|---|---|
-| `maintenance cleanup` | none (dry-run only) |
-| `maintenance cleanup --execute` | safe repairs only (cascade orphan cleanup, state realign, empty orphan dir removal) |
-| `maintenance cleanup --execute --prune-orphans` | above + delete non-empty orphan repos |
-| `maintenance cleanup --execute --prune-missing-git` | above + delete unresolved missing-git announcement/state scopes |
-| `maintenance cleanup --execute --prune-orphans --prune-missing-git --prune-after 7d` | same destructive actions, only when older than retention threshold |
+The command should be dry-run by default. Mutations should require explicit
+`--execute`, with destructive pruning of non-empty git data and unresolved
+missing-git scopes gated by separate opt-in flags and optional age thresholds.
+Reports should include candidate event deletions, orphan git directories,
+degraded state events, and PR/git mismatches before any destructive cleanup.
 
 ### Migration from `cleanup-empty-repos`
 
-`cleanup-empty-repos` is retained as a compatibility wrapper but now routes
-through the shared maintenance engine internals.
+`cleanup-empty-repos` remains the current legacy command. It should not be
+treated as a general database/git-data repair mechanism, and it should not grow
+ad hoc cascade-reconciliation behavior.
 
-Recommended operator migration:
+The intended migration is to introduce `ngit-grasp maintenance cleanup` in a
+separate change as the operator-facing replacement. That command should first
+ship as a read-only analyzer, then add explicit `--execute` mutations once the
+full-state sweep reports and invariants are well covered. After the replacement
+is proven, `cleanup-empty-repos` can be retained as a compatibility alias or
+deprecated in favor of the maintenance command.
 
-```text
-# 1) inspect first
-ngit-grasp maintenance cleanup --relay-data-path /var/lib/ngit-grasp/relay \
-                               --git-data-path   /var/lib/ngit-grasp/git
-
-# 2) apply safe repairs
-ngit-grasp maintenance cleanup --execute --relay-data-path /var/lib/ngit-grasp/relay \
-                                         --git-data-path   /var/lib/ngit-grasp/git
-
-# 3) optional destructive pruning after retention window
-ngit-grasp maintenance cleanup --execute --prune-orphans --prune-missing-git \
-                               --prune-after 7d \
-                               --relay-data-path /var/lib/ngit-grasp/relay \
-                               --git-data-path   /var/lib/ngit-grasp/git
-```
 - **Blacklist restoration policy:** optional startup auto-restore
   - Controlled by `NGIT_BLACKLIST_AUTO_RESTORE` (default `false`)
   - Restores only `holding-source=blacklist` scopes that are now unblacklisted
