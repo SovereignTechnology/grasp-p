@@ -18,5 +18,3 @@ pub use startup::{
     BlacklistParityStats, BlacklistRestoreStats, StartupReconciliationStats, WhitelistParityStats,
     WhitelistRestoreStats,
 };
-
-pub use cascade::{plan_cascade_retention_for_deleted_announcements, CascadeRetentionPlan};

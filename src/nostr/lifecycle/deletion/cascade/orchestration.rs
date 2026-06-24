@@ -30,11 +30,11 @@ struct ParsedAddressRef {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CascadeRetentionPlan {
-    pub kept_event_ids: HashSet<EventId>,
-    pub orphan_event_ids: HashSet<EventId>,
-    pub component_nodes: usize,
-    pub component_edges: usize,
+struct CascadeRetentionPlan {
+    kept_event_ids: HashSet<EventId>,
+    orphan_event_ids: HashSet<EventId>,
+    component_nodes: usize,
+    component_edges: usize,
 }
 
 #[derive(Debug, Default)]
@@ -416,7 +416,7 @@ impl DeletionPolicy {
     }
 }
 
-pub async fn plan_cascade_retention_for_deleted_announcements(
+async fn plan_cascade_retention_for_deleted_announcements(
     database: &SharedDatabase,
     deleted_announcements: &[Event],
     domain: &str,

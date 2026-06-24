@@ -2,7 +2,7 @@ use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -35,25 +35,10 @@ enum Cli {
     /// Stop the relay service before running with --execute.
     CleanupEmptyRepos(cleanup_empty_repos::CleanupArgs),
 
-    /// Unified maintenance operations for repository/event consistency.
-    Maintenance(MaintenanceArgs),
-
     /// Permanently eject deleted repository data from holding/archive stores.
     ///
     /// This is an operator/admin maintenance command and is idempotent.
     HoldingEject(nostr::lifecycle::HoldingEjectArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct MaintenanceArgs {
-    #[command(subcommand)]
-    command: MaintenanceCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum MaintenanceCommand {
-    /// Consolidated cleanup pipeline (dry-run by default).
-    Cleanup(cleanup_empty_repos::MaintenanceCleanupArgs),
 }
 
 #[tokio::main]
@@ -65,13 +50,7 @@ async fn main() -> Result<()> {
     // If not, prepend the implicit "serve" subcommand so that clap routes to Cli::Serve
     // and all relay flags are parsed normally (preserving backward compatibility).
     let mut args: Vec<String> = std::env::args().collect();
-    let known_subcommands = [
-        "serve",
-        "cleanup-empty-repos",
-        "maintenance",
-        "holding-eject",
-        "help",
-    ];
+    let known_subcommands = ["serve", "cleanup-empty-repos", "holding-eject", "help"];
     let has_subcommand = args.get(1).is_some_and(|a| {
         known_subcommands.contains(&a.as_str())
             || matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")
@@ -82,11 +61,6 @@ async fn main() -> Result<()> {
 
     match Cli::parse_from(args) {
         Cli::CleanupEmptyRepos(cleanup_args) => cleanup_empty_repos::run(&cleanup_args).await,
-        Cli::Maintenance(args) => match args.command {
-            MaintenanceCommand::Cleanup(cleanup_args) => {
-                cleanup_empty_repos::run_maintenance_cleanup(&cleanup_args).await
-            }
-        },
         Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
