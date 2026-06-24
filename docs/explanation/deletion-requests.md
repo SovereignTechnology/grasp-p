@@ -28,9 +28,9 @@ relay policy code:
 - main DB uses `process_nip09(false)` and `process_nip62(false)`
   (`src/nostr/builder.rs`)
 - tombstones DB uses `process_nip09(false)` and `process_nip62(false)`
-  (`src/nostr/tombstones.rs`)
+  (`src/nostr/lifecycle/tombstones.rs`)
 - holding DB uses `process_nip09(false)` and `process_nip62(false)`
-  (`src/nostr/holding.rs`)
+  (`src/nostr/lifecycle/holding.rs`)
 
 This keeps deletion behavior auditable and prevents the storage backends from
 silently applying deletion semantics outside ngit-grasp policy code.
@@ -90,7 +90,7 @@ The deletion system uses three relay databases plus archive filesystem storage:
 ┌─────────────────────────────────────────────────────────┐
 │           Archive Filesystem                            │
 │    .archive/<npub>/<identifier>-<timestamp>.tar.gz     │
-│    + metadata.json                                     │
+│    Metadata is stored as holding DB events/tags         │
 │    Retention: configurable (default 90 days)           │
 └─────────────────────────────────────────────────────────┘
                          ↓ expiry
@@ -189,27 +189,39 @@ deprecated in favor of the maintenance command.
    - `e` targets must be authored by deleter (cross-author delete rejected)
    - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
-3. Recursively discover the accepted-reference component affected by the target
-   announcement
+3. Record deletion tombstone so re-submission is gated
    ↓
-4. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+4. Process targets:
+   - `a` tag targeting a kind-30617 announcement coordinate:
+     recursively discover the accepted-reference component affected by the
+     announcement deletion
+   - `e` tag targeting an active kind-30617/30618 replaceable event:
+     delete the targeted event and attempt rollback from replaceable history;
+     this path does not run graph cascade
+   - other valid `e`/`a` targets: delete the targeted event/coordinate without
+     announcement graph cascade
    ↓
-5. Move events to holding database:
-   - Announcement
+5. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+   when deleting a repository announcement with live git data
+   ↓
+6. Move deleted events to holding database:
+   - Targeted events
+   - Repository announcements, when announcement deletion is involved
    - All main-DB events that lose their accepted-reference path after cascade
-     reevaluation
+     reevaluation, for cascade paths
    - Deletion metadata for retention/cleanup/recovery
    ↓
-6. Delete events from main database
+7. Delete events from main database
    ↓
-7. Record deletion tombstone so re-submission is gated
+8. Remove the live git repository when the owner+identifier announcement scope
+   is no longer served
    ↓
-8. Events no longer served in queries
+9. Deleted/tombstoned targets no longer serve in queries
    ↓
-9. Background task (daily):
-   - Check holding database for expired entries
-   - Delete events older than retention period
-   - Delete corresponding archive files
+10. Background task (daily):
+    - Check holding database for expired entries
+    - Delete events older than retention period
+    - Delete corresponding archive files
 ```
 
 Deletion gate checks tombstones before kind-specific admission and rejects:
@@ -364,13 +376,14 @@ This architecture is covered by two integration-test layers:
 - `tests/replaceable_history.rs` verifies the durable history substrate:
   superseded 30617/30618 payloads are captured, queryable by coordinate/cutoff,
   survive LMDB restart, and do not change normal serving semantics.
-- `tests/nip09_state_cascade.rs` should verify deletion behavior that consumes that
+- `tests/nip09_state_cascade.rs` verifies deletion behavior that consumes that
   substrate: active 30618 `e` deletion restores the previous state event and
-  realigns refs, active 30617 `e` deletion restores the previous announcement,
-  coordinate deletion cutoff semantics do not incorrectly resurrect history, and
-  no-active-state behavior follows the purgatory invariant below.
+  realigns refs, active 30617 `e` deletion restores the previous announcement
+  when history exists, coordinate deletion cutoff semantics do not incorrectly
+  resurrect history, and no-active-state behavior follows the purgatory
+  invariant below.
 
-### Active state rollback and git ref restoration
+### Active replaceable rollback and git ref restoration
 
 When a kind-5 deletion targets the active repository state (`30618`) by `e` tag,
 ngit-grasp must either restore a valid active state or stop serving the affected
@@ -393,6 +406,21 @@ repository announcement scope:
    the newest authorized active state per announcement owner, finds a repository
    copy containing the referenced objects, and runs the normal state-processing
    path to update/delete branch and tag refs in the served bare repositories.
+
+When a kind-5 deletion targets the active repository announcement (`30617`) by
+`e` tag, ngit-grasp similarly looks for the latest superseded announcement in
+replaceable history and restores it when present. This `e`-tag rollback path is
+not the same as announcement-coordinate cascade deletion:
+
+- If a history candidate exists, the previous announcement is restored to the
+  main DB.
+- If no history candidate exists, no cascade graph is computed from the deleted
+  announcement. The targeted announcement is moved to holding and removed from
+  the main DB, and the live bare repository is removed when that owner+identifier
+  announcement scope is no longer served.
+- Dependent event graph cascade currently belongs to announcement-coordinate
+  deletion (`a` tag), targeted NIP-62 vanish over announcements, and
+  operator-driven blacklist/whitelist deletion paths.
 
 If another authorized maintainer still has a valid active state for the
 identifier, the surviving state remains the active source for git ref alignment;
@@ -441,14 +469,13 @@ Operators need ability to **force-delete** items from holding area before retent
 **Mechanism (implemented):**
 - Admin CLI command: `ngit-grasp holding-eject --owner <npub|hex> --identifier <id>`
 - Immediately delete from holding DB and archive filesystem
-- Log operation for audit trail
+- Emits command output with deletion counts
 - Metric: `ngit_manual_ejections_total`
 
-**Safety Considerations:**
+**Current CLI limitations:**
 - Manual ejection is permanent (no undo)
-- Should require confirmation for safety
-- Should log npub, identifier, reason, operator
-- Consider retention policy override vs immediate deletion
+- It intentionally has no confirmation prompt, reason field, or operator field in
+  the current CLI; richer operator UX is planned separately.
 
 ## Blacklist Deletion Integration
 
@@ -521,10 +548,15 @@ restores holding scopes tagged `holding-source=whitelist` when they now match
 
 ## Cascade Deletion Strategy
 
-When a repository announcement is deleted (NIP-09, targeted NIP-62 vanish,
-blacklist, or whitelist reconciliation), ngit-grasp cascade-deletes the main-DB
-events that lose their accepted-reference path after that announcement is
-removed.
+When a repository announcement is deleted through a cascade-capable path
+(NIP-09 `a`-coordinate deletion of a kind-30617 announcement, targeted NIP-62
+vanish over the author's announcements, blacklist deletion, or whitelist
+reconciliation), ngit-grasp cascade-deletes the main-DB events that lose their
+accepted-reference path after that announcement is removed.
+
+NIP-09 `e`-tag deletion of a kind-30617 announcement is narrower: it deletes the
+targeted announcement event and may restore a previous announcement from
+replaceable history, but it does not compute the generic announcement cascade.
 
 ### Basic Rules
 
