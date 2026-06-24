@@ -698,14 +698,13 @@ pub fn build_deletion(
 
 /// Build a kind-62 NIP-62 request-to-vanish signed by `client`.
 ///
-/// The relay validates vanish requests with
-/// `nip62::is_valid_vanish_request_for_relay(tags, None)`, so a request is
-/// only *actioned* (the author's served events removed and future events blocked) when
-/// it carries a `["relay", "ALL_RELAYS"]` tag. A request that names a specific
-/// relay URL never matches `None` and is therefore accepted-but-ignored.
+/// The relay actions requests that target `ALL_RELAYS` or one of the relay URL
+/// candidates derived from `NGIT_DOMAIN` (`wss://<domain>` and `ws://<domain>`
+/// when the domain is configured without a scheme). Requests naming another
+/// relay URL are accepted but not actioned.
 ///
-/// When `relay_target` is `None` the request targets `ALL_RELAYS` (actioned);
-/// otherwise it targets the supplied relay URL string (stored, not actioned).
+/// When `relay_target` is `None` the request targets `ALL_RELAYS`; otherwise it
+/// targets the supplied relay URL string.
 pub fn build_vanish(client: &AuditClient, relay_target: Option<&str>) -> Event {
     let relay_value = relay_target.unwrap_or("ALL_RELAYS").to_string();
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nostr_relay_builder::prelude::{
-    nip62, Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag, WritePolicyResult,
+    nip62, Alphabet, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, WritePolicyResult,
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
@@ -88,11 +88,12 @@ impl DeletionService {
             return WritePolicyResult::Accept;
         }
 
-        // Only honour requests that target this relay (or all relays). We do not
-        // configure a relay_url on the database, matching the historical
-        // behaviour where only ALL_RELAYS requests were actioned; but we accept
-        // (store) any well-formed kind-62 so clients get an OK.
-        let targets_relay = nip62::is_valid_vanish_request_for_relay(event.tags.as_slice(), None);
+        // Only honour requests that target this relay (or all relays). `domain`
+        // is configured as an authority for GRASP matching, so derive both
+        // `wss://` and `ws://` relay URL candidates when no scheme is present.
+        // We still accept (store) well-formed kind-62 requests that target other
+        // relays so clients get an OK for their event.
+        let targets_relay = self.vanish_targets_this_relay(event);
 
         if !targets_relay {
             tracing::debug!(
@@ -130,6 +131,49 @@ impl DeletionService {
 
     pub(crate) fn admission_hooks(&self) -> DeletionAdmissionHooks<'_> {
         DeletionAdmissionHooks { deletion: self }
+    }
+
+    fn vanish_targets_this_relay(&self, event: &Event) -> bool {
+        let relay_urls = Self::relay_url_candidates(self.ctx.domain());
+
+        if relay_urls.is_empty() {
+            // Fall back to historical ALL_RELAYS-only matching when the relay's
+            // configured domain cannot be converted into a NIP-62 RelayUrl.
+            return nip62::is_valid_vanish_request_for_relay(event.tags.as_slice(), None);
+        }
+
+        relay_urls.iter().any(|relay_url| {
+            nip62::is_valid_vanish_request_for_relay(event.tags.as_slice(), Some(relay_url))
+        })
+    }
+
+    fn relay_url_candidates(domain: &str) -> Vec<RelayUrl> {
+        let domain = domain.trim().trim_end_matches('/');
+        if domain.is_empty() {
+            return Vec::new();
+        }
+
+        let candidate_strings = if domain.contains("://") {
+            vec![domain.to_owned()]
+        } else {
+            vec![format!("wss://{domain}"), format!("ws://{domain}")]
+        };
+
+        let mut candidates = Vec::new();
+        for candidate in candidate_strings {
+            match RelayUrl::parse(&candidate) {
+                Ok(relay_url) if !candidates.contains(&relay_url) => candidates.push(relay_url),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    domain = %domain,
+                    candidate = %candidate,
+                    error = %e,
+                    "Unable to derive NIP-62 relay URL candidate from configured domain"
+                ),
+            }
+        }
+
+        candidates
     }
 
     /// Runtime de-list parity path for already-served repositories.

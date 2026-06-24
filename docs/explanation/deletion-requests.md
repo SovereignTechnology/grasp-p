@@ -240,6 +240,10 @@ Deletion gate checks tombstones before kind-specific admission and rejects:
 1. Kind 62 request-to-vanish arrives
    ↓
 2. Validate relay targeting with NIP-62 rules:
+   - `ALL_RELAYS` requests are actioned
+   - relay URL targets matching this relay are actioned (`NGIT_DOMAIN` is
+     interpreted as `wss://<domain>` and `ws://<domain>` when configured without
+     a scheme)
    - non-targeting requests are accepted/stored but not actioned
    ↓
 3. Record vanish tombstone so future events from that pubkey are gated

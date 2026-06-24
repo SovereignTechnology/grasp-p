@@ -21,8 +21,9 @@
 //! standard-conformance baseline. If a change you are testing diverges from
 //! what a stock NIP-62 relay would do, it does NOT belong in this file.
 //!
-//! - a kind-62 targeting this relay (via `["relay", "ALL_RELAYS"]`) is accepted,
-//!   removes the author's served events, and lays down a vanish tombstone;
+//! - a kind-62 targeting this relay (via `["relay", "ALL_RELAYS"]` or this
+//!   relay's URL) is accepted, removes the author's served events, and lays
+//!   down a vanish tombstone;
 //! - once a pubkey has vanished, any *new* event it submits is rejected by the
 //!   deletion/vanish gate with a message mentioning the vanish;
 //! - a vanish request is author-bound: author B's vanish must never delete or
@@ -280,13 +281,65 @@ async fn vanish_does_not_affect_other_authors() {
     );
 }
 
-/// 4. A vanish request that names a DIFFERENT relay (not this one) is accepted
+/// 4. A vanish request that names this relay's URL is accepted and actioned.
+#[tokio::test]
+async fn vanish_targeting_this_relay_url_is_actioned() {
+    let relay = TestRelay::start().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let (announcement, repo_id) = publish_served_repo(&client, "vanish-this-relay-url").await;
+    let issue = client
+        .create_issue(&announcement, "Issue to vanish", "bye", vec![])
+        .expect("build issue");
+    let issue_id = issue.id;
+    client
+        .send_event(issue)
+        .await
+        .expect("relay should accept issue");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        client
+            .is_event_on_relay(issue_id)
+            .await
+            .expect("query issue before vanish"),
+        "issue should be served before the targeted vanish request"
+    );
+
+    let vanish = build_vanish(&client, Some(relay.url()));
+    client
+        .send_event(vanish)
+        .await
+        .expect("relay should accept a vanish request that targets it by URL");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let issue_served = client
+        .is_event_on_relay(issue_id)
+        .await
+        .expect("query issue after targeted vanish");
+    let announcement_served_by_coord =
+        announcement_served_by_coordinate(&client, &announcement, &repo_id).await;
+
+    relay.stop().await;
+
+    assert!(
+        !issue_served,
+        "issue {} should be deleted after a vanish targeting this relay URL",
+        issue_id
+    );
+    assert!(
+        !announcement_served_by_coord,
+        "announcement {} should be deleted after a vanish targeting this relay URL",
+        announcement.id
+    );
+}
+
+/// 5. A vanish request that names a DIFFERENT relay (not this one) is accepted
 ///    but NOT actioned: the author's events remain served and the author may
 ///    keep publishing.
-///
-/// The relay validates vanish requests with
-/// `is_valid_vanish_request_for_relay(tags, None)`, so a request naming a
-/// specific relay URL never matches and is stored-without-action.
 #[tokio::test]
 async fn vanish_targeting_other_relay_is_not_actioned() {
     let relay = TestRelay::start().await;
@@ -367,7 +420,7 @@ async fn vanish_targeting_other_relay_is_not_actioned() {
     );
 }
 
-/// 5. The kind-62 vanish request event itself is accepted (the author signs
+/// 6. The kind-62 vanish request event itself is accepted (the author signs
 ///    their own vanish, so authorship is inherent and no target is required).
 #[tokio::test]
 async fn vanish_request_event_is_accepted() {
