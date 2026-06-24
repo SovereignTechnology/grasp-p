@@ -328,21 +328,22 @@ The relay archives superseded 30617/30618 versions on write and uses that
 history at deletion time to pick rollback candidates for active `e`-target
 deletions (announcement + state).
 
-This is covered by two integration-test layers:
+This architecture is covered by two integration-test layers:
 
 - `tests/replaceable_history.rs` verifies the durable history substrate:
   superseded 30617/30618 payloads are captured, queryable by coordinate/cutoff,
   survive LMDB restart, and do not change normal serving semantics.
-- `tests/nip09_state_cascade.rs` verifies deletion behavior that consumes that
+- `tests/nip09_state_cascade.rs` should verify deletion behavior that consumes that
   substrate: active 30618 `e` deletion restores the previous state event and
   realigns refs, active 30617 `e` deletion restores the previous announcement,
   coordinate deletion cutoff semantics do not incorrectly resurrect history, and
-  the no-history path clears managed refs.
+  no-active-state behavior follows the purgatory invariant below.
 
 ### Active state rollback and git ref restoration
 
 When a kind-5 deletion targets the active repository state (`30618`) by `e` tag,
-ngit-grasp restores both the served nostr state and the git refs derived from it:
+ngit-grasp must either restore a valid active state or stop serving the affected
+repository announcement scope:
 
 1. Before destructive work, deletion policy builds rollback plans only for
    `e`-targeted 30617/30618 events that are still the active version for their
@@ -362,11 +363,26 @@ ngit-grasp restores both the served nostr state and the git refs derived from it
    copy containing the referenced objects, and runs the normal state-processing
    path to update/delete branch and tag refs in the served bare repositories.
 
-If there is no valid rollback candidate, the relay does not keep stale git refs.
-The realignment pass detects that no active authorized state remains and deletes
-managed `refs/heads/*` and `refs/tags/*` from the served repository, preserving
-the invariant that served nostr state matches git refs the relay can actually
-serve.
+If another authorized maintainer still has a valid active state for the
+identifier, the surviving state remains the active source for git ref alignment;
+the deleted maintainer's state rollback must not disturb that maintainer's served
+announcement/state.
+
+If no valid active state remains for the affected announcement scope, the relay
+must not keep serving an announcement with empty/stale git refs. Instead it must:
+
+1. remove the served announcement scope from the main DB;
+2. archive/remove the live bare repository using the same holding/archive safety
+   semantics as announcement deletion;
+3. park the announcement scope in purgatory, so it is not served while git/state
+   alignment is unresolved;
+4. wait for a new valid authorized state event and matching git data; and
+5. promote/recover the scope only through the normal purgatory promotion path,
+   restoring any holding/archive data needed for the same owner+identifier.
+
+This is stricter than merely clearing `refs/heads/*` and `refs/tags/*`: a
+repository with no valid active state should leave the served set until a
+promotable state re-establishes the core consistency invariant.
 
 ### Blacklist Recovery
 
