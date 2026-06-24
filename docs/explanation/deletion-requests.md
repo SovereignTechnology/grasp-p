@@ -502,11 +502,11 @@ Deletion requests, vanish requests, holding metadata, and history metadata do no
 act as recursive graph frontiers. They are lifecycle/control records, not normal
 repository content anchors.
 
-PR and PR-update events are retained only when doing so preserves git-data
-availability. Generic graph reachability is not enough on its own: a PR or
-PR-update must still reference a kept repository announcement, or be
-independently valid through the GRASP-06 `/prs/` flow. Otherwise it is removed
-from the retained set and retention is recalculated.
+PR and PR-update events have an additional invariant: served PR data must not
+outlive the git data needed to broadcast it. Generic graph reachability may keep
+them only when they still reference a kept repository announcement, or when they
+are independently valid through the GRASP-06 `/prs/` flow. Otherwise they are
+removed from the retained set and retention is recalculated.
 
 GRASP-06 PRs are treated as their own anchored flow. They can survive repository
 announcement deletion when the `/prs/` endpoint relationship still makes the PR
