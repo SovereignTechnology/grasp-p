@@ -2,21 +2,6 @@
 
 A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized via Signed-Nostr Proofs) implementation in Rust.
 
-## What's New 🎉
-
-**Full GRASP-02 Implementation Complete!**
-
-ngit-grasp now features a sophisticated proactive sync system that automatically discovers relays, syncs events using NIP-77 negentropy, and hunts for missing git data across clone URLs. Key highlights:
-
-- ✨ **NIP-77 Negentropy**: Efficient set reconciliation with automatic REQ+EOSE fallback
-- ✨ **Intelligent Purgatory**: Auto-fetches missing git data from clone URLs (500ms for synced events, 3min for user pushes)
-- ✨ **Multi-Maintainer First-Class**: Pushed git data automatically syncs to all maintainer repositories
-- ✨ **Smart Throttling**: Respectful rate limiting (5 concurrent, 30/min per domain) with exponential backoff
-- ✨ **Live & Historic Sync**: Real-time event streaming plus daily full reconciliation
-- ✨ **Connection Health**: Exponential backoff, rate limit detection, dead relay handling
-
-See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) and [Purgatory Git Data Sync](docs/explanation/grasp-02-proactive-sync-purgatory-git-data.md) for details.
-
 ## Overview
 
 `ngit-grasp` is a Rust-based implementation of the GRASP protocol, which enables decentralized Git repository hosting with Nostr-based authorization. This implementation combines:
