@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Implemented repository lifecycle handling for removals caused by NIP-09 deletion requests, NIP-62 requests-to-vanish, repository blacklist matches, and removal from whitelist. Removed repository scopes now archive git data and move data through holding/recovery flows with a 90-day default retention period, cascade-delete related events that lose their accepted-reference path, roll back deleted state-event versions where possible, and keep served nostr state aligned with git refs. This is an enabler for moderation features.
+
 ### Changed
 
 - Upgraded dependencies: rust-nostr to `0.45.0-alpha.1` from a patched version to enable publishing ngit-grasp to crates.io, a Rust toolchain bump via Nix flake upgrade, and other Rust dependencies.
-- Added `maintenance cleanup` command as the unified maintenance pipeline (dry-run default, `--execute` for safe repairs, destructive pruning explicitly gated by `--prune-orphans` / `--prune-missing-git` and optional `--prune-after`). `cleanup-empty-repos` remains for compatibility and now routes through shared maintenance internals.
 
 ## [1.1.0] - 2026-05-22
 
