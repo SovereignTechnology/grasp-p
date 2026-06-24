@@ -34,6 +34,11 @@ enum Cli {
     /// Runs in dry-run mode by default. Pass --execute to make changes.
     /// Stop the relay service before running with --execute.
     CleanupEmptyRepos(cleanup_empty_repos::CleanupArgs),
+
+    /// Permanently eject deleted repository data from holding/archive stores.
+    ///
+    /// This is an operator/admin maintenance command and is idempotent.
+    HoldingEject(nostr::lifecycle::HoldingEjectArgs),
 }
 
 #[tokio::main]
@@ -45,7 +50,7 @@ async fn main() -> Result<()> {
     // If not, prepend the implicit "serve" subcommand so that clap routes to Cli::Serve
     // and all relay flags are parsed normally (preserving backward compatibility).
     let mut args: Vec<String> = std::env::args().collect();
-    let known_subcommands = ["serve", "cleanup-empty-repos", "help"];
+    let known_subcommands = ["serve", "cleanup-empty-repos", "holding-eject", "help"];
     let has_subcommand = args.get(1).is_some_and(|a| {
         known_subcommands.contains(&a.as_str())
             || matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")
@@ -56,6 +61,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse_from(args) {
         Cli::CleanupEmptyRepos(cleanup_args) => cleanup_empty_repos::run(&cleanup_args).await,
+        Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
             // Finish initialising the Config (load relay owner key if not provided).
@@ -160,9 +166,8 @@ async fn run_relay(config: Config) -> Result<()> {
         }
     }
 
-    // Create Nostr relay with NIP-34 validation
-    // Returns both the relay and database for direct queries in handlers
-    if let Ok(relay_with_db) =
+    // Create Nostr relay runtime with NIP-34 validation and shared stores.
+    if let Ok(relay_runtime) =
         nostr::builder::create_relay(&config, purgatory.clone(), repo_init_locks.clone()).await
     {
         info!(
@@ -172,9 +177,12 @@ async fn run_relay(config: Config) -> Result<()> {
 
         // Set the local relay on the write policy for purgatory notifications
         // This must be done after relay creation since the relay depends on the policy
-        relay_with_db
+        relay_runtime
             .write_policy
-            .set_local_relay(relay_with_db.relay.clone());
+            .set_local_relay(relay_runtime.relay.clone());
+
+        let deletion_runtime = relay_runtime.deletion_runtime.clone();
+        deletion_runtime.run_startup_tasks().await;
 
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling
@@ -193,9 +201,9 @@ async fn run_relay(config: Config) -> Result<()> {
         let sync_manager = SyncManager::new(
             config.sync_bootstrap_relay_url.clone(),
             config.domain.clone(),
-            relay_with_db.database.clone(),
-            relay_with_db.write_policy.clone(),
-            relay_with_db.relay.clone(),
+            relay_runtime.stores.database.clone(),
+            relay_runtime.write_policy.clone(),
+            relay_runtime.relay.clone(),
             &config,
             PathBuf::from(config.effective_git_data_path()),
             metrics.as_ref().and_then(|m| m.sync_metrics().cloned()),
@@ -269,7 +277,7 @@ async fn run_relay(config: Config) -> Result<()> {
         info!("Expired event cleanup task started (24h interval, keeps 7 days)");
 
         // Spawn audit event cleanup task (30m interval, removes events >2h old)
-        let audit_db = relay_with_db.database.clone();
+        let audit_db = relay_runtime.stores.database.clone();
         let audit_git_path = PathBuf::from(config.effective_git_data_path());
         tokio::spawn(async move {
             audit_cleanup::run_audit_cleanup_loop(audit_db, audit_git_path).await;
@@ -282,10 +290,11 @@ async fn run_relay(config: Config) -> Result<()> {
 
         let sync_ctx = Arc::new(RealSyncContext::new(
             purgatory.clone(),
-            relay_with_db.database.clone(),
+            relay_runtime.stores.database.clone(),
             PathBuf::from(config.effective_git_data_path()),
             Some(config.domain.clone()),
-            Some(relay_with_db.relay.clone()),
+            Some(relay_runtime.relay.clone()),
+            Some(relay_runtime.write_policy.clone()),
             git_naughty_list.clone(),
         ));
 
@@ -309,8 +318,11 @@ async fn run_relay(config: Config) -> Result<()> {
         // Start HTTP server with integrated relay and database
         info!("Starting HTTP server on {}", config.bind_address);
 
+        let deletion_cleanup = deletion_runtime.spawn_cleanup_task();
+
         // Wrap write_policy in Arc for sharing between HTTP server connections
-        let http_write_policy = Arc::new(relay_with_db.write_policy.clone());
+        let http_write_policy = Arc::new(relay_runtime.write_policy.clone());
+        let http_lifecycle = Arc::new(relay_runtime.lifecycle.clone());
 
         // Run server until shutdown signal, then cleanup
         #[cfg(unix)]
@@ -321,11 +333,12 @@ async fn run_relay(config: Config) -> Result<()> {
             tokio::select! {
                 result = http::run_server(
                     config,
-                    relay_with_db.relay,
-                    relay_with_db.database,
+                    relay_runtime.relay,
+                    relay_runtime.stores.database,
                     metrics,
                     purgatory,
                     http_write_policy,
+                    http_lifecycle,
                     http_rejected_index,
                     repo_init_locks,
                 ) => {
@@ -345,11 +358,12 @@ async fn run_relay(config: Config) -> Result<()> {
             tokio::select! {
                 result = http::run_server(
                     config,
-                    relay_with_db.relay,
-                    relay_with_db.database,
+                    relay_runtime.relay,
+                    relay_runtime.stores.database,
                     metrics,
                     purgatory,
                     http_write_policy,
+                    http_lifecycle,
                     http_rejected_index,
                     repo_init_locks,
                 ) => {
@@ -360,6 +374,8 @@ async fn run_relay(config: Config) -> Result<()> {
                 }
             }
         }
+
+        deletion_cleanup.shutdown().await;
 
         // Save purgatory state to disk
         let purgatory_save_path = PathBuf::from(&git_data_path).join("purgatory-state.json");

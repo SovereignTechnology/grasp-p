@@ -492,6 +492,58 @@ NGIT_REJECTED_COLD_INDEX_EXPIRY_SECS=1209600
 
 ---
 
+### Holding DB Cleanup Configuration
+
+These options control retention and cleanup cadence for deleted events archived in the holding database.
+
+#### `NGIT_HOLDING_RETENTION_SECS`
+
+**Description:** How long deleted events are retained in the holding DB before expiration cleanup removes them
+**Type:** Integer (seconds)
+**Default:** `7776000` (90 days)
+**Required:** No
+
+**Examples:**
+
+```bash
+# Default: 90 days
+NGIT_HOLDING_RETENTION_SECS=7776000
+
+# Short retention (30 days)
+NGIT_HOLDING_RETENTION_SECS=2592000
+```
+
+**Notes:**
+
+- Must be greater than 0
+- Used by both startup catch-up cleanup and periodic cleanup passes
+
+---
+
+#### `NGIT_HOLDING_CLEANUP_INTERVAL_SECS`
+
+**Description:** Interval between periodic holding DB expiration cleanup passes
+**Type:** Integer (seconds)
+**Default:** `86400` (24 hours)
+**Required:** No
+
+**Examples:**
+
+```bash
+# Default: daily cleanup
+NGIT_HOLDING_CLEANUP_INTERVAL_SECS=86400
+
+# Every 6 hours
+NGIT_HOLDING_CLEANUP_INTERVAL_SECS=21600
+```
+
+**Notes:**
+
+- Must be greater than 0
+- Smaller values clean up expired records sooner at the cost of more background work
+
+---
+
 ### GRASP-05 Archive Configuration
 
 These options enable archive/mirror/backup mode per the GRASP-05 specification.
@@ -944,6 +996,46 @@ Blacklist does **not** affect NIP-11 metadata:
 - Blacklist is transparent to clients (rejected with specific reason)
 - Operators can use blacklist without advertising curation
 
+#### `NGIT_BLACKLIST_AUTO_RESTORE`
+
+**Description:** On startup, restore repositories previously deleted by blacklist parity when they are no longer blacklisted and still within holding retention
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+**CLI:** `--blacklist-auto-restore`
+
+**Behavior:**
+
+- When `false` (default): startup does not run blacklist-source auto-restore; unblacklisted repositories in holding are restored only by existing recovery triggers (for example re-announcement).
+- When `true`: startup also scans holding metadata with `holding-source=blacklist`, deduplicates owner+identifier scopes, and attempts restore for scopes that:
+  - are still within `NGIT_HOLDING_RETENTION_SECS`, and
+  - no longer match `NGIT_REPOSITORY_BLACKLIST`.
+- Scopes that are still blacklisted are skipped (not restored).
+
+**Related startup behavior (always on when repository whitelist is enabled):**
+
+- Startup scans holding metadata with `holding-source=whitelist` and attempts restore for scopes that are within retention, now match `NGIT_REPOSITORY_WHITELIST`, and are not blacklisted.
+- Scopes still not matching `NGIT_REPOSITORY_WHITELIST` are skipped.
+
+**Startup ordering:**
+
+1. Blacklist parity delete
+2. Blacklist auto-restore (if enabled)
+3. Whitelist parity delete
+4. Whitelist restore (for scopes now matching `NGIT_REPOSITORY_WHITELIST`)
+
+This ordering keeps startup reconciliation deterministic when multiple policies interact.
+
+**Examples:**
+
+```bash
+# Enable startup auto-restore for unblacklisted repos
+NGIT_BLACKLIST_AUTO_RESTORE=true
+
+# Default behavior
+NGIT_BLACKLIST_AUTO_RESTORE=false
+```
+
 ---
 
 ### Event Blacklist
@@ -1035,6 +1127,57 @@ Event blacklist does **not** affect NIP-11 metadata:
 - No `curation` field changes (blacklist is operational, not policy)
 - Blacklist is transparent to clients (rejected with specific reason)
 - Operators can use blacklist without advertising moderation
+
+---
+
+### Deletion Requests (NIP-09)
+
+#### `NGIT_DELETION_REQUEST_DISRESPECTOR`
+
+**Description:** Ignore NIP-09 deletion requests and act as an archival server
+**Type:** Boolean
+**Default:** `false` (deletion requests are honoured)
+**Required:** No
+**CLI:** `--deletion-request-disrespector`
+
+**Behavior:**
+
+- When `false` (default):
+  - NIP-09 (kind 5) deletion requests are honoured: targeted events are
+    hard-deleted from the relay, matching purgatory entries are evicted, and a
+    persistent tombstone is recorded so re-submission of the deleted event stays
+    rejected across restarts.
+  - NIP-11 `supported_nips` includes `9` (deletion) and `62` (request to vanish).
+- When `true`:
+  - Incoming NIP-09 deletion requests are still **stored** (the client receives
+    an OK), but they are **not acted upon**. Targeted events remain fully
+    accessible. This makes the relay an archival server, preserving content and
+    preventing "left-pad" scenarios.
+  - NIP-11 `supported_nips` does **not** include `9` or `62`, so clients can
+    discover that this relay does not honour deletions.
+
+**IMPORTANT:** This setting ONLY affects NIP-09 user-initiated deletions. It does
+**NOT** prevent blacklist-triggered deletions, which are an operator moderation
+mechanism (spam/malware/abuse) that archival relays still need.
+
+**Use Cases:**
+
+- Community archival relays
+- Research / historical preservation
+- Backup / mirror relays
+
+**Examples:**
+
+```bash
+# Archival relay: preserve deleted content (disrespect NIP-09)
+NGIT_DELETION_REQUEST_DISRESPECTOR=true
+
+# Standard relay: honour deletion requests (default)
+NGIT_DELETION_REQUEST_DISRESPECTOR=false
+```
+
+See [`docs/explanation/repository-lifecycle.md`](../explanation/repository-lifecycle.md)
+for the full lifecycle design rationale.
 
 ---
 

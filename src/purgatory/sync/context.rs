@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::authorization::RepositoryData;
+use crate::git::sync::PurgatoryPromotionHooks;
+use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 
 /// Result of processing newly available git data.
 ///
@@ -192,8 +194,9 @@ use std::process::Command;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::nostr::builder::SharedDatabase;
+use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryState;
+use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use crate::sync::naughty_list::NaughtyListTracker;
 
@@ -222,6 +225,9 @@ pub struct RealSyncContext {
     /// Local relay for notifying WebSocket subscribers
     local_relay: Option<LocalRelay>,
 
+    /// Write policy used for promotion-time recovery hooks.
+    write_policy: Option<Nip34WritePolicy>,
+
     /// Naughty list tracker for git remote domains with persistent errors
     git_naughty_list: Arc<NaughtyListTracker>,
 }
@@ -235,6 +241,7 @@ impl RealSyncContext {
     /// * `git_data_path` - Base path for git repositories
     /// * `our_domain` - Our domain to exclude from clone URLs
     /// * `local_relay` - Local relay for WebSocket notifications
+    /// * `write_policy` - Write policy for promotion-time recovery hooks
     /// * `git_naughty_list` - Naughty list tracker for git remote domains
     pub fn new(
         purgatory: Arc<Purgatory>,
@@ -242,6 +249,7 @@ impl RealSyncContext {
         git_data_path: PathBuf,
         our_domain: Option<String>,
         local_relay: Option<LocalRelay>,
+        write_policy: Option<Nip34WritePolicy>,
         git_naughty_list: Arc<NaughtyListTracker>,
     ) -> Self {
         Self {
@@ -250,6 +258,7 @@ impl RealSyncContext {
             git_data_path,
             our_domain_value: our_domain,
             local_relay,
+            write_policy,
             git_naughty_list,
         }
     }
@@ -508,8 +517,17 @@ impl SyncContext for RealSyncContext {
         new_oids: &HashSet<String>,
     ) -> Result<ProcessResult> {
         // Delegate to the unified function from git::sync.
-        // Pass None for write_policy and rejected_events_index: the purgatory sync path
-        // already handles hot-cache re-processing via SyncManager::process_event_static.
+        // Pass configured deletion service for promotion-time recovery hooks.
+        // Keep git-push reprocessing disabled: the purgatory sync path already
+        // handles hot-cache re-processing via SyncManager::process_event_static.
+        let promotion_hooks = self
+            .write_policy
+            .as_ref()
+            .map(NostrPurgatoryPromotionHooks::recovery_only);
+        let promotion_hooks = promotion_hooks
+            .as_ref()
+            .map(|hooks| hooks as &dyn PurgatoryPromotionHooks);
+
         let result = crate::git::sync::process_newly_available_git_data(
             source_repo_path,
             new_oids,
@@ -517,8 +535,7 @@ impl SyncContext for RealSyncContext {
             self.local_relay.as_ref(),
             &self.purgatory,
             &self.git_data_path,
-            None,
-            None,
+            promotion_hooks,
         )
         .await?;
 

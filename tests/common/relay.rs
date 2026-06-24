@@ -16,19 +16,21 @@ use nostr_sdk::prelude::ToBech32;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
 use crate::common::port::{self, PortReservation};
 
-/// How long to wait for the spawned ngit-grasp subprocess to accept TCP
-/// connections before giving up on a single attempt.
+/// How long to wait for the spawned ngit-grasp subprocess to handle HTTP
+/// requests before giving up on a single attempt.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often to retry the TCP probe while waiting for readiness.
+/// How often to retry the HTTP probe while waiting for readiness.
 const READY_POLL: Duration = Duration::from_millis(100);
-/// Extra grace after the listener accepts before declaring the relay
-/// ready. Mirrors the existing fixture; without it the first WebSocket
-/// upgrade can race the handler wiring.
+/// Extra grace after the HTTP service responds before declaring the relay
+/// ready.
 const READY_GRACE: Duration = Duration::from_millis(100);
+/// Per-attempt timeout for the HTTP readiness probe once TCP connects.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How many fresh port reservations to attempt before giving up. The
 /// subprocess binds itself from `NGIT_BIND_ADDRESS`, so there is a
 /// microsecond-scale TOCTOU window between [`PortReservation::release`]
@@ -53,9 +55,13 @@ pub struct TestRelay {
     port: u16,
     /// Temporary directory for git repositories
     /// Kept alive for the lifetime of the relay
-    _git_data_dir: tempfile::TempDir,
+    _git_data_dir: Option<tempfile::TempDir>,
     /// Path to git data directory (for test assertions)
     git_data_path: PathBuf,
+    /// Temporary directory for relay data (LMDB side stores)
+    _relay_data_dir: Option<tempfile::TempDir>,
+    /// Path to relay data directory (for test assertions)
+    relay_data_path: PathBuf,
 }
 
 /// Options that the various `start*` constructors fan out into a single
@@ -68,6 +74,11 @@ struct RelayOptions {
     archive_all: bool,
     archive_read_only: bool,
     grasp06_enable: bool,
+    deletion_request_disrespector: bool,
+    lmdb_backend: bool,
+    repository_blacklist: Option<String>,
+    git_data_path: Option<PathBuf>,
+    relay_data_path: Option<PathBuf>,
 }
 
 impl TestRelay {
@@ -217,6 +228,80 @@ impl TestRelay {
         .await
     }
 
+    /// Start a relay in NIP-09 deletion "disrespector" (archival) mode.
+    ///
+    /// Sets `NGIT_DELETION_REQUEST_DISRESPECTOR=true`: the relay stores incoming
+    /// kind-5 deletion requests but does not act on them.
+    pub async fn start_with_deletion_disrespector() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                deletion_request_disrespector: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay with LMDB backend (persistent side DBs on a temp dir).
+    pub async fn start_with_lmdb() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay with LMDB backend + deletion disrespector mode.
+    pub async fn start_with_lmdb_deletion_disrespector() -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                deletion_request_disrespector: true,
+                lmdb_backend: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay with LMDB backend and repository blacklist.
+    pub async fn start_with_lmdb_blacklist(repository_blacklist: impl Into<String>) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                repository_blacklist: Some(repository_blacklist.into()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a relay on fresh port using pre-existing LMDB/git directories.
+    pub async fn start_with_existing_lmdb_paths(
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+        repository_blacklist: Option<String>,
+        deletion_request_disrespector: bool,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                lmdb_backend: true,
+                repository_blacklist,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                deletion_request_disrespector,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -237,6 +322,7 @@ impl TestRelay {
                 archive_all,
                 archive_read_only,
                 grasp06_enable,
+                ..RelayOptions::default()
             },
         )
         .await
@@ -292,9 +378,25 @@ impl TestRelay {
         let bind_address = format!("127.0.0.1:{}", port);
         let url = format!("ws://127.0.0.1:{}", port);
 
-        // Create temporary directory for git repositories
-        let git_data_dir =
-            tempfile::tempdir().expect("Failed to create temporary git data directory");
+        // Create temporary directories unless caller provided explicit paths.
+        let (git_data_dir, git_data_path) = if let Some(path) = options.git_data_path.clone() {
+            std::fs::create_dir_all(&path).expect("Failed to create provided git data directory");
+            (None, path)
+        } else {
+            let dir = tempfile::tempdir().expect("Failed to create temporary git data directory");
+            let path = dir.path().to_path_buf();
+            (Some(dir), path)
+        };
+
+        let (relay_data_dir, relay_data_path) = if let Some(path) = options.relay_data_path.clone()
+        {
+            std::fs::create_dir_all(&path).expect("Failed to create provided relay data directory");
+            (None, path)
+        } else {
+            let dir = tempfile::tempdir().expect("Failed to create temporary relay data directory");
+            let path = dir.path().to_path_buf();
+            (Some(dir), path)
+        };
 
         // Use the built binary directly (faster than cargo run)
         let binary_path = std::env::current_exe()
@@ -318,8 +420,8 @@ impl TestRelay {
         let mut cmd = Command::new(&binary_path);
         cmd.env("NGIT_BIND_ADDRESS", &bind_address)
             .env("NGIT_DOMAIN", &bind_address) // Set domain to match bind address
-            .env("NGIT_GIT_DATA_PATH", git_data_dir.path())
-            .env("NGIT_DATABASE_BACKEND", "memory") // Force in-memory database for isolation
+            .env("NGIT_GIT_DATA_PATH", &git_data_path)
+            .env("NGIT_RELAY_DATA_PATH", &relay_data_path)
             .env("NGIT_OWNER_NPUB", &test_npub)
             .env("NGIT_TEST", "1") // Enable test mode: fast timers (200ms batch window, 200ms purgatory sync)
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
@@ -339,6 +441,15 @@ impl TestRelay {
                     .unwrap_or(Stdio::null()),
             )
             .stderr(Stdio::inherit()); // Inherit stderr for test output
+
+        cmd.env(
+            "NGIT_DATABASE_BACKEND",
+            if options.lmdb_backend {
+                "lmdb"
+            } else {
+                "memory"
+            },
+        );
 
         // Add bootstrap relay URL if provided
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
@@ -364,6 +475,15 @@ impl TestRelay {
             cmd.env("NGIT_GRASP06_ENABLE", "true");
         }
 
+        // Enable NIP-09 deletion disrespector (archival) mode if requested.
+        if options.deletion_request_disrespector {
+            cmd.env("NGIT_DELETION_REQUEST_DISRESPECTOR", "true");
+        }
+
+        if let Some(ref blacklist) = options.repository_blacklist {
+            cmd.env("NGIT_REPOSITORY_BLACKLIST", blacklist);
+        }
+
         // Release the port reservation immediately before spawning the
         // subprocess that will bind it. Holding the reservation through
         // env-var setup above is what keeps any concurrent
@@ -372,15 +492,14 @@ impl TestRelay {
 
         let process = cmd.spawn().expect("Failed to start relay process");
 
-        // Store git data path for test assertions
-        let git_data_path = git_data_dir.path().to_path_buf();
-
         let mut relay = Self {
             process,
             url,
             port,
             _git_data_dir: git_data_dir,
             git_data_path,
+            _relay_data_dir: relay_data_dir,
+            relay_data_path,
         };
 
         match relay.wait_for_ready_or_early_exit().await {
@@ -413,17 +532,23 @@ impl TestRelay {
         &self.git_data_path
     }
 
-    /// Probe the listener with async TCP connects until it accepts,
-    /// while concurrently watching for the subprocess to exit early
-    /// (the signature of a lost port-bind race). Without the early-exit
-    /// check we'd burn the full [`READY_TIMEOUT`] on a process that's
-    /// already dead.
+    /// Get the relay data directory path.
+    pub fn relay_data_path(&self) -> &PathBuf {
+        &self.relay_data_path
+    }
+
+    /// Probe the relay with a real HTTP request until it responds 200,
+    /// while concurrently watching for the subprocess to exit early (the
+    /// signature of a lost port-bind race). A raw TCP connect can succeed
+    /// before Hyper has installed the service that accepts test clients,
+    /// so HTTP readiness is the point where WebSocket clients may safely
+    /// begin racing the relay.
     async fn wait_for_ready_or_early_exit(&mut self) -> ReadyOutcome {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            // Check whether the subprocess has already exited. If so the
-            // TCP probe will never succeed — bail immediately so the
-            // caller can retry with a fresh port.
+            // Check whether the subprocess has already exited. If so no
+            // readiness probe can succeed — bail immediately so the caller
+            // can retry with a fresh port.
             match self.process.try_wait() {
                 Ok(Some(status)) => return ReadyOutcome::EarlyExit { status },
                 Ok(None) => { /* still running */ }
@@ -432,10 +557,10 @@ impl TestRelay {
                 }
             }
 
-            match tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await {
-                Ok(_) => {
-                    // Connection successful, relay is ready
-                    // Give it a tiny bit more time to fully initialize
+            match self.probe_http_ready().await {
+                Ok(()) => {
+                    // HTTP service handled a request successfully, so the
+                    // accept loop, Hyper service, and relay wiring are ready.
                     sleep(READY_GRACE).await;
                     return ReadyOutcome::Ready;
                 }
@@ -450,6 +575,48 @@ impl TestRelay {
                 }
             }
         }
+    }
+
+    async fn probe_http_ready(&self) -> std::io::Result<()> {
+        let probe = async {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await?;
+            // Use the relay's HTTP handler rather than a bare TCP connect:
+            // this verifies the accept loop and Hyper service are both live,
+            // which is what the immediately-following WebSocket tests need.
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                self.port
+            );
+            stream.write_all(request.as_bytes()).await?;
+
+            let mut response = [0_u8; 64];
+            let read = stream.read(&mut response).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "readiness probe got empty HTTP response",
+                ));
+            }
+
+            let status = String::from_utf8_lossy(&response[..read]);
+            if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200") {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("readiness probe got non-200 response: {status:?}"),
+                ))
+            }
+        };
+
+        tokio::time::timeout(READY_PROBE_TIMEOUT, probe)
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP readiness probe timed out",
+                ))
+            })
     }
 
     /// Stop the relay

@@ -178,6 +178,20 @@ let
         description = "Hours before removing relay from naughty list";
       };
 
+      holdingRetentionSecs = mkOption {
+        type = types.int;
+        default = 7776000;
+        description =
+          "Retention window in seconds for deleted events in holding DB (default: 90 days)";
+      };
+
+      holdingCleanupIntervalSecs = mkOption {
+        type = types.int;
+        default = 86400;
+        description =
+          "Interval in seconds between holding DB cleanup passes (default: 24 hours)";
+      };
+
       archiveAll = mkOption {
         type = types.bool;
         default = false;
@@ -257,6 +271,28 @@ let
         '';
       };
 
+      deletionRequestDisrespector = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Ignore NIP-09 deletion requests and act as an archival server.
+
+          When enabled, incoming NIP-09 (kind 5) deletion requests are stored
+          but NOT acted upon: targeted events remain fully accessible. This
+          preserves content and prevents "left-pad" scenarios. NIP-11
+          supported_nips will NOT advertise NIP-09 (deletion) or NIP-62
+          (request to vanish).
+
+          This ONLY affects NIP-09 user-initiated deletions. It does NOT prevent
+          blacklist-triggered deletions (operator moderation).
+
+          When disabled (default), deletion requests are honoured and NIP-09 and
+          NIP-62 are advertised in NIP-11.
+
+          See: docs/explanation/repository-lifecycle.md
+        '';
+      };
+
       repositoryBlacklist = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -267,6 +303,16 @@ let
           Formats: <npub>, <npub>/<identifier>, <identifier>
           Blacklisted repos are rejected with specific reasons (npub/identifier/both).
           Does not affect NIP-11 curation field (operational, not curation policy).
+        '';
+      };
+
+      blacklistAutoRestore = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Automatically restore repositories deleted by blacklist parity on
+          startup when they are no longer blacklisted and still within the
+          holding retention window.
         '';
       };
 
@@ -347,15 +393,22 @@ let
         toString cfg.rejectedColdIndexExpirySecs;
       NGIT_NAUGHTY_LIST_EXPIRATION_HOURS =
         toString cfg.naughtyListExpirationHours;
+      NGIT_HOLDING_RETENTION_SECS = toString cfg.holdingRetentionSecs;
+      NGIT_HOLDING_CLEANUP_INTERVAL_SECS =
+        toString cfg.holdingCleanupIntervalSecs;
       NGIT_ARCHIVE_ALL = if cfg.archiveAll then "true" else "false";
       NGIT_ARCHIVE_WHITELIST = concatStringsSep "," cfg.archiveWhitelist;
       NGIT_ARCHIVE_GRASP_SERVICES =
         concatStringsSep "," cfg.archiveGraspServices;
       NGIT_REPOSITORY_WHITELIST = concatStringsSep "," cfg.repositoryWhitelist;
       NGIT_REPOSITORY_BLACKLIST = concatStringsSep "," cfg.repositoryBlacklist;
+      NGIT_BLACKLIST_AUTO_RESTORE =
+        if cfg.blacklistAutoRestore then "true" else "false";
       NGIT_EVENT_BLACKLIST = concatStringsSep "," cfg.eventBlacklist;
       NGIT_LOG_LEVEL = cfg.logLevel;
       NGIT_GRASP06_ENABLE = if cfg.grasp06Enable then "true" else "false";
+      NGIT_DELETION_REQUEST_DISRESPECTOR =
+        if cfg.deletionRequestDisrespector then "true" else "false";
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.relayName != null) {

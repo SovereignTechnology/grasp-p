@@ -21,8 +21,8 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
-use crate::nostr::builder::SharedDatabase;
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::SharedDatabase;
 
 /// How old an audit event must be before it is eligible for deletion (2 hours).
 const AUDIT_CLEANUP_AGE_SECS: u64 = 2 * 3600;

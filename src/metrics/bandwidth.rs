@@ -10,6 +10,7 @@
 //! - Previous repo labels are cleared before setting new ones
 //! - Prometheus only ever sees ~10 label values, keeping cardinality low
 
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -148,7 +149,7 @@ impl BandwidthTracker {
             .collect();
 
         // Sort by bytes descending
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| Reverse(b.1));
 
         // Clear old labels and set new top N
         self.top_repos_gauge.reset();
@@ -187,7 +188,7 @@ impl BandwidthTracker {
             .map(|r| (r.key().clone(), *r.value()))
             .collect();
 
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| Reverse(b.1));
         sorted.truncate(self.top_n);
         sorted
     }

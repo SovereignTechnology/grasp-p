@@ -180,16 +180,17 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
-### [Deletion Requests](deletion-requests.md)
-**Handling repository and event deletion**
+### [Repository Lifecycle](repository-lifecycle.md)
+**Handling repository removal, holding, archive, recovery, and purgatory**
 
 **Topics:**
-- Deletion request architecture
+- Repository lifecycle architecture
 - Delete disrespector concept
 - Preventing left-pad scenarios
 - Archival policies
+- Holding, recovery, purgatory, and operator curation flows
 
-**Read when:** You want to understand how ngit-grasp handles deletion events (planned feature)
+**Read when:** You want to understand how ngit-grasp keeps nostr state and git data aligned across deletion, vanish, moderation, recovery, and purgatory flows
 
 ---
 

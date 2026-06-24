@@ -32,6 +32,252 @@ use connection::ConnectionTracker;
 lazy_static! {
     /// Global Prometheus registry for ngit-grasp metrics
     pub static ref REGISTRY: Registry = Registry::new();
+    static ref BLACKLIST_DELETIONS_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_blacklist_deletions_total",
+                "Blacklist-triggered deletion attempts by phase and result",
+            ),
+            &["phase", "result"],
+        )
+        .expect("build blacklist deletion metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register blacklist deletion metric");
+        metric
+    };
+    static ref BLACKLIST_STARTUP_RESTORE_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_blacklist_startup_restore_total",
+                "Blacklist startup restore operations by result and reason",
+            ),
+            &["result", "reason"],
+        )
+        .expect("build blacklist startup restore metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register blacklist startup restore metric");
+        metric
+    };
+    static ref WHITELIST_STARTUP_RESTORE_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_whitelist_startup_restore_total",
+                "Whitelist startup restore operations by result and reason",
+            ),
+            &["result", "reason"],
+        )
+        .expect("build whitelist startup restore metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register whitelist startup restore metric");
+        metric
+    };
+    static ref HOLDING_CLEANUP_RUNS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_holding_cleanup_runs_total",
+            "Number of holding cleanup passes run",
+        ))
+        .expect("build holding cleanup runs metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register holding cleanup runs metric");
+        metric
+    };
+    static ref HOLDING_CLEANUP_DELETED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_holding_cleanup_deleted_total",
+                "Holding cleanup deleted objects by type",
+            ),
+            &["type"],
+        )
+        .expect("build holding cleanup deleted metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register holding cleanup deleted metric");
+        metric
+    };
+    static ref HOLDING_CLEANUP_LAST_RUN_DELETED: GaugeVec = {
+        let metric = GaugeVec::new(
+            Opts::new(
+                "ngit_holding_cleanup_last_run_deleted",
+                "Objects deleted in the most recent holding cleanup pass by type",
+            ),
+            &["type"],
+        )
+        .expect("build holding cleanup last-run metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register holding cleanup last-run metric");
+        metric
+    };
+    static ref RECOVERY_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_recovery_total",
+                "Recovery attempts by outcome",
+            ),
+            &["result"],
+        )
+        .expect("build recovery metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register recovery metric");
+        metric
+    };
+    static ref MANUAL_EJECTIONS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_manual_ejections_total",
+            "Number of manual holding ejections",
+        ))
+        .expect("build manual ejections metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register manual ejections metric");
+        metric
+    };
+    static ref MANUAL_EJECTION_DELETED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_manual_ejection_deleted_total",
+                "Objects deleted by manual ejection operations",
+            ),
+            &["type"],
+        )
+        .expect("build manual ejection deleted metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register manual ejection deleted metric");
+        metric
+    };
+}
+
+pub fn record_blacklist_deletion_attempt(phase: &str) {
+    BLACKLIST_DELETIONS_TOTAL
+        .with_label_values(&[phase, "attempted"])
+        .inc();
+}
+
+pub fn record_blacklist_deletion_success(phase: &str) {
+    BLACKLIST_DELETIONS_TOTAL
+        .with_label_values(&[phase, "succeeded"])
+        .inc();
+}
+
+pub fn record_blacklist_deletion_failure(phase: &str) {
+    BLACKLIST_DELETIONS_TOTAL
+        .with_label_values(&[phase, "failed"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_attempt() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["attempted", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_success() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["succeeded", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_failure() {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["failed", "none"])
+        .inc();
+}
+
+pub fn record_blacklist_startup_restore_skipped(reason: &str) {
+    BLACKLIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["skipped", reason])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_attempt() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["attempted", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_success() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["succeeded", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_failure() {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["failed", "none"])
+        .inc();
+}
+
+pub fn record_whitelist_startup_restore_skipped(reason: &str) {
+    WHITELIST_STARTUP_RESTORE_TOTAL
+        .with_label_values(&["skipped", reason])
+        .inc();
+}
+
+pub fn record_holding_cleanup_run(
+    metadata_deleted: usize,
+    archived_events_deleted: usize,
+    archive_files_deleted: usize,
+) {
+    HOLDING_CLEANUP_RUNS_TOTAL.inc();
+    HOLDING_CLEANUP_DELETED_TOTAL
+        .with_label_values(&["metadata"])
+        .inc_by(metadata_deleted as f64);
+    HOLDING_CLEANUP_DELETED_TOTAL
+        .with_label_values(&["payload"])
+        .inc_by(archived_events_deleted as f64);
+    HOLDING_CLEANUP_DELETED_TOTAL
+        .with_label_values(&["archive_file"])
+        .inc_by(archive_files_deleted as f64);
+
+    HOLDING_CLEANUP_LAST_RUN_DELETED
+        .with_label_values(&["metadata"])
+        .set(metadata_deleted as f64);
+    HOLDING_CLEANUP_LAST_RUN_DELETED
+        .with_label_values(&["payload"])
+        .set(archived_events_deleted as f64);
+    HOLDING_CLEANUP_LAST_RUN_DELETED
+        .with_label_values(&["archive_file"])
+        .set(archive_files_deleted as f64);
+}
+
+pub fn record_recovery_attempt() {
+    RECOVERY_TOTAL.with_label_values(&["attempted"]).inc();
+}
+
+pub fn record_recovery_success() {
+    RECOVERY_TOTAL.with_label_values(&["succeeded"]).inc();
+}
+
+pub fn record_recovery_failed() {
+    RECOVERY_TOTAL.with_label_values(&["failed"]).inc();
+}
+
+pub fn record_recovery_partial() {
+    RECOVERY_TOTAL.with_label_values(&["partial"]).inc();
+}
+
+pub fn record_manual_ejection(
+    metadata_deleted: usize,
+    archived_events_deleted: usize,
+    archive_files_deleted: usize,
+) {
+    MANUAL_EJECTIONS_TOTAL.inc();
+    MANUAL_EJECTION_DELETED_TOTAL
+        .with_label_values(&["metadata"])
+        .inc_by(metadata_deleted as f64);
+    MANUAL_EJECTION_DELETED_TOTAL
+        .with_label_values(&["payload"])
+        .inc_by(archived_events_deleted as f64);
+    MANUAL_EJECTION_DELETED_TOTAL
+        .with_label_values(&["archive_file"])
+        .inc_by(archive_files_deleted as f64);
 }
 
 /// Central metrics collection for ngit-grasp relay.

@@ -51,7 +51,8 @@ use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::config::Config;
-use crate::nostr::builder::{Nip34WritePolicy, SharedDatabase};
+use crate::nostr::builder::Nip34WritePolicy;
+use crate::nostr::SharedDatabase;
 use nostr_relay_builder::prelude::LocalRelay;
 
 // =============================================================================
@@ -1787,6 +1788,7 @@ impl SyncManager {
                             &write_policy,
                             &local_relay,
                             &rejected_events_index,
+                            crate::nostr::persistence::SaveContext::RelaySync,
                         )
                         .await;
                         // Only record metric when event is actually saved
@@ -2636,6 +2638,7 @@ impl SyncManager {
                 write_policy,
                 local_relay,
                 rejected_events_index,
+                crate::nostr::persistence::SaveContext::HotCacheReprocess,
             ))
             .await;
 
@@ -2698,6 +2701,7 @@ impl SyncManager {
         write_policy: &Nip34WritePolicy,
         local_relay: &LocalRelay,
         rejected_events_index: &Arc<RejectedEventsIndex>,
+        save_context: crate::nostr::persistence::SaveContext,
     ) -> ProcessResult {
         use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2722,7 +2726,7 @@ impl SyncManager {
             WritePolicyResult::Accept => {
                 // Save event to database
 
-                if let Err(e) = database.save_event(event).await {
+                if let Err(e) = write_policy.save_accepted_event(event, save_context).await {
                     tracing::error!(
                         event_id = %event.id,
                         relay = %relay_url,
@@ -3541,7 +3545,7 @@ impl SyncManager {
                             "[DIAG TRACE] ✓ Negentropy diff results for filter {}", idx
                         );
                         if remote_count > 0 {
-                            all_remote_ids.extend(remote_excluding_ids.into_iter());
+                            all_remote_ids.extend(remote_excluding_ids);
                         }
                     }
                     Err(e) => {

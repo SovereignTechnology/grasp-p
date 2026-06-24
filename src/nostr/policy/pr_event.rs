@@ -10,16 +10,24 @@ use crate::git;
 use crate::git::authorization::{
     collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
 };
+use crate::grasp06::receive::RepoInitLocks;
 
 /// Policy for validating PR and PR Update events
 #[derive(Clone)]
 pub struct PrEventPolicy {
     ctx: PolicyContext,
+    /// Per-path locks shared with the GRASP-06 `/prs/` receive handler for the
+    /// scoped-placeholder cleanup path. This is intentionally a narrow PR-policy
+    /// capability rather than part of the shared policy context.
+    repo_init_locks: RepoInitLocks,
 }
 
 impl PrEventPolicy {
-    pub fn new(ctx: PolicyContext) -> Self {
-        Self { ctx }
+    pub fn new(ctx: PolicyContext, repo_init_locks: RepoInitLocks) -> Self {
+        Self {
+            ctx,
+            repo_init_locks,
+        }
     }
 
     /// Check if git data exists for a PR event
@@ -125,10 +133,8 @@ impl PrEventPolicy {
                     );
                     let ref_name = format!("refs/nostr/{}", event_id);
                     if prs_repo.exists() {
-                        let state = crate::grasp06::receive::path_state(
-                            &self.ctx.repo_init_locks,
-                            &prs_repo,
-                        );
+                        let state =
+                            crate::grasp06::receive::path_state(&self.repo_init_locks, &prs_repo);
                         let _guard = state.mu.lock().expect("prs path mutex poisoned");
 
                         if let Err(e) = crate::git::delete_ref(&prs_repo, &ref_name) {

@@ -44,6 +44,7 @@ Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15
   - **Multi-Maintainer First-Class**: Internal sync of pushed git data across all maintainer repositories
   - **Intelligent Purgatory**: Auto-fetches missing git data from clone URLs when events arrive first
   - **Discovery-Driven**: Dynamically connects to relays listed in repository announcements
+- **Deletion Lifecycle**: NIP-09 deletion requests, NIP-62 request-to-vanish, blacklist/whitelist parity, and service de-listing share one cascade/holding/archive/recovery path for related events and git data
 - **Developer-Friendly**: Built with modern Rust async patterns using tokio and actix-web
 
 ## Architecture Highlights
@@ -63,6 +64,21 @@ This approach provides:
 - **Simpler deployment**: No hook management or symlinks
 - **Tighter integration**: Shared state between Git and Nostr components
 - **Easier testing**: Pure Rust unit and integration tests
+
+### Deletion Lifecycle
+
+ngit-grasp owns NIP-09/NIP-62 deletion handling in relay policy code, with
+backend auto-processing disabled. Removed repository data flows through holding
+storage and git archives for a configurable recovery window, while GRASP-aware
+cascade deletion removes repository-related events that lose their accepted
+reference path and the git data needed to serve them. Tombstones gate
+re-submission and request-to-vanish authors where applicable. The same lifecycle
+is reused for operator moderation and curation reconciliation (repository
+blacklist, repository whitelist, and service de-listing), while
+`NGIT_DELETION_REQUEST_DISRESPECTOR=true` stores but does not act on user
+deletion/vanish requests for archival relays.
+
+See [Repository Lifecycle](docs/explanation/repository-lifecycle.md) for details.
 
 ### Sophisticated Sync System (GRASP-02)
 
@@ -119,6 +135,7 @@ See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for f
 - ✅ CORS support for web-based Git clients
 - ✅ NIP-11 relay information document
 - ✅ **Purgatory**: Events without git data held for 30 minutes, auto-released when data arrives
+- ✅ **Deletion Lifecycle**: NIP-09/NIP-62 support with GRASP-aware cascade deletion, related git-data archival/removal, holding/archive recovery, and archival-relay disrespector mode
 
 ### GRASP-02 (Proactive Sync) ✅
 
@@ -345,17 +362,14 @@ ngit-grasp exposes comprehensive Prometheus metrics at `/metrics` for:
 
 See [Monitoring Overview](docs/explanation/monitoring.md) and [Prometheus Setup Guide](docs/how-to/prometheus-setup.md) for deployment.
 
-### Delete Events
+### Deletion Lifecycle Follow-ups
 
-Git data related to deleted Repositories should be archvied (and deleted after 90 days), also events related to ONLY this repository.
+NIP-09/NIP-62 deletion handling, holding/archive retention, recovery, blacklist
+and whitelist reconciliation, archival disrespector mode, and service de-listing
+removal are implemented. Remaining work is operator-facing UX: richer holding
+management, explicit restore commands, and optional delayed archival policies.
 
-Delete Request Disrepector - so that events dont get removes - its problematic if someone elses PR event and comments gets deleted if the owner deletes the repo. having at least some archival grasp servers retaining it so it can be recovered is important. also we need to make left-pad impossible.
-
-[Deletion Request Archecture](docs/explanation/deletion-request.md) designed by not yet implemented.
-
-### Grasp Server Removed from Announcement Event
-
-Unless GRASP-05, This should cause the git data and events related ONLY to this repository to be archived (and deleted after 90 days).
+See [Repository Lifecycle](docs/explanation/repository-lifecycle.md).
 
 ### Mitigate DoS attack vector
 
@@ -478,6 +492,15 @@ NGIT_RELAY_OWNER_NSEC=nsec1... ngit-grasp --domain relay.example.com
 | Archive read-only    | `--archive-read-only`       | `NGIT_ARCHIVE_READ_ONLY`       | (auto)    |
 | Repository blacklist | `--repository-blacklist`    | `NGIT_REPOSITORY_BLACKLIST`    | (empty)   |
 | Event blacklist      | `--event-blacklist`         | `NGIT_EVENT_BLACKLIST`         | (empty)   |
+
+#### Deletion Lifecycle Settings
+
+| Option                        | CLI Flag                          | Environment Variable                 | Default             |
+| ----------------------------- | --------------------------------- | ------------------------------------ | ------------------- |
+| Disrespect user delete/vanish | `--deletion-request-disrespector` | `NGIT_DELETION_REQUEST_DISRESPECTOR` | `false`             |
+| Holding retention             | `--holding-retention-secs`        | `NGIT_HOLDING_RETENTION_SECS`        | `7776000` (90 days) |
+| Holding cleanup interval      | `--holding-cleanup-interval-secs` | `NGIT_HOLDING_CLEANUP_INTERVAL_SECS` | `86400` (1 day)     |
+| Blacklist auto-restore        | `--blacklist-auto-restore`        | `NGIT_BLACKLIST_AUTO_RESTORE`        | `false`             |
 
 **Sync Notes:**
 

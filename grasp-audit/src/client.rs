@@ -71,10 +71,13 @@ impl AuditClient {
         client.add_relay(relay_url).await?;
         client.connect().await;
 
-        // Wait for connection to establish (with retries)
+        // Wait up to ~5s for nostr-sdk's background relay task to finish the
+        // WebSocket handshake. Full audit suites can briefly starve the task
+        // scheduler under load, so the older ~2s window produced flakes even
+        // when the relay was already accepting connections.
         let mut attempts = 0;
         let mut connected = false;
-        while attempts < 20 {
+        while attempts < 50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let relays = client.relays().await;
@@ -141,10 +144,13 @@ impl AuditClient {
         client.add_relay(relay_url).await?;
         client.connect().await;
 
-        // Wait for connection to establish (with retries)
+        // Wait up to ~5s for nostr-sdk's background relay task to finish the
+        // WebSocket handshake. Full audit suites can briefly starve the task
+        // scheduler under load, so the older ~2s window produced flakes even
+        // when the relay was already accepting connections.
         let mut attempts = 0;
         let mut connected = false;
-        while attempts < 20 {
+        while attempts < 50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let relays = client.relays().await;

@@ -5,8 +5,8 @@
 /// - `StatePolicy` - State event validation + ref alignment
 /// - `PrEventPolicy` - PR/PR Update validation
 /// - `RelatedEventPolicy` - Forward/backward reference checking
+/// - Deletion handling lives in `crate::nostr::lifecycle`
 mod announcement;
-mod deletion;
 mod pr_event;
 mod related;
 mod result;
@@ -17,7 +17,6 @@ pub(crate) use result::{
 };
 
 pub use announcement::{AnnouncementPolicy, AnnouncementResult};
-pub use deletion::DeletionPolicy;
 pub use pr_event::PrEventPolicy;
 pub use related::{ReferenceResult, RelatedEventPolicy};
 pub use state::{StatePolicy, StateResult};
@@ -26,9 +25,6 @@ pub use state::{StatePolicy, StateResult};
 pub use crate::git::sync::AlignmentResult;
 
 use super::SharedDatabase;
-#[cfg(test)]
-use crate::grasp06::receive::new_repo_init_locks;
-use crate::grasp06::receive::RepoInitLocks;
 use crate::purgatory::Purgatory;
 use nostr_relay_builder::LocalRelay;
 use std::sync::Arc;
@@ -44,20 +40,16 @@ pub struct PolicyContext {
     pub local_relay: Arc<std::sync::RwLock<Option<LocalRelay>>>,
     /// Configuration reference for policy settings (includes blacklists)
     pub config: crate::config::Config,
-    /// Per-path locks shared with the GRASP-06 `/prs/` receive handler so
-    /// validation paths that may delete a `/prs/` bare repo serialise
-    /// against in-flight pushes to the same `(submitter, identifier)`.
-    pub repo_init_locks: RepoInitLocks,
 }
 
 impl PolicyContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: impl Into<String>,
         database: SharedDatabase,
         git_data_path: impl Into<std::path::PathBuf>,
         purgatory: Arc<Purgatory>,
         config: crate::config::Config,
-        repo_init_locks: RepoInitLocks,
     ) -> Self {
         Self {
             domain: domain.into(),
@@ -66,7 +58,6 @@ impl PolicyContext {
             purgatory,
             local_relay: Arc::new(std::sync::RwLock::new(None)),
             config,
-            repo_init_locks,
         }
     }
 
@@ -81,14 +72,7 @@ impl PolicyContext {
         purgatory: Arc<Purgatory>,
         config: crate::config::Config,
     ) -> Self {
-        Self::new(
-            domain,
-            database,
-            git_data_path,
-            purgatory,
-            config,
-            new_repo_init_locks(),
-        )
+        Self::new(domain, database, git_data_path, purgatory, config)
     }
 
     /// Set the local relay after it's been created.

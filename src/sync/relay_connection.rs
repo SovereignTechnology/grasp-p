@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::nostr::builder::SharedDatabase;
+use crate::nostr::SharedDatabase;
 
 /// Events from a relay connection
 #[derive(Debug)]

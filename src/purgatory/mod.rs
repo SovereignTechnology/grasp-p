@@ -13,6 +13,7 @@
 
 mod helpers;
 pub mod persistence;
+pub mod promotion_hooks;
 pub mod sync;
 mod types;
 

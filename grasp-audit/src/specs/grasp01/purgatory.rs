@@ -808,6 +808,11 @@ impl PurgatoryTests {
                 .await
                 .map_err(|e| format!("Failed to get purgatory test repo: {}", e))?;
 
+            let existing_announcement = ctx
+                .get_fixture(FixtureKind::PurgatoryValidRepoSent)
+                .await
+                .map_err(|e| format!("Failed to get purgatory announcement fixture: {}", e))?;
+
             let repo_id = existing_state
                 .tags
                 .iter()
@@ -815,6 +820,10 @@ impl PurgatoryTests {
                 .and_then(|t| t.content())
                 .ok_or("Missing d tag in state event")?
                 .to_string();
+
+            // Ensure replacement announcement is strictly newer than the existing
+            // owner announcement for this (pubkey, d) coordinate.
+            let replacement_created_at = Timestamp::from(existing_announcement.created_at.as_secs() + 1);
 
             // Stage 2: generate a fresh keypair for a new maintainer
             let new_maintainer_keys = Keys::generate();
@@ -850,6 +859,7 @@ impl PurgatoryTests {
                     "maintainers",
                     vec![new_maintainer_hex.clone()],
                 ))
+                .custom_time(replacement_created_at)
                 .build(client.keys())
                 .map_err(|e| format!("Failed to build replacement announcement: {}", e))?;
 
