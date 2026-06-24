@@ -206,10 +206,12 @@ Deletion handling is owned by ngit-grasp policy code rather than backend
 auto-processing. NIP-09 deletion requests, NIP-62 request-to-vanish events,
 repository blacklist/whitelist parity, and runtime service de-listing all flow
 through the same lifecycle: gate future writes with tombstones where applicable,
-move removed events into holding, archive/remove live git repositories when a
-served scope disappears, and keep nostr state aligned with git data. Operators
-can opt into archival behaviour with `NGIT_DELETION_REQUEST_DISRESPECTOR`, which
-stores but does not act on user deletion/vanish requests.
+move removed events into holding, cascade-delete repository-related events that
+lose their accepted-reference path, archive/remove the related git repositories
+when a served scope disappears, and keep nostr state aligned with git data.
+Operators can opt into archival behaviour with
+`NGIT_DELETION_REQUEST_DISRESPECTOR`, which stores but does not act on user
+deletion/vanish requests.
 
 Full details: [Deletion Request Support](deletion-requests.md).
 

@@ -44,7 +44,7 @@ Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15
   - **Multi-Maintainer First-Class**: Internal sync of pushed git data across all maintainer repositories
   - **Intelligent Purgatory**: Auto-fetches missing git data from clone URLs when events arrive first
   - **Discovery-Driven**: Dynamically connects to relays listed in repository announcements
-- **Deletion Lifecycle**: NIP-09 deletion requests, NIP-62 request-to-vanish, blacklist/whitelist parity, and service de-listing share one holding/archive/recovery path
+- **Deletion Lifecycle**: NIP-09 deletion requests, NIP-62 request-to-vanish, blacklist/whitelist parity, and service de-listing share one cascade/holding/archive/recovery path for related events and git data
 - **Developer-Friendly**: Built with modern Rust async patterns using tokio and actix-web
 
 ## Architecture Highlights
@@ -69,10 +69,12 @@ This approach provides:
 
 ngit-grasp owns NIP-09/NIP-62 deletion handling in relay policy code, with
 backend auto-processing disabled. Removed repository data flows through holding
-storage and git archives for a configurable recovery window, while tombstones
-gate re-submission and request-to-vanish authors where applicable. The same
-lifecycle is reused for operator moderation and curation reconciliation
-(repository blacklist, repository whitelist, and service de-listing), while
+storage and git archives for a configurable recovery window, while GRASP-aware
+cascade deletion removes repository-related events that lose their accepted
+reference path and the git data needed to serve them. Tombstones gate
+re-submission and request-to-vanish authors where applicable. The same lifecycle
+is reused for operator moderation and curation reconciliation (repository
+blacklist, repository whitelist, and service de-listing), while
 `NGIT_DELETION_REQUEST_DISRESPECTOR=true` stores but does not act on user
 deletion/vanish requests for archival relays.
 
@@ -133,7 +135,7 @@ See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for f
 - ✅ CORS support for web-based Git clients
 - ✅ NIP-11 relay information document
 - ✅ **Purgatory**: Events without git data held for 30 minutes, auto-released when data arrives
-- ✅ **Deletion Lifecycle**: NIP-09/NIP-62 support with holding/archive recovery and archival-relay disrespector mode
+- ✅ **Deletion Lifecycle**: NIP-09/NIP-62 support with GRASP-aware cascade deletion, related git-data archival/removal, holding/archive recovery, and archival-relay disrespector mode
 
 ### GRASP-02 (Proactive Sync) ✅
 
