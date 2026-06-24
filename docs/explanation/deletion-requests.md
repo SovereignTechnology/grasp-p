@@ -707,6 +707,21 @@ work):
 ### Operator controls and UX
 - **Holding-area management UI:** optional web/admin UX for archive and holding lifecycle operations.
 
+### Repository maintenance cleanup replacement
+- Replace the narrow legacy cleanup command with `ngit-grasp maintenance cleanup`
+  as a deliberate full-state integrity sweep rather than a deletion-cascade
+  helper.
+- Functional intent: inspect the full relay/git data set, mark events rooted in
+  accepted repository announcements, recursively retain valid dependent events,
+  and independently retain GRASP-06 PR/PR-update events only when their backing
+  git data is present and consistent.
+- Sweep unmarked repository-related events, then reconcile repository git dirs,
+  state events, PR git data, and PR/PR-update events so served nostr state and
+  filesystem git data match.
+- Keep the command dry-run by default, require explicit `--execute` for mutation,
+  and report candidate deletions, degraded states, orphan git dirs, and PR/git
+  mismatches before destructive cleanup.
+
 ### Delayed archival strategy (active repositories)
 - Add optional grace/delay workflow for high-activity repositories before archival execution.
 - Support cancellation windows, notification issue creation, and schedulable delayed archival operations.
