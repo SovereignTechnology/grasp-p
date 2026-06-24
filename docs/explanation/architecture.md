@@ -200,6 +200,19 @@ Manual ejection   -> RepositoryLifecycle
 RepositoryLifecycle -> RepositoryLifecycleLocks
 ```
 
+#### [`lifecycle/deletion/`](src/nostr/lifecycle/deletion/) - Deletion Lifecycle
+
+Deletion handling is owned by ngit-grasp policy code rather than backend
+auto-processing. NIP-09 deletion requests, NIP-62 request-to-vanish events,
+repository blacklist/whitelist parity, and runtime service de-listing all flow
+through the same lifecycle: gate future writes with tombstones where applicable,
+move removed events into holding, archive/remove live git repositories when a
+served scope disappears, and keep nostr state aligned with git data. Operators
+can opt into archival behaviour with `NGIT_DELETION_REQUEST_DISRESPECTOR`, which
+stores but does not act on user deletion/vanish requests.
+
+Full details: [Deletion Request Support](deletion-requests.md).
+
 #### [`events.rs`](src/nostr/events.rs) - Event Parsing
 
 Provides structures for parsing NIP-34 events:
