@@ -57,18 +57,15 @@ impl<'a> NostrPurgatoryPromotionHooks<'a> {
 #[async_trait]
 impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
     async fn before_event_saved(&self, event: &Event, context: PurgatorySaveContext) {
-        let Some(write_policy) = self.write_policy else {
-            return;
-        };
+        tracing::trace!(
+            event_id = %event.id,
+            kind = event.kind.as_u16(),
+            ?context,
+            "Preparing purgatory-promoted event for main database persistence"
+        );
 
-        let context = match context {
-            PurgatorySaveContext::State => SaveContext::PurgatoryStatePromotion,
-            PurgatorySaveContext::Announcement => SaveContext::PurgatoryAnnouncementPromotion,
-            PurgatorySaveContext::Pr => SaveContext::PurgatoryPrPromotion,
-        };
-
-        write_policy
-            .prepare_accepted_event_persistence(event, context)
+        self.deletion
+            .capture_superseded_replaceable_history(event)
             .await;
     }
 

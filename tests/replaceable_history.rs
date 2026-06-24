@@ -2,10 +2,20 @@
 
 mod common;
 
+use clap::Parser;
 use common::{publish_served_repo, TestRelay};
 use grasp_audit::{AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
+use ngit_grasp::config::Config;
+use ngit_grasp::grasp06::receive::new_repo_init_locks;
+use ngit_grasp::nostr::builder::Nip34WritePolicy;
 use ngit_grasp::nostr::lifecycle::ReplaceableHistoryStore;
+use ngit_grasp::nostr::lifecycle::{HoldingStore, RepositoryLifecycle, Tombstones};
+use ngit_grasp::nostr::persistence::SaveContext;
+use ngit_grasp::nostr::SharedDatabase;
+use ngit_grasp::purgatory::Purgatory;
 use nostr_sdk::prelude::*;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 async fn open_history(relay_data_path: &std::path::Path) -> ReplaceableHistoryStore {
@@ -64,6 +74,57 @@ fn build_state_version(
         .custom_created_at(created_at)
         .finalize(client.keys())
         .expect("build state version")
+}
+
+fn build_policy_for_history_regression(
+    database: SharedDatabase,
+    history: ReplaceableHistoryStore,
+    git_data_path: &std::path::Path,
+) -> Nip34WritePolicy {
+    let config = Config::parse_from([
+        "ngit-grasp-test",
+        "--domain",
+        "test.example.com",
+        "--archive-all",
+        "--archive-read-only",
+        "false",
+    ]);
+    let purgatory = Arc::new(Purgatory::new(git_data_path.to_path_buf()));
+
+    Nip34WritePolicy::new(
+        database,
+        Tombstones::in_memory(),
+        HoldingStore::in_memory(),
+        RepositoryLifecycle::in_memory(),
+        history,
+        git_data_path.to_path_buf(),
+        purgatory,
+        config,
+        new_repo_init_locks(),
+    )
+}
+
+fn build_policy_announcement_version(
+    keys: &Keys,
+    repo_id: &str,
+    created_at: Timestamp,
+    content: &str,
+) -> Event {
+    let npub = keys.public_key().to_bech32().expect("pubkey to npub");
+
+    EventBuilder::new(Kind::GitRepoAnnouncement, content)
+        .tags(vec![
+            Tag::identifier(repo_id),
+            Tag::custom("name", vec![repo_id.to_string()]),
+            Tag::custom(
+                "clone",
+                vec![format!("http://test.example.com/{}/{}.git", npub, repo_id)],
+            ),
+            Tag::custom("relays", vec!["wss://test.example.com".to_string()]),
+        ])
+        .custom_created_at(created_at)
+        .finalize(keys)
+        .expect("build policy announcement version")
 }
 
 #[tokio::test]
@@ -174,6 +235,70 @@ async fn newer_30617_supersedes_older_and_preserves_old_in_history() {
     );
 
     relay.stop().await;
+}
+
+#[tokio::test]
+async fn sync_style_admit_then_save_captures_superseded_history_once() {
+    use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};
+
+    let git_dir = tempfile::tempdir().expect("git tempdir");
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let history = ReplaceableHistoryStore::in_memory();
+    let policy = build_policy_for_history_regression(db.clone(), history.clone(), git_dir.path());
+    let keys = Keys::generate();
+    let repo_id = format!("history-sync-once-{}", &keys.public_key().to_hex()[..8]);
+    let old_announcement = build_policy_announcement_version(
+        &keys,
+        &repo_id,
+        Timestamp::from_secs(Timestamp::now().as_secs() + 1),
+        "old",
+    );
+    let new_announcement = build_policy_announcement_version(
+        &keys,
+        &repo_id,
+        Timestamp::from_secs(old_announcement.created_at.as_secs() + 30),
+        "new",
+    );
+
+    db.save_event(&old_announcement)
+        .await
+        .expect("save old announcement");
+
+    let dummy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let result = policy.admit_event(&new_announcement, &dummy_addr).await;
+    assert!(
+        matches!(result, WritePolicyResult::Accept),
+        "new announcement must be accepted before central save"
+    );
+
+    // Cross a timestamp-second boundary before saving. The old persistence hook
+    // also captured history here, producing a distinct metadata event instead
+    // of collapsing onto the admission hook's metadata ID.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    policy
+        .save_accepted_event(&new_announcement, SaveContext::RelaySync)
+        .await
+        .expect("save accepted announcement");
+
+    let coordinate = format!("30617:{}:{}", keys.public_key().to_hex(), repo_id);
+    let records = history
+        .superseded_records_for_coordinate_before(
+            &coordinate,
+            Timestamp::from_secs(new_announcement.created_at.as_secs() + 1),
+        )
+        .await;
+    let matching_records = records
+        .iter()
+        .filter(|r| {
+            r.superseded_event_id == Some(old_announcement.id)
+                && r.replaced_by == Some(new_announcement.id)
+        })
+        .count();
+
+    assert_eq!(
+        matching_records, 1,
+        "sync-style admit then save must not duplicate superseded history metadata"
+    );
 }
 
 #[tokio::test]

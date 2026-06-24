@@ -153,15 +153,7 @@ impl Nip34WritePolicy {
     }
 
     fn event_persistence(&self) -> EventPersistence<'_> {
-        EventPersistence::new(&self.ctx.database, &self.deletion)
-    }
-
-    /// Run central persistence hooks for an accepted event whose actual save is
-    /// performed by the relay builder after policy acceptance.
-    pub async fn prepare_accepted_event_persistence(&self, event: &Event, context: SaveContext) {
-        self.event_persistence()
-            .before_accepted_event_persisted(event, context)
-            .await;
+        EventPersistence::new(&self.ctx.database)
     }
 
     /// Save an already-admitted event through the central accepted-event path.
