@@ -498,9 +498,9 @@ These options control retention and cleanup cadence for deleted events archived 
 
 #### `NGIT_HOLDING_RETENTION_SECS`
 
-**Description:** How long deleted events are retained in the holding DB before expiration cleanup removes them  
-**Type:** Integer (seconds)  
-**Default:** `7776000` (90 days)  
+**Description:** How long deleted events are retained in the holding DB before expiration cleanup removes them
+**Type:** Integer (seconds)
+**Default:** `7776000` (90 days)
 **Required:** No
 
 **Examples:**
@@ -522,9 +522,9 @@ NGIT_HOLDING_RETENTION_SECS=2592000
 
 #### `NGIT_HOLDING_CLEANUP_INTERVAL_SECS`
 
-**Description:** Interval between periodic holding DB expiration cleanup passes  
-**Type:** Integer (seconds)  
-**Default:** `86400` (24 hours)  
+**Description:** Interval between periodic holding DB expiration cleanup passes
+**Type:** Integer (seconds)
+**Default:** `86400` (24 hours)
 **Required:** No
 
 **Examples:**
@@ -998,10 +998,10 @@ Blacklist does **not** affect NIP-11 metadata:
 
 #### `NGIT_BLACKLIST_AUTO_RESTORE`
 
-**Description:** On startup, restore repositories previously deleted by blacklist parity when they are no longer blacklisted and still within holding retention  
-**Type:** Boolean  
-**Default:** `false`  
-**Required:** No  
+**Description:** On startup, restore repositories previously deleted by blacklist parity when they are no longer blacklisted and still within holding retention
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
 **CLI:** `--blacklist-auto-restore`
 
 **Behavior:**
@@ -1134,10 +1134,10 @@ Event blacklist does **not** affect NIP-11 metadata:
 
 #### `NGIT_DELETION_REQUEST_DISRESPECTOR`
 
-**Description:** Ignore NIP-09 deletion requests and act as an archival server  
-**Type:** Boolean  
-**Default:** `false` (deletion requests are honoured)  
-**Required:** No  
+**Description:** Ignore NIP-09 deletion requests and act as an archival server
+**Type:** Boolean
+**Default:** `false` (deletion requests are honoured)
+**Required:** No
 **CLI:** `--deletion-request-disrespector`
 
 **Behavior:**

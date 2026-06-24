@@ -750,9 +750,9 @@ scenarios by ensuring at least some relays preserve deleted content.
 
 ### holding_retention_secs
 
-**Type:** `u64`  
-**Default:** `7776000` (90 days in seconds)  
-**CLI:** `--holding-retention-secs`  
+**Type:** `u64`
+**Default:** `7776000` (90 days in seconds)
+**CLI:** `--holding-retention-secs`
 **Env:** `NGIT_HOLDING_RETENTION_SECS`
 
 **Description:**
