@@ -1,11 +1,12 @@
-# Deletion Request Support (NIP-09 and NIP-62)
+# Repository Lifecycle (Deletion, Holding, Archive, and Recovery)
 
 ## Overview
 
-ngit-grasp implements optional support for NIP-09 deletion requests and NIP-62
-request-to-vanish events, allowing repository owners to remove their data from
-the relay while giving operators configurable archival behavior for left-pad
-resilience.
+ngit-grasp owns the lifecycle of repository-related nostr events and git data
+when a served repository scope is removed, restored, or quarantined. This covers
+NIP-09 deletion requests, NIP-62 request-to-vanish events, operator blacklist and
+whitelist reconciliation, service de-listing, holding/archive retention, recovery,
+and purgatory transitions.
 
 ## Core consistency invariant
 
@@ -14,16 +15,16 @@ and recovery:
 
 > **Served nostr state must always match git refs we can actually serve.**
 
-This invariant is the design center for deletion handling and a key rationale
-for purgatory. If the currently served repository state is deleted and no valid
+This invariant is the design center for lifecycle handling and a key rationale
+for purgatory. If the currently served repository state is removed and no valid
 rollback state exists, the relay must stop serving that state, park the
 announcement scope in purgatory, and wait for a promotable state before serving
 again.
 
-## Ownership of deletion behavior
+## Ownership of lifecycle behavior
 
-ngit-grasp disables backend auto-processing and owns NIP-09/NIP-62 handling in
-relay policy code:
+ngit-grasp disables backend auto-processing and owns NIP-09/NIP-62 lifecycle
+handling in relay policy code:
 
 - main DB uses `process_nip09(false)` and `process_nip62(false)`
   (`src/nostr/builder.rs`)
@@ -32,7 +33,7 @@ relay policy code:
 - holding DB uses `process_nip09(false)` and `process_nip62(false)`
   (`src/nostr/lifecycle/holding.rs`)
 
-This keeps deletion behavior auditable and prevents the storage backends from
+This keeps lifecycle behavior auditable and prevents the storage backends from
 silently applying deletion semantics outside ngit-grasp policy code.
 
 The full cascade, holding, archive, and lifecycle flow applies consistently to
@@ -54,7 +55,8 @@ The "left-pad problem" refers to a 2016 incident where a critical npm package wa
 
 ### Three-Database Design
 
-The deletion system uses three relay databases plus archive filesystem storage:
+The repository lifecycle system uses three relay databases plus archive
+filesystem storage:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -176,7 +178,7 @@ deprecated in favor of the maintenance command.
     and still within holding retention
   - Still-blacklisted scopes are skipped
 
-## Deletion Flow
+## Lifecycle Removal Flows
 
 ### Standard Mode (Respects Deletions)
 
@@ -491,12 +493,12 @@ Operators need ability to **force-delete** items from holding area before retent
 - It intentionally has no confirmation prompt, reason field, or operator field in
   the current CLI; richer operator UX is planned separately.
 
-## Blacklist Deletion Integration
+## Operator Curation Integration
 
 ### Overview
 
-Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
-requests and NIP-62 vanish lifecycle removals:
+Blacklist- and whitelist-triggered removals use the **same infrastructure** as
+NIP-09 deletion requests and NIP-62 vanish lifecycle removals:
 - Same holding database for 90-day retention
 - Same git archive mechanism
 - Same cascade deletion logic

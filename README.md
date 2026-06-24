@@ -78,7 +78,7 @@ blacklist, repository whitelist, and service de-listing), while
 `NGIT_DELETION_REQUEST_DISRESPECTOR=true` stores but does not act on user
 deletion/vanish requests for archival relays.
 
-See [Deletion Request Support](docs/explanation/deletion-requests.md) for details.
+See [Repository Lifecycle](docs/explanation/repository-lifecycle.md) for details.
 
 ### Sophisticated Sync System (GRASP-02)
 
@@ -369,7 +369,7 @@ and whitelist reconciliation, archival disrespector mode, and service de-listing
 removal are implemented. Remaining work is operator-facing UX: richer holding
 management, explicit restore commands, and optional delayed archival policies.
 
-See [Deletion Request Support](docs/explanation/deletion-requests.md).
+See [Repository Lifecycle](docs/explanation/repository-lifecycle.md).
 
 ### Mitigate DoS attack vector
 

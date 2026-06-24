@@ -213,7 +213,7 @@ Operators can opt into archival behaviour with
 `NGIT_DELETION_REQUEST_DISRESPECTOR`, which stores but does not act on user
 deletion/vanish requests.
 
-Full details: [Deletion Request Support](deletion-requests.md).
+Full details: [Repository Lifecycle](repository-lifecycle.md).
 
 #### [`events.rs`](src/nostr/events.rs) - Event Parsing
 

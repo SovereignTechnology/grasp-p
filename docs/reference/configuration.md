@@ -1176,8 +1176,8 @@ NGIT_DELETION_REQUEST_DISRESPECTOR=true
 NGIT_DELETION_REQUEST_DISRESPECTOR=false
 ```
 
-See [`docs/explanation/deletion-requests.md`](../explanation/deletion-requests.md)
-for the full design rationale.
+See [`docs/explanation/repository-lifecycle.md`](../explanation/repository-lifecycle.md)
+for the full lifecycle design rationale.
 
 ---
 

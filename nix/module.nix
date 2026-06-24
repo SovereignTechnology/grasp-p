@@ -289,7 +289,7 @@ let
           When disabled (default), deletion requests are honoured and NIP-09 and
           NIP-62 are advertised in NIP-11.
 
-          See: docs/explanation/deletion-requests.md
+          See: docs/explanation/repository-lifecycle.md
         '';
       };
 
