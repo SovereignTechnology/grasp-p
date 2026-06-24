@@ -699,10 +699,11 @@ fn compute_retained_events(
     domain: &str,
 ) -> HashSet<EventId> {
     let mut kept = HashSet::new();
-    let mut vetoed_git_nodes = HashSet::new();
+    let mut vetoed_pr_graph_nodes = HashSet::new();
 
     for event in graph.nodes.values() {
-        if deleted_announcement_ids.contains(&event.id) || vetoed_git_nodes.contains(&event.id) {
+        if deleted_announcement_ids.contains(&event.id) || vetoed_pr_graph_nodes.contains(&event.id)
+        {
             continue;
         }
         if is_independent_anchor(event, deleted_announcement_ids, domain) {
@@ -716,7 +717,7 @@ fn compute_retained_events(
 
         for event in graph.nodes.values() {
             if kept.contains(&event.id)
-                || vetoed_git_nodes.contains(&event.id)
+                || vetoed_pr_graph_nodes.contains(&event.id)
                 || deleted_announcement_ids.contains(&event.id)
                 || should_exclude_from_generic_graph(event)
                 || should_not_recurse_through(event)
@@ -742,11 +743,11 @@ fn compute_retained_events(
             }
         }
 
-        let vetoed = veto_invalid_git_invariant_nodes(graph, &kept, domain);
+        let vetoed = veto_unanchored_pr_graph_nodes(graph, &kept, domain);
         if !vetoed.is_empty() {
             for id in vetoed {
                 kept.remove(&id);
-                vetoed_git_nodes.insert(id);
+                vetoed_pr_graph_nodes.insert(id);
             }
             continue;
         }
@@ -812,7 +813,7 @@ fn is_independent_anchor(
     crate::grasp06::policy::event_names_relays_prs_endpoint(event, domain)
 }
 
-fn veto_invalid_git_invariant_nodes(
+fn veto_unanchored_pr_graph_nodes(
     graph: &CascadeGraph,
     kept: &HashSet<EventId>,
     domain: &str,
