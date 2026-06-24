@@ -1,5 +1,6 @@
 //! Integration tests for durable replaceable/addressable history capture.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use clap::Parser;

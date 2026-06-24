@@ -1,5 +1,6 @@
 //! Integration tests for Phase 4 git archive lifecycle.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{announcement_coordinate, build_deletion, publish_served_repo, TestRelay};

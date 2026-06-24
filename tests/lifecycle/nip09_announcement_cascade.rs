@@ -24,6 +24,7 @@
 //! cargo test --test nip09_announcement_cascade -- --nocapture
 //! ```
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{announcement_coordinate, build_deletion, publish_served_repo, TestRelay};

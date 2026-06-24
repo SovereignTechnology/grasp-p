@@ -10,6 +10,7 @@
 //! Serving note: second-maintainer announcements are served via the maintainer
 //! exception path in this suite (`maintainers` tag + non-local `relays` tag).
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

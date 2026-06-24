@@ -81,5 +81,65 @@ path = "src/lib.rs"
 name = "ngit-grasp"
 path = "src/main.rs"
 
+[[test]]
+name = "nip09_announcement_cascade"
+path = "tests/lifecycle/nip09_announcement_cascade.rs"
+
+[[test]]
+name = "nip09_blacklist_ops"
+path = "tests/lifecycle/nip09_blacklist_ops.rs"
+
+[[test]]
+name = "nip09_cascade_event_types"
+path = "tests/lifecycle/nip09_cascade_event_types.rs"
+
+[[test]]
+name = "nip09_disrespector"
+path = "tests/lifecycle/nip09_disrespector.rs"
+
+[[test]]
+name = "nip09_git_archive_cleanup"
+path = "tests/lifecycle/nip09_git_archive_cleanup.rs"
+
+[[test]]
+name = "nip09_holding_cleanup"
+path = "tests/lifecycle/nip09_holding_cleanup.rs"
+
+[[test]]
+name = "nip09_holding_db"
+path = "tests/lifecycle/nip09_holding_db.rs"
+
+[[test]]
+name = "nip09_multi_maintainer"
+path = "tests/lifecycle/nip09_multi_maintainer.rs"
+
+[[test]]
+name = "nip09_recovery"
+path = "tests/lifecycle/nip09_recovery.rs"
+
+[[test]]
+name = "nip09_state_cascade"
+path = "tests/lifecycle/nip09_state_cascade.rs"
+
+[[test]]
+name = "nip09_state_multi_maintainer"
+path = "tests/lifecycle/nip09_state_multi_maintainer.rs"
+
+[[test]]
+name = "nip09_validation"
+path = "tests/lifecycle/nip09_validation.rs"
+
+[[test]]
+name = "nip62_lifecycle"
+path = "tests/lifecycle/nip62_lifecycle.rs"
+
+[[test]]
+name = "nip62_validation"
+path = "tests/lifecycle/nip62_validation.rs"
+
+[[test]]
+name = "replaceable_history"
+path = "tests/lifecycle/replaceable_history.rs"
+
 [workspace]
 members = [".", "grasp-audit"]

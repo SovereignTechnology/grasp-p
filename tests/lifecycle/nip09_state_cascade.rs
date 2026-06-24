@@ -3,6 +3,7 @@
 //! These tests extend the announcement-cascade coverage to kind-30618
 //! repository state events in the **single-maintainer** case.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

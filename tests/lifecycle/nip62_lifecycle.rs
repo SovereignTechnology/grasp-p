@@ -5,6 +5,7 @@
 //! lifecycle: targeted vanish requests must move served data through holding and
 //! repository archival instead of hard-deleting directly from the main DB.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{build_vanish, publish_served_repo, TestRelay};

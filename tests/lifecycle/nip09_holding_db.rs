@@ -1,5 +1,6 @@
 //! Focused integration tests for Phase 2 holding-DB semantics.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

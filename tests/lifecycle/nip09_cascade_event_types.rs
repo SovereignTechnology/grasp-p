@@ -4,6 +4,7 @@
 //! (1630), comment (1111), repo-status (1633), PR chain
 //! (1618/1619/1631/1632).
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

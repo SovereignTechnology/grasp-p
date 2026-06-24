@@ -14,6 +14,7 @@
 //! independent second-announcement git promotion is not currently reliable in
 //! this fixture setup.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

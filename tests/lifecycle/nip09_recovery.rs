@@ -1,5 +1,6 @@
 //! Integration tests for Phase 5 NIP-09 recovery workflow.
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

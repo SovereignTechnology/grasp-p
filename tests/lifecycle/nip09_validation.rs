@@ -49,6 +49,7 @@
 //! cargo test --test nip09_validation -- --nocapture
 //! ```
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{

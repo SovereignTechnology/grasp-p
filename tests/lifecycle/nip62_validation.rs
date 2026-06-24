@@ -48,6 +48,7 @@
 //! cargo test --test nip62_validation -- --nocapture
 //! ```
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{announcement_served_by_coordinate, build_vanish, publish_served_repo, TestRelay};
