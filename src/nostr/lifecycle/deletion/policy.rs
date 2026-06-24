@@ -73,7 +73,8 @@ impl DeletionPolicy {
     /// main database) so clients see an OK and the request is preserved, but it
     /// is NOT acted upon — no purgatory eviction, no main-DB deletion, and no
     /// tombstone recording. The targeted events therefore remain fully
-    /// accessible. This only affects NIP-09 user-initiated deletions.
+    /// accessible. The same archival-mode contract is applied to NIP-62 vanish
+    /// requests in [`DeletionService::handle_vanish`](super::service::DeletionService::handle_vanish).
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
         // Archival mode: store the deletion request but do not process it.
         if self.ctx.config.deletion_request_disrespector {

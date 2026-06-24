@@ -78,6 +78,16 @@ impl DeletionService {
     }
 
     pub async fn handle_vanish(&self, event: &Event) -> WritePolicyResult {
+        // Archival mode: store the vanish request but do not process it.
+        if self.ctx.config.deletion_request_disrespector {
+            tracing::info!(
+                event_id = %event.id.to_hex(),
+                author = %event.pubkey.to_hex(),
+                "Disrespector mode: storing NIP-62 vanish request without acting on it"
+            );
+            return WritePolicyResult::Accept;
+        }
+
         // Only honour requests that target this relay (or all relays). We do not
         // configure a relay_url on the database, matching the historical
         // behaviour where only ALL_RELAYS requests were actioned; but we accept

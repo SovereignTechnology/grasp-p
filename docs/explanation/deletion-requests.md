@@ -31,8 +31,16 @@ relay policy code:
 - holding DB uses `process_nip09(false)` and `process_nip62(false)`
   (`src/nostr/holding.rs`)
 
-This keeps deletion behavior auditable and consistent across cascade, holding,
-archive, and recovery flows.
+This keeps deletion behavior auditable and prevents the storage backends from
+silently applying deletion semantics outside ngit-grasp policy code.
+
+The full cascade, holding, archive, and recovery flow currently applies to
+NIP-09 repository/content deletions and operator-driven blacklist/whitelist
+deletions. NIP-62 request-to-vanish handling is narrower: in normal mode a
+targeted vanish request records a vanish tombstone, removes that author's events
+from the main database, and evicts that author's purgatory entries. It does not
+currently move those events through the holding database or archive/recovery
+pipeline.
 
 ## The Left-Pad Problem
 
@@ -677,7 +685,7 @@ Deletion support is **conditionally advertised** in NIP-11 relay information
 (implemented in [`src/http/nip11.rs`](../../src/http/nip11.rs)):
 
 - **When `deletion_request_disrespector = false`:** include `9` (`"deletion"`) and `62` (`"request to vanish"`) in the supported NIPs array
-- **When `deletion_request_disrespector = true`:** do NOT include `9` or `62` (archival mode doesn't honor deletions)
+- **When `deletion_request_disrespector = true`:** do NOT include `9` or `62` (archival mode stores but does not honor deletion or vanish requests)
 
 This allows clients to discover whether a relay respects deletion requests.
 
