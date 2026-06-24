@@ -380,10 +380,6 @@ must not keep serving an announcement with empty/stale git refs. Instead it must
 5. promote/recover the scope only through the normal purgatory promotion path,
    restoring any holding/archive data needed for the same owner+identifier.
 
-This is stricter than merely clearing `refs/heads/*` and `refs/tags/*`: a
-repository with no valid active state should leave the served set until a
-promotable state re-establishes the core consistency invariant.
-
 ### Blacklist Recovery
 
 When a repository is removed from the blacklist, startup behavior depends on
