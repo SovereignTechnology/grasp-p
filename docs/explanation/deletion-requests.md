@@ -126,7 +126,7 @@ data during the retention window.
 
 `ngit-grasp maintenance cleanup` runs three ordered passes:
 
-1. `cascade-reconcile` — remove orphaned dependent events that are no longer anchored by surviving 30617 announcements (includes legacy LMDB drift repair).
+1. `cascade-reconcile` — remove orphaned main-DB events that are no longer accepted through any surviving repository/reference path (includes legacy LMDB drift repair).
 2. `state-realign` — re-apply authorized 30618 state to git refs where the git objects are available.
 3. `repo-fs-reconcile` — reconcile filesystem and DB repository layout (includes prior `cleanup-empty-repos` logic).
 
@@ -187,13 +187,15 @@ ngit-grasp maintenance cleanup --execute --prune-orphans --prune-missing-git \
    - `e` targets must be authored by deleter (cross-author delete rejected)
    - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
-3. Query dependent events (PRs, issues, patches, comments)
+3. Recursively discover the accepted-reference component affected by the target
+   announcement
    ↓
 4. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
    ↓
 5. Move events to holding database:
    - Announcement
-   - All dependent events (cascade delete)
+   - All main-DB events that lose their accepted-reference path after cascade
+     reevaluation
    - Deletion metadata for retention/cleanup/recovery
    ↓
 6. Delete events from main database
@@ -221,7 +223,7 @@ When a repository is added to `NGIT_REPOSITORY_BLACKLIST`, the same deletion flo
 1. Startup: Scan main DB for repos matching blacklist
    ↓
 2. For each matching repository:
-   - Query dependent events (same cascade logic)
+   - Recursively discover affected accepted-reference component (same cascade logic)
    - Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
    - Mark metadata as "blacklist-triggered" (not NIP-09)
    - Move events to holding database
@@ -432,38 +434,99 @@ restores holding scopes tagged `holding-source=whitelist` when they now match
 
 ## Cascade Deletion Strategy
 
-When a repository announcement is deleted (NIP-09 or blacklist), we cascade delete **all dependent events**:
+When a repository announcement is deleted (NIP-09, blacklist, or whitelist
+reconciliation), ngit-grasp cascade-deletes the main-DB events that lose their
+accepted-reference path after that announcement is removed.
 
 ### Rationale
 
-**Decision:** Delete all dependent events, not just owner's events.
+**Decision:** Cascade deletion mirrors admission policy instead of relying on a
+hardcoded list of repository-related event kinds.
 
 **Why?**
-1. **Deletion Intent:** Owner wants repository gone - includes all associated data
-2. **Data Integrity:** Orphaned PRs/issues without context are confusing
-3. **Consistency:** Matches user expectation that "delete repo" means "delete everything"
-4. **Recovery Available:** Holding database preserves everything for recovery window
+1. **Admission/deletion symmetry:** If an event was accepted because it referenced
+   an accepted repository/event, or because an accepted event referenced it,
+   deletion should reason over the same reference universe.
+2. **Data integrity:** Events that only made sense through the deleted repository
+   should not remain served as orphaned content.
+3. **Generalization:** Arbitrary accepted event kinds participate in cascade
+   analysis; the algorithm is not limited to issues, PRs, patches, or comments.
+4. **Recovery available:** Holding database preserves deleted events for the
+   configured recovery window before permanent cleanup.
 
 **Community Protection:**
 - Archival relays (`deletion_request_disrespector = true`) preserve community work
-- 90-day default retention allows time for recovery
-- Other maintainers can continue repository with different identifier
+  for user-initiated NIP-09 deletions.
+- 90-day default retention allows time for recovery.
+- Other maintainers can continue anchoring shared discussion through surviving
+  announcements or accepted reference paths.
 
-### Event Cascade Hierarchy
+### Acceptance-Reachability Cascade
+
+Cascade starts from the deleted repository announcement event(s) and coordinate,
+then recursively expands the affected main-DB reference component:
 
 ```
-Repository Announcement (30617)
-    ↓ deleted
-├─→ State Events (30618) - same identifier
-├─→ Pull Requests (1618) - tag via 'a'
-├─→ Issues (1621) - tag via 'a'  
-├─→ Patches (1617) - tag via 'a'
-├─→ Repository/Issue/PR/Patch status (1633/1630/1631/1632)
-    ↓ all above deleted
-    └─→ Comments (1111) - tag via 'e'
+Deleted repository announcement (30617)
+    ↓ seed by event id and address
+Load outgoing accepted-reference tags
+    - `a` / `A` address references
+    - `e` / `E` event references
+    - `q` event or address references
+    ↓
+Load incoming references from main-DB tag indexes
+    - events that reference the current event id
+    - events that reference the current address
+    ↓
+Repeat until the affected component reaches a fixed point
 ```
 
-**Implementation:** Recursive dependency graph traversal starting from announcement.
+The graph is built from the main database only. Holding, history, archive, and
+internal metadata stores are not graph inputs.
+
+Once the affected component is loaded, the deleted announcement is excluded and
+ngit-grasp recomputes retention as a fixed point:
+
+1. Keep surviving independent anchors.
+2. Keep events that reference kept events or kept addresses.
+3. Keep events that are referenced by kept events.
+4. Repeat until no additional events are kept.
+5. Move every remaining non-special node in the component to holding and delete
+   it from the main database.
+
+Surviving anchors include remaining repository announcements and independently
+valid GRASP-06 `/prs/` endpoint events. The deleted announcement itself is never
+a surviving anchor.
+
+This means a deleted repository's issue, comment, or arbitrary related event can
+survive when it is still connected to another accepted repository/reference path.
+The same event is deleted when the removed announcement was its only acceptance
+path.
+
+### Special Cases and Safety Rules
+
+Repository state events (`30618`) are not handled by the generic graph. They are
+keyed by repository identifier, so ngit-grasp preserves the existing identifier
+semantics:
+
+- state survives while any repository announcement for the identifier remains;
+- state is moved to holding when the last announcement for that identifier is
+  removed.
+
+Deletion requests, vanish requests, holding metadata, and history metadata do not
+act as recursive graph frontiers. They are lifecycle/control records, not normal
+repository content anchors.
+
+PR and PR-update events have an additional invariant: served PR data must not
+outlive the git data needed to broadcast it. Generic graph reachability may keep
+them only when they still reference a kept repository announcement, or when they
+are independently valid through the GRASP-06 `/prs/` flow. Otherwise they are
+vetoed from the retained set and normal fixed-point retention is recalculated.
+
+If recursive graph expansion fails or exceeds internal safety caps, ngit-grasp
+does not cascade-delete from a known-partial graph. It falls back to deleting the
+requested announcement coordinate and then applies the normal identifier-level
+state cleanup.
 
 ## Multi-Maintainer Scenarios
 
@@ -475,7 +538,7 @@ Multiple maintainers can have announcements for the same `identifier`:
 
 Git data is synced between their repositories. When ONE maintainer deletes, what happens?
 
-### Solution: Graph-Based Retention Algorithm
+### Solution: Acceptance-Reachability Retention
 
 ```
 When npub1alice deletes her announcement:
@@ -483,9 +546,9 @@ When npub1alice deletes her announcement:
 1. Archive HER git directory:
    .archive/npub1alice.../my-repo-<timestamp>.tar.gz
 
-2. Query all events that referenced her announcement
+2. Recursively load the affected reference component from the main database
 
-3. Re-evaluate each event through acceptance policy:
+3. Re-evaluate the component through acceptance reachability:
    - WITHOUT alice's announcement
    - WITH bob's announcement still present
    
@@ -499,7 +562,7 @@ When npub1alice deletes her announcement:
 
 5. Delete orphaned events, keep retained events
 
-6. Handle circular dependencies:
+6. Handle circular dependencies naturally:
    - Event X kept because references Event Y
    - Event Y kept because references Event X
    - Neither has external anchor → both deleted
@@ -507,22 +570,29 @@ When npub1alice deletes her announcement:
 
 ### Graph Algorithm Details
 
-**Topological Traversal:**
-1. Start from remaining announcements (roots)
-2. Traverse dependency edges (a/e/q tags)
-3. Mark reachable events as "keep"
-4. Mark unreachable events as "delete"
+**Recursive expansion:**
+1. Seed from the deleted announcement event id and address.
+2. Follow outgoing accepted-reference tags (`a`, `A`, `e`, `E`, and `q`).
+3. Query incoming references using the same tag forms.
+4. Deduplicate by event id/address and continue until no new main-DB nodes are
+   discovered.
 
-**Max Depth Limit:**
-- Internal maximum traversal depth guard (prevents infinite loops)
-- Default: 100 levels
-- Note: this is currently code-level, not a user/operator config option
+**Retention fixed point:**
+1. Start from surviving independent anchors.
+2. Propagate retention in both directions across accepted-reference edges.
+3. Apply PR/PR-update git-data vetoes.
+4. Delete the loaded nodes that remain unretained.
+
+**Safety caps:**
+- Internal node, edge, and orphan-delete caps bound worst-case graph work.
+- Cap/query failures fall back to coordinate-only announcement deletion plus
+  state cleanup rather than broad deletion from a partial graph.
+- These limits are code-level safeguards, not user/operator configuration.
 
 **Complexity:**
 - Deletion events are rare (not performance critical)
-- Compute on-demand when deletion request arrives
-- No pre-computation or caching needed at current scale
-- Note: Will analyze large-scale scenarios in future
+- The graph is computed on demand from indexed main-DB reference queries
+- No full relay dump, pre-computation, or cache is required at current scale
 
 ## Configuration
 
@@ -624,34 +694,12 @@ This allows clients to discover whether a relay respects deletion requests.
 - `ngit_manual_ejections_total`
 - `ngit_manual_ejection_deleted_total{type}`
 
-## Testing Strategy
-
-### Unit Tests
-- Kind 5 validation and parsing
-- Author matching logic
-- Cascade dependency query
-- Graph traversal algorithm
-- Recovery detection
-
-### Integration Tests
-- Cascade correctness (single-maintainer + multi-maintainer + state-event paths)
-- Holding DB move semantics (subset of representative scenarios, not every test)
-- Retention/expiry cleanup behavior (short-retention deterministic tests)
-- Recovery mechanism
-- Disrespector mode behavior
-
-### Audit Tests
-- NIP-09 compliance validation
-- Event re-submission after deletion (rejected)
-- Deletion request event itself (stored)
-- Archival mode relay behavior
-
 ## Related Documentation
 
 - **NIP-09 Specification:** `/persistent/dcdev/clones/nips/09.md`
 - **Architecture Overview:** `docs/explanation/architecture.md`
 - **Configuration Reference:** `docs/reference/configuration.md`
-- **Roadmap:** `README.md` lines 198-206
+- **Roadmap:** `README.md`
 
 ## Future Enhancements
 
@@ -664,7 +712,7 @@ work):
 ### Cleanup and deletion engine follow-up
 - **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
 - **Backend/index behavior verification:** continue validating deletion behavior across backend upgrades, including index consistency when relay-owned deletion paths mutate served data.
-- **Large-scale + edge-case analysis:** document/validate max-depth behavior, large dependency graphs, and memory/performance characteristics.
+- **Large-scale + edge-case analysis:** continue validating large dependency graphs, safety caps, and memory/performance characteristics.
 
 ### Blacklist lifecycle improvements
 - **Dynamic blacklist updates:** apply blacklist additions/removals without restart.
@@ -682,7 +730,7 @@ work):
 
 ### Advanced deletion semantics
 - **Generalized replaceable/addressable rollback policy:** current `e`-target rollback covers repository announcement/state (30617/30618); evaluate whether additional kinds should adopt the same behavior.
-- **PR deletion policy refinement:** define final behavior for deleting PR-related events without unintended dependent-data loss.
+- **PR deletion policy refinement:** continue validating PR-related deletion behavior as GRASP-06 and git-data handling evolve.
 
 ### Monitoring and integration follow-up
 - Expand deletion/archival/recovery metrics and provide dashboard + alerting guidance.
