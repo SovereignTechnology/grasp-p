@@ -438,54 +438,39 @@ When a repository announcement is deleted (NIP-09, blacklist, or whitelist
 reconciliation), ngit-grasp cascade-deletes the main-DB events that lose their
 accepted-reference path after that announcement is removed.
 
-### Rationale
+### Basic Rules
 
-**Decision:** Cascade deletion mirrors admission policy instead of relying on a
-hardcoded list of repository-related event kinds.
+Cascade deletion is graph analysis over the same reference shapes used for event
+admission. It is not limited to a fixed list of repository event kinds.
 
-**Why?**
-1. **Admission/deletion symmetry:** If an event was accepted because it referenced
-   an accepted repository/event, or because an accepted event referenced it,
-   deletion should reason over the same reference universe.
-2. **Data integrity:** Events that only made sense through the deleted repository
-   should not remain served as orphaned content.
-3. **Generalization:** Arbitrary accepted event kinds participate in cascade
-   analysis; the algorithm is not limited to issues, PRs, patches, or comments.
-4. **Recovery available:** Holding database preserves deleted events for the
-   configured recovery window before permanent cleanup.
+1. **Start at the deleted announcement.** The seed is the deleted kind-30617
+   announcement event id plus its address coordinate.
+2. **Recursively load the affected main-DB graph.** From each discovered event,
+   load events it references and events that reference it.
+3. **Analyze the loaded graph after removing the announcement.** Events that
+   still have a surviving accepted-repository path are retained. Events that only
+   depended on the deleted announcement are moved to holding and removed from the
+   main database.
+4. **Do not promote unrelated graph regions into the cascade.** Another accepted
+   repository announcement can anchor events already found in the affected graph,
+   but a reference to that announcement is a boundary, not permission to retain
+   or delete that repository's entire descendant graph.
 
-**Community Protection:**
-- Archival relays (`deletion_request_disrespector = true`) preserve community work
-  for user-initiated NIP-09 deletions.
-- 90-day default retention allows time for recovery.
-- Other maintainers can continue anchoring shared discussion through surviving
-  announcements or accepted reference paths.
-
-### Acceptance-Reachability Cascade
-
-Cascade starts from the deleted repository announcement event(s) and coordinate,
-then recursively expands the affected main-DB reference component:
+The reference forms are:
 
 ```
-Deleted repository announcement (30617)
-    ↓ seed by event id and address
-Load outgoing accepted-reference tags
-    - `a` / `A` address references
-    - `e` / `E` event references
-    - `q` event or address references
-    ↓
-Load incoming references from main-DB tag indexes
-    - events that reference the current event id
-    - events that reference the current address
-    ↓
-Repeat until the affected component reaches a fixed point
+`a` / `A` — address references
+`e` / `E` — event-id references
+`q`       — event-id or address references
 ```
 
 The graph is built from the main database only. Holding, history, archive, and
 internal metadata stores are not graph inputs.
 
-Once the affected component is loaded, the deleted announcement is excluded and
-ngit-grasp recomputes retention as a fixed point:
+### Retention Rule
+
+After graph loading, the deleted announcement is excluded and retention is
+computed as a fixed point:
 
 1. Keep surviving independent anchors.
 2. Keep events that reference kept events or kept addresses.
@@ -494,16 +479,16 @@ ngit-grasp recomputes retention as a fixed point:
 5. Move every remaining non-special node in the component to holding and delete
    it from the main database.
 
-Surviving anchors include remaining repository announcements and independently
-valid GRASP-06 `/prs/` endpoint events. The deleted announcement itself is never
-a surviving anchor.
+Surviving anchors include remaining repository announcements, kind-10317 GRASP
+lists, and independently valid GRASP-06 `/prs/` endpoint events. The deleted
+announcement itself is never a surviving anchor.
 
 This means a deleted repository's issue, comment, or arbitrary related event can
 survive when it is still connected to another accepted repository/reference path.
 The same event is deleted when the removed announcement was its only acceptance
 path.
 
-### Special Cases and Safety Rules
+### Boundaries and Special Cases
 
 Repository state events (`30618`) are not handled by the generic graph. They are
 keyed by repository identifier, so ngit-grasp preserves the existing identifier
@@ -517,11 +502,15 @@ Deletion requests, vanish requests, holding metadata, and history metadata do no
 act as recursive graph frontiers. They are lifecycle/control records, not normal
 repository content anchors.
 
-PR and PR-update events have an additional invariant: served PR data must not
-outlive the git data needed to broadcast it. Generic graph reachability may keep
-them only when they still reference a kept repository announcement, or when they
-are independently valid through the GRASP-06 `/prs/` flow. Otherwise they are
-vetoed from the retained set and normal fixed-point retention is recalculated.
+PR and PR-update events are retained only when doing so preserves git-data
+availability. Generic graph reachability is not enough on its own: a PR or
+PR-update must still reference a kept repository announcement, or be
+independently valid through the GRASP-06 `/prs/` flow. Otherwise it is removed
+from the retained set and retention is recalculated.
+
+GRASP-06 PRs are treated as their own anchored flow. They can survive repository
+announcement deletion when the `/prs/` endpoint relationship still makes the PR
+data independently valid.
 
 If recursive graph expansion fails or exceeds internal safety caps, ngit-grasp
 does not cascade-delete from a known-partial graph. It falls back to deleting the
@@ -538,7 +527,7 @@ Multiple maintainers can have announcements for the same `identifier`:
 
 Git data is synced between their repositories. When ONE maintainer deletes, what happens?
 
-### Solution: Acceptance-Reachability Retention
+### Solution: Graph Retention
 
 ```
 When npub1alice deletes her announcement:
@@ -546,13 +535,13 @@ When npub1alice deletes her announcement:
 1. Archive HER git directory:
    .archive/npub1alice.../my-repo-<timestamp>.tar.gz
 
-2. Recursively load the affected reference component from the main database
+2. Recursively load the affected main-DB reference graph
 
-3. Re-evaluate the component through acceptance reachability:
+3. Analyze the graph after removing alice's announcement:
    - WITHOUT alice's announcement
    - WITH bob's announcement still present
    
-4. Build retention graph:
+4. Retain events still anchored by bob's announcement:
    Event A kept because:
      - References bob's announcement ✓
    Event B kept because:
@@ -574,7 +563,9 @@ When npub1alice deletes her announcement:
 1. Seed from the deleted announcement event id and address.
 2. Follow outgoing accepted-reference tags (`a`, `A`, `e`, `E`, and `q`).
 3. Query incoming references using the same tag forms.
-4. Deduplicate by event id/address and continue until no new main-DB nodes are
+4. Treat other repository announcements as boundaries for unrelated graph
+   expansion.
+5. Deduplicate by event id/address and continue until no new main-DB nodes are
    discovered.
 
 **Retention fixed point:**
