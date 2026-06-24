@@ -195,9 +195,14 @@ deprecated in favor of the maintenance command.
    - `a` tag targeting a kind-30617 announcement coordinate:
      recursively discover the accepted-reference component affected by the
      announcement deletion
-   - `e` tag targeting an active kind-30617/30618 replaceable event:
-     delete the targeted event and attempt rollback from replaceable history;
-     this path does not run graph cascade
+   - `e` tag targeting an active kind-30618 repository state:
+     delete the targeted state and attempt rollback from replaceable history;
+     if no valid active state remains, move the affected announcement scope
+     through cascade/holding into purgatory
+   - `e` tag targeting an active kind-30617 repository announcement:
+     delete the targeted announcement and attempt rollback from replaceable
+     history; this path does not run generic graph cascade when no history
+     candidate exists
    - other valid `e`/`a` targets: delete the targeted event/coordinate without
      announcement graph cascade
    ↓
@@ -418,9 +423,10 @@ not the same as announcement-coordinate cascade deletion:
   announcement. The targeted announcement is moved to holding and removed from
   the main DB, and the live bare repository is removed when that owner+identifier
   announcement scope is no longer served.
-- Dependent event graph cascade currently belongs to announcement-coordinate
-  deletion (`a` tag), targeted NIP-62 vanish over announcements, and
-  operator-driven blacklist/whitelist deletion paths.
+- Dependent event graph cascade for announcement deletion currently belongs to
+  announcement-coordinate deletion (`a` tag), targeted NIP-62 vanish over
+  announcements, operator-driven blacklist/whitelist deletion paths, and the
+  no-active-state transition caused by deleting the only valid active 30618 state.
 
 If another authorized maintainer still has a valid active state for the
 identifier, the surviving state remains the active source for git ref alignment;
@@ -554,9 +560,16 @@ vanish over the author's announcements, blacklist deletion, or whitelist
 reconciliation), ngit-grasp cascade-deletes the main-DB events that lose their
 accepted-reference path after that announcement is removed.
 
-NIP-09 `e`-tag deletion of a kind-30617 announcement is narrower: it deletes the
-targeted announcement event and may restore a previous announcement from
-replaceable history, but it does not compute the generic announcement cascade.
+NIP-09 `e`-tag deletion has two important replaceable cases:
+
+- Deleting the only valid active kind-30618 repository state can make the served
+  announcement scope invalid. In that no-active-state case, ngit-grasp runs the
+  announcement cascade, archives/removes live git data, and parks the scope in
+  purgatory until a new valid state and git data arrive.
+- Deleting a kind-30617 announcement by event id is narrower: it deletes the
+  targeted announcement event and may restore a previous announcement from
+  replaceable history, but it does not compute the generic announcement cascade
+  when no history candidate exists.
 
 ### Basic Rules
 
