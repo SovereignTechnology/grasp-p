@@ -186,7 +186,11 @@ deprecated in favor of the maintenance command.
 1. Kind 5 deletion request arrives
    ↓
 2. Validate targets:
-   - `e` targets must be authored by deleter (cross-author delete rejected)
+   - `e` targets found in the main DB must be authored by the deleter;
+     cross-author main-DB targets reject the whole request
+   - pre-emptive `e` deletes for unknown targets may be accepted, but if the
+     target later arrives from a different author, the stale deletion request is
+     removed from both tombstones and the served deletion-request stream
    - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
 3. Record deletion tombstone so re-submission is gated

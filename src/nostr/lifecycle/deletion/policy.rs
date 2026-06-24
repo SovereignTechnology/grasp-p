@@ -230,6 +230,7 @@ pub(super) fn owner_directory_component(pubkey: &PublicKey) -> String {
 mod tests {
     use super::*;
     use crate::grasp06::receive::new_repo_init_locks;
+    use crate::nostr::lifecycle::DeletionService;
     use crate::nostr::lifecycle::HoldingStore;
     use crate::nostr::lifecycle::ReplaceableHistoryStore;
     use crate::nostr::lifecycle::RepositoryLifecycle;
@@ -401,6 +402,56 @@ mod tests {
             ctx.purgatory
                 .has_purgatory_announcement(&owner_keys.public_key(), identifier),
             "Purgatory entry should NOT have been removed by wrong author"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_target_arrival_removes_stale_cross_author_deletion_request() {
+        let ctx = make_context();
+        let attacker_keys = Keys::generate();
+        let victim_keys = Keys::generate();
+
+        let target = EventBuilder::text_note("real event from victim")
+            .finalize(&victim_keys)
+            .unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target.id)])
+            .finalize(&attacker_keys)
+            .unwrap();
+
+        ctx.tombstones.record_deletion(&deletion).await.unwrap();
+        ctx.database.save_event(&deletion).await.unwrap();
+
+        assert!(
+            ctx.tombstones
+                .is_event_deleted(&target.id, &attacker_keys.public_key())
+                .await
+        );
+        assert!(ctx
+            .database
+            .event_by_id(&deletion.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let service = DeletionService::new(ctx.clone());
+        service
+            .remove_stale_cross_author_event_deletions(&target)
+            .await;
+
+        assert!(
+            !ctx.tombstones
+                .is_event_deleted(&target.id, &attacker_keys.public_key())
+                .await,
+            "stale cross-author deletion tombstone should be removed"
+        );
+        assert!(
+            ctx.database
+                .event_by_id(&deletion.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "stale cross-author deletion request should be removed from main DB"
         );
     }
 

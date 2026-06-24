@@ -754,7 +754,7 @@ impl WritePolicy for Nip34WritePolicy {
             // Sync uses localhost:0 as a dummy address
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
-            match event.kind {
+            let result = match event.kind {
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
                 Kind::RepoState => self.handle_state(event, is_synced).await,
                 Kind::GitPullRequest | Kind::GitPullRequestUpdate => {
@@ -773,7 +773,15 @@ impl WritePolicy for Nip34WritePolicy {
                 Kind::EventDeletion => self.deletion.handle_nip09(event).await,
                 Kind::RequestToVanish => self.deletion.handle_vanish(event).await,
                 _ => self.handle_related_event(event, "Event").await,
+            };
+
+            if !matches!(&result, WritePolicyResult::Reject { .. }) {
+                self.deletion
+                    .remove_stale_cross_author_event_deletions(event)
+                    .await;
             }
+
+            result
         })
     }
 }

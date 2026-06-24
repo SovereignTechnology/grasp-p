@@ -118,6 +118,43 @@ impl Tombstones {
         Ok(())
     }
 
+    /// Remove recorded kind-5 requests from other authors that targeted `id`.
+    ///
+    /// This handles out-of-order cross-author deletes. A relay may accept a
+    /// pre-emptive `e` deletion before the target event exists, because it cannot
+    /// yet validate ownership. When the real event later arrives from a different
+    /// pubkey, the earlier deletion request is known to be invalid for that
+    /// target and should no longer remain in the tombstone store.
+    pub async fn remove_event_deletions_by_other_authors(
+        &self,
+        id: &EventId,
+        author: &PublicKey,
+    ) -> anyhow::Result<usize> {
+        let filter = Filter::new()
+            .kind(Kind::EventDeletion)
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), id.to_hex());
+
+        let stale_ids: Vec<EventId> = self
+            .db
+            .query(filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query deletion tombstones: {e}"))?
+            .into_iter()
+            .filter(|deletion| deletion.pubkey != *author)
+            .map(|deletion| deletion.id)
+            .collect();
+
+        let removed = stale_ids.len();
+        if removed > 0 {
+            self.db
+                .delete(Filter::new().ids(stale_ids))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to remove deletion tombstones: {e}"))?;
+        }
+
+        Ok(removed)
+    }
+
     /// Record a NIP-62 vanish request (kind 62).
     ///
     /// The caller MUST have already validated that the request targets this relay
@@ -263,6 +300,36 @@ mod tests {
         assert!(
             !store.is_event_deleted(&target, &victim.public_key()).await,
             "a deletion from another pubkey must not block the victim's event"
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_deletion_requests_from_other_authors_when_target_author_is_known() {
+        let store = Tombstones::in_memory();
+        let attacker = Keys::generate();
+        let victim = Keys::generate();
+        let target = EventId::all_zeros();
+
+        let deletion = deletion_by_event(&attacker, target);
+        store.record_deletion(&deletion).await.unwrap();
+
+        assert!(
+            store
+                .is_event_deleted(&target, &attacker.public_key())
+                .await
+        );
+
+        let removed = store
+            .remove_event_deletions_by_other_authors(&target, &victim.public_key())
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(
+            !store
+                .is_event_deleted(&target, &attacker.public_key())
+                .await,
+            "cross-author deletion request should be removed once the real author is known"
         );
     }
 
