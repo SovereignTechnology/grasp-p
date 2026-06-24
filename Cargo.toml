@@ -30,6 +30,7 @@ futures-util = "0.3"
 base64 = "0.22"
 flate2 = "1.0"
 tar = "0.4"
+fs2 = "0.4"
 
 # Metrics
 prometheus = "0.14"
