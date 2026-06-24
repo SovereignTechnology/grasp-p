@@ -36,6 +36,15 @@ async fn announcement_deletion_creates_git_archive_and_metadata_linkage() {
 
     let (announcement, repo_id) = publish_served_repo(&client, "git-archive-create").await;
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let owner_npub = client.public_key().to_bech32().expect("pubkey to npub");
+    let live_repo_path = relay
+        .git_data_path()
+        .join(owner_npub)
+        .join(format!("{repo_id}.git"));
+    assert!(
+        live_repo_path.is_dir(),
+        "live bare repo must exist before announcement deletion"
+    );
 
     let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client.send_event(deletion).await.expect("send deletion");
@@ -62,6 +71,10 @@ async fn announcement_deletion_creates_git_archive_and_metadata_linkage() {
         .join(".archive")
         .join(&archive_rel_path);
     assert!(archive_path.exists(), "archive file must exist on disk");
+    assert!(
+        !live_repo_path.exists(),
+        "live bare repo must be removed after successful announcement archival and deletion"
+    );
     assert_eq!(owner, client.public_key().to_hex());
 
     relay.stop().await;

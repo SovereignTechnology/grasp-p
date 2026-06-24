@@ -12,6 +12,13 @@ use tar::Builder as TarBuilder;
 use super::policy::{identifier_from_event, owner_directory_component, DeletionPolicy};
 use crate::nostr::lifecycle::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeletedAnnouncementRepoScope {
+    owner: PublicKey,
+    owner_path_component: String,
+    identifier: String,
+}
+
 impl DeletionPolicy {
     /// Move all currently served data authored by a targeted NIP-62 vanish
     /// request through the same holding/archive deletion lifecycle used for
@@ -254,6 +261,7 @@ impl DeletionPolicy {
         }
 
         let mut deletable = Vec::with_capacity(matches.len());
+        let mut deleted_announcement_repo_scopes = HashSet::new();
         for event in matches {
             let mut event_metadata = metadata.clone();
 
@@ -303,6 +311,14 @@ impl DeletionPolicy {
                         );
                         continue;
                     }
+
+                    if event_metadata.git_archive.is_some() {
+                        deleted_announcement_repo_scopes.insert(DeletedAnnouncementRepoScope {
+                            owner: event.pubkey,
+                            owner_path_component: owner_dir,
+                            identifier,
+                        });
+                    }
                 }
             }
 
@@ -339,7 +355,94 @@ impl DeletionPolicy {
         let delete_filter = Filter::new().ids(deletable);
         if let Err(e) = self.ctx.database.delete(delete_filter).await {
             tracing::warn!(error = %e, op = %context, "Failed to delete events from main DB");
+            return;
         }
+
+        for scope in deleted_announcement_repo_scopes {
+            self.remove_live_repo_if_announcement_scope_unserved(scope, context)
+                .await;
+        }
+    }
+
+    async fn remove_live_repo_if_announcement_scope_unserved(
+        &self,
+        scope: DeletedAnnouncementRepoScope,
+        context: &str,
+    ) {
+        let remaining_filter = Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(scope.owner)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                scope.identifier.clone(),
+            );
+
+        match self.ctx.database.query(remaining_filter).await {
+            Ok(remaining) if !remaining.is_empty() => {
+                tracing::debug!(
+                    owner = %scope.owner.to_hex(),
+                    identifier = %scope.identifier,
+                    remaining = remaining.len(),
+                    op = %context,
+                    "Preserving live git repository because announcement scope is still served"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    owner = %scope.owner.to_hex(),
+                    identifier = %scope.identifier,
+                    error = %e,
+                    op = %context,
+                    "Could not verify announcement scope deletion; preserving live git repository"
+                );
+                return;
+            }
+        }
+
+        let repo_path =
+            self.repo_path_for_owner_and_identifier(&scope.owner_path_component, &scope.identifier);
+        if !repo_path.exists() {
+            return;
+        }
+
+        if let Err(e) = std::fs::remove_dir_all(&repo_path) {
+            tracing::warn!(
+                owner = %scope.owner.to_hex(),
+                identifier = %scope.identifier,
+                repo = %repo_path.display(),
+                error = %e,
+                op = %context,
+                "Failed to remove live git repository after announcement deletion"
+            );
+            return;
+        }
+
+        if let Some(parent) = repo_path.parent() {
+            if let Err(e) = std::fs::remove_dir(parent) {
+                if e.kind() != std::io::ErrorKind::NotFound
+                    && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+                {
+                    tracing::debug!(
+                        owner = %scope.owner.to_hex(),
+                        identifier = %scope.identifier,
+                        parent = %parent.display(),
+                        error = %e,
+                        op = %context,
+                        "Could not remove empty repository owner directory"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            owner = %scope.owner.to_hex(),
+            identifier = %scope.identifier,
+            repo = %repo_path.display(),
+            op = %context,
+            "Removed live git repository after announcement deletion"
+        );
     }
 
     fn archive_output_path(
