@@ -700,7 +700,7 @@ pub fn build_deletion(
 ///
 /// The relay validates vanish requests with
 /// `nip62::is_valid_vanish_request_for_relay(tags, None)`, so a request is
-/// only *actioned* (the author's events deleted and future events blocked) when
+/// only *actioned* (the author's served events removed and future events blocked) when
 /// it carries a `["relay", "ALL_RELAYS"]` tag. A request that names a specific
 /// relay URL never matches `None` and is therefore accepted-but-ignored.
 ///

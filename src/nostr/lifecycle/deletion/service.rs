@@ -110,19 +110,19 @@ impl DeletionService {
             return reject_error(format!("internal error recording vanish: {e}"));
         }
 
-        // 2. Hard-delete the author's events from the main database.
-        let filter = nostr_relay_builder::prelude::Filter::new().author(author);
-        if let Err(e) = self.ctx.database().delete(filter).await {
-            tracing::error!(error = %e, author = %author.to_hex(), "Failed to delete vanished author's events");
+        if let Err(e) = self.policy.apply_nip62_vanish(event).await {
+            tracing::error!(error = %e, author = %author.to_hex(), "Failed to process vanished author's lifecycle deletion");
             return reject_error(format!("internal error processing vanish: {e}"));
         }
 
-        // 3. Evict the author's purgatory entries (and their bare repos).
+        // Evict the author's purgatory entries (and their bare repos). Served
+        // data has already gone through the holding/archive lifecycle above;
+        // purgatory entries are not live served data.
         self.evict_author_from_purgatory(&author);
 
         tracing::info!(
             author = %author.to_hex(),
-            "Processed NIP-62 request to vanish: deleted author's events and purgatory entries"
+            "Processed NIP-62 request to vanish through deletion lifecycle"
         );
 
         WritePolicyResult::Accept

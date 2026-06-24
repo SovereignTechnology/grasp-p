@@ -37,6 +37,7 @@ pub const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletionSource {
     Nip09,
+    Nip62,
     Blacklist,
     Whitelist,
 }
@@ -45,6 +46,7 @@ impl DeletionSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Nip09 => "nip09",
+            Self::Nip62 => "nip62",
             Self::Blacklist => "blacklist",
             Self::Whitelist => "whitelist",
         }
@@ -249,6 +251,7 @@ impl HoldingStore {
 
             match v[1].as_str() {
                 "nip09" => Some(DeletionSource::Nip09),
+                "nip62" => Some(DeletionSource::Nip62),
                 "blacklist" => Some(DeletionSource::Blacklist),
                 "whitelist" => Some(DeletionSource::Whitelist),
                 _ => None,

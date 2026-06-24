@@ -13,6 +13,80 @@ use super::policy::{identifier_from_event, owner_directory_component, DeletionPo
 use crate::nostr::lifecycle::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 
 impl DeletionPolicy {
+    /// Move all currently served data authored by a targeted NIP-62 vanish
+    /// request through the same holding/archive deletion lifecycle used for
+    /// NIP-09 announcement deletion.
+    ///
+    /// Kind-30617 announcements are processed first via the graph cascade path
+    /// so dependent events that become orphaned are moved to holding with the
+    /// repository archive linkage. Any remaining author events are then moved to
+    /// holding before main-DB deletion. The caller is responsible for recording
+    /// the vanish tombstone before invoking this method.
+    pub(super) async fn apply_nip62_vanish(&self, event: &Event) -> anyhow::Result<()> {
+        let author = event.pubkey;
+        let deleted_at = event.created_at;
+
+        let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement).author(author);
+        let announcements = self
+            .ctx
+            .database
+            .query(announcement_filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query vanished author's announcements: {e}"))?;
+
+        let scopes = announcements
+            .iter()
+            .filter_map(|announcement| {
+                identifier_from_event(announcement).map(|identifier| {
+                    crate::nostr::lifecycle::RecoveryScope {
+                        owner_pubkey_hex: author.to_hex(),
+                        identifier,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let _lifecycle_guards = self.ctx.lifecycle.write_repositories(scopes).await;
+
+        for announcement in announcements {
+            let Some(identifier) = identifier_from_event(&announcement) else {
+                tracing::warn!(
+                    event_id = %announcement.id.to_hex(),
+                    author = %author.to_hex(),
+                    "NIP-62 vanish: announcement missing identifier; it will be handled by remaining author-event deletion"
+                );
+                continue;
+            };
+            let coordinate = format!("30617:{}:{}", author.to_hex(), identifier);
+            self.cascade_delete_announcement(
+                &author,
+                &coordinate,
+                deleted_at,
+                DeletionSource::Nip62,
+            )
+            .await;
+        }
+
+        let mut moved_ids = HashSet::new();
+        let metadata = HoldingMetadata {
+            deleted_at,
+            source: DeletionSource::Nip62,
+            coordinate: None,
+            identifier: None,
+            owner_pubkey: Some(author.to_hex()),
+            git_archive: None,
+        };
+
+        self.archive_and_delete_filter(
+            Filter::new().author(author),
+            &metadata,
+            &mut moved_ids,
+            "NIP-62 vanish remaining author-event deletion",
+        )
+        .await;
+
+        Ok(())
+    }
+
     /// Hard-delete the targeted events from the main database.
     ///
     /// Handles both `e`-tag (by event id) and `a`-tag (by coordinate) targets.

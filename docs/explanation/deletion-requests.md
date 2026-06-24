@@ -1,10 +1,11 @@
-# Deletion Request Support (NIP-09)
+# Deletion Request Support (NIP-09 and NIP-62)
 
 ## Overview
 
-ngit-grasp implements optional support for NIP-09 deletion requests, allowing
-repository owners to remove their repositories from the relay while giving
-operators configurable archival behavior for left-pad resilience.
+ngit-grasp implements optional support for NIP-09 deletion requests and NIP-62
+request-to-vanish events, allowing repository owners to remove their data from
+the relay while giving operators configurable archival behavior for left-pad
+resilience.
 
 ## Core consistency invariant
 
@@ -34,13 +35,12 @@ relay policy code:
 This keeps deletion behavior auditable and prevents the storage backends from
 silently applying deletion semantics outside ngit-grasp policy code.
 
-The full cascade, holding, archive, and recovery flow currently applies to
-NIP-09 repository/content deletions and operator-driven blacklist/whitelist
-deletions. NIP-62 request-to-vanish handling is narrower: in normal mode a
-targeted vanish request records a vanish tombstone, removes that author's events
-from the main database, and evicts that author's purgatory entries. It does not
-currently move those events through the holding database or archive/recovery
-pipeline.
+The full cascade, holding, archive, and lifecycle flow applies consistently to
+NIP-09 repository/content deletions, targeted NIP-62 request-to-vanish events,
+and operator-driven blacklist/whitelist deletions. NIP-62 additionally records a
+vanish tombstone: archived payloads can remain in holding for retention and
+cleanup, but the tombstone continues to gate new events from that pubkey unless
+an explicit tombstone-removal path is introduced.
 
 ## The Left-Pad Problem
 
@@ -112,8 +112,12 @@ data during the retention window.
 ### Holding Database Operations
 
 **Automatic Operations:**
-- **Move to holding:** NIP-09 deletions, blacklist deletions
-- **Automatic recovery:** Re-publishing after NIP-09 deletion (within retention window)
+- **Move to holding:** NIP-09 deletions, targeted NIP-62 vanish removals,
+  blacklist/whitelist deletions
+- **Automatic recovery:** Re-publishing after NIP-09 deletion or
+  operator-driven blacklist/whitelist restoration (within retention window).
+  NIP-62 holding records are retained for safety/cleanup, but recovery of events
+  authored by the vanished pubkey remains blocked by the vanish tombstone.
 - **Expiry cleanup:** Daily background task removes entries older than retention period
 
 **Manual Operations:**
@@ -213,6 +217,34 @@ Deletion gate checks tombstones before kind-specific admission and rejects:
 - re-submission of deleted event IDs,
 - replaceable/addressable events covered by coordinate tombstones.
 
+#### NIP-62 Vanish Requests
+
+```
+1. Kind 62 request-to-vanish arrives
+   ↓
+2. Validate relay targeting with NIP-62 rules:
+   - non-targeting requests are accepted/stored but not actioned
+   ↓
+3. Record vanish tombstone so future events from that pubkey are gated
+   ↓
+4. For every live kind-30617 announcement authored by the vanished pubkey:
+   - Recursively discover the accepted-reference component
+   - Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+   - Move announcement and newly orphaned dependents to holding DB with
+     holding-source=nip62
+   - Delete those events from the main DB
+   ↓
+5. Move any remaining main-DB events authored by the vanished pubkey to holding
+   with holding-source=nip62, then delete them from the main DB
+   ↓
+6. Evict the vanished author's purgatory entries
+```
+
+The vanish tombstone is intentionally independent from holding retention. A
+future re-announcement cannot bypass the vanish gate: recovery may preserve data
+for operators and cleanup, but publishing new events from the vanished pubkey is
+still rejected unless the relay gains an intentional tombstone-removal workflow.
+
 #### Blacklist-Triggered Deletion
 
 When a repository is added to `NGIT_REPOSITORY_BLACKLIST`, the same deletion flow applies:
@@ -260,19 +292,20 @@ When `deletion_request_disrespector = true`:
 Result: Archival relay preserves all content
 ```
 
-**Important:** Disrespector mode ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions.
+**Important:** Disrespector mode affects user-initiated NIP-09 deletions and
+NIP-62 vanish requests. It does NOT prevent blacklist-triggered deletions.
 
 **Rationale:**
-- NIP-09 deletions are user agency decisions (left-pad protection needed)
+- NIP-09/NIP-62 deletions are user agency decisions (left-pad protection needed)
 - Blacklist deletions are operator moderation decisions (spam/malware/abuse)
 - Archival relays still need ability to moderate malicious content
 - Different policy goals: preservation vs. safety
 
-**Implementation Note:** Implemented. The LMDB backend's automatic NIP-09
-processing is disabled (`process_nip09(false)`); ngit-grasp owns deletion
-handling in [`DeletionPolicy::handle`](../../src/nostr/policy/deletion.rs), which
-short-circuits when `deletion_request_disrespector` is set — storing but not
-acting on the kind-5 request. NIP-09 is omitted from the NIP-11
+**Implementation Note:** Implemented. The LMDB backend's automatic NIP-09 and
+NIP-62 processing is disabled (`process_nip09(false)`, `process_nip62(false)`);
+ngit-grasp owns deletion handling in relay policy code, which short-circuits
+when `deletion_request_disrespector` is set — storing but not acting on kind-5
+or kind-62 requests. NIP-09 and NIP-62 are omitted from the NIP-11
 `supported_nips` list in this mode.
 
 ## Recovery Mechanism
@@ -421,7 +454,8 @@ Operators need ability to **force-delete** items from holding area before retent
 
 ### Overview
 
-Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion requests:
+Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
+requests and NIP-62 vanish lifecycle removals:
 - Same holding database for 90-day retention
 - Same git archive mechanism
 - Same cascade deletion logic
@@ -440,11 +474,13 @@ Blacklist-triggered deletions use the **same infrastructure** as NIP-09 deletion
 
 ### Why Disrespector Doesn't Prevent Blacklist Deletion
 
-**Design Decision:** The `deletion_request_disrespector` configuration ONLY affects NIP-09 user-initiated deletions. It does NOT prevent blacklist-triggered deletions.
+**Design Decision:** The `deletion_request_disrespector` configuration ONLY
+affects NIP-09/NIP-62 user-initiated deletions. It does NOT prevent
+blacklist-triggered deletions.
 
 **Rationale:**
 1. **Different Policy Goals:**
-   - NIP-09 = User agency (prevent left-pad)
+   - NIP-09/NIP-62 = User agency (prevent left-pad)
    - Blacklist = Operator safety (prevent spam/malware/abuse)
 
 2. **Archival Relays Need Moderation:**
@@ -485,9 +521,10 @@ restores holding scopes tagged `holding-source=whitelist` when they now match
 
 ## Cascade Deletion Strategy
 
-When a repository announcement is deleted (NIP-09, blacklist, or whitelist
-reconciliation), ngit-grasp cascade-deletes the main-DB events that lose their
-accepted-reference path after that announcement is removed.
+When a repository announcement is deleted (NIP-09, targeted NIP-62 vanish,
+blacklist, or whitelist reconciliation), ngit-grasp cascade-deletes the main-DB
+events that lose their accepted-reference path after that announcement is
+removed.
 
 ### Basic Rules
 
@@ -646,7 +683,9 @@ When npub1alice deletes her announcement:
 **Env:** `NGIT_DELETION_REQUEST_DISRESPECTOR`
 
 **Description:**
-When `true`, relay ignores **NIP-09 deletion requests** and acts as an archival server. Critical for preventing left-pad scenarios by ensuring at least some relays preserve deleted content.
+When `true`, relay ignores **NIP-09 deletion requests and NIP-62 vanish
+requests** and acts as an archival server. Critical for preventing left-pad
+scenarios by ensuring at least some relays preserve deleted content.
 
 **IMPORTANT:** This setting does NOT prevent blacklist-triggered deletions. Blacklist is for operator moderation (spam/malware/abuse), which archival relays still need.
 

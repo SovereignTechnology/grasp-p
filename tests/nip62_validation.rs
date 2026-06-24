@@ -22,7 +22,7 @@
 //! what a stock NIP-62 relay would do, it does NOT belong in this file.
 //!
 //! - a kind-62 targeting this relay (via `["relay", "ALL_RELAYS"]`) is accepted,
-//!   hard-deletes the author's served events, and lays down a vanish tombstone;
+//!   removes the author's served events, and lays down a vanish tombstone;
 //! - once a pubkey has vanished, any *new* event it submits is rejected by the
 //!   deletion/vanish gate with a message mentioning the vanish;
 //! - a vanish request is author-bound: author B's vanish must never delete or
