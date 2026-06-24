@@ -709,18 +709,11 @@ work):
 ### Archive-mode policy extensions
 - **Selective disrespect:** policy-based disrespect for specific criteria (e.g. popularity, community contribution, identifier allowlist).
 
-### Cleanup and deletion engine follow-up
-- **Cleanup timing strategy:** optimize cleanup behavior for both production cadence and short-retention test scenarios.
-- **Backend/index behavior verification:** continue validating deletion behavior across backend upgrades, including index consistency when relay-owned deletion paths mutate served data.
-- **Large-scale + edge-case analysis:** continue validating large dependency graphs, safety caps, and memory/performance characteristics.
-
 ### Blacklist lifecycle improvements
 - **Dynamic blacklist updates:** apply blacklist additions/removals without restart.
 - **Dedicated restore CLI:** explicit operator restore commands with clear scope selection and outcomes.
 
 ### Operator controls and UX
-- **Enhanced manual ejection:** batch operations, selective ejection (events vs git archive), export-before-eject, richer operator audit metadata.
-- **Recovery notifications:** notify owner when content is restored, so they can confirm or re-delete.
 - **Holding-area management UI:** optional web/admin UX for archive and holding lifecycle operations.
 
 ### Delayed archival strategy (active repositories)
@@ -728,13 +721,8 @@ work):
 - Support cancellation windows, notification issue creation, and schedulable delayed archival operations.
 - Expose policy knobs (notification delay, archive delay, activity/creator thresholds).
 
-### Advanced deletion semantics
-- **Generalized replaceable/addressable rollback policy:** current `e`-target rollback covers repository announcement/state (30617/30618); evaluate whether additional kinds should adopt the same behavior.
-- **PR deletion policy refinement:** continue validating PR-related deletion behavior as GRASP-06 and git-data handling evolve.
-
 ### Monitoring and integration follow-up
 - Expand deletion/archival/recovery metrics and provide dashboard + alerting guidance.
-- Re-verify compatibility as core relay features evolve.
 
 ## Conclusion
 
