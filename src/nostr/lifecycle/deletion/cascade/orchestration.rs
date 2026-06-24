@@ -30,7 +30,7 @@ struct ParsedAddressRef {
 }
 
 #[derive(Debug, Clone, Default)]
-struct CascadeRetentionPlan {
+struct CascadeDeletionPlan {
     kept_event_ids: HashSet<EventId>,
     orphan_event_ids: HashSet<EventId>,
     component_nodes: usize,
@@ -155,7 +155,7 @@ impl DeletionPolicy {
             return;
         }
 
-        let plan = match plan_cascade_retention_for_deleted_announcements(
+        let plan = match plan_deleted_announcement_cascade(
             &self.ctx.database,
             &deletable_announcements,
             &self.ctx.config.domain,
@@ -416,11 +416,11 @@ impl DeletionPolicy {
     }
 }
 
-async fn plan_cascade_retention_for_deleted_announcements(
+async fn plan_deleted_announcement_cascade(
     database: &SharedDatabase,
     deleted_announcements: &[Event],
     domain: &str,
-) -> Result<CascadeRetentionPlan, String> {
+) -> Result<CascadeDeletionPlan, String> {
     let deleted_announcement_ids: HashSet<EventId> = deleted_announcements
         .iter()
         .filter(|event| event.kind == Kind::GitRepoAnnouncement)
@@ -428,7 +428,7 @@ async fn plan_cascade_retention_for_deleted_announcements(
         .collect();
 
     if deleted_announcement_ids.is_empty() {
-        return Ok(CascadeRetentionPlan::default());
+        return Ok(CascadeDeletionPlan::default());
     }
 
     let seed_addresses: HashSet<String> = deleted_announcements
@@ -445,7 +445,7 @@ async fn plan_cascade_retention_for_deleted_announcements(
     let orphan_event_ids =
         compute_deletable_events(&graph, &kept_event_ids, &deleted_announcement_ids);
 
-    Ok(CascadeRetentionPlan {
+    Ok(CascadeDeletionPlan {
         kept_event_ids,
         orphan_event_ids,
         component_nodes: graph.nodes.len(),
