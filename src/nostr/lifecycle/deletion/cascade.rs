@@ -4,7 +4,7 @@ use nostr_relay_builder::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
 };
 
-use super::super::policy::{
+use super::policy::{
     announcement_address_of, identifier_from_event, owner_directory_component, DeletionPolicy,
 };
 use crate::nostr::lifecycle::{DeletionSource, HoldingMetadata, HOLDING_METADATA_KIND};
