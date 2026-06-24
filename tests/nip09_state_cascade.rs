@@ -72,10 +72,77 @@ fn list_repo_refs(repo_path: &std::path::Path) -> HashSet<String> {
         .collect()
 }
 
+fn assert_valid_empty_bare_repo(repo_path: &std::path::Path) {
+    assert!(
+        repo_path.is_dir(),
+        "purgatory replacement repo path must exist: {}",
+        repo_path.display()
+    );
+
+    let bare = Command::new("git")
+        .args([
+            "--git-dir",
+            repo_path.to_str().expect("repo path"),
+            "rev-parse",
+            "--is-bare-repository",
+        ])
+        .output()
+        .expect("run git rev-parse --is-bare-repository");
+    assert!(
+        bare.status.success(),
+        "replacement repo must be a valid bare git repo: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim(),
+        "true",
+        "replacement repo must report itself as bare"
+    );
+
+    let refs = Command::new("git")
+        .args([
+            "--git-dir",
+            repo_path.to_str().expect("repo path"),
+            "show-ref",
+        ])
+        .output()
+        .expect("run git show-ref on replacement repo");
+    assert!(
+        !refs.status.success(),
+        "empty replacement repo must not have refs: {}",
+        String::from_utf8_lossy(&refs.stdout)
+    );
+}
+
 async fn open_holding(relay: &TestRelay) -> HoldingStore {
     HoldingStore::open_lmdb(relay.relay_data_path(), relay.git_data_path())
         .await
         .expect("open holding db")
+}
+
+async fn raw_announcement_served_by_coordinate(
+    relay_url: &str,
+    announcement: &Event,
+    repo_id: &str,
+) -> bool {
+    let raw_client = Client::builder()
+        .authenticator(SignerAuthenticator::new(Keys::generate()))
+        .build();
+    raw_client.add_relay(relay_url).await.expect("add relay");
+    raw_client.connect().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let filter = Filter::new()
+        .kind(Kind::GitRepoAnnouncement)
+        .author(announcement.pubkey)
+        .identifier(repo_id);
+    raw_client
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(2))
+        .await
+        .expect("raw query announcement by coordinate")
+        .iter()
+        .any(|e| e.id == announcement.id)
 }
 
 fn metadata_has_tag(event: &Event, key: &str, value: Option<&str>) -> bool {
@@ -492,12 +559,32 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
 
     let (announcement, repo_id, original_state) =
         publish_served_repo_with_state_event(&client, "state-rollback-none").await;
+    let dependent_issue = client
+        .create_issue(
+            &announcement,
+            "state delete dependent issue",
+            "must move with announcement scope",
+            vec![],
+        )
+        .expect("build dependent issue");
+    client
+        .send_event(dependent_issue.clone())
+        .await
+        .expect("send dependent issue");
     let owner_repo = repo_path(&relay, &client, &repo_id);
     let holding = open_holding(&relay).await;
+    let relay_url = relay.url().to_string();
 
     assert!(
         list_repo_refs(&owner_repo).contains("refs/heads/main"),
         "main ref must exist before deleting the only active state"
+    );
+    assert!(
+        client
+            .is_event_on_relay(dependent_issue.id)
+            .await
+            .expect("query dependent issue before deletion"),
+        "dependent issue must be served before deleting the only active state"
     );
 
     client
@@ -524,7 +611,15 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
         !announcement_served_by_coordinate(&client, &announcement, &repo_id).await,
         "announcement must not remain served by coordinate when no active state exists"
     );
+    assert!(
+        !client
+            .is_event_on_relay(dependent_issue.id)
+            .await
+            .expect("query dependent issue after no-active-state transition"),
+        "dependent issue must not remain served when its announcement scope moves to purgatory"
+    );
 
+    assert_valid_empty_bare_repo(&owner_repo);
     let refs_after_delete = list_repo_refs(&owner_repo);
     assert!(
         !refs_after_delete
@@ -542,6 +637,10 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
     assert!(
         holding.has_event(&announcement.id).await,
         "announcement must be moved to holding during no-active-state transition"
+    );
+    assert!(
+        holding.has_event(&dependent_issue.id).await,
+        "dependent issue must be moved to holding during no-active-state transition"
     );
     assert!(
         holding.has_event(&original_state.id).await,
@@ -605,6 +704,17 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
             .await
             .expect("query announcement after recovery promotion"),
         "announcement should be promoted from purgatory after new matching state+git data arrive"
+    );
+    assert!(
+        raw_announcement_served_by_coordinate(&relay_url, &announcement, &repo_id).await,
+        "announcement coordinate should be served again after recovery promotion"
+    );
+    assert!(
+        client
+            .is_event_on_relay(dependent_issue.id)
+            .await
+            .expect("query dependent issue after recovery promotion"),
+        "dependent issue should be restored after new matching state+git data arrive"
     );
     assert!(
         client
