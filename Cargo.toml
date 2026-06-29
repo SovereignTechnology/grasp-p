@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["ngit-grasp contributors"]
 license = "MIT"
 description = "A GRASP (Git Relays Authorized via Signed-Nostr Proofs) implementation in Rust"
-repository = "https://gitworkshop.dev/ngit-grasp"
+repository = "https://gitworkshop.dev/danconwaydev.com/ngit-grasp"
 
 [dependencies]
 # Async runtime

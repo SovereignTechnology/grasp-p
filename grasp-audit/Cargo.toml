@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 description = "Audit and compliance testing tool for GRASP protocol implementations"
 license = "MIT"
-repository = "https://gitworkshop.dev/ngit-grasp"
+repository = "https://gitworkshop.dev/danconwaydev.com/ngit-grasp"
 
 [[bin]]
 name = "grasp-audit"
