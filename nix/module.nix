@@ -6,7 +6,7 @@ let
   # Build ngit-grasp package (shared across all instances)
   ngit-grasp = pkgs.rustPlatform.buildRustPackage {
     pname = "ngit-grasp";
-    version = "1.1.0";
+    version = "1.2.0-rc.1";
     src = ../.;
     cargoLock = {
       lockFile = ../Cargo.lock;

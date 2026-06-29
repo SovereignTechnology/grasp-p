@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "grasp-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1275,7 +1275,7 @@ checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
 
 [[package]]
 name = "ngit-grasp"
-version = "1.1.0"
+version = "1.2.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",

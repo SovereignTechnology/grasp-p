@@ -1,6 +1,6 @@
 [package]
 name = "ngit-grasp"
-version = "1.1.0"
+version = "1.2.0-rc.1"
 edition = "2021"
 authors = ["ngit-grasp contributors"]
 license = "MIT"
@@ -69,7 +69,7 @@ tempfile = "3"
 
 [dev-dependencies]
 # Testing
-grasp-audit = { path = "grasp-audit" }
+grasp-audit = { path = "grasp-audit", version = "0.2.0" }
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
