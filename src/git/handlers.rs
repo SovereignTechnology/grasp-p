@@ -2,24 +2,32 @@
 //!
 //! This module implements the HTTP handlers for Git Smart HTTP protocol.
 
-use http_body_util::Full;
-use hyper::{body::Bytes, Response, StatusCode};
+use futures_util::stream;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::{body::Bytes, body::Frame, Response, StatusCode};
 use nostr_relay_builder::LocalRelay;
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::protocol::{GitService, PktLine};
 use super::subprocess::GitSubprocess;
+use super::{full_body, GitResponseBody};
 
 use crate::git::authorization::{authorize_push, parse_pushed_refs};
 use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionHooks};
+use crate::metrics::Metrics;
 use crate::nostr::lifecycle::LifecycleReadGuard;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
+
+pub(crate) const STREAM_CHANNEL_DEPTH: usize = 8;
+const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 
 /// Handle GET /info/refs?service=git-{upload,receive}-pack
 ///
@@ -28,7 +36,7 @@ pub async fn handle_info_refs(
     repo_path: PathBuf,
     service: GitService,
     git_protocol: Option<&str>,
-) -> Result<Response<Full<Bytes>>, GitError> {
+) -> Result<Response<GitResponseBody>, GitError> {
     debug!(
         "Handling info/refs for {:?} with service {:?}",
         repo_path, service
@@ -96,7 +104,7 @@ pub async fn handle_info_refs(
         .status(StatusCode::OK)
         .header("content-type", service.advertisement_content_type())
         .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(response_body)))
+        .body(full_body(response_body))
         .unwrap())
 }
 
@@ -178,7 +186,22 @@ pub(crate) fn build_git_protocol_error_response(
     service: GitService,
     error_message: &str,
     request_body: Option<&[u8]>,
-) -> Response<Full<Bytes>> {
+) -> Response<GitResponseBody> {
+    let err_pktline = encode_err_pktline(service, error_message, request_body);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", service.result_content_type())
+        .header("cache-control", "no-cache")
+        .body(full_body(err_pktline))
+        .unwrap()
+}
+
+fn encode_err_pktline(
+    service: GitService,
+    error_message: &str,
+    request_body: Option<&[u8]>,
+) -> Vec<u8> {
     // Format: "ERR <message>\n"
     let err_content = format!("ERR {}\n", error_message.trim());
 
@@ -189,21 +212,26 @@ pub(crate) fn build_git_protocol_error_response(
             .map(client_negotiated_sideband_64k)
             .unwrap_or(false);
 
-    let err_pktline = if use_sideband {
+    if use_sideband {
         let mut framed = Vec::with_capacity(1 + err_content.len());
         framed.push(0x03); // band 3 = error
         framed.extend_from_slice(err_content.as_bytes());
         PktLine::data(framed).encode()
     } else {
         PktLine::data(err_content.as_bytes()).encode()
-    };
+    }
+}
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", service.result_content_type())
-        .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(err_pktline)))
-        .unwrap()
+pub(crate) fn err_pktline_frame(
+    service: GitService,
+    error_message: &str,
+    request_body: Option<&[u8]>,
+) -> Frame<Bytes> {
+    Frame::data(Bytes::from(encode_err_pktline(
+        service,
+        error_message,
+        request_body,
+    )))
 }
 
 /// Check if a git process failure is a protocol error (vs transport error).
@@ -222,12 +250,105 @@ pub(crate) fn is_git_protocol_error(exit_code: Option<i32>, stderr: &[u8]) -> bo
     exit_code == Some(128) && !stderr.is_empty()
 }
 
+/// Build the common channel-backed Git response used by streaming handlers.
+///
+/// The handler returns this response before the Git child has necessarily
+/// exited. A background task sends `Frame<Bytes>` values into `rx`; dropping the
+/// sender closes the HTTP body. Kept `pub(crate)` so `/prs/` receive-pack can
+/// use the same wire shape as the standard endpoints.
+pub(crate) fn streaming_response(
+    service: GitService,
+    rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
+) -> Response<GitResponseBody> {
+    let body_stream = stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let body = BodyExt::boxed(StreamBody::new(body_stream));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", service.result_content_type())
+        .header("cache-control", "no-cache")
+        .body(body)
+        .unwrap()
+}
+
+/// Record Git metrics from either the request handler or the detached streaming
+/// task without repeating the `Option<Metrics>` plumbing at every callsite.
+pub(crate) fn record_git_operation(metrics: &Option<Arc<Metrics>>, operation: &str, status: &str) {
+    if let Some(metrics) = metrics {
+        metrics.record_git_operation(operation, status);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PumpResult {
+    /// Stdout reached EOF. `sent_stdout` tells callers whether it is still safe
+    /// to synthesize a Git `ERR` pkt-line for a late process failure.
+    Eof { sent_stdout: bool },
+    /// The response receiver was dropped, usually because the HTTP client
+    /// disconnected. Callers should stop the child process and clean up state.
+    ClientDisconnected,
+    /// Reading stdout failed. The read error has already been sent through the
+    /// body channel so Hyper can terminate the response stream.
+    ReadError,
+}
+
+/// Forward Git stdout into the streaming response channel.
+///
+/// This is intentionally only the stdout pump. The caller still owns process
+/// termination, stderr collection, protocol-error classification, and any
+/// endpoint-specific cleanup after the stream ends.
+pub(crate) async fn pump_stdout_to_channel<R>(
+    mut stdout: R,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+) -> PumpResult
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut read_buf = [0_u8; STREAM_CHUNK_SIZE];
+    let mut sent_stdout = false;
+
+    loop {
+        match stdout.read(&mut read_buf).await {
+            Ok(0) => return PumpResult::Eof { sent_stdout },
+            Ok(n) => {
+                sent_stdout = true;
+                if send_body_bytes(tx, read_buf[..n].to_vec()).await.is_err() {
+                    return PumpResult::ClientDisconnected;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return PumpResult::ReadError;
+            }
+        }
+    }
+}
+
+/// Drain Git stderr for later logging or Git protocol error synthesis.
+///
+/// Streaming handlers run this concurrently with stdout pumping so the child
+/// cannot block on a full stderr pipe while the HTTP body is still being read.
+pub(crate) async fn read_stderr_to_end<R>(mut stderr: R) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut stderr_output = Vec::new();
+    if let Err(e) = stderr.read_to_end(&mut stderr_output).await {
+        warn!("Failed to read git subprocess stderr: {}", e);
+    }
+    stderr_output
+}
+
 /// Handle POST /git-upload-pack (clone/fetch)
 pub async fn handle_upload_pack(
     repo_path: PathBuf,
     request_body: Bytes,
     git_protocol: Option<&str>,
-) -> Result<Response<Full<Bytes>>, GitError> {
+    repo_lifecycle_guard: Option<LifecycleReadGuard>,
+    metrics: Option<Arc<Metrics>>,
+) -> Result<Response<GitResponseBody>, GitError> {
     debug!("Handling upload-pack for {:?}", repo_path);
 
     if !repo_path.exists() {
@@ -248,60 +369,101 @@ pub async fn handle_upload_pack(
         drop(stdin);
     }
 
-    // Read response from git's stdout
-    let mut output = Vec::new();
-    let mut stderr_output = Vec::new();
-
-    if let Some(stdout) = git.take_stdout() {
-        let mut stdout = stdout;
-        stdout.read_to_end(&mut output).await.map_err(|e| {
-            error!("Failed to read git upload-pack stdout: {}", e);
-            GitError::IoError(e)
-        })?;
-    }
-
-    if let Some(stderr) = git.take_stderr() {
-        let mut stderr = stderr;
-        stderr.read_to_end(&mut stderr_output).await.map_err(|e| {
-            error!("Failed to read git upload-pack stderr: {}", e);
-            GitError::IoError(e)
-        })?;
-    }
-
-    // Wait for process
-    let status = git.wait().await.map_err(|e| {
-        error!("Failed to wait for git upload-pack process: {}", e);
-        GitError::IoError(e)
+    let stdout = git.take_stdout().ok_or_else(|| {
+        GitError::IoError(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "git upload-pack stdout unavailable",
+        ))
     })?;
+    let stderr = git.take_stderr();
 
-    if !status.success() {
+    // Stream upload-pack stdout as Git produces it instead of buffering the
+    // whole fetch response in memory. The detached task below owns the child
+    // until EOF so the request future can return the HTTP body immediately.
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
+
+    tokio::spawn(async move {
+        stream_upload_pack_output(git, stdout, stderr, tx, repo_lifecycle_guard, metrics).await;
+    });
+
+    Ok(streaming_response(GitService::UploadPack, rx))
+}
+
+async fn stream_upload_pack_output<S, E>(
+    mut git: GitSubprocess,
+    stdout: S,
+    stderr: Option<E>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    repo_lifecycle_guard: Option<LifecycleReadGuard>,
+    metrics: Option<Arc<Metrics>>,
+) where
+    S: tokio::io::AsyncRead + Unpin + Send + 'static,
+    E: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
+    let pump_result = pump_stdout_to_channel(stdout, &tx).await;
+
+    if !matches!(pump_result, PumpResult::Eof { .. }) {
+        let _ = git.kill().await;
+    }
+
+    let status = match git.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = tx.send(Err(e)).await;
+            drop(repo_lifecycle_guard);
+            record_git_operation(&metrics, "clone", "error");
+            return;
+        }
+    };
+
+    // Keep the repository lifecycle read lock until git-upload-pack exits so
+    // deletion/archive/restore cannot remove or replace the bare repository
+    // while Git is still reading it in the detached streaming task.
+    drop(repo_lifecycle_guard);
+
+    let stderr_output = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    if !status.success() && matches!(pump_result, PumpResult::Eof { sent_stdout: false }) {
+        record_git_operation(&metrics, "clone", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
+        let msg = if stderr_str.trim().is_empty() {
+            format!("git upload-pack failed with code {:?}", status.code())
+        } else {
+            stderr_str.to_string()
+        };
 
-        // Check if this is a git protocol error (exit code 128 with stderr)
-        // Protocol errors should be returned as HTTP 200 with ERR pkt-line
         if is_git_protocol_error(status.code(), &stderr_output) {
             warn!(
                 "Git upload-pack protocol error (returning ERR pkt-line): {}",
                 stderr_str
             );
-            return Ok(build_git_protocol_error_response(
-                GitService::UploadPack,
-                &stderr_str,
-                None,
-            ));
+        } else {
+            error!("Git upload-pack failed: {}", stderr_str);
         }
 
-        // Transport errors (spawn failures, signals, etc.) remain as HTTP 500
-        error!("Git upload-pack failed: {}", stderr_str);
-        return Err(GitError::GitFailed(status.code()));
+        // The streaming response headers have already been sent. If Git failed
+        // before producing any stdout, surface a protocol-visible ERR pkt-line
+        // instead of silently completing an empty HTTP 200 body.
+        let _ = tx
+            .send(Ok(err_pktline_frame(GitService::UploadPack, &msg, None)))
+            .await;
+    } else if !status.success() {
+        record_git_operation(&metrics, "clone", "error");
+        let stderr_str = String::from_utf8_lossy(&stderr_output);
+        error!(
+            "Git upload-pack failed after streaming stdout: {}",
+            stderr_str
+        );
+    } else if matches!(pump_result, PumpResult::Eof { .. }) {
+        debug!("Git upload-pack stream completed successfully");
+        record_git_operation(&metrics, "clone", "success");
+    } else {
+        record_git_operation(&metrics, "clone", "error");
     }
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", GitService::UploadPack.result_content_type())
-        .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(output)))
-        .unwrap())
 }
 
 /// Handle POST /git-receive-pack (push)
@@ -338,8 +500,9 @@ pub async fn handle_receive_pack(
     git_data_path: &str,
     git_protocol: Option<&str>,
     repo_lifecycle_guard: Option<LifecycleReadGuard>,
-    promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
-) -> Result<Response<Full<Bytes>>, GitError> {
+    promotion_hooks: Option<Arc<dyn PurgatoryPromotionHooks>>,
+    metrics: Option<Arc<Metrics>>,
+) -> Result<Response<GitResponseBody>, GitError> {
     debug!("Handling receive-pack for {:?}", repo_path);
 
     if !repo_path.exists() {
@@ -366,6 +529,7 @@ pub async fn handle_receive_pack(
         Ok(auth_result) => {
             if !auth_result.authorized {
                 warn!("Push rejected for {}: {}", identifier, auth_result.reason);
+                record_git_operation(&metrics, "push", "error");
                 return Ok(build_git_protocol_error_response(
                     GitService::ReceivePack,
                     &format!("authorisation failed: {}", auth_result.reason),
@@ -383,6 +547,7 @@ pub async fn handle_receive_pack(
         }
         Err(e) => {
             warn!("Authorization check failed for {}: {}", identifier, e);
+            record_git_operation(&metrics, "push", "error");
             return Ok(build_git_protocol_error_response(
                 GitService::ReceivePack,
                 &format!("authorisation failed: {}", e),
@@ -404,54 +569,146 @@ pub async fn handle_receive_pack(
         drop(stdin);
     }
 
-    // Read response from git's stdout
-    let mut output = Vec::new();
-    let mut stderr_output = Vec::new();
-
-    if let Some(stdout) = git.take_stdout() {
-        let mut stdout = stdout;
-        stdout.read_to_end(&mut output).await.map_err(|e| {
-            error!("Failed to read git receive-pack stdout: {}", e);
-            GitError::IoError(e)
-        })?;
-    }
-
-    if let Some(stderr) = git.take_stderr() {
-        let mut stderr = stderr;
-        stderr.read_to_end(&mut stderr_output).await.map_err(|e| {
-            error!("Failed to read git receive-pack stderr: {}", e);
-            GitError::IoError(e)
-        })?;
-    }
-
-    // Wait for process
-    let status = git.wait().await.map_err(|e| {
-        error!("Failed to wait for git receive-pack process: {}", e);
-        GitError::IoError(e)
+    let stdout = git.take_stdout().ok_or_else(|| {
+        GitError::IoError(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "git receive-pack stdout unavailable",
+        ))
     })?;
+    let stderr = git.take_stderr();
+
+    // Do not buffer receive-pack stdout: for large pushes Git may spend tens of
+    // seconds resolving deltas/checking connectivity after the client finishes
+    // uploading. Streaming sideband progress keeps libgit2 clients from
+    // hitting their per-recv timeout during that otherwise-silent window.
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
+    let pushed_refs = parse_pushed_refs(&request_body);
+    let new_oids: HashSet<String> = pushed_refs
+        .iter()
+        .filter(|(_, new_oid, _)| new_oid != "0000000000000000000000000000000000000000")
+        .map(|(_, new_oid, _)| new_oid.clone())
+        .collect();
+    let request_body_for_errors = request_body.clone();
+    let identifier = identifier.to_owned();
+    let git_data_path = git_data_path.to_owned();
+
+    tokio::spawn(async move {
+        stream_receive_pack_output(
+            git,
+            stdout,
+            stderr,
+            tx,
+            repo_path,
+            new_oids,
+            database,
+            relay,
+            identifier,
+            purgatory,
+            git_data_path,
+            request_body_for_errors,
+            repo_lifecycle_guard,
+            promotion_hooks,
+            metrics,
+        )
+        .await;
+    });
+
+    Ok(streaming_response(GitService::ReceivePack, rx))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_receive_pack_output<S, E>(
+    mut git: GitSubprocess,
+    stdout: S,
+    stderr: Option<E>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    repo_path: PathBuf,
+    new_oids: HashSet<String>,
+    database: SharedDatabase,
+    relay: LocalRelay,
+    identifier: String,
+    purgatory: Arc<Purgatory>,
+    git_data_path: String,
+    request_body: Bytes,
+    repo_lifecycle_guard: Option<LifecycleReadGuard>,
+    promotion_hooks: Option<Arc<dyn PurgatoryPromotionHooks>>,
+    metrics: Option<Arc<Metrics>>,
+) where
+    S: tokio::io::AsyncRead + Unpin + Send + 'static,
+    E: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
+    let pump_result = pump_stdout_to_channel(stdout, &tx).await;
+
+    if !matches!(pump_result, PumpResult::Eof { .. }) {
+        let _ = git.kill().await;
+    }
+
+    let status = match git.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = tx.send(Err(e)).await;
+            drop(repo_lifecycle_guard);
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    };
+
+    let stderr_output = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let sent_stdout = match pump_result {
+        PumpResult::Eof { sent_stdout } => sent_stdout,
+        PumpResult::ClientDisconnected | PumpResult::ReadError => {
+            drop(repo_lifecycle_guard);
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    };
 
     if !status.success() {
         drop(repo_lifecycle_guard);
+        record_git_operation(&metrics, "push", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
 
-        // Check if this is a git protocol error (exit code 128 with stderr)
-        // Protocol errors should be returned as HTTP 200 with ERR pkt-line
         if is_git_protocol_error(status.code(), &stderr_output) {
             warn!(
                 "Git receive-pack protocol error (returning ERR pkt-line): {}",
                 stderr_str
             );
-            return Ok(build_git_protocol_error_response(
-                GitService::ReceivePack,
-                &stderr_str,
-                Some(&request_body),
-            ));
+            if !sent_stdout {
+                let _ = tx
+                    .send(Ok(err_pktline_frame(
+                        GitService::ReceivePack,
+                        &stderr_str,
+                        Some(&request_body),
+                    )))
+                    .await;
+            }
+        } else {
+            error!("Git receive-pack failed: {}", stderr_str);
+            if !sent_stdout {
+                let msg = if stderr_str.trim().is_empty() {
+                    format!("git receive-pack failed with code {:?}", status.code())
+                } else {
+                    stderr_str.to_string()
+                };
+                let _ = tx
+                    .send(Ok(err_pktline_frame(
+                        GitService::ReceivePack,
+                        &msg,
+                        Some(&request_body),
+                    )))
+                    .await;
+            }
         }
-
-        // Transport errors (spawn failures, signals, etc.) remain as HTTP 500
-        error!("Git receive-pack failed: {}", stderr_str);
-        return Err(GitError::GitFailed(status.code()));
+        return;
     }
+
+    debug!("Git receive-pack stream completed successfully");
+    record_git_operation(&metrics, "push", "success");
 
     // Release the repository lifecycle read lock once git-receive-pack itself
     // has finished. The lock's purpose is to keep deletion/archive/restore from
@@ -462,33 +719,19 @@ pub async fn handle_receive_pack(
     // the subprocess boundary would deadlock.
     drop(repo_lifecycle_guard);
 
-    // Process newly available git data using the unified function
-    // This handles:
-    // - Discovering satisfiable events from purgatory (state events and PR events)
-    // - Syncing OIDs to authorized owner repos
-    // - Aligning refs (+ setting HEAD) in all owner repos
-    // - Saving events to database
-    // - Notifying WebSocket subscribers
-    // - Removing from purgatory
-    //
-    // Parse pushed refs to collect new OIDs
-    let pushed_refs = parse_pushed_refs(&request_body);
-    let new_oids: HashSet<String> = pushed_refs
-        .iter()
-        .filter(|(_, new_oid, _)| new_oid != "0000000000000000000000000000000000000000")
-        .map(|(_, new_oid, _)| new_oid.clone())
-        .collect();
-
-    let git_data_path_buf = std::path::Path::new(git_data_path);
-
+    // Git's receive-pack response has already been streamed verbatim, including
+    // its final flush. Run GRASP follow-up work before closing the HTTP body so
+    // push completion still implies local refs/HEAD are aligned, but treat those
+    // follow-up failures as internal/log-only rather than client-visible push
+    // rejections.
     match process_newly_available_git_data(
         &repo_path,
         &new_oids,
         &database,
         Some(&relay),
         &purgatory,
-        git_data_path_buf,
-        promotion_hooks,
+        std::path::Path::new(&git_data_path),
+        promotion_hooks.as_deref(),
     )
     .await
     {
@@ -516,16 +759,13 @@ pub async fn handle_receive_pack(
             );
         }
     }
+}
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            "content-type",
-            GitService::ReceivePack.result_content_type(),
-        )
-        .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(output)))
-        .unwrap())
+async fn send_body_bytes(
+    tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    bytes: Vec<u8>,
+) -> Result<(), mpsc::error::SendError<Result<Frame<Bytes>, io::Error>>> {
+    tx.send(Ok(Frame::data(Bytes::from(bytes)))).await
 }
 
 /// Errors that can occur in Git handlers
@@ -591,7 +831,7 @@ mod tests {
         out
     }
 
-    async fn response_body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+    async fn response_body_bytes(resp: Response<GitResponseBody>) -> Vec<u8> {
         resp.into_body()
             .collect()
             .await
@@ -696,6 +936,39 @@ mod tests {
             build_git_protocol_error_response(GitService::UploadPack, "not our ref", Some(&body));
         let raw = response_body_bytes(resp).await;
         assert_eq!(raw[4], b'E');
+    }
+
+    #[tokio::test]
+    async fn streaming_body_yields_stdout_before_eof() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{timeout, Duration};
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
+
+        let pump_task = tokio::spawn(async move { pump_stdout_to_channel(reader, &tx).await });
+        writer.write_all(b"progress chunk").await.unwrap();
+
+        let mut body = streaming_response(GitService::ReceivePack, rx).into_body();
+        let frame = timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("stream should yield first stdout chunk before EOF")
+            .expect("stream should still be open")
+            .expect("stdout chunk should not be a body error");
+
+        let data = frame.into_data().expect("frame should contain data");
+        assert_eq!(data, Bytes::from_static(b"progress chunk"));
+
+        assert!(
+            !pump_task.is_finished(),
+            "stdout pump should still be waiting for EOF after yielding first chunk"
+        );
+
+        drop(writer);
+        assert_eq!(
+            pump_task.await.unwrap(),
+            PumpResult::Eof { sent_stdout: true }
+        );
     }
 
     #[tokio::test]

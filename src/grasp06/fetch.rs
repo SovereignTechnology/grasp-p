@@ -12,18 +12,20 @@
 //!
 //! Receive-pack lives in [`crate::grasp06::receive`].
 
-use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::Response;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tracing::{debug, warn};
 
 use crate::git::handlers::{handle_info_refs, handle_upload_pack, GitError};
 use crate::git::protocol::GitService;
+use crate::git::GitResponseBody;
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
+use crate::metrics::Metrics;
 
 /// Handle `GET /prs/<npub>/<id>.git/info/refs?service=...`.
 ///
@@ -38,7 +40,7 @@ pub async fn handle_prs_info_refs(
     git_data_path: &str,
     service: GitService,
     git_protocol: Option<&str>,
-) -> Result<Response<Full<Bytes>>, GitError> {
+) -> Result<Response<GitResponseBody>, GitError> {
     let real_repo = prs_repo_path(
         Path::new(git_data_path),
         &prs.submitter.to_hex(),
@@ -75,7 +77,8 @@ pub async fn handle_prs_upload_pack(
     git_data_path: &str,
     body: Bytes,
     git_protocol: Option<&str>,
-) -> Result<Response<Full<Bytes>>, GitError> {
+    metrics: Option<Arc<Metrics>>,
+) -> Result<Response<GitResponseBody>, GitError> {
     let real_repo = prs_repo_path(
         Path::new(git_data_path),
         &prs.submitter.to_hex(),
@@ -87,7 +90,7 @@ pub async fn handle_prs_upload_pack(
             "/prs/ upload-pack: real repo found at {} — delegating",
             real_repo.display()
         );
-        return handle_upload_pack(real_repo, body, git_protocol).await;
+        return handle_upload_pack(real_repo, body, git_protocol, None, metrics).await;
     }
 
     debug!(
@@ -96,10 +99,74 @@ pub async fn handle_prs_upload_pack(
         prs.identifier
     );
     let temp = init_empty_bare_repo()?;
+    handle_prs_upload_pack_buffered(temp, body, git_protocol).await
+}
+
+async fn handle_prs_upload_pack_buffered(
+    temp: TempDir,
+    request_body: Bytes,
+    git_protocol: Option<&str>,
+) -> Result<Response<GitResponseBody>, GitError> {
+    use crate::git::full_body;
+    use crate::git::handlers::{build_git_protocol_error_response, is_git_protocol_error};
+    use crate::git::subprocess::GitSubprocess;
+    use hyper::StatusCode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let repo_path = temp.path().to_path_buf();
-    let response = handle_upload_pack(repo_path, body, git_protocol).await;
+    let mut git = GitSubprocess::spawn(GitService::UploadPack, &repo_path, false, git_protocol)
+        .map_err(GitError::ProcessSpawnFailed)?;
+
+    if let Some(mut stdin) = git.take_stdin() {
+        stdin
+            .write_all(&request_body)
+            .await
+            .map_err(GitError::IoError)?;
+        drop(stdin);
+    }
+
+    let mut output = Vec::new();
+    let mut stderr_output = Vec::new();
+
+    if let Some(mut stdout) = git.take_stdout() {
+        stdout
+            .read_to_end(&mut output)
+            .await
+            .map_err(GitError::IoError)?;
+    }
+
+    if let Some(mut stderr) = git.take_stderr() {
+        stderr
+            .read_to_end(&mut stderr_output)
+            .await
+            .map_err(GitError::IoError)?;
+    }
+
+    let status = git.wait().await.map_err(GitError::IoError)?;
+
+    // Keep the TempDir alive until git has fully exited. The standard
+    // upload-pack handler streams in a detached task; using that for this
+    // synthesized repo would race with dropping `temp` and deleting the repo.
     drop(temp);
-    response
+
+    if !status.success() {
+        let stderr_str = String::from_utf8_lossy(&stderr_output);
+        if is_git_protocol_error(status.code(), &stderr_output) {
+            return Ok(build_git_protocol_error_response(
+                GitService::UploadPack,
+                &stderr_str,
+                None,
+            ));
+        }
+        return Err(GitError::GitFailed(status.code()));
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", GitService::UploadPack.result_content_type())
+        .header("cache-control", "no-cache")
+        .body(full_body(output))
+        .unwrap())
 }
 
 /// Create a fresh empty bare repo in a temp directory.

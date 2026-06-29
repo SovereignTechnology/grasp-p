@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use base64::Engine;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, UPGRADE};
 use hyper::server::conn::http1;
@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::git;
+use crate::git::{empty_body, full_body, GitResponseBody};
 use crate::grasp06::receive::RepoInitLocks;
 use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
@@ -33,6 +34,8 @@ use crate::nostr::SharedDatabase;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
+
+type HttpBody = GitResponseBody;
 
 /// CORS headers required by GRASP-01 specification (lines 40-47)
 const CORS_ALLOW_ORIGIN: &str = "*";
@@ -159,7 +162,7 @@ impl HttpService {
 }
 
 impl Service<Request<Incoming>> for HttpService {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<HttpBody>;
     type Error = String;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -183,7 +186,7 @@ impl Service<Request<Incoming>> for HttpService {
                 Ok(
                     add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                         .status(204)
-                        .body(Full::new(Bytes::new()))
+                        .body(empty_body())
                         .unwrap(),
                 )
             });
@@ -245,7 +248,7 @@ impl Service<Request<Incoming>> for HttpService {
                         raw_body
                     };
 
-                    let result: Result<Response<Full<Bytes>>, git::handlers::GitError> =
+                    let result: Result<Response<HttpBody>, git::handlers::GitError> =
                         match (method_clone.as_ref(), subpath.as_str()) {
                             // GET|HEAD /info/refs?service=git-{upload,receive}-pack
                             // HEAD must mirror GET headers with no body (RFC 9110 §9.3.2)
@@ -284,16 +287,33 @@ impl Service<Request<Incoming>> for HttpService {
 
                             // POST /git-upload-pack — clone/fetch.
                             (m, "git-upload-pack") if m == Method::POST => {
+                                let streams_real_repo = crate::grasp06::paths::prs_repo_path(
+                                    std::path::Path::new(&git_data_path),
+                                    &prs.submitter.to_hex(),
+                                    &prs.identifier,
+                                )
+                                .exists();
                                 let r = crate::grasp06::fetch::handle_prs_upload_pack(
                                     &prs,
                                     &git_data_path,
                                     body_bytes,
                                     git_protocol.as_deref(),
+                                    metrics_clone.clone(),
                                 )
                                 .await;
                                 if let Some(ref m) = metrics_clone {
                                     let status = if r.is_ok() { "success" } else { "error" };
-                                    m.record_git_operation("clone", status);
+                                    if streams_real_repo && r.is_ok() {
+                                        // Real /prs/ repos delegate to the standard streaming
+                                        // upload-pack handler. The streaming task records the final
+                                        // git-upload-pack success/failure when Git exits; this
+                                        // `Ok(Response)` only means Hyper received a body stream.
+                                    } else {
+                                        // Synthesized empty repos are still buffered, so `Ok` here
+                                        // means git-upload-pack has already completed. For streamed
+                                        // setup errors, there is no task to record the failure.
+                                        m.record_git_operation("clone", status);
+                                    }
                                 }
                                 r
                             }
@@ -302,6 +322,11 @@ impl Service<Request<Incoming>> for HttpService {
                             // refs/nostr/<event-id>, reject anything else,
                             // per GRASP-06 06.md line 15.
                             (m, "git-receive-pack") if m == Method::POST => {
+                                // Metrics are recorded inside the `/prs/`
+                                // handler and its detached streaming task. For
+                                // successful setup this `await` only means the
+                                // response stream was created, not that Git has
+                                // finished receiving the push.
                                 let r = crate::grasp06::receive::handle_prs_receive_pack(
                                     &prs,
                                     body_bytes,
@@ -314,12 +339,9 @@ impl Service<Request<Incoming>> for HttpService {
                                     git_protocol.as_deref(),
                                     repo_init_locks.clone(),
                                     &config_clone.domain,
+                                    metrics_clone.clone(),
                                 )
                                 .await;
-                                if let Some(ref m) = metrics_clone {
-                                    let status = if r.is_ok() { "success" } else { "error" };
-                                    m.record_git_operation("push", status);
-                                }
                                 r
                             }
 
@@ -332,7 +354,7 @@ impl Service<Request<Incoming>> for HttpService {
                             // RFC 9110 §9.3.2: HEAD response must have same headers as GET
                             // but no body.
                             let body = if method_clone == Method::HEAD {
-                                Full::new(Bytes::new())
+                                empty_body()
                             } else {
                                 body
                             };
@@ -360,7 +382,7 @@ impl Service<Request<Incoming>> for HttpService {
                             let error_msg = format!("Git error: {}", e);
                             Ok(add_cors_headers(Response::builder())
                                 .status(e.status_code())
-                                .body(Full::new(Bytes::from(error_msg)))
+                                .body(full_body(error_msg))
                                 .unwrap())
                         }
                     }
@@ -482,7 +504,7 @@ impl Service<Request<Incoming>> for HttpService {
 
                     // POST /git-upload-pack (clone/fetch)
                     (m, "git-upload-pack") if m == Method::POST => {
-                        let _repo_lifecycle_guard = match PublicKey::parse(&npub) {
+                        let repo_lifecycle_guard = match PublicKey::parse(&npub) {
                             Ok(owner_pk) => Some(
                                 lifecycle
                                     .read_repository(&owner_pk.to_hex(), &identifier)
@@ -494,11 +516,17 @@ impl Service<Request<Incoming>> for HttpService {
                             repo_path,
                             body_bytes,
                             git_protocol.as_deref(),
+                            repo_lifecycle_guard,
+                            metrics_clone.clone(),
                         )
                         .await;
                         if let Some(ref m) = metrics_clone {
-                            let status = if result.is_ok() { "success" } else { "error" };
-                            m.record_git_operation("clone", status);
+                            if result.is_err() {
+                                // On `Ok(Response)`, the streaming task owns the actual
+                                // git-upload-pack outcome metric. The synchronous handler result
+                                // only says whether stream setup succeeded.
+                                m.record_git_operation("clone", "error");
+                            }
                         }
                         result
                     }
@@ -516,7 +544,7 @@ impl Service<Request<Incoming>> for HttpService {
                                 }
                                 return Ok(add_cors_headers(Response::builder())
                                     .status(hyper::StatusCode::BAD_REQUEST)
-                                    .body(Full::new(Bytes::from(format!("Invalid npub: {}", e))))
+                                    .body(full_body(format!("Invalid npub: {}", e)))
                                     .unwrap());
                             }
                         };
@@ -528,9 +556,9 @@ impl Service<Request<Incoming>> for HttpService {
                         );
 
                         let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
-                            &write_policy,
-                            &rejected_events_index,
-                            Some(&relay),
+                            write_policy.clone(),
+                            rejected_events_index.clone(),
+                            Some(relay.clone()),
                         );
 
                         let result = git::handlers::handle_receive_pack(
@@ -544,13 +572,19 @@ impl Service<Request<Incoming>> for HttpService {
                             &git_data_path,
                             git_protocol.as_deref(),
                             repo_lifecycle_guard,
-                            Some(&promotion_hooks),
+                            Some(Arc::new(promotion_hooks)),
+                            metrics_clone.clone(),
                         )
                         .await;
 
                         if let Some(ref m) = metrics_clone {
-                            let status = if result.is_ok() { "success" } else { "error" };
-                            m.record_git_operation("push", status);
+                            if result.is_err() {
+                                // On `Ok(Response)`, the operation may be a buffered protocol
+                                // rejection already recorded by `handle_receive_pack`, or a stream
+                                // whose final git-receive-pack outcome will be recorded by the
+                                // streaming task. Do not treat this setup result as success.
+                                m.record_git_operation("push", "error");
+                            }
                         }
 
                         result
@@ -566,7 +600,7 @@ impl Service<Request<Incoming>> for HttpService {
                         // RFC 9110 §9.3.2: HEAD response must have same headers as GET
                         // but no body.
                         let body = if method == Method::HEAD {
-                            Full::new(Bytes::new())
+                            empty_body()
                         } else {
                             body
                         };
@@ -595,7 +629,7 @@ impl Service<Request<Incoming>> for HttpService {
                         let error_msg = format!("Git error: {}", e);
                         Ok(add_cors_headers(Response::builder())
                             .status(e.status_code())
-                            .body(Full::new(Bytes::from(error_msg)))
+                            .body(full_body(error_msg))
                             .unwrap())
                     }
                 }
@@ -625,7 +659,7 @@ impl Service<Request<Incoming>> for HttpService {
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(200)
                             .header("content-type", "application/nostr+json")
-                            .body(Full::new(Bytes::from(json)))
+                            .body(full_body(json))
                             .unwrap(),
                     )
                 });
@@ -656,7 +690,7 @@ impl Service<Request<Incoming>> for HttpService {
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(200)
                             .header("content-type", "text/html; charset=utf-8")
-                            .body(Full::new(Bytes::from(html)))
+                            .body(full_body(html))
                             .unwrap(),
                     )
                 } else {
@@ -666,7 +700,7 @@ impl Service<Request<Incoming>> for HttpService {
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(404)
                             .header("content-type", "text/html; charset=utf-8")
-                            .body(Full::new(Bytes::from(html)))
+                            .body(full_body(html))
                             .unwrap(),
                     )
                 }
@@ -722,7 +756,7 @@ impl Service<Request<Incoming>> for HttpService {
                         .header(CONNECTION, "upgrade")
                         .header(UPGRADE, "websocket")
                         .header(SEC_WEBSOCKET_ACCEPT, derived.unwrap())
-                        .body(Full::new(Bytes::new()))
+                        .body(empty_body())
                         .unwrap())
                 });
             }
@@ -738,7 +772,7 @@ impl Service<Request<Incoming>> for HttpService {
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(200)
                             .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                            .body(Full::new(Bytes::from(output)))
+                            .body(full_body(output))
                             .unwrap(),
                     )
                 });
@@ -748,7 +782,7 @@ impl Service<Request<Incoming>> for HttpService {
                     Ok(
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(404)
-                            .body(Full::new(Bytes::from("Metrics disabled")))
+                            .body(full_body("Metrics disabled"))
                             .unwrap(),
                     )
                 });
@@ -763,7 +797,7 @@ impl Service<Request<Incoming>> for HttpService {
                         .status(200)
                         .header("content-type", "image/png")
                         .header("cache-control", "public, max-age=86400")
-                        .body(Full::new(Bytes::from_static(ICON_PNG)))
+                        .body(full_body(Bytes::from_static(ICON_PNG)))
                         .unwrap(),
                 )
             });
@@ -779,7 +813,7 @@ impl Service<Request<Incoming>> for HttpService {
                     add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                         .status(200)
                         .header("content-type", "text/html; charset=utf-8")
-                        .body(Full::new(Bytes::from(html)))
+                        .body(full_body(html))
                         .unwrap(),
                 )
             } else {
@@ -789,7 +823,7 @@ impl Service<Request<Incoming>> for HttpService {
                     add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                         .status(404)
                         .header("content-type", "text/html; charset=utf-8")
-                        .body(Full::new(Bytes::from(html)))
+                        .body(full_body(html))
                         .unwrap(),
                 )
             }

@@ -27,50 +27,65 @@
 //!    own ref locking handles intra-push concurrency, and the
 //!    `in_flight` counter is what off-push cleanup paths consult to know
 //!    a push is active.
-//! 4. Runs `git-receive-pack` against the repo, mirroring the subprocess
-//!    plumbing in [`crate::git::handlers::handle_receive_pack`].
-//! 5. For each accepted `refs/nostr/<event-id>` ref, re-runs the shared
-//!    pre-validation as a **race safety net** — an event for one of the
-//!    pushed ids may have arrived via WebSocket during the receive-pack
-//!    window. On mismatch the ref is deleted (and any populated purgatory
-//!    entry is dropped). When neither the DB nor purgatory knows about
-//!    the event a scoped PR placeholder is added so the standard
-//!    30-minute purgatory sweep can clean it up if the event never
+//! 4. Starts `git-receive-pack`, writes the full request body to the child, and
+//!    immediately returns an HTTP response whose body is backed by a bounded
+//!    channel. From this point on Hyper can stream stdout to the client while a
+//!    detached task owns the subprocess, stderr, and all post-push work.
+//! 5. In the detached task, each stdout chunk is forwarded as it is read. If Git
+//!    exits with a protocol-level error before writing stdout, the task sends a
+//!    Git `ERR` pkt-line through the same stream so clients still see a normal
+//!    receive-pack failure. If stdout has already been sent, the task cannot
+//!    safely append a late protocol error without corrupting the Git stream, so
+//!    it logs and performs cleanup instead.
+//! 6. After a successful receive-pack, for each accepted
+//!    `refs/nostr/<event-id>` ref, re-runs the shared pre-validation as a
+//!    **race safety net** — an event for one of the pushed ids may have arrived
+//!    via WebSocket during the receive-pack window. On mismatch the ref is
+//!    deleted (and any populated purgatory entry is dropped). When neither the
+//!    DB nor purgatory knows about the event a scoped PR placeholder is added so
+//!    the standard 30-minute purgatory sweep can clean it up if the event never
 //!    arrives.
-//! 6. Re-acquires the per-path mutex briefly, decrements `in_flight`,
-//!    and — if no other push is in flight and the repo has zero refs
-//!    left — removes the bare directory. Always runs, including on
-//!    receive-pack protocol errors, so a failed push that has just
-//!    initialised an empty repo does not leak it.
-//! 7. Triggers the standard purgatory-release path via
-//!    [`crate::git::sync::process_newly_available_git_data`] so PR events
-//!    already in purgatory waiting for these commits get promoted.
+//! 7. The detached task re-acquires the per-path mutex briefly, decrements
+//!    `in_flight`, and — if no other push is in flight and the repo has zero
+//!    refs left — removes the bare directory. This runs on success, protocol
+//!    errors, client disconnects, and subprocess I/O failures, so a failed push
+//!    that has just initialised an empty repo does not leak it.
+//! 8. Finally, on successful pushes where the repo still exists, the detached
+//!    task triggers the standard purgatory-release path via
+//!    [`crate::git::sync::process_newly_available_git_data`] so PR events already
+//!    in purgatory waiting for these commits get promoted.
 
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::{Response, StatusCode};
+use hyper::body::{Bytes, Frame};
+use hyper::Response;
 use nostr_relay_builder::LocalRelay;
 use nostr_sdk::prelude::*;
 use std::sync::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::git::authorization::{
     parse_pushed_refs, pre_validate_refs_nostr_push, NostrRefPreValidation, PrsUrlConstraints,
 };
-use crate::git::handlers::{build_git_protocol_error_response, is_git_protocol_error, GitError};
+use crate::git::handlers::{
+    build_git_protocol_error_response, err_pktline_frame, is_git_protocol_error,
+    pump_stdout_to_channel, read_stderr_to_end, record_git_operation, streaming_response, GitError,
+    PumpResult, STREAM_CHANNEL_DEPTH,
+};
 use crate::git::protocol::GitService;
 use crate::git::subprocess::GitSubprocess;
 use crate::git::sync::process_newly_available_git_data;
-use crate::git::{delete_ref, list_refs};
+use crate::git::{delete_ref, list_refs, GitResponseBody};
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
+use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
@@ -85,9 +100,9 @@ use crate::sync::rejected_index::RejectedEventsIndex;
 ///
 /// * by the receive handler to perform `git init --bare` and register
 ///   the request as in-flight (`fetch_add` on `in_flight`),
-/// * by the receive handler again at end-of-push to decrement
-///   `in_flight` and, if no other push is in flight and the repo has
-///   zero refs, remove the bare directory,
+/// * by the detached receive-pack streaming task at end-of-push to decrement
+///   `in_flight` and, if no other push is in flight and the repo has zero refs,
+///   remove the bare directory,
 /// * by off-push cleanup paths (PR-event validation discard, purgatory
 ///   expiry) for the duration of one `delete_ref` + optional
 ///   `remove_dir_all`.
@@ -161,7 +176,8 @@ pub async fn handle_prs_receive_pack(
     git_protocol: Option<&str>,
     repo_init_locks: RepoInitLocks,
     domain: &str,
-) -> Result<Response<Full<Bytes>>, GitError> {
+    metrics: Option<Arc<Metrics>>,
+) -> Result<Response<GitResponseBody>, GitError> {
     // 1. Pre-scan refs and reject the whole push if any ref name is not
     //    `refs/nostr/<64-lowercase-hex>`. We use the same parser as the
     //    standard receive-pack path so behaviour stays in lock-step.
@@ -172,6 +188,7 @@ pub async fn handle_prs_receive_pack(
             prs.submitter.to_hex(),
             prs.identifier
         );
+        record_git_operation(&metrics, "push", "error");
         return Ok(build_git_protocol_error_response(
             GitService::ReceivePack,
             "no ref updates found in push",
@@ -187,6 +204,7 @@ pub async fn handle_prs_receive_pack(
                 prs.identifier,
                 reason
             );
+            record_git_operation(&metrics, "push", "error");
             return Ok(build_git_protocol_error_response(
                 GitService::ReceivePack,
                 &format!(
@@ -226,6 +244,7 @@ pub async fn handle_prs_receive_pack(
                     prs.identifier,
                     reason
                 );
+                record_git_operation(&metrics, "push", "error");
                 return Ok(build_git_protocol_error_response(
                     GitService::ReceivePack,
                     &format!("GRASP-06: {}", reason),
@@ -258,128 +277,82 @@ pub async fn handle_prs_receive_pack(
                 repo_path.display(),
                 e
             );
+            record_git_operation(&metrics, "push", "error");
             return Err(e);
         }
         state.in_flight.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 4 + 5: run receive-pack and re-validate refs without the per-path
-    //        mutex held. Wrapping in an async block lets us catch every
-    //        exit path with the same end-of-push cleanup below.
-    let process_result: Result<Response<Full<Bytes>>, GitError> = async {
-        let response = run_receive_pack(&repo_path, &request_body, git_protocol).await?;
-
-        // If the push itself failed with a protocol error (e.g. a stale
-        // OID or a corrupt pack) we return that ERR pkt-line straight
-        // back to the client without doing any post-push validation. The
-        // pre-scan in step 1 already gated ref-name shape, so we only
-        // land here for git-level failures.
-        if response.status() != StatusCode::OK {
-            return Ok(response);
-        }
-
-        // 5. Race safety net. The pre-validation in step 2 was performed
-        //    *before* `git-receive-pack` ran, so an event with one of the
-        //    pushed ids may have arrived via WebSocket during the
-        //    receive-pack window. Re-run the same shared check now and
-        //    delete the ref on any mismatch. The `Unknown` branch is the
-        //    common case — neither DB nor purgatory have heard of this
-        //    event yet — and creates a scoped placeholder so the
-        //    30-minute purgatory sweep can clean it up if the event
-        //    never arrives.
-        let post_push_constraints = PrsUrlConstraints {
-            submitter: &prs.submitter,
-            identifier: &prs.identifier,
-            domain,
-        };
-        for (_, new_oid, ref_name) in &pushed_refs {
-            let event_id_hex = ref_name
-                .strip_prefix("refs/nostr/")
-                .expect("ref shape validated above");
-            post_push_validate(
-                &database,
-                &purgatory,
-                &repo_path,
-                post_push_constraints,
-                event_id_hex,
-                new_oid,
-                ref_name,
-            )
-            .await;
-        }
-
-        Ok(response)
-    }
-    .await;
-
-    // 6. End-of-push cleanup. Always runs — including on receive-pack
-    //    protocol errors and `?`-propagated transport errors — so a
-    //    failed push that has just initialised an empty repo does not
-    //    leak it. Decrements `in_flight`; if no other push is in flight
-    //    and the repo has zero refs left, removes the bare directory.
-    {
-        let _g = state.mu.lock().expect("prs path mutex poisoned");
-        state.in_flight.fetch_sub(1, Ordering::Relaxed);
-        if state.in_flight.load(Ordering::Relaxed) == 0 {
-            if let Ok(refs) = list_refs(&repo_path) {
-                if refs.is_empty() {
-                    if let Err(e) = std::fs::remove_dir_all(&repo_path) {
-                        warn!(
-                            "/prs/ receive-pack: failed to clean up empty repo {}: {}",
-                            repo_path.display(),
-                            e
-                        );
-                    } else {
-                        debug!(
-                            "/prs/ receive-pack: removed empty repo {} (no refs after push)",
-                            repo_path.display()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let response = process_result?;
-
-    // 7. Drive the standard purgatory-release pipeline so PR events
-    //    already waiting on these commits can be promoted out of
-    //    purgatory. Only fires on a successful push, and only if the
-    //    repo still exists (it may have been removed in step 6).
-    if response.status() == StatusCode::OK && repo_path.exists() {
-        let new_oids: HashSet<String> = pushed_refs
-            .iter()
-            .filter(|(_, new_oid, _)| new_oid != "0000000000000000000000000000000000000000")
-            .map(|(_, new_oid, _)| new_oid.clone())
-            .collect();
-
-        let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
-            &write_policy,
-            &rejected_events_index,
-            Some(&relay),
-        );
-
-        if let Err(e) = process_newly_available_git_data(
-            &repo_path,
-            &new_oids,
-            &database,
-            Some(&relay),
-            &purgatory,
-            Path::new(git_data_path),
-            Some(&promotion_hooks),
-        )
-        .await
+    // 4. The pre-validation and repo creation work above must stay buffered so
+    //    rejections can be returned as a complete Git `ERR` response before any
+    //    repository state is touched. Once we start `git-receive-pack`, switch
+    //    to the same streaming shape as the standard receive-pack endpoint:
+    //    write stdin here, then hand stdout/stderr and all follow-up state to a
+    //    detached task that feeds the response body channel.
+    let mut git =
+        match GitSubprocess::spawn(GitService::ReceivePack, &repo_path, false, git_protocol)
+            .map_err(GitError::ProcessSpawnFailed)
         {
-            warn!(
-                "/prs/ receive-pack: post-push processing failed for {}/{}: {}",
-                prs.submitter.to_hex(),
-                prs.identifier,
-                e
-            );
+            Ok(git) => git,
+            Err(e) => {
+                finish_prs_receive_pack(&state, &repo_path);
+                record_git_operation(&metrics, "push", "error");
+                return Err(e);
+            }
+        };
+
+    if let Some(mut stdin) = git.take_stdin() {
+        if let Err(e) = stdin.write_all(&request_body).await {
+            let _ = git.kill().await;
+            finish_prs_receive_pack(&state, &repo_path);
+            record_git_operation(&metrics, "push", "error");
+            return Err(GitError::IoError(e));
         }
+        drop(stdin);
     }
 
-    Ok(response)
+    let stdout = match git.take_stdout() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = git.kill().await;
+            finish_prs_receive_pack(&state, &repo_path);
+            record_git_operation(&metrics, "push", "error");
+            return Err(GitError::IoError(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "git receive-pack stdout unavailable",
+            )));
+        }
+    };
+    let stderr = git.take_stderr();
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
+
+    // The request future returns as soon as the channel-backed response is
+    // built. Everything that previously happened after the buffered
+    // `run_receive_pack` call must therefore move into this task: forwarding
+    // stdout, classifying Git failures, decrementing `in_flight`, race-window
+    // validation, empty-repo cleanup, purgatory promotion, and metrics.
+    tokio::spawn(stream_prs_receive_pack_output(
+        git,
+        stdout,
+        stderr,
+        tx,
+        repo_path,
+        state,
+        pushed_refs,
+        database,
+        relay,
+        purgatory,
+        write_policy,
+        rejected_events_index,
+        git_data_path.to_string(),
+        request_body,
+        prs.submitter,
+        prs.identifier.clone(),
+        domain.to_string(),
+        metrics,
+    ));
+
+    Ok(streaming_response(GitService::ReceivePack, rx))
 }
 
 /// Return `Some(reason)` if `ref_name` is not exactly
@@ -448,75 +421,218 @@ fn ensure_repo_initialised(repo_path: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
-/// Spawn `git-receive-pack`, stream stdin/stdout/stderr, and convert the
-/// result into an HTTP response — protocol errors become 200 + ERR
-/// pkt-line, transport errors bubble up as [`GitError`]. Mirrors
-/// [`crate::git::handlers::handle_receive_pack`]'s subprocess plumbing.
-async fn run_receive_pack(
-    repo_path: &Path,
-    request_body: &Bytes,
-    git_protocol: Option<&str>,
-) -> Result<Response<Full<Bytes>>, GitError> {
-    let mut git = GitSubprocess::spawn(GitService::ReceivePack, repo_path, false, git_protocol)
-        .map_err(GitError::ProcessSpawnFailed)?;
+/// End-of-push cleanup. Always runs — including on receive-pack protocol
+/// errors and client disconnects — so a failed push that has just initialised
+/// an empty repo does not leak it. Decrements `in_flight`; if no other push is
+/// in flight and the repo has zero refs left, removes the bare directory.
+fn finish_prs_receive_pack(state: &PrsPathState, repo_path: &Path) {
+    let _g = state.mu.lock().expect("prs path mutex poisoned");
+    state.in_flight.fetch_sub(1, Ordering::Relaxed);
+    if state.in_flight.load(Ordering::Relaxed) == 0 {
+        if let Ok(refs) = list_refs(repo_path) {
+            if refs.is_empty() {
+                if let Err(e) = std::fs::remove_dir_all(repo_path) {
+                    warn!(
+                        "/prs/ receive-pack: failed to clean up empty repo {}: {}",
+                        repo_path.display(),
+                        e
+                    );
+                } else {
+                    debug!(
+                        "/prs/ receive-pack: removed empty repo {} (no refs after push)",
+                        repo_path.display()
+                    );
+                }
+            }
+        }
+    }
+}
 
-    if let Some(mut stdin) = git.take_stdin() {
-        stdin
-            .write_all(request_body)
-            .await
-            .map_err(GitError::IoError)?;
-        drop(stdin);
+/// Own the live `/prs/` receive-pack after the request handler has returned its
+/// streaming response.
+///
+/// This task is the continuation of [`handle_prs_receive_pack`], not just a
+/// stdout pump. It must preserve the old buffered handler's guarantees while the
+/// HTTP body is already streaming:
+///
+/// * if stdout reaches EOF cleanly, inspect Git's exit status and stderr;
+/// * if Git failed before sending stdout, synthesize a final Git `ERR` pkt-line
+///   through the response channel;
+/// * always run `finish_prs_receive_pack` on every terminal path after
+///   `in_flight` was incremented;
+/// * only run race-window validation and purgatory promotion after a successful
+///   receive-pack.
+#[allow(clippy::too_many_arguments)]
+async fn stream_prs_receive_pack_output<S, E>(
+    mut git: GitSubprocess,
+    stdout: S,
+    stderr: Option<E>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    repo_path: PathBuf,
+    state: Arc<PrsPathState>,
+    pushed_refs: Vec<(String, String, String)>,
+    database: SharedDatabase,
+    relay: LocalRelay,
+    purgatory: Arc<Purgatory>,
+    write_policy: Arc<Nip34WritePolicy>,
+    rejected_events_index: Arc<RejectedEventsIndex>,
+    git_data_path: String,
+    request_body: Bytes,
+    submitter: PublicKey,
+    identifier: String,
+    domain: String,
+    metrics: Option<Arc<Metrics>>,
+) where
+    S: tokio::io::AsyncRead + Unpin + Send + 'static,
+    E: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    // Drain stderr concurrently with stdout. Git can write enough diagnostics to
+    // fill its stderr pipe while still producing stdout; draining both prevents
+    // child-process deadlock and preserves stderr for protocol-error reporting.
+    let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
+    let pump_result = pump_stdout_to_channel(stdout, &tx).await;
+
+    // If the client goes away or stdout read fails, stop Git rather than letting
+    // it continue writing into a response nobody can receive. Cleanup below will
+    // still release `in_flight` after `wait()` observes process termination.
+    if !matches!(pump_result, PumpResult::Eof { .. }) {
+        let _ = git.kill().await;
     }
 
-    let mut output = Vec::new();
-    let mut stderr_output = Vec::new();
+    let status = match git.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = tx.send(Err(e)).await;
+            finish_prs_receive_pack(&state, &repo_path);
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    };
 
-    if let Some(stdout) = git.take_stdout() {
-        let mut stdout = stdout;
-        stdout
-            .read_to_end(&mut output)
-            .await
-            .map_err(GitError::IoError)?;
-    }
-    if let Some(stderr) = git.take_stderr() {
-        let mut stderr = stderr;
-        stderr
-            .read_to_end(&mut stderr_output)
-            .await
-            .map_err(GitError::IoError)?;
-    }
+    let stderr_output = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
 
-    let status = git.wait().await.map_err(GitError::IoError)?;
+    let sent_stdout = match pump_result {
+        PumpResult::Eof { sent_stdout } => sent_stdout,
+        PumpResult::ClientDisconnected | PumpResult::ReadError => {
+            finish_prs_receive_pack(&state, &repo_path);
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    };
 
     if !status.success() {
+        record_git_operation(&metrics, "push", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
         if is_git_protocol_error(status.code(), &stderr_output) {
             warn!(
                 "/prs/ git-receive-pack protocol error (returning ERR pkt-line): {}",
                 stderr_str.trim()
             );
-            return Ok(build_git_protocol_error_response(
-                GitService::ReceivePack,
-                &stderr_str,
-                Some(request_body),
-            ));
+            if !sent_stdout {
+                let _ = tx
+                    .send(Ok(err_pktline_frame(
+                        GitService::ReceivePack,
+                        &stderr_str,
+                        Some(&request_body),
+                    )))
+                    .await;
+            }
+        } else {
+            error!(
+                "/prs/ git-receive-pack failed (transport): {}",
+                stderr_str.trim()
+            );
+            if !sent_stdout {
+                let msg = if stderr_str.trim().is_empty() {
+                    format!("git receive-pack failed with code {:?}", status.code())
+                } else {
+                    stderr_str.to_string()
+                };
+                let _ = tx
+                    .send(Ok(err_pktline_frame(
+                        GitService::ReceivePack,
+                        &msg,
+                        Some(&request_body),
+                    )))
+                    .await;
+            }
         }
-        error!(
-            "/prs/ git-receive-pack failed (transport): {}",
-            stderr_str.trim()
-        );
-        return Err(GitError::GitFailed(status.code()));
+        // Whether or not an ERR frame could be sent, the HTTP headers are
+        // already committed as a streaming 200 response. The only remaining
+        // safe action is to close the body after cleanup.
+        finish_prs_receive_pack(&state, &repo_path);
+        return;
     }
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            "content-type",
-            GitService::ReceivePack.result_content_type(),
+    debug!("/prs/ git-receive-pack stream completed successfully");
+    record_git_operation(&metrics, "push", "success");
+
+    // Race safety net. The pre-validation in `handle_prs_receive_pack` was
+    // performed before `git-receive-pack` ran, so an event with one of the
+    // pushed ids may have arrived via WebSocket during the receive-pack window.
+    // Re-run the same shared check now and delete the ref on any mismatch.
+    for (_, new_oid, ref_name) in &pushed_refs {
+        let event_id_hex = ref_name
+            .strip_prefix("refs/nostr/")
+            .expect("ref shape validated above");
+        let post_push_constraints = PrsUrlConstraints {
+            submitter: &submitter,
+            identifier: &identifier,
+            domain: &domain,
+        };
+        post_push_validate(
+            &database,
+            &purgatory,
+            &repo_path,
+            post_push_constraints,
+            event_id_hex,
+            new_oid,
+            ref_name,
         )
-        .header("cache-control", "no-cache")
-        .body(Full::new(Bytes::from(output)))
-        .unwrap())
+        .await;
+    }
+
+    finish_prs_receive_pack(&state, &repo_path);
+
+    // Drive the standard purgatory-release pipeline so PR events already
+    // waiting on these commits can be promoted out of purgatory. Only fires on
+    // a successful push, and only if the repo still exists (it may have been
+    // removed by end-of-push cleanup).
+    if repo_path.exists() {
+        let new_oids: HashSet<String> = pushed_refs
+            .iter()
+            .filter(|(_, new_oid, _)| new_oid != "0000000000000000000000000000000000000000")
+            .map(|(_, new_oid, _)| new_oid.clone())
+            .collect();
+
+        let promotion_hooks = NostrPurgatoryPromotionHooks::git_push(
+            write_policy,
+            rejected_events_index,
+            Some(relay.clone()),
+        );
+
+        if let Err(e) = process_newly_available_git_data(
+            &repo_path,
+            &new_oids,
+            &database,
+            Some(&relay),
+            &purgatory,
+            Path::new(&git_data_path),
+            Some(&promotion_hooks),
+        )
+        .await
+        {
+            warn!(
+                "/prs/ receive-pack: post-push processing failed for {}/{}: {}",
+                submitter.to_hex(),
+                identifier,
+                e
+            );
+        }
+    }
 }
 
 /// Race safety net for the `/prs/` receive-pack post-push phase.
@@ -534,10 +650,11 @@ async fn run_receive_pack(
 /// - was held in purgatory with a populated entry that also mismatches
 ///   (delete the ref AND drop the purgatory entry — its event is wrong).
 ///
-/// Anything left here is best-effort: errors deleting refs are logged
-/// and the push response is not changed. The end-of-push cleanup in
-/// [`handle_prs_receive_pack`] removes the bare repo if every ref ends
-/// up deleted.
+/// Anything left here is best-effort: errors deleting refs are logged and the
+/// push response is not changed. By the time this runs the response body has
+/// already streamed Git's success output, so the only safe correction is to fix
+/// repository state before `finish_prs_receive_pack` decides whether the bare
+/// repo is now empty.
 async fn post_push_validate(
     database: &SharedDatabase,
     purgatory: &Purgatory,

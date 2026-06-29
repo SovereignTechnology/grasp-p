@@ -398,7 +398,12 @@ impl Metrics {
 
     // === Git Operation Recording Methods ===
 
-    /// Record a git operation completion
+    /// Record a git operation event.
+    ///
+    /// Buffered handlers record completion from the synchronous request path.
+    /// Streaming handlers record the final `success`/`error` from the background
+    /// task that owns the Git subprocess; their synchronous `Ok(Response)` only
+    /// means stream setup succeeded.
     pub fn record_git_operation(&self, operation: &str, status: &str) {
         self.inner
             .git_operations_total

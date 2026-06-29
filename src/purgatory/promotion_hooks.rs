@@ -21,19 +21,19 @@ use crate::nostr::lifecycle::DeletionService;
 use crate::nostr::persistence::SaveContext;
 use crate::sync::rejected_index::{EventType, RejectedEventsIndex};
 
-pub struct NostrPurgatoryPromotionHooks<'a> {
-    deletion: &'a DeletionService,
-    write_policy: Option<&'a Nip34WritePolicy>,
-    rejected_events_index: Option<&'a Arc<RejectedEventsIndex>>,
-    local_relay: Option<&'a LocalRelay>,
+pub struct NostrPurgatoryPromotionHooks {
+    deletion: DeletionService,
+    write_policy: Option<Arc<Nip34WritePolicy>>,
+    rejected_events_index: Option<Arc<RejectedEventsIndex>>,
+    local_relay: Option<LocalRelay>,
 }
 
-impl<'a> NostrPurgatoryPromotionHooks<'a> {
+impl NostrPurgatoryPromotionHooks {
     /// Run deletion recovery and accepted-event persistence hooks only.
-    pub fn recovery_only(write_policy: &'a Nip34WritePolicy) -> Self {
+    pub fn recovery_only(write_policy: &Nip34WritePolicy) -> Self {
         Self {
-            deletion: write_policy.deletion(),
-            write_policy: Some(write_policy),
+            deletion: write_policy.deletion().clone(),
+            write_policy: Some(Arc::new(write_policy.clone())),
             rejected_events_index: None,
             local_relay: None,
         }
@@ -41,12 +41,12 @@ impl<'a> NostrPurgatoryPromotionHooks<'a> {
 
     /// Git-push path: deletion recovery plus immediate hot-cache reprocessing.
     pub fn git_push(
-        write_policy: &'a Nip34WritePolicy,
-        rejected_events_index: &'a Arc<RejectedEventsIndex>,
-        local_relay: Option<&'a LocalRelay>,
+        write_policy: Arc<Nip34WritePolicy>,
+        rejected_events_index: Arc<RejectedEventsIndex>,
+        local_relay: Option<LocalRelay>,
     ) -> Self {
         Self {
-            deletion: write_policy.deletion(),
+            deletion: write_policy.deletion().clone(),
             write_policy: Some(write_policy),
             rejected_events_index: Some(rejected_events_index),
             local_relay,
@@ -55,7 +55,7 @@ impl<'a> NostrPurgatoryPromotionHooks<'a> {
 }
 
 #[async_trait]
-impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
+impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
     async fn before_event_saved(&self, event: &Event, context: PurgatorySaveContext) {
         tracing::trace!(
             event_id = %event.id,
@@ -77,9 +77,9 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks<'_> {
 
     async fn after_announcement_saved(&self, event: &Event) {
         let (Some(write_policy), Some(rejected_events_index), Some(relay)) = (
-            self.write_policy,
-            self.rejected_events_index,
-            self.local_relay,
+            self.write_policy.as_deref(),
+            self.rejected_events_index.as_ref(),
+            self.local_relay.as_ref(),
         ) else {
             return;
         };

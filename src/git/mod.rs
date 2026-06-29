@@ -24,9 +24,35 @@ pub mod protocol;
 pub mod subprocess;
 pub mod sync;
 
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use tracing::{debug, info};
+
+/// Unified HTTP response body for every route served by ngit-grasp.
+///
+/// This boxed body can hold either a buffered [`Full<Bytes>`] payload (for
+/// small responses such as advertisements, protocol-error pkt-lines, JSON
+/// pages, and static assets) or a streaming body backed by a channel (for live
+/// `git-receive-pack` / `git-upload-pack` stdout). Using one body type keeps
+/// the Hyper service response type unified.
+pub type GitResponseBody = BoxBody<Bytes, std::io::Error>;
+
+/// Wrap an in-memory payload as a one-shot [`GitResponseBody`].
+pub fn full_body(bytes: impl Into<Bytes>) -> GitResponseBody {
+    Full::new(bytes.into())
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
+
+/// Explicit empty response body.
+pub fn empty_body() -> GitResponseBody {
+    full_body(Bytes::new())
+}
 
 /// Parse a Git repository path from URL components
 ///

@@ -1,0 +1,300 @@
+//! Integration coverage for Git Smart HTTP response streaming.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use http_body_util::BodyExt;
+use hyper::body::{Bytes, Frame};
+use ngit_grasp::config::Config;
+use ngit_grasp::git::handlers::handle_receive_pack;
+use ngit_grasp::grasp06::endpoint::PrsUrl;
+use ngit_grasp::grasp06::paths::prs_repo_path;
+use ngit_grasp::grasp06::receive::{handle_prs_receive_pack, new_repo_init_locks};
+use ngit_grasp::nostr::builder::Nip34WritePolicy;
+use ngit_grasp::nostr::lifecycle::{
+    HoldingStore, ReplaceableHistoryStore, RepositoryLifecycle, Tombstones,
+};
+use ngit_grasp::nostr::SharedDatabase;
+use ngit_grasp::purgatory::Purgatory;
+use ngit_grasp::sync::rejected_index::RejectedEventsIndex;
+use nostr_relay_builder::prelude::LocalRelayBuilder;
+use nostr_sdk::prelude::*;
+use tokio::time::timeout;
+
+static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct PathOverride {
+    original: Option<std::ffi::OsString>,
+}
+
+impl PathOverride {
+    fn prepend(dir: &Path) -> Self {
+        let original = std::env::var_os("PATH");
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(existing) = original.as_ref() {
+            paths.extend(std::env::split_paths(existing));
+        }
+        let joined = std::env::join_paths(paths).expect("join PATH entries");
+        std::env::set_var("PATH", joined);
+        Self { original }
+    }
+}
+
+impl Drop for PathOverride {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            std::env::set_var("PATH", original);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+}
+
+#[tokio::test]
+async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
+    let _env_lock = PATH_ENV_LOCK.lock().await;
+
+    let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
+    write_fake_git(fake_bin.path());
+    let _path = PathOverride::prepend(fake_bin.path());
+
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let git_data = tempfile::tempdir().expect("git data tempdir");
+    let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let relay = LocalRelayBuilder::default().build();
+    let purgatory = Arc::new(Purgatory::new(git_data.path().to_path_buf()));
+    let owner_pubkey = "0".repeat(64);
+    let request_body = receive_pack_request_body();
+
+    let response = handle_receive_pack(
+        repo.path().to_path_buf(),
+        request_body,
+        database,
+        relay,
+        "streaming-test",
+        &owner_pubkey,
+        purgatory,
+        git_data.path().to_str().expect("utf-8 temp path"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("receive-pack handler should start fake subprocess");
+
+    let mut body = response.into_body();
+
+    let first = timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("first stdout chunk should arrive before fake git exits")
+        .expect("body should still be open")
+        .expect("first frame should not be an HTTP body error");
+    assert_eq!(frame_data(first), Bytes::from_static(b"first-progress\n"));
+
+    let no_second_yet = timeout(Duration::from_millis(250), body.frame()).await;
+    assert!(
+        no_second_yet.is_err(),
+        "body produced another frame while fake git was still sleeping; \
+         this test needs the first frame to be observed before subprocess EOF"
+    );
+
+    let second = timeout(Duration::from_secs(3), body.frame())
+        .await
+        .expect("second stdout chunk should arrive after fake git wakes")
+        .expect("body should still be open for second chunk")
+        .expect("second frame should not be an HTTP body error");
+    assert_eq!(frame_data(second), Bytes::from_static(b"second-progress\n"));
+}
+
+#[tokio::test]
+async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
+    let _env_lock = PATH_ENV_LOCK.lock().await;
+
+    let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
+    write_fake_git(fake_bin.path());
+    let _path = PathOverride::prepend(fake_bin.path());
+
+    let keys = Keys::generate();
+    let git_data = tempfile::tempdir().expect("git data tempdir");
+    let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let relay = LocalRelayBuilder::default().build();
+    let purgatory = Arc::new(Purgatory::new(git_data.path().to_path_buf()));
+    let repo_init_locks = new_repo_init_locks();
+    let write_policy = Arc::new(test_write_policy(
+        database.clone(),
+        purgatory.clone(),
+        repo_init_locks.clone(),
+        git_data.path(),
+    ));
+    let rejected_events_index = Arc::new(RejectedEventsIndex::new(
+        Duration::from_secs(120),
+        Duration::from_secs(7 * 24 * 60 * 60),
+    ));
+    let prs = PrsUrl {
+        submitter: keys.public_key(),
+        identifier: "prs-streaming-cleanup".to_string(),
+        subpath: "git-receive-pack".to_string(),
+    };
+    let repo_path = prs_repo_path(git_data.path(), &prs.submitter.to_hex(), &prs.identifier);
+
+    let response = handle_prs_receive_pack(
+        &prs,
+        receive_pack_request_body(),
+        database,
+        relay,
+        purgatory,
+        write_policy,
+        rejected_events_index,
+        git_data.path().to_str().expect("utf-8 temp path"),
+        None,
+        repo_init_locks,
+        "streaming-test.example",
+        None,
+    )
+    .await
+    .expect("/prs/ receive-pack handler should start fake subprocess");
+
+    assert!(
+        repo_path.exists(),
+        "/prs/ repo should exist while fake receive-pack is in flight"
+    );
+
+    let mut body = response.into_body();
+
+    let first = timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("first /prs/ stdout chunk should arrive before fake git exits")
+        .expect("/prs/ body should still be open")
+        .expect("first /prs/ frame should not be an HTTP body error");
+    assert_eq!(frame_data(first), Bytes::from_static(b"first-progress\n"));
+
+    assert!(
+        repo_path.exists(),
+        "/prs/ cleanup must not remove the repo before receive-pack exits"
+    );
+
+    let no_second_yet = timeout(Duration::from_millis(250), body.frame()).await;
+    assert!(
+        no_second_yet.is_err(),
+        "/prs/ body produced another frame while fake git was still sleeping; \
+         this test needs the first frame to be observed before subprocess EOF"
+    );
+
+    let second = timeout(Duration::from_secs(3), body.frame())
+        .await
+        .expect("second /prs/ stdout chunk should arrive after fake git wakes")
+        .expect("/prs/ body should still be open for second chunk")
+        .expect("second /prs/ frame should not be an HTTP body error");
+    assert_eq!(frame_data(second), Bytes::from_static(b"second-progress\n"));
+
+    let eof = timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("/prs/ body should close after cleanup");
+    assert!(
+        eof.is_none(),
+        "/prs/ body should be closed after fake git exits"
+    );
+
+    assert!(
+        !repo_path.exists(),
+        "/prs/ cleanup should remove zero-ref repo after receive-pack exits"
+    );
+}
+
+fn frame_data(frame: Frame<Bytes>) -> Bytes {
+    frame.into_data().expect("frame should contain data")
+}
+
+fn receive_pack_request_body() -> Bytes {
+    let old_oid = "0".repeat(40);
+    let new_oid = "1".repeat(40);
+    let event_id = "a".repeat(64);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(format!("{old_oid} {new_oid} refs/nostr/{event_id}").as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(b"report-status side-band-64k\n");
+
+    let mut request = Vec::new();
+    request.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    request.extend_from_slice(&payload);
+    request.extend_from_slice(b"0000");
+    Bytes::from(request)
+}
+
+fn test_write_policy(
+    database: SharedDatabase,
+    purgatory: Arc<Purgatory>,
+    repo_init_locks: ngit_grasp::grasp06::receive::RepoInitLocks,
+    git_data_path: &Path,
+) -> Nip34WritePolicy {
+    let config = Config::parse_from([
+        "ngit-grasp-test",
+        "--domain",
+        "streaming-test.example",
+        "--grasp06-enable",
+    ]);
+
+    Nip34WritePolicy::new(
+        database,
+        Tombstones::in_memory(),
+        HoldingStore::in_memory(),
+        RepositoryLifecycle::in_memory(),
+        ReplaceableHistoryStore::in_memory(),
+        git_data_path.to_path_buf(),
+        purgatory,
+        config,
+        repo_init_locks,
+    )
+}
+
+fn write_fake_git(bin_dir: &Path) {
+    let git_path = bin_dir.join("git");
+    std::fs::write(
+        &git_path,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+is_receive_pack=0
+for arg in "$@"; do
+  if [ "$arg" = "receive-pack" ]; then
+    is_receive_pack=1
+  fi
+done
+
+if [ "$is_receive_pack" = "1" ]; then
+cat >/dev/null
+printf 'first-progress\n'
+sleep 2
+printf 'second-progress\n'
+exit 0
+fi
+
+if [ "$1" = "init" ]; then
+  repo="${@: -1}"
+  mkdir -p "$repo"
+  exit 0
+fi
+
+if [ "$1" = "for-each-ref" ]; then
+  exit 0
+fi
+
+echo "fake git only supports init, for-each-ref, and receive-pack" >&2
+exit 1
+"#,
+    )
+    .expect("write fake git executable");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&git_path)
+            .expect("fake git metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&git_path, perms).expect("chmod fake git");
+    }
+}
