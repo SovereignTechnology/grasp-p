@@ -12,7 +12,7 @@ path = "src/bin/grasp-audit.rs"
 
 [dependencies]
 # Nostr
-nostr-sdk = "0.45.0-alpha.1"
+nostr-sdk = "0.45.0-alpha.3"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -31,7 +31,7 @@ clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 
 # HTTP Client
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 regex = "1"
 
 # Logging

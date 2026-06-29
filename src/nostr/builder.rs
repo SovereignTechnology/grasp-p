@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Result;
 use nostr::nips::nip19::ToBech32;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;

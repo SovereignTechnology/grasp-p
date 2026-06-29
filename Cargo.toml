@@ -17,13 +17,13 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"]
 http-body-util = "0.1"
 
 # Nostr relay
-nostr-relay-builder = "0.45.0-alpha.1"
+nostr-relay-builder = "0.45.0-alpha.3"
 
 # Nostr
-nostr = "0.45.0-alpha.1"
-nostr-sdk = "0.45.0-alpha.1"
-nostr-lmdb = "0.45.0-alpha.1"
-nostr-memory = "0.45.0-alpha.1"
+nostr = "0.45.0-alpha.3"
+nostr-sdk = "0.45.0-alpha.3"
+nostr-lmdb = "0.45.0-alpha.3"
+nostr-memory = "0.45.0-alpha.3"
 
 # Utilities
 futures-util = "0.3"
@@ -71,7 +71,7 @@ tempfile = "3"
 # Testing
 grasp-audit = { path = "grasp-audit" }
 tempfile = "3"
-reqwest = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 [lib]
 name = "ngit_grasp"

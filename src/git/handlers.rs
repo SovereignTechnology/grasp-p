@@ -6,7 +6,6 @@ use futures_util::stream;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::{body::Bytes, body::Frame, Response, StatusCode};
 use nostr_relay_builder::LocalRelay;
-use nostr_sdk::prelude::*;
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
