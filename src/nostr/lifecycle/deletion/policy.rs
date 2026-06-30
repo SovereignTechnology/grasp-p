@@ -33,7 +33,7 @@
 use std::collections::HashSet;
 
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::prelude::{Event, EventId, Kind, PublicKey, WritePolicyResult};
+use nostr_relay_builder::prelude::{Event, EventId, Filter, Kind, PublicKey, WritePolicyResult};
 
 use super::DeletionContext;
 use crate::nostr::policy::{duplicate, reject_error, reject_invalid};
@@ -172,6 +172,8 @@ impl DeletionPolicy {
             return reject_error(format!("internal error recording deletion: {e}"));
         }
 
+        self.compact_superseded_deletion_requests(event).await;
+
         let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
 
@@ -195,6 +197,65 @@ impl DeletionPolicy {
 
         // Accept the deletion event itself so it is stored.
         WritePolicyResult::Accept
+    }
+
+    async fn compact_superseded_deletion_requests(&self, event: &Event) {
+        let superseded_ids = match self.ctx.tombstones.superseded_deletion_ids(event).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %event.id.to_hex(),
+                    error = %e,
+                    "Failed to discover superseded NIP-09 deletion requests"
+                );
+                return;
+            }
+        };
+
+        if superseded_ids.is_empty() {
+            return;
+        }
+
+        let superseded_count = superseded_ids.len();
+
+        // Remove superseded kind-5 events from the served main DB. The database
+        // delete API owns secondary index maintenance; this is the same path
+        // used for stale cross-author deletion request cleanup.
+        if let Err(e) = self
+            .ctx
+            .database
+            .delete(Filter::new().ids(superseded_ids.clone()))
+            .await
+        {
+            tracing::warn!(
+                event_id = %event.id.to_hex(),
+                superseded_count,
+                error = %e,
+                "Failed to remove superseded NIP-09 deletion requests from main DB"
+            );
+        }
+
+        if let Err(e) = self
+            .ctx
+            .tombstones
+            .remove_deletions_by_ids(superseded_ids)
+            .await
+        {
+            tracing::warn!(
+                event_id = %event.id.to_hex(),
+                superseded_count,
+                error = %e,
+                "Failed to remove superseded NIP-09 deletion requests from tombstone DB"
+            );
+            return;
+        }
+
+        tracing::info!(
+            event_id = %event.id.to_hex(),
+            author = %event.pubkey.to_hex(),
+            superseded_count,
+            "Compacted superseded NIP-09 deletion request(s)"
+        );
     }
 
     /// Extract all event-id (`e` tag) targets from a deletion event.
@@ -387,6 +448,52 @@ mod tests {
         assert!(
             !matches!(duplicate_result, WritePolicyResult::Accept),
             "duplicate deletion request should not be returned as Accept, because Accept causes relay storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_coordinate_deletion_compacts_superseded_request_from_main_db() {
+        let ctx = make_context();
+        let keys = Keys::generate();
+        let coord = format!("30618:{}:my-repo", keys.public_key().to_hex());
+
+        let older = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord.clone()])])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&keys)
+            .unwrap();
+        let newer = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord])])
+            .custom_created_at(Timestamp::from_secs(1100))
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx.clone());
+        assert!(matches!(
+            policy.handle(&older).await,
+            WritePolicyResult::Accept
+        ));
+
+        // Simulate relay-builder's post-policy persistence of accepted events.
+        ctx.database.save_event(&older).await.unwrap();
+        assert!(ctx.database.event_by_id(&older.id).await.unwrap().is_some());
+
+        assert!(matches!(
+            policy.handle(&newer).await,
+            WritePolicyResult::Accept
+        ));
+
+        assert!(
+            ctx.database.event_by_id(&older.id).await.unwrap().is_none(),
+            "superseded older kind-5 request should be removed from the served main DB"
+        );
+        assert!(
+            ctx.tombstones
+                .superseded_deletion_ids(&newer)
+                .await
+                .unwrap()
+                .is_empty(),
+            "superseded older kind-5 tombstone should be compacted after the newer request is recorded"
         );
     }
 

@@ -206,7 +206,16 @@ deprecated in favor of the maintenance command.
    ↓
 4. Record deletion tombstone so re-submission is gated
    ↓
-5. Process targets:
+5. Compact superseded deletion requests:
+   - after the new tombstone is recorded, remove older same-author kind-5
+     requests from the tombstone DB and served main DB when every actionable
+     target in the older request is covered by the new request
+   - a newer `a`-tag cutoff supersedes an older cutoff for the same coordinate;
+     `e` targets must still be present in the new request
+   - removal uses the database delete path so event-id/kind/tag indexes stay in
+     sync with event storage
+   ↓
+6. Process targets:
    - `a` tag targeting a kind-30617 announcement coordinate:
      recursively discover the accepted-reference component affected by the
      announcement deletion
@@ -221,24 +230,24 @@ deprecated in favor of the maintenance command.
    - other valid `e`/`a` targets: delete the targeted event/coordinate without
      announcement graph cascade
    ↓
-6. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+7. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
    when deleting a repository announcement with live git data
    ↓
-7. Move deleted events to holding database:
+8. Move deleted events to holding database:
    - Targeted events
    - Repository announcements, when announcement deletion is involved
    - All main-DB events that lose their accepted-reference path after cascade
      reevaluation, for cascade paths
    - Deletion metadata for retention/cleanup/recovery
    ↓
-8. Delete events from main database
+9. Delete events from main database
    ↓
-9. Remove the live git repository when the owner+identifier announcement scope
+10. Remove the live git repository when the owner+identifier announcement scope
    is no longer served
    ↓
-10. Deleted/tombstoned targets no longer serve in queries
+11. Deleted/tombstoned targets no longer serve in queries
    ↓
-11. Background task (daily):
+12. Background task (daily):
     - Check holding database for expired entries
     - Delete events older than retention period
     - Delete corresponding archive files

@@ -40,6 +40,7 @@
 //! request its own vanish) is enforced by the caller *before* recording, so any
 //! request stored here is already authoritative.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -51,6 +52,29 @@ use nostr_relay_builder::prelude::{
 
 /// Directory name (under `relay_data_path`) for the LMDB tombstone database.
 const TOMBSTONE_DIR: &str = "tombstones";
+
+#[derive(Debug, Default)]
+struct DeletionTargets {
+    e_ids: HashSet<EventId>,
+    a_coordinates: HashSet<String>,
+}
+
+impl DeletionTargets {
+    fn is_empty(&self) -> bool {
+        self.e_ids.is_empty() && self.a_coordinates.is_empty()
+    }
+
+    fn covers(
+        &self,
+        newer_created_at: Timestamp,
+        older: &Self,
+        older_created_at: Timestamp,
+    ) -> bool {
+        older.e_ids.is_subset(&self.e_ids)
+            && older.a_coordinates.is_subset(&self.a_coordinates)
+            && (older.a_coordinates.is_empty() || newer_created_at >= older_created_at)
+    }
+}
 
 /// Persistent record of NIP-09 deletions and NIP-62 vanish requests.
 ///
@@ -202,6 +226,88 @@ impl Tombstones {
         }
 
         Ok(actionable_targets > 0)
+    }
+
+    /// Return older same-author kind-5 request IDs whose actionable target set
+    /// is fully subsumed by `event`.
+    ///
+    /// This supports deletion-request compaction. For example, if a client first
+    /// publishes `kind:5` with `a=30617:<pubkey>:repo` at t=1000 and later
+    /// publishes the same coordinate at t=2000, the t=2000 request preserves all
+    /// deletion semantics of the older request and extends the coordinate cutoff.
+    /// The older request can therefore be removed from both the tombstone store
+    /// and the served deletion-request stream.
+    pub async fn superseded_deletion_ids(&self, event: &Event) -> anyhow::Result<Vec<EventId>> {
+        debug_assert_eq!(event.kind, Kind::EventDeletion);
+
+        let newer_targets = Self::actionable_targets(event);
+        if newer_targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidates = self
+            .db
+            .query(Filter::new().kind(Kind::EventDeletion).author(event.pubkey))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query deletion tombstones: {e}"))?;
+
+        Ok(candidates
+            .into_iter()
+            .filter(|candidate| candidate.id != event.id)
+            .filter(|candidate| {
+                let older_targets = Self::actionable_targets(candidate);
+                !older_targets.is_empty()
+                    && newer_targets.covers(event.created_at, &older_targets, candidate.created_at)
+            })
+            .map(|candidate| candidate.id)
+            .collect())
+    }
+
+    /// Remove deletion request records by event id from this tombstone store.
+    pub async fn remove_deletions_by_ids(&self, ids: Vec<EventId>) -> anyhow::Result<usize> {
+        let removed = ids.len();
+        if removed > 0 {
+            self.db
+                .delete(Filter::new().ids(ids))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to remove deletion tombstones: {e}"))?;
+        }
+
+        Ok(removed)
+    }
+
+    fn actionable_targets(event: &Event) -> DeletionTargets {
+        let author_hex = event.pubkey.to_hex();
+        let mut targets = DeletionTargets::default();
+
+        for tag in event.tags.iter() {
+            let v = tag.as_slice();
+            if v.len() < 2 {
+                continue;
+            }
+
+            match v[0].as_str() {
+                "e" => {
+                    if let Ok(target_id) = EventId::from_hex(&v[1]) {
+                        targets.e_ids.insert(target_id);
+                    }
+                }
+                "a" => {
+                    let coordinate = &v[1];
+                    if coordinate
+                        .split(':')
+                        .nth(1)
+                        .map(|owner| owner == author_hex)
+                        .unwrap_or(false)
+                    {
+                        targets.a_coordinates.insert(coordinate.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        targets
     }
 
     /// Remove recorded kind-5 requests from other authors that targeted `id`.
@@ -411,6 +517,70 @@ mod tests {
             .deletion_targets_already_covered(&newer)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn newer_coordinate_deletion_supersedes_older_request() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let coord = format!("30618:{}:my-repo", keys.public_key().to_hex());
+
+        let older = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord.clone()])])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&keys)
+            .unwrap();
+        store.record_deletion(&older).await.unwrap();
+
+        let newer = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord])])
+            .custom_created_at(Timestamp::from_secs(1100))
+            .finalize(&keys)
+            .unwrap();
+        store.record_deletion(&newer).await.unwrap();
+
+        assert_eq!(
+            store.superseded_deletion_ids(&newer).await.unwrap(),
+            vec![older.id]
+        );
+
+        let removed = store.remove_deletions_by_ids(vec![older.id]).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store.superseded_deletion_ids(&newer).await.unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_deletion_detection_requires_full_target_coverage() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let coord = format!("30618:{}:my-repo", keys.public_key().to_hex());
+        let target = EventId::all_zeros();
+
+        let older = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![
+                Tag::event(target),
+                Tag::custom("a", vec![coord.clone()]),
+            ])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&keys)
+            .unwrap();
+        store.record_deletion(&older).await.unwrap();
+
+        let newer = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord])])
+            .custom_created_at(Timestamp::from_secs(1100))
+            .finalize(&keys)
+            .unwrap();
+        store.record_deletion(&newer).await.unwrap();
+
+        assert!(store
+            .superseded_deletion_ids(&newer)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
