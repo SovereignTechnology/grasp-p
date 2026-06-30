@@ -187,7 +187,16 @@ deprecated in favor of the maintenance command.
 ```
 1. Kind 5 deletion request arrives
    ↓
-2. Validate targets:
+2. Check idempotency:
+   - if every actionable `e`/`a` target is already covered by an existing
+     same-author kind-5 request, return a duplicate success response without
+     storing the new deletion event
+   - `e` targets are covered by any existing same-author deletion for that id
+   - `a` targets are covered only when an existing same-author deletion for the
+     same coordinate has `created_at >=` the new deletion request, preserving
+     NIP-09 coordinate cutoff semantics
+   ↓
+3. Validate targets:
    - `e` targets found in the main DB must be authored by the deleter;
      cross-author main-DB targets reject the whole request
    - pre-emptive `e` deletes for unknown targets may be accepted, but if the
@@ -195,9 +204,9 @@ deprecated in favor of the maintenance command.
      removed from both tombstones and the served deletion-request stream
    - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
-3. Record deletion tombstone so re-submission is gated
+4. Record deletion tombstone so re-submission is gated
    ↓
-4. Process targets:
+5. Process targets:
    - `a` tag targeting a kind-30617 announcement coordinate:
      recursively discover the accepted-reference component affected by the
      announcement deletion
@@ -212,24 +221,24 @@ deprecated in favor of the maintenance command.
    - other valid `e`/`a` targets: delete the targeted event/coordinate without
      announcement graph cascade
    ↓
-5. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+6. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
    when deleting a repository announcement with live git data
    ↓
-6. Move deleted events to holding database:
+7. Move deleted events to holding database:
    - Targeted events
    - Repository announcements, when announcement deletion is involved
    - All main-DB events that lose their accepted-reference path after cascade
      reevaluation, for cascade paths
    - Deletion metadata for retention/cleanup/recovery
    ↓
-7. Delete events from main database
+8. Delete events from main database
    ↓
-8. Remove the live git repository when the owner+identifier announcement scope
+9. Remove the live git repository when the owner+identifier announcement scope
    is no longer served
    ↓
-9. Deleted/tombstoned targets no longer serve in queries
+10. Deleted/tombstoned targets no longer serve in queries
    ↓
-10. Background task (daily):
+11. Background task (daily):
     - Check holding database for expired entries
     - Delete events older than retention period
     - Delete corresponding archive files

@@ -36,7 +36,7 @@ use nostr::nips::nip19::ToBech32;
 use nostr_relay_builder::prelude::{Event, EventId, Kind, PublicKey, WritePolicyResult};
 
 use super::DeletionContext;
-use crate::nostr::policy::{reject_error, reject_invalid};
+use crate::nostr::policy::{duplicate, reject_error, reject_invalid};
 
 const MAX_DELETION_TARGET_TAGS: usize = 2048;
 /// Policy for handling NIP-09 event deletion requests
@@ -102,6 +102,27 @@ impl DeletionPolicy {
                 "Rejected NIP-09 deletion with too many targets"
             );
             return reject_invalid("too many deletion targets");
+        }
+
+        match self
+            .ctx
+            .tombstones
+            .deletion_targets_already_covered(event)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    event_id = %event.id.to_hex(),
+                    author = %event.pubkey.to_hex(),
+                    "Skipping duplicate NIP-09 deletion request; all actionable targets are already covered"
+                );
+                return duplicate("deletion target(s) already covered");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Tombstone lookup failed during duplicate deletion check");
+                return reject_error(format!("internal error checking deletion coverage: {e}"));
+            }
         }
 
         // Validate authorship of all targets first. If any `e`-tag target exists
@@ -338,6 +359,34 @@ mod tests {
                 .is_event_deleted(&announcement.id, &keys.public_key())
                 .await,
             "accepted deletion must persist a tombstone as the durable operation marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_deletion_request_is_not_accepted_for_storage() {
+        let ctx = make_context();
+        let keys = Keys::generate();
+        let target = EventId::all_zeros();
+
+        let first = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target)])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&keys)
+            .unwrap();
+        let duplicate = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target)])
+            .custom_created_at(Timestamp::from_secs(1001))
+            .finalize(&keys)
+            .unwrap();
+
+        let policy = DeletionPolicy::new(ctx);
+        let first_result = policy.handle(&first).await;
+        assert!(matches!(first_result, WritePolicyResult::Accept));
+
+        let duplicate_result = policy.handle(&duplicate).await;
+        assert!(
+            !matches!(duplicate_result, WritePolicyResult::Accept),
+            "duplicate deletion request should not be returned as Accept, because Accept causes relay storage"
         );
     }
 

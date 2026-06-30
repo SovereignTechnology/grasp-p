@@ -118,6 +118,92 @@ impl Tombstones {
         Ok(())
     }
 
+    /// Return `true` when every actionable NIP-09 target in `event` is already
+    /// covered by an existing same-author kind-5 request in this store.
+    ///
+    /// This is an idempotency helper for admission: a client may generate a new
+    /// kind-5 event id by changing only `created_at` while tagging the same
+    /// targets. Once the relay has already accepted a deletion request that
+    /// covers those targets, accepting another equivalent request only pollutes
+    /// the served deletion-request stream.
+    ///
+    /// Coverage is target-specific:
+    /// - `e` targets are covered by any existing same-author kind-5 with that
+    ///   event id.
+    /// - `a` targets are covered only by an existing same-author kind-5 for the
+    ///   same coordinate whose `created_at` is greater than or equal to the new
+    ///   request's `created_at`, preserving NIP-09's "delete versions up to this
+    ///   timestamp" semantics.
+    ///
+    /// Non-actionable targets (malformed tags, or `a` coordinates owned by a
+    /// different pubkey than the event author) are ignored so this helper does
+    /// not change existing no-op acceptance semantics for those events.
+    pub async fn deletion_targets_already_covered(&self, event: &Event) -> anyhow::Result<bool> {
+        debug_assert_eq!(event.kind, Kind::EventDeletion);
+
+        let author = event.pubkey;
+        let author_hex = author.to_hex();
+        let mut actionable_targets = 0usize;
+
+        for tag in event.tags.iter() {
+            let v = tag.as_slice();
+            if v.len() < 2 {
+                continue;
+            }
+
+            match v[0].as_str() {
+                "e" => {
+                    let Ok(target_id) = EventId::from_hex(&v[1]) else {
+                        continue;
+                    };
+                    actionable_targets += 1;
+
+                    let filter = Filter::new()
+                        .kind(Kind::EventDeletion)
+                        .author(author)
+                        .custom_tag(SingleLetterTag::lowercase(Alphabet::E), target_id.to_hex());
+                    let covered = !self
+                        .db
+                        .query(filter)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to query deletion tombstones: {e}"))?
+                        .is_empty();
+                    if !covered {
+                        return Ok(false);
+                    }
+                }
+                "a" => {
+                    let coordinate = &v[1];
+                    let Some(coord_owner_hex) = coordinate.split(':').nth(1) else {
+                        continue;
+                    };
+                    if coord_owner_hex != author_hex {
+                        continue;
+                    }
+                    actionable_targets += 1;
+
+                    let filter = Filter::new()
+                        .kind(Kind::EventDeletion)
+                        .author(author)
+                        .custom_tag(SingleLetterTag::lowercase(Alphabet::A), coordinate.clone());
+                    let covered = self
+                        .db
+                        .query(filter)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to query deletion tombstones: {e}"))?
+                        .iter()
+                        .any(|deletion| deletion.created_at >= event.created_at);
+                    if !covered {
+                        return Ok(false);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(actionable_targets > 0)
+    }
+
     /// Remove recorded kind-5 requests from other authors that targeted `id`.
     ///
     /// This handles out-of-order cross-author deletes. A relay may accept a
@@ -274,6 +360,57 @@ mod tests {
         store.record_deletion(&deletion).await.unwrap();
 
         assert!(store.is_event_deleted(&target, &keys.public_key()).await);
+    }
+
+    #[tokio::test]
+    async fn detects_already_covered_event_deletion_request() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let target = EventId::all_zeros();
+
+        let first = deletion_by_event(&keys, target);
+        store.record_deletion(&first).await.unwrap();
+
+        let duplicate = deletion_by_event(&keys, target);
+
+        assert!(store
+            .deletion_targets_already_covered(&duplicate)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn coordinate_coverage_respects_deletion_created_at() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let coord = format!("30618:{}:my-repo", keys.public_key().to_hex());
+
+        let first = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord.clone()])])
+            .custom_created_at(Timestamp::from_secs(1000))
+            .finalize(&keys)
+            .unwrap();
+        store.record_deletion(&first).await.unwrap();
+
+        let older_or_equal = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord.clone()])])
+            .custom_created_at(Timestamp::from_secs(900))
+            .finalize(&keys)
+            .unwrap();
+        assert!(store
+            .deletion_targets_already_covered(&older_or_equal)
+            .await
+            .unwrap());
+
+        let newer = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coord])])
+            .custom_created_at(Timestamp::from_secs(1100))
+            .finalize(&keys)
+            .unwrap();
+        assert!(!store
+            .deletion_targets_already_covered(&newer)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
