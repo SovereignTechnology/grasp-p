@@ -328,11 +328,16 @@ When `deletion_request_disrespector = true`:
 ```
 1. Kind 5 deletion request arrives
    ↓
-2. Store deletion request event in main database
+2. Check idempotency:
+   - if every actionable `e`/`a` target is already covered by an existing
+     same-author kind-5 request, return a duplicate success response without
+     storing the new deletion event
    ↓
-3. Do NOT process deletion
+3. Store deletion request event in main database
    ↓
-4. Repository and events remain fully accessible
+4. Do NOT process deletion
+   ↓
+5. Repository and events remain fully accessible
    ↓
 Result: Archival relay preserves all content
 ```
@@ -349,9 +354,11 @@ NIP-62 vanish requests. It does NOT prevent blacklist-triggered deletions.
 **Implementation Note:** Implemented. The LMDB backend's automatic NIP-09 and
 NIP-62 processing is disabled (`process_nip09(false)`, `process_nip62(false)`);
 ngit-grasp owns deletion handling in relay policy code, which short-circuits
-when `deletion_request_disrespector` is set — storing but not acting on kind-5
-or kind-62 requests. NIP-09 and NIP-62 are omitted from the NIP-11
-`supported_nips` list in this mode.
+already-covered NIP-09 deletions before the `deletion_request_disrespector`
+archival-mode branch. When `deletion_request_disrespector` is set, new kind-5
+requests are stored but not acted on, and kind-62 requests are stored but not
+acted on. NIP-09 and NIP-62 are omitted from the NIP-11 `supported_nips` list
+in this mode.
 
 ## Recovery Mechanism
 
