@@ -8,4 +8,5 @@ pub mod metrics;
 pub mod nostr;
 pub mod purgatory;
 pub mod repair_deletion_requests;
+pub mod server;
 pub mod sync;

@@ -48,25 +48,38 @@
 
 ## Component Design
 
-### 1. Main Server ([`src/main.rs`](src/main.rs))
+### 1. Main Server ([`src/main.rs`](src/main.rs) + [`src/server.rs`](src/server.rs))
 
-**Responsibilities:**
+Server startup is split across two layers: `main.rs` owns binary-only
+concerns, while `RelayServer` in `server.rs` owns the reusable relay
+runtime:
 
-- Initialize configuration from environment (clap + dotenvy)
-- Set up Hyper HTTP server with request routing
+**[`src/main.rs`](src/main.rs) — binary-only concerns:**
+
+- Initialize configuration from CLI/environment (clap + dotenvy)
+- Install the global tracing subscriber
+- Load/generate the relay owner key file (`.relay-owner.nsec`)
+- Translate OS signals (SIGINT/SIGTERM) into a shutdown future
+
+**[`src/server.rs`](src/server.rs) — `RelayServer`, the shared runtime:**
+
+- Bind the TCP listener (supports `:0` for kernel-assigned ports; the
+  resolved address back-fills `bind_address` and, if empty, `domain`)
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
-- Set up shared storage (LMDB or Memory)
-- Handle WebSocket upgrades for Nostr relay
-- Handle graceful shutdown
+- Set up shared storage (LMDB or Memory), purgatory, sync manager, and
+  background maintenance tasks
+- Serve HTTP + WebSocket until a caller-supplied shutdown future
+  resolves, then persist state (purgatory, rejected-events cache,
+  placeholder ref cleanup) and stop background tasks
 
 **Key Dependencies:**
 
 ```rust
 hyper = "1"
 tokio = { version = "1", features = ["full"] }
-nostr-relay-builder = "0.43"
-nostr-sdk = "0.43"
-nostr-lmdb = "0.43"
+nostr-relay-builder = "0.45.0-alpha.3"
+nostr-sdk = "0.45.0-alpha.3"
+nostr-lmdb = "0.45.0-alpha.3"
 ```
 
 ### 2. HTTP Module ([`src/http/mod.rs`](src/http/mod.rs))

@@ -843,15 +843,11 @@ fn derive_accept_key(request_key: &[u8]) -> String {
 
 /// Start the HTTP server with integrated Nostr relay
 ///
-/// # Arguments
-/// * `config` - Server configuration
-/// * `relay` - The LocalRelay for WebSocket connections
-/// * `database` - The database for direct queries (e.g., push authorization)
-/// * `metrics` - Optional metrics for Prometheus endpoint
-/// * `purgatory` - Purgatory for event/git coordination
-/// * `write_policy` - Write policy for re-processing hot-cache events after git push promotion
-/// * `lifecycle` - Repository lifecycle locks for Git HTTP serving
-/// * `rejected_events_index` - Rejected events index for hot-cache re-processing
+/// Binds a fresh [`TcpListener`] on `config.bind_address` and delegates to
+/// [`run_server_on_listener`]. Callers that need the actual bound address
+/// before serving (e.g. binding `:0` for a kernel-assigned port, as
+/// `RelayServer` does) should bind the listener themselves and call
+/// [`run_server_on_listener`] directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     config: Config,
@@ -865,12 +861,50 @@ pub async fn run_server(
     repo_init_locks: RepoInitLocks,
 ) -> anyhow::Result<()> {
     let bind_addr: SocketAddr = config.bind_address.parse()?;
+    let listener = TcpListener::bind(&bind_addr).await?;
+    run_server_on_listener(
+        listener,
+        config,
+        relay,
+        database,
+        metrics,
+        purgatory,
+        write_policy,
+        lifecycle,
+        rejected_events_index,
+        repo_init_locks,
+    )
+    .await
+}
 
-    tracing::info!("Starting HTTP server on {}", bind_addr);
+/// Serve HTTP + WebSocket relay traffic on an already-bound listener.
+///
+/// # Arguments
+/// * `listener` - Pre-bound TCP listener to accept connections on
+/// * `config` - Server configuration
+/// * `relay` - The LocalRelay for WebSocket connections
+/// * `database` - The database for direct queries (e.g., push authorization)
+/// * `metrics` - Optional metrics for Prometheus endpoint
+/// * `purgatory` - Purgatory for event/git coordination
+/// * `write_policy` - Write policy for re-processing hot-cache events after git push promotion
+/// * `lifecycle` - Repository lifecycle locks for Git HTTP serving
+/// * `rejected_events_index` - Rejected events index for hot-cache re-processing
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server_on_listener(
+    listener: TcpListener,
+    config: Config,
+    relay: LocalRelay,
+    database: SharedDatabase,
+    metrics: Option<Arc<Metrics>>,
+    purgatory: Arc<Purgatory>,
+    write_policy: Arc<Nip34WritePolicy>,
+    lifecycle: Arc<RepositoryLifecycle>,
+    rejected_events_index: Arc<RejectedEventsIndex>,
+    repo_init_locks: RepoInitLocks,
+) -> anyhow::Result<()> {
+    tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
     tracing::info!("Domain: {}", config.domain);
-
-    let listener = TcpListener::bind(&bind_addr).await?;
 
     loop {
         let (socket, addr) = listener.accept().await?;
