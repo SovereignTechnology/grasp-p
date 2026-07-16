@@ -12,9 +12,10 @@ and purgatory transitions.
 
 > **Status:** Lifecycle metadata, NIP-09 and NIP-62 lifecycle admission
 > (including disrespector read-only would-have-deleted classification),
-> deterministic admission-use attribution, and measured destructive outcomes are
-> implemented. Request cleanup/expiry, migration, target-set deduplication
-> removal, and final policy-mode reconciliation remain future stages.
+> deterministic admission-use attribution, measured destructive outcomes,
+> startup reconciliation, and periodic request cleanup/permanent expiry are
+> implemented. Target-set deduplication removal, repair-command retirement, and
+> final rollout coverage remain future work.
 
 ### Production motivation
 
@@ -271,9 +272,16 @@ mode reapplies normal gating and the 9-month served plus 3-month unserved expiry
 schedule using retained lifecycle timestamps. Startup reconciliation must apply
 these transitions before the relay begins serving traffic.
 
-Periodic request cleanup, permanent tombstone expiry, removal of target-set
-deduplication and the `repair-deletion-requests` command, and final rollout
-coverage remain future work.
+Startup catch-up and periodic cleanup use the holding-cleanup cadence. They
+apply the same timestamp-derived half-open lifecycle boundaries, remove expired
+served copies from Main before Tombstones, and permanently remove payload plus
+lifecycle metadata only after the additional gating period. A shared lifecycle
+transition lock prevents cleanup from acting on a stale record while admission
+is promoting and marking it used.
+
+Removal of target-set deduplication, retirement of the
+`repair-deletion-requests` command, and final rollout coverage remain future
+work.
 
 ## Core consistency invariant
 

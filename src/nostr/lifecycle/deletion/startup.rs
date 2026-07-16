@@ -5,7 +5,7 @@ use anyhow::Result;
 use nostr_relay_builder::prelude::{Event, Filter, Kind, PublicKey, Timestamp};
 
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::lifecycle::{DeletionSource, RequestClassification, RequestLifecycleRecord};
+use crate::nostr::lifecycle::{DeletionSource, RequestClassification};
 
 use super::DeletionService;
 
@@ -246,28 +246,6 @@ impl DeletionService {
         } else {
             RequestClassification::LocallyActionable
         }
-    }
-
-    fn request_is_served(&self, record: &RequestLifecycleRecord, now: Timestamp) -> Result<bool> {
-        let (anchor, duration) = match record.last_used_at {
-            Some(used) => (
-                used,
-                self.ctx
-                    .config
-                    .deletion_request_retention_used_served_after_last_used(),
-            ),
-            None => (
-                record.first_seen_at,
-                self.ctx.config.deletion_request_retention_unused_served(),
-            ),
-        };
-        let deadline = anchor
-            .as_secs()
-            .checked_add(duration.as_secs())
-            .ok_or_else(|| {
-                anyhow::anyhow!("deletion-request served retention deadline overflow")
-            })?;
-        Ok(now.as_secs() < deadline)
     }
 
     async fn promote_request(

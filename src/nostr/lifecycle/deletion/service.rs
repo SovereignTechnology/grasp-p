@@ -93,13 +93,44 @@ impl DeletionService {
             .into_values()
             .min_by(|(left, _), (right, _)| Self::winner_order(left, right))?;
 
+        // Serialize promotion plus last-used attribution with request cleanup.
+        // Cleanup always re-reads metadata under this same lock, so it cannot
+        // remove the Main copy selected by an admission using an old snapshot.
+        let _lifecycle_guard = tombstones.lock_lifecycle().await;
+        let Some(winner) = (match tombstones
+            .lifecycle_for_request_result(&winner.request.id)
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                return Some(Self::gate_error(
+                    "re-reading deletion-request lifecycle",
+                    error,
+                ))
+            }
+        }) else {
+            return Some(Self::gate_error(
+                "re-reading deletion-request lifecycle",
+                anyhow::anyhow!("request {} disappeared", winner.request.id),
+            ));
+        };
+        match self.request_is_expired(&winner, Timestamp::now()) {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(error) => {
+                return Some(Self::gate_error(
+                    "evaluating deletion-request retention",
+                    error,
+                ))
+            }
+        }
         let previous_last_used_at = winner.last_used_at;
         if let Err(error) = self.ctx.database().save_event(&winner.request).await {
             return Some(Self::gate_error("promoting deletion request", error));
         }
         let used_at = Timestamp::now();
         let updated = match tombstones
-            .mark_request_used(&winner.request.id, used_at)
+            .mark_request_used_locked(&winner.request.id, used_at)
             .await
         {
             Ok(Some(record)) if record.last_used_at >= Some(used_at) => record,
@@ -149,7 +180,11 @@ impl DeletionService {
         })
     }
 
-    fn request_is_expired(&self, record: &RequestLifecycleRecord, now: Timestamp) -> Result<bool> {
+    pub(crate) fn request_is_expired(
+        &self,
+        record: &RequestLifecycleRecord,
+        now: Timestamp,
+    ) -> Result<bool> {
         let (anchor, served, additional) = match record.last_used_at {
             Some(last_used_at) => (
                 last_used_at,

@@ -113,6 +113,30 @@ lazy_static! {
             .expect("register holding cleanup last-run metric");
         metric
     };
+    static ref DELETION_REQUEST_CLEANUP_RUNS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_deletion_request_cleanup_runs_total",
+            "Number of deletion-request cleanup passes run",
+        )).expect("build deletion request cleanup runs metric");
+        REGISTRY.register(Box::new(metric.clone())).expect("register deletion request cleanup runs metric");
+        metric
+    };
+    static ref DELETION_REQUEST_CLEANUP_REMOVED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(Opts::new(
+            "ngit_deletion_request_cleanup_removed_total",
+            "Deletion-request cleanup removals by storage type",
+        ), &["type"]).expect("build deletion request cleanup removed metric");
+        REGISTRY.register(Box::new(metric.clone())).expect("register deletion request cleanup removed metric");
+        metric
+    };
+    static ref DELETION_REQUEST_CLEANUP_OUTCOMES_TOTAL: CounterVec = {
+        let metric = CounterVec::new(Opts::new(
+            "ngit_deletion_request_cleanup_outcomes_total",
+            "Deletion-request cleanup failures and concurrent skips",
+        ), &["outcome"]).expect("build deletion request cleanup outcomes metric");
+        REGISTRY.register(Box::new(metric.clone())).expect("register deletion request cleanup outcomes metric");
+        metric
+    };
     static ref RECOVERY_TOTAL: CounterVec = {
         let metric = CounterVec::new(
             Opts::new(
@@ -245,6 +269,30 @@ pub fn record_holding_cleanup_run(
     HOLDING_CLEANUP_LAST_RUN_DELETED
         .with_label_values(&["archive_file"])
         .set(archive_files_deleted as f64);
+}
+
+pub fn record_deletion_request_cleanup_run(
+    main_removed: usize,
+    tombstone_removed: usize,
+    metadata_removed: usize,
+    failures: usize,
+    skipped: usize,
+) {
+    DELETION_REQUEST_CLEANUP_RUNS_TOTAL.inc();
+    for (kind, value) in [
+        ("main", main_removed),
+        ("tombstone", tombstone_removed),
+        ("metadata", metadata_removed),
+    ] {
+        DELETION_REQUEST_CLEANUP_REMOVED_TOTAL
+            .with_label_values(&[kind])
+            .inc_by(value as f64);
+    }
+    for (outcome, value) in [("failure", failures), ("stale_or_concurrent_skip", skipped)] {
+        DELETION_REQUEST_CLEANUP_OUTCOMES_TOTAL
+            .with_label_values(&[outcome])
+            .inc_by(value as f64);
+    }
 }
 
 pub fn record_recovery_attempt() {

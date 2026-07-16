@@ -1,5 +1,6 @@
 mod archival;
 mod cascade;
+mod cleanup;
 mod context;
 mod policy;
 mod pr_refs;
@@ -42,6 +43,7 @@ impl DeletionOutcome {
     }
 }
 
+pub use cleanup::RequestCleanupStats;
 pub use context::DeletionContext;
 pub use policy::DeletionPolicy;
 pub use runtime::{run_holding_eject, DeletionCleanupTask, DeletionRuntime, HoldingEjectArgs};

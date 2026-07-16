@@ -334,16 +334,15 @@ impl DeletionPolicy {
                         return true;
                     }
                 }
-                Kind::RepoState => {
+                Kind::RepoState
                     if self
                         .ctx
                         .purgatory
                         .find_state(&identifier)
                         .into_iter()
-                        .any(|entry| entry.author == owner && covered(entry.event.created_at))
-                    {
-                        return true;
-                    }
+                        .any(|entry| entry.author == owner && covered(entry.event.created_at)) =>
+                {
+                    return true;
                 }
                 _ => {}
             }

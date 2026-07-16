@@ -14,7 +14,7 @@ use super::startup::{
     BlacklistParityStats, BlacklistRestoreStats, StartupReconciliationStats, WhitelistParityStats,
     WhitelistRestoreStats,
 };
-use super::DeletionService;
+use super::{DeletionService, RequestCleanupStats};
 
 #[derive(Debug, Args)]
 pub struct HoldingEjectArgs {
@@ -63,6 +63,13 @@ impl DeletionRuntime {
     /// Run deletion-owned startup tasks before the relay begins serving traffic.
     pub async fn run_startup_tasks(&self) -> Result<()> {
         log_startup_reconciliation(self.service.run_startup_reconciliation().await?);
+        // Enumeration failure is fatal before serving traffic; individual record
+        // failures are conservatively retained and retried by the timer.
+        let request_stats = self
+            .service
+            .cleanup_expired_requests(Timestamp::now())
+            .await?;
+        log_request_cleanup("startup catch-up", request_stats);
         self.run_holding_startup_cleanup().await;
         Ok(())
     }
@@ -71,6 +78,7 @@ impl DeletionRuntime {
     pub fn spawn_cleanup_task(&self) -> DeletionCleanupTask {
         let holding = self.holding.clone();
         let lifecycle = self.lifecycle.clone();
+        let service = self.service.clone();
         let retention = self.holding_retention;
         let interval_duration = self.holding_cleanup_interval;
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -84,6 +92,10 @@ impl DeletionRuntime {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        match service.cleanup_expired_requests(Timestamp::now()).await {
+                            Ok(stats) => log_request_cleanup("periodic pass", stats),
+                            Err(error) => tracing::warn!(error = %error, "Deletion-request cleanup periodic pass failed"),
+                        }
                         match holding.cleanup_expired_with_lifecycle(&lifecycle, Timestamp::now(), retention).await {
                             Ok(stats) => {
                                 if stats.expired_records > 0 {
@@ -103,7 +115,7 @@ impl DeletionRuntime {
                     }
                     changed = shutdown_rx.changed() => {
                         if changed.is_ok() && *shutdown_rx.borrow() {
-                            tracing::info!("Holding cleanup task received shutdown signal");
+                            tracing::info!("Deletion lifecycle maintenance task received shutdown signal");
                             break;
                         }
                     }
@@ -114,7 +126,7 @@ impl DeletionRuntime {
         tracing::info!(
             retention_secs = retention.as_secs(),
             interval_secs = interval_duration.as_secs(),
-            "Holding cleanup task started"
+            "Deletion lifecycle maintenance task started"
         );
 
         DeletionCleanupTask {
@@ -160,7 +172,7 @@ impl DeletionCleanupTask {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         if let Err(e) = self.handle.await {
-            tracing::warn!(error = %e, "Holding cleanup task join failed during shutdown");
+            tracing::warn!(error = %e, "Deletion lifecycle maintenance task join failed during shutdown");
         }
     }
 }
@@ -198,6 +210,27 @@ fn log_startup_reconciliation(stats: StartupReconciliationStats) {
     log_blacklist_restore(stats.blacklist_restore);
     log_whitelist_parity(stats.whitelist_parity);
     log_whitelist_restore(stats.whitelist_restore);
+}
+
+fn log_request_cleanup(phase: &str, stats: RequestCleanupStats) {
+    crate::metrics::record_deletion_request_cleanup_run(
+        stats.main_payloads_removed,
+        stats.tombstone_payloads_removed,
+        stats.metadata_rows_removed,
+        stats.failures,
+        stats.stale_or_concurrent_records_skipped,
+    );
+    tracing::info!(
+        phase,
+        examined = stats.canonical_records_examined,
+        main_removed = stats.main_payloads_removed,
+        tombstone_removed = stats.tombstone_payloads_removed,
+        metadata_removed = stats.metadata_rows_removed,
+        indefinitely_retained = stats.indefinitely_retained_disrespector_requests,
+        skipped = stats.stale_or_concurrent_records_skipped,
+        failures = stats.failures,
+        "Deletion-request cleanup completed"
+    );
 }
 
 fn log_blacklist_parity(stats: BlacklistParityStats) {

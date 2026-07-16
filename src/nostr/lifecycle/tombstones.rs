@@ -45,6 +45,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::sync::{Mutex, MutexGuard};
+
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::{
@@ -101,6 +103,13 @@ pub struct RequestLifecycleRecord {
     pub classification: RequestClassification,
 }
 
+/// Counts returned after permanently removing one request lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestLifecycleDeletionStats {
+    pub payloads_deleted: usize,
+    pub metadata_deleted: usize,
+}
+
 #[derive(Debug, Default)]
 struct DeletionTargets {
     e_ids: HashSet<EventId>,
@@ -141,6 +150,11 @@ impl DeletionTargets {
 pub struct Tombstones {
     db: Arc<dyn NostrDatabase>,
     metadata_signer: Keys,
+    /// Serializes lifecycle metadata changes with Main-database transitions
+    /// performed by `DeletionService`. This is intentionally one simple lock:
+    /// request lifecycles are a small control plane and correctness matters more
+    /// than parallel metadata writes.
+    lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for Tombstones {
@@ -179,6 +193,7 @@ impl Tombstones {
         Ok(Self {
             db: Arc::new(db),
             metadata_signer: Keys::generate(),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -193,7 +208,15 @@ impl Tombstones {
                     .build(),
             ),
             metadata_signer: Keys::generate(),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Acquire the lifecycle transition lock. Callers that also transition the
+    /// Main database must hold this across the Main operation and the matching
+    /// metadata update/removal.
+    pub(crate) async fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+        self.lifecycle_lock.lock().await
     }
 
     #[cfg(test)]
@@ -211,6 +234,17 @@ impl Tombstones {
     /// Persist a signed deletion/vanish request and relay-generated lifecycle
     /// metadata. Exact replays retain their original `first_seen_at`.
     pub async fn record_request(
+        &self,
+        event: &Event,
+        first_seen_at: Timestamp,
+        classification: RequestClassification,
+    ) -> anyhow::Result<RequestLifecycleRecord> {
+        let _guard = self.lock_lifecycle().await;
+        self.record_request_locked(event, first_seen_at, classification)
+            .await
+    }
+
+    pub(crate) async fn record_request_locked(
         &self,
         event: &Event,
         first_seen_at: Timestamp,
@@ -340,6 +374,15 @@ impl Tombstones {
         request_id: &EventId,
         used_at: Timestamp,
     ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        let _guard = self.lock_lifecycle().await;
+        self.mark_request_used_locked(request_id, used_at).await
+    }
+
+    pub(crate) async fn mark_request_used_locked(
+        &self,
+        request_id: &EventId,
+        used_at: Timestamp,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
         let Some(existing) = self.lifecycle_for_request_result(request_id).await? else {
             return Ok(None);
         };
@@ -361,6 +404,16 @@ impl Tombstones {
     /// timestamps. The replacement is durable before stale rows are compacted,
     /// so an interrupted update always leaves a readable lifecycle record.
     pub async fn reclassify_request(
+        &self,
+        request_id: &EventId,
+        classification: RequestClassification,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        let _guard = self.lock_lifecycle().await;
+        self.reclassify_request_locked(request_id, classification)
+            .await
+    }
+
+    pub(crate) async fn reclassify_request_locked(
         &self,
         request_id: &EventId,
         classification: RequestClassification,
@@ -400,6 +453,86 @@ impl Tombstones {
         }
         records.sort_by_key(|record| record.request.id.to_hex());
         records
+    }
+
+    /// Fallible enumeration for destructive maintenance. Unlike
+    /// `lifecycle_records`, this never turns a database failure into an
+    /// apparently empty result. Private metadata is not returned.
+    pub async fn lifecycle_records_result(&self) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
+        let requests = self.request_payloads().await?;
+        let mut records = Vec::new();
+        for request in requests {
+            if let Some(record) = self.lifecycle_for_request_result(&request.id).await? {
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.request.id.to_hex());
+        Ok(records)
+    }
+
+    /// Remove one payload and every metadata row linked to it. This is
+    /// idempotent when either side was already removed. The caller must hold
+    /// `lock_lifecycle` and has already completed any required Main removal.
+    pub(crate) async fn permanently_delete_request_locked(
+        &self,
+        request_id: &EventId,
+    ) -> anyhow::Result<RequestLifecycleDeletionStats> {
+        let payloads_deleted = usize::from(self.request_payload(request_id).await?.is_some());
+        let metadata = self.metadata_events_for_request_result(request_id).await?;
+        if payloads_deleted > 0 {
+            self.db
+                .delete(Filter::new().ids(vec![*request_id]))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to remove tombstone request {request_id}: {error}")
+                })?;
+        }
+        let metadata_deleted = metadata.len();
+        if metadata_deleted > 0 {
+            self.db
+                .delete(Filter::new().ids(metadata.into_iter().map(|event| event.id)))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to remove lifecycle metadata for {request_id}: {error}")
+                })?;
+        }
+        Ok(RequestLifecycleDeletionStats {
+            payloads_deleted,
+            metadata_deleted,
+        })
+    }
+
+    /// Remove metadata whose unambiguous `e` link has no retained request.
+    /// This is deliberately separate from canonical enumeration: malformed
+    /// metadata remains invisible to queries but is not guessed at.
+    pub async fn remove_orphan_metadata(&self) -> anyhow::Result<usize> {
+        let _guard = self.lock_lifecycle().await;
+        let metadata = self
+            .db
+            .query(Filter::new().kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND)))
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to enumerate tombstone metadata: {error}"))?;
+        let mut stale = Vec::new();
+        for event in metadata {
+            let Some(request_id) =
+                Self::tag_value(&event, "e").and_then(|value| EventId::from_hex(value).ok())
+            else {
+                continue;
+            };
+            if self.request_payload(&request_id).await?.is_none() {
+                stale.push(event.id);
+            }
+        }
+        let removed = stale.len();
+        if removed > 0 {
+            self.db
+                .delete(Filter::new().ids(stale))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to remove orphan lifecycle metadata: {error}")
+                })?;
+        }
+        Ok(removed)
     }
 
     /// List the original kind-5 and kind-62 payloads retained by this store.
