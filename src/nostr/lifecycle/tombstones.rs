@@ -196,6 +196,18 @@ impl Tombstones {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn save_request_payload_without_metadata(
+        &self,
+        event: &Event,
+    ) -> anyhow::Result<()> {
+        self.db
+            .save_event(event)
+            .await
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("Failed to save test request payload: {error}"))
+    }
+
     /// Persist a signed deletion/vanish request and relay-generated lifecycle
     /// metadata. Exact replays retain their original `first_seen_at`.
     pub async fn record_request(
@@ -208,7 +220,7 @@ impl Tombstones {
             anyhow::bail!("Tombstone lifecycle accepts only kind-5 or kind-62 requests");
         }
 
-        if let Some(record) = self.lifecycle_for_request(&event.id).await {
+        if let Some(record) = self.lifecycle_for_request_result(&event.id).await? {
             return Ok(record);
         }
 
@@ -328,7 +340,7 @@ impl Tombstones {
         request_id: &EventId,
         used_at: Timestamp,
     ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
-        let Some(existing) = self.lifecycle_for_request(request_id).await else {
+        let Some(existing) = self.lifecycle_for_request_result(request_id).await? else {
             return Ok(None);
         };
         let last_used_at = existing.last_used_at.max(Some(used_at));
@@ -336,37 +348,36 @@ impl Tombstones {
             return Ok(Some(existing));
         }
 
-        let replacement = self.build_metadata(
-            *request_id,
+        self.replace_lifecycle_metadata(
+            request_id,
             existing.first_seen_at,
             last_used_at,
             existing.classification,
-        )?;
-        self.db.save_event(&replacement).await.map_err(|e| {
-            anyhow::anyhow!("Failed to update lifecycle metadata for {request_id}: {e}")
-        })?;
-        let updated = self
-            .lifecycle_for_request(request_id)
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!("Updated lifecycle metadata for {request_id} was not readable")
-            })?;
-        let stale_ids: Vec<_> = self
-            .metadata_events_for_request(request_id)
-            .await
-            .into_iter()
-            .map(|event| event.id)
-            .filter(|id| *id != updated.metadata_event_id)
-            .collect();
-        if !stale_ids.is_empty() {
-            self.db
-                .delete(Filter::new().ids(stale_ids))
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to compact lifecycle metadata for {request_id}: {e}")
-                })?;
+        )
+        .await
+    }
+
+    /// Update a request's policy classification without changing its lifecycle
+    /// timestamps. The replacement is durable before stale rows are compacted,
+    /// so an interrupted update always leaves a readable lifecycle record.
+    pub async fn reclassify_request(
+        &self,
+        request_id: &EventId,
+        classification: RequestClassification,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        let Some(existing) = self.lifecycle_for_request_result(request_id).await? else {
+            return Ok(None);
+        };
+        if existing.classification == classification {
+            return Ok(Some(existing));
         }
-        Ok(self.lifecycle_for_request(request_id).await)
+        self.replace_lifecycle_metadata(
+            request_id,
+            existing.first_seen_at,
+            existing.last_used_at,
+            classification,
+        )
+        .await
     }
 
     /// List canonical request lifecycles for migration and retention work.
@@ -391,8 +402,87 @@ impl Tombstones {
         records
     }
 
+    /// List the original kind-5 and kind-62 payloads retained by this store.
+    /// This deliberately does not require lifecycle metadata, and never exposes
+    /// relay-private metadata events to callers.
+    pub async fn request_payloads(&self) -> anyhow::Result<Vec<Event>> {
+        let mut requests = Vec::new();
+        for kind in [Kind::EventDeletion, Kind::RequestToVanish] {
+            let events = self
+                .db
+                .query(Filter::new().kind(kind))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to list tombstone request payloads: {error}")
+                })?;
+            requests.extend(events);
+        }
+        requests.sort_by_key(|event| event.id.to_hex());
+        requests.dedup_by_key(|event| event.id);
+        Ok(requests)
+    }
+
     fn is_request_kind(kind: Kind) -> bool {
         kind == Kind::EventDeletion || kind == Kind::RequestToVanish
+    }
+
+    async fn replace_lifecycle_metadata(
+        &self,
+        request_id: &EventId,
+        first_seen_at: Timestamp,
+        last_used_at: Option<Timestamp>,
+        classification: RequestClassification,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        // Metadata timestamps only order relay-private replacement rows. Ensure
+        // this row is newer even when multiple updates happen in one wall-clock
+        // second, otherwise canonical selection could retain the old class.
+        let newest_existing = self
+            .metadata_events_for_request_result(request_id)
+            .await?
+            .iter()
+            .map(|event| event.created_at)
+            .max();
+        let replacement_created_at = match newest_existing {
+            Some(existing) if existing >= Timestamp::now() => Timestamp::from_secs(
+                existing
+                    .as_secs()
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("lifecycle metadata timestamp overflow"))?,
+            ),
+            _ => Timestamp::now(),
+        };
+        let replacement = self.build_metadata_at(
+            *request_id,
+            first_seen_at,
+            last_used_at,
+            classification,
+            replacement_created_at,
+        )?;
+        self.db.save_event(&replacement).await.map_err(|e| {
+            anyhow::anyhow!("Failed to update lifecycle metadata for {request_id}: {e}")
+        })?;
+        let updated = self
+            .lifecycle_for_request_result(request_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Updated lifecycle metadata for {request_id} was not readable")
+            })?;
+        let stale_ids: Vec<_> = self
+            .metadata_events_for_request_result(request_id)
+            .await?
+            .into_iter()
+            .map(|event| event.id)
+            .filter(|id| *id != updated.metadata_event_id)
+            .collect();
+        if !stale_ids.is_empty() {
+            self.db
+                .delete(Filter::new().ids(stale_ids))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to compact lifecycle metadata for {request_id}: {e}")
+                })?;
+        }
+        self.lifecycle_for_request_result(request_id).await
     }
 
     async fn request_payload(&self, request_id: &EventId) -> anyhow::Result<Option<Event>> {
@@ -414,6 +504,23 @@ impl Tombstones {
         last_used_at: Option<Timestamp>,
         classification: RequestClassification,
     ) -> anyhow::Result<Event> {
+        self.build_metadata_at(
+            request_id,
+            first_seen_at,
+            last_used_at,
+            classification,
+            Timestamp::now(),
+        )
+    }
+
+    fn build_metadata_at(
+        &self,
+        request_id: EventId,
+        first_seen_at: Timestamp,
+        last_used_at: Option<Timestamp>,
+        classification: RequestClassification,
+        created_at: Timestamp,
+    ) -> anyhow::Result<Event> {
         let mut tags = vec![
             Tag::event(request_id),
             Tag::custom(
@@ -433,10 +540,12 @@ impl Tombstones {
         }
         EventBuilder::new(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND), "")
             .tags(tags)
+            .custom_created_at(created_at)
             .finalize(&self.metadata_signer)
             .map_err(|e| anyhow::anyhow!("Failed to build tombstone lifecycle metadata: {e}"))
     }
 
+    #[cfg(test)]
     async fn metadata_events_for_request(&self, request_id: &EventId) -> Vec<Event> {
         match self.metadata_events_for_request_result(request_id).await {
             Ok(events) => events,

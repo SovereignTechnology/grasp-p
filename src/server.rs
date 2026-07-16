@@ -188,7 +188,10 @@ impl RelayServer {
             .set_local_relay(relay_runtime.relay.clone());
 
         let deletion_runtime = relay_runtime.deletion_runtime.clone();
-        deletion_runtime.run_startup_tasks().await;
+        deletion_runtime
+            .run_startup_tasks()
+            .await
+            .context("failed deletion lifecycle startup reconciliation")?;
 
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling

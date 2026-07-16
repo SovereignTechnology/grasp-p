@@ -408,7 +408,7 @@ impl DeletionService {
         DeletionAdmissionHooks { deletion: self }
     }
 
-    fn vanish_targets_this_relay(&self, event: &Event) -> bool {
+    pub(crate) fn vanish_targets_this_relay(&self, event: &Event) -> bool {
         let relay_urls = Self::relay_url_candidates(self.ctx.domain());
 
         if relay_urls.is_empty() {
@@ -420,6 +420,17 @@ impl DeletionService {
         relay_urls.iter().any(|relay_url| {
             nip62::is_valid_vanish_request_for_relay(event.tags.as_slice(), Some(relay_url))
         })
+    }
+
+    pub(crate) async fn would_delete_stored_target(&self, event: &Event) -> anyhow::Result<bool> {
+        self.policy.would_delete_stored_target(event).await
+    }
+
+    pub(crate) async fn would_nip62_vanish_stored_data(
+        &self,
+        event: &Event,
+    ) -> anyhow::Result<bool> {
+        self.policy.would_nip62_vanish_stored_data(event).await
     }
 
     fn relay_url_candidates(domain: &str) -> Vec<RelayUrl> {

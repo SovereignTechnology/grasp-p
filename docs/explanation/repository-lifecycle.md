@@ -244,6 +244,25 @@ request a fresh 30-day probation window. This deliberately favors preservation
 over immediate production cleanup; normal cleanup moves requests that remain
 unused out of the served main database after that window.
 
+Startup performs this migration before blacklist/whitelist reconciliation and
+before the relay starts serving traffic. It discovers signed kind-5 and kind-62
+payloads from both the served and tombstone databases, including tombstone
+payloads whose metadata is missing or malformed, and deduplicates by signed
+event ID. Valid existing metadata is preserved; missing metadata is written
+with one startup timestamp and the original payload is promoted to the served
+database for its fresh probation. The pass is restart-safe: replacement
+metadata preserves the earliest `first_seen_at` and greatest `last_used_at`.
+
+The same startup pass reclassifies retained requests using current relay
+configuration and reconciles served copies at the exact lifecycle deadline.
+In disrespector mode it read-only evaluates unused targeting requests against
+main and purgatory data, marking only requests that would currently have an
+effect as used; it never changes target data during that evaluation. Used
+targeting requests remain served in that mode, while non-targeting NIP-62 and
+unused no-op requests retain their ordinary bounded served schedule. Critical
+query, metadata, promotion, or removal failures fail startup rather than
+allowing traffic to begin with an incomplete lifecycle reconciliation.
+
 The relay's current deletion-disrespector configuration governs retained
 requests; receipt-time mode is not permanent metadata. Switching into
 disrespector mode removes their local gates and keeps requests that are used or
@@ -251,6 +270,10 @@ would delete currently stored data served indefinitely. Switching back to normal
 mode reapplies normal gating and the 9-month served plus 3-month unserved expiry
 schedule using retained lifecycle timestamps. Startup reconciliation must apply
 these transitions before the relay begins serving traffic.
+
+Periodic request cleanup, permanent tombstone expiry, removal of target-set
+deduplication and the `repair-deletion-requests` command, and final rollout
+coverage remain future work.
 
 ## Core consistency invariant
 

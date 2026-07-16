@@ -47,8 +47,8 @@ pub use policy::DeletionPolicy;
 pub use runtime::{run_holding_eject, DeletionCleanupTask, DeletionRuntime, HoldingEjectArgs};
 pub use service::DeletionService;
 pub use startup::{
-    BlacklistParityStats, BlacklistRestoreStats, StartupReconciliationStats, WhitelistParityStats,
-    WhitelistRestoreStats,
+    BlacklistParityStats, BlacklistRestoreStats, RequestLifecycleStartupStats,
+    StartupReconciliationStats, WhitelistParityStats, WhitelistRestoreStats,
 };
 
 #[cfg(test)]

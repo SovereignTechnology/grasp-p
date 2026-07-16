@@ -253,7 +253,7 @@ impl DeletionPolicy {
     /// Read-only normal-policy target evaluation for disrespector mode.
     /// This intentionally only queries the main database and purgatory snapshots;
     /// it must not call deletion, holding, archive, rollback, or cascade helpers.
-    async fn would_delete_stored_target(&self, event: &Event) -> anyhow::Result<bool> {
+    pub(super) async fn would_delete_stored_target(&self, event: &Event) -> anyhow::Result<bool> {
         for id in Self::e_tag_ids(event) {
             if self.ctx.database.event_by_id(&id).await?.is_some() {
                 return Ok(true);

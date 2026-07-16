@@ -61,9 +61,10 @@ impl DeletionRuntime {
     }
 
     /// Run deletion-owned startup tasks before the relay begins serving traffic.
-    pub async fn run_startup_tasks(&self) {
-        log_startup_reconciliation(self.service.run_startup_reconciliation().await);
+    pub async fn run_startup_tasks(&self) -> Result<()> {
+        log_startup_reconciliation(self.service.run_startup_reconciliation().await?);
         self.run_holding_startup_cleanup().await;
+        Ok(())
     }
 
     /// Spawn deletion-owned background maintenance tasks.
