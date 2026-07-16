@@ -10,12 +10,11 @@ and purgatory transitions.
 
 ## Bounded request retention
 
-> **Status:** Lifecycle metadata, NIP-09 lifecycle admission (including
-> disrespector read-only would-have-deleted classification), deterministic
-> admission-use attribution, and measured destructive outcomes are implemented.
-> NIP-62 lifecycle admission, request cleanup/expiry, migration, target-set
-> deduplication removal, and remaining policy-mode reconciliation remain future
-> stages.
+> **Status:** Lifecycle metadata, NIP-09 and NIP-62 lifecycle admission
+> (including disrespector read-only would-have-deleted classification),
+> deterministic admission-use attribution, and measured destructive outcomes are
+> implemented. Request cleanup/expiry, migration, target-set deduplication
+> removal, and final policy-mode reconciliation remain future stages.
 
 ### Production motivation
 

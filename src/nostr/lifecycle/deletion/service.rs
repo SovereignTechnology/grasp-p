@@ -5,7 +5,7 @@ use nostr_relay_builder::prelude::{
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
-use crate::nostr::lifecycle::RequestLifecycleRecord;
+use crate::nostr::lifecycle::{RequestClassification, RequestLifecycleRecord};
 use crate::nostr::policy::{reject_error, reject_invalid, AnnouncementResult};
 
 use super::{DeletionContext, DeletionOutcome, DeletionPolicy};
@@ -287,22 +287,34 @@ impl DeletionService {
     }
 
     pub async fn handle_vanish(&self, event: &Event) -> WritePolicyResult {
-        // Archival mode: store the vanish request but do not process it.
-        if self.ctx.config.deletion_request_disrespector {
-            tracing::info!(
-                event_id = %event.id.to_hex(),
-                author = %event.pubkey.to_hex(),
-                "Disrespector mode: storing NIP-62 vanish request without acting on it"
-            );
-            return WritePolicyResult::Accept;
-        }
-
         // Only honour requests that target this relay (or all relays). `domain`
         // is configured as an authority for GRASP matching, so derive both
         // `wss://` and `ws://` relay URL candidates when no scheme is present.
         // We still accept (store) well-formed kind-62 requests that target other
         // relays so clients get an OK for their event.
         let targets_relay = self.vanish_targets_this_relay(event);
+        let classification = if !targets_relay {
+            RequestClassification::NonTargetingNip62
+        } else if self.ctx.config.deletion_request_disrespector {
+            RequestClassification::Disrespector
+        } else {
+            RequestClassification::LocallyActionable
+        };
+
+        // Persist every accepted NIP-62 request before accepting it or doing
+        // destructive work. `record_request` preserves receipt time and
+        // classification on an exact replay.
+        if let Err(error) = self
+            .ctx
+            .tombstones()
+            .record_request(event, Timestamp::now(), classification)
+            .await
+        {
+            tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to record NIP-62 vanish lifecycle");
+            return reject_error(format!(
+                "internal error recording vanish lifecycle: {error}"
+            ));
+        }
 
         if !targets_relay {
             tracing::debug!(
@@ -314,10 +326,28 @@ impl DeletionService {
 
         let author = event.pubkey;
 
-        // 1. Record the vanish so re-submission of the author's events is blocked.
-        if let Err(e) = self.ctx.tombstones().record_vanish(event).await {
-            tracing::error!(error = %e, author = %author.to_hex(), "Failed to record vanish tombstone");
-            return reject_error(format!("internal error recording vanish: {e}"));
+        if self.ctx.config.deletion_request_disrespector {
+            let would_vanish = match self.policy.would_nip62_vanish_stored_data(event).await {
+                Ok(would_vanish) => would_vanish,
+                Err(error) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to read-only evaluate NIP-62 vanish request");
+                    return reject_error(format!(
+                        "internal error evaluating vanish request: {error}"
+                    ));
+                }
+            };
+            if would_vanish {
+                if let Err(result) = self.mark_vanish_request_used(event).await {
+                    return result;
+                }
+            }
+            tracing::info!(
+                event_id = %event.id.to_hex(),
+                author = %author.to_hex(),
+                would_vanish,
+                "Disrespector mode: stored and read-only evaluated NIP-62 vanish request"
+            );
+            return WritePolicyResult::Accept;
         }
 
         let mut outcome = match self.policy.apply_nip62_vanish(event).await {
@@ -334,22 +364,8 @@ impl DeletionService {
         outcome.merge(self.evict_author_from_purgatory(&author));
 
         if outcome.used() {
-            match self
-                .ctx
-                .tombstones()
-                .mark_request_used(&event.id, Timestamp::now())
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return reject_error(
-                        "internal error updating vanish lifecycle: missing metadata",
-                    )
-                }
-                Err(e) => {
-                    tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to mark used NIP-62 vanish request");
-                    return reject_error(format!("internal error updating vanish lifecycle: {e}"));
-                }
+            if let Err(result) = self.mark_vanish_request_used(event).await {
+                return result;
             }
         }
 
@@ -363,6 +379,29 @@ impl DeletionService {
         );
 
         WritePolicyResult::Accept
+    }
+
+    async fn mark_vanish_request_used(
+        &self,
+        event: &Event,
+    ) -> std::result::Result<(), WritePolicyResult> {
+        match self
+            .ctx
+            .tombstones()
+            .mark_request_used(&event.id, Timestamp::now())
+            .await
+        {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(reject_error(
+                "internal error updating vanish lifecycle: missing metadata",
+            )),
+            Err(error) => {
+                tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to mark used NIP-62 vanish request");
+                Err(reject_error(format!(
+                    "internal error updating vanish lifecycle: {error}"
+                )))
+            }
+        }
     }
 
     pub(crate) fn admission_hooks(&self) -> DeletionAdmissionHooks<'_> {
@@ -798,6 +837,26 @@ mod tests {
             .unwrap()
     }
 
+    fn vanish(keys: &Keys, content: &str) -> Event {
+        EventBuilder::new(Kind::RequestToVanish, content)
+            .tags(vec![nostr_relay_builder::prelude::Tag::custom(
+                "relay",
+                vec!["ALL_RELAYS".to_string()],
+            )])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    fn non_targeting_vanish(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::RequestToVanish, "non-targeting")
+            .tags(vec![nostr_relay_builder::prelude::Tag::custom(
+                "relay",
+                vec!["wss://other.example".to_string()],
+            )])
+            .finalize(keys)
+            .unwrap()
+    }
+
     #[test]
     fn retention_expiry_uses_exact_deadline_boundary() {
         let service = DeletionService::new(context(crate::config::Config {
@@ -956,6 +1015,333 @@ mod tests {
         assert_eq!(
             ctx.tombstones
                 .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_vanish_without_stored_data_is_actionable_and_unused() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let request = vanish(&Keys::generate(), "empty");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        let record = ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.classification,
+            RequestClassification::LocallyActionable
+        );
+        assert_eq!(record.last_used_at, None);
+    }
+
+    #[tokio::test]
+    async fn targeted_vanish_marks_used_after_main_database_removal() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "vanish me")
+            .finalize(&keys)
+            .unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let request = vanish(&keys, "main-db");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn targeted_vanish_marks_used_after_purgatory_only_removal() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let state = EventBuilder::new(Kind::RepoState, "")
+            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
+                "purgatory-only",
+            )])
+            .finalize(&keys)
+            .unwrap();
+        ctx.purgatory.add_state(
+            state.clone(),
+            "purgatory-only".to_string(),
+            keys.public_key(),
+            false,
+        );
+        let request = vanish(&keys, "purgatory-only");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx.purgatory.find_state("purgatory-only").is_empty());
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn non_targeting_vanish_is_unused_and_never_gates() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "keep me")
+            .finalize(&keys)
+            .unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let request = non_targeting_vanish(&keys);
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+        let record = ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.classification,
+            RequestClassification::NonTargetingNip62
+        );
+        assert_eq!(record.last_used_at, None);
+        let later = EventBuilder::new(Kind::TextNote, "allowed")
+            .finalize(&keys)
+            .unwrap();
+        assert!(service.gate(&later).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_targeting_vanish_takes_precedence_over_disrespector_classification() {
+        let ctx = context(crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let request = non_targeting_vanish(&Keys::generate());
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .classification,
+            RequestClassification::NonTargetingNip62
+        );
+    }
+
+    #[tokio::test]
+    async fn disrespector_vanish_marks_main_database_and_purgatory_matches_used_without_mutating() {
+        let ctx = context(crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "preserve me")
+            .finalize(&keys)
+            .unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let state = EventBuilder::new(Kind::RepoState, "")
+            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
+                "preserve-purgatory",
+            )])
+            .finalize(&keys)
+            .unwrap();
+        ctx.purgatory.add_state(
+            state.clone(),
+            "preserve-purgatory".to_string(),
+            keys.public_key(),
+            false,
+        );
+        let request = vanish(&keys, "disrespector-data");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(ctx
+            .purgatory
+            .find_state("preserve-purgatory")
+            .iter()
+            .any(|entry| entry.event.id == state.id));
+        let record = ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap();
+        assert_eq!(record.classification, RequestClassification::Disrespector);
+        assert!(record.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn disrespector_vanish_marks_purgatory_only_match_used_without_mutating() {
+        let ctx = context(crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let state = EventBuilder::new(Kind::RepoState, "")
+            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
+                "disrespector-purgatory",
+            )])
+            .finalize(&keys)
+            .unwrap();
+        ctx.purgatory.add_state(
+            state.clone(),
+            "disrespector-purgatory".to_string(),
+            keys.public_key(),
+            false,
+        );
+        let request = vanish(&keys, "disrespector-purgatory-only");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .purgatory
+            .find_state("disrespector-purgatory")
+            .iter()
+            .any(|entry| entry.event.id == state.id));
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&request.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn disrespector_vanish_noop_remains_unused() {
+        let ctx = context(crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let request = vanish(&Keys::generate(), "disrespector-empty");
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_vanish_replay_keeps_original_first_seen_at() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let request = vanish(&Keys::generate(), "replay");
+        ctx.tombstones
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.handle_vanish(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .first_seen_at,
+            Timestamp::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn vanish_gate_promotes_and_updates_only_one_deterministic_request() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let older = vanish(&keys, "older");
+        let newer = vanish(&keys, "newer");
+        let now = Timestamp::now().as_secs();
+        for (request, first_seen_at) in [(&older, now - 2), (&newer, now - 1)] {
+            ctx.tombstones
+                .record_request(
+                    request,
+                    Timestamp::from_secs(first_seen_at),
+                    RequestClassification::LocallyActionable,
+                )
+                .await
+                .unwrap();
+        }
+        let incoming = EventBuilder::new(Kind::TextNote, "blocked")
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(service.gate(&incoming).await.is_some());
+        assert!(ctx.database.event_by_id(&older.id).await.unwrap().is_some());
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&older.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&newer.id)
                 .await
                 .unwrap()
                 .last_used_at,

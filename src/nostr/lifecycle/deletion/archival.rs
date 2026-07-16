@@ -23,6 +23,46 @@ struct DeletedAnnouncementRepoScope {
 }
 
 impl DeletionPolicy {
+    /// Read-only normal-policy evaluation for a targeting NIP-62 request in
+    /// disrespector mode. This deliberately does not invoke archive, cascade,
+    /// holding, rollback, repository, or purgatory mutation helpers.
+    pub(super) async fn would_nip62_vanish_stored_data(
+        &self,
+        event: &Event,
+    ) -> anyhow::Result<bool> {
+        if !self
+            .ctx
+            .database
+            .query(Filter::new().author(event.pubkey))
+            .await?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+
+        let author = event.pubkey;
+        if self
+            .ctx
+            .purgatory
+            .announcements_for_sync()
+            .into_iter()
+            .any(|(repository_id, _)| {
+                let parts: Vec<_> = repository_id.splitn(3, ':').collect();
+                parts.len() == 3 && parts[1] == author.to_hex()
+            })
+        {
+            return Ok(true);
+        }
+
+        Ok(self
+            .ctx
+            .purgatory
+            .get_all_identifiers()
+            .into_iter()
+            .flat_map(|identifier| self.ctx.purgatory.find_state(&identifier))
+            .any(|entry| entry.author == author))
+    }
+
     /// Move all currently served data authored by a targeted NIP-62 vanish
     /// request through the same holding/archive deletion lifecycle used for
     /// NIP-09 announcement deletion.
