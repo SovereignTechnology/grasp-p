@@ -229,6 +229,23 @@ complete.
 Once an expired request has been permanently removed, replaying that identical
 signed event starts a new lifecycle because no live event-ID marker remains.
 
+### Migration and policy-mode changes
+
+Existing request rows predate relay-observed lifecycle metadata, so their true
+`first_seen_at` and `last_used_at` cannot be reconstructed reliably. Migration
+assigns the migration timestamp as `first_seen_at` and gives every historical
+request a fresh 30-day probation window. This deliberately favors preservation
+over immediate production cleanup; normal cleanup moves requests that remain
+unused out of the served main database after that window.
+
+The relay's current deletion-disrespector configuration governs retained
+requests; receipt-time mode is not permanent metadata. Switching into
+disrespector mode removes their local gates and keeps requests that are used or
+would delete currently stored data served indefinitely. Switching back to normal
+mode reapplies normal gating and the 9-month served plus 3-month unserved expiry
+schedule using retained lifecycle timestamps. Startup reconciliation must apply
+these transitions before the relay begins serving traffic.
+
 ## Core consistency invariant
 
 ngit-grasp enforces the following invariant across admission, serving, deletion,
