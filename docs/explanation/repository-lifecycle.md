@@ -108,7 +108,8 @@ The four lifecycle durations should be operator-configurable, with defaults of
 30 days for unused serving, a further 180 days for unused gating, 9 months for
 used serving, and a further 3 months for used gating. Configuration validation
 must preserve the ordering of each served period followed by its unserved gate
-period; cleanup cadence is operational and must not alter the timestamp-derived
+period. The existing holding cleanup cadence also schedules deletion-request
+retention cleanup; it is operational and must not alter the timestamp-derived
 deadlines.
 
 ### Multiple matching requests

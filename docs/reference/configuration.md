@@ -492,9 +492,9 @@ NGIT_REJECTED_COLD_INDEX_EXPIRY_SECS=1209600
 
 ---
 
-### Holding DB Cleanup Configuration
+### Holding DB and Deletion-Request Cleanup Configuration
 
-These options control retention and cleanup cadence for deleted events archived in the holding database.
+These options control retention for deleted events archived in the holding database and the shared cleanup cadence for holding and deletion-request retention records.
 
 #### `NGIT_HOLDING_RETENTION_SECS`
 
@@ -522,7 +522,7 @@ NGIT_HOLDING_RETENTION_SECS=2592000
 
 #### `NGIT_HOLDING_CLEANUP_INTERVAL_SECS`
 
-**Description:** Interval between periodic holding DB expiration cleanup passes
+**Description:** Interval between periodic holding DB expiration cleanup passes and deletion-request retention cleanup passes
 **Type:** Integer (seconds)
 **Default:** `86400` (24 hours)
 **Required:** No
@@ -541,6 +541,7 @@ NGIT_HOLDING_CLEANUP_INTERVAL_SECS=21600
 
 - Must be greater than 0
 - Smaller values clean up expired records sooner at the cost of more background work
+- This interval only determines how soon expired records are observed and removed. It does not change any timestamp-derived holding or deletion-request retention deadline.
 
 ---
 
@@ -1178,6 +1179,84 @@ NGIT_DELETION_REQUEST_DISRESPECTOR=false
 
 See [`docs/explanation/repository-lifecycle.md`](../explanation/repository-lifecycle.md)
 for the full lifecycle design rationale.
+
+---
+
+### Deletion-Request Retention (NIP-09 and NIP-62)
+
+These options govern the bounded lifecycle of accepted NIP-09 deletion requests and NIP-62 request-to-vanish events. All values are integer seconds. The used-request defaults express months as fixed 30-day periods, not calendar months.
+
+The relay derives unused deadlines from relay-observed `first_seen_at`, never from the client-controlled event `created_at`. It derives used deadlines from `last_used_at`. Each `...ADDITIONAL...` option begins only after its corresponding served period ends; it is not a total retention duration.
+
+#### `NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS`
+
+- **Description:** How long an unused deletion or vanish request remains served from relay-observed `first_seen_at`
+- **Type:** Positive integer (seconds)
+- **Default:** `2592000` (30 days)
+- **Required:** No
+- **CLI:** `--deletion-request-retention-unused-served-secs`
+
+```bash
+# Default: serve an unused request for 30 days from first_seen_at
+NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS=2592000
+```
+
+After this served period, an unused request enters its additional unserved/gating period.
+
+---
+
+#### `NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS`
+
+- **Description:** Additional time after unused serving ends that an unused deletion or vanish request remains unserved but eligible to gate admission
+- **Type:** Positive integer (seconds)
+- **Default:** `15552000` (180 days)
+- **Required:** No
+- **CLI:** `--deletion-request-retention-unused-unserved-gating-additional-secs`
+
+```bash
+# Default: retain an unused request as an unserved gate for a further 180 days
+NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS=15552000
+```
+
+The unused request expires after `unused served + this additional period` from `first_seen_at`. Retained disrespector and non-targeting NIP-62 records do not enforce a local admission gate.
+
+---
+
+#### `NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS`
+
+- **Description:** In normal mode, how long a used deletion or vanish request remains served after `last_used_at`
+- **Type:** Positive integer (seconds)
+- **Default:** `23328000` (270 days; 9 fixed 30-day months)
+- **Required:** No
+- **CLI:** `--deletion-request-retention-used-served-after-last-used-secs`
+
+```bash
+# Default: serve a used request for 270 days after last_used_at
+NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS=23328000
+```
+
+Every successful use resets `last_used_at` and restarts this served period. When `NGIT_DELETION_REQUEST_DISRESPECTOR=true`, used requests remain served indefinitely, so this normal-mode duration does not expire them.
+
+---
+
+#### `NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS`
+
+- **Description:** Additional normal-mode time after used serving ends that a used deletion or vanish request remains unserved but continues gating admission
+- **Type:** Positive integer (seconds)
+- **Default:** `7776000` (90 days; 3 fixed 30-day months)
+- **Required:** No
+- **CLI:** `--deletion-request-retention-used-unserved-gating-additional-secs`
+
+```bash
+# Default: continue gating for a further 90 days after used serving ends
+NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS=7776000
+```
+
+The used request expires after `used served + this additional period` from `last_used_at`. When `NGIT_DELETION_REQUEST_DISRESPECTOR=true`, used requests remain served indefinitely, so this normal-mode additional period does not expire their local record.
+
+**Validation:** Each deletion-request retention duration must be greater than zero. Each served and additional-gating pair must also fit in an unsigned 64-bit second duration when combined.
+
+**Cleanup cadence:** `NGIT_HOLDING_CLEANUP_INTERVAL_SECS` schedules both holding DB and deletion-request retention cleanup passes. Cleanup evaluates deadlines derived from `first_seen_at` and `last_used_at`; changing its cadence never changes those deadlines.
 
 ---
 
