@@ -8,7 +8,7 @@ use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::lifecycle::RequestLifecycleRecord;
 use crate::nostr::policy::{reject_error, reject_invalid, AnnouncementResult};
 
-use super::{DeletionContext, DeletionPolicy};
+use super::{DeletionContext, DeletionOutcome, DeletionPolicy};
 
 #[derive(Clone)]
 pub struct DeletionService {
@@ -320,18 +320,45 @@ impl DeletionService {
             return reject_error(format!("internal error recording vanish: {e}"));
         }
 
-        if let Err(e) = self.policy.apply_nip62_vanish(event).await {
-            tracing::error!(error = %e, author = %author.to_hex(), "Failed to process vanished author's lifecycle deletion");
-            return reject_error(format!("internal error processing vanish: {e}"));
-        }
+        let mut outcome = match self.policy.apply_nip62_vanish(event).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(error = %e, author = %author.to_hex(), "Failed to process vanished author's lifecycle deletion");
+                return reject_error(format!("internal error processing vanish: {e}"));
+            }
+        };
 
         // Evict the author's purgatory entries (and their bare repos). Served
         // data has already gone through the holding/archive lifecycle above;
         // purgatory entries are not live served data.
-        self.evict_author_from_purgatory(&author);
+        outcome.merge(self.evict_author_from_purgatory(&author));
+
+        if outcome.used() {
+            match self
+                .ctx
+                .tombstones()
+                .mark_request_used(&event.id, Timestamp::now())
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return reject_error(
+                        "internal error updating vanish lifecycle: missing metadata",
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to mark used NIP-62 vanish request");
+                    return reject_error(format!("internal error updating vanish lifecycle: {e}"));
+                }
+            }
+        }
 
         tracing::info!(
             author = %author.to_hex(),
+            main_db_deleted = outcome.main_db_deleted,
+            purgatory_removed = outcome.purgatory_removed,
+            skipped = outcome.skipped,
+            failures = outcome.failures,
             "Processed NIP-62 request to vanish through deletion lifecycle"
         );
 
@@ -608,7 +635,9 @@ impl DeletionService {
         kind == Kind::GitRepoAnnouncement || kind == Kind::RepoState
     }
 
-    fn evict_author_from_purgatory(&self, author: &PublicKey) {
+    fn evict_author_from_purgatory(&self, author: &PublicKey) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
+        let mut removed_ids = std::collections::HashSet::new();
         // Announcements owned by this author.
         for (repo_id, _) in self.ctx.purgatory().announcements_for_sync() {
             // repo_id format: "30617:{pubkey_hex}:{identifier}"
@@ -625,8 +654,14 @@ impl DeletionService {
                             error = %e,
                             "Failed to delete bare repository during vanish processing"
                         );
+                        outcome.failures = outcome.failures.saturating_add(1);
                     }
                 }
+            }
+            if let Some(entry) = self.ctx.purgatory().find_announcement(author, identifier) {
+                outcome.purgatory_removed = outcome
+                    .purgatory_removed
+                    .saturating_add(usize::from(removed_ids.insert(entry.event.id)));
             }
             self.ctx.purgatory().remove_announcement(author, identifier);
         }
@@ -635,12 +670,16 @@ impl DeletionService {
         for identifier in self.ctx.purgatory().get_all_identifiers() {
             for entry in self.ctx.purgatory().find_state(&identifier) {
                 if entry.author == *author {
+                    outcome.purgatory_removed = outcome
+                        .purgatory_removed
+                        .saturating_add(usize::from(removed_ids.insert(entry.event.id)));
                     self.ctx
                         .purgatory()
                         .remove_state_event(&identifier, &entry.event.id);
                 }
             }
         }
+        outcome
     }
 }
 

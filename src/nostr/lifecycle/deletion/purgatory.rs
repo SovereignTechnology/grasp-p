@@ -3,7 +3,7 @@ use std::process::Command;
 
 use nostr_relay_builder::prelude::{Event, Kind, Timestamp};
 
-use super::policy::DeletionPolicy;
+use super::{policy::DeletionPolicy, DeletionOutcome};
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::lifecycle::DeletionSource;
 
@@ -137,8 +137,10 @@ impl DeletionPolicy {
     ///
     /// Only removes entries where the purgatory entry's author matches the deletion
     /// event's pubkey (enforces author-only deletion).
-    pub(super) fn remove_purgatory_targets(&self, event: &Event) {
+    pub(super) fn remove_purgatory_targets(&self, event: &Event) -> DeletionOutcome {
         let author = &event.pubkey;
+        let mut outcome = DeletionOutcome::default();
+        let mut removed_ids = HashSet::new();
 
         for tag in event.tags.iter() {
             let tag_vec = tag.as_slice();
@@ -150,16 +152,27 @@ impl DeletionPolicy {
                 "e" => {
                     // Event ID reference: find purgatory announcement with this event ID
                     let target_id = &tag_vec[1];
-                    self.remove_by_event_id(author, target_id, event.created_at.as_secs());
+                    outcome.merge(self.remove_by_event_id(
+                        author,
+                        target_id,
+                        event.created_at.as_secs(),
+                        &mut removed_ids,
+                    ));
                 }
                 "a" => {
                     // Addressable coordinate reference: `<kind>:<pubkey>:<d-identifier>`
                     let coord = &tag_vec[1];
-                    self.remove_by_coordinate(author, coord, event.created_at.as_secs());
+                    outcome.merge(self.remove_by_coordinate(
+                        author,
+                        coord,
+                        event.created_at.as_secs(),
+                        &mut removed_ids,
+                    ));
                 }
                 _ => {}
             }
         }
+        outcome
     }
 
     /// Remove a purgatory entry (announcement, state event, or PR event) matched by event ID.
@@ -171,7 +184,8 @@ impl DeletionPolicy {
         author: &nostr_relay_builder::prelude::PublicKey,
         target_id_hex: &str,
         _deletion_created_at: u64,
-    ) {
+        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+    ) -> DeletionOutcome {
         // --- Check PR events (kind 1617/1618) first — O(1) direct lookup ---
         // PR purgatory is keyed by event ID hex, so this is the cheapest check.
         // Only remove if the entry has an actual event (not a placeholder) and the
@@ -185,11 +199,14 @@ impl DeletionPolicy {
                         "Deletion request: removing purgatory PR event by event ID"
                     );
                     self.ctx.purgatory.remove_pr(target_id_hex);
-                    return;
+                    return DeletionOutcome {
+                        purgatory_removed: usize::from(removed_ids.insert(event.id)),
+                        ..Default::default()
+                    };
                 }
             }
             // Entry exists but is a placeholder or wrong author — don't remove
-            return;
+            return DeletionOutcome::default();
         }
 
         // --- Check announcements (kind 30617) ---
@@ -217,8 +234,7 @@ impl DeletionPolicy {
                         author = %author.to_hex(),
                         "Deletion request: removing purgatory announcement by event ID"
                     );
-                    self.evict_purgatory_entry(author, identifier);
-                    return; // event IDs are unique
+                    return self.evict_purgatory_entry(author, identifier, removed_ids);
                 }
             }
         }
@@ -239,10 +255,14 @@ impl DeletionPolicy {
                     self.ctx
                         .purgatory
                         .remove_state_event(&identifier, &entry.event.id);
-                    return; // event IDs are unique
+                    return DeletionOutcome {
+                        purgatory_removed: usize::from(removed_ids.insert(entry.event.id)),
+                        ..Default::default()
+                    };
                 }
             }
         }
+        DeletionOutcome::default()
     }
 
     /// Remove a purgatory entry matched by addressable coordinate.
@@ -256,11 +276,13 @@ impl DeletionPolicy {
         author: &nostr_relay_builder::prelude::PublicKey,
         coordinate: &str,
         deletion_created_at: u64,
-    ) {
+        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+    ) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
         // Parse coordinate: `<kind>:<pubkey>:<d-identifier>`
         let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
         if parts.len() != 3 {
-            return;
+            return DeletionOutcome::default();
         }
 
         let kind_str = parts[0];
@@ -274,7 +296,7 @@ impl DeletionPolicy {
                 deletion_author = %author.to_hex(),
                 "Ignoring deletion: coordinate pubkey does not match deletion author"
             );
-            return;
+            return DeletionOutcome::default();
         }
 
         match kind_str {
@@ -287,7 +309,7 @@ impl DeletionPolicy {
                             author = %author.to_hex(),
                             "Deletion request: removing purgatory announcement by coordinate"
                         );
-                        self.evict_purgatory_entry(author, identifier);
+                        return self.evict_purgatory_entry(author, identifier, removed_ids);
                     } else {
                         tracing::debug!(
                             identifier = %identifier,
@@ -309,7 +331,10 @@ impl DeletionPolicy {
                         self.ctx
                             .purgatory
                             .remove_state_event(identifier, &entry.event.id);
-                        removed += 1;
+                        let counted = usize::from(removed_ids.insert(entry.event.id));
+                        removed += counted;
+                        outcome.purgatory_removed =
+                            outcome.purgatory_removed.saturating_add(counted);
                     }
                 }
                 if removed > 0 {
@@ -325,6 +350,7 @@ impl DeletionPolicy {
                 // Other kinds not handled
             }
         }
+        outcome
     }
 
     /// Remove a purgatory announcement and delete its bare repository from disk.
@@ -332,7 +358,9 @@ impl DeletionPolicy {
         &self,
         author: &nostr_relay_builder::prelude::PublicKey,
         identifier: &str,
-    ) {
+        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+    ) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
         // Get repo path before removing
         if let Some(entry) = self.ctx.purgatory.find_announcement(author, identifier) {
             if entry.repo_path.exists() {
@@ -342,6 +370,7 @@ impl DeletionPolicy {
                         error = %e,
                         "Failed to delete bare repository during deletion request processing"
                     );
+                    outcome.failures = outcome.failures.saturating_add(1);
                 } else {
                     tracing::info!(
                         path = %entry.repo_path.display(),
@@ -351,6 +380,11 @@ impl DeletionPolicy {
             }
         }
 
+        if let Some(entry) = self.ctx.purgatory.find_announcement(author, identifier) {
+            outcome.purgatory_removed = outcome
+                .purgatory_removed
+                .saturating_add(usize::from(removed_ids.insert(entry.event.id)));
+        }
         self.ctx.purgatory.remove_announcement(author, identifier);
 
         // Remove state events for this identifier only if no other owner's
@@ -362,7 +396,13 @@ impl DeletionPolicy {
             .is_empty();
 
         if !other_owners_remain {
+            for entry in self.ctx.purgatory.find_state(identifier) {
+                outcome.purgatory_removed = outcome
+                    .purgatory_removed
+                    .saturating_add(usize::from(removed_ids.insert(entry.event.id)));
+            }
             self.ctx.purgatory.remove_state(identifier);
         }
+        outcome
     }
 }

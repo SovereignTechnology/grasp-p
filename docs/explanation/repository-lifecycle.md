@@ -8,12 +8,12 @@ NIP-09 deletion requests, NIP-62 request-to-vanish events, operator blacklist an
 whitelist reconciliation, service de-listing, holding/archive retention, recovery,
 and purgatory transitions.
 
-## Proposed bounded request retention
+## Bounded request retention
 
-> **Status:** Desired architecture, not yet implemented. The current code keeps
-> accepted NIP-09 requests in the served main database and in the
-> tombstone database without age-based expiry. This section records the target
-> behavior for approval before implementation planning.
+> **Status:** Lifecycle metadata, deterministic admission-use attribution, and
+> measured destructive outcomes are implemented. Request cleanup/expiry,
+> migration, target-set deduplication removal, and the disrespector
+> would-have-deleted classification remain future stages.
 
 ### Production motivation
 
@@ -491,6 +491,14 @@ deprecated in favor of the maintenance command.
     - Delete events older than retention period
     - Delete corresponding archive files
 ```
+
+Deletion processing records a structured outcome: successful main-database
+removals and successful purgatory removals are counted separately from skipped
+fail-safe preservation and query/delete failures. A kind-5 request receives
+`last_used_at` only after at least one actual main-DB or purgatory event removal;
+archiving to Holding, git/filesystem cleanup, candidate matching, and failed
+operations do not constitute use. NIP-62 uses the same rule, including its
+author-wide purgatory eviction.
 
 Deletion gate checks tombstones before kind-specific admission and rejects:
 - events from vanished pubkeys,

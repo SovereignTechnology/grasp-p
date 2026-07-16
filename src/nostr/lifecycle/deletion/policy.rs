@@ -180,11 +180,11 @@ impl DeletionPolicy {
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
 
         // Process purgatory removals (synchronous, in-memory).
-        self.remove_purgatory_targets(event);
+        let mut outcome = self.remove_purgatory_targets(event);
 
         // Move targeted events into holding DB, then delete from main DB.
         let mut moved_ids = HashSet::new();
-        self.delete_main_db_targets(event, &mut moved_ids).await;
+        outcome.merge(self.delete_main_db_targets(event, &mut moved_ids).await);
 
         for plan in &rollback_plans {
             self.rollback_deleted_active_replaceable(plan).await;
@@ -196,6 +196,29 @@ impl DeletionPolicy {
         for identifier in identifiers_to_realign {
             self.realign_identifier_state(&identifier).await;
         }
+
+        if outcome.used() {
+            match self
+                .ctx
+                .tombstones
+                .mark_request_used(&event.id, nostr_relay_builder::prelude::Timestamp::now())
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return reject_error(
+                        "internal error updating deletion lifecycle: missing metadata",
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to mark used NIP-09 deletion request");
+                    return reject_error(format!(
+                        "internal error updating deletion lifecycle: {e}"
+                    ));
+                }
+            }
+        }
+        tracing::info!(event_id = %event.id.to_hex(), main_db_deleted = outcome.main_db_deleted, purgatory_removed = outcome.purgatory_removed, skipped = outcome.skipped, failures = outcome.failures, "Processed NIP-09 deletion outcome");
 
         // Accept the deletion event itself so it is stored.
         WritePolicyResult::Accept
@@ -451,6 +474,56 @@ mod tests {
             !matches!(duplicate_result, WritePolicyResult::Accept),
             "duplicate deletion request should not be returned as Accept, because Accept causes relay storage"
         );
+    }
+
+    #[tokio::test]
+    async fn nip09_marks_request_used_only_after_successful_removal() {
+        let ctx = make_context();
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target.id)])
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
+        let record = ctx
+            .tombstones
+            .lifecycle_records()
+            .await
+            .into_iter()
+            .find(|record| record.request.id == deletion.id)
+            .unwrap();
+        assert!(record.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn nip09_noop_leaves_request_lifecycle_unused() {
+        let ctx = make_context();
+        let keys = Keys::generate();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(EventId::all_zeros())])
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
+        let record = ctx
+            .tombstones
+            .lifecycle_records()
+            .await
+            .into_iter()
+            .find(|record| record.request.id == deletion.id)
+            .unwrap();
+        assert_eq!(record.last_used_at, None);
     }
 
     #[tokio::test]
