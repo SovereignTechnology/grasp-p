@@ -24,8 +24,9 @@
 //! ## How it works
 //!
 //! Rather than inventing a bespoke key-value schema, we persist the **deletion
-//! and vanish request events themselves** (kind 5 and kind 62) in a dedicated
-//! nostr database and derive the deleted/vanished state by querying it:
+//! and vanish request events themselves** (kind 5 and kind 62), plus private
+//! relay-generated lifecycle metadata, in a dedicated nostr database. Deleted /
+//! vanished state is derived only from the original request payloads:
 //!
 //! - a kind-5 with an `e` tag → that event id is deleted
 //! - a kind-5 with an `a` tag → that coordinate is deleted up to the kind-5's
@@ -47,16 +48,72 @@ use std::sync::Arc;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, NostrDatabase, PublicKey, SingleLetterTag, Timestamp,
+    Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
+    PublicKey, SingleLetterTag, Tag, Timestamp,
 };
 
 /// Directory name (under `relay_data_path`) for the LMDB tombstone database.
 const TOMBSTONE_DIR: &str = "tombstones";
 
+/// Internal metadata event kind stored alongside deletion-request payloads.
+pub const TOMBSTONE_REQUEST_METADATA_KIND: u16 = 9907;
+/// Tag containing the relay-observed first receipt time for a request.
+pub const TOMBSTONE_FIRST_SEEN_AT_TAG: &str = "tombstone-first-seen-at";
+/// Tag containing the most recent successful use time for a request.
+pub const TOMBSTONE_LAST_USED_AT_TAG: &str = "tombstone-last-used-at";
+/// Tag containing the relay's deletion-request classification.
+pub const TOMBSTONE_REQUEST_CLASSIFICATION_TAG: &str = "tombstone-request-classification";
+
+/// Relay policy classification retained with a deletion request's lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestClassification {
+    LocallyActionable,
+    NonTargetingNip62,
+    Disrespector,
+}
+
+impl RequestClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocallyActionable => "locally-actionable",
+            Self::NonTargetingNip62 => "non-targeting-nip62",
+            Self::Disrespector => "disrespector",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "locally-actionable" => Some(Self::LocallyActionable),
+            "non-targeting-nip62" => Some(Self::NonTargetingNip62),
+            "disrespector" => Some(Self::Disrespector),
+            _ => None,
+        }
+    }
+}
+
+/// The canonical lifecycle state for one original kind-5 or kind-62 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLifecycleRecord {
+    pub metadata_event_id: EventId,
+    pub request: Event,
+    pub first_seen_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
+    pub classification: RequestClassification,
+}
+
 #[derive(Debug, Default)]
 struct DeletionTargets {
     e_ids: HashSet<EventId>,
     a_coordinates: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedMetadata {
+    id: EventId,
+    created_at: Timestamp,
+    first_seen_at: Timestamp,
+    last_used_at: Option<Timestamp>,
+    classification: RequestClassification,
 }
 
 impl DeletionTargets {
@@ -83,6 +140,7 @@ impl DeletionTargets {
 #[derive(Clone)]
 pub struct Tombstones {
     db: Arc<dyn NostrDatabase>,
+    metadata_signer: Keys,
 }
 
 impl std::fmt::Debug for Tombstones {
@@ -95,8 +153,8 @@ impl Tombstones {
     /// Open a persistent (LMDB) tombstone store under `relay_data_path`.
     ///
     /// The database lives at `<relay_data_path>/tombstones`. NIP-09 / NIP-62
-    /// auto-processing is explicitly disabled on this database: it is used purely
-    /// as a raw, append-only record of deletion/vanish request events.
+    /// auto-processing is explicitly disabled on this database: requests and
+    /// relay-private lifecycle metadata are interpreted explicitly by this store.
     pub async fn open_lmdb(relay_data_path: &Path) -> anyhow::Result<Self> {
         let path = relay_data_path.join(TOMBSTONE_DIR);
         std::fs::create_dir_all(&path).map_err(|e| {
@@ -118,7 +176,10 @@ impl Tombstones {
                 anyhow::anyhow!("Failed to open tombstone LMDB at {}: {}", path.display(), e)
             })?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            metadata_signer: Keys::generate(),
+        })
     }
 
     /// Create an in-memory tombstone store (used with the memory backend and in
@@ -126,7 +187,290 @@ impl Tombstones {
     pub fn in_memory() -> Self {
         Self {
             db: Arc::new(MemoryDatabase::unbounded()),
+            metadata_signer: Keys::generate(),
         }
+    }
+
+    /// Persist a signed deletion/vanish request and relay-generated lifecycle
+    /// metadata. Exact replays retain their original `first_seen_at`.
+    pub async fn record_request(
+        &self,
+        event: &Event,
+        first_seen_at: Timestamp,
+        classification: RequestClassification,
+    ) -> anyhow::Result<RequestLifecycleRecord> {
+        if !Self::is_request_kind(event.kind) {
+            anyhow::bail!("Tombstone lifecycle accepts only kind-5 or kind-62 requests");
+        }
+
+        if let Some(record) = self.lifecycle_for_request(&event.id).await {
+            return Ok(record);
+        }
+
+        let payload_existed = self.request_payload(&event.id).await?.is_some();
+        self.db.save_event(event).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to record deletion-request payload {}: {e}",
+                event.id
+            )
+        })?;
+
+        let metadata = self.build_metadata(event.id, first_seen_at, None, classification)?;
+        if let Err(error) = self.db.save_event(&metadata).await {
+            if !payload_existed {
+                if let Err(rollback_error) = self.db.delete(Filter::new().ids(vec![event.id])).await
+                {
+                    tracing::error!(error = %rollback_error, request_id = %event.id, "Failed to roll back tombstone payload after metadata write failure");
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "Failed to record lifecycle metadata for {}: {error}",
+                event.id
+            ));
+        }
+
+        Ok(RequestLifecycleRecord {
+            metadata_event_id: metadata.id,
+            request: event.clone(),
+            first_seen_at,
+            last_used_at: None,
+            classification,
+        })
+    }
+
+    /// Return the canonical lifecycle record, if both a valid payload and valid
+    /// metadata exist. Multiple metadata rows are compacted lazily by updates.
+    ///
+    /// Canonical selection is deterministic: valid rows are required; the record
+    /// preserves the earliest `first_seen_at` and greatest `last_used_at` across
+    /// them, while its metadata ID is selected by greatest `last_used_at`, then
+    /// earliest `first_seen_at`, newest metadata creation time, then lowest ID.
+    pub async fn lifecycle_for_request(
+        &self,
+        request_id: &EventId,
+    ) -> Option<RequestLifecycleRecord> {
+        let request = match self.request_payload(request_id).await {
+            Ok(Some(event)) if Self::is_request_kind(event.kind) => event,
+            Ok(Some(event)) => {
+                tracing::warn!(request_id = %request_id, kind = event.kind.as_u16(), "Tombstone lifecycle payload has invalid kind");
+                return None;
+            }
+            Ok(None) => {
+                let orphaned_metadata = self.metadata_events_for_request(request_id).await;
+                if !orphaned_metadata.is_empty() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        metadata_count = orphaned_metadata.len(),
+                        "Ignoring orphan tombstone lifecycle metadata without a request payload"
+                    );
+                }
+                return None;
+            }
+            Err(error) => {
+                tracing::error!(error = %error, request_id = %request_id, "Failed to read tombstone lifecycle payload");
+                return None;
+            }
+        };
+
+        let metadata = self.metadata_events_for_request(request_id).await;
+        let mut valid: Vec<_> = metadata
+            .into_iter()
+            .filter_map(|event| self.parse_metadata(&event, request_id))
+            .collect();
+        if valid.is_empty() {
+            return None;
+        }
+
+        let first_seen_at = valid
+            .iter()
+            .map(|m| m.first_seen_at)
+            .min()
+            .expect("nonempty");
+        let last_used_at = valid.iter().filter_map(|m| m.last_used_at).max();
+        valid.sort_by(|left, right| {
+            right
+                .last_used_at
+                .cmp(&left.last_used_at)
+                .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        });
+        let canonical = valid.remove(0);
+        Some(RequestLifecycleRecord {
+            metadata_event_id: canonical.id,
+            request,
+            first_seen_at,
+            last_used_at,
+            classification: canonical.classification,
+        })
+    }
+
+    /// Set `last_used_at`, never moving it backwards, then compact superseded
+    /// metadata only after the replacement is durable.
+    pub async fn mark_request_used(
+        &self,
+        request_id: &EventId,
+        used_at: Timestamp,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        let Some(existing) = self.lifecycle_for_request(request_id).await else {
+            return Ok(None);
+        };
+        let last_used_at = existing.last_used_at.max(Some(used_at));
+        if last_used_at == existing.last_used_at {
+            return Ok(Some(existing));
+        }
+
+        let replacement = self.build_metadata(
+            *request_id,
+            existing.first_seen_at,
+            last_used_at,
+            existing.classification,
+        )?;
+        self.db.save_event(&replacement).await.map_err(|e| {
+            anyhow::anyhow!("Failed to update lifecycle metadata for {request_id}: {e}")
+        })?;
+        let updated = self
+            .lifecycle_for_request(request_id)
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("Updated lifecycle metadata for {request_id} was not readable")
+            })?;
+        let stale_ids: Vec<_> = self
+            .metadata_events_for_request(request_id)
+            .await
+            .into_iter()
+            .map(|event| event.id)
+            .filter(|id| *id != updated.metadata_event_id)
+            .collect();
+        if !stale_ids.is_empty() {
+            self.db
+                .delete(Filter::new().ids(stale_ids))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to compact lifecycle metadata for {request_id}: {e}")
+                })?;
+        }
+        Ok(self.lifecycle_for_request(request_id).await)
+    }
+
+    /// List canonical request lifecycles for migration and retention work.
+    /// Internal metadata events are never returned.
+    pub async fn lifecycle_records(&self) -> Vec<RequestLifecycleRecord> {
+        let mut requests = Vec::new();
+        for kind in [Kind::EventDeletion, Kind::RequestToVanish] {
+            match self.db.query(Filter::new().kind(kind)).await {
+                Ok(events) => requests.extend(events),
+                Err(error) => {
+                    tracing::error!(error = %error, "Failed to list tombstone request payloads")
+                }
+            }
+        }
+        let mut records = Vec::new();
+        for request in requests {
+            if let Some(record) = self.lifecycle_for_request(&request.id).await {
+                records.push(record);
+            }
+        }
+        records.sort_by(|left, right| left.request.id.to_hex().cmp(&right.request.id.to_hex()));
+        records
+    }
+
+    fn is_request_kind(kind: Kind) -> bool {
+        kind == Kind::EventDeletion || kind == Kind::RequestToVanish
+    }
+
+    async fn request_payload(&self, request_id: &EventId) -> anyhow::Result<Option<Event>> {
+        for kind in [Kind::EventDeletion, Kind::RequestToVanish] {
+            let events = self.db.query(Filter::new().kind(kind)).await.map_err(|e| {
+                anyhow::anyhow!("Failed to read tombstone request {request_id}: {e}")
+            })?;
+            if let Some(event) = events.into_iter().find(|event| event.id == *request_id) {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    fn build_metadata(
+        &self,
+        request_id: EventId,
+        first_seen_at: Timestamp,
+        last_used_at: Option<Timestamp>,
+        classification: RequestClassification,
+    ) -> anyhow::Result<Event> {
+        let mut tags = vec![
+            Tag::event(request_id),
+            Tag::custom(
+                TOMBSTONE_FIRST_SEEN_AT_TAG,
+                vec![first_seen_at.as_secs().to_string()],
+            ),
+            Tag::custom(
+                TOMBSTONE_REQUEST_CLASSIFICATION_TAG,
+                vec![classification.as_str().to_string()],
+            ),
+        ];
+        if let Some(last_used_at) = last_used_at {
+            tags.push(Tag::custom(
+                TOMBSTONE_LAST_USED_AT_TAG,
+                vec![last_used_at.as_secs().to_string()],
+            ));
+        }
+        EventBuilder::new(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND), "")
+            .tags(tags)
+            .finalize(&self.metadata_signer)
+            .map_err(|e| anyhow::anyhow!("Failed to build tombstone lifecycle metadata: {e}"))
+    }
+
+    async fn metadata_events_for_request(&self, request_id: &EventId) -> Vec<Event> {
+        let filter = Filter::new()
+            .kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), request_id.to_hex());
+        match self.db.query(filter).await {
+            Ok(events) => events.into_iter().collect(),
+            Err(error) => {
+                tracing::error!(error = %error, request_id = %request_id, "Failed to query tombstone lifecycle metadata");
+                Vec::new()
+            }
+        }
+    }
+
+    fn parse_metadata(&self, event: &Event, request_id: &EventId) -> Option<ParsedMetadata> {
+        let linked = Self::tag_value(event, "e")
+            .and_then(|value| EventId::from_hex(value).ok())
+            .is_some_and(|id| id == *request_id);
+        let first_seen_at = Self::tag_value(event, TOMBSTONE_FIRST_SEEN_AT_TAG)
+            .and_then(|value| value.parse().ok())
+            .map(Timestamp::from_secs);
+        let classification = Self::tag_value(event, TOMBSTONE_REQUEST_CLASSIFICATION_TAG)
+            .and_then(RequestClassification::parse);
+        let last_used_at = Self::tag_value(event, TOMBSTONE_LAST_USED_AT_TAG)
+            .and_then(|value| value.parse().ok())
+            .map(Timestamp::from_secs);
+        match (
+            event.kind.as_u16() == TOMBSTONE_REQUEST_METADATA_KIND,
+            linked,
+            first_seen_at,
+            classification,
+        ) {
+            (true, true, Some(first_seen_at), Some(classification)) => Some(ParsedMetadata {
+                id: event.id,
+                created_at: event.created_at,
+                first_seen_at,
+                last_used_at,
+                classification,
+            }),
+            _ => {
+                tracing::warn!(metadata_id = %event.id, request_id = %request_id, "Ignoring malformed tombstone lifecycle metadata");
+                None
+            }
+        }
+    }
+
+    fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+        event.tags.iter().find_map(|tag| {
+            let tag = tag.as_slice();
+            (tag.len() >= 2 && tag[0] == name).then_some(tag[1].as_str())
+        })
     }
 
     /// Record a NIP-09 deletion request (kind 5).
@@ -135,10 +479,12 @@ impl Tombstones {
     /// Storing the event makes the deletions durable and queryable.
     pub async fn record_deletion(&self, event: &Event) -> anyhow::Result<()> {
         debug_assert_eq!(event.kind, Kind::EventDeletion);
-        self.db
-            .save_event(event)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to record deletion tombstone: {e}"))?;
+        self.record_request(
+            event,
+            Timestamp::now(),
+            RequestClassification::LocallyActionable,
+        )
+        .await?;
         Ok(())
     }
 
@@ -353,10 +699,12 @@ impl Tombstones {
     /// and is signed by the pubkey being vanished.
     pub async fn record_vanish(&self, event: &Event) -> anyhow::Result<()> {
         debug_assert_eq!(event.kind, Kind::RequestToVanish);
-        self.db
-            .save_event(event)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to record vanish tombstone: {e}"))?;
+        self.record_request(
+            event,
+            Timestamp::now(),
+            RequestClassification::LocallyActionable,
+        )
+        .await?;
         Ok(())
     }
 
@@ -445,13 +793,247 @@ impl Tombstones {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_relay_builder::prelude::*;
 
     fn deletion_by_event(keys: &Keys, target: EventId) -> Event {
         EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![Tag::event(target)])
             .finalize(keys)
             .unwrap()
+    }
+
+    fn vanish(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::RequestToVanish, "")
+            .tags(vec![Tag::custom("relay", vec!["ALL_RELAYS".to_string()])])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    async fn metadata_count(store: &Tombstones, request_id: EventId) -> usize {
+        store.metadata_events_for_request(&request_id).await.len()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_round_trip_for_kind_five_preserves_relay_first_seen_at() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let request = deletion_by_event(&keys, EventId::all_zeros());
+        let first_seen_at = Timestamp::from_secs(1234);
+
+        store
+            .record_request(
+                &request,
+                first_seen_at,
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        let lifecycle = store.lifecycle_for_request(&request.id).await.unwrap();
+
+        assert_eq!(lifecycle.request, request);
+        assert_eq!(lifecycle.first_seen_at, first_seen_at);
+        assert_eq!(lifecycle.last_used_at, None);
+        assert_eq!(
+            lifecycle.classification,
+            RequestClassification::LocallyActionable
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_round_trip_for_kind_sixty_two() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let request = vanish(&keys);
+
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(2345),
+                RequestClassification::NonTargetingNip62,
+            )
+            .await
+            .unwrap();
+        let lifecycle = store.lifecycle_for_request(&request.id).await.unwrap();
+
+        assert_eq!(lifecycle.request, request);
+        assert_eq!(
+            lifecycle.classification,
+            RequestClassification::NonTargetingNip62
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_does_not_reset_first_seen_at() {
+        let store = Tombstones::in_memory();
+        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(99),
+                RequestClassification::Disrespector,
+            )
+            .await
+            .unwrap();
+
+        let lifecycle = store.lifecycle_for_request(&request.id).await.unwrap();
+        assert_eq!(lifecycle.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(
+            lifecycle.classification,
+            RequestClassification::LocallyActionable
+        );
+        assert_eq!(metadata_count(&store, request.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn marking_request_used_advances_without_resetting_first_seen_at() {
+        let store = Tombstones::in_memory();
+        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+
+        let first_use = store
+            .mark_request_used(&request.id, Timestamp::from_secs(20))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_use.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(first_use.last_used_at, Some(Timestamp::from_secs(20)));
+        let later_use = store
+            .mark_request_used(&request.id, Timestamp::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later_use.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(later_use.last_used_at, Some(Timestamp::from_secs(30)));
+        let older_use = store
+            .mark_request_used(&request.id, Timestamp::from_secs(25))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older_use.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(older_use.last_used_at, Some(Timestamp::from_secs(30)));
+        assert_eq!(metadata_count(&store, request.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_metadata_selection_is_deterministic_and_compacted_on_update() {
+        let store = Tombstones::in_memory();
+        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(20),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        let older_first_seen = store
+            .build_metadata(
+                request.id,
+                Timestamp::from_secs(10),
+                Some(Timestamp::from_secs(40)),
+                RequestClassification::Disrespector,
+            )
+            .unwrap();
+        let newest_use = store
+            .build_metadata(
+                request.id,
+                Timestamp::from_secs(30),
+                Some(Timestamp::from_secs(50)),
+                RequestClassification::NonTargetingNip62,
+            )
+            .unwrap();
+        store.db.save_event(&older_first_seen).await.unwrap();
+        store.db.save_event(&newest_use).await.unwrap();
+
+        let lifecycle = store.lifecycle_for_request(&request.id).await.unwrap();
+        assert_eq!(lifecycle.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(lifecycle.last_used_at, Some(Timestamp::from_secs(50)));
+        assert_eq!(lifecycle.metadata_event_id, newest_use.id);
+
+        store
+            .mark_request_used(&request.id, Timestamp::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(metadata_count(&store, request.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_orphan_metadata_are_ignored_safely() {
+        let store = Tombstones::in_memory();
+        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        let malformed = EventBuilder::new(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND), "")
+            .tags(vec![Tag::event(request.id)])
+            .finalize(&store.metadata_signer)
+            .unwrap();
+        store.db.save_event(&malformed).await.unwrap();
+        assert!(store.lifecycle_for_request(&request.id).await.is_none());
+
+        let orphan_id = EventId::all_zeros();
+        let orphan = store
+            .build_metadata(
+                orphan_id,
+                Timestamp::from_secs(10),
+                None,
+                RequestClassification::LocallyActionable,
+            )
+            .unwrap();
+        store.db.save_event(&orphan).await.unwrap();
+        assert!(store.lifecycle_for_request(&orphan_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_events_do_not_affect_deletion_or_vanish_queries() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let target = EventId::all_zeros();
+        let metadata = store
+            .build_metadata(
+                target,
+                Timestamp::from_secs(10),
+                None,
+                RequestClassification::LocallyActionable,
+            )
+            .unwrap();
+        store.db.save_event(&metadata).await.unwrap();
+
+        assert!(!store.is_event_deleted(&target, &keys.public_key()).await);
+        assert!(!store.is_pubkey_vanished(&keys.public_key()).await);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_metadata_survives_lmdb_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = Keys::generate();
+        let request = deletion_by_event(&keys, EventId::all_zeros());
+        let store = Tombstones::open_lmdb(directory.path()).await.unwrap();
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(1234),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = Tombstones::open_lmdb(directory.path()).await.unwrap();
+        let lifecycle = reopened.lifecycle_for_request(&request.id).await.unwrap();
+        assert_eq!(lifecycle.first_seen_at, Timestamp::from_secs(1234));
+        assert_eq!(lifecycle.request, request);
     }
 
     #[tokio::test]
