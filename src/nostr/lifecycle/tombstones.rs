@@ -249,14 +249,29 @@ impl Tombstones {
         &self,
         request_id: &EventId,
     ) -> Option<RequestLifecycleRecord> {
-        let request = match self.request_payload(request_id).await {
-            Ok(Some(event)) if Self::is_request_kind(event.kind) => event,
-            Ok(Some(event)) => {
-                tracing::warn!(request_id = %request_id, kind = event.kind.as_u16(), "Tombstone lifecycle payload has invalid kind");
-                return None;
+        match self.lifecycle_for_request_result(request_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::error!(error = %error, request_id = %request_id, "Failed to read tombstone lifecycle record");
+                None
             }
-            Ok(None) => {
-                let orphaned_metadata = self.metadata_events_for_request(request_id).await;
+        }
+    }
+
+    /// Fallible counterpart to [`Self::lifecycle_for_request`], for policy paths
+    /// where an unreadable lifecycle must not be mistaken for an absent one.
+    pub async fn lifecycle_for_request_result(
+        &self,
+        request_id: &EventId,
+    ) -> anyhow::Result<Option<RequestLifecycleRecord>> {
+        let request = match self.request_payload(request_id).await? {
+            Some(event) if Self::is_request_kind(event.kind) => event,
+            Some(event) => {
+                tracing::warn!(request_id = %request_id, kind = event.kind.as_u16(), "Tombstone lifecycle payload has invalid kind");
+                return Ok(None);
+            }
+            None => {
+                let orphaned_metadata = self.metadata_events_for_request_result(request_id).await?;
                 if !orphaned_metadata.is_empty() {
                     tracing::warn!(
                         request_id = %request_id,
@@ -264,21 +279,17 @@ impl Tombstones {
                         "Ignoring orphan tombstone lifecycle metadata without a request payload"
                     );
                 }
-                return None;
-            }
-            Err(error) => {
-                tracing::error!(error = %error, request_id = %request_id, "Failed to read tombstone lifecycle payload");
-                return None;
+                return Ok(None);
             }
         };
 
-        let metadata = self.metadata_events_for_request(request_id).await;
+        let metadata = self.metadata_events_for_request_result(request_id).await?;
         let mut valid: Vec<_> = metadata
             .into_iter()
             .filter_map(|event| self.parse_metadata(&event, request_id))
             .collect();
         if valid.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let first_seen_at = valid
@@ -296,13 +307,13 @@ impl Tombstones {
                 .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
         });
         let canonical = valid.remove(0);
-        Some(RequestLifecycleRecord {
+        Ok(Some(RequestLifecycleRecord {
             metadata_event_id: canonical.id,
             request,
             first_seen_at,
             last_used_at,
             classification: canonical.classification,
-        })
+        }))
     }
 
     /// Set `last_used_at`, never moving it backwards, then compact superseded
@@ -371,7 +382,7 @@ impl Tombstones {
                 records.push(record);
             }
         }
-        records.sort_by(|left, right| left.request.id.to_hex().cmp(&right.request.id.to_hex()));
+        records.sort_by_key(|record| record.request.id.to_hex());
         records
     }
 
@@ -422,16 +433,31 @@ impl Tombstones {
     }
 
     async fn metadata_events_for_request(&self, request_id: &EventId) -> Vec<Event> {
-        let filter = Filter::new()
-            .kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), request_id.to_hex());
-        match self.db.query(filter).await {
-            Ok(events) => events.into_iter().collect(),
+        match self.metadata_events_for_request_result(request_id).await {
+            Ok(events) => events,
             Err(error) => {
                 tracing::error!(error = %error, request_id = %request_id, "Failed to query tombstone lifecycle metadata");
                 Vec::new()
             }
         }
+    }
+
+    async fn metadata_events_for_request_result(
+        &self,
+        request_id: &EventId,
+    ) -> anyhow::Result<Vec<Event>> {
+        let filter = Filter::new()
+            .kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), request_id.to_hex());
+        self.db
+            .query(filter)
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to query tombstone lifecycle metadata for {request_id}: {error}"
+                )
+            })
     }
 
     fn parse_metadata(&self, event: &Event, request_id: &EventId) -> Option<ParsedMetadata> {
@@ -718,22 +744,36 @@ impl Tombstones {
     /// otherwise any pubkey could pre-emptively censor another's events by
     /// racing a kind-5 ahead of the target (out-of-order delete).
     pub async fn is_event_deleted(&self, id: &EventId, author: &PublicKey) -> bool {
-        // A stored kind-5 authored by `author` carrying this id in an `e` tag
-        // means `author` deleted their own event.
+        match self.event_deletion_candidates(id, author).await {
+            Ok(candidates) => !candidates.is_empty(),
+            Err(error) => {
+                tracing::error!(error = %error, "Tombstone query failed for is_event_deleted");
+                false
+            }
+        }
+    }
+
+    /// Return locally actionable, lifecycle-backed kind-5 requests that delete
+    /// `id` on behalf of `author`.
+    pub async fn event_deletion_candidates(
+        &self,
+        id: &EventId,
+        author: &PublicKey,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
         let filter = Filter::new()
             .kind(Kind::EventDeletion)
             .author(*author)
             .custom_tag(SingleLetterTag::lowercase(Alphabet::E), id.to_hex());
-        match self.db.query(filter).await {
-            Ok(events) => !events.is_empty(),
-            Err(e) => {
-                // Fail secure: if we cannot determine deletion status, do not
-                // claim the event is deleted (so we don't reject legitimate
-                // events), but log loudly.
-                tracing::error!(error = %e, "Tombstone query failed for is_event_deleted");
-                false
-            }
-        }
+        self.lifecycle_candidates(filter, |request| {
+            request.kind == Kind::EventDeletion
+                && request.pubkey == *author
+                && request.tags.iter().any(|tag| {
+                    tag.as_slice()
+                        .get(0..2)
+                        .is_some_and(|values| values[0] == "e" && values[1] == id.to_hex())
+                })
+        })
+        .await
     }
 
     /// Has this addressable/replaceable coordinate been deleted at or after
@@ -753,6 +793,25 @@ impl Tombstones {
         coordinate: &str,
         event_created_at: Timestamp,
     ) -> bool {
+        match self
+            .coordinate_deletion_candidates(coordinate, event_created_at)
+            .await
+        {
+            Ok(candidates) => !candidates.is_empty(),
+            Err(error) => {
+                tracing::error!(error = %error, "Tombstone query failed for is_coordinate_deleted");
+                false
+            }
+        }
+    }
+
+    /// Return locally actionable, lifecycle-backed kind-5 requests that delete
+    /// the coordinate at or after `event_created_at`.
+    pub async fn coordinate_deletion_candidates(
+        &self,
+        coordinate: &str,
+        event_created_at: Timestamp,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
         // The coordinate owner (pubkey hex) is the only party allowed to delete
         // it. Extract it so we can require the kind-5 author to match.
         let coord_owner_hex = coordinate.split(':').nth(1);
@@ -761,18 +820,19 @@ impl Tombstones {
             SingleLetterTag::lowercase(Alphabet::A),
             coordinate.to_string(),
         );
-        match self.db.query(filter).await {
-            Ok(events) => events.iter().any(|deletion| {
-                deletion.created_at >= event_created_at
-                    && coord_owner_hex
-                        .map(|owner| owner == deletion.pubkey.to_hex())
-                        .unwrap_or(false)
-            }),
-            Err(e) => {
-                tracing::error!(error = %e, "Tombstone query failed for is_coordinate_deleted");
-                false
-            }
-        }
+        self.lifecycle_candidates(filter, |request| {
+            request.kind == Kind::EventDeletion
+                && request.created_at >= event_created_at
+                && coord_owner_hex
+                    .map(|owner| owner == request.pubkey.to_hex())
+                    .unwrap_or(false)
+                && request.tags.iter().any(|tag| {
+                    tag.as_slice()
+                        .get(0..2)
+                        .is_some_and(|values| values[0] == "a" && values[1] == coordinate)
+                })
+        })
+        .await
     }
 
     /// Has this pubkey requested to vanish from this relay (recorded kind-62)?
@@ -780,13 +840,62 @@ impl Tombstones {
     /// Mirrors the backend's `is_pubkey_vanished` check.
     pub async fn is_pubkey_vanished(&self, pubkey: &PublicKey) -> bool {
         let filter = Filter::new().kind(Kind::RequestToVanish).author(*pubkey);
-        match self.db.query(filter).await {
-            Ok(events) => !events.is_empty(),
-            Err(e) => {
-                tracing::error!(error = %e, "Tombstone query failed for is_pubkey_vanished");
+        match self
+            .lifecycle_candidates(filter, |request| {
+                request.kind == Kind::RequestToVanish && request.pubkey == *pubkey
+            })
+            .await
+        {
+            Ok(candidates) => !candidates.is_empty(),
+            Err(error) => {
+                tracing::error!(error = %error, "Tombstone query failed for is_pubkey_vanished");
                 false
             }
         }
+    }
+
+    /// Return locally actionable, lifecycle-backed kind-62 requests made by
+    /// `pubkey`. Non-targeting and disrespector classifications never gate.
+    pub async fn vanish_candidates(
+        &self,
+        pubkey: &PublicKey,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
+        let filter = Filter::new().kind(Kind::RequestToVanish).author(*pubkey);
+        self.lifecycle_candidates(filter, |request| {
+            request.kind == Kind::RequestToVanish && request.pubkey == *pubkey
+        })
+        .await
+    }
+
+    async fn lifecycle_candidates<F>(
+        &self,
+        filter: Filter,
+        matches_request: F,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let requests =
+            self.db.query(filter).await.map_err(|error| {
+                anyhow::anyhow!("Failed to query tombstone candidates: {error}")
+            })?;
+        let mut candidates = Vec::new();
+        for request in requests {
+            // Queries are intentionally restricted to original kind-5/kind-62
+            // payloads; private metadata can never enter this path.
+            if !Self::is_request_kind(request.kind) || !matches_request(&request) {
+                continue;
+            }
+            let Some(record) = self.lifecycle_for_request_result(&request.id).await? else {
+                // Requests without valid metadata await startup migration and do
+                // not yet carry enough relay-observed state to gate admission.
+                continue;
+            };
+            if record.classification == RequestClassification::LocallyActionable {
+                candidates.push(record);
+            }
+        }
+        Ok(candidates)
     }
 }
 
@@ -1012,6 +1121,127 @@ mod tests {
 
         assert!(!store.is_event_deleted(&target, &keys.public_key()).await);
         assert!(!store.is_pubkey_vanished(&keys.public_key()).await);
+    }
+
+    #[tokio::test]
+    async fn event_deletion_candidates_are_author_bound_and_lifecycle_backed() {
+        let store = Tombstones::in_memory();
+        let owner = Keys::generate();
+        let other = Keys::generate();
+        let target = EventId::all_zeros();
+        let request = deletion_by_event(&owner, target);
+        store
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+
+        let candidates = store
+            .event_deletion_candidates(&target, &owner.public_key())
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].request.id, request.id);
+        assert!(store
+            .event_deletion_candidates(&target, &other.public_key())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinate_candidates_enforce_cutoff_and_coordinate_owner() {
+        let store = Tombstones::in_memory();
+        let owner = Keys::generate();
+        let attacker = Keys::generate();
+        let coordinate = format!("30618:{}:repo", owner.public_key().to_hex());
+        let valid = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coordinate.clone()])])
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&owner)
+            .unwrap();
+        let invalid = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coordinate.clone()])])
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&attacker)
+            .unwrap();
+        for request in [&valid, &invalid] {
+            store
+                .record_request(
+                    request,
+                    Timestamp::from_secs(10),
+                    RequestClassification::LocallyActionable,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .coordinate_deletion_candidates(&coordinate, Timestamp::from_secs(100))
+                .await
+                .unwrap()
+                .iter()
+                .map(|record| record.request.id)
+                .collect::<Vec<_>>(),
+            vec![valid.id]
+        );
+        assert_eq!(
+            store
+                .coordinate_deletion_candidates(&coordinate, Timestamp::from_secs(99))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .coordinate_deletion_candidates(&coordinate, Timestamp::from_secs(101))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn vanish_candidates_require_locally_actionable_classification() {
+        let store = Tombstones::in_memory();
+        let keys = Keys::generate();
+        let actionable = vanish(&keys);
+        store
+            .record_request(
+                &actionable,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .vanish_candidates(&keys.public_key())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for classification in [
+            RequestClassification::NonTargetingNip62,
+            RequestClassification::Disrespector,
+        ] {
+            let store = Tombstones::in_memory();
+            let request = vanish(&keys);
+            store
+                .record_request(&request, Timestamp::from_secs(10), classification)
+                .await
+                .unwrap();
+            assert!(store
+                .vanish_candidates(&keys.public_key())
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[tokio::test]

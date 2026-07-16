@@ -1,9 +1,11 @@
 use anyhow::Result;
 use nostr_relay_builder::prelude::{
-    nip62, Alphabet, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, WritePolicyResult,
+    nip62, Alphabet, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Timestamp,
+    WritePolicyResult,
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::lifecycle::RequestLifecycleRecord;
 use crate::nostr::policy::{reject_error, reject_invalid, AnnouncementResult};
 
 use super::{DeletionContext, DeletionPolicy};
@@ -21,56 +23,180 @@ impl DeletionService {
     }
 
     pub async fn gate(&self, event: &Event) -> Option<WritePolicyResult> {
-        // 1. Vanished pubkey
-        if self
-            .ctx
-            .tombstones()
-            .is_pubkey_vanished(&event.pubkey)
-            .await
-        {
-            tracing::debug!(
-                event_id = %event.id.to_hex(),
-                author = %event.pubkey.to_hex(),
-                "Rejected event from vanished pubkey"
-            );
-            return Some(reject_invalid("this pubkey has requested to vanish"));
+        // The operator's current archival-mode policy governs every retained
+        // request, regardless of how it was classified when received.
+        if self.ctx.config.deletion_request_disrespector {
+            return None;
         }
 
-        // 2. Deleted event id (author-bound: only the event's own author may
-        //    have deleted it)
-        if self
-            .ctx
-            .tombstones()
-            .is_event_deleted(&event.id, &event.pubkey)
+        let mut candidates = Vec::new();
+        let tombstones = self.ctx.tombstones();
+        match tombstones.vanish_candidates(&event.pubkey).await {
+            Ok(records) => candidates.extend(records.into_iter().map(|record| (record, "vanish"))),
+            Err(error) => return Some(Self::gate_error("querying vanish candidates", error)),
+        }
+        match tombstones
+            .event_deletion_candidates(&event.id, &event.pubkey)
             .await
         {
-            tracing::debug!(
-                event_id = %event.id.to_hex(),
-                "Rejected re-submission of deleted event"
-            );
-            return Some(reject_invalid("this event is deleted"));
+            Ok(records) => {
+                candidates.extend(records.into_iter().map(|record| (record, "event-id")))
+            }
+            Err(error) => {
+                return Some(Self::gate_error(
+                    "querying event deletion candidates",
+                    error,
+                ))
+            }
         }
 
-        // 3. Deleted coordinate (replaceable / addressable events only)
+        // Deleted coordinate (replaceable / addressable events only).
         if event.kind.is_replaceable() || event.kind.is_addressable() {
             if let Some(coord) = Self::event_coordinate(event) {
-                if self
-                    .ctx
-                    .tombstones()
-                    .is_coordinate_deleted(&coord, event.created_at)
+                match tombstones
+                    .coordinate_deletion_candidates(&coord, event.created_at)
                     .await
                 {
-                    tracing::debug!(
-                        event_id = %event.id.to_hex(),
-                        coordinate = %coord,
-                        "Rejected event whose coordinate was deleted"
-                    );
-                    return Some(reject_invalid("this event is deleted"));
+                    Ok(records) => {
+                        candidates.extend(records.into_iter().map(|record| (record, "coordinate")))
+                    }
+                    Err(error) => {
+                        return Some(Self::gate_error(
+                            "querying coordinate deletion candidates",
+                            error,
+                        ));
+                    }
                 }
             }
         }
 
-        None
+        let now = Timestamp::now();
+        let mut eligible = std::collections::HashMap::new();
+        for (record, category) in candidates {
+            match self.request_is_expired(&record, now) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    return Some(Self::gate_error(
+                        "evaluating deletion-request retention",
+                        error,
+                    ));
+                }
+            }
+            eligible
+                .entry(record.request.id)
+                .or_insert((record, category));
+        }
+
+        let candidate_count = eligible.len();
+        let (winner, category) = eligible
+            .into_values()
+            .min_by(|(left, _), (right, _)| Self::winner_order(left, right))?;
+
+        let previous_last_used_at = winner.last_used_at;
+        if let Err(error) = self.ctx.database().save_event(&winner.request).await {
+            return Some(Self::gate_error("promoting deletion request", error));
+        }
+        let used_at = Timestamp::now();
+        let updated = match tombstones
+            .mark_request_used(&winner.request.id, used_at)
+            .await
+        {
+            Ok(Some(record)) if record.last_used_at >= Some(used_at) => record,
+            Ok(Some(record)) => {
+                return Some(Self::gate_error(
+                    "verifying deletion-request lifecycle update",
+                    anyhow::anyhow!(
+                        "request {} retained an older last_used_at {:?}",
+                        record.request.id,
+                        record.last_used_at
+                    ),
+                ));
+            }
+            Ok(None) => {
+                return Some(Self::gate_error(
+                    "updating deletion-request lifecycle",
+                    anyhow::anyhow!(
+                        "request {} no longer has lifecycle metadata",
+                        winner.request.id
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Some(Self::gate_error(
+                    "updating deletion-request lifecycle",
+                    error,
+                ))
+            }
+        };
+
+        tracing::debug!(
+            incoming_event_id = %event.id.to_hex(),
+            winning_request_id = %winner.request.id.to_hex(),
+            request_kind = winner.request.kind.as_u16(),
+            first_seen_at = winner.first_seen_at.as_secs(),
+            previous_last_used_at = ?previous_last_used_at.map(|timestamp| timestamp.as_secs()),
+            new_last_used_at = ?updated.last_used_at.map(|timestamp| timestamp.as_secs()),
+            candidate_count,
+            match_category = category,
+            "Rejected event through attributed deletion-request gate"
+        );
+
+        Some(if winner.request.kind == Kind::RequestToVanish {
+            reject_invalid("this pubkey has requested to vanish")
+        } else {
+            reject_invalid("this event is deleted")
+        })
+    }
+
+    fn request_is_expired(&self, record: &RequestLifecycleRecord, now: Timestamp) -> Result<bool> {
+        let (anchor, served, additional) = match record.last_used_at {
+            Some(last_used_at) => (
+                last_used_at,
+                self.ctx
+                    .config
+                    .deletion_request_retention_used_served_after_last_used(),
+                self.ctx
+                    .config
+                    .deletion_request_retention_used_unserved_gating_additional(),
+            ),
+            None => (
+                record.first_seen_at,
+                self.ctx.config.deletion_request_retention_unused_served(),
+                self.ctx
+                    .config
+                    .deletion_request_retention_unused_unserved_gating_additional(),
+            ),
+        };
+        let lifetime = served
+            .as_secs()
+            .checked_add(additional.as_secs())
+            .ok_or_else(|| anyhow::anyhow!("deletion-request retention duration overflow"))?;
+        let deadline = anchor
+            .as_secs()
+            .checked_add(lifetime)
+            .ok_or_else(|| anyhow::anyhow!("deletion-request retention deadline overflow"))?;
+        if now.as_secs() >= deadline {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn winner_order(
+        left: &RequestLifecycleRecord,
+        right: &RequestLifecycleRecord,
+    ) -> std::cmp::Ordering {
+        right
+            .last_used_at
+            .is_some()
+            .cmp(&left.last_used_at.is_some())
+            .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
+            .then_with(|| left.request.id.to_hex().cmp(&right.request.id.to_hex()))
+    }
+
+    fn gate_error(context: &str, error: impl std::fmt::Display) -> WritePolicyResult {
+        tracing::error!(error = %error, "Deletion-request admission gate failed while {context}");
+        reject_error(format!("internal error {context}: {error}"))
     }
 
     /// Remove stale out-of-order kind-5 requests that targeted this event ID but
@@ -596,5 +722,205 @@ impl DeletionAdmissionHooks<'_> {
                 .capture_superseded_replaceable_history(event)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grasp06::receive::new_repo_init_locks;
+    use crate::nostr::lifecycle::{
+        HoldingStore, ReplaceableHistoryStore, RepositoryLifecycle, Tombstones,
+    };
+    use crate::purgatory::Purgatory;
+    use nostr_relay_builder::prelude::{EventBuilder, EventId, FinalizeEvent, Keys, Tag};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn context(config: crate::config::Config) -> DeletionContext {
+        DeletionContext::new(
+            "test.example.com",
+            Arc::new(nostr_memory::MemoryDatabase::unbounded()),
+            Tombstones::in_memory(),
+            HoldingStore::in_memory(),
+            RepositoryLifecycle::in_memory(),
+            ReplaceableHistoryStore::in_memory(),
+            PathBuf::new(),
+            Arc::new(Purgatory::new(PathBuf::new())),
+            config,
+            new_repo_init_locks(),
+        )
+    }
+
+    fn deletion(keys: &Keys, target: EventId) -> Event {
+        EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target)])
+            .finalize(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn retention_expiry_uses_exact_deadline_boundary() {
+        let service = DeletionService::new(context(crate::config::Config {
+            deletion_request_retention_unused_served_secs: 2,
+            deletion_request_retention_unused_unserved_gating_additional_secs: 3,
+            deletion_request_retention_used_served_after_last_used_secs: 2,
+            deletion_request_retention_used_unserved_gating_additional_secs: 3,
+            ..crate::config::Config::for_testing()
+        }));
+        let request = deletion(&Keys::generate(), EventId::all_zeros());
+        let unused = RequestLifecycleRecord {
+            metadata_event_id: EventId::all_zeros(),
+            request: request.clone(),
+            first_seen_at: Timestamp::from_secs(10),
+            last_used_at: None,
+            classification: crate::nostr::lifecycle::RequestClassification::LocallyActionable,
+        };
+        assert!(!service
+            .request_is_expired(&unused, Timestamp::from_secs(14))
+            .unwrap());
+        assert!(service
+            .request_is_expired(&unused, Timestamp::from_secs(15))
+            .unwrap());
+        let used = RequestLifecycleRecord {
+            last_used_at: Some(Timestamp::from_secs(20)),
+            ..unused
+        };
+        assert!(!service
+            .request_is_expired(&used, Timestamp::from_secs(24))
+            .unwrap());
+        assert!(service
+            .request_is_expired(&used, Timestamp::from_secs(25))
+            .unwrap());
+    }
+
+    #[test]
+    fn winner_order_prefers_used_then_first_seen_then_event_id() {
+        let keys = Keys::generate();
+        let first_request = EventBuilder::new(Kind::EventDeletion, "first")
+            .tags(vec![Tag::event(EventId::all_zeros())])
+            .finalize(&keys)
+            .unwrap();
+        let second_request = EventBuilder::new(Kind::EventDeletion, "second")
+            .tags(vec![Tag::event(EventId::all_zeros())])
+            .finalize(&keys)
+            .unwrap();
+        let record = |request: Event, first_seen_at: u64, last_used_at: Option<u64>| {
+            RequestLifecycleRecord {
+                metadata_event_id: EventId::all_zeros(),
+                request,
+                first_seen_at: Timestamp::from_secs(first_seen_at),
+                last_used_at: last_used_at.map(Timestamp::from_secs),
+                classification: crate::nostr::lifecycle::RequestClassification::LocallyActionable,
+            }
+        };
+        let unused_early = record(first_request.clone(), 10, None);
+        let unused_late = record(second_request.clone(), 20, None);
+        let used_late = record(second_request.clone(), 20, Some(21));
+        assert_eq!(
+            DeletionService::winner_order(&used_late, &unused_early),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            DeletionService::winner_order(&unused_early, &unused_late),
+            std::cmp::Ordering::Less
+        );
+        let same_time_left = record(first_request, 10, None);
+        let same_time_right = record(second_request, 10, None);
+        assert_eq!(
+            DeletionService::winner_order(&same_time_left, &same_time_right),
+            same_time_left
+                .request
+                .id
+                .to_hex()
+                .cmp(&same_time_right.request.id.to_hex())
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_deduplicates_matches_promotes_winner_and_updates_only_it() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let incoming = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        let older = deletion(&keys, incoming.id);
+        let newer = EventBuilder::new(Kind::EventDeletion, "newer")
+            .tags(vec![Tag::event(incoming.id)])
+            .finalize(&keys)
+            .unwrap();
+        let now = Timestamp::now().as_secs();
+        ctx.tombstones
+            .record_request(
+                &older,
+                Timestamp::from_secs(now - 2),
+                crate::nostr::lifecycle::RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        ctx.tombstones
+            .record_request(
+                &newer,
+                Timestamp::from_secs(now - 1),
+                crate::nostr::lifecycle::RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+
+        assert!(service.gate(&incoming).await.is_some());
+        assert!(ctx
+            .database
+            .query(Filter::new().id(older.id))
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.id == older.id));
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&older.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&newer.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn disrespector_mode_bypasses_all_deletion_gates() {
+        let ctx = context(crate::config::Config {
+            deletion_request_disrespector: true,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        let request = deletion(&keys, event.id);
+        ctx.tombstones
+            .record_request(
+                &request,
+                Timestamp::now(),
+                crate::nostr::lifecycle::RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        assert!(service.gate(&event).await.is_none());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
     }
 }
