@@ -10,10 +10,12 @@ and purgatory transitions.
 
 ## Bounded request retention
 
-> **Status:** Lifecycle metadata, deterministic admission-use attribution, and
-> measured destructive outcomes are implemented. Request cleanup/expiry,
-> migration, target-set deduplication removal, and the disrespector
-> would-have-deleted classification remain future stages.
+> **Status:** Lifecycle metadata, NIP-09 lifecycle admission (including
+> disrespector read-only would-have-deleted classification), deterministic
+> admission-use attribution, and measured destructive outcomes are implemented.
+> NIP-62 lifecycle admission, request cleanup/expiry, migration, target-set
+> deduplication removal, and remaining policy-mode reconciliation remain future
+> stages.
 
 ### Production motivation
 
@@ -149,6 +151,9 @@ independent archive hierarchy:
    In normal mode it remains the authoritative admission-gate source. It also
    retains unused disrespector and non-targeting NIP-62 requests until their
    lifecycle expires, although those records do not enforce a local gate.
+   Disrespector NIP-09 requests are read-only evaluated after persistence and
+   receive `last_used_at` only when an existing main-database or purgatory
+   target would be removed by normal policy.
 3. **Holding database — deleted payload retention:** continues to contain events
    actually removed by NIP-09/NIP-62, with its existing deletion metadata and
    independent holding-retention clock. Expiry of a request does not shorten or
@@ -174,9 +179,10 @@ State transitions must be ordered so failures cannot silently lose a live gate:
   before destructive work or acceptance for main-database storage.
 - Mark it used only after at least one main-database or purgatory removal has
   succeeded. A partial deletion counts as use if at least one removal succeeded.
-- In disrespector mode, classify it as used when the normal policy's validated
-  target lookup finds at least one existing main-database or purgatory event,
-  without deleting that event or installing a gate.
+- In disrespector mode, classify it as used when a read-only normal-policy
+  target lookup finds at least one existing main-database or purgatory event
+  that would be removed, without deleting that event, installing a gate, or
+  performing holding, archive, cascade, rollback, or repository work.
 - When a later admission is blocked, durably update the deterministic winner's
   `last_used_at` and restore its main-database copy before completing the
   rejection path. If that update fails, report an internal policy error rather

@@ -186,7 +186,12 @@ impl Tombstones {
     /// tests). Not persistent.
     pub fn in_memory() -> Self {
         Self {
-            db: Arc::new(MemoryDatabase::unbounded()),
+            db: Arc::new(
+                MemoryDatabase::builder()
+                    .process_nip09(false)
+                    .process_nip62(false)
+                    .build(),
+            ),
             metadata_signer: Keys::generate(),
         }
     }

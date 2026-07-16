@@ -33,9 +33,13 @@
 use std::collections::HashSet;
 
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::prelude::{Event, EventId, Filter, Kind, PublicKey, WritePolicyResult};
+use nostr_relay_builder::prelude::{
+    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
+    WritePolicyResult,
+};
 
 use super::DeletionContext;
+use crate::nostr::lifecycle::RequestClassification;
 use crate::nostr::policy::{duplicate, reject_error, reject_invalid};
 
 const MAX_DELETION_TARGET_TAGS: usize = 2048;
@@ -70,14 +74,19 @@ impl DeletionPolicy {
     ///
     /// When `deletion_request_disrespector` is enabled the relay acts as an
     /// archival server: the kind-5 event is still accepted (and stored in the
-    /// main database) so clients see an OK and the request is preserved, but it
-    /// is NOT acted upon — no purgatory eviction, no main-DB deletion, and no
-    /// tombstone recording. The targeted events therefore remain fully
-    /// accessible. Already-covered kind-5 requests are still treated as
-    /// duplicates before archival-mode storage to avoid polluting the served
-    /// deletion-request stream. The same archival-mode contract is applied to
-    /// NIP-62 vanish requests in [`DeletionService::handle_vanish`](super::service::DeletionService::handle_vanish).
+    /// main database) so clients see an OK and the request is preserved. It
+    /// receives disrespector lifecycle metadata and is evaluated read-only to
+    /// determine whether it would delete stored data under normal policy, but
+    /// it never installs a local gate or mutates targets. Already-covered
+    /// kind-5 requests are still treated as duplicates before archival-mode
+    /// storage to avoid polluting the served deletion-request stream. The same
+    /// archival-mode contract is applied to NIP-62 vanish requests in
+    /// [`DeletionService::handle_vanish`](super::service::DeletionService::handle_vanish).
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
+        if let Err(result) = self.validate_request(event).await {
+            return result;
+        }
+
         match self
             .ctx
             .tombstones
@@ -99,57 +108,45 @@ impl DeletionPolicy {
             }
         }
 
-        // Archival mode: store the deletion request but do not process it.
+        let classification = if self.ctx.config.deletion_request_disrespector {
+            RequestClassification::Disrespector
+        } else {
+            RequestClassification::LocallyActionable
+        };
+        if let Err(e) = self
+            .ctx
+            .tombstones
+            .record_request(event, Timestamp::now(), classification)
+            .await
+        {
+            tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to record NIP-09 deletion lifecycle");
+            return reject_error(format!("internal error recording deletion lifecycle: {e}"));
+        }
+
+        // Archival mode: retain and classify the deletion request without
+        // invoking any destructive lifecycle paths.
         if self.ctx.config.deletion_request_disrespector {
+            let would_delete = match self.would_delete_stored_target(event).await {
+                Ok(would_delete) => would_delete,
+                Err(e) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to evaluate disrespector NIP-09 request");
+                    return reject_error(format!(
+                        "internal error evaluating deletion request: {e}"
+                    ));
+                }
+            };
+            if would_delete {
+                if let Err(result) = self.mark_request_used(event).await {
+                    return result;
+                }
+            }
             tracing::info!(
                 event_id = %event.id.to_hex(),
                 author = %event.pubkey.to_hex(),
-                "Disrespector mode: storing NIP-09 deletion request without acting on it"
+                would_delete,
+                "Disrespector mode: stored and read-only evaluated NIP-09 deletion request"
             );
             return WritePolicyResult::Accept;
-        }
-
-        let target_tag_count = event
-            .tags
-            .iter()
-            .filter(|tag| {
-                let v = tag.as_slice();
-                v.len() >= 2 && (v[0] == "e" || v[0] == "a")
-            })
-            .count();
-        if target_tag_count > MAX_DELETION_TARGET_TAGS {
-            tracing::warn!(
-                event_id = %event.id.to_hex(),
-                target_tag_count,
-                max = MAX_DELETION_TARGET_TAGS,
-                "Rejected NIP-09 deletion with too many targets"
-            );
-            return reject_invalid("too many deletion targets");
-        }
-
-        // Validate authorship of all targets first. If any `e`-tag target exists
-        // in the main DB and is owned by someone else, the whole deletion is
-        // invalid (mirrors the backend's `handle_deletion_event` returning
-        // `invalid`). `a`-tag author mismatches are simply ignored (the
-        // coordinate pubkey is part of the tag, so a mismatch is a no-op rather
-        // than an attack signal).
-        for id in Self::e_tag_ids(event) {
-            match self.ctx.database.event_by_id(&id).await {
-                Ok(Some(target)) if target.pubkey != event.pubkey => {
-                    tracing::warn!(
-                        deleter = %event.pubkey.to_hex(),
-                        target_author = %target.pubkey.to_hex(),
-                        target_id = %id.to_hex(),
-                        "Rejected invalid NIP-09 deletion: target authored by another pubkey"
-                    );
-                    return reject_invalid("cannot delete event authored by another pubkey");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "Database lookup failed during deletion validation");
-                    return reject_error(format!("internal error: {e}"));
-                }
-            }
         }
 
         // Lifecycle lock discipline: acquire per `(owner, identifier)` locks
@@ -163,16 +160,6 @@ impl DeletionPolicy {
             .lifecycle()
             .write_repositories(self.deletion_recovery_scopes(event).await)
             .await;
-
-        // Record the deletion before destructive work so a tombstone write
-        // failure rejects the deletion request without already having removed
-        // targets from purgatory/main DB/holding/archive state. Subsequent
-        // destructive steps are best-effort and log their own failures; the
-        // tombstone is the durable operation marker and resubmission gate source.
-        if let Err(e) = self.ctx.tombstones.record_deletion(event).await {
-            tracing::error!(error = %e, "Failed to record deletion tombstone");
-            return reject_error(format!("internal error recording deletion: {e}"));
-        }
 
         self.compact_superseded_deletion_requests(event).await;
 
@@ -198,30 +185,170 @@ impl DeletionPolicy {
         }
 
         if outcome.used() {
-            match self
-                .ctx
-                .tombstones
-                .mark_request_used(&event.id, nostr_relay_builder::prelude::Timestamp::now())
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return reject_error(
-                        "internal error updating deletion lifecycle: missing metadata",
-                    )
-                }
-                Err(e) => {
-                    tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to mark used NIP-09 deletion request");
-                    return reject_error(format!(
-                        "internal error updating deletion lifecycle: {e}"
-                    ));
-                }
+            if let Err(result) = self.mark_request_used(event).await {
+                return result;
             }
         }
         tracing::info!(event_id = %event.id.to_hex(), main_db_deleted = outcome.main_db_deleted, purgatory_removed = outcome.purgatory_removed, skipped = outcome.skipped, failures = outcome.failures, "Processed NIP-09 deletion outcome");
 
         // Accept the deletion event itself so it is stored.
         WritePolicyResult::Accept
+    }
+
+    /// Validate all admission inputs before lifecycle persistence or target work.
+    async fn validate_request(&self, event: &Event) -> Result<(), WritePolicyResult> {
+        let target_tag_count = event
+            .tags
+            .iter()
+            .filter(|tag| {
+                let v = tag.as_slice();
+                v.len() >= 2 && (v[0] == "e" || v[0] == "a")
+            })
+            .count();
+        if target_tag_count > MAX_DELETION_TARGET_TAGS {
+            tracing::warn!(event_id = %event.id.to_hex(), target_tag_count, max = MAX_DELETION_TARGET_TAGS, "Rejected NIP-09 deletion with too many targets");
+            return Err(reject_invalid("too many deletion targets"));
+        }
+
+        // An existing cross-author `e` target invalidates the entire request.
+        // Foreign and malformed `a` coordinates remain NIP-09 no-ops.
+        for id in Self::e_tag_ids(event) {
+            match self.ctx.database.event_by_id(&id).await {
+                Ok(Some(target)) if target.pubkey != event.pubkey => {
+                    tracing::warn!(deleter = %event.pubkey.to_hex(), target_author = %target.pubkey.to_hex(), target_id = %id.to_hex(), "Rejected invalid NIP-09 deletion: target authored by another pubkey");
+                    return Err(reject_invalid(
+                        "cannot delete event authored by another pubkey",
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Database lookup failed during deletion validation");
+                    return Err(reject_error(format!("internal error: {e}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_request_used(&self, event: &Event) -> Result<(), WritePolicyResult> {
+        match self
+            .ctx
+            .tombstones
+            .mark_request_used(&event.id, Timestamp::now())
+            .await
+        {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(reject_error(
+                "internal error updating deletion lifecycle: missing metadata",
+            )),
+            Err(e) => {
+                tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to mark used NIP-09 deletion request after target processing");
+                Err(reject_error(format!(
+                    "internal error updating deletion lifecycle: {e}"
+                )))
+            }
+        }
+    }
+
+    /// Read-only normal-policy target evaluation for disrespector mode.
+    /// This intentionally only queries the main database and purgatory snapshots;
+    /// it must not call deletion, holding, archive, rollback, or cascade helpers.
+    async fn would_delete_stored_target(&self, event: &Event) -> anyhow::Result<bool> {
+        for id in Self::e_tag_ids(event) {
+            if self.ctx.database.event_by_id(&id).await?.is_some() {
+                return Ok(true);
+            }
+        }
+
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, owner, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if owner != event.pubkey {
+                continue;
+            }
+            let mut filter = Filter::new()
+                .kind(kind)
+                .author(owner)
+                .until(event.created_at);
+            if kind.is_addressable() {
+                filter =
+                    filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier.clone());
+            }
+            if !self.ctx.database.query(filter).await?.is_empty() {
+                return Ok(true);
+            }
+        }
+
+        Ok(self.purgatory_target_would_be_removed(event))
+    }
+
+    fn purgatory_target_would_be_removed(&self, event: &Event) -> bool {
+        for id in Self::e_tag_ids(event) {
+            for (repository_id, _) in self.ctx.purgatory.announcements_for_sync() {
+                let parts: Vec<_> = repository_id.splitn(3, ':').collect();
+                if parts.len() == 3
+                    && parts[1] == event.pubkey.to_hex()
+                    && self
+                        .ctx
+                        .purgatory
+                        .find_announcement(&event.pubkey, parts[2])
+                        .is_some_and(|entry| entry.event.id == id)
+                {
+                    return true;
+                }
+            }
+            if self
+                .ctx
+                .purgatory
+                .get_all_identifiers()
+                .into_iter()
+                .any(|identifier| {
+                    self.ctx
+                        .purgatory
+                        .find_state(&identifier)
+                        .into_iter()
+                        .any(|entry| entry.author == event.pubkey && entry.event.id == id)
+                })
+            {
+                return true;
+            }
+        }
+
+        for coordinate in Self::a_tag_coordinates(event) {
+            let Some((kind, owner, identifier)) = Self::parse_coordinate(&coordinate) else {
+                continue;
+            };
+            if owner != event.pubkey {
+                continue;
+            }
+            let covered = |created_at: Timestamp| created_at <= event.created_at;
+            match kind {
+                Kind::GitRepoAnnouncement => {
+                    if self
+                        .ctx
+                        .purgatory
+                        .find_announcement(&owner, &identifier)
+                        .is_some_and(|entry| covered(entry.event.created_at))
+                    {
+                        return true;
+                    }
+                }
+                Kind::RepoState => {
+                    if self
+                        .ctx
+                        .purgatory
+                        .find_state(&identifier)
+                        .into_iter()
+                        .any(|entry| entry.author == owner && covered(entry.event.created_at))
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     async fn compact_superseded_deletion_requests(&self, event: &Event) {
@@ -500,6 +627,10 @@ mod tests {
             .into_iter()
             .find(|record| record.request.id == deletion.id)
             .unwrap();
+        assert_eq!(
+            record.classification,
+            RequestClassification::LocallyActionable
+        );
         assert!(record.last_used_at.is_some());
     }
 
@@ -634,6 +765,11 @@ mod tests {
                 .has_purgatory_announcement(&owner_keys.public_key(), identifier),
             "Purgatory entry should NOT have been removed by wrong author"
         );
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
@@ -740,7 +876,6 @@ mod tests {
 
     #[tokio::test]
     async fn deletion_with_excessive_target_tags_is_rejected() {
-        let ctx = make_context();
         let keys = Keys::generate();
         let tags = (0..=MAX_DELETION_TARGET_TAGS)
             .map(|i| {
@@ -756,10 +891,15 @@ mod tests {
             .finalize(&keys)
             .unwrap();
 
-        let policy = DeletionPolicy::new(ctx);
-        let result = policy.handle(&deletion).await;
-
-        assert!(matches!(result, WritePolicyResult::Reject { .. }));
+        for ctx in [make_context(), make_disrespector_context()] {
+            let result = DeletionPolicy::new(ctx.clone()).handle(&deletion).await;
+            assert!(matches!(result, WritePolicyResult::Reject { .. }));
+            assert!(ctx
+                .tombstones
+                .lifecycle_for_request(&deletion.id)
+                .await
+                .is_none());
+        }
     }
 
     #[tokio::test]
@@ -831,7 +971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_disrespector_does_not_record_tombstone() {
+    async fn disrespector_records_unused_lifecycle_without_enforcing_a_gate() {
         let ctx = make_disrespector_context();
         let keys = Keys::generate();
         let target = EventId::all_zeros();
@@ -845,7 +985,14 @@ mod tests {
         let result = policy.handle(&deletion).await;
 
         assert!(matches!(result, WritePolicyResult::Accept));
-        // No tombstone recorded -> re-submission of the target is NOT blocked.
+        let record = ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .expect("disrespector request lifecycle should be recorded");
+        assert_eq!(record.classification, RequestClassification::Disrespector);
+        assert_eq!(record.last_used_at, None);
+        // Disrespector metadata does not install a gate.
         assert!(
             !ctx.tombstones
                 .is_event_deleted(&target, &keys.public_key())
@@ -878,6 +1025,133 @@ mod tests {
         assert!(
             still_there.is_some(),
             "Disrespector mode must NOT delete the target from the main DB"
+        );
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .is_some_and(|record| record.last_used_at.is_some()));
+    }
+
+    #[tokio::test]
+    async fn disrespector_marks_covered_coordinate_used_without_mutating_target() {
+        let ctx = make_disrespector_context();
+        let keys = Keys::generate();
+        let target = make_announcement_event(&keys, "keep-coordinate");
+        ctx.database.save_event(&target).await.unwrap();
+        let coordinate = format!("30617:{}:keep-coordinate", keys.public_key().to_hex());
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coordinate])])
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn disrespector_marks_matching_purgatory_target_used_without_removing_it() {
+        let ctx = make_disrespector_context();
+        let keys = Keys::generate();
+        let announcement = make_announcement_event(&keys, "keep-purgatory");
+        add_to_purgatory(&ctx, &announcement, "keep-purgatory");
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(announcement.id)])
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .purgatory
+            .has_purgatory_announcement(&keys.public_key(), "keep-purgatory"));
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .unwrap()
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cross_author_existing_target_is_rejected_without_lifecycle_record() {
+        let ctx = make_disrespector_context();
+        let owner = Keys::generate();
+        let attacker = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "owned")
+            .finalize(&owner)
+            .unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target.id)])
+            .finalize(&attacker)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Reject { .. }
+        ));
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request(&deletion.id)
+            .await
+            .is_none());
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn disrespector_foreign_coordinate_is_unused() {
+        let ctx = make_disrespector_context();
+        let owner = Keys::generate();
+        let attacker = Keys::generate();
+        let target = make_announcement_event(&owner, "foreign-coordinate");
+        ctx.database.save_event(&target).await.unwrap();
+        let coordinate = format!("30617:{}:foreign-coordinate", owner.public_key().to_hex());
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coordinate])])
+            .finalize(&attacker)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&deletion.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
         );
     }
 

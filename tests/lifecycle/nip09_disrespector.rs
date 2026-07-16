@@ -5,9 +5,9 @@
 //! ngit-grasp instance driven by the [`TestRelay`] fixture.
 //!
 //! These tests deliberately assert only on observable contract, not on any
-//! internal "holding database" — the current implementation is tombstone /
-//! purgatory based, so the disrespector simply accepts the kind-5 request and
-//! does nothing with it. The two properties under test are:
+//! internal lifecycle metadata or "holding database" — the disrespector accepts
+//! and read-only evaluates kind-5 requests, but never mutates their targets.
+//! The two observable properties under test are:
 //!
 //! 1. **Disrespector accepts but ignores deletion/vanish** — a kind-5 or
 //!    kind-62 request gets an `OK`, yet the targeted/author events remain
