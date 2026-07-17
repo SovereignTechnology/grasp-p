@@ -181,7 +181,6 @@ impl DeletionService {
             if self.ctx.config.deletion_request_disrespector
                 && targeting
                 && record.last_used_at.is_none()
-                && !self.request_is_expired(&record, now)?
             {
                 let would_use = if record.request.kind == Kind::EventDeletion {
                     self.would_delete_stored_target(&record.request).await?
@@ -886,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_unused_disrespector_request_is_not_credited_on_startup() {
+    async fn expired_unused_disrespector_request_is_credited_when_target_is_present() {
         let service = service(true);
         let keys = Keys::generate();
         let target = EventBuilder::new(Kind::TextNote, "target")
@@ -912,38 +911,32 @@ mod tests {
             .run_request_lifecycle_startup_reconciliation(Timestamp::from_secs(15))
             .await
             .unwrap();
-        assert_eq!(stats.disrespector_requests_newly_used, 0);
+        assert_eq!(stats.disrespector_requests_newly_used, 1);
         let record = service
             .ctx
             .tombstones()
             .lifecycle_for_request_result(&request.id)
             .await
             .unwrap()
-            .expect("startup reconciliation does not perform cleanup");
-        assert_eq!(record.last_used_at, None);
+            .expect("request is retained after receiving use credit");
+        assert_eq!(record.last_used_at, Some(Timestamp::from_secs(15)));
         assert!(service
             .ctx
             .database()
             .event_by_id(&request.id)
             .await
             .unwrap()
-            .is_none());
+            .is_some());
 
-        service
+        let cleanup = service
             .cleanup_expired_requests(Timestamp::from_secs(15))
             .await
             .unwrap();
+        assert_eq!(cleanup.indefinitely_retained_disrespector_requests, 1);
         assert!(service
             .ctx
             .tombstones()
             .lifecycle_for_request_result(&request.id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(service
-            .ctx
-            .database()
-            .event_by_id(&target.id)
             .await
             .unwrap()
             .is_some());

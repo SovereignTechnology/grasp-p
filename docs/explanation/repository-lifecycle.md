@@ -254,15 +254,16 @@ metadata preserves the earliest `first_seen_at` and greatest `last_used_at`.
 
 The same startup pass reclassifies retained requests using current relay
 configuration and reconciles served copies at the exact lifecycle deadline.
-In disrespector mode it read-only evaluates only unexpired, unused targeting
-requests against main and purgatory data, marking only requests that would
-currently have an effect as used; it never changes target data during that
-evaluation. An unused request that expired while the relay was offline is not
-given use credit during startup and proceeds to the subsequent cleanup pass.
-Used targeting requests remain served in that mode, while non-targeting NIP-62
-and unused no-op requests retain their ordinary bounded served schedule.
-Critical query, metadata, promotion, or removal failures fail startup rather
-than allowing traffic to begin with an incomplete lifecycle reconciliation.
+In disrespector mode it read-only evaluates unused targeting requests against
+main and purgatory data, marking only requests that would currently have an
+effect as used; it never changes target data during that evaluation. This
+evaluation includes requests whose unused lifecycle elapsed while the relay was
+offline: if a matching target is present, startup gives the request use credit
+before cleanup runs. Used targeting requests remain served in that mode
+indefinitely, while non-targeting NIP-62 and unused no-op requests retain their
+ordinary bounded served schedule. Critical query, metadata, promotion, or
+removal failures fail startup rather than allowing traffic to begin with an
+incomplete lifecycle reconciliation.
 
 The relay's current deletion-disrespector configuration governs retained
 requests; receipt-time mode is not permanent metadata. Switching into
