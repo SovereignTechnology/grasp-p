@@ -38,9 +38,10 @@ use nostr_relay_builder::prelude::{
     WritePolicyResult,
 };
 
+use super::service::{request_is_served_with_config, UNSERVED_REPLAY_MESSAGE};
 use super::DeletionContext;
 use crate::nostr::lifecycle::RequestClassification;
-use crate::nostr::policy::{reject_error, reject_invalid};
+use crate::nostr::policy::{duplicate, reject_error, reject_invalid};
 
 const MAX_DELETION_TARGET_TAGS: usize = 2048;
 /// Policy for handling NIP-09 event deletion requests
@@ -92,12 +93,37 @@ impl DeletionPolicy {
         } else {
             RequestClassification::LocallyActionable
         };
-        if let Err(e) = self
-            .ctx
-            .tombstones
-            .record_request(event, Timestamp::now(), classification)
-            .await
-        {
+        // Hold the lifecycle lock through the admission decision so cleanup
+        // cannot race an exact replay back into Main after its served deadline.
+        let tombstones = &self.ctx.tombstones;
+        let record_result = {
+            let _lifecycle_guard = tombstones.lock_lifecycle().await;
+            let existing = match tombstones.lifecycle_for_request_result(&event.id).await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to read NIP-09 deletion lifecycle");
+                    return reject_error(format!(
+                        "internal error reading deletion lifecycle: {error}"
+                    ));
+                }
+            };
+            if let Some(record) = existing {
+                match request_is_served_with_config(&self.ctx, &record, Timestamp::now()) {
+                    Ok(false) => return duplicate(UNSERVED_REPLAY_MESSAGE),
+                    Ok(true) => {}
+                    Err(error) => {
+                        tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to evaluate NIP-09 deletion lifecycle retention");
+                        return reject_error(format!(
+                            "internal error evaluating deletion lifecycle retention: {error}"
+                        ));
+                    }
+                }
+            }
+            tombstones
+                .record_request_locked(event, Timestamp::now(), classification)
+                .await
+        };
+        if let Err(e) = record_result {
             tracing::error!(event_id = %event.id.to_hex(), error = %e, "Failed to record NIP-09 deletion lifecycle");
             return reject_error(format!("internal error recording deletion lifecycle: {e}"));
         }

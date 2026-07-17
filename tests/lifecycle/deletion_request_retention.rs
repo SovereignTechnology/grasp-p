@@ -429,26 +429,57 @@ async fn nip62_targeting_gates_while_non_targeting_request_never_does() {
 }
 
 #[tokio::test]
-async fn normal_mode_nip62_replay_from_unserved_gate_does_not_make_a_noop_request_used() {
+async fn nip09_replay_from_unserved_gate_does_not_restore_its_served_copy() {
     let relay = TestRelay::start_with_deletion_lifecycle(lifecycle_options()).await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())
         .await
         .expect("create client");
-    let request = build_vanish(&client, None);
+    let request = build_deletion(&client, &[], &[]);
 
     client
         .send_event(request.clone())
         .await
-        .expect("accept initial no-op vanish request");
+        .expect("accept initial deletion request");
+    wait_until("deletion request moves to its unserved gate", || async {
+        !is_served(&client, request.id).await
+    })
+    .await;
+    client
+        .send_event(request.clone())
+        .await
+        .expect("exact replay receives the duplicate acknowledgement");
+    assert!(
+        !is_served(&client, request.id).await,
+        "duplicate replay must not restore an unserved deletion request to Main"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn non_targeting_nip62_replay_from_unserved_gate_does_not_restore_its_served_copy() {
+    let relay = TestRelay::start_with_deletion_lifecycle(lifecycle_options()).await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create client");
+    let request = build_vanish(&client, Some("wss://other.example"));
+
+    client
+        .send_event(request.clone())
+        .await
+        .expect("accept initial non-targeting vanish request");
     wait_until(
-        "no-op vanish request moves to its unserved gate",
+        "non-targeting vanish request moves to its unserved gate",
         || async { !is_served(&client, request.id).await },
     )
     .await;
     client
         .send_event(request.clone())
         .await
-        .expect("accept exact no-op vanish replay from its unserved gate");
+        .expect("exact replay receives the duplicate acknowledgement");
+    assert!(
+        !is_served(&client, request.id).await,
+        "duplicate replay must not restore an unserved non-targeting vanish request to Main"
+    );
 
     let record = open_tombstones(relay.relay_data_path().clone())
         .await
@@ -458,7 +489,7 @@ async fn normal_mode_nip62_replay_from_unserved_gate_does_not_make_a_noop_reques
         .expect("retain request lifecycle");
     assert_eq!(
         record.last_used_at, None,
-        "replaying a no-op vanish must not let it delete itself or count as use"
+        "replaying a non-targeting vanish must not count as use"
     );
     relay.stop().await;
 }

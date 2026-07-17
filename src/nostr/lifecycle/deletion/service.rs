@@ -6,9 +6,35 @@ use nostr_relay_builder::prelude::{
 
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::lifecycle::{RequestClassification, RequestLifecycleRecord};
-use crate::nostr::policy::{reject_error, reject_invalid, AnnouncementResult};
+use crate::nostr::policy::{duplicate, reject_error, reject_invalid, AnnouncementResult};
 
 use super::{DeletionContext, DeletionOutcome, DeletionPolicy};
+
+pub(super) const UNSERVED_REPLAY_MESSAGE: &str =
+    "deletion request is no longer served; it will be re-served when used to reject an in-scope event";
+
+pub(super) fn request_is_served_with_config(
+    ctx: &DeletionContext,
+    record: &RequestLifecycleRecord,
+    now: Timestamp,
+) -> Result<bool> {
+    let (anchor, duration) = match record.last_used_at {
+        Some(used) => (
+            used,
+            ctx.config
+                .deletion_request_retention_used_served_after_last_used(),
+        ),
+        None => (
+            record.first_seen_at,
+            ctx.config.deletion_request_retention_unused_served(),
+        ),
+    };
+    let deadline = anchor
+        .as_secs()
+        .checked_add(duration.as_secs())
+        .ok_or_else(|| anyhow::anyhow!("deletion-request served retention deadline overflow"))?;
+    Ok(now.as_secs() < deadline)
+}
 
 #[derive(Clone)]
 pub struct DeletionService {
@@ -267,15 +293,39 @@ impl DeletionService {
             RequestClassification::LocallyActionable
         };
 
-        // Persist every accepted NIP-62 request before accepting it or doing
-        // destructive work. `record_request` preserves receipt time and
-        // classification on an exact replay.
-        if let Err(error) = self
-            .ctx
-            .tombstones()
-            .record_request(event, Timestamp::now(), classification)
-            .await
-        {
+        // Keep the retention decision and lifecycle write atomic with cleanup.
+        // An exact replay during the unserved-but-gating interval must receive
+        // an OK duplicate response, not Accept: relay-builder persists Accept
+        // results back into Main and would make the request queryable again.
+        let tombstones = self.ctx.tombstones();
+        let record_result = {
+            let _lifecycle_guard = tombstones.lock_lifecycle().await;
+            let existing = match tombstones.lifecycle_for_request_result(&event.id).await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to read NIP-62 vanish lifecycle");
+                    return reject_error(format!(
+                        "internal error reading vanish lifecycle: {error}"
+                    ));
+                }
+            };
+            if let Some(record) = existing {
+                match self.request_is_served(&record, Timestamp::now()) {
+                    Ok(false) => return duplicate(UNSERVED_REPLAY_MESSAGE),
+                    Ok(true) => {}
+                    Err(error) => {
+                        tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to evaluate NIP-62 vanish lifecycle retention");
+                        return reject_error(format!(
+                            "internal error evaluating vanish lifecycle retention: {error}"
+                        ));
+                    }
+                }
+            }
+            tombstones
+                .record_request_locked(event, Timestamp::now(), classification)
+                .await
+        };
+        if let Err(error) = record_result {
             tracing::error!(event_id = %event.id.to_hex(), error = %error, "Failed to record NIP-62 vanish lifecycle");
             return reject_error(format!(
                 "internal error recording vanish lifecycle: {error}"
