@@ -316,8 +316,13 @@ expired served copies from Main before Tombstones, and permanently remove
 payload plus lifecycle metadata only after the additional gating period. Main
 and Tombstone removal can therefore lag a deadline until the next cleanup pass;
 that is expected cleanup latency, not an extension of the request's gate
-eligibility. A shared lifecycle transition lock prevents cleanup from acting on
-a stale record while admission is promoting and marking it used.
+eligibility. Admission first probes for matching live requests without the
+lifecycle transition lock, so ordinary unrelated event writes are not serialized
+behind deletion-store reads. When that probe finds a possible gate, admission
+acquires the shared transition lock and repeats candidate discovery and winner
+selection before promotion. This confines serialization to events that actually
+match a live request while still preventing cleanup from expiring one candidate
+and causing admission to overlook another live candidate during promotion.
 
 Target-set deduplication has been removed and the temporary
 `repair-deletion-requests` command has been retired. Startup migration and

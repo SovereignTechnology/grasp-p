@@ -55,85 +55,47 @@ impl DeletionService {
             return None;
         }
 
-        let tombstones = self.ctx.tombstones();
-
-        // Candidate discovery, expiry evaluation, promotion, and last-used
-        // attribution are one lifecycle transition. In particular, selecting a
-        // winner before waiting for this lock can leave a later, still-live
-        // candidate unchecked when that winner expires while waiting. Hold the
-        // lock through discovery so cleanup cannot change the candidate set or
-        // expiry state between selection and attribution.
-        let _lifecycle_guard = tombstones.lock_lifecycle().await;
-
-        let mut candidates = Vec::new();
-        match tombstones.vanish_candidates(&event.pubkey).await {
-            Ok(records) => candidates.extend(records.into_iter().map(|record| (record, "vanish"))),
-            Err(error) => return Some(Self::gate_error("querying vanish candidates", error)),
-        }
-        match tombstones
-            .event_deletion_candidates(&event.id, &event.pubkey)
-            .await
-        {
-            Ok(records) => {
-                candidates.extend(records.into_iter().map(|record| (record, "event-id")))
-            }
+        // Probe without the lifecycle transition lock. Most events have no
+        // matching deletion request, so serializing their database reads would
+        // turn this gate into a global relay-write mutex.
+        let candidates = match self.gate_candidates(event).await {
+            Ok(candidates) => candidates,
+            Err(error) => return Some(Self::gate_error("querying deletion candidates", error)),
+        };
+        match self.select_gate_winner(event, candidates, Timestamp::now()) {
+            Ok(Some(_)) => {}
+            Ok(None) => return None,
             Err(error) => {
                 return Some(Self::gate_error(
-                    "querying event deletion candidates",
+                    "evaluating deletion-request retention",
                     error,
                 ))
             }
         }
 
-        // Deleted coordinate (replaceable / addressable events only).
-        if event.kind.is_replaceable() || event.kind.is_addressable() {
-            if let Some(coord) = Self::event_coordinate(event) {
-                match tombstones
-                    .coordinate_deletion_candidates(&coord, event.created_at)
-                    .await
-                {
-                    Ok(records) => {
-                        candidates.extend(records.into_iter().map(|record| (record, "coordinate")))
-                    }
-                    Err(error) => {
-                        return Some(Self::gate_error(
-                            "querying coordinate deletion candidates",
-                            error,
-                        ));
-                    }
-                }
-            }
-        }
+        let tombstones = self.ctx.tombstones();
+        let _lifecycle_guard = tombstones.lock_lifecycle().await;
 
-        let now = Timestamp::now();
-        let mut eligible = std::collections::HashMap::new();
-        for (record, category) in candidates {
-            // A deletion or vanish request must never prove the utility of its
-            // own gate. In particular, after cleanup moves an unused request
-            // to Tombstones, replaying its signed payload reaches this gate
-            // before duplicate handling and would otherwise select itself.
-            if record.request.id == event.id {
-                continue;
-            }
-            match self.request_is_expired(&record, now) {
-                Ok(true) => continue,
-                Ok(false) => {}
+        // Rediscover under the transition lock instead of trusting the probe.
+        // Cleanup may have expired its winner while this task waited; a later
+        // matching request can still be live and must then become the winner.
+        // Only admissions that actually matched a live request pay this
+        // serialization cost.
+        let candidates = match self.gate_candidates(event).await {
+            Ok(candidates) => candidates,
+            Err(error) => return Some(Self::gate_error("querying deletion candidates", error)),
+        };
+        let (winner, category, candidate_count) =
+            match self.select_gate_winner(event, candidates, Timestamp::now()) {
+                Ok(Some(winner)) => winner,
+                Ok(None) => return None,
                 Err(error) => {
                     return Some(Self::gate_error(
                         "evaluating deletion-request retention",
                         error,
-                    ));
+                    ))
                 }
-            }
-            eligible
-                .entry(record.request.id)
-                .or_insert((record, category));
-        }
-
-        let candidate_count = eligible.len();
-        let (winner, category) = eligible
-            .into_values()
-            .min_by(|(left, _), (right, _)| Self::winner_order(left, right))?;
+            };
 
         // Cleanup uses this same lock, so it cannot remove the Main copy
         // selected by this admission while it is being promoted.
@@ -267,6 +229,66 @@ impl DeletionService {
             .cmp(&left.last_used_at.is_some())
             .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
             .then_with(|| left.request.id.to_hex().cmp(&right.request.id.to_hex()))
+    }
+
+    async fn gate_candidates(
+        &self,
+        event: &Event,
+    ) -> Result<Vec<(RequestLifecycleRecord, &'static str)>> {
+        let tombstones = self.ctx.tombstones();
+        let mut candidates = tombstones
+            .vanish_candidates(&event.pubkey)
+            .await?
+            .into_iter()
+            .map(|record| (record, "vanish"))
+            .collect::<Vec<_>>();
+        candidates.extend(
+            tombstones
+                .event_deletion_candidates(&event.id, &event.pubkey)
+                .await?
+                .into_iter()
+                .map(|record| (record, "event-id")),
+        );
+
+        if event.kind.is_replaceable() || event.kind.is_addressable() {
+            if let Some(coord) = Self::event_coordinate(event) {
+                candidates.extend(
+                    tombstones
+                        .coordinate_deletion_candidates(&coord, event.created_at)
+                        .await?
+                        .into_iter()
+                        .map(|record| (record, "coordinate")),
+                );
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn select_gate_winner(
+        &self,
+        event: &Event,
+        candidates: Vec<(RequestLifecycleRecord, &'static str)>,
+        now: Timestamp,
+    ) -> Result<Option<(RequestLifecycleRecord, &'static str, usize)>> {
+        let mut eligible = std::collections::HashMap::new();
+        for (record, category) in candidates {
+            // A deletion or vanish request must never prove the utility of its
+            // own gate. In particular, after cleanup moves an unused request
+            // to Tombstones, replaying its signed payload reaches this gate
+            // before duplicate handling and would otherwise select itself.
+            if record.request.id == event.id || self.request_is_expired(&record, now)? {
+                continue;
+            }
+            eligible
+                .entry(record.request.id)
+                .or_insert((record, category));
+        }
+
+        let candidate_count = eligible.len();
+        Ok(eligible
+            .into_values()
+            .min_by(|(left, _), (right, _)| Self::winner_order(left, right))
+            .map(|(record, category)| (record, category, candidate_count)))
     }
 
     fn gate_error(context: &str, error: impl std::fmt::Display) -> WritePolicyResult {
@@ -1049,6 +1071,24 @@ mod tests {
                 .last_used_at,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn unmatched_gate_does_not_wait_for_lifecycle_transition_lock() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let incoming = EventBuilder::new(Kind::TextNote, "unmatched")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let _guard = ctx.tombstones.lock_lifecycle().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.gate(&incoming),
+        )
+        .await
+        .expect("an unmatched event must not wait for lifecycle serialization");
+        assert!(result.is_none());
     }
 
     #[tokio::test]
