@@ -37,7 +37,7 @@ use crate::sync::rejected_index::RejectedEventsIndex;
 
 type HttpBody = GitResponseBody;
 
-/// CORS headers required by GRASP-01 specification (lines 40-47)
+/// CORS headers required by GRASP-01 specification (lines 48-51)
 const CORS_ALLOW_ORIGIN: &str = "*";
 const CORS_ALLOW_METHODS: &str = "GET, POST";
 const CORS_ALLOW_HEADERS: &str = "Content-Type";
@@ -180,7 +180,7 @@ impl Service<Request<Incoming>> for HttpService {
         let repo_init_locks = self.repo_init_locks.clone();
 
         // Handle OPTIONS preflight requests (CORS)
-        // GRASP-01 spec line 47: Respond to OPTIONS with 204 No Content
+        // GRASP-01 spec line 51: Respond to OPTIONS with 204 No Content
         if method == Method::OPTIONS {
             return Box::pin(async move {
                 Ok(
@@ -320,7 +320,7 @@ impl Service<Request<Incoming>> for HttpService {
 
                             // POST /git-receive-pack — accept pushes to
                             // refs/nostr/<event-id>, reject anything else,
-                            // per GRASP-06 06.md line 15.
+                            // per GRASP-06 06.md line 13.
                             (m, "git-receive-pack") if m == Method::POST => {
                                 // Metrics are recorded inside the `/prs/`
                                 // handler and its detached streaming task. For

@@ -1,6 +1,6 @@
 //! GRASP-06 `/prs/` fetch handlers.
 //!
-//! Spec 06.md line 13:
+//! Spec 06.md line 11:
 //!
 //! > MUST respond to upload-pack requests for any well-formed path as if
 //! > serving an empty bare repository.

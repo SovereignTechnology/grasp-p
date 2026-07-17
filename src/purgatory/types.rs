@@ -146,7 +146,7 @@ pub struct PrPurgatoryEntry {
     pub source: EventSource,
 
     /// If set, this placeholder was created by a push to the GRASP-06
-    /// `/prs/<submitter>/<identifier>.git` endpoint (06.md line 14). When
+    /// `/prs/<submitter>/<identifier>.git` endpoint (06.md line 12). When
     /// the corresponding PR event arrives, its signer MUST equal
     /// `submitter` and it MUST carry an `a` tag with d-tag equal to
     /// `identifier`. Mismatches cause the pushed ref + placeholder to be

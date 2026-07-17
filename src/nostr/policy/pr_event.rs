@@ -75,7 +75,7 @@ impl PrEventPolicy {
 
             if let Some(scope) = prs_scope {
                 // The placeholder was created by a /prs/<submitter>/<id>.git
-                // push (06.md line 14). The arriving event MUST be signed by
+                // push (06.md line 12). The arriving event MUST be signed by
                 // the URL submitter AND carry an `a` tag with d-tag equal to
                 // the URL identifier — otherwise this event was published by
                 // someone else and merely shares an id with a ref the

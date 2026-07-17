@@ -482,7 +482,7 @@ impl Nip34WritePolicy {
 
         // Reject PRs unrelated to stored repositories / events.
         //
-        // GRASP-06 (06.md lines 21–24) relaxes this: a PR / PR-Update event
+        // GRASP-06 (06.md lines 19–22) relaxes this: a PR / PR-Update event
         // whose `clone` tag names this relay's
         // `/prs/<signer-npub>/<d>.git` endpoint (and which carries a
         // matching `a` tag of the form `30617:<hex>:<d>`) MUST be accepted

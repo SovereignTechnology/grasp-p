@@ -738,7 +738,7 @@ pub fn align_repository_with_state(repo_path: &Path, state: &RepositoryState) ->
 /// - Standard endpoint: `{git_data_path}/{npub}/{identifier}.git` — two
 ///   components after `git_data_path`. The identifier is the last
 ///   component minus the `.git` suffix.
-/// - GRASP-06 `/prs/` endpoint (06.md line 14): the `/prs/`
+/// - GRASP-06 `/prs/` endpoint (06.md line 12): the `/prs/`
 ///   contributor-submission subtree at
 ///   `{git_data_path}/prs/{submitter-hex}/{identifier}.git` — three
 ///   components, where the leading `prs` is the namespace marker (see
@@ -947,7 +947,7 @@ pub async fn process_newly_available_git_data(
     // Cross-service mirror (design doc:
     // docs/explanation/grasp-06-contributor-pr-submission.md, "Cross-service
     // mirror" section). When the source repo lives under the `/prs/`
-    // subtree (06.md line 14), refs released from purgatory by this push
+    // subtree (06.md line 12), refs released from purgatory by this push
     // must be copied into any matching announced repo on this relay so the
     // PR is fetchable at the maintainer's canonical URL. The reverse
     // direction is NOT supported — a push to `<owner>/<id>.git` must never

@@ -498,7 +498,7 @@ impl Purgatory {
     }
 
     /// Add a PR placeholder created by a push to the GRASP-06 `/prs/`
-    /// endpoint (06.md line 14).
+    /// endpoint (06.md line 12).
     ///
     /// Behaves like [`Self::add_pr_placeholder`] but additionally records
     /// the URL's submitter and identifier on the entry. When the

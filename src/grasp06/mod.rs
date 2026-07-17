@@ -16,7 +16,7 @@
 //!   post-push validation against the database / purgatory.
 //! - PR / PR-Update event acceptance relaxation for un-announced coords
 //!   whose `clone` tag names this relay's `/prs/<signer-npub>/<d>.git`
-//!   endpoint (06.md lines 21–24).
+//!   endpoint (06.md lines 19–22).
 //!
 //! Cross-service mirroring into matching announced repos is not yet
 //! implemented.

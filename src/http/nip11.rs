@@ -38,17 +38,17 @@ pub struct RelayInformationDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 
-    // GRASP-01 Extensions (lines 11-14 of GRASP-01 spec)
+    // GRASP-01 Extensions (lines 24-28 of GRASP-01 spec)
     /// List of supported GRASPs (e.g., ["GRASP-01"])
-    /// Required by GRASP-01 specification line 12
+    /// Required by GRASP-01 specification line 26
     pub supported_grasps: Vec<String>,
 
     /// Repository acceptance criteria description
-    /// Required by GRASP-01 specification line 13
+    /// Required by GRASP-01 specification line 27
     pub repo_acceptance_criteria: String,
 
     /// Curation policy (present if curated, absent otherwise)
-    /// Optional per GRASP-01 specification line 14
+    /// Required by GRASP-01 specification line 28 when events are curated
     #[serde(skip_serializing_if = "Option::is_none")]
     pub curation: Option<String>,
 }

@@ -126,7 +126,7 @@ isolated_test_with_grasp_06!(
 // Test 3: Empty-bare-repo fetch for any well-formed /prs/<npub>/<id>.git
 // =============================================================================
 //
-// Spec: GRASP-06 06.md line 13
+// Spec: GRASP-06 06.md line 11
 //
 // Contract: when GRASP-06 is enabled on the relay, a fetch against any
 // well-formed /prs/<npub>/<id>.git path that has no accepted
@@ -149,7 +149,7 @@ isolated_test_with_grasp_06!(
 // Test 4: /prs/ MUST accept pushes to refs/nostr/<event-id>
 // =============================================================================
 //
-// Spec: GRASP-06 06.md line 15
+// Spec: GRASP-06 06.md line 13
 //
 // Contract: a `git push` of refs/nostr/<event-id> to /prs/<npub>/<id>.git
 // MUST succeed, even when there is no prior state on the path and no matching
@@ -170,7 +170,7 @@ isolated_test_with_grasp_06!(
 // Test 5: /prs/ MUST reject pushes to anything else
 // =============================================================================
 //
-// Spec: GRASP-06 06.md line 15
+// Spec: GRASP-06 06.md line 13
 //
 // Contract: pushes to ref names that don't match refs/nostr/<64-hex-event-id>
 // MUST be rejected. Two sub-assertions inside one test:
@@ -191,7 +191,7 @@ isolated_test_with_grasp_06!(
 // Test 6: PR for un-announced coord MUST be accepted when clone tag names /prs/
 // =============================================================================
 //
-// Spec: GRASP-06 06.md lines 21–24
+// Spec: GRASP-06 06.md lines 19–22
 //
 // Contract: a PR event (kind 1618) for a coord this relay has NO accepted
 // announcement for MUST be accepted (purgatory or served) when the event
@@ -215,7 +215,7 @@ isolated_test_with_grasp_06!(
 // Test 6b: Relaxation-accepted PR MUST stay in purgatory until git data arrives
 // =============================================================================
 //
-// Spec: GRASP-06 06.md lines 21–24, in combination with GRASP-01 line 22
+// Spec: GRASP-06 06.md lines 19–22, in combination with GRASP-01 line 20
 // (the purgatory rule).
 //
 // Contract: a PR event accepted under the GRASP-06 relaxation (un-announced
@@ -242,7 +242,7 @@ isolated_test_with_grasp_06!(
 // Test 7: Relaxation MUST NOT apply when clone tag does not name this relay
 // =============================================================================
 //
-// Spec: GRASP-06 06.md lines 23–24
+// Spec: GRASP-06 06.md line 22
 //
 // Contract: the same un-announced-coord PR event, but with a `clone` tag
 // pointing at a foreign host, MUST remain rejected. The relaxation is gated
@@ -332,7 +332,7 @@ isolated_test_with_grasp_06!(
 //
 // Wired only as `with_grasp_06`. Pre-implementation this can't make its
 // assertion (the /prs/ endpoint 404s) and reports a setup failure with a
-// pointer to the 06.md line 13 endpoint-reachability requirement. Once
+// pointer to the 06.md line 11 endpoint-reachability requirement. Once
 // /prs/ becomes reachable, the test goes green and stays green as long as
 // no one adds a reverse-mirror branch.
 

@@ -1,6 +1,6 @@
 //! GRASP-06 `/prs/` `git-receive-pack` handler.
 //!
-//! Spec 06.md line 15:
+//! Spec 06.md line 13:
 //!
 //! > MUST accept pushes to `refs/nostr/<event-id>`. MUST reject pushes to any
 //! > other ref namespace.
