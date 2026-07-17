@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Replaced permanent deletion-request deduplication with lifecycle-based retention: requests are served and can protect against replays for a limited period, then unactioned or irrelevant requests expire instead of being stored indefinitely.
+- Addressed a production storage imbalance where roughly 50k of 60k stored events were deletion requests. Deletion requests now have a bounded lifecycle, so requests that are no longer relevant are reconciled and retired while requests that may still affect valid event handling are preserved.
 - Deletion-disrespector mode now explicitly applies to both NIP-09 deletion requests and NIP-62 request-to-vanish events.
 - Retired the hidden `repair-deletion-requests` maintenance command.
 
