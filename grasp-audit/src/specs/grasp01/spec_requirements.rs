@@ -4,7 +4,7 @@
 //! This is the single source of truth for spec text displayed in audit reports.
 
 /// GRASP spec repository commit ID that this version is based on
-pub const GRASP_COMMIT_ID: &str = "4eeee96ffefeec8fd80a320d944f5b5e89171f0b";
+pub const GRASP_COMMIT_ID: &str = "a7d3f8b2340c8893ee81334622ff6379006aced5";
 
 /// Reference to a specific GRASP-01 specification requirement
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,7 +140,7 @@ pub const GRASP_01_REQUIREMENTS: &[SpecRequirement] = &[
         spec_ref: SpecRef::PurgatoryAcceptUntilGitData,
         line: 20,
         section: "Purgatory",
-        text: "Accepted repo state announcements, PRs and PR Updates SHOULD be accepted with message \"purgatory: won't be served until git data arrives\" and kept in purgatory (not served) until the related git data arrives and otherwise discarded after 30 minutes.",
+        text: "Accepted git repository announcements, repo state announcements, PRs and PR Updates SHOULD be accepted with message \"purgatory: won't be served until git data arrives\" and kept in purgatory (not served) until the related git data arrives and otherwise discarded after 30 minutes.",
         level: RequirementLevel::Should,
     },
     SpecRequirement {

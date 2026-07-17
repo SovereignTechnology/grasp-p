@@ -11,7 +11,7 @@ use crate::specs::grasp01::RequirementLevel;
 ///
 /// Update this when bumping to a newer spec revision so reports indicate
 /// which spec line numbers are being referenced.
-pub const GRASP_06_COMMIT_ID: &str = "4eeee96ffefeec8fd80a320d944f5b5e89171f0b";
+pub const GRASP_06_COMMIT_ID: &str = "a7d3f8b2340c8893ee81334622ff6379006aced5";
 
 /// Reference to a specific GRASP-06 specification requirement.
 ///

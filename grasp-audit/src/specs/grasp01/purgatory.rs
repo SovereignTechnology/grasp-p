@@ -5,7 +5,7 @@
 //!
 //! ## Purgatory Behavior (GRASP-01 Line 20)
 //!
-//! "Accepted repo state announcements, PRs and PR Updates
+//! "Accepted git repository announcements, repo state announcements, PRs and PR Updates
 //! SHOULD be accepted with message 'purgatory: won't be served until git data arrives'
 //! and kept in purgatory (not served) until the related git data arrives and otherwise
 //! discarded after 30 minutes."
@@ -70,8 +70,8 @@ impl PurgatoryTests {
 
     /// Test: Repository announcement not served before git data arrives
     ///
-    /// Legacy relay behavior — not a current GRASP-01 requirement.
-    /// Previous revisions required repository announcements to be accepted with message
+    /// Spec: GRASP-01 Line 20
+    /// "Accepted git repository announcements... SHOULD be accepted with message
     /// 'purgatory: won't be served until git data arrives' and kept in purgatory
     /// (not served) until the related git data arrives"
     ///
@@ -135,8 +135,8 @@ impl PurgatoryTests {
 
     /// Test: Repository announcement served after git push
     ///
-    /// Legacy relay behavior — not a current GRASP-01 requirement.
-    /// This verifies the former repository-announcement purgatory lifecycle.
+    /// Spec: GRASP-01 Line 20
+    /// "...kept in purgatory (not served) until the related git data arrives"
     ///
     /// This test verifies the full lifecycle:
     /// 1. Send repository announcement (enters purgatory)
@@ -214,7 +214,9 @@ impl PurgatoryTests {
 
     /// Test: Bare repository exists for purgatory announcement
     ///
-    /// Legacy relay behavior — GRASP-01 line 32 applies only to accepted
+    /// Spec: GRASP-01 Line 32
+    /// The purgatory rule defines repository announcements as accepted; therefore
+    /// line 32 also requires the Git Smart HTTP service while they are in purgatory.
     /// "MUST serve a git repository via an unauthenticated git smart http service
     /// at `/<npub>/<percent-encoded-identifier>.git` for each accepted git repository
     /// announcement."
