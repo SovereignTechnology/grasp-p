@@ -421,6 +421,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_repairs_orphan_metadata_idempotently_after_partial_removal() {
+        let service = service(false);
+        let request = deletion();
+        service
+            .ctx
+            .tombstones()
+            .record_request(
+                &request,
+                Timestamp::from_secs(0),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        service
+            .ctx
+            .tombstones()
+            .remove_request_payload_without_metadata(request.id)
+            .await
+            .unwrap();
+
+        let first = service
+            .cleanup_expired_requests(Timestamp::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(first.canonical_records_examined, 0);
+        assert_eq!(first.metadata_rows_removed, 1);
+        let rerun = service
+            .cleanup_expired_requests(Timestamp::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(rerun.metadata_rows_removed, 0);
+        assert_eq!(rerun.failures, 0);
+    }
+
+    #[tokio::test]
     async fn startup_reconciliation_and_periodic_cleanup_share_serving_boundary() {
         let startup = service(false);
         let periodic = service(false);

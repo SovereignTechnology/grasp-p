@@ -1327,4 +1327,40 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn coordinate_request_with_insufficient_cutoff_never_receives_use_credit() {
+        let ctx = context(crate::config::Config::for_testing());
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let coordinate = format!("30617:{}:repo", keys.public_key().to_hex());
+        let request = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::custom("a", vec![coordinate])])
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&keys)
+            .unwrap();
+        ctx.tombstones
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        let incoming = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+            .tags(vec![Tag::identifier("repo")])
+            .custom_created_at(Timestamp::from_secs(101))
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(service.gate(&incoming).await.is_none());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
+    }
 }

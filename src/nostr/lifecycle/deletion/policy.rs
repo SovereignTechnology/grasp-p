@@ -616,6 +616,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nip09_failed_archive_preserves_target_and_leaves_request_unused() {
+        let mut ctx = make_context();
+        let directory = tempfile::tempdir().unwrap();
+        ctx.git_data_path = directory.path().to_path_buf();
+        let keys = Keys::generate();
+        let target = make_announcement_event(&keys, "archive-failure");
+        let owner = owner_directory_component(&keys.public_key());
+        std::fs::create_dir_all(directory.path().join(&owner).join("archive-failure.git")).unwrap();
+        // A file where the archive directory belongs makes the archival attempt
+        // fail, so the fail-safe path must not award deletion-use credit.
+        std::fs::write(directory.path().join(".archive"), "not a directory").unwrap();
+        ctx.database.save_event(&target).await.unwrap();
+        let request = EventBuilder::new(Kind::EventDeletion, "")
+            .tags(vec![Tag::event(target.id)])
+            .finalize(&keys)
+            .unwrap();
+
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&request).await,
+            WritePolicyResult::Accept
+        ));
+        assert!(ctx
+            .database
+            .event_by_id(&target.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&request.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn coordinate_deletion_requests_with_different_cutoffs_coexist() {
         let ctx = make_context();
         let keys = Keys::generate();

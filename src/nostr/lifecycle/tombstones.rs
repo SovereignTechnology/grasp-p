@@ -207,6 +207,17 @@ impl Tombstones {
             .map_err(|error| anyhow::anyhow!("Failed to save test request payload: {error}"))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn remove_request_payload_without_metadata(
+        &self,
+        request_id: EventId,
+    ) -> anyhow::Result<()> {
+        self.db
+            .delete(Filter::new().ids(vec![request_id]))
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to remove test request payload: {error}"))
+    }
+
     /// Persist a signed deletion/vanish request and relay-generated lifecycle
     /// metadata. Exact replays retain their original `first_seen_at`.
     pub async fn record_request(

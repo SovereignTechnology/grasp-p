@@ -837,4 +837,67 @@ mod tests {
             .unwrap()
             .is_some());
     }
+
+    #[tokio::test]
+    async fn mode_round_trip_reclassifies_without_changing_lifecycle_timestamps() {
+        let normal = service(false);
+        let request = deletion(&Keys::generate());
+        normal
+            .ctx
+            .tombstones()
+            .record_request(
+                &request,
+                Timestamp::from_secs(10),
+                RequestClassification::LocallyActionable,
+            )
+            .await
+            .unwrap();
+        normal
+            .ctx
+            .tombstones()
+            .mark_request_used(&request.id, Timestamp::from_secs(20))
+            .await
+            .unwrap();
+
+        let mut disrespector_context = normal.ctx.clone();
+        disrespector_context.config.deletion_request_disrespector = true;
+        let disrespector = DeletionService::new(disrespector_context);
+        let entering = disrespector
+            .run_request_lifecycle_startup_reconciliation(Timestamp::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(entering.requests_reclassified, 1);
+        let entering_record = disrespector
+            .ctx
+            .tombstones()
+            .lifecycle_for_request_result(&request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entering_record.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(entering_record.last_used_at, Some(Timestamp::from_secs(20)));
+        assert_eq!(
+            entering_record.classification,
+            RequestClassification::Disrespector
+        );
+
+        let leaving = normal
+            .run_request_lifecycle_startup_reconciliation(Timestamp::from_secs(40))
+            .await
+            .unwrap();
+        assert_eq!(leaving.requests_reclassified, 1);
+        let leaving_record = normal
+            .ctx
+            .tombstones()
+            .lifecycle_for_request_result(&request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(leaving_record.first_seen_at, Timestamp::from_secs(10));
+        assert_eq!(leaving_record.last_used_at, Some(Timestamp::from_secs(20)));
+        assert_eq!(
+            leaving_record.classification,
+            RequestClassification::LocallyActionable
+        );
+    }
 }
