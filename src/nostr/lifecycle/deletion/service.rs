@@ -234,89 +234,6 @@ impl DeletionService {
         reject_error(format!("internal error {context}: {error}"))
     }
 
-    /// Remove stale out-of-order kind-5 requests that targeted this event ID but
-    /// were authored by a different pubkey.
-    ///
-    /// Main-DB validation rejects cross-author `e` deletes when the target is
-    /// already known. For pre-emptive deletes, ownership is unknowable until the
-    /// target arrives. Once an accepted event establishes the real author, any
-    /// stored deletion requests from other authors are retroactively invalid and
-    /// should be removed from both the internal tombstone store and the served
-    /// deletion-request event stream.
-    pub async fn remove_stale_cross_author_event_deletions(&self, event: &Event) {
-        let target_id = event.id;
-        let author = event.pubkey;
-
-        match self
-            .ctx
-            .tombstones()
-            .remove_event_deletions_by_other_authors(&target_id, &author)
-            .await
-        {
-            Ok(removed) if removed > 0 => tracing::info!(
-                target_id = %target_id.to_hex(),
-                author = %author.to_hex(),
-                removed,
-                "Removed stale cross-author deletion tombstone(s) after target arrival"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                target_id = %target_id.to_hex(),
-                author = %author.to_hex(),
-                error = %e,
-                "Failed to remove stale cross-author deletion tombstones"
-            ),
-        }
-
-        let filter = Filter::new()
-            .kind(Kind::EventDeletion)
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), target_id.to_hex());
-
-        let stale_ids = match self.ctx.database().query(filter).await {
-            Ok(events) => events
-                .into_iter()
-                .filter(|deletion| deletion.pubkey != author)
-                .map(|deletion| deletion.id)
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!(
-                    target_id = %target_id.to_hex(),
-                    author = %author.to_hex(),
-                    error = %e,
-                    "Failed to query stale cross-author deletion requests in main DB"
-                );
-                return;
-            }
-        };
-
-        if stale_ids.is_empty() {
-            return;
-        }
-
-        let removed = stale_ids.len();
-        if let Err(e) = self
-            .ctx
-            .database()
-            .delete(Filter::new().ids(stale_ids))
-            .await
-        {
-            tracing::warn!(
-                target_id = %target_id.to_hex(),
-                author = %author.to_hex(),
-                error = %e,
-                "Failed to remove stale cross-author deletion requests from main DB"
-            );
-            return;
-        }
-
-        tracing::info!(
-            target_id = %target_id.to_hex(),
-            author = %author.to_hex(),
-            removed,
-            "Removed stale cross-author deletion request(s) from main DB after target arrival"
-        );
-    }
-
     pub async fn handle_nip09(&self, event: &Event) -> WritePolicyResult {
         self.policy.handle(event).await
     }
@@ -857,6 +774,22 @@ mod tests {
         HoldingStore, ReplaceableHistoryStore, RepositoryLifecycle, Tombstones,
     };
     use crate::purgatory::Purgatory;
+
+    trait TombstoneTestExt {
+        async fn lifecycle_for_request(
+            &self,
+            request_id: &EventId,
+        ) -> Option<RequestLifecycleRecord>;
+    }
+
+    impl TombstoneTestExt for Tombstones {
+        async fn lifecycle_for_request(
+            &self,
+            request_id: &EventId,
+        ) -> Option<RequestLifecycleRecord> {
+            self.lifecycle_for_request_result(request_id).await.unwrap()
+        }
+    }
     use nostr_relay_builder::prelude::{EventBuilder, EventId, FinalizeEvent, Keys, Tag};
     use std::path::PathBuf;
     use std::sync::Arc;

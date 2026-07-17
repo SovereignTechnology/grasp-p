@@ -40,7 +40,7 @@ use nostr_relay_builder::prelude::{
 
 use super::DeletionContext;
 use crate::nostr::lifecycle::RequestClassification;
-use crate::nostr::policy::{duplicate, reject_error, reject_invalid};
+use crate::nostr::policy::{reject_error, reject_invalid};
 
 const MAX_DELETION_TARGET_TAGS: usize = 2048;
 /// Policy for handling NIP-09 event deletion requests
@@ -77,35 +77,14 @@ impl DeletionPolicy {
     /// main database) so clients see an OK and the request is preserved. It
     /// receives disrespector lifecycle metadata and is evaluated read-only to
     /// determine whether it would delete stored data under normal policy, but
-    /// it never installs a local gate or mutates targets. Already-covered
-    /// kind-5 requests are still treated as duplicates before archival-mode
-    /// storage to avoid polluting the served deletion-request stream. The same
-    /// archival-mode contract is applied to NIP-62 vanish requests in
+    /// it never installs a local gate or mutates targets. Distinct signed
+    /// kind-5 requests receive independent lifecycle records even when their
+    /// targets overlap. The same archival-mode contract is applied to NIP-62
+    /// vanish requests in
     /// [`DeletionService::handle_vanish`](super::service::DeletionService::handle_vanish).
     pub async fn handle(&self, event: &Event) -> WritePolicyResult {
         if let Err(result) = self.validate_request(event).await {
             return result;
-        }
-
-        match self
-            .ctx
-            .tombstones
-            .deletion_targets_already_covered(event)
-            .await
-        {
-            Ok(true) => {
-                tracing::info!(
-                    event_id = %event.id.to_hex(),
-                    author = %event.pubkey.to_hex(),
-                    "Skipping duplicate NIP-09 deletion request; all actionable targets are already covered"
-                );
-                return duplicate("deletion target(s) already covered");
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "Tombstone lookup failed during duplicate deletion check");
-                return reject_error(format!("internal error checking deletion coverage: {e}"));
-            }
         }
 
         let classification = if self.ctx.config.deletion_request_disrespector {
@@ -160,8 +139,6 @@ impl DeletionPolicy {
             .lifecycle()
             .write_repositories(self.deletion_recovery_scopes(event).await)
             .await;
-
-        self.compact_superseded_deletion_requests(event).await;
 
         let rollback_plans = self.collect_replaceable_rollback_plans(event).await;
         let mut identifiers_to_realign = Self::state_a_tag_identifiers_for_author(event);
@@ -350,65 +327,6 @@ impl DeletionPolicy {
         false
     }
 
-    async fn compact_superseded_deletion_requests(&self, event: &Event) {
-        let superseded_ids = match self.ctx.tombstones.superseded_deletion_ids(event).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!(
-                    event_id = %event.id.to_hex(),
-                    error = %e,
-                    "Failed to discover superseded NIP-09 deletion requests"
-                );
-                return;
-            }
-        };
-
-        if superseded_ids.is_empty() {
-            return;
-        }
-
-        let superseded_count = superseded_ids.len();
-
-        // Remove superseded kind-5 events from the served main DB. The database
-        // delete API owns secondary index maintenance; this is the same path
-        // used for stale cross-author deletion request cleanup.
-        if let Err(e) = self
-            .ctx
-            .database
-            .delete(Filter::new().ids(superseded_ids.clone()))
-            .await
-        {
-            tracing::warn!(
-                event_id = %event.id.to_hex(),
-                superseded_count,
-                error = %e,
-                "Failed to remove superseded NIP-09 deletion requests from main DB"
-            );
-        }
-
-        if let Err(e) = self
-            .ctx
-            .tombstones
-            .remove_deletions_by_ids(superseded_ids)
-            .await
-        {
-            tracing::warn!(
-                event_id = %event.id.to_hex(),
-                superseded_count,
-                error = %e,
-                "Failed to remove superseded NIP-09 deletion requests from tombstone DB"
-            );
-            return;
-        }
-
-        tracing::info!(
-            event_id = %event.id.to_hex(),
-            author = %event.pubkey.to_hex(),
-            superseded_count,
-            "Compacted superseded NIP-09 deletion request(s)"
-        );
-    }
-
     /// Extract all event-id (`e` tag) targets from a deletion event.
     pub(super) fn e_tag_ids(event: &Event) -> Vec<EventId> {
         event
@@ -467,12 +385,38 @@ mod tests {
     use crate::nostr::lifecycle::HoldingStore;
     use crate::nostr::lifecycle::ReplaceableHistoryStore;
     use crate::nostr::lifecycle::RepositoryLifecycle;
+    use crate::nostr::lifecycle::RequestLifecycleRecord;
     use crate::nostr::lifecycle::Tombstones;
     use crate::purgatory::Purgatory;
     use nostr_relay_builder::prelude::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    trait TombstoneTestExt {
+        async fn lifecycle_for_request(
+            &self,
+            request_id: &EventId,
+        ) -> Option<RequestLifecycleRecord>;
+        async fn is_event_deleted(&self, id: &EventId, author: &PublicKey) -> bool;
+    }
+
+    impl TombstoneTestExt for Tombstones {
+        async fn lifecycle_for_request(
+            &self,
+            request_id: &EventId,
+        ) -> Option<RequestLifecycleRecord> {
+            self.lifecycle_for_request_result(request_id).await.unwrap()
+        }
+
+        async fn is_event_deleted(&self, id: &EventId, author: &PublicKey) -> bool {
+            !self
+                .event_deletion_candidates(id, author)
+                .await
+                .unwrap()
+                .is_empty()
+        }
+    }
 
     fn make_context() -> DeletionContext {
         let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
@@ -566,16 +510,19 @@ mod tests {
                 .has_purgatory_announcement(&keys.public_key(), identifier),
             "Purgatory entry should have been removed"
         );
-        assert!(
+        assert_eq!(
             ctx.tombstones
-                .is_event_deleted(&announcement.id, &keys.public_key())
-                .await,
-            "accepted deletion must persist a tombstone as the durable operation marker"
+                .event_deletion_candidates(&announcement.id, &keys.public_key())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "accepted deletion must persist a lifecycle-backed tombstone"
         );
     }
 
     #[tokio::test]
-    async fn duplicate_deletion_request_is_not_accepted_for_storage() {
+    async fn distinct_overlapping_deletion_requests_are_independently_accepted() {
         let ctx = make_context();
         let keys = Keys::generate();
         let target = EventId::all_zeros();
@@ -585,7 +532,7 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(1000))
             .finalize(&keys)
             .unwrap();
-        let duplicate = EventBuilder::new(Kind::EventDeletion, "")
+        let overlapping = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![Tag::event(target)])
             .custom_created_at(Timestamp::from_secs(1001))
             .finalize(&keys)
@@ -595,11 +542,21 @@ mod tests {
         let first_result = policy.handle(&first).await;
         assert!(matches!(first_result, WritePolicyResult::Accept));
 
-        let duplicate_result = policy.handle(&duplicate).await;
-        assert!(
-            !matches!(duplicate_result, WritePolicyResult::Accept),
-            "duplicate deletion request should not be returned as Accept, because Accept causes relay storage"
-        );
+        assert!(matches!(
+            policy.handle(&overlapping).await,
+            WritePolicyResult::Accept
+        ));
+        let records = policy
+            .ctx
+            .tombstones
+            .lifecycle_records_result()
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.request.id == first.id));
+        assert!(records
+            .iter()
+            .any(|record| record.request.id == overlapping.id));
     }
 
     #[tokio::test]
@@ -621,8 +578,9 @@ mod tests {
         ));
         let record = ctx
             .tombstones
-            .lifecycle_records()
+            .lifecycle_records_result()
             .await
+            .unwrap()
             .into_iter()
             .find(|record| record.request.id == deletion.id)
             .unwrap();
@@ -648,8 +606,9 @@ mod tests {
         ));
         let record = ctx
             .tombstones
-            .lifecycle_records()
+            .lifecycle_records_result()
             .await
+            .unwrap()
             .into_iter()
             .find(|record| record.request.id == deletion.id)
             .unwrap();
@@ -657,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newer_coordinate_deletion_compacts_superseded_request_from_main_db() {
+    async fn coordinate_deletion_requests_with_different_cutoffs_coexist() {
         let ctx = make_context();
         let keys = Keys::generate();
         let coord = format!("30618:{}:my-repo", keys.public_key().to_hex());
@@ -688,18 +647,21 @@ mod tests {
             WritePolicyResult::Accept
         ));
 
-        assert!(
-            ctx.database.event_by_id(&older.id).await.unwrap().is_none(),
-            "superseded older kind-5 request should be removed from the served main DB"
-        );
-        assert!(
-            ctx.tombstones
-                .superseded_deletion_ids(&newer)
+        ctx.database.save_event(&newer).await.unwrap();
+        for request in [&older, &newer] {
+            assert!(ctx
+                .database
+                .event_by_id(&request.id)
                 .await
                 .unwrap()
-                .is_empty(),
-            "superseded older kind-5 tombstone should be compacted after the newer request is recorded"
-        );
+                .is_some());
+            assert!(ctx
+                .tombstones
+                .lifecycle_for_request_result(&request.id)
+                .await
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[tokio::test]
@@ -766,59 +728,65 @@ mod tests {
         );
         assert!(ctx
             .tombstones
-            .lifecycle_for_request(&deletion.id)
+            .lifecycle_for_request_result(&deletion.id)
             .await
+            .unwrap()
             .is_some());
     }
 
     #[tokio::test]
-    async fn test_target_arrival_removes_stale_cross_author_deletion_request() {
+    async fn preemptive_multi_target_foreign_event_keeps_request_and_valid_target_effective() {
         let ctx = make_context();
         let attacker_keys = Keys::generate();
         let victim_keys = Keys::generate();
 
-        let target = EventBuilder::text_note("real event from victim")
+        let foreign_target = EventBuilder::text_note("real event from victim")
             .finalize(&victim_keys)
             .unwrap();
+        let valid_target = EventBuilder::text_note("real event from deleter")
+            .finalize(&attacker_keys)
+            .unwrap();
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
-            .tags(vec![Tag::event(target.id)])
+            .tags(vec![
+                Tag::event(foreign_target.id),
+                Tag::event(valid_target.id),
+            ])
             .finalize(&attacker_keys)
             .unwrap();
 
-        ctx.tombstones.record_deletion(&deletion).await.unwrap();
+        assert!(matches!(
+            DeletionPolicy::new(ctx.clone()).handle(&deletion).await,
+            WritePolicyResult::Accept
+        ));
         ctx.database.save_event(&deletion).await.unwrap();
 
-        assert!(
-            ctx.tombstones
-                .is_event_deleted(&target.id, &attacker_keys.public_key())
-                .await
-        );
-        assert!(ctx
-            .database
-            .event_by_id(&deletion.id)
-            .await
-            .unwrap()
-            .is_some());
-
         let service = DeletionService::new(ctx.clone());
-        service
-            .remove_stale_cross_author_event_deletions(&target)
-            .await;
-
-        assert!(
-            !ctx.tombstones
-                .is_event_deleted(&target.id, &attacker_keys.public_key())
-                .await,
-            "stale cross-author deletion tombstone should be removed"
-        );
+        assert!(service.gate(&foreign_target).await.is_none());
         assert!(
             ctx.database
                 .event_by_id(&deletion.id)
                 .await
                 .unwrap()
-                .is_none(),
-            "stale cross-author deletion request should be removed from main DB"
+                .is_some(),
+            "foreign target discovery must not remove the entire signed request"
         );
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request_result(&deletion.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .is_none());
+        assert!(service.gate(&valid_target).await.is_some());
+        assert!(ctx
+            .tombstones
+            .lifecycle_for_request_result(&deletion.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .is_some());
     }
 
     #[tokio::test]
