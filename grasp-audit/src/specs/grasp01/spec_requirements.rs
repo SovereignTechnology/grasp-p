@@ -197,7 +197,7 @@ pub const GRASP_01_REQUIREMENTS: &[SpecRequirement] = &[
         spec_ref: SpecRef::GitAcceptRefsNostrEventId,
         line: 38,
         section: "Git Smart HTTP Service",
-        text: "MUST accept pushes via this service to `refs/nostr/<event-id>` but SHOULD reject if the event exists in purgatory listing a different tip, and MAY reject based on criteria such as size, SPAM prevention, etc.",
+        text: "MUST accept pushes via this service to `refs/nostr/<event-id>` but SHOULD reject if event exists on relay listing a different tip and MAY reject based on criteria such as size, SPAM prevention, etc. SHOULD delete and MAY garbage collect these refs if no corresponding git PR event or git PR update event, with a `c` tag that matches the ref tip, is accepted by relay within 20 minutes.",
         level: RequirementLevel::Must,
     },
     SpecRequirement {

@@ -37,7 +37,7 @@ impl RepositoryCreationTests {
     /// Test that a bare repository is created when a valid announcement is accepted
     /// and is accessible via Smart HTTP service
     ///
-    /// Spec: Line 28 of ../grasp/01.md
+    /// Spec: Line 32 of ../grasp/01.md
     /// This test verifies:
     /// 1. Sends a valid repository announcement via TestContext
     /// 2. Verifies the announcement was accepted
@@ -116,7 +116,7 @@ impl RepositoryCreationTests {
 
     /// Test that a webpage is served for an existing repository
     ///
-    /// Spec: Line 38 of ../grasp/01.md
+    /// Spec: Line 42 of ../grasp/01.md
     /// This test verifies:
     /// 1. Creates a valid repository announcement
     /// 2. Accesses the repository URL without git service parameters
@@ -196,7 +196,7 @@ impl RepositoryCreationTests {
 
     /// Test that 404 is returned for non-existent repositories
     ///
-    /// Spec: Line 38 of ../grasp/01.md
+    /// Spec: Line 42 of ../grasp/01.md
     /// This test verifies:
     /// 1. Accesses a URL for a repository that doesn't exist
     /// 2. Verifies a 404 status is returned

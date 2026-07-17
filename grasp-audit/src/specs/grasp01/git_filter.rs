@@ -10,7 +10,7 @@
 //!
 //! ## Specification Reference
 //!
-//! Per GRASP-01 line 36-43, implementations MUST:
+//! Per GRASP-01 line 40, implementations MUST:
 //! - Include `allow-reachable-sha1-in-want` in advertisement
 //! - Include `allow-tip-sha1-in-want` in advertisement  
 //! - Include uploadpack.allowFilter in advertisement
@@ -45,7 +45,7 @@ impl GitFilterTests {
 
     /// Test that filter capability is advertised in git-upload-pack
     ///
-    /// Spec: Line 36 of ../grasp/01.md (updated requirement)
+    /// Spec: Line 40 of ../grasp/01.md
     /// GRASP-01 requires:
     /// "MUST include `allow-reachable-sha1-in-want`, `allow-tip-sha1-in-want`,
     /// and uploadpack.allowFilter in advertisement and serve available oids and
@@ -172,7 +172,7 @@ impl GitFilterTests {
 
     /// Test that filtered clone with blob:none works
     ///
-    /// Spec: Line 36 of ../grasp/01.md
+    /// Spec: Line 40 of ../grasp/01.md
     /// This test verifies:
     /// 1. A repository can be cloned with --filter=blob:none
     /// 2. The clone succeeds without downloading blob objects
@@ -284,7 +284,7 @@ impl GitFilterTests {
 
     /// Test that filtered fetch with tree:0 works
     ///
-    /// Spec: Line 36 of ../grasp/01.md
+    /// Spec: Line 40 of ../grasp/01.md
     /// This test verifies:
     /// 1. An existing repository can fetch with --filter=tree:0
     /// 2. The fetch succeeds without downloading tree objects

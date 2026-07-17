@@ -1,6 +1,6 @@
 //! GRASP-01 CORS Tests
 //!
-//! Tests for GRASP-01 CORS requirements (lines 40-47 of ../grasp/01.md)
+//! Tests for GRASP-01 CORS requirements (lines 44-51 of ../grasp/01.md)
 //!
 //! These tests validate that a GRASP-01 compliant relay implements CORS correctly:
 //! - Sets `Access-Control-Allow-Origin: *` on ALL responses
@@ -40,7 +40,7 @@ impl CorsTests {
 
     /// Test: Access-Control-Allow-Origin header on all responses
     ///
-    /// Spec: Line 44 of ../grasp/01.md
+    /// Spec: Line 48 of ../grasp/01.md
     /// Requirement: Set `Access-Control-Allow-Origin: *` on ALL responses
     pub async fn test_cors_allow_origin(_client: &AuditClient, relay_domain: &str) -> TestResult {
         TestResult::new(
@@ -86,7 +86,7 @@ impl CorsTests {
 
     /// Test: Access-Control-Allow-Methods header on all responses
     ///
-    /// Spec: Line 45 of ../grasp/01.md
+    /// Spec: Line 49 of ../grasp/01.md
     /// Requirement: Set `Access-Control-Allow-Methods: GET, POST` on ALL responses
     pub async fn test_cors_allow_methods(_client: &AuditClient, relay_domain: &str) -> TestResult {
         TestResult::new(
@@ -130,7 +130,7 @@ impl CorsTests {
 
     /// Test: Access-Control-Allow-Headers header on all responses
     ///
-    /// Spec: Line 46 of ../grasp/01.md
+    /// Spec: Line 50 of ../grasp/01.md
     /// Requirement: Set `Access-Control-Allow-Headers: Content-Type` on ALL responses
     pub async fn test_cors_allow_headers(_client: &AuditClient, relay_domain: &str) -> TestResult {
         TestResult::new(
@@ -174,7 +174,7 @@ impl CorsTests {
 
     /// Test: OPTIONS preflight requests return 204 No Content
     ///
-    /// Spec: Line 47 of ../grasp/01.md
+    /// Spec: Line 51 of ../grasp/01.md
     /// Requirement: Respond to OPTIONS requests with 204 No Content
     pub async fn test_cors_options_preflight(
         _client: &AuditClient,

@@ -8,7 +8,7 @@
 //!   (discovery gate, empty-repo fetch, push acceptance/rejection)
 //! - [`Nip11Tests`] - NIP-11 advertisement of GRASP-06 capability
 //! - [`EventAcceptanceTests`] - PR/PR-Update event-acceptance relaxation
-//!   (06.md lines 21–24)
+//!   (06.md lines 19–22)
 //! - [`MirroringTests`] - cross-service mirror: `/prs/` → announced repo
 //!   (forward), and announced repo ↛ `/prs/` (reverse must not fire).
 //!   Design-doc derived.
@@ -282,7 +282,7 @@ impl Grasp06Tests {
         // Group tests by their full spec_ref string, not just by line.
         //
         // Two GRASP-06 requirements can legitimately share a spec line — for
-        // example 06.md line 15 carries both "MUST accept refs/nostr/<event-id>"
+        // example 06.md line 13 carries both "MUST accept refs/nostr/<event-id>"
         // and "MUST reject other ref namespaces". Grouping by line would
         // duplicate tests under every same-line requirement, which is
         // misleading. Grouping by the full spec_ref string matches each test

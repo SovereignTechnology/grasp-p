@@ -1,6 +1,6 @@
 //! GRASP-01 NIP-11 Document
 //!
-//! Tests for GRASP-01 NIP-11 relay information document requirements (lines 11-14 of ../grasp/01.md)
+//! Tests for GRASP-01 NIP-11 relay information document requirements (lines 24-28 of ../grasp/01.md)
 //!
 //! These tests validate that a GRASP-01 compliant relay:
 //! - Serves a valid NIP-11 relay information document
@@ -33,7 +33,7 @@ impl Nip11DocumentTests {
 
     /// Test: Serve NIP-11 document
     ///
-    /// Spec: Line 20 of ../grasp/01.md
+    /// Spec: Line 24 of ../grasp/01.md
     /// Requirement: MUST serve NIP-11 document
     pub async fn test_nip11_document_exists(client: &AuditClient) -> TestResult {
         TestResult::new(
@@ -92,7 +92,7 @@ impl Nip11DocumentTests {
 
     /// Test: NIP-11 includes supported_grasps field
     ///
-    /// Spec: Line 22 of ../grasp/01.md
+    /// Spec: Line 26 of ../grasp/01.md
     /// Requirement: MUST list supported GRASPs as string array
     pub async fn test_nip11_supported_grasps_field(client: &AuditClient) -> TestResult {
         TestResult::new(
@@ -168,7 +168,7 @@ impl Nip11DocumentTests {
 
     /// Test: NIP-11 includes repo_acceptance_criteria field
     ///
-    /// Spec: Line 23 of ../grasp/01.md
+    /// Spec: Line 27 of ../grasp/01.md
     /// Requirement: MUST list repository acceptance criteria
     pub async fn test_nip11_repo_acceptance_criteria_field(client: &AuditClient) -> TestResult {
         TestResult::new(
@@ -223,7 +223,7 @@ impl Nip11DocumentTests {
 
     /// Test: NIP-11 curation field handling
     ///
-    /// Spec: Line 24 of ../grasp/01.md
+    /// Spec: Line 28 of ../grasp/01.md
     /// Requirement: MUST include curation if curated, omit otherwise
     pub async fn test_nip11_curation_field(client: &AuditClient) -> TestResult {
         TestResult::new(

@@ -3,9 +3,9 @@
 //! Tests for the GRASP-01 purgatory mechanism where events are accepted but not
 //! served until corresponding git data arrives.
 //!
-//! ## Purgatory Behavior (GRASP-01 Line 22)
+//! ## Purgatory Behavior (GRASP-01 Line 20)
 //!
-//! "New repository announcements, repo state announcements, PRs and PR Updates
+//! "Accepted repo state announcements, PRs and PR Updates
 //! SHOULD be accepted with message 'purgatory: won't be served until git data arrives'
 //! and kept in purgatory (not served) until the related git data arrives and otherwise
 //! discarded after 30 minutes."
@@ -70,8 +70,8 @@ impl PurgatoryTests {
 
     /// Test: Repository announcement not served before git data arrives
     ///
-    /// Spec: GRASP-01 Line 22
-    /// "New repository announcements... SHOULD be accepted with message
+    /// Legacy relay behavior — not a current GRASP-01 requirement.
+    /// Previous revisions required repository announcements to be accepted with message
     /// 'purgatory: won't be served until git data arrives' and kept in purgatory
     /// (not served) until the related git data arrives"
     ///
@@ -135,8 +135,8 @@ impl PurgatoryTests {
 
     /// Test: Repository announcement served after git push
     ///
-    /// Spec: GRASP-01 Line 22
-    /// "...kept in purgatory (not served) until the related git data arrives"
+    /// Legacy relay behavior — not a current GRASP-01 requirement.
+    /// This verifies the former repository-announcement purgatory lifecycle.
     ///
     /// This test verifies the full lifecycle:
     /// 1. Send repository announcement (enters purgatory)
@@ -214,10 +214,10 @@ impl PurgatoryTests {
 
     /// Test: Bare repository exists for purgatory announcement
     ///
-    /// Spec: GRASP-01 Line 34
+    /// Legacy relay behavior — GRASP-01 line 32 applies only to accepted
     /// "MUST serve a git repository via an unauthenticated git smart http service
-    /// at `/<npub>/<identifier>.git` for each git repository announcement the relay
-    /// serves or has in purgatory."
+    /// at `/<npub>/<percent-encoded-identifier>.git` for each accepted git repository
+    /// announcement."
     ///
     /// This test verifies that git HTTP service works even for repos in purgatory.
     ///
@@ -295,8 +295,8 @@ impl PurgatoryTests {
 
     /// Test: State event accepted for purgatory announcement
     ///
-    /// Spec: GRASP-01 Line 22
-    /// "New repository announcements, repo state announcements... SHOULD be accepted"
+    /// Spec: GRASP-01 Line 20
+    /// "Accepted repo state announcements... SHOULD be accepted"
     ///
     /// This test verifies that state events are accepted even when the repo
     /// announcement is in purgatory (no git data yet).
@@ -389,7 +389,7 @@ impl PurgatoryTests {
 
     /// Test: State event not served before git data arrives
     ///
-    /// Spec: GRASP-01 Line 22
+    /// Spec: GRASP-01 Line 20
     /// "repo state announcements... SHOULD be accepted with message
     /// 'purgatory: won't be served until git data arrives'"
     ///
@@ -459,7 +459,7 @@ impl PurgatoryTests {
 
     /// Test: State event served after git push
     ///
-    /// Spec: GRASP-01 Line 22
+    /// Spec: GRASP-01 Line 20
     /// "...kept in purgatory (not served) until the related git data arrives"
     ///
     /// This test verifies the full lifecycle using PurgatoryOwnerStateDataPushed fixture:
@@ -508,7 +508,7 @@ impl PurgatoryTests {
 
     /// Test: PR event accepted into purgatory (not served before git data)
     ///
-    /// Spec: GRASP-01 Line 22
+    /// Spec: GRASP-01 Line 20
     /// "PRs and PR Updates SHOULD be accepted with message
     /// 'purgatory: won't be served until git data arrives'"
     ///

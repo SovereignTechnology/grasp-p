@@ -102,7 +102,7 @@ impl PrsEndpointTests {
     /// accepted `refs/nostr/<event-id>` MUST respond as if serving an empty
     /// bare repository.
     ///
-    /// Spec: 06.md line 13 — "MUST respond to upload-pack requests for any
+    /// Spec: 06.md line 11 — "MUST respond to upload-pack requests for any
     /// well-formed path as if serving an empty bare repository until at least
     /// one `refs/nostr/<event-id>` has been accepted for that path."
     ///
@@ -226,7 +226,7 @@ impl PrsEndpointTests {
     /// Test: a `git push` of `refs/nostr/<event-id>` to a fresh
     /// `/prs/<npub>/<id>.git` path MUST succeed.
     ///
-    /// Spec: 06.md line 15 — "MUST accept pushes to `refs/nostr/<event-id>`."
+    /// Spec: 06.md line 13 — "MUST accept pushes to `refs/nostr/<event-id>`."
     ///
     /// Setup is intentionally minimal:
     /// - Fresh contributor keys → `<npub>` for the URL.
@@ -298,7 +298,7 @@ impl PrsEndpointTests {
     /// Test: pushes to ref namespaces other than `refs/nostr/<64-hex-event-id>`
     /// MUST be rejected.
     ///
-    /// Spec: 06.md line 15 — "MUST reject pushes to any other ref namespace."
+    /// Spec: 06.md line 13 — "MUST reject pushes to any other ref namespace."
     /// Implementation plan Phase 4 clarifies that the validator requires
     /// `refs/nostr/<64-hex>`, so non-hex values under `refs/nostr/*` are also
     /// "other ref namespace" for the purposes of this contract.
@@ -311,7 +311,7 @@ impl PrsEndpointTests {
     ///
     /// ## Why a "not found" stderr is treated as a test failure
     ///
-    /// Spec line 13 requires that any well-formed `/prs/<npub>/<id>.git` path
+    /// Spec line 11 requires that any well-formed `/prs/<npub>/<id>.git` path
     /// respond as an empty bare repo (i.e. the endpoint must be reachable).
     /// If a push gets a 404, the endpoint doesn't exist — the rejection is
     /// trivial and tells us nothing about the ref-name validator. To stay
@@ -715,7 +715,7 @@ fn check_push_rejected_not_404(cwd: &Path, url: &str, refname: &str) -> Result<(
     if out.status.success() {
         return Err(format!(
             "Expected push to {} (ref={}) to be REJECTED, but it succeeded: relay accepted \
-             a ref outside `refs/nostr/<event-id>` which violates GRASP-06 06.md line 15",
+             a ref outside `refs/nostr/<event-id>` which violates GRASP-06 06.md line 13",
             url, refname
         ));
     }
@@ -727,8 +727,8 @@ fn check_push_rejected_not_404(cwd: &Path, url: &str, refname: &str) -> Result<(
     if lower.contains("not found") || lower.contains("404") {
         return Err(format!(
             "Push to {} (ref={}) failed with a 404 — the /prs/ endpoint is not implemented. \
-             GRASP-06 06.md line 13 requires the endpoint to be reachable as an empty bare \
-             repo, so this test cannot meaningfully assert the line 15 rejection contract. \
+             GRASP-06 06.md line 11 requires the endpoint to be reachable as an empty bare \
+             repo, so this test cannot meaningfully assert the line 13 rejection contract. \
              stderr was: {}",
             url,
             refname,

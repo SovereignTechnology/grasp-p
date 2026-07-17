@@ -2,7 +2,7 @@
 //!
 //! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
 //!
-//! Covers 06.md lines 21–24: PR and PR Update events that would otherwise be
+//! Covers 06.md lines 19–22: PR and PR Update events that would otherwise be
 //! rejected under GRASP-01 for not referencing an accepted repository
 //! announcement MUST instead be accepted, provided the event:
 //!
@@ -33,7 +33,7 @@ impl EventAcceptanceTests {
     /// carrying a `clone` tag naming this relay's `/prs/<signer-npub>/<d>.git`,
     /// MUST be accepted (purgatory or served).
     ///
-    /// Spec: 06.md lines 21–24.
+    /// Spec: 06.md lines 19–22.
     ///
     /// ## Setup (no fixtures)
     ///
@@ -123,7 +123,7 @@ impl EventAcceptanceTests {
                 .await
                 .map_err(|e| {
                     format!(
-                        "Expected relay to ACCEPT the PR event (per GRASP-06 06.md lines 21–24): \
+                        "Expected relay to ACCEPT the PR event (per GRASP-06 06.md lines 19–22): \
                          clone tag named this relay's /prs/<signer-npub>/<d>.git and the `a` tag \
                          was well-formed, but the relay rejected it. Relay error: {}",
                         e
@@ -139,8 +139,8 @@ impl EventAcceptanceTests {
     /// placed in purgatory and MUST NOT be broadcast until matching git data
     /// arrives.
     ///
-    /// Spec: 06.md lines 21–24 say "MUST accept" — accept here means "accept
-    /// as the standard PR pipeline would". GRASP-01 line 22 (the purgatory
+    /// Spec: 06.md lines 19–22 say "MUST accept" — accept here means "accept
+    /// as the standard PR pipeline would". GRASP-01 line 20 (the purgatory
     /// rule) then governs visibility: an accepted PR event with no matching
     /// git data is held in purgatory, not served, until either the matching
     /// `refs/nostr/<event-id>` push arrives or the 30-minute TTL expires.
@@ -240,7 +240,7 @@ impl EventAcceptanceTests {
                 return Err(format!(
                     "Orphan PR event {} accepted via GRASP-06 relaxation was \
                      served immediately. The relaxation must route un-announced \
-                     PRs through purgatory (06.md lines 21–24 + GRASP-01 line 22), \
+                     PRs through purgatory (06.md lines 19–22 + GRASP-01 line 20), \
                      not directly to accept. A common cause is a \
                      `WritePolicyResult::Accept` short-circuit in the relaxation \
                      branch.",
@@ -257,7 +257,7 @@ impl EventAcceptanceTests {
     /// a `clone` tag pointing somewhere OTHER than this relay's `/prs/`
     /// endpoint, MUST remain rejected.
     ///
-    /// Spec: 06.md lines 23–24 — the relaxation applies only when the event's
+    /// Spec: 06.md line 22 — the relaxation applies only when the event's
     /// `clone` tag names this relay's `/prs/` endpoint.
     ///
     /// ## TDD posture
@@ -326,7 +326,7 @@ impl EventAcceptanceTests {
             match client.send_event_and_note_purgatory(event).await {
                 Ok(_) => Err(
                     "Relay ACCEPTED a PR event for an un-announced coord whose clone tag did NOT \
-                     name this relay's /prs/ endpoint. GRASP-06 06.md lines 23–24 require the \
+                     name this relay's /prs/ endpoint. GRASP-06 06.md line 22 requires the \
                      relaxation to apply only when the clone tag names this relay; this is either \
                      a missing host check in the relaxation branch or a regression in the \
                      baseline GRASP-01 rejection."

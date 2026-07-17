@@ -69,7 +69,7 @@ mod synthetic_lines {
 impl SpecRef {
     /// Get the spec reference string in format "GRASP-06:section:line".
     ///
-    /// When two requirements share a spec line (e.g. 06.md line 15 carries
+    /// When two requirements share a spec line (e.g. 06.md line 13 carries
     /// BOTH "MUST accept refs/nostr/<event-id>" AND "MUST reject other ref
     /// namespaces"), they MUST still produce distinct strings here — the
     /// report renderer keys tests by the full string. Use a `-<sibling>`

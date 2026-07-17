@@ -557,7 +557,7 @@ impl MirroringTests {
     /// ## Pass condition
     ///
     /// `ls-remote` exits 0 with empty stdout for the filtered refname.
-    /// Per 06.md line 13 the endpoint MUST respond as an empty bare repo
+    /// Per 06.md line 11 the endpoint MUST respond as an empty bare repo
     /// when nothing was pushed to it; an absent ref + clean exit is exactly
     /// the "empty repo" shape. A non-empty stdout for the filter means the
     /// reverse-mirror fired — that's the regression this test guards.
@@ -634,7 +634,7 @@ impl MirroringTests {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 return Err(format!(
                     "git ls-remote {} {} failed (exit {}): {} — /prs/ endpoint must be reachable \
-                     for this test to assert the reverse-mirror contract (06.md line 13 requires \
+                     for this test to assert the reverse-mirror contract (06.md line 11 requires \
                      an empty-bare-repo response for any well-formed /prs/ path)",
                     prs_url,
                     refname,

@@ -38,7 +38,7 @@ impl GitCloneTests {
 
     /// Test that a repository can be cloned via Git HTTP backend
     ///
-    /// Spec: Line 28 of ../grasp/01.md
+    /// Spec: Line 32 of ../grasp/01.md
     /// This test:
     /// 1. Creates a repository announcement
     /// 2. Waits for repository creation
@@ -162,7 +162,7 @@ impl GitCloneTests {
 
     /// Test clone URL format validation
     ///
-    /// Spec: Line 28 of ../grasp/01.md
+    /// Spec: Line 32 of ../grasp/01.md
     /// This test verifies:
     /// 1. URLs follow the pattern http://domain/npub/identifier.git
     /// 2. Invalid URLs are rejected properly
@@ -258,10 +258,10 @@ impl GitCloneTests {
 
     /// Test that SHA1 capabilities are advertised in git-upload-pack
     ///
-    /// Spec: Line 36 of ../grasp/01.md
+    /// Spec: Line 40 of ../grasp/01.md
     /// GRASP-01 requires:
-    /// "MUST include `allow-reachable-sha1-in-want` and `allow-tip-sha1-in-want`
-    /// in advertisement and serve available oids."
+    /// "MUST include `allow-reachable-sha1-in-want`, `allow-tip-sha1-in-want`, and
+    /// `uploadpack.allowFilter` in advertisement and serve available oids and filtered requests."
     ///
     /// This test verifies:
     /// 1. The info/refs endpoint returns the capabilities
