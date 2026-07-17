@@ -542,19 +542,20 @@ pub struct Config {
     #[arg(long, env = "NGIT_EVENT_BLACKLIST", default_value = "")]
     pub event_blacklist: String,
 
-    /// Deletion request disrespector: ignore NIP-09 deletion requests (archival mode)
+    /// Deletion request disrespector: ignore NIP-09 and NIP-62 requests (archival mode)
     ///
-    /// When `true`, the relay stores incoming NIP-09 (kind 5) deletion requests but
-    /// does NOT act on them: targeted events remain fully accessible. This makes the
-    /// relay an archival server, preventing "left-pad" scenarios by ensuring at least
-    /// some relays preserve deleted content.
+    /// When `true`, the relay stores incoming NIP-09 (kind 5) deletion requests and
+    /// NIP-62 request-to-vanish events but does NOT act on them: their targets remain
+    /// fully accessible. This makes the relay an archival server, preventing
+    /// "left-pad" scenarios by ensuring at least some relays preserve deleted content.
     ///
-    /// This setting ONLY affects NIP-09 user-initiated deletions. Policy-driven
-    /// blacklist/whitelist deletion flows still run because they enforce local
-    /// relay serving policy rather than client deletion requests.
+    /// This setting ONLY affects NIP-09 and NIP-62 user-initiated requests.
+    /// Policy-driven blacklist/whitelist deletion flows still run because they
+    /// enforce local relay serving policy rather than client requests.
     ///
-    /// When `true`, NIP-09 (`"deletion"`) is NOT advertised in the NIP-11 supported
-    /// NIPs list so clients can discover that the relay does not honour deletions.
+    /// When `true`, NIP-09 (`"deletion"`) and NIP-62 (`"request to vanish"`) are NOT
+    /// advertised in the NIP-11 supported NIPs list so clients can discover that the
+    /// relay does not honour either request type.
     #[arg(
         long,
         env = "NGIT_DELETION_REQUEST_DISRESPECTOR",
