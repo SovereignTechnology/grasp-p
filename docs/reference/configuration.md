@@ -541,7 +541,7 @@ NGIT_HOLDING_CLEANUP_INTERVAL_SECS=21600
 
 - Must be greater than 0
 - Smaller values clean up expired records sooner at the cost of more background work
-- This interval only determines how soon expired records are observed and removed. It does not change any timestamp-derived holding or deletion-request retention deadline.
+- This interval determines how soon expired records are observed and physically removed. A deletion request may remain queryable from Main until the next cleanup pass, but admission-gate eligibility still ends at its timestamp-derived deadline; this cleanup latency does not reset or extend the lifecycle.
 
 ---
 

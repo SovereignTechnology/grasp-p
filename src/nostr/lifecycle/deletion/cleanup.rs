@@ -19,6 +19,10 @@ pub struct RequestCleanupStats {
 
 impl DeletionService {
     /// Reconcile served copies and permanently expire elapsed request lifecycles.
+    ///
+    /// Deadlines determine lifecycle eligibility, while physical Main and
+    /// Tombstone removal occurs when this cleanup runs. A request can therefore
+    /// remain queryable until the next pass without remaining gate-eligible.
     /// The supplied time makes every retention boundary deterministic in tests.
     pub(crate) async fn cleanup_expired_requests(
         &self,

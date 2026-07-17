@@ -105,13 +105,15 @@ once both periods end, a previously deleted event, coordinate version, or
 vanished-author event is eligible for admission again unless another live
 request covers it.
 
-The four lifecycle durations should be operator-configurable, with defaults of
+The four lifecycle durations are operator-configurable, with defaults of
 30 days for unused serving, a further 180 days for unused gating, 9 months for
 used serving, and a further 3 months for used gating. Configuration validation
 must preserve the ordering of each served period followed by its unserved gate
 period. The existing holding cleanup cadence also schedules deletion-request
-retention cleanup; it is operational and must not alter the timestamp-derived
-deadlines.
+retention cleanup. Timestamp-derived deadlines determine lifecycle eligibility;
+physical removal from Main and Tombstones is asynchronous cleanup and may occur
+on the next scheduled pass. This bounded cleanup delay is intentional and does
+not extend admission-gate eligibility past the deadline.
 
 ### Multiple matching requests
 
@@ -253,7 +255,7 @@ database for its fresh probation. The pass is restart-safe: replacement
 metadata preserves the earliest `first_seen_at` and greatest `last_used_at`.
 
 The same startup pass reclassifies retained requests using current relay
-configuration and reconciles served copies at the exact lifecycle deadline.
+configuration and reconciles served copies against the lifecycle deadline.
 In disrespector mode it read-only evaluates unused targeting requests against
 main and purgatory data, marking only requests that would currently have an
 effect as used; it never changes target data during that evaluation. This
@@ -274,11 +276,13 @@ schedule using retained lifecycle timestamps. Startup reconciliation must apply
 these transitions before the relay begins serving traffic.
 
 Startup catch-up and periodic cleanup use the holding-cleanup cadence. They
-apply the same timestamp-derived half-open lifecycle boundaries, remove expired
-served copies from Main before Tombstones, and permanently remove payload plus
-lifecycle metadata only after the additional gating period. A shared lifecycle
-transition lock prevents cleanup from acting on a stale record while admission
-is promoting and marking it used.
+evaluate the same timestamp-derived half-open lifecycle boundaries, remove
+expired served copies from Main before Tombstones, and permanently remove
+payload plus lifecycle metadata only after the additional gating period. Main
+and Tombstone removal can therefore lag a deadline until the next cleanup pass;
+that is expected cleanup latency, not an extension of the request's gate
+eligibility. A shared lifecycle transition lock prevents cleanup from acting on
+a stale record while admission is promoting and marking it used.
 
 Target-set deduplication has been removed and the temporary
 `repair-deletion-requests` command has been retired. Startup migration and
