@@ -821,23 +821,22 @@ impl Tombstones {
             self.db.query(filter).await.map_err(|error| {
                 anyhow::anyhow!("Failed to query tombstone candidates: {error}")
             })?;
-        let mut candidates = Vec::new();
-        for request in requests {
-            // Queries are intentionally restricted to original kind-5/kind-62
-            // payloads; private metadata can never enter this path.
-            if !Self::is_request_kind(request.kind) || !matches_request(&request) {
-                continue;
-            }
-            let Some(record) = self.lifecycle_for_request_result(&request.id).await? else {
-                // Requests without valid metadata await startup migration and do
-                // not yet carry enough relay-observed state to gate admission.
-                continue;
-            };
-            if record.classification == RequestClassification::LocallyActionable {
-                candidates.push(record);
-            }
-        }
-        Ok(candidates)
+        // Queries are intentionally restricted to original kind-5/kind-62
+        // payloads; private metadata can never enter this path. Resolve the
+        // resulting payloads together, rather than performing an event-ID and
+        // metadata lookup for every matching request. A single target can have
+        // many valid requests, so per-request lifecycle reads would make event
+        // admission attacker-controlled and linear in the number of requests.
+        let matching_requests = requests
+            .into_iter()
+            .filter(|request| Self::is_request_kind(request.kind) && matches_request(request))
+            .collect();
+        Ok(self
+            .lifecycle_records_for_payloads_result(matching_requests)
+            .await?
+            .into_iter()
+            .filter(|record| record.classification == RequestClassification::LocallyActionable)
+            .collect())
     }
 }
 
@@ -1124,6 +1123,54 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_deletion_candidates_resolve_duplicate_requests_together() {
+        let store = Tombstones::in_memory();
+        let owner = Keys::generate();
+        let target = EventId::all_zeros();
+        let mut actionable_ids = Vec::new();
+
+        // A single event may have many valid deletion requests. Save their
+        // payloads and metadata directly so this test isolates the candidate
+        // resolution path from record_request's single-request replay check.
+        for created_at in 1..=64 {
+            let request = EventBuilder::new(Kind::EventDeletion, "")
+                .tags(vec![Tag::event(target)])
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&owner)
+                .unwrap();
+            let classification = if created_at % 2 == 0 {
+                actionable_ids.push(request.id);
+                RequestClassification::LocallyActionable
+            } else {
+                RequestClassification::Disrespector
+            };
+            store.db.save_event(&request).await.unwrap();
+            let metadata = store
+                .build_metadata(
+                    request.id,
+                    Timestamp::from_secs(created_at),
+                    None,
+                    classification,
+                )
+                .unwrap();
+            store.db.save_event(&metadata).await.unwrap();
+        }
+
+        let candidate_ids = store
+            .event_deletion_candidates(&target, &owner.public_key())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.request.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidate_ids.len(), actionable_ids.len());
+        assert!(candidate_ids
+            .iter()
+            .all(|candidate_id| actionable_ids.contains(candidate_id)));
     }
 
     #[tokio::test]
