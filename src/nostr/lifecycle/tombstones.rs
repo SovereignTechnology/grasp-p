@@ -66,6 +66,10 @@ pub const TOMBSTONE_LAST_USED_AT_TAG: &str = "tombstone-last-used-at";
 /// Tag containing the relay's deletion-request classification.
 pub const TOMBSTONE_REQUEST_CLASSIFICATION_TAG: &str = "tombstone-request-classification";
 
+/// Bound the number of request IDs in a metadata `#e` query so a target with
+/// many deletion requests cannot create an unbounded database filter.
+const METADATA_REQUEST_ID_QUERY_CHUNK_SIZE: usize = 256;
+
 /// Relay policy classification retained with a deletion request's lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestClassification {
@@ -422,6 +426,55 @@ impl Tombstones {
                 metadata_by_request.remove(&request_id).unwrap_or_default(),
             ) {
                 records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.request.id.to_hex());
+        Ok(records)
+    }
+
+    /// Resolve lifecycle records for already-matched live-admission payloads.
+    ///
+    /// Unlike startup enumeration, this must never scan every metadata row.
+    /// Query relay-private metadata through its indexed `#e` request reference,
+    /// batching IDs to keep a heavily-targeted event's query bounded.
+    async fn lifecycle_records_for_matched_payloads_result(
+        &self,
+        requests: Vec<Event>,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
+        let mut records = Vec::new();
+        for request_batch in requests.chunks(METADATA_REQUEST_ID_QUERY_CHUNK_SIZE) {
+            let request_ids: Vec<_> = request_batch.iter().map(|request| request.id).collect();
+            let metadata = self
+                .db
+                .query(
+                    Filter::new()
+                        .kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND))
+                        .events(request_ids),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to query matched tombstone lifecycle metadata: {error}")
+                })?;
+            let mut metadata_by_request: HashMap<EventId, Vec<Event>> = HashMap::new();
+            for event in metadata {
+                let Some(request_id) =
+                    Self::tag_value(&event, "e").and_then(|value| EventId::from_hex(value).ok())
+                else {
+                    continue;
+                };
+                metadata_by_request
+                    .entry(request_id)
+                    .or_default()
+                    .push(event);
+            }
+            for request in request_batch {
+                let request_id = request.id;
+                if let Some(record) = self.lifecycle_record_from_metadata(
+                    request.clone(),
+                    metadata_by_request.remove(&request_id).unwrap_or_default(),
+                ) {
+                    records.push(record);
+                }
             }
         }
         records.sort_by_key(|record| record.request.id.to_hex());
@@ -823,16 +876,15 @@ impl Tombstones {
             })?;
         // Queries are intentionally restricted to original kind-5/kind-62
         // payloads; private metadata can never enter this path. Resolve the
-        // resulting payloads together, rather than performing an event-ID and
-        // metadata lookup for every matching request. A single target can have
-        // many valid requests, so per-request lifecycle reads would make event
-        // admission attacker-controlled and linear in the number of requests.
+        // resulting payloads together through indexed metadata `#e` queries.
+        // Startup uses full-table grouping, but using that strategy here would
+        // scan all retained lifecycle metadata while the admission lock is held.
         let matching_requests = requests
             .into_iter()
             .filter(|request| Self::is_request_kind(request.kind) && matches_request(request))
             .collect();
         Ok(self
-            .lifecycle_records_for_payloads_result(matching_requests)
+            .lifecycle_records_for_matched_payloads_result(matching_requests)
             .await?
             .into_iter()
             .filter(|record| record.classification == RequestClassification::LocallyActionable)
@@ -1135,7 +1187,7 @@ mod tests {
         // A single event may have many valid deletion requests. Save their
         // payloads and metadata directly so this test isolates the candidate
         // resolution path from record_request's single-request replay check.
-        for created_at in 1..=64 {
+        for created_at in 1..=METADATA_REQUEST_ID_QUERY_CHUNK_SIZE as u64 + 1 {
             let request = EventBuilder::new(Kind::EventDeletion, "")
                 .tags(vec![Tag::event(target)])
                 .custom_created_at(Timestamp::from_secs(created_at))
