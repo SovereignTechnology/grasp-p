@@ -1162,6 +1162,9 @@ This allows clients to discover whether a relay respects deletion requests.
 - `ngit_holding_cleanup_runs_total`
 - `ngit_holding_cleanup_deleted_total{type}`
 - `ngit_holding_cleanup_last_run_deleted{type}`
+- `ngit_deletion_request_cleanup_runs_total`
+- `ngit_deletion_request_cleanup_removed_total{type}`
+- `ngit_deletion_request_cleanup_outcomes_total{outcome}`
 - `ngit_recovery_total{result}`
 - `ngit_manual_ejections_total`
 - `ngit_manual_ejection_deleted_total{type}`

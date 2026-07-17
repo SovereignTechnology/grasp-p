@@ -1435,10 +1435,11 @@ mod tests {
         let ctx = context(crate::config::Config::for_testing());
         let service = DeletionService::new(ctx.clone());
         let request = vanish(&Keys::generate(), "replay");
+        let first_seen_at = Timestamp::now();
         ctx.tombstones
             .record_request(
                 &request,
-                Timestamp::from_secs(10),
+                first_seen_at,
                 RequestClassification::LocallyActionable,
             )
             .await
@@ -1454,7 +1455,7 @@ mod tests {
                 .await
                 .unwrap()
                 .first_seen_at,
-            Timestamp::from_secs(10)
+            first_seen_at
         );
     }
 

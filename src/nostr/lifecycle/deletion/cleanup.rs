@@ -3,7 +3,7 @@ use nostr_relay_builder::prelude::{Filter, Kind, Timestamp};
 
 use crate::nostr::lifecycle::RequestLifecycleRecord;
 
-use super::DeletionService;
+use super::{service::request_is_served_with_config, DeletionService};
 
 /// Result counters for one bounded deletion-request retention pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -120,25 +120,7 @@ impl DeletionService {
         record: &RequestLifecycleRecord,
         now: Timestamp,
     ) -> Result<bool> {
-        let (anchor, duration) = match record.last_used_at {
-            Some(used) => (
-                used,
-                self.ctx
-                    .config
-                    .deletion_request_retention_used_served_after_last_used(),
-            ),
-            None => (
-                record.first_seen_at,
-                self.ctx.config.deletion_request_retention_unused_served(),
-            ),
-        };
-        let deadline = anchor
-            .as_secs()
-            .checked_add(duration.as_secs())
-            .ok_or_else(|| {
-                anyhow::anyhow!("deletion-request served retention deadline overflow")
-            })?;
-        Ok(now.as_secs() < deadline)
+        request_is_served_with_config(&self.ctx, record, now)
     }
 }
 
