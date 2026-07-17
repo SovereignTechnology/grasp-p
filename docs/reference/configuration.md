@@ -1220,7 +1220,7 @@ After this served period, an unused request enters its additional unserved/gatin
 NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS=15552000
 ```
 
-The unused request expires after `unused served + this additional period` from `first_seen_at`. Retained disrespector and non-targeting NIP-62 records do not enforce a local admission gate.
+The unused request expires after `unused served + this additional period` from `first_seen_at`. Retained disrespector and non-targeting NIP-62 records do not enforce a local admission gate. An unused request that has already expired when an archival relay starts is not reclassified as used, even if its target is present; startup cleanup permanently removes it.
 
 ---
 
