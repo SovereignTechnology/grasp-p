@@ -115,10 +115,23 @@ impl DeletionService {
         now: Timestamp,
     ) -> Result<RequestLifecycleStartupStats> {
         let main = self.request_payloads_from_main().await?;
-        let tombstone_payloads = self.ctx.tombstones().request_payloads().await?;
+        let tombstones = self.ctx.tombstones();
+        // This bulk query resolves all payload/metadata pairs in one pass. Do
+        // not call lifecycle_for_request_result once per request here: startup
+        // runs before serving traffic and must remain linear in retained data.
+        // Keep payloads lacking valid metadata in the migration set too.
+        let tombstone_payloads = tombstones.request_payloads().await?;
+        let tombstone_payloads_scanned = tombstone_payloads.len();
+        let existing_lifecycles = tombstones
+            .lifecycle_records_for_payloads_result(tombstone_payloads.clone())
+            .await?;
+        let mut existing_by_request: HashMap<_, _> = existing_lifecycles
+            .into_iter()
+            .map(|record| (record.request.id, record))
+            .collect();
         let mut stats = RequestLifecycleStartupStats {
             main_payloads_scanned: main.len(),
-            tombstone_payloads_scanned: tombstone_payloads.len(),
+            tombstone_payloads_scanned,
             ..Default::default()
         };
         let mut requests: HashMap<_, Event> = HashMap::new();
@@ -128,11 +141,7 @@ impl DeletionService {
         stats.unique_requests_discovered = requests.len();
 
         for request in requests.into_values() {
-            let existing = self
-                .ctx
-                .tombstones()
-                .lifecycle_for_request_result(&request.id)
-                .await?;
+            let existing = existing_by_request.remove(&request.id);
             let mut record = match existing {
                 Some(record) => {
                     stats.valid_metadata_existing += 1;
@@ -792,6 +801,42 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_thousands_of_retained_lifecycles() {
+        // Keep this large enough that a per-request full payload scan is a
+        // visible regression (the former implementation inspected millions of
+        // events), while remaining small enough for the unit-test suite.
+        const REQUEST_COUNT: usize = 2_000;
+
+        let service = service(false);
+        let keys = Keys::generate();
+        for sequence in 0..REQUEST_COUNT {
+            let request = EventBuilder::new(Kind::EventDeletion, sequence.to_string())
+                .finalize(&keys)
+                .unwrap();
+            service
+                .ctx
+                .tombstones()
+                .record_request(
+                    &request,
+                    Timestamp::from_secs(100),
+                    RequestClassification::LocallyActionable,
+                )
+                .await
+                .unwrap();
+        }
+
+        let stats = service
+            .run_request_lifecycle_startup_reconciliation(Timestamp::from_secs(101))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.tombstone_payloads_scanned, REQUEST_COUNT);
+        assert_eq!(stats.unique_requests_discovered, REQUEST_COUNT);
+        assert_eq!(stats.valid_metadata_existing, REQUEST_COUNT);
+        assert_eq!(stats.requests_migrated, 0);
     }
 
     #[tokio::test]

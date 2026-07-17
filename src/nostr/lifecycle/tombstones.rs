@@ -41,6 +41,7 @@
 //! request its own vanish) is enforced by the caller *before* recording, so any
 //! request stored here is already authoritative.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -309,36 +310,7 @@ impl Tombstones {
         };
 
         let metadata = self.metadata_events_for_request_result(request_id).await?;
-        let mut valid: Vec<_> = metadata
-            .into_iter()
-            .filter_map(|event| self.parse_metadata(&event, request_id))
-            .collect();
-        if valid.is_empty() {
-            return Ok(None);
-        }
-
-        let first_seen_at = valid
-            .iter()
-            .map(|m| m.first_seen_at)
-            .min()
-            .expect("nonempty");
-        let last_used_at = valid.iter().filter_map(|m| m.last_used_at).max();
-        valid.sort_by(|left, right| {
-            right
-                .last_used_at
-                .cmp(&left.last_used_at)
-                .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
-                .then_with(|| right.created_at.cmp(&left.created_at))
-                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
-        });
-        let canonical = valid.remove(0);
-        Ok(Some(RequestLifecycleRecord {
-            metadata_event_id: canonical.id,
-            request,
-            first_seen_at,
-            last_used_at,
-            classification: canonical.classification,
-        }))
+        Ok(self.lifecycle_record_from_metadata(request, metadata))
     }
 
     /// Set `last_used_at`, never moving it backwards, then compact superseded
@@ -411,9 +383,44 @@ impl Tombstones {
     /// Private metadata is not returned, and database failures are propagated.
     pub async fn lifecycle_records_result(&self) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
         let requests = self.request_payloads().await?;
+        self.lifecycle_records_for_payloads_result(requests).await
+    }
+
+    /// Resolve lifecycle records for an already-enumerated payload set. This
+    /// avoids reading payloads twice during startup reconciliation.
+    pub(crate) async fn lifecycle_records_for_payloads_result(
+        &self,
+        requests: Vec<Event>,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
+        // Do not resolve metadata one request at a time. In particular, startup
+        // calls this over the full retained request set, where per-request
+        // lookups would turn an otherwise linear migration into thousands of
+        // database reads. The metadata kind is small and indexed by LMDB, so
+        // load it once and group its standard `e` references in memory.
+        let metadata = self
+            .db
+            .query(Filter::new().kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND)))
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to enumerate tombstone metadata: {error}"))?;
+        let mut metadata_by_request: HashMap<EventId, Vec<Event>> = HashMap::new();
+        for event in metadata {
+            let Some(request_id) =
+                Self::tag_value(&event, "e").and_then(|value| EventId::from_hex(value).ok())
+            else {
+                continue;
+            };
+            metadata_by_request
+                .entry(request_id)
+                .or_default()
+                .push(event);
+        }
         let mut records = Vec::new();
         for request in requests {
-            if let Some(record) = self.lifecycle_for_request_result(&request.id).await? {
+            let request_id = request.id;
+            if let Some(record) = self.lifecycle_record_from_metadata(
+                request,
+                metadata_by_request.remove(&request_id).unwrap_or_default(),
+            ) {
                 records.push(record);
             }
         }
@@ -570,15 +577,12 @@ impl Tombstones {
     }
 
     async fn request_payload(&self, request_id: &EventId) -> anyhow::Result<Option<Event>> {
-        for kind in [Kind::EventDeletion, Kind::RequestToVanish] {
-            let events = self.db.query(Filter::new().kind(kind)).await.map_err(|e| {
-                anyhow::anyhow!("Failed to read tombstone request {request_id}: {e}")
-            })?;
-            if let Some(event) = events.into_iter().find(|event| event.id == *request_id) {
-                return Ok(Some(event));
-            }
-        }
-        Ok(None)
+        // `event_by_id` uses the database's primary event-ID index. Never scan
+        // every kind-5 and kind-62 payload to find one request: this is called
+        // in admission, cleanup, and startup reconciliation.
+        self.db.event_by_id(request_id).await.map_err(|error| {
+            anyhow::anyhow!("Failed to read tombstone request {request_id}: {error}")
+        })
     }
 
     fn build_metadata(
@@ -688,6 +692,48 @@ impl Tombstones {
                 None
             }
         }
+    }
+
+    fn lifecycle_record_from_metadata(
+        &self,
+        request: Event,
+        metadata: Vec<Event>,
+    ) -> Option<RequestLifecycleRecord> {
+        if !Self::is_request_kind(request.kind) {
+            tracing::warn!(request_id = %request.id, kind = request.kind.as_u16(), "Tombstone lifecycle payload has invalid kind");
+            return None;
+        }
+        let request_id = request.id;
+        let mut valid: Vec<_> = metadata
+            .into_iter()
+            .filter_map(|event| self.parse_metadata(&event, &request_id))
+            .collect();
+        if valid.is_empty() {
+            return None;
+        }
+
+        let first_seen_at = valid
+            .iter()
+            .map(|m| m.first_seen_at)
+            .min()
+            .expect("nonempty");
+        let last_used_at = valid.iter().filter_map(|m| m.last_used_at).max();
+        valid.sort_by(|left, right| {
+            right
+                .last_used_at
+                .cmp(&left.last_used_at)
+                .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        });
+        let canonical = valid.remove(0);
+        Some(RequestLifecycleRecord {
+            metadata_event_id: canonical.id,
+            request,
+            first_seen_at,
+            last_used_at,
+            classification: canonical.classification,
+        })
     }
 
     fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
