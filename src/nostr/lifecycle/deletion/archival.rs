@@ -9,7 +9,10 @@ use nostr_relay_builder::prelude::{
 };
 use tar::Builder as TarBuilder;
 
-use super::policy::{identifier_from_event, owner_directory_component, DeletionPolicy};
+use super::{
+    policy::{identifier_from_event, owner_directory_component, DeletionPolicy},
+    DeletionOutcome,
+};
 use crate::nostr::lifecycle::{DeletionSource, GitArchiveMetadata, HoldingMetadata};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,6 +23,50 @@ struct DeletedAnnouncementRepoScope {
 }
 
 impl DeletionPolicy {
+    /// Read-only normal-policy evaluation for a targeting NIP-62 request in
+    /// disrespector mode. This deliberately does not invoke archive, cascade,
+    /// holding, rollback, repository, or purgatory mutation helpers.
+    pub(super) async fn would_nip62_vanish_stored_data(
+        &self,
+        event: &Event,
+    ) -> anyhow::Result<bool> {
+        // The request has already been recorded and may be persisted before an
+        // exact replay reaches this handler. It is not evidence that the
+        // request had an effect; only a distinct event by this author is.
+        if self
+            .ctx
+            .database
+            .query(Filter::new().author(event.pubkey))
+            .await?
+            .into_iter()
+            .any(|stored| stored.id != event.id)
+        {
+            return Ok(true);
+        }
+
+        let author = event.pubkey;
+        if self
+            .ctx
+            .purgatory
+            .announcements_for_sync()
+            .into_iter()
+            .any(|(repository_id, _)| {
+                let parts: Vec<_> = repository_id.splitn(3, ':').collect();
+                parts.len() == 3 && parts[1] == author.to_hex()
+            })
+        {
+            return Ok(true);
+        }
+
+        Ok(self
+            .ctx
+            .purgatory
+            .get_all_identifiers()
+            .into_iter()
+            .flat_map(|identifier| self.ctx.purgatory.find_state(&identifier))
+            .any(|entry| entry.author == author))
+    }
+
     /// Move all currently served data authored by a targeted NIP-62 vanish
     /// request through the same holding/archive deletion lifecycle used for
     /// NIP-09 announcement deletion.
@@ -29,7 +76,11 @@ impl DeletionPolicy {
     /// repository archive linkage. Any remaining author events are then moved to
     /// holding before main-DB deletion. The caller is responsible for recording
     /// the vanish tombstone before invoking this method.
-    pub(super) async fn apply_nip62_vanish(&self, event: &Event) -> anyhow::Result<()> {
+    pub(super) async fn apply_nip62_vanish(
+        &self,
+        event: &Event,
+    ) -> anyhow::Result<DeletionOutcome> {
+        let mut outcome = DeletionOutcome::default();
         let author = event.pubkey;
         let deleted_at = event.created_at;
 
@@ -64,13 +115,15 @@ impl DeletionPolicy {
                 continue;
             };
             let coordinate = format!("30617:{}:{}", author.to_hex(), identifier);
-            self.cascade_delete_announcement(
-                &author,
-                &coordinate,
-                deleted_at,
-                DeletionSource::Nip62,
-            )
-            .await;
+            outcome.merge(
+                self.cascade_delete_announcement(
+                    &author,
+                    &coordinate,
+                    deleted_at,
+                    DeletionSource::Nip62,
+                )
+                .await,
+            );
         }
 
         let mut moved_ids = HashSet::new();
@@ -83,15 +136,34 @@ impl DeletionPolicy {
             git_archive: None,
         };
 
-        self.archive_and_delete_filter(
-            Filter::new().author(author),
-            &metadata,
-            &mut moved_ids,
-            "NIP-62 vanish remaining author-event deletion",
-        )
-        .await;
+        // Exclude the incoming request itself. On an exact replay it may
+        // already be stored in Main; deleting it would falsely turn a no-op
+        // request into a used request and extend its retention lifecycle.
+        let remaining_ids = self
+            .ctx
+            .database
+            .query(Filter::new().author(author))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to query vanished author's remaining events: {e}")
+            })?
+            .into_iter()
+            .filter(|stored| stored.id != event.id)
+            .map(|stored| stored.id)
+            .collect::<Vec<_>>();
+        if !remaining_ids.is_empty() {
+            outcome.merge(
+                self.archive_and_delete_filter(
+                    Filter::new().ids(remaining_ids),
+                    &metadata,
+                    &mut moved_ids,
+                    "NIP-62 vanish remaining author-event deletion",
+                )
+                .await,
+            );
+        }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Hard-delete the targeted events from the main database.
@@ -103,7 +175,8 @@ impl DeletionPolicy {
         &self,
         event: &Event,
         moved_ids: &mut HashSet<EventId>,
-    ) {
+    ) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
         // `e` tags: delete by event id.
         let ids = Self::e_tag_ids(event);
         if !ids.is_empty() {
@@ -116,8 +189,15 @@ impl DeletionPolicy {
                 owner_pubkey: None,
                 git_archive: None,
             };
-            self.archive_and_delete_filter(filter, &metadata, moved_ids, "NIP-09 e-tag deletion")
-                .await;
+            outcome.merge(
+                self.archive_and_delete_filter(
+                    filter,
+                    &metadata,
+                    moved_ids,
+                    "NIP-09 e-tag deletion",
+                )
+                .await,
+            );
         }
 
         // `a` tags: delete matching addressable/replaceable events up to the
@@ -134,24 +214,29 @@ impl DeletionPolicy {
                 continue;
             }
             if Self::is_announcement_coordinate_for_author(&v[1], &event.pubkey) {
-                self.cascade_delete_announcement(
-                    &event.pubkey,
-                    &v[1],
-                    event.created_at,
-                    DeletionSource::Nip09,
-                )
-                .await;
+                outcome.merge(
+                    self.cascade_delete_announcement(
+                        &event.pubkey,
+                        &v[1],
+                        event.created_at,
+                        DeletionSource::Nip09,
+                    )
+                    .await,
+                );
             } else {
-                self.delete_coordinate_from_main_db(
-                    &event.pubkey,
-                    &v[1],
-                    event.created_at,
-                    moved_ids,
-                    DeletionSource::Nip09,
-                )
-                .await;
+                outcome.merge(
+                    self.delete_coordinate_from_main_db(
+                        &event.pubkey,
+                        &v[1],
+                        event.created_at,
+                        moved_ids,
+                        DeletionSource::Nip09,
+                    )
+                    .await,
+                );
             }
         }
+        outcome
     }
 
     /// Whether `coordinate` is a kind-30617 announcement coordinate whose
@@ -173,21 +258,21 @@ impl DeletionPolicy {
         deletion_created_at: nostr_relay_builder::prelude::Timestamp,
         moved_ids: &mut HashSet<EventId>,
         source: DeletionSource,
-    ) {
+    ) -> DeletionOutcome {
         // coordinate: `<kind>:<pubkey>:<d-identifier>`
         let parts: Vec<&str> = coordinate.splitn(3, ':').collect();
         if parts.len() != 3 {
-            return;
+            return DeletionOutcome::default();
         }
         let Ok(kind_num) = parts[0].parse::<u16>() else {
-            return;
+            return DeletionOutcome::default();
         };
         let coord_pubkey_hex = parts[1];
         let identifier = parts[2];
 
         // The coordinate pubkey must match the deletion author.
         if coord_pubkey_hex != author.to_hex() {
-            return;
+            return DeletionOutcome::default();
         }
 
         let kind = Kind::from(kind_num);
@@ -234,11 +319,14 @@ impl DeletionPolicy {
                 op = "coordinate deletion",
                 "Skipping announcement deletion because git archival failed (fail-safe preservation)"
             );
-            return;
+            return DeletionOutcome {
+                skipped: 1,
+                ..Default::default()
+            };
         }
 
         self.archive_and_delete_filter(filter, &metadata, moved_ids, "coordinate deletion")
-            .await;
+            .await
     }
 
     pub(super) async fn archive_and_delete_filter(
@@ -247,20 +335,24 @@ impl DeletionPolicy {
         metadata: &HoldingMetadata,
         moved_ids: &mut HashSet<EventId>,
         context: &str,
-    ) {
+    ) -> DeletionOutcome {
         let matches = match self.ctx.database.query(filter).await {
             Ok(events) => events,
             Err(e) => {
                 tracing::warn!(error = %e, op = %context, "Failed to query deletion targets");
-                return;
+                return DeletionOutcome {
+                    failures: 1,
+                    ..Default::default()
+                };
             }
         };
 
         if matches.is_empty() {
-            return;
+            return DeletionOutcome::default();
         }
 
-        let mut deletable = Vec::with_capacity(matches.len());
+        let mut deletable = HashSet::with_capacity(matches.len());
+        let mut outcome = DeletionOutcome::default();
         let mut deleted_announcement_repo_scopes = HashSet::new();
         for event in matches {
             let mut event_metadata = metadata.clone();
@@ -309,6 +401,7 @@ impl DeletionPolicy {
                             op = %context,
                             "Skipping announcement deletion because git archival failed (fail-safe preservation)"
                         );
+                        outcome.skipped = outcome.skipped.saturating_add(1);
                         continue;
                     }
 
@@ -322,7 +415,7 @@ impl DeletionPolicy {
                 }
             }
 
-            if moved_ids.insert(event.id) {
+            if !moved_ids.contains(&event.id) {
                 if let Err(e) = self
                     .ctx
                     .holding
@@ -335,8 +428,10 @@ impl DeletionPolicy {
                         op = %context,
                         "Skipping main-DB deletion because holding archival failed"
                     );
+                    outcome.skipped = outcome.skipped.saturating_add(1);
                     continue;
                 }
+                moved_ids.insert(event.id);
 
                 if matches!(
                     event.kind,
@@ -345,23 +440,34 @@ impl DeletionPolicy {
                     self.delete_pr_event_git_refs(&event).await;
                 }
             }
-            deletable.push(event.id);
+            deletable.insert(event.id);
         }
 
         if deletable.is_empty() {
-            return;
+            return outcome;
         }
 
+        // NostrDatabase::delete does not return a per-event removed count. Two
+        // concurrently processed requests can therefore both have observed one
+        // target and both receive use credit after successful delete calls. This
+        // narrow over-credit race is accepted: avoiding it would require broad
+        // target-level serialization, it cannot affect deletion correctness,
+        // and any extra credited request still follows bounded used retention.
+        // Deterministic single-winner attribution remains strict for the more
+        // important case of one later admission matching many pending requests.
+        let deleted_count = deletable.len();
         let delete_filter = Filter::new().ids(deletable);
         if let Err(e) = self.ctx.database.delete(delete_filter).await {
             tracing::warn!(error = %e, op = %context, "Failed to delete events from main DB");
-            return;
+            outcome.failures = outcome.failures.saturating_add(1);
+            return outcome;
         }
-
         for scope in deleted_announcement_repo_scopes {
             self.remove_live_repo_if_announcement_scope_unserved(scope, context)
                 .await;
         }
+        outcome.main_db_deleted = outcome.main_db_deleted.saturating_add(deleted_count);
+        outcome
     }
 
     async fn remove_live_repo_if_announcement_scope_unserved(

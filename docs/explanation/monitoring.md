@@ -78,6 +78,9 @@ The deletion/recovery operational paths expose these additional metrics:
 | `ngit_holding_cleanup_runs_total` | Counter | - | Number of holding cleanup passes run |
 | `ngit_holding_cleanup_deleted_total` | Counter | `type` | Total deleted objects by cleanup (`metadata`, `payload`, `archive_file`) |
 | `ngit_holding_cleanup_last_run_deleted` | Gauge | `type` | Deleted object counts for most recent cleanup pass |
+| `ngit_deletion_request_cleanup_runs_total` | Counter | - | Number of deletion-request cleanup passes run |
+| `ngit_deletion_request_cleanup_removed_total` | Counter | `type` | Deletion-request payloads and lifecycle metadata removed (`main`, `tombstone`, `metadata`) |
+| `ngit_deletion_request_cleanup_outcomes_total` | Counter | `outcome` | Deletion-request cleanup failures and stale/concurrent skips (`failure`, `stale_or_concurrent_skip`) |
 | `ngit_recovery_total` | Counter | `result` | Recovery attempts and outcomes (`attempted`, `succeeded`, `failed`, `partial`) |
 | `ngit_manual_ejections_total` | Counter | - | Number of operator manual ejection operations |
 | `ngit_manual_ejection_deleted_total` | Counter | `type` | Objects removed by manual ejection (`metadata`, `payload`, `archive_file`) |

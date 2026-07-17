@@ -8,6 +8,326 @@ NIP-09 deletion requests, NIP-62 request-to-vanish events, operator blacklist an
 whitelist reconciliation, service de-listing, holding/archive retention, recovery,
 and purgatory transitions.
 
+## Bounded request retention
+
+> **Status:** Lifecycle metadata, NIP-09 and NIP-62 lifecycle admission
+> (including disrespector read-only would-have-deleted classification),
+> deterministic admission-use attribution, measured destructive outcomes,
+> startup reconciliation, periodic request cleanup/permanent expiry, removal of
+> target-set deduplication, and repair-command retirement are implemented.
+
+### Production motivation
+
+Deletion and vanish requests are necessary admission controls, but they can also
+create substantial retention pressure without hostile traffic. Valid requests
+published by reputable users may be unrelated to this relay's Git data, and a
+request can arrive before any event it names. The relay therefore cannot require
+the target to exist without breaking legitimate out-of-order delivery.
+
+Production measurements exposed the cost of retaining every such request
+indefinitely: approximately 50,000 of 60,000 stored events were deletion
+requests. In other words, the relay was receiving and storing roughly five times
+more deletion requests than all other event kinds combined. Target-coverage
+deduplication accounted for only about 1,500 requests, leaving approximately
+48,000 requests whose retention was not addressed by target-set deduplication.
+Retaining every accepted request permanently is therefore the wrong storage
+policy; the relay should retain requests according to demonstrated utility
+instead.
+
+Bounded lifecycle retention is a storage-hygiene mechanism, not comprehensive
+adversarial admission control. Trust-based admission, rate controls, and
+operator moderation are separate concerns and can be layered over this policy.
+
+### Intent
+
+The relay should:
+
+1. accept valid out-of-order requests without requiring an existing target;
+2. serve a new request for an intentionally generous probation window that
+   covers delayed rebroadcasting and intermittently connected clients;
+3. retain an unserved request for a further window in which it can still block a
+   late event;
+4. retain and serve requests that demonstrably deleted or blocked data;
+5. eventually expire both the request and its admission-gate effect; and
+6. permanently remove expired requests and their lifecycle metadata from live
+   storage.
+
+This lifecycle applies to NIP-09 deletion requests and NIP-62 vanish requests.
+For NIP-62, a request that does not target this relay is never an active local
+vanish gate, but it still follows the bounded served/unserved retention schedule.
+In deletion-disrespector mode, NIP-09 and NIP-62 requests likewise follow the
+storage schedule. A request is classified as used when it would have removed an
+existing main-database or purgatory event under normal policy, but the relay does
+not perform that removal or enforce an admission gate. Used requests in this
+mode remain served indefinitely; unused requests age out normally.
+
+### Request lifecycle
+
+Retention is based on a durable relay-observed `first_seen_at` timestamp, not the
+client-controlled Nostr `created_at` timestamp.
+
+#### New and unused
+
+1. **Served probation — 30 days from first receipt:** store the original signed
+   request in the main database and serve it normally. Thirty days is
+   intentionally much longer than ordinary Nostr propagation, which is usually
+   measured in hours: the additional time accommodates delayed client
+   rebroadcasting and intermittently connected clients. If processing the
+   request successfully removes at least one event from the main database or
+   purgatory, the request is immediately considered used. Attempted or failed
+   deletions do not count.
+2. **Unserved pending gate — a further 180 days:** if still unused after 30 days,
+   remove it from the main database but retain it in the tombstone database.
+   Continue consulting locally actionable requests during admission; retained
+   disrespector and non-targeting NIP-62 records do not enforce a gate.
+3. **Expiry:** if it remains unused after the additional 180 days, permanently
+   remove the request and its lifecycle metadata from the tombstone database.
+
+A pending request becomes used only when it actually causes a later event to be
+rejected under valid ownership, coordinate-cutoff, relay-targeting, and other
+NIP-09/NIP-62 rules. Merely matching a tag, inspecting the request, or discovering
+that a different author owns the target does not count as use.
+
+The unserved gate is the deliberate observation period that establishes whether
+an apparently unused request still has practical value. While the request was
+served, clients that saw it could avoid sending the deleted target to this relay,
+even if copies of that target continued circulating elsewhere. Removing the
+request from relay queries gives those late copies an opportunity to reach the
+relay again. The retained Tombstone gate still rejects a covered target; that
+rejection is evidence of current utility, so the winning request becomes used,
+is promoted back to Main, and begins the longer used lifecycle. If no covered
+target arrives during the unserved period, the request has supplied no evidence
+that its gate is still needed and can expire. Replaying the deletion or vanish
+request itself is not such evidence and does not update `last_used_at`.
+
+#### Used
+
+When a request is used:
+
+1. promote it back to the served main database if necessary;
+2. serve it and enforce its admission gate for **9 months after its last use**;
+3. after 9 months, stop serving it but continue enforcing its gate for a further
+   **3 months**; and
+4. after 12 months without use, expire its gate and permanently remove the
+   request and its lifecycle metadata.
+
+The normal-mode schedule above does not expire used requests in disrespector
+mode: because archival relays exist to preserve deletion history, a request that
+would have deleted stored data remains served there indefinitely.
+
+Every successful use resets `last_used_at` and therefore restarts the 9-month
+served plus 3-month unserved lifecycle. Unused retention is based on
+`first_seen_at`; used retention is based on `last_used_at`. Expiry is intentional:
+once both periods end, a previously deleted event, coordinate version, or
+vanished-author event is eligible for admission again unless another live
+request covers it.
+
+The four lifecycle durations are operator-configurable, with defaults of
+30 days for unused serving, a further 180 days for unused gating, 9 months for
+used serving, and a further 3 months for used gating. Configuration validation
+must preserve the ordering of each served period followed by its unserved gate
+period. The existing holding cleanup cadence also schedules deletion-request
+retention cleanup. Timestamp-derived deadlines determine lifecycle eligibility;
+physical removal from Main and Tombstones is asynchronous cleanup and may occur
+on the next scheduled pass. This bounded cleanup delay is intentional and does
+not extend admission-gate eligibility past the deadline.
+
+Durations use seconds for configuration consistency and to permit short automated
+tests. Production values are expected to be at least one day and comfortably
+longer than the worst-case processing time for a deletion or vanish request,
+including repository archival and cascade work. Sub-day values are a testing
+facility, not a supported production operating point; cleanup is therefore not
+coordinated with an initial request handler across an artificially short total
+lifetime.
+
+### Multiple matching requests
+
+If several pending requests would independently reject the same arriving event,
+promoting all of them would turn one target arrival into retention amplification:
+an attacker could publish many equivalent requests and make all of them long
+lived with one later event. Exactly one deterministic sufficient request should
+receive credit for the use and be promoted. The remaining matching requests keep
+their existing lifecycle and expire normally.
+
+The winner-selection rule must be deterministic across restarts and independent
+of database iteration order. It must also preserve deletion correctness: for an
+`a`-tag target, the selected request must have a cutoff that actually covers the
+arriving event. A stable event-ID tie-break should be used after semantic
+eligibility and lifecycle priority are considered.
+
+### Multi-target requests
+
+Nostr events are signed and cannot be rewritten into a smaller authentic event.
+If any target makes a request used, retain and promote the whole signed request,
+including all of its valid targets. This is why the existing maximum target-tag
+limit remains an important admission bound.
+
+### Integration with lifecycle storage
+
+Request retention should extend the existing lifecycle stores rather than add an
+independent archive hierarchy:
+
+1. **Main database — served state:** contains a copy of each request during its
+   initial 30-day probation and each normally honored used request within 9
+   months of `last_used_at`. A used request on a disrespector relay remains here
+   indefinitely. Presence in this database determines whether normal relay
+   queries serve the original signed request.
+2. **Tombstone database — unserved gate and request lifecycle:** contains the
+   original signed NIP-09/NIP-62 request plus relay-generated lifecycle metadata.
+   In normal mode it remains the authoritative admission-gate source. It also
+   retains unused disrespector and non-targeting NIP-62 requests until their
+   lifecycle expires, although those records do not enforce a local gate.
+   Disrespector NIP-09 requests are read-only evaluated after persistence and
+   receive `last_used_at` only when an existing main-database or purgatory
+   target would be removed by normal policy.
+3. **Holding database — deleted payload retention:** continues to contain events
+   actually removed by NIP-09/NIP-62, with its existing deletion metadata and
+   independent holding-retention clock. Expiry of a request does not shorten or
+   extend holding retention, and expiry of holding data does not change a live
+   request gate.
+4. **Replaceable-history database — rollback state:** remains independent and
+   continues to supply valid prior replaceable/addressable versions during a
+   deletion rollback. Request retention must not duplicate this payload history.
+
+No cold request database is added. This matches holding cleanup's existing model:
+when retention ends, payload and internal metadata are permanently removed.
+
+The Tombstone store should adopt the same payload-plus-internal-metadata-event
+pattern already used by Holding and Replaceable History. The original request is
+stored verbatim. A relay-generated metadata event, linked to the request with an
+`e` tag and never exposed to clients, records at least `first_seen_at`, optional
+`last_used_at`, and whether the request is locally actionable, non-targeting, or
+handled in disrespector mode.
+
+State transitions must be ordered so failures cannot silently lose a live gate:
+
+- On receipt, persist the request and `first_seen_at` metadata in Tombstones
+  before destructive work or acceptance for main-database storage.
+- Mark it used only after at least one main-database or purgatory removal has
+  succeeded. A partial deletion counts as use if at least one removal succeeded.
+- In disrespector mode, classify it as used when a read-only normal-policy
+  target lookup finds at least one existing main-database or purgatory event
+  that would be removed, without deleting that event, installing a gate, or
+  performing holding, archive, cascade, rollback, or repository work.
+- When a later admission is blocked, durably update the deterministic winner's
+  `last_used_at` and restore its main-database copy before completing the
+  rejection path. If that update fails, report an internal policy error rather
+  than claiming that retention was extended.
+- On expiry, remove the main-database copy first, then its Tombstone payload and
+  metadata. If Tombstone cleanup fails, the unserved gate remains conservative
+  and the next cleanup pass retries it.
+
+The Tombstone store should expose one canonical current metadata record per
+request. A `last_used_at` update should save its replacement metadata before
+deleting the older metadata record; readers choose the newest valid record during
+an interrupted update. Cleanup then compacts stale metadata so frequent reuse
+cannot create another unbounded stream.
+
+### Deterministic use attribution
+
+Admission lookup may find several sufficient requests. It should first discard
+requests that do not actually authorize rejection, including wrong-author
+NIP-09 requests, coordinate deletions with an insufficient cutoff, expired
+requests, and NIP-62 requests not targeting this relay. From the remaining
+candidates it should choose exactly one winner using this stable order:
+
+1. prefer an already-used request over an unused request, avoiding unnecessary
+   promotion of another payload;
+2. prefer the earliest relay-observed `first_seen_at`; and
+3. use the lowest event ID as the final tie-break.
+
+Only the winner receives a `last_used_at` update and possible promotion to the
+main database. Other sufficient requests still participate in rejection
+correctness, but their retention clocks do not change. This rule is independent
+of database iteration order and prevents one event arrival from extending an
+arbitrary number of duplicate requests.
+
+This deterministic single-winner rule applies when one later target admission is
+matched against already-pending requests. Initial processing of distinct deletion
+requests is intentionally less strict: two requests processed concurrently may
+both observe the same stored target before either removal completes and may both
+receive use credit. The database deletion API does not report an authoritative
+per-event removed count, so eliminating that narrow race would require broader
+target-level serialization. The occasional extra used request is accepted: it is
+bounded by actual concurrency, does not change deletion correctness, and still
+expires through the normal used lifecycle.
+
+### Simplification of target-set deduplication
+
+The lifecycle replaces semantic target-set deduplication and supersession as the
+primary storage-control mechanism. Distinct, valid signed requests receive
+independent probation windows even when their target sets overlap. Exact replay
+of the same event ID remains an ordinary database duplicate and does not create a
+new record or reset `first_seen_at`.
+
+The live write path therefore does not reject a distinct request merely because
+another request already covers its targets, and should not delete older requests
+by trying to prove one signed request semantically subsumes another. Deterministic
+single-winner attribution provides the necessary anti-amplification bound when a
+target later arrives, while age-based cleanup handles requests that never become
+useful. The temporary target-deduplication repair command has been retired;
+startup migration and lifecycle cleanup own historical request handling.
+
+Once an expired request has been permanently removed, replaying that identical
+signed event starts a new lifecycle because no live event-ID marker remains.
+
+### Migration and policy-mode changes
+
+Existing request rows predate relay-observed lifecycle metadata, so their true
+`first_seen_at` and `last_used_at` cannot be reconstructed reliably. Migration
+assigns the migration timestamp as `first_seen_at` and gives every historical
+request a fresh 30-day probation window. This deliberately favors preservation
+over immediate production cleanup; normal cleanup moves requests that remain
+unused out of the served main database after that window.
+
+Startup performs this migration before blacklist/whitelist reconciliation and
+before the relay starts serving traffic. It discovers signed kind-5 and kind-62
+payloads from both the served and tombstone databases, including tombstone
+payloads whose metadata is missing or malformed, and deduplicates by signed
+event ID. Valid existing metadata is preserved; missing metadata is written
+with one startup timestamp and the original payload is promoted to the served
+database for its fresh probation. The pass is restart-safe: replacement
+metadata preserves the earliest `first_seen_at` and greatest `last_used_at`.
+
+The same startup pass reclassifies retained requests using current relay
+configuration and reconciles served copies against the lifecycle deadline.
+In disrespector mode it read-only evaluates unused targeting requests against
+main and purgatory data, marking only requests that would currently have an
+effect as used; it never changes target data during that evaluation. This
+evaluation includes requests whose unused lifecycle elapsed while the relay was
+offline: if a matching target is present, startup gives the request use credit
+before cleanup runs. Used targeting requests remain served in that mode
+indefinitely, while non-targeting NIP-62 and unused no-op requests retain their
+ordinary bounded served schedule. Critical query, metadata, promotion, or
+removal failures fail startup rather than allowing traffic to begin with an
+incomplete lifecycle reconciliation.
+
+The relay's current deletion-disrespector configuration governs retained
+requests; receipt-time mode is not permanent metadata. Switching into
+disrespector mode removes their local gates and keeps requests that are used or
+would delete currently stored data served indefinitely. Switching back to normal
+mode reapplies normal gating and the 9-month served plus 3-month unserved expiry
+schedule using retained lifecycle timestamps. Startup reconciliation must apply
+these transitions before the relay begins serving traffic.
+
+Startup catch-up and periodic cleanup use the holding-cleanup cadence. They
+evaluate the same timestamp-derived half-open lifecycle boundaries, remove
+expired served copies from Main before Tombstones, and permanently remove
+payload plus lifecycle metadata only after the additional gating period. Main
+and Tombstone removal can therefore lag a deadline until the next cleanup pass;
+that is expected cleanup latency, not an extension of the request's gate
+eligibility. Admission first probes for matching live requests without the
+lifecycle transition lock, so ordinary unrelated event writes are not serialized
+behind deletion-store reads. When that probe finds a possible gate, admission
+acquires the shared transition lock and repeats candidate discovery and winner
+selection before promotion. This confines serialization to events that actually
+match a live request while still preventing cleanup from expiring one candidate
+and causing admission to overlook another live candidate during promotion.
+
+Target-set deduplication has been removed and the temporary
+`repair-deletion-requests` command has been retired. Startup migration and
+periodic cleanup now handle historical requests under the same lifecycle rules.
+
 ## Core consistency invariant
 
 ngit-grasp enforces the following invariant across admission, serving, deletion,
@@ -187,35 +507,20 @@ deprecated in favor of the maintenance command.
 ```
 1. Kind 5 deletion request arrives
    ↓
-2. Check idempotency:
-   - if every actionable `e`/`a` target is already covered by an existing
-     same-author kind-5 request, return a duplicate success response without
-     storing the new deletion event
-   - `e` targets are covered by any existing same-author deletion for that id
-   - `a` targets are covered only when an existing same-author deletion for the
-     same coordinate has `created_at >=` the new deletion request, preserving
-     NIP-09 coordinate cutoff semantics
-   ↓
-3. Validate targets:
+2. Validate targets:
    - `e` targets found in the main DB must be authored by the deleter;
      cross-author main-DB targets reject the whole request
-   - pre-emptive `e` deletes for unknown targets may be accepted, but if the
-     target later arrives from a different author, the stale deletion request is
-     removed from both tombstones and the served deletion-request stream
+   - pre-emptive `e` deletes for unknown targets may be accepted; candidate
+     lookup later binds the request author to the arriving event author, so a
+     foreign target does not block admission or receive use credit
    - `a` coordinates are acted on only when coordinate pubkey matches deleter
    ↓
-4. Record deletion tombstone so re-submission is gated
+3. Record the signed request and independent lifecycle metadata in Tombstones.
+   Exact event-ID replay reuses its canonical record without resetting
+   `first_seen_at`; a distinct signed request is accepted even when targets
+   overlap.
    ↓
-5. Compact superseded deletion requests:
-   - after the new tombstone is recorded, remove older same-author kind-5
-     requests from the tombstone DB and served main DB when every actionable
-     target in the older request is covered by the new request
-   - a newer `a`-tag cutoff supersedes an older cutoff for the same coordinate;
-     `e` targets must still be present in the new request
-   - removal uses the database delete path so event-id/kind/tag indexes stay in
-     sync with event storage
-   ↓
-6. Process targets:
+4. Process targets:
    - `a` tag targeting a kind-30617 announcement coordinate:
      recursively discover the accepted-reference component affected by the
      announcement deletion
@@ -230,28 +535,36 @@ deprecated in favor of the maintenance command.
    - other valid `e`/`a` targets: delete the targeted event/coordinate without
      announcement graph cascade
    ↓
-7. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
+5. Archive git repository to .archive/<npub>/<identifier>-<timestamp>.tar.gz
    when deleting a repository announcement with live git data
    ↓
-8. Move deleted events to holding database:
+6. Move deleted events to holding database:
    - Targeted events
    - Repository announcements, when announcement deletion is involved
    - All main-DB events that lose their accepted-reference path after cascade
      reevaluation, for cascade paths
    - Deletion metadata for retention/cleanup/recovery
    ↓
-9. Delete events from main database
+7. Delete events from main database
    ↓
-10. Remove the live git repository when the owner+identifier announcement scope
+8. Remove the live git repository when the owner+identifier announcement scope
    is no longer served
    ↓
-11. Deleted/tombstoned targets no longer serve in queries
+9. Deleted/tombstoned targets no longer serve in queries
    ↓
-12. Background task (daily):
+10. Background task (daily):
     - Check holding database for expired entries
     - Delete events older than retention period
     - Delete corresponding archive files
 ```
+
+Deletion processing records a structured outcome: successful main-database
+removals and successful purgatory removals are counted separately from skipped
+fail-safe preservation and query/delete failures. A kind-5 request receives
+`last_used_at` only after at least one actual main-DB or purgatory event removal;
+archiving to Holding, git/filesystem cleanup, candidate matching, and failed
+operations do not constitute use. NIP-62 uses the same rule, including its
+author-wide purgatory eviction.
 
 Deletion gate checks tombstones before kind-specific admission and rejects:
 - events from vanished pubkeys,
@@ -328,16 +641,13 @@ When `deletion_request_disrespector = true`:
 ```
 1. Kind 5 deletion request arrives
    ↓
-2. Check idempotency:
-   - if every actionable `e`/`a` target is already covered by an existing
-     same-author kind-5 request, return a duplicate success response without
-     storing the new deletion event
+2. Record independent lifecycle metadata and store the signed deletion request
+   event in the main database. Exact event-ID replay reuses its existing
+   lifecycle record; distinct overlapping requests remain distinct.
    ↓
-3. Store deletion request event in main database
+3. Do NOT process deletion
    ↓
-4. Do NOT process deletion
-   ↓
-5. Repository and events remain fully accessible
+4. Repository and events remain fully accessible
    ↓
 Result: Archival relay preserves all content
 ```
@@ -353,9 +663,8 @@ NIP-62 vanish requests. It does NOT prevent blacklist-triggered deletions.
 
 **Implementation Note:** Implemented. The LMDB backend's automatic NIP-09 and
 NIP-62 processing is disabled (`process_nip09(false)`, `process_nip62(false)`);
-ngit-grasp owns deletion handling in relay policy code, which short-circuits
-already-covered NIP-09 deletions before the `deletion_request_disrespector`
-archival-mode branch. When `deletion_request_disrespector` is set, new kind-5
+ngit-grasp owns deletion handling in relay policy code. When
+`deletion_request_disrespector` is set, new kind-5
 requests are stored but not acted on, and kind-62 requests are stored but not
 acted on. NIP-09 and NIP-62 are omitted from the NIP-11 `supported_nips` list
 in this mode.
@@ -822,9 +1131,11 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ### Attack Vectors
 
-**DoS via Deletion Spam:**
-- Mitigation: ownership checks + normal admission validation
-- Mitigation: idempotent delete paths for already-deleted targets
+**Deletion-Request Storage Pressure:**
+- Mitigation: bounded probation and unserved gating periods
+- Mitigation: longer retention only after demonstrated local utility
+- Mitigation: permanent expiry of unused request payloads and lifecycle metadata
+- Mitigation: ownership checks, normal admission validation, and operator moderation
 
 **Archive Disk Exhaustion:**
 - Mitigation: Background cleanup enforces retention limits
@@ -851,6 +1162,9 @@ This allows clients to discover whether a relay respects deletion requests.
 - `ngit_holding_cleanup_runs_total`
 - `ngit_holding_cleanup_deleted_total{type}`
 - `ngit_holding_cleanup_last_run_deleted{type}`
+- `ngit_deletion_request_cleanup_runs_total`
+- `ngit_deletion_request_cleanup_removed_total{type}`
+- `ngit_deletion_request_cleanup_outcomes_total{outcome}`
 - `ngit_recovery_total{result}`
 - `ngit_manual_ejections_total`
 - `ngit_manual_ejection_deleted_total{type}`

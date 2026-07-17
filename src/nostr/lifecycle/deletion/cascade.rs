@@ -10,6 +10,7 @@ use super::policy::{
 use crate::nostr::lifecycle::{DeletionSource, HoldingMetadata, HOLDING_METADATA_KIND};
 use crate::nostr::SharedDatabase;
 
+use super::DeletionOutcome;
 use crate::nostr::lifecycle::history::HISTORY_METADATA_KIND;
 
 const MAX_CASCADE_CANDIDATE_EVENTS: usize = 50_000;
@@ -121,14 +122,15 @@ impl DeletionPolicy {
         announcement_addr: &str,
         deletion_created_at: Timestamp,
         source: DeletionSource,
-    ) {
+    ) -> DeletionOutcome {
+        let mut outcome = DeletionOutcome::default();
         let mut moved_ids = HashSet::new();
 
         // Parse `30617:<pubkey>:<identifier>` (already validated as a 30617
         // coordinate for this author, but re-parse defensively).
         let parts: Vec<&str> = announcement_addr.splitn(3, ':').collect();
         if parts.len() != 3 {
-            return;
+            return outcome;
         }
         let identifier = parts[2];
 
@@ -142,7 +144,10 @@ impl DeletionPolicy {
                 .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(error = %e, announcement = %announcement_addr, "Cascade deletion: failed to verify announcement versions under deletion cutoff");
-                return;
+                return DeletionOutcome {
+                    failures: 1,
+                    ..Default::default()
+                };
             }
         };
 
@@ -152,7 +157,7 @@ impl DeletionPolicy {
                 deletion_created_at = deletion_created_at.as_secs(),
                 "Cascade deletion skipped: no announcement version is deletable under NIP-09 cutoff"
             );
-            return;
+            return outcome;
         }
 
         let plan = match plan_deleted_announcement_cascade(
@@ -165,16 +170,16 @@ impl DeletionPolicy {
             Ok(plan) => plan,
             Err(e) => {
                 tracing::warn!(error = %e, "Cascade deletion: graph expansion failed; falling back to simple coordinate deletion");
-                self.delete_announcement_coordinate_and_maybe_state(
-                    author,
-                    announcement_addr,
-                    identifier,
-                    deletion_created_at,
-                    &mut moved_ids,
-                    source,
-                )
-                .await;
-                return;
+                return self
+                    .delete_announcement_coordinate_and_maybe_state(
+                        author,
+                        announcement_addr,
+                        identifier,
+                        deletion_created_at,
+                        &mut moved_ids,
+                        source,
+                    )
+                    .await;
             }
         };
 
@@ -196,16 +201,16 @@ impl DeletionPolicy {
                 max = MAX_CASCADE_ORPHAN_DELETES,
                 "Cascade deletion orphan set exceeds limit; deleting announcement coordinate only"
             );
-            self.delete_announcement_coordinate_and_maybe_state(
-                author,
-                announcement_addr,
-                identifier,
-                deletion_created_at,
-                &mut moved_ids,
-                source,
-            )
-            .await;
-            return;
+            return self
+                .delete_announcement_coordinate_and_maybe_state(
+                    author,
+                    announcement_addr,
+                    identifier,
+                    deletion_created_at,
+                    &mut moved_ids,
+                    source,
+                )
+                .await;
         }
         if !orphan_ids.is_empty() {
             tracing::debug!(
@@ -227,27 +232,32 @@ impl DeletionPolicy {
                     )
                     .await,
             };
-            self.archive_and_delete_filter(
-                filter,
-                &metadata,
-                &mut moved_ids,
-                "cascade orphan deletion",
-            )
-            .await;
+            outcome.merge(
+                self.archive_and_delete_filter(
+                    filter,
+                    &metadata,
+                    &mut moved_ids,
+                    "cascade orphan deletion",
+                )
+                .await,
+            );
         }
 
         // Step 5b: hard-delete the announcement coordinate itself (up to the
         // deletion's created_at, per NIP-09), exactly as the simple path does,
         // then clean state if this identifier is now unanchored.
-        self.delete_announcement_coordinate_and_maybe_state(
-            author,
-            announcement_addr,
-            identifier,
-            deletion_created_at,
-            &mut moved_ids,
-            source,
-        )
-        .await;
+        outcome.merge(
+            self.delete_announcement_coordinate_and_maybe_state(
+                author,
+                announcement_addr,
+                identifier,
+                deletion_created_at,
+                &mut moved_ids,
+                source,
+            )
+            .await,
+        );
+        outcome
     }
 
     /// Apply operator-driven blacklist deletion for a stored kind-30617
@@ -275,13 +285,14 @@ impl DeletionPolicy {
         };
 
         let coordinate = format!("30617:{}:{}", announcement.pubkey.to_hex(), identifier);
-        self.cascade_delete_announcement(
-            &announcement.pubkey,
-            &coordinate,
-            Timestamp::now(),
-            DeletionSource::Blacklist,
-        )
-        .await;
+        let _ = self
+            .cascade_delete_announcement(
+                &announcement.pubkey,
+                &coordinate,
+                Timestamp::now(),
+                DeletionSource::Blacklist,
+            )
+            .await;
 
         Ok(())
     }
@@ -332,7 +343,7 @@ impl DeletionPolicy {
         deletion_created_at: Timestamp,
         moved_ids: &mut HashSet<EventId>,
         source: DeletionSource,
-    ) {
+    ) -> DeletionOutcome {
         let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement).custom_tag(
             SingleLetterTag::lowercase(Alphabet::D),
             identifier.to_string(),
@@ -346,12 +357,15 @@ impl DeletionPolicy {
                     identifier = %identifier,
                     "Cascade deletion: failed to check remaining announcements for identifier"
                 );
-                return;
+                return DeletionOutcome {
+                    failures: 1,
+                    ..Default::default()
+                };
             }
         };
 
         if !remaining_announcements.is_empty() {
-            return;
+            return DeletionOutcome::default();
         }
 
         let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
@@ -373,7 +387,7 @@ impl DeletionPolicy {
             moved_ids,
             "unanchored state deletion",
         )
-        .await;
+        .await
     }
 
     async fn delete_announcement_coordinate_and_maybe_state(
@@ -384,27 +398,31 @@ impl DeletionPolicy {
         deletion_created_at: Timestamp,
         moved_ids: &mut HashSet<EventId>,
         source: DeletionSource,
-    ) {
-        self.delete_coordinate_from_main_db(
-            author,
-            announcement_addr,
-            deletion_created_at,
-            moved_ids,
-            source,
-        )
-        .await;
+    ) -> DeletionOutcome {
+        let mut outcome = self
+            .delete_coordinate_from_main_db(
+                author,
+                announcement_addr,
+                deletion_created_at,
+                moved_ids,
+                source,
+            )
+            .await;
 
         // Repository state (30618) is keyed by identifier, not by graph edges.
         // After deleting this announcement coordinate, delete state events for
         // the identifier only when no announcement for that identifier remains
         // in the main DB. This must also run on coordinate-only fallbacks.
-        self.delete_repo_state_if_identifier_is_unanchored(
-            identifier,
-            deletion_created_at,
-            moved_ids,
-            source,
-        )
-        .await;
+        outcome.merge(
+            self.delete_repo_state_if_identifier_is_unanchored(
+                identifier,
+                deletion_created_at,
+                moved_ids,
+                source,
+            )
+            .await,
+        );
+        outcome
     }
 
     async fn query_address_events_until(

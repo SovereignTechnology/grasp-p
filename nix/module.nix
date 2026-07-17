@@ -189,7 +189,55 @@ let
         type = types.int;
         default = 86400;
         description =
-          "Interval in seconds between holding DB cleanup passes (default: 24 hours)";
+          "Interval in seconds between holding DB and deletion-request retention cleanup passes (default: 24 hours)";
+      };
+
+      deletionRequestRetention = {
+        unusedServedSecs = mkOption {
+          type = types.ints.positive;
+          default = 2592000;
+          description = ''
+            Time in seconds an unused deletion or vanish request remains served
+            from relay-observed first_seen_at (default: 30 days). Production
+            periods should be at least one day; sub-day values are for tests.
+          '';
+        };
+
+        unusedUnservedGatingAdditionalSecs = mkOption {
+          type = types.ints.positive;
+          default = 15552000;
+          description = ''
+            Additional time in seconds after unused serving ends that a deletion
+            or vanish request remains unserved but eligible to gate admission
+            (default: 180 days). Production periods should be at least one day;
+            sub-day values are for tests.
+          '';
+        };
+
+        usedServedAfterLastUsedSecs = mkOption {
+          type = types.ints.positive;
+          default = 23328000;
+          description = ''
+            Normal-mode time in seconds a used deletion or vanish request
+            remains served after last_used_at (default: 270 days, 9 fixed
+            30-day months). Used requests remain served indefinitely when
+            deletionRequestDisrespector is enabled. Production periods should
+            be at least one day; sub-day values are for tests.
+          '';
+        };
+
+        usedUnservedGatingAdditionalSecs = mkOption {
+          type = types.ints.positive;
+          default = 7776000;
+          description = ''
+            Additional normal-mode time in seconds after used serving ends that
+            a deletion or vanish request remains unserved but continues gating
+            admission (default: 90 days, 3 fixed 30-day months). This duration
+            does not expire used requests when deletionRequestDisrespector is
+            enabled. Production periods should be at least one day; sub-day
+            values are for tests.
+          '';
+        };
       };
 
       archiveAll = mkOption {
@@ -275,19 +323,20 @@ let
         type = types.bool;
         default = false;
         description = ''
-          Ignore NIP-09 deletion requests and act as an archival server.
+          Ignore NIP-09 deletion requests and NIP-62 request-to-vanish events
+          and act as an archival server.
 
-          When enabled, incoming NIP-09 (kind 5) deletion requests are stored
-          but NOT acted upon: targeted events remain fully accessible. This
-          preserves content and prevents "left-pad" scenarios. NIP-11
-          supported_nips will NOT advertise NIP-09 (deletion) or NIP-62
-          (request to vanish).
+          When enabled, incoming NIP-09 (kind 5) deletion requests and NIP-62
+          request-to-vanish events are stored but NOT acted upon: their targets
+          remain fully accessible. This preserves content and prevents
+          "left-pad" scenarios. NIP-11 supported_nips will NOT advertise NIP-09
+          (deletion) or NIP-62 (request to vanish).
 
-          This ONLY affects NIP-09 user-initiated deletions. It does NOT prevent
-          blacklist-triggered deletions (operator moderation).
+          This ONLY affects NIP-09 and NIP-62 user-initiated requests. It does
+          NOT prevent blacklist-triggered deletions (operator moderation).
 
-          When disabled (default), deletion requests are honoured and NIP-09 and
-          NIP-62 are advertised in NIP-11.
+          When disabled (default), both request types are honoured and NIP-09
+          and NIP-62 are advertised in NIP-11.
 
           See: docs/explanation/repository-lifecycle.md
         '';
@@ -396,6 +445,14 @@ let
       NGIT_HOLDING_RETENTION_SECS = toString cfg.holdingRetentionSecs;
       NGIT_HOLDING_CLEANUP_INTERVAL_SECS =
         toString cfg.holdingCleanupIntervalSecs;
+      NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS =
+        toString cfg.deletionRequestRetention.unusedServedSecs;
+      NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS =
+        toString cfg.deletionRequestRetention.unusedUnservedGatingAdditionalSecs;
+      NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS =
+        toString cfg.deletionRequestRetention.usedServedAfterLastUsedSecs;
+      NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS =
+        toString cfg.deletionRequestRetention.usedUnservedGatingAdditionalSecs;
       NGIT_ARCHIVE_ALL = if cfg.archiveAll then "true" else "false";
       NGIT_ARCHIVE_WHITELIST = concatStringsSep "," cfg.archiveWhitelist;
       NGIT_ARCHIVE_GRASP_SERVICES =

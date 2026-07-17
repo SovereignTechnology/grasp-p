@@ -4,9 +4,7 @@ use tokio::signal;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-use ngit_grasp::{
-    cleanup_empty_repos, config::Config, nostr, repair_deletion_requests, server::RelayServer,
-};
+use ngit_grasp::{cleanup_empty_repos, config::Config, nostr, server::RelayServer};
 
 /// Top-level CLI dispatcher.
 ///
@@ -30,10 +28,6 @@ enum Cli {
     ///
     /// This is an operator/admin maintenance command and is idempotent.
     HoldingEject(nostr::lifecycle::HoldingEjectArgs),
-
-    /// Temporarily repair historical redundant kind-5 deletion request rows.
-    #[command(hide = true)]
-    RepairDeletionRequests(repair_deletion_requests::RepairDeletionRequestsArgs),
 }
 
 #[tokio::main]
@@ -45,13 +39,7 @@ async fn main() -> Result<()> {
     // If not, prepend the implicit "serve" subcommand so that clap routes to Cli::Serve
     // and all relay flags are parsed normally (preserving backward compatibility).
     let mut args: Vec<String> = std::env::args().collect();
-    let known_subcommands = [
-        "serve",
-        "cleanup-empty-repos",
-        "holding-eject",
-        "repair-deletion-requests",
-        "help",
-    ];
+    let known_subcommands = ["serve", "cleanup-empty-repos", "holding-eject", "help"];
     let has_subcommand = args.get(1).is_some_and(|a| {
         known_subcommands.contains(&a.as_str())
             || matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")
@@ -63,9 +51,6 @@ async fn main() -> Result<()> {
     match Cli::parse_from(args) {
         Cli::CleanupEmptyRepos(cleanup_args) => cleanup_empty_repos::run(&cleanup_args).await,
         Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
-        Cli::RepairDeletionRequests(repair_args) => {
-            repair_deletion_requests::run(&repair_args).await
-        }
         Cli::Serve(config) => {
             let mut config = *config;
             // Finish initialising the Config (load relay owner key if not provided).

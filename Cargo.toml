@@ -130,6 +130,10 @@ name = "nip09_validation"
 path = "tests/lifecycle/nip09_validation.rs"
 
 [[test]]
+name = "deletion_request_retention"
+path = "tests/lifecycle/deletion_request_retention.rs"
+
+[[test]]
 name = "nip62_lifecycle"
 path = "tests/lifecycle/nip62_lifecycle.rs"
 

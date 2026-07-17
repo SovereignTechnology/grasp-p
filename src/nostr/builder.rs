@@ -768,12 +768,6 @@ impl WritePolicy for Nip34WritePolicy {
                 _ => self.handle_related_event(event, "Event").await,
             };
 
-            if !matches!(&result, WritePolicyResult::Reject { .. }) {
-                self.deletion
-                    .remove_stale_cross_author_event_deletions(event)
-                    .await;
-            }
-
             result
         })
     }

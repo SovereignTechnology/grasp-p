@@ -79,6 +79,23 @@ struct RelayOptions {
     repository_blacklist: Option<String>,
     git_data_path: Option<PathBuf>,
     relay_data_path: Option<PathBuf>,
+    deletion_lifecycle: Option<DeletionLifecycleOptions>,
+}
+
+/// Focused configuration for short-lived deletion-request lifecycle tests.
+///
+/// Explicit paths are owned by the caller, so they can be reused after
+/// [`TestRelay::stop`] to exercise LMDB restart reconciliation.
+#[derive(Clone, Debug)]
+pub struct DeletionLifecycleOptions {
+    pub unused_served_retention_secs: u64,
+    pub unused_gating_additional_secs: u64,
+    pub used_served_after_last_use_secs: u64,
+    pub used_gating_additional_secs: u64,
+    pub cleanup_interval_secs: u64,
+    pub git_data_path: Option<PathBuf>,
+    pub relay_data_path: Option<PathBuf>,
+    pub deletion_request_disrespector: bool,
 }
 
 impl TestRelay {
@@ -249,6 +266,25 @@ impl TestRelay {
             port::reserve_port(),
             RelayOptions {
                 lmdb_backend: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start an LMDB relay with explicit, short deletion-request lifecycle
+    /// timings. This intentionally groups the retention knobs used by the
+    /// subprocess lifecycle tests rather than expanding the public constructor
+    /// matrix with positional duration arguments.
+    pub async fn start_with_deletion_lifecycle(options: DeletionLifecycleOptions) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                deletion_request_disrespector: options.deletion_request_disrespector,
+                lmdb_backend: true,
+                git_data_path: options.git_data_path.clone(),
+                relay_data_path: options.relay_data_path.clone(),
+                deletion_lifecycle: Some(options),
                 ..RelayOptions::default()
             },
         )
@@ -482,6 +518,29 @@ impl TestRelay {
 
         if let Some(ref blacklist) = options.repository_blacklist {
             cmd.env("NGIT_REPOSITORY_BLACKLIST", blacklist);
+        }
+
+        if let Some(lifecycle) = &options.deletion_lifecycle {
+            cmd.env(
+                "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS",
+                lifecycle.unused_served_retention_secs.to_string(),
+            )
+            .env(
+                "NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS",
+                lifecycle.unused_gating_additional_secs.to_string(),
+            )
+            .env(
+                "NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS",
+                lifecycle.used_served_after_last_use_secs.to_string(),
+            )
+            .env(
+                "NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS",
+                lifecycle.used_gating_additional_secs.to_string(),
+            )
+            .env(
+                "NGIT_HOLDING_CLEANUP_INTERVAL_SECS",
+                lifecycle.cleanup_interval_secs.to_string(),
+            );
         }
 
         // Release the port reservation immediately before spawning the

@@ -6,6 +6,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS: u64 = 30 * 24 * 60 * 60;
+const DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS: u64 =
+    180 * 24 * 60 * 60;
+// Retention months are fixed 30-day periods, avoiding calendar-month ambiguity.
+const DEFAULT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS: u64 = 270 * 24 * 60 * 60;
+const DEFAULT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS: u64 =
+    90 * 24 * 60 * 60;
+
 /// Whitelist entry for repository/archive filtering
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -445,6 +453,41 @@ pub struct Config {
     )]
     pub holding_cleanup_interval_secs: u64,
 
+    // Retention is expressed in seconds for configuration consistency and short
+    // tests. Production deployments are expected to use periods of at least one
+    // day, comfortably exceeding worst-case deletion/archive processing time.
+    /// How long an unused deletion or vanish request remains served after relay-observed first_seen_at.
+    #[arg(
+        long = "deletion-request-retention-unused-served-secs",
+        env = "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS",
+        default_value_t = DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS
+    )]
+    pub deletion_request_retention_unused_served_secs: u64,
+
+    /// Additional time an unused deletion or vanish request remains unserved but eligible to gate.
+    #[arg(
+        long = "deletion-request-retention-unused-unserved-gating-additional-secs",
+        env = "NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS",
+        default_value_t = DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS
+    )]
+    pub deletion_request_retention_unused_unserved_gating_additional_secs: u64,
+
+    /// Normal-mode time a used deletion or vanish request remains served after last_used_at.
+    #[arg(
+        long = "deletion-request-retention-used-served-after-last-used-secs",
+        env = "NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS",
+        default_value_t = DEFAULT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS
+    )]
+    pub deletion_request_retention_used_served_after_last_used_secs: u64,
+
+    /// Additional normal-mode time a used request remains unserved but continues gating after serving ends.
+    #[arg(
+        long = "deletion-request-retention-used-unserved-gating-additional-secs",
+        env = "NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS",
+        default_value_t = DEFAULT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS
+    )]
+    pub deletion_request_retention_used_unserved_gating_additional_secs: u64,
+
     /// Enable GRASP-05 archive mode: accept all announcements regardless of listing (WARNING: storage risk)
     #[arg(long, env = "NGIT_ARCHIVE_ALL", default_value_t = false)]
     pub archive_all: bool,
@@ -502,19 +545,20 @@ pub struct Config {
     #[arg(long, env = "NGIT_EVENT_BLACKLIST", default_value = "")]
     pub event_blacklist: String,
 
-    /// Deletion request disrespector: ignore NIP-09 deletion requests (archival mode)
+    /// Deletion request disrespector: ignore NIP-09 and NIP-62 requests (archival mode)
     ///
-    /// When `true`, the relay stores incoming NIP-09 (kind 5) deletion requests but
-    /// does NOT act on them: targeted events remain fully accessible. This makes the
-    /// relay an archival server, preventing "left-pad" scenarios by ensuring at least
-    /// some relays preserve deleted content.
+    /// When `true`, the relay stores incoming NIP-09 (kind 5) deletion requests and
+    /// NIP-62 request-to-vanish events but does NOT act on them: their targets remain
+    /// fully accessible. This makes the relay an archival server, preventing
+    /// "left-pad" scenarios by ensuring at least some relays preserve deleted content.
     ///
-    /// This setting ONLY affects NIP-09 user-initiated deletions. Policy-driven
-    /// blacklist/whitelist deletion flows still run because they enforce local
-    /// relay serving policy rather than client deletion requests.
+    /// This setting ONLY affects NIP-09 and NIP-62 user-initiated requests.
+    /// Policy-driven blacklist/whitelist deletion flows still run because they
+    /// enforce local relay serving policy rather than client requests.
     ///
-    /// When `true`, NIP-09 (`"deletion"`) is NOT advertised in the NIP-11 supported
-    /// NIPs list so clients can discover that the relay does not honour deletions.
+    /// When `true`, NIP-09 (`"deletion"`) and NIP-62 (`"request to vanish"`) are NOT
+    /// advertised in the NIP-11 supported NIPs list so clients can discover that the
+    /// relay does not honour either request type.
     #[arg(
         long,
         env = "NGIT_DELETION_REQUEST_DISRESPECTOR",
@@ -695,6 +739,34 @@ impl Config {
             ));
         }
 
+        Self::validate_deletion_request_retention_duration(
+            self.deletion_request_retention_unused_served_secs,
+            "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS",
+        )?;
+        Self::validate_deletion_request_retention_duration(
+            self.deletion_request_retention_unused_unserved_gating_additional_secs,
+            "NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS",
+        )?;
+        Self::validate_deletion_request_retention_duration(
+            self.deletion_request_retention_used_served_after_last_used_secs,
+            "NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS",
+        )?;
+        Self::validate_deletion_request_retention_duration(
+            self.deletion_request_retention_used_unserved_gating_additional_secs,
+            "NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS",
+        )?;
+
+        Self::validate_deletion_request_retention_deadline(
+            self.deletion_request_retention_unused_served_secs,
+            self.deletion_request_retention_unused_unserved_gating_additional_secs,
+            "unused",
+        )?;
+        Self::validate_deletion_request_retention_deadline(
+            self.deletion_request_retention_used_served_after_last_used_secs,
+            self.deletion_request_retention_used_unserved_gating_additional_secs,
+            "used",
+        )?;
+
         // Fatal error: repository_whitelist with archive_read_only=true (incompatible)
         if !repository_whitelist.is_empty() {
             let read_only = self.archive_read_only.unwrap_or(archive_enabled);
@@ -795,6 +867,46 @@ impl Config {
         Duration::from_secs(self.holding_cleanup_interval_secs)
     }
 
+    /// How long an unused request remains served from relay-observed first_seen_at.
+    pub fn deletion_request_retention_unused_served(&self) -> Duration {
+        Duration::from_secs(self.deletion_request_retention_unused_served_secs)
+    }
+
+    /// Additional time an unused request remains unserved but eligible to gate.
+    pub fn deletion_request_retention_unused_unserved_gating_additional(&self) -> Duration {
+        Duration::from_secs(self.deletion_request_retention_unused_unserved_gating_additional_secs)
+    }
+
+    /// Normal-mode time a used request remains served after last_used_at.
+    pub fn deletion_request_retention_used_served_after_last_used(&self) -> Duration {
+        Duration::from_secs(self.deletion_request_retention_used_served_after_last_used_secs)
+    }
+
+    /// Additional normal-mode time a used request remains unserved but continues gating.
+    pub fn deletion_request_retention_used_unserved_gating_additional(&self) -> Duration {
+        Duration::from_secs(self.deletion_request_retention_used_unserved_gating_additional_secs)
+    }
+
+    fn validate_deletion_request_retention_duration(value: u64, name: &str) -> Result<()> {
+        if value == 0 {
+            return Err(anyhow!("{name} must be greater than 0"));
+        }
+        Ok(())
+    }
+
+    fn validate_deletion_request_retention_deadline(
+        served_secs: u64,
+        additional_gating_secs: u64,
+        lifecycle: &str,
+    ) -> Result<()> {
+        if served_secs.checked_add(additional_gating_secs).is_none() {
+            return Err(anyhow!(
+                "{lifecycle} deletion-request retention served and additional gating durations must not overflow when combined"
+            ));
+        }
+        Ok(())
+    }
+
     /// Create config for testing
     #[cfg(test)]
     pub fn for_testing() -> Self {
@@ -828,6 +940,14 @@ impl Config {
             holding_retention_secs: crate::nostr::lifecycle::DEFAULT_RETENTION.as_secs(),
             holding_cleanup_interval_secs: crate::nostr::lifecycle::DEFAULT_CLEANUP_INTERVAL
                 .as_secs(),
+            deletion_request_retention_unused_served_secs:
+                DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS,
+            deletion_request_retention_unused_unserved_gating_additional_secs:
+                DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS,
+            deletion_request_retention_used_served_after_last_used_secs:
+                DEFAULT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS,
+            deletion_request_retention_used_unserved_gating_additional_secs:
+                DEFAULT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS,
             archive_all: false,
             archive_whitelist: String::new(),
             archive_grasp_services: String::new(),
@@ -847,6 +967,9 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_default_values() {
@@ -855,6 +978,135 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:7334");
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    #[test]
+    fn test_deletion_request_retention_cli_defaults() {
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default deletion-request retention configuration should parse");
+
+        assert_eq!(
+            config.deletion_request_retention_unused_served(),
+            Duration::from_secs(2_592_000)
+        );
+        assert_eq!(
+            config.deletion_request_retention_unused_unserved_gating_additional(),
+            Duration::from_secs(15_552_000)
+        );
+        assert_eq!(
+            config.deletion_request_retention_used_served_after_last_used(),
+            Duration::from_secs(23_328_000)
+        );
+        assert_eq!(
+            config.deletion_request_retention_used_unserved_gating_additional(),
+            Duration::from_secs(7_776_000)
+        );
+    }
+
+    #[test]
+    fn test_deletion_request_retention_cli_overrides() {
+        let config = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--deletion-request-retention-unused-served-secs",
+            "1",
+            "--deletion-request-retention-unused-unserved-gating-additional-secs",
+            "2",
+            "--deletion-request-retention-used-served-after-last-used-secs",
+            "3",
+            "--deletion-request-retention-used-unserved-gating-additional-secs",
+            "4",
+        ])
+        .expect("custom deletion-request retention configuration should parse");
+
+        assert_eq!(config.deletion_request_retention_unused_served_secs, 1);
+        assert_eq!(
+            config.deletion_request_retention_unused_unserved_gating_additional_secs,
+            2
+        );
+        assert_eq!(
+            config.deletion_request_retention_used_served_after_last_used_secs,
+            3
+        );
+        assert_eq!(
+            config.deletion_request_retention_used_unserved_gating_additional_secs,
+            4
+        );
+    }
+
+    #[test]
+    fn test_deletion_request_retention_environment_override() {
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS";
+        let original = std::env::var_os(VARIABLE);
+        std::env::set_var(VARIABLE, "42");
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("environment deletion-request retention configuration should parse");
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
+
+        assert_eq!(config.deletion_request_retention_unused_served_secs, 42);
+    }
+
+    #[test]
+    fn test_deletion_request_retention_rejects_zero_durations() {
+        let cases = [
+            (
+                "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS",
+                Config {
+                    deletion_request_retention_unused_served_secs: 0,
+                    ..Config::for_testing()
+                },
+            ),
+            (
+                "NGIT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS",
+                Config {
+                    deletion_request_retention_unused_unserved_gating_additional_secs: 0,
+                    ..Config::for_testing()
+                },
+            ),
+            (
+                "NGIT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS",
+                Config {
+                    deletion_request_retention_used_served_after_last_used_secs: 0,
+                    ..Config::for_testing()
+                },
+            ),
+            (
+                "NGIT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS",
+                Config {
+                    deletion_request_retention_used_unserved_gating_additional_secs: 0,
+                    ..Config::for_testing()
+                },
+            ),
+        ];
+
+        for (variable, config) in cases {
+            let error = config.validate().expect_err("zero duration must fail");
+            assert!(error.to_string().contains(variable));
+        }
+    }
+
+    #[test]
+    fn test_deletion_request_retention_rejects_deadline_overflow() {
+        let config = Config {
+            deletion_request_retention_unused_served_secs: u64::MAX,
+            deletion_request_retention_unused_unserved_gating_additional_secs: 1,
+            ..Config::for_testing()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("combined duration overflow must fail");
+        assert!(error
+            .to_string()
+            .contains("unused deletion-request retention"));
     }
 
     #[test]
