@@ -427,3 +427,65 @@ async fn nip62_targeting_gates_while_non_targeting_request_never_does() {
     .await;
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn normal_mode_nip62_replay_does_not_make_a_noop_request_used() {
+    let relay = TestRelay::start_with_deletion_lifecycle(lifecycle_options()).await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create client");
+    let request = build_vanish(&client, None);
+
+    client
+        .send_event(request.clone())
+        .await
+        .expect("accept initial no-op vanish request");
+    client
+        .send_event(request.clone())
+        .await
+        .expect("accept exact no-op vanish replay");
+
+    let record = open_tombstones(relay.relay_data_path().clone())
+        .await
+        .lifecycle_for_request_result(&request.id)
+        .await
+        .expect("read request lifecycle")
+        .expect("retain request lifecycle");
+    assert_eq!(
+        record.last_used_at, None,
+        "replaying a no-op vanish must not let it delete itself or count as use"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn disrespector_nip62_replay_does_not_make_a_noop_request_used() {
+    let mut options = lifecycle_options();
+    options.deletion_request_disrespector = true;
+    let relay = TestRelay::start_with_deletion_lifecycle(options).await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create client");
+    let request = build_vanish(&client, None);
+
+    client
+        .send_event(request.clone())
+        .await
+        .expect("accept initial no-op vanish request");
+    client
+        .send_event(request.clone())
+        .await
+        .expect("accept exact no-op vanish replay");
+
+    let record = open_tombstones(relay.relay_data_path().clone())
+        .await
+        .lifecycle_for_request_result(&request.id)
+        .await
+        .expect("read request lifecycle")
+        .expect("retain request lifecycle");
+    assert_eq!(
+        record.last_used_at, None,
+        "replaying a no-op vanish must not make it indefinitely retained in disrespector mode"
+    );
+    relay.stop().await;
+}

@@ -30,12 +30,16 @@ impl DeletionPolicy {
         &self,
         event: &Event,
     ) -> anyhow::Result<bool> {
-        if !self
+        // The request has already been recorded and may be persisted before an
+        // exact replay reaches this handler. It is not evidence that the
+        // request had an effect; only a distinct event by this author is.
+        if self
             .ctx
             .database
             .query(Filter::new().author(event.pubkey))
             .await?
-            .is_empty()
+            .into_iter()
+            .any(|stored| stored.id != event.id)
         {
             return Ok(true);
         }
@@ -132,15 +136,32 @@ impl DeletionPolicy {
             git_archive: None,
         };
 
-        outcome.merge(
-            self.archive_and_delete_filter(
-                Filter::new().author(author),
-                &metadata,
-                &mut moved_ids,
-                "NIP-62 vanish remaining author-event deletion",
-            )
-            .await,
-        );
+        // Exclude the incoming request itself. On an exact replay it may
+        // already be stored in Main; deleting it would falsely turn a no-op
+        // request into a used request and extend its retention lifecycle.
+        let remaining_ids = self
+            .ctx
+            .database
+            .query(Filter::new().author(author))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to query vanished author's remaining events: {e}")
+            })?
+            .into_iter()
+            .filter(|stored| stored.id != event.id)
+            .map(|stored| stored.id)
+            .collect::<Vec<_>>();
+        if !remaining_ids.is_empty() {
+            outcome.merge(
+                self.archive_and_delete_filter(
+                    Filter::new().ids(remaining_ids),
+                    &metadata,
+                    &mut moved_ids,
+                    "NIP-62 vanish remaining author-event deletion",
+                )
+                .await,
+            );
+        }
 
         Ok(outcome)
     }

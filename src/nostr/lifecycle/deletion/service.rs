@@ -837,6 +837,23 @@ mod tests {
     }
 
     #[test]
+    fn all_relays_vanish_target_takes_precedence_over_relay_specific_target() {
+        let service = DeletionService::new(context(crate::config::Config::for_testing()));
+        let request = EventBuilder::new(Kind::RequestToVanish, "multiple targets")
+            .tags(vec![
+                Tag::custom("relay", vec!["wss://other.example".to_string()]),
+                Tag::custom("relay", vec!["ALL_RELAYS".to_string()]),
+            ])
+            .finalize(&Keys::generate())
+            .unwrap();
+
+        assert!(
+            service.vanish_targets_this_relay(&request),
+            "ALL_RELAYS must target this relay even when a relay-specific tag does not"
+        );
+    }
+
+    #[test]
     fn retention_expiry_uses_exact_deadline_boundary() {
         let service = DeletionService::new(context(crate::config::Config {
             deletion_request_retention_unused_served_secs: 2,
