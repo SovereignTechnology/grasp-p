@@ -18,10 +18,11 @@ and purgatory transitions.
 
 ### Production motivation
 
-Deletion and vanish requests are necessary admission controls, but they are also
-an inexpensive denial-of-service vector. A request can arrive before any event
-it names, and the relay cannot require the target to exist without breaking
-legitimate out-of-order delivery.
+Deletion and vanish requests are necessary admission controls, but they can also
+create substantial retention pressure without hostile traffic. Valid requests
+published by reputable users may be unrelated to this relay's Git data, and a
+request can arrive before any event it names. The relay therefore cannot require
+the target to exist without breaking legitimate out-of-order delivery.
 
 Production measurements exposed the cost of retaining every such request
 indefinitely: approximately 50,000 of 60,000 stored events were deletion
@@ -32,6 +33,10 @@ deduplication accounted for only about 1,500 requests, leaving approximately
 Retaining every accepted request permanently is therefore the wrong storage
 policy; the relay should retain requests according to demonstrated utility
 instead.
+
+Bounded lifecycle retention is a storage-hygiene mechanism, not comprehensive
+adversarial admission control. Trust-based admission, rate controls, and
+operator moderation are separate concerns and can be layered over this policy.
 
 ### Intent
 
@@ -1121,9 +1126,11 @@ This allows clients to discover whether a relay respects deletion requests.
 
 ### Attack Vectors
 
-**DoS via Deletion Spam:**
-- Mitigation: ownership checks + normal admission validation
-- Mitigation: idempotent delete paths for already-deleted targets
+**Deletion-Request Storage Pressure:**
+- Mitigation: bounded probation and unserved gating periods
+- Mitigation: longer retention only after demonstrated local utility
+- Mitigation: permanent expiry of unused request payloads and lifecycle metadata
+- Mitigation: ownership checks, normal admission validation, and operator moderation
 
 **Archive Disk Exhaustion:**
 - Mitigation: Background cleanup enforces retention limits
