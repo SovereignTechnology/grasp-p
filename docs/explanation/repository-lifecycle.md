@@ -83,6 +83,18 @@ rejected under valid ownership, coordinate-cutoff, relay-targeting, and other
 NIP-09/NIP-62 rules. Merely matching a tag, inspecting the request, or discovering
 that a different author owns the target does not count as use.
 
+The unserved gate is the deliberate observation period that establishes whether
+an apparently unused request still has practical value. While the request was
+served, clients that saw it could avoid sending the deleted target to this relay,
+even if copies of that target continued circulating elsewhere. Removing the
+request from relay queries gives those late copies an opportunity to reach the
+relay again. The retained Tombstone gate still rejects a covered target; that
+rejection is evidence of current utility, so the winning request becomes used,
+is promoted back to Main, and begins the longer used lifecycle. If no covered
+target arrives during the unserved period, the request has supplied no evidence
+that its gate is still needed and can expire. Replaying the deletion or vanish
+request itself is not such evidence and does not update `last_used_at`.
+
 #### Used
 
 When a request is used:
@@ -114,6 +126,14 @@ retention cleanup. Timestamp-derived deadlines determine lifecycle eligibility;
 physical removal from Main and Tombstones is asynchronous cleanup and may occur
 on the next scheduled pass. This bounded cleanup delay is intentional and does
 not extend admission-gate eligibility past the deadline.
+
+Durations use seconds for configuration consistency and to permit short automated
+tests. Production values are expected to be at least one day and comfortably
+longer than the worst-case processing time for a deletion or vanish request,
+including repository archival and cascade work. Sub-day values are a testing
+facility, not a supported production operating point; cleanup is therefore not
+coordinated with an initial request handler across an artificially short total
+lifetime.
 
 ### Multiple matching requests
 
@@ -216,6 +236,16 @@ main database. Other sufficient requests still participate in rejection
 correctness, but their retention clocks do not change. This rule is independent
 of database iteration order and prevents one event arrival from extending an
 arbitrary number of duplicate requests.
+
+This deterministic single-winner rule applies when one later target admission is
+matched against already-pending requests. Initial processing of distinct deletion
+requests is intentionally less strict: two requests processed concurrently may
+both observe the same stored target before either removal completes and may both
+receive use credit. The database deletion API does not report an authoritative
+per-event removed count, so eliminating that narrow race would require broader
+target-level serialization. The occasional extra used request is accepted: it is
+bounded by actual concurrency, does not change deletion correctness, and still
+expires through the normal used lifecycle.
 
 ### Simplification of target-set deduplication
 

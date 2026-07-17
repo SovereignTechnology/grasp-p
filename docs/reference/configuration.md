@@ -1190,6 +1190,8 @@ These options govern the bounded lifecycle of accepted NIP-09 deletion requests 
 
 The relay derives unused deadlines from relay-observed `first_seen_at`, never from the client-controlled event `created_at`. It derives used deadlines from `last_used_at`. Each `...ADDITIONAL...` option begins only after its corresponding served period ends; it is not a total retention duration.
 
+Seconds are used for configuration consistency and short automated tests. In production, configure every period to at least one day and keep each total lifecycle comfortably longer than the worst-case deletion processing time, including repository archival and cascade work. Sub-day values are intended only for tests.
+
 #### `NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS`
 
 - **Description:** How long an unused deletion or vanish request remains served from relay-observed `first_seen_at`

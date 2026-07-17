@@ -198,7 +198,8 @@ let
           default = 2592000;
           description = ''
             Time in seconds an unused deletion or vanish request remains served
-            from relay-observed first_seen_at (default: 30 days).
+            from relay-observed first_seen_at (default: 30 days). Production
+            periods should be at least one day; sub-day values are for tests.
           '';
         };
 
@@ -208,7 +209,8 @@ let
           description = ''
             Additional time in seconds after unused serving ends that a deletion
             or vanish request remains unserved but eligible to gate admission
-            (default: 180 days).
+            (default: 180 days). Production periods should be at least one day;
+            sub-day values are for tests.
           '';
         };
 
@@ -219,7 +221,8 @@ let
             Normal-mode time in seconds a used deletion or vanish request
             remains served after last_used_at (default: 270 days, 9 fixed
             30-day months). Used requests remain served indefinitely when
-            deletionRequestDisrespector is enabled.
+            deletionRequestDisrespector is enabled. Production periods should
+            be at least one day; sub-day values are for tests.
           '';
         };
 
@@ -230,7 +233,9 @@ let
             Additional normal-mode time in seconds after used serving ends that
             a deletion or vanish request remains unserved but continues gating
             admission (default: 90 days, 3 fixed 30-day months). This duration
-            does not expire used requests when deletionRequestDisrespector is enabled.
+            does not expire used requests when deletionRequestDisrespector is
+            enabled. Production periods should be at least one day; sub-day
+            values are for tests.
           '';
         };
       };

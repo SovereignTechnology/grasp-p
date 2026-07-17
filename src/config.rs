@@ -453,6 +453,9 @@ pub struct Config {
     )]
     pub holding_cleanup_interval_secs: u64,
 
+    // Retention is expressed in seconds for configuration consistency and short
+    // tests. Production deployments are expected to use periods of at least one
+    // day, comfortably exceeding worst-case deletion/archive processing time.
     /// How long an unused deletion or vanish request remains served after relay-observed first_seen_at.
     #[arg(
         long = "deletion-request-retention-unused-served-secs",

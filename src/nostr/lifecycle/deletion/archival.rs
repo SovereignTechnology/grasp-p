@@ -447,6 +447,14 @@ impl DeletionPolicy {
             return outcome;
         }
 
+        // NostrDatabase::delete does not return a per-event removed count. Two
+        // concurrently processed requests can therefore both have observed one
+        // target and both receive use credit after successful delete calls. This
+        // narrow over-credit race is accepted: avoiding it would require broad
+        // target-level serialization, it cannot affect deletion correctness,
+        // and any extra credited request still follows bounded used retention.
+        // Deterministic single-winner attribution remains strict for the more
+        // important case of one later admission matching many pending requests.
         let deleted_count = deletable.len();
         let delete_filter = Filter::new().ids(deletable);
         if let Err(e) = self.ctx.database.delete(delete_filter).await {
