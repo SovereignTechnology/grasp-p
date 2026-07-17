@@ -24,8 +24,8 @@ const BOLD: &str = "\x1b[1m";
 /// Returns a vector of line numbers that this spec_ref covers
 ///
 /// Examples:
-/// - "GRASP-01:nostr-relay:7" -> [7]
-/// - "GRASP-01:nostr-relay:7-9" -> [7, 8, 9]
+/// - "GRASP-01:nostr-relay:5" -> [5]
+/// - "GRASP-01:nostr-relay:5-7" -> [5, 6, 7]
 /// - "NIP-01:basic:2" -> []  (not a GRASP-01 ref)
 fn parse_spec_lines(spec_ref: &str) -> Vec<u32> {
     // Only parse GRASP-01 refs
@@ -444,16 +444,16 @@ mod tests {
 
     #[test]
     fn test_parse_spec_lines_single() {
-        assert_eq!(parse_spec_lines("GRASP-01:nostr-relay:7"), vec![7]);
-        assert_eq!(parse_spec_lines("GRASP-01:git-http:34"), vec![34]);
+        assert_eq!(parse_spec_lines("GRASP-01:nostr-relay:5"), vec![5]);
+        assert_eq!(parse_spec_lines("GRASP-01:git-http:32"), vec![32]);
     }
 
     #[test]
     fn test_parse_spec_lines_range() {
-        assert_eq!(parse_spec_lines("GRASP-01:nostr-relay:7-9"), vec![7, 8, 9]);
+        assert_eq!(parse_spec_lines("GRASP-01:nostr-relay:5-7"), vec![5, 6, 7]);
         assert_eq!(
-            parse_spec_lines("GRASP-01:cors:50-53"),
-            vec![50, 51, 52, 53]
+            parse_spec_lines("GRASP-01:cors:48-51"),
+            vec![48, 49, 50, 51]
         );
     }
 

@@ -11,7 +11,7 @@ use crate::specs::grasp01::RequirementLevel;
 ///
 /// Update this when bumping to a newer spec revision so reports indicate
 /// which spec line numbers are being referenced.
-pub const GRASP_06_COMMIT_ID: &str = "DRAFT";
+pub const GRASP_06_COMMIT_ID: &str = "4eeee96ffefeec8fd80a320d944f5b5e89171f0b";
 
 /// Reference to a specific GRASP-06 specification requirement.
 ///
@@ -27,18 +27,18 @@ pub enum SpecRef {
     /// configured with GRASP-06 enabled, NIP-11 `supported_grasps` MUST
     /// include `"GRASP-06"` so clients can discover the capability.
     Grasp06AdvertisedWhenEnabled,
-    /// 06.md line 13 — MUST respond to upload-pack on any well-formed path as
+    /// 06.md line 11 — MUST respond to upload-pack on any well-formed path as
     /// if serving an empty bare repository.
     Grasp06FetchEmptyRepo,
-    /// 06.md line 15 — MUST accept pushes to `refs/nostr/<event-id>`.
+    /// 06.md line 13 — MUST accept pushes to `refs/nostr/<event-id>`.
     Grasp06AcceptRefsNostrPush,
-    /// 06.md line 15 — MUST reject pushes to any other ref namespace.
+    /// 06.md line 13 — MUST reject pushes to any other ref namespace.
     Grasp06RejectNonNostrRefs,
-    /// 06.md lines 21–24 — MUST accept PR/PR-Update events that would otherwise
+    /// 06.md lines 19–22 — MUST accept PR/PR-Update events that would otherwise
     /// be rejected by GRASP-01, when they carry a matching `a` tag AND a `clone`
     /// tag naming this relay's /prs/ endpoint.
     Grasp06RelaxAcceptPrEvent,
-    /// 06.md lines 23–24 — the relaxation applies only when the event's `clone`
+    /// 06.md line 22 — the relaxation applies only when the event's `clone`
     /// tag names this relay's /prs/ endpoint; otherwise the event is rejected.
     Grasp06RelaxRequiresCloneTag,
     /// Design-doc derived (docs/explanation/grasp-06-contributor-pr-submission.md
@@ -79,11 +79,11 @@ impl SpecRef {
         match self {
             SpecRef::Grasp06NotAdvertised404 => "GRASP-06:nip-11-discovery:-1",
             SpecRef::Grasp06AdvertisedWhenEnabled => "GRASP-06:nip-11-discovery:-2",
-            SpecRef::Grasp06FetchEmptyRepo => "GRASP-06:git-http:13",
-            SpecRef::Grasp06AcceptRefsNostrPush => "GRASP-06:git-http-accept:15",
-            SpecRef::Grasp06RejectNonNostrRefs => "GRASP-06:git-http-reject:15",
-            SpecRef::Grasp06RelaxAcceptPrEvent => "GRASP-06:event-acceptance:21",
-            SpecRef::Grasp06RelaxRequiresCloneTag => "GRASP-06:event-acceptance:23",
+            SpecRef::Grasp06FetchEmptyRepo => "GRASP-06:git-http:11",
+            SpecRef::Grasp06AcceptRefsNostrPush => "GRASP-06:git-http-accept:13",
+            SpecRef::Grasp06RejectNonNostrRefs => "GRASP-06:git-http-reject:13",
+            SpecRef::Grasp06RelaxAcceptPrEvent => "GRASP-06:event-acceptance:19",
+            SpecRef::Grasp06RelaxRequiresCloneTag => "GRASP-06:event-acceptance:22",
             SpecRef::Grasp06MirrorToAnnouncedRepo => "GRASP-06:mirror-forward:design",
             SpecRef::Grasp06NoReverseMirror => "GRASP-06:mirror-reverse:design",
             SpecRef::Grasp06CommitMismatchDeletesRef => "GRASP-06:commit-mismatch:design",
@@ -133,21 +133,21 @@ pub const GRASP_06_REQUIREMENTS: &[SpecRequirement] = &[
     // Git Smart HTTP Service
     SpecRequirement {
         spec_ref: SpecRef::Grasp06FetchEmptyRepo,
-        line: 13,
+        line: 11,
         section: "Git Smart HTTP Service",
         text: "MUST respond to upload-pack requests for any well-formed path as if serving an empty bare repository until at least one `refs/nostr/<event-id>` has been accepted for that path.",
         level: RequirementLevel::Must,
     },
     SpecRequirement {
         spec_ref: SpecRef::Grasp06AcceptRefsNostrPush,
-        line: 15,
+        line: 13,
         section: "Git Smart HTTP Service",
         text: "MUST accept pushes to `refs/nostr/<event-id>`. MAY reject based on size, SPAM prevention, allowlists, pre-payment, PoW, or similar policy.",
         level: RequirementLevel::Must,
     },
     SpecRequirement {
         spec_ref: SpecRef::Grasp06RejectNonNostrRefs,
-        line: 15,
+        line: 13,
         section: "Git Smart HTTP Service",
         text: "MUST reject pushes to any other ref namespace (only `refs/nostr/<event-id>` is accepted).",
         level: RequirementLevel::Must,
@@ -155,14 +155,14 @@ pub const GRASP_06_REQUIREMENTS: &[SpecRequirement] = &[
     // Event Acceptance
     SpecRequirement {
         spec_ref: SpecRef::Grasp06RelaxAcceptPrEvent,
-        line: 21,
+        line: 19,
         section: "Event Acceptance",
         text: "MUST accept PRs and PR Updates that would otherwise be rejected under GRASP-01 for not referencing an accepted repository announcement, provided the event has an `a` tag of the form `30617:<pubkey>:<identifier>` AND a `clone` tag naming this service's /prs/<signer-npub>/<identifier>.git endpoint.",
         level: RequirementLevel::Must,
     },
     SpecRequirement {
         spec_ref: SpecRef::Grasp06RelaxRequiresCloneTag,
-        line: 23,
+        line: 22,
         section: "Event Acceptance",
         text: "The relaxation applies ONLY when the event's `clone` tag names this relay's /prs/ endpoint. PR events without a matching clone tag remain subject to GRASP-01 rejection.",
         level: RequirementLevel::Must,
@@ -240,8 +240,8 @@ mod tests {
 
     #[test]
     fn test_parse_spec_line_real() {
+        assert_eq!(parse_spec_line("GRASP-06:git-http:11"), Some(11));
         assert_eq!(parse_spec_line("GRASP-06:git-http:13"), Some(13));
-        assert_eq!(parse_spec_line("GRASP-06:git-http:15"), Some(15));
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_parse_spec_line_non_grasp06() {
-        assert_eq!(parse_spec_line("GRASP-01:nostr-relay:7"), None);
+        assert_eq!(parse_spec_line("GRASP-01:nostr-relay:5"), None);
         assert_eq!(parse_spec_line("NIP-01:basic:1"), None);
     }
 
