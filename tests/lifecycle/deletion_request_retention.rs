@@ -429,7 +429,7 @@ async fn nip62_targeting_gates_while_non_targeting_request_never_does() {
 }
 
 #[tokio::test]
-async fn normal_mode_nip62_replay_does_not_make_a_noop_request_used() {
+async fn normal_mode_nip62_replay_from_unserved_gate_does_not_make_a_noop_request_used() {
     let relay = TestRelay::start_with_deletion_lifecycle(lifecycle_options()).await;
     let client = AuditClient::new(relay.url(), AuditConfig::isolated())
         .await
@@ -440,10 +440,15 @@ async fn normal_mode_nip62_replay_does_not_make_a_noop_request_used() {
         .send_event(request.clone())
         .await
         .expect("accept initial no-op vanish request");
+    wait_until(
+        "no-op vanish request moves to its unserved gate",
+        || async { !is_served(&client, request.id).await },
+    )
+    .await;
     client
         .send_event(request.clone())
         .await
-        .expect("accept exact no-op vanish replay");
+        .expect("accept exact no-op vanish replay from its unserved gate");
 
     let record = open_tombstones(relay.relay_data_path().clone())
         .await

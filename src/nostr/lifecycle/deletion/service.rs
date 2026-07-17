@@ -82,6 +82,13 @@ impl DeletionService {
         let now = Timestamp::now();
         let mut eligible = std::collections::HashMap::new();
         for (record, category) in candidates {
+            // A deletion or vanish request must never prove the utility of its
+            // own gate. In particular, after cleanup moves an unused request
+            // to Tombstones, replaying its signed payload reaches this gate
+            // before duplicate handling and would otherwise select itself.
+            if record.request.id == event.id {
+                continue;
+            }
             match self.request_is_expired(&record, now) {
                 Ok(true) => continue,
                 Ok(false) => {}
