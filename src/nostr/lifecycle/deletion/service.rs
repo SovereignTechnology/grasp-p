@@ -29,8 +29,17 @@ impl DeletionService {
             return None;
         }
 
-        let mut candidates = Vec::new();
         let tombstones = self.ctx.tombstones();
+
+        // Candidate discovery, expiry evaluation, promotion, and last-used
+        // attribution are one lifecycle transition. In particular, selecting a
+        // winner before waiting for this lock can leave a later, still-live
+        // candidate unchecked when that winner expires while waiting. Hold the
+        // lock through discovery so cleanup cannot change the candidate set or
+        // expiry state between selection and attribution.
+        let _lifecycle_guard = tombstones.lock_lifecycle().await;
+
+        let mut candidates = Vec::new();
         match tombstones.vanish_candidates(&event.pubkey).await {
             Ok(records) => candidates.extend(records.into_iter().map(|record| (record, "vanish"))),
             Err(error) => return Some(Self::gate_error("querying vanish candidates", error)),
@@ -93,10 +102,8 @@ impl DeletionService {
             .into_values()
             .min_by(|(left, _), (right, _)| Self::winner_order(left, right))?;
 
-        // Serialize promotion plus last-used attribution with request cleanup.
-        // Cleanup always re-reads metadata under this same lock, so it cannot
-        // remove the Main copy selected by an admission using an old snapshot.
-        let _lifecycle_guard = tombstones.lock_lifecycle().await;
+        // Cleanup uses this same lock, so it cannot remove the Main copy
+        // selected by this admission while it is being promoted.
         let Some(winner) = (match tombstones
             .lifecycle_for_request_result(&winner.request.id)
             .await
@@ -984,6 +991,56 @@ mod tests {
                 .unwrap()
                 .last_used_at,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_uses_a_live_later_request_when_an_earlier_request_has_expired() {
+        let ctx = context(crate::config::Config {
+            deletion_request_retention_unused_served_secs: 1,
+            deletion_request_retention_unused_unserved_gating_additional_secs: 1,
+            ..crate::config::Config::for_testing()
+        });
+        let service = DeletionService::new(ctx.clone());
+        let keys = Keys::generate();
+        let incoming = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        let expired = deletion(&keys, incoming.id);
+        let live = EventBuilder::new(Kind::EventDeletion, "live fallback")
+            .tags(vec![Tag::event(incoming.id)])
+            .finalize(&keys)
+            .unwrap();
+        let now = Timestamp::now().as_secs();
+        for (request, first_seen_at) in [(&expired, now - 3), (&live, now)] {
+            ctx.tombstones
+                .record_request(
+                    request,
+                    Timestamp::from_secs(first_seen_at),
+                    RequestClassification::LocallyActionable,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(service.gate(&incoming).await.is_some());
+        assert_eq!(
+            ctx.tombstones
+                .lifecycle_for_request(&expired.id)
+                .await
+                .unwrap()
+                .last_used_at,
+            None,
+            "expired requests must not receive gate-use credit"
+        );
+        assert!(
+            ctx.tombstones
+                .lifecycle_for_request(&live.id)
+                .await
+                .unwrap()
+                .last_used_at
+                .is_some(),
+            "a later live request must still reject the incoming event"
         );
     }
 
