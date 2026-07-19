@@ -17,6 +17,7 @@ pub mod filters;
 pub mod health;
 pub mod metrics;
 pub mod naughty_list;
+pub mod private_index;
 pub mod rejected_index;
 pub mod relay_connection;
 pub mod self_subscriber;
@@ -432,6 +433,38 @@ async fn run_purgatory_announcement_sync(
     }
 }
 
+/// GRASP-P Phase 2: background task that rebuilds the PrivateSyncIndex from
+/// the relay DB's kind-30640 events (every 5s, 200ms when `NGIT_TEST=1`).
+///
+/// Spawned ONLY when `config.private_repos_enable`. This is the single
+/// registration path into the private index and covers both sources
+/// uniformly (client-pushed AND synced 30640s both live in the relay DB).
+/// On change it re-issues derived 30641/1059 filters to connected peers,
+/// connects any newly-listed peer relays, and reprocesses held out-of-order
+/// events whose registration just became available.
+async fn run_private_registration_sync(
+    sync_manager: Arc<Mutex<SyncManager>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let interval = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(5)
+    };
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                let mut manager = sync_manager.lock().await;
+                manager.sync_private_registrations_to_index().await;
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::debug!("Private registration sync timer received shutdown signal");
+                break;
+            }
+        }
+    }
+}
+
 // Combined Health and Metrics Checker
 
 /// Background task for cleaning up expired entries from the rejected events index
@@ -470,6 +503,18 @@ async fn run_rejected_index_cleanup(
                 // Note: cleanup_expired_for_type updates metrics with type label
                 let (ann_hot_expired, _) = manager.rejected_events_index.cleanup_expired_for_type("announcement");
                 let (state_hot_expired, _) = manager.rejected_events_index.cleanup_expired_for_type("state");
+
+                // GRASP-P Phase 2: expire held private events on the same
+                // hot-cache TTL. Inert when private repos are disabled.
+                if let Some(private) = manager.write_policy.private() {
+                    let expired = private.sync_rejected().cleanup_expired();
+                    if expired > 0 {
+                        tracing::debug!(
+                            expired = expired,
+                            "Cleaned up expired held private events"
+                        );
+                    }
+                }
 
                 if ann_hot_expired + state_hot_expired > 0 {
                     tracing::debug!(
@@ -604,6 +649,10 @@ pub struct SyncManager {
     /// Rejected events (30617/30618) - two-tier storage for re-processing
     /// Handles both announcement and state events via EventType discriminator
     rejected_events_index: Arc<RejectedEventsIndex>,
+    /// GRASP-P Phase 2: alias → registration sync needs, rebuilt from the
+    /// relay DB's kind-30640 events. Only populated when
+    /// `config.private_repos_enable`; drives the derived 30641/1059 filters.
+    private_sync_index: Arc<RwLock<private_index::PrivateSyncIndex>>,
     /// Active relay connections - keyed by relay URL
     connections: HashMap<String, RelayConnection>,
     /// Health tracker for relay connection state
@@ -690,6 +739,9 @@ impl SyncManager {
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
+            private_sync_index: Arc::new(RwLock::new(
+                private_index::PrivateSyncIndex::default(),
+            )),
             connections: HashMap::new(),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
@@ -1566,6 +1618,20 @@ impl SyncManager {
             run_purgatory_announcement_sync(purgatory_sync_manager, purgatory_sync_shutdown).await;
         });
 
+        // 12b. GRASP-P Phase 2: spawn the private registration sync timer.
+        // Strictly additive — never spawned when private repos are disabled.
+        let private_enabled = {
+            let manager = sync_manager.lock().await;
+            manager.config.private_repos_enable
+        };
+        if private_enabled {
+            let private_sync_manager = Arc::clone(&sync_manager);
+            let private_sync_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                run_private_registration_sync(private_sync_manager, private_sync_shutdown).await;
+            });
+        }
+
         // 12. Main loop - handle actions from self-subscriber, disconnect, EOSE, and connect notifications
         loop {
             // Wait for an event without holding the lock
@@ -1779,6 +1845,29 @@ impl SyncManager {
                                 "Skipping previously rejected announcement event"
                             );
                             continue;
+                        }
+
+                        // GRASP-P Phase 2: skip known-rejected private events
+                        // (30640/30641/1059) — same refetch-loop protection,
+                        // via the dedicated private rejected index. Inert
+                        // when private repos are disabled (private() is None).
+                        if matches!(
+                            event.kind.as_u16(),
+                            crate::private::KIND_REGISTRATION
+                                | crate::private::KIND_STATE_ROOT
+                                | crate::private::KIND_WRAP
+                        ) {
+                            if let Some(private) = write_policy.private() {
+                                if private.sync_rejected().contains(&event.id) {
+                                    tracing::trace!(
+                                        event_id = %event.id,
+                                        kind = %event.kind.as_u16(),
+                                        relay = %relay_url_clone,
+                                        "Skipping previously rejected private event"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
 
                         let result = Self::process_event_static(
@@ -2052,7 +2141,21 @@ impl SyncManager {
     }
 
     async fn sync_generic_filters(&mut self, relay_url: &str, since: Option<Timestamp>) {
-        let filters = vec![filters::build_announcement_filter(None)];
+        let mut filters = vec![filters::build_announcement_filter(None)];
+
+        // GRASP-P Phase 2: the private registration filter (kind 30640) is a
+        // Layer-1 sibling — always subscribed alongside announcements — and
+        // the current derived 30641/1059 filters ride the same connect-time
+        // subscription so a (re)connected peer is fully covered. Strictly
+        // additive: with private repos disabled the filter set is unchanged.
+        if self.config.private_repos_enable {
+            filters.push(filters::build_private_registration_filter(None));
+            let derived_inputs = self.private_sync_index.read().await.derived_inputs();
+            filters.extend(filters::build_private_derived_filters(
+                &derived_inputs,
+                None,
+            ));
+        }
 
         // Create live subscription for ongoing announcements
         let _sub_ids = self.sync_live(relay_url, &filters).await;
@@ -2061,6 +2164,177 @@ impl SyncManager {
         // Generic filters (announcements) don't have associated repos or root_events
         let items = PendingItems::default();
         let _batch_id = self.historic_sync(relay_url, filters, items, since).await;
+    }
+
+    /// GRASP-P Phase 2: rebuild the PrivateSyncIndex from the relay DB's
+    /// kind-30640 events, reprocess held out-of-order events for newly
+    /// available registrations, and (on change) re-issue derived filters to
+    /// connected peers + connect newly-listed peer relays.
+    ///
+    /// Driven by `run_private_registration_sync` (5s, 200ms in tests). The
+    /// DB is the single source of truth, so client-pushed and synced 30640s
+    /// (and NIP-09 deletes, which remove the event from the DB) are all
+    /// reflected within one interval.
+    async fn sync_private_registrations_to_index(&mut self) {
+        if !self.config.private_repos_enable {
+            return;
+        }
+
+        let filter = Filter::new().kind(Kind::Custom(crate::private::KIND_REGISTRATION));
+        let events = match self.database.query(filter).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!("private registration index query failed: {e}");
+                return;
+            }
+        };
+
+        let mut entries: HashMap<String, private_index::PrivateRepoEntry> = HashMap::new();
+        for event in events.into_iter() {
+            let mut alias: Option<String> = None;
+            let mut keys: Vec<String> = Vec::new();
+            let mut relay_urls: Vec<String> = Vec::new();
+            let mut server_urls: Vec<String> = Vec::new();
+            for tag in event.tags.iter() {
+                let v = tag.clone().to_vec();
+                if v.len() < 2 {
+                    continue;
+                }
+                match v[0].as_str() {
+                    "d" => {
+                        if alias.is_none() {
+                            alias = Some(v[1].clone());
+                        }
+                    }
+                    // Key tags are [name, pubkey, pop-signature]; only the
+                    // pubkey matters for filters.
+                    "w" | "aux" => keys.push(v[1].clone()),
+                    "relays" => relay_urls.extend(v[1..].iter().cloned()),
+                    "server" => server_urls.extend(v[1..].iter().cloned()),
+                    _ => {}
+                }
+            }
+            let Some(alias) = alias else { continue };
+            keys.sort();
+            keys.dedup();
+            entries.insert(
+                alias,
+                private_index::PrivateRepoEntry {
+                    keys,
+                    relay_urls,
+                    server_urls,
+                },
+            );
+        }
+
+        let diff = {
+            let mut index = self.private_sync_index.write().await;
+            index.replace_all(entries)
+        };
+
+        // Out-of-order reprocess (design 1.4): drain held 30641s keyed by a
+        // newly-registered alias and held 1059s authored by a newly-claimed
+        // key, then re-run them through the standard application path. The
+        // sync path ALSO reprocesses inline on 30640 Accept; this timer pass
+        // covers registrations that arrived via client WebSocket push.
+        if !diff.added_aliases.is_empty() || !diff.added_keys.is_empty() {
+            if let Some(private) = self.write_policy.private() {
+                let private = Arc::clone(private);
+                let mut held: Vec<Event> = Vec::new();
+                for alias in &diff.added_aliases {
+                    held.extend(private.sync_rejected().take_for_alias(alias));
+                }
+                held.extend(private.sync_rejected().take_for_authors(&diff.added_keys));
+                let mut seen: HashSet<EventId> = HashSet::new();
+                held.retain(|e| seen.insert(e.id));
+                for event in held {
+                    let result = Box::pin(Self::process_event_static(
+                        &event,
+                        "private-30640-reprocess",
+                        &self.database,
+                        &self.write_policy,
+                        &self.local_relay,
+                        &self.rejected_events_index,
+                        crate::nostr::persistence::SaveContext::HotCacheReprocess,
+                    ))
+                    .await;
+                    tracing::info!(
+                        event_id = %event.id,
+                        kind = %event.kind.as_u16(),
+                        result = ?result,
+                        "Re-processed held private event after 30640 registration"
+                    );
+                }
+            }
+        }
+
+        if !diff.changed {
+            return;
+        }
+
+        let derived = {
+            let index = self.private_sync_index.read().await;
+            filters::build_private_derived_filters(&index.derived_inputs(), None)
+        };
+
+        // Connect operator-allowlisted peer relays not yet registered. Peers
+        // come EXCLUSIVELY from NGIT_PRIVATE_SYNC_PEER_URLS — tenant 30640
+        // `relays` tags are advisory metadata and must never trigger an
+        // outbound connection (SSRF / membership-map-leak guard). Their
+        // filters arrive on connect via sync_generic_filters.
+        let peer_urls = private_index::configured_peer_relay_urls(
+            &self.config.private_sync_peer_url_entries(),
+            &self.service_domain,
+        );
+        let unknown_peers: Vec<String> = {
+            let index = self.relay_sync_index.read().await;
+            peer_urls
+                .iter()
+                .filter(|url| !index.contains_key(*url))
+                .cloned()
+                .collect()
+        };
+        for url in unknown_peers {
+            if !crate::private::mirror::relay_peer_allowed(
+                &url,
+                self.config.private_mirror_allow_private_ips,
+            )
+            .await
+            {
+                tracing::warn!(
+                    relay = %url,
+                    "Skipping private-repo peer relay: SSRF guard rejected URL"
+                );
+                continue;
+            }
+            tracing::info!(relay = %url, "Registering private-repo peer relay");
+            self.register_relay(url.clone(), false).await;
+            self.try_connect_relay(&url).await;
+        }
+
+        if derived.is_empty() {
+            return;
+        }
+
+        // Re-issue the derived filters to every live-connected relay
+        // (since=None backfill, mirroring handle_new_sync_filters).
+        let live_relays: Vec<String> = {
+            let index = self.relay_sync_index.read().await;
+            index
+                .iter()
+                .filter(|(_, state)| state.connection_status.is_live_sync_active())
+                .map(|(url, _)| url.clone())
+                .collect()
+        };
+        for relay_url in live_relays {
+            if self.health_tracker.is_rate_limited(&relay_url) {
+                continue;
+            }
+            self.maybe_consolidate(&relay_url, derived.len()).await;
+            self.sync_live(&relay_url, &derived).await;
+            self.historic_sync(&relay_url, derived.clone(), PendingItems::default(), None)
+                .await;
+        }
     }
 
     /// Quick reconnect - for disconnections < 15 minutes
@@ -2905,6 +3179,67 @@ impl SyncManager {
                     }
                 }
 
+                // GRASP-P Phase 2 (design 1.4): a 30640 registration was
+                // accepted — re-process held 30641s targeting the registered
+                // alias and held 1059 wraps authored by any newly-registered
+                // w/aux key. Inert when private repos are disabled.
+                if event.kind.as_u16() == crate::private::KIND_REGISTRATION {
+                    if let Some(private) = write_policy.private() {
+                        let alias = event.tags.iter().find_map(|tag| {
+                            let v = tag.clone().to_vec();
+                            if v.len() >= 2 && v[0] == "d" {
+                                Some(v[1].clone())
+                            } else {
+                                None
+                            }
+                        });
+                        let keys: Vec<String> = event
+                            .tags
+                            .iter()
+                            .filter_map(|tag| {
+                                let v = tag.clone().to_vec();
+                                if v.len() >= 2 && (v[0] == "w" || v[0] == "aux") {
+                                    Some(v[1].clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        let mut held: Vec<Event> = Vec::new();
+                        if let Some(ref alias) = alias {
+                            held.extend(private.sync_rejected().take_for_alias(alias));
+                        }
+                        held.extend(private.sync_rejected().take_for_authors(&keys));
+                        let mut seen: HashSet<EventId> = HashSet::new();
+                        held.retain(|e| seen.insert(e.id));
+
+                        for held_event in held {
+                            // Safe recursion: the event was removed from the
+                            // private hold (and its skip-set entry cleared)
+                            // before this call; a second rejection re-holds
+                            // it without looping.
+                            let result = Box::pin(Self::process_event_static(
+                                &held_event,
+                                relay_url,
+                                database,
+                                write_policy,
+                                local_relay,
+                                rejected_events_index,
+                                crate::nostr::persistence::SaveContext::HotCacheReprocess,
+                            ))
+                            .await;
+                            tracing::info!(
+                                event_id = %held_event.id,
+                                kind = %held_event.kind.as_u16(),
+                                alias = ?alias,
+                                result = ?result,
+                                "Re-processed held private event after synced 30640 accept"
+                            );
+                        }
+                    }
+                }
+
                 ProcessResult::Saved
             }
             WritePolicyResult::Reject {
@@ -2987,6 +3322,44 @@ impl SyncManager {
                                 kind = %event.kind.as_u16(),
                                 "Event missing 'd' tag, cannot track in rejected index"
                             );
+                        }
+                    }
+
+                    // GRASP-P Phase 2 (design 1.4): hold rejected private
+                    // events in the dedicated index. The existing (pubkey,
+                    // d-tag) registration above does NOT fit these kinds —
+                    // 1059 wraps have an ephemeral outer pubkey and no `d`
+                    // tag — so 30641s are keyed by their target alias and
+                    // 1059s by their outer author. Inert when disabled.
+                    if let Some(private) = write_policy.private() {
+                        match event.kind.as_u16() {
+                            crate::private::KIND_REGISTRATION => {
+                                // No missing-dependency semantics: id-only
+                                // skip-set entry to stop refetch loops.
+                                private.sync_rejected().add_id_only(event.id);
+                            }
+                            crate::private::KIND_STATE_ROOT => {
+                                let alias = event.tags.iter().find_map(|tag| {
+                                    let v = tag.clone().to_vec();
+                                    if v.len() >= 2 && v[0] == "d" {
+                                        Some(v[1].clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+                                match alias {
+                                    Some(alias) => private
+                                        .sync_rejected()
+                                        .add_state_root(alias, event.clone()),
+                                    None => private.sync_rejected().add_id_only(event.id),
+                                }
+                            }
+                            crate::private::KIND_WRAP => {
+                                private
+                                    .sync_rejected()
+                                    .add_wrap(event.pubkey.to_hex(), event.clone());
+                            }
+                            _ => {}
                         }
                     }
 
@@ -3136,6 +3509,19 @@ impl SyncManager {
     ///
     /// Bootstrap relays are NEVER disconnected, even if empty.
     async fn check_disconnects(&mut self) {
+        // GRASP-P Phase 2: relays connected for private-repo sync carry no
+        // public repos/root events, so the empty-relay heuristic below would
+        // flap them. Keep operator-allowlisted peers connected. Empty set
+        // (zero overhead) when private repos are disabled.
+        let private_peer_urls: HashSet<String> = if self.config.private_repos_enable {
+            private_index::configured_peer_relay_urls(
+                &self.config.private_sync_peer_url_entries(),
+                &self.service_domain,
+            )
+        } else {
+            HashSet::new()
+        };
+
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
             let index = self.relay_sync_index.read().await;
@@ -3144,6 +3530,11 @@ impl SyncManager {
                 .filter_map(|(relay_url, state)| {
                     // Skip bootstrap relays - they stay connected
                     if state.is_bootstrap {
+                        return None;
+                    }
+
+                    // Skip private-repo peer relays (Phase 2)
+                    if private_peer_urls.contains(relay_url) {
                         return None;
                     }
 
@@ -3523,8 +3914,13 @@ impl SyncManager {
             // Get event IDs to exclude: purgatory + rejected announcements
             let purgatory_ids = self.purgatory.event_ids();
             let rejected_ids = self.rejected_events_index.get_all_event_ids();
-            let excluded_ids: HashSet<EventId> =
+            let mut excluded_ids: HashSet<EventId> =
                 purgatory_ids.union(&rejected_ids).cloned().collect();
+            // GRASP-P Phase 2: also exclude known-rejected private events
+            // (30640/30641/1059) so negentropy doesn't refetch them.
+            if let Some(private) = self.write_policy.private() {
+                excluded_ids.extend(private.sync_rejected().all_event_ids());
+            }
 
             for (idx, result) in diff_results {
                 match result {

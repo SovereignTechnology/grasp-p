@@ -64,6 +64,27 @@ async-trait = "0.1"
 # Temporary directories (used for GRASP-06 empty-repo synthesis)
 tempfile = "3"
 
+# GRASP-P private repos: meta store (same heed version nostr-lmdb pins),
+# small sync primitives, and temp-file names for streamed blob uploads.
+# sha256/hex come from the `nostr` re-export of bitcoin_hashes (already compiled).
+# NOTE (follow-up C3): these "serde"/"serde-json" features unify (Cargo feature
+# union) onto the heed that nostr-lmdb pins for the relay core store. This
+# assumes both crates continue to share one heed version; the features are
+# additive and unused by nostr-lmdb (benign today). If nostr-lmdb ever moves to
+# a different heed major, revisit rather than relying on this shared-version
+# assumption. Left as documentation only — no refactor.
+heed = { version = "0.20", default-features = false, features = ["serde", "serde-json"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+# GRASP-P Phase 2 blob mirror: pull peer blobs over the existing public
+# GET /<sha256> route (plain http for tests, https in production).
+# rustls (not native-tls) keeps openssl/openssl-sys out of the shipped
+# relay binary — master used rustls via nostr-sdk; native-tls was dev-only.
+# The mirror only uses GET + Response::chunk(), so no stream/gzip/http2/json
+# features are needed.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
 # Git (for future use)
 # git-http-backend = "0.3"
 
@@ -71,7 +92,6 @@ tempfile = "3"
 # Testing
 grasp-audit = { path = "grasp-audit", version = "0.2.0" }
 tempfile = "3"
-reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
 [lib]
 name = "ngit_grasp"

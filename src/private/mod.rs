@@ -1,0 +1,892 @@
+//! GRASP-P: multi-tenant private git repositories on a public grasp relay.
+//!
+//! The server is content-blind: it verifies outer signatures against
+//! registered opaque pubkeys and moves ciphertext (events + blobs). It never
+//! inspects wrap contents and never creates bare git repos for private repos.
+//!
+//! Everything here is inert unless `NGIT_PRIVATE_REPOS_ENABLE=true`: when the
+//! flag is off no [`PrivateService`] is constructed and all four private kinds
+//! (30640/30641/1059/21059) fall through to the existing admission handling.
+
+pub mod blob_store;
+pub mod blossom_auth;
+pub mod gc;
+pub mod meta;
+pub mod mirror;
+pub mod quota;
+pub mod registration;
+pub mod state_root;
+pub mod write_keys;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use nostr::{Event, Filter, Kind, PublicKey};
+use nostr_relay_builder::prelude::WritePolicyResult;
+use tokio::task::JoinHandle;
+
+use crate::config::{Config, RegistrationMode};
+use crate::nostr::policy::{reject_error, reject_restricted};
+use crate::nostr::SharedDatabase;
+
+pub use blob_store::{BlobDescriptor, BlobStore, UploadSink};
+pub use blossom_auth::{BlossomAuth, BlossomOp};
+pub use meta::{MetaEnv, RegistrationRecord};
+
+/// Private-repo event kinds.
+pub const KIND_REGISTRATION: u16 = 30640;
+pub const KIND_STATE_ROOT: u16 = 30641;
+pub const KIND_WRAP: u16 = 1059;
+pub const KIND_EPHEMERAL_WRAP: u16 = 21059;
+
+/// Hard cap on concurrent in-flight blob uploads. Together with the in-flight
+/// byte reservation this bounds transient `<blob_root>/tmp` disk usage, file
+/// descriptors, and inodes BEFORE any request body bytes land on disk.
+const MAX_CONCURRENT_UPLOADS: u32 = 64;
+
+/// Book-keeping for uploads whose bytes are still streaming to tmp files.
+#[derive(Debug, Default)]
+struct InflightUploads {
+    bytes: u64,
+    count: u32,
+}
+
+/// RAII reservation of in-flight upload capacity: declared bytes are counted
+/// against the global budget from BEFORE the temp file is opened until the
+/// sink is finished or dropped.
+#[derive(Debug)]
+pub struct UploadReservation {
+    inflight: Arc<parking_lot::Mutex<InflightUploads>>,
+    bytes: u64,
+}
+
+impl Drop for UploadReservation {
+    fn drop(&mut self) {
+        let mut guard = self.inflight.lock();
+        guard.bytes = guard.bytes.saturating_sub(self.bytes);
+        guard.count = guard.count.saturating_sub(1);
+    }
+}
+
+/// Errors surfaced by the blob routes, carrying their HTTP status.
+#[derive(Debug)]
+pub enum BlobError {
+    /// 400 — malformed request / hash mismatch.
+    BadRequest(String),
+    /// 401 — missing/malformed/expired authorization.
+    Unauthorized(String),
+    /// 403 — valid auth event signed by a key not authorized for the alias.
+    Forbidden(String),
+    /// 411 — PUT without Content-Length.
+    LengthRequired,
+    /// 413 — blob exceeds the per-blob cap (pre- or mid-stream).
+    TooLarge,
+    /// 451 — denylisted content.
+    Denylisted,
+    /// 507 — tenant/repo/global quota exceeded.
+    QuotaExceeded,
+    /// 500 — internal failure.
+    Internal(String),
+}
+
+impl BlobError {
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::BadRequest(_) => 400,
+            Self::Unauthorized(_) => 401,
+            Self::Forbidden(_) => 403,
+            Self::LengthRequired => 411,
+            Self::TooLarge => 413,
+            Self::Denylisted => 451,
+            Self::QuotaExceeded => 507,
+            Self::Internal(_) => 500,
+        }
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            Self::BadRequest(reason) | Self::Unauthorized(reason) | Self::Forbidden(reason) => {
+                reason.clone()
+            }
+            Self::LengthRequired => "Content-Length header is required".to_string(),
+            Self::TooLarge => "blob exceeds the maximum blob size".to_string(),
+            Self::Denylisted => "content unavailable for legal reasons".to_string(),
+            Self::QuotaExceeded => "quota exceeded".to_string(),
+            Self::Internal(reason) => reason.clone(),
+        }
+    }
+}
+
+/// Extracted private-repo config subset (cheap to clone into sinks/tasks).
+#[derive(Debug, Clone)]
+pub struct PrivateConfig {
+    pub domain: String,
+    pub registration_mode: RegistrationMode,
+    pub pow_bits: u8,
+    pub tenant_whitelist: Vec<String>,
+    pub max_blob_bytes: u64,
+    pub max_event_bytes: u64,
+    pub quota_tenant_bytes: u64,
+    pub quota_repo_bytes: u64,
+    pub global_budget_bytes: u64,
+    pub max_aliases_per_tenant: u32,
+    pub max_write_keys_per_alias: u32,
+    pub state_history_editions: u32,
+    pub gc_grace_secs: u64,
+    pub gc_interval_secs: u64,
+    pub offboard_retention_secs: u64,
+    pub accept_direct_invites: bool,
+    pub per_tenant_metrics: bool,
+    // Phase 2 blob mirror knobs.
+    pub mirror_enable: bool,
+    pub mirror_peer_urls: Option<Vec<String>>,
+    pub mirror_max_concurrency: u32,
+    pub mirror_fetch_timeout_secs: u64,
+    /// SSRF guard: when false (default), mirror fetch peers resolving to
+    /// loopback/private/link-local/unspecified/multicast IPs are dropped and
+    /// only https peers are contacted. Tests set this true to mirror over
+    /// http://127.0.0.1.
+    pub mirror_allow_private_ips: bool,
+    /// R6 parity fingerprint over the admission-affecting config.
+    pub policy_fingerprint: String,
+}
+
+impl PrivateConfig {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            domain: config.domain.clone(),
+            registration_mode: config.private_registration_mode,
+            pow_bits: config.private_pow_bits,
+            tenant_whitelist: config.private_tenant_whitelist_entries(),
+            max_blob_bytes: config.private_max_blob_bytes,
+            max_event_bytes: config.private_max_event_bytes,
+            quota_tenant_bytes: config.private_quota_tenant_bytes,
+            quota_repo_bytes: config.private_quota_repo_bytes,
+            global_budget_bytes: config.private_global_budget_bytes,
+            max_aliases_per_tenant: config.private_max_aliases_per_tenant,
+            max_write_keys_per_alias: config.private_max_write_keys_per_alias,
+            state_history_editions: config.private_state_history_editions,
+            gc_grace_secs: config.private_gc_grace_secs,
+            gc_interval_secs: config.private_gc_interval_secs,
+            offboard_retention_secs: config.private_offboard_retention_secs,
+            accept_direct_invites: config.private_accept_direct_invites,
+            per_tenant_metrics: config.private_per_tenant_metrics,
+            mirror_enable: config.private_mirror_enable,
+            mirror_peer_urls: config.private_mirror_peer_url_entries(),
+            mirror_max_concurrency: config.private_mirror_max_concurrency,
+            mirror_fetch_timeout_secs: config.private_mirror_fetch_timeout_secs,
+            mirror_allow_private_ips: config.private_mirror_allow_private_ips,
+            policy_fingerprint: policy_fingerprint(config),
+        }
+    }
+}
+
+/// R6 config-parity fingerprint: a short hash of the admission-affecting
+/// private-repo config. Both nodes of a pair must advertise the SAME value
+/// (compare via NIP-11 `private_repos.policy_fingerprint` or the startup
+/// log); a mismatch means registrations can be accepted on one node and
+/// silently rejected on the other (per-repo desync).
+///
+/// The raw tenant whitelist feeds the hash but is never exposed. The domain
+/// set is `sorted({own domain} ∪ {bootstrap peer})` so a correctly-paired
+/// two-node setup (each bootstrapped to the other) hashes the same set on
+/// both sides.
+pub fn policy_fingerprint(config: &Config) -> String {
+    use nostr::hashes::{sha256, Hash};
+
+    fn strip_url(value: &str) -> String {
+        let v = value.trim().trim_end_matches('/');
+        for prefix in ["wss://", "ws://", "https://", "http://"] {
+            if let Some(rest) = v.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+        v.to_string()
+    }
+
+    let mut domains = vec![strip_url(&config.domain)];
+    if let Some(ref bootstrap) = config.sync_bootstrap_relay_url {
+        domains.push(strip_url(bootstrap));
+    }
+    domains.sort();
+    domains.dedup();
+
+    let mut whitelist = config.private_tenant_whitelist_entries();
+    whitelist.sort();
+
+    let preimage = format!(
+        "grasp-p-policy-v1|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|domains={}",
+        config.private_registration_mode,
+        config.private_pow_bits,
+        whitelist.join(","),
+        config.private_max_event_bytes,
+        config.private_max_blob_bytes,
+        config.private_quota_tenant_bytes,
+        config.private_quota_repo_bytes,
+        config.private_global_budget_bytes,
+        config.private_max_aliases_per_tenant,
+        config.private_max_write_keys_per_alias,
+        domains.join(","),
+    );
+    let digest = sha256::Hash::hash(preimage.as_bytes()).to_string();
+    digest[..16].to_string()
+}
+
+/// Upper bound on how far into the future a private event's `created_at` may
+/// be (15 minutes of clock skew). NIP-59 gift wraps are backdated, never
+/// future-dated, and a future-dated 30640/30641 is an attack twice over: it
+/// wins latest-edition selection on naive readers, AND — worse — it EVICTS
+/// the real latest edition from the relay DB (addressable replacement keeps
+/// only the newest per coordinate), a data-availability attack. Anything
+/// beyond clock skew is refused at admission.
+pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 900;
+
+/// Reject events dated implausibly far in the future. Returns Some(rejection)
+/// when the event must be refused, None when it may proceed.
+pub(crate) fn check_not_future_dated(event: &Event) -> Option<WritePolicyResult> {
+    let now = nostr::Timestamp::now().as_secs();
+    if event.created_at.as_secs() > now + MAX_FUTURE_SKEW_SECS {
+        Some(crate::nostr::policy::reject_invalid(
+            "event created_at is too far in the future",
+        ))
+    } else {
+        None
+    }
+}
+
+/// The GRASP-P private-repo subsystem: registration/key/quota/blob state plus
+/// admission handlers and blob-route logic. Constructed once per relay when
+/// `NGIT_PRIVATE_REPOS_ENABLE=true`.
+pub struct PrivateService {
+    pub(crate) cfg: PrivateConfig,
+    pub(crate) meta: MetaEnv,
+    pub(crate) blobs: BlobStore,
+    pub(crate) database: SharedDatabase,
+    denylist: HashSet<String>,
+    /// In-flight upload reservations (see [`UploadReservation`]).
+    inflight: Arc<parking_lot::Mutex<InflightUploads>>,
+    /// Phase 2: hot cache of 30641/1059 events rejected before their 30640
+    /// arrived (out-of-order sync). Drained by the sync layer on 30640 Accept.
+    sync_rejected: crate::sync::private_index::PrivateRejectedIndex,
+    /// Phase 2: blob mirror job queue sender (set by [`Self::spawn_mirror`],
+    /// absent when mirroring is disabled).
+    mirror_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<mirror::MirrorJob>>,
+}
+
+impl std::fmt::Debug for PrivateService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateService")
+            .field("domain", &self.cfg.domain)
+            .field("mode", &self.cfg.registration_mode)
+            .finish()
+    }
+}
+
+impl PrivateService {
+    /// Construct the service: open meta env + blob store, load the denylist,
+    /// and reconcile the meta index against the relay DB's kind-30640 events.
+    pub async fn new(config: &Config, database: SharedDatabase) -> Result<Arc<Self>> {
+        let meta_path = PathBuf::from(config.effective_private_meta_path());
+        let blob_path = PathBuf::from(config.effective_private_blob_path());
+
+        let meta = MetaEnv::open(&meta_path)?;
+        let blobs = BlobStore::open(&blob_path)?;
+
+        let denylist = match &config.private_denylist_path {
+            Some(path) => {
+                let contents = std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read private denylist at {path}"))?;
+                contents
+                    .lines()
+                    .map(|l| l.trim().to_lowercase())
+                    .filter(|l| blossom_auth::is_lower_hex_64(l))
+                    .collect()
+            }
+            None => HashSet::new(),
+        };
+
+        let svc = Arc::new(Self {
+            cfg: PrivateConfig::from_config(config),
+            meta,
+            blobs,
+            database,
+            denylist,
+            inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
+            sync_rejected: crate::sync::private_index::PrivateRejectedIndex::new(
+                std::time::Duration::from_secs(config.rejected_hot_cache_duration_secs),
+            ),
+            mirror_tx: std::sync::OnceLock::new(),
+        });
+
+        svc.boot_reconcile().await?;
+        svc.refresh_gauges();
+        tracing::info!(
+            mode = %svc.cfg.registration_mode,
+            policy_fingerprint = %svc.cfg.policy_fingerprint,
+            mirror_enabled = svc.cfg.mirror_enable,
+            configured_peer = ?config.sync_bootstrap_relay_url,
+            "GRASP-P private repositories enabled"
+        );
+        Ok(svc)
+    }
+
+    /// Phase 2: the out-of-order rejected-event hold (30641 by alias, 1059
+    /// by outer author). Used by the sync layer's pre-filter, rejection
+    /// registration, and 30640-Accept reprocess hook.
+    pub fn sync_rejected(&self) -> &crate::sync::private_index::PrivateRejectedIndex {
+        &self.sync_rejected
+    }
+
+    /// Rebuild registrations/key_claims/tenant_aliases from the relay DB's
+    /// kind-30640 events when the meta index is missing or stale. Ledger and
+    /// blob claims are authoritative in meta and never recomputed here.
+    async fn boot_reconcile(&self) -> Result<()> {
+        let filter = Filter::new().kind(Kind::Custom(KIND_REGISTRATION));
+        let events = self
+            .database
+            .query(filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("boot reconcile query failed: {e}"))?;
+
+        let mut applied = 0_usize;
+        for event in events.into_iter() {
+            let alias = event.tags.iter().find_map(|t| {
+                let v = t.clone().to_vec();
+                if v.len() >= 2 && v[0] == "d" {
+                    Some(v[1].clone())
+                } else {
+                    None
+                }
+            });
+            let Some(alias) = alias else { continue };
+            if !registration::is_valid_alias(&alias) {
+                continue;
+            }
+
+            let needs_apply = {
+                let txn = self.meta.read_txn()?;
+                match self.meta.get_registration(&txn, &alias)? {
+                    None => true,
+                    Some(record) => record.event_id != event.id.to_hex(),
+                }
+            };
+            if needs_apply {
+                // Re-run the registration handler; admission-mode gates only
+                // apply to NEW aliases, which is correct for replays of events
+                // this node already admitted, except whitelist/pow changes —
+                // those are intentionally re-enforced for consistency.
+                let result = registration::handle(self, &event);
+                if matches!(result, WritePolicyResult::Accept) {
+                    applied += 1;
+                } else {
+                    tracing::warn!(
+                        alias = %alias,
+                        "boot reconcile: stored 30640 no longer passes registration checks"
+                    );
+                }
+            }
+        }
+        if applied > 0 {
+            tracing::info!("private meta boot reconcile applied {applied} registration(s)");
+        }
+        Ok(())
+    }
+
+    /// Update the aggregate gauges (aliases + global ledger bytes).
+    pub(crate) fn refresh_gauges(&self) {
+        if let Ok(txn) = self.meta.read_txn() {
+            if let Ok(count) = self.meta.registrations_len(&txn) {
+                crate::metrics::set_private_aliases_total(count);
+            }
+            if let Ok(total) = quota::global_total(&self.meta, &txn) {
+                crate::metrics::set_private_ledger_global_bytes(total);
+            }
+        }
+    }
+
+    /// A registration that exists in meta, is not tombstoned, AND whose 30640
+    /// coordinate still exists in the relay DB (self-healing vs missed
+    /// deletes — see exit test 8).
+    pub(crate) async fn live_registration(&self, alias: &str) -> Result<Option<RegistrationRecord>> {
+        let record = {
+            let txn = self.meta.read_txn()?;
+            self.meta.get_registration(&txn, alias)?
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if record.tombstoned_at.is_some() {
+            return Ok(None);
+        }
+        let Ok(tenant_pk) = PublicKey::from_hex(&record.tenant_hex) else {
+            return Ok(None);
+        };
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_REGISTRATION))
+            .author(tenant_pk)
+            .identifier(alias)
+            .limit(1);
+        let events = self
+            .database
+            .query(filter)
+            .await
+            .map_err(|e| anyhow::anyhow!("liveness query failed: {e}"))?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    // ------------------------------------------------------------------
+    // admit_event arms
+    // ------------------------------------------------------------------
+
+    /// Kind 30640. Applies identically to user-submitted and synced events.
+    pub async fn handle_registration(&self, event: &Event) -> WritePolicyResult {
+        let result = registration::handle(self, event);
+        record_event_metric(KIND_REGISTRATION, &result);
+        result
+    }
+
+    /// Kind 30641.
+    pub async fn handle_state_root(&self, event: &Event) -> WritePolicyResult {
+        let result = state_root::handle(self, event).await;
+        if matches!(result, WritePolicyResult::Accept) {
+            // Phase 2: pull any referenced blobs we don't hold from a peer.
+            // No-op when mirroring is disabled (sender never set) or when all
+            // blobs are already local (client-push path on the origin node).
+            mirror::enqueue_for_state_root(self, event);
+        }
+        record_event_metric(KIND_STATE_ROOT, &result);
+        result
+    }
+
+    /// Kinds 1059 / 21059. Returns `None` for wraps from unregistered keys so
+    /// the caller can fall through to the existing related-event handling
+    /// (public path unchanged).
+    pub async fn try_handle_wrap(
+        &self,
+        event: &Event,
+        ephemeral: bool,
+    ) -> Option<WritePolicyResult> {
+        let kind = if ephemeral { KIND_EPHEMERAL_WRAP } else { KIND_WRAP };
+
+        let author_hex = event.pubkey.to_hex();
+        let claim = match write_keys::find_claim(&self.meta, &author_hex) {
+            Ok(claim) => claim,
+            Err(e) => {
+                tracing::warn!("private wrap key lookup failed: {e}");
+                let result = reject_error("private meta store failure");
+                record_event_metric(kind, &result);
+                return Some(result);
+            }
+        };
+        // Unregistered outer key → fall through to public handling.
+        let (alias, record, _role) = claim?;
+
+        // From here on this subsystem owns the event.
+        if let Some(rejection) = check_not_future_dated(event) {
+            return Some(rejection);
+        }
+        let event_json_len = event.as_json().len() as u64;
+        if event_json_len > self.cfg.max_event_bytes {
+            let result = reject_restricted("event exceeds private repo size limit");
+            record_event_metric(kind, &result);
+            return Some(result);
+        }
+
+        // Alias must still be live (registration deleted → reject).
+        match self.live_registration(&alias).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let result = reject_restricted("unregistered key");
+                record_event_metric(kind, &result);
+                return Some(result);
+            }
+            Err(e) => {
+                tracing::warn!("private wrap liveness check failed: {e}");
+                let result = reject_error("private liveness check failed");
+                record_event_metric(kind, &result);
+                return Some(result);
+            }
+        }
+
+        // Quota: charge only stored wraps (1059), never ephemeral (21059).
+        // §4b idempotency: admit_event runs BEFORE the library's save_event,
+        // and duplicates/replays (client retries, P2 loopback:0 sync) still
+        // reach this policy — charge only wraps the DB does not already hold,
+        // otherwise every replay would inflate the ledger.
+        if !ephemeral {
+            match self.database.check_id(&event.id).await {
+                Ok(nostr_relay_builder::prelude::DatabaseEventStatus::NotExistent) => {}
+                Ok(_) => {
+                    // Already saved (the DB will answer Duplicate) or deleted
+                    // (the deletion gate handles it): never re-charge.
+                    let result = WritePolicyResult::Accept;
+                    record_event_metric(kind, &result);
+                    return Some(result);
+                }
+                Err(e) => {
+                    tracing::warn!("private wrap duplicate check failed: {e}");
+                    let result = reject_error("private liveness check failed");
+                    record_event_metric(kind, &result);
+                    return Some(result);
+                }
+            }
+            let tenant_hex = record.tenant_hex.clone();
+            let event_id_hex = event.id.to_hex();
+            // The async `check_id` above races: two concurrent deliveries of the
+            // SAME wrap id can both observe NotExistent before either is saved,
+            // then both charge event_bytes for one stored copy. Make the charge
+            // idempotent per id INSIDE the serialized meta write txn: the first
+            // delivery charges + records the id; any concurrent one sees the id
+            // already charged and accepts without re-charging.
+            let charge_result = self.meta.with_write(|meta, txn| {
+                if meta.is_wrap_charged(txn, &event_id_hex)? {
+                    return Ok(true);
+                }
+                if !quota::check(meta, txn, &self.cfg, &tenant_hex, &alias, event_json_len)? {
+                    return Ok(false);
+                }
+                quota::charge(meta, txn, &tenant_hex, &alias, event_json_len, false)?;
+                meta.mark_wrap_charged(txn, &event_id_hex)?;
+                Ok(true)
+            });
+            match charge_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    let result = reject_restricted("quota exceeded");
+                    record_event_metric(kind, &result);
+                    return Some(result);
+                }
+                Err(e) => {
+                    tracing::warn!("private wrap quota update failed: {e}");
+                    let result = reject_error("private meta store failure");
+                    record_event_metric(kind, &result);
+                    return Some(result);
+                }
+            }
+            self.refresh_gauges();
+        }
+
+        let result = WritePolicyResult::Accept;
+        record_event_metric(kind, &result);
+        Some(result)
+    }
+
+    // ------------------------------------------------------------------
+    // Blob routes
+    // ------------------------------------------------------------------
+
+    /// Parse + verify a Blossom `Authorization` header for `op` on
+    /// `expected_sha`, resolving the attribution to a live registration and
+    /// requiring the signing key to be in the alias's **w** set.
+    pub async fn verify_blossom_auth(
+        &self,
+        header: Option<&str>,
+        op: BlossomOp,
+        expected_sha: &str,
+    ) -> Result<BlossomAuth, BlobError> {
+        let auth = blossom_auth::verify_auth_shape(header, op, expected_sha)?;
+
+        let record = self
+            .live_registration(&auth.alias)
+            .await
+            .map_err(|e| BlobError::Internal(format!("liveness check failed: {e}")))?
+            .ok_or_else(|| {
+                BlobError::Forbidden("attributed alias is not a live registration".into())
+            })?;
+
+        if record.tenant_hex != auth.tenant_hex {
+            return Err(BlobError::Forbidden(
+                "a tag tenant does not match the registration".into(),
+            ));
+        }
+        if !record.w_keys.contains(&auth.pubkey_hex) {
+            return Err(BlobError::Forbidden(
+                "signing key is not a write key for this alias".into(),
+            ));
+        }
+        Ok(auth)
+    }
+
+    /// BUD-06 preflight checks for an upload of `len` bytes.
+    pub async fn blob_upload_preflight(
+        &self,
+        auth: &BlossomAuth,
+        sha256: &str,
+        len: u64,
+    ) -> Result<(), BlobError> {
+        if auth.sha256 != sha256 {
+            return Err(BlobError::BadRequest(
+                "authorization does not cover this sha256".into(),
+            ));
+        }
+        // B4: reject denylisted (taken-down) content on the WRITE path too, not
+        // only on read — otherwise the same bytes could be re-uploaded and
+        // re-stored. Same status the read path returns (451).
+        if self.is_denylisted(sha256) {
+            return Err(BlobError::Denylisted);
+        }
+        if len > self.cfg.max_blob_bytes {
+            return Err(BlobError::TooLarge);
+        }
+        // Existing blobs re-upload for free (no double-charge).
+        let needs_charge = {
+            let txn = self
+                .meta
+                .read_txn()
+                .map_err(|e| BlobError::Internal(e.to_string()))?;
+            match self
+                .meta
+                .get_blob_claim(&txn, sha256)
+                .map_err(|e| BlobError::Internal(e.to_string()))?
+            {
+                Some(claim) if claim.stored => false,
+                _ => !self.blobs.exists(sha256),
+            }
+        };
+        if needs_charge {
+            let txn = self
+                .meta
+                .read_txn()
+                .map_err(|e| BlobError::Internal(e.to_string()))?;
+            let ok = quota::check(
+                &self.meta,
+                &txn,
+                &self.cfg,
+                &auth.tenant_hex,
+                &auth.alias,
+                len,
+            )
+            .map_err(|e| BlobError::Internal(e.to_string()))?;
+            if !ok {
+                return Err(BlobError::QuotaExceeded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserve in-flight capacity for `declared_len` bytes BEFORE any body
+    /// byte lands on disk. Enforces (a) a hard cap on concurrent uploads and
+    /// (b) `ledger global total + reserved in-flight bytes + declared_len ≤
+    /// global_budget_bytes`, so N concurrent slow streams can never exceed
+    /// the global byte budget in transient tmp usage.
+    fn reserve_upload(&self, declared_len: u64) -> Result<UploadReservation, BlobError> {
+        let ledger_total = {
+            let txn = self
+                .meta
+                .read_txn()
+                .map_err(|e| BlobError::Internal(e.to_string()))?;
+            quota::global_total(&self.meta, &txn)
+                .map_err(|e| BlobError::Internal(e.to_string()))?
+        };
+        let mut guard = self.inflight.lock();
+        if guard.count >= MAX_CONCURRENT_UPLOADS {
+            return Err(BlobError::QuotaExceeded);
+        }
+        if ledger_total
+            .saturating_add(guard.bytes)
+            .saturating_add(declared_len)
+            > self.cfg.global_budget_bytes
+        {
+            return Err(BlobError::QuotaExceeded);
+        }
+        guard.count += 1;
+        guard.bytes = guard.bytes.saturating_add(declared_len);
+        Ok(UploadReservation {
+            inflight: self.inflight.clone(),
+            bytes: declared_len,
+        })
+    }
+
+    /// Open a streaming upload sink after validating auth + quota like the
+    /// preflight. The HTTP layer feeds `hyper::body::Incoming` frames in.
+    pub async fn begin_upload(
+        &self,
+        auth: &BlossomAuth,
+        declared_len: u64,
+    ) -> Result<UploadSink, BlobError> {
+        self.blob_upload_preflight(auth, &auth.sha256, declared_len)
+            .await?;
+        // Reserve BEFORE opening the temp file: without this, unbounded
+        // concurrent PUT streams could exhaust disk/inodes/fds while each
+        // one's authoritative charge only happens at finish().
+        let reservation = self.reserve_upload(declared_len)?;
+        UploadSink::create(
+            self.meta.clone(),
+            self.blobs.clone(),
+            self.cfg.clone(),
+            auth.tenant_hex.clone(),
+            auth.alias.clone(),
+            auth.sha256.clone(),
+            declared_len,
+            reservation,
+        )
+        .await
+    }
+
+    /// Path of a stored blob, or `None` if absent. Denylist handling (451) is
+    /// the caller's job via [`Self::is_denylisted`].
+    pub fn blob_path(&self, sha256: &str) -> Option<PathBuf> {
+        let path = self.blobs.path_for(sha256);
+        path.is_file().then_some(path)
+    }
+
+    pub fn is_denylisted(&self, sha256: &str) -> bool {
+        self.denylist.contains(sha256)
+    }
+
+    /// Remove this alias's claim on a blob (Blossom DELETE). File removal is
+    /// GC's job after the grace period. Idempotent — 200 even if no claim.
+    pub async fn blob_delete(&self, auth: &BlossomAuth, sha256: &str) -> Result<(), BlobError> {
+        if auth.sha256 != sha256 {
+            return Err(BlobError::BadRequest(
+                "authorization does not cover this sha256".into(),
+            ));
+        }
+        let alias = auth.alias.clone();
+        self.meta
+            .with_write(|meta, txn| {
+                if let Some(mut claim) = meta.get_blob_claim(txn, sha256)? {
+                    if claim.aliases.iter().any(|a| a == &alias) {
+                        claim.aliases.retain(|a| a != &alias);
+                        if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
+                            claim.unreferenced_since = Some(nostr::Timestamp::now().as_secs());
+                        }
+                        meta.put_blob_claim(txn, sha256, &claim)?;
+                        meta.delete_alias_claim(txn, &alias, sha256)?;
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| BlobError::Internal(format!("meta update failed: {e}")))
+    }
+
+    /// Aggregate blob descriptors across all of a tenant's aliases.
+    ///
+    /// Iterates the per-alias claim index (prefix scans scoped to the
+    /// tenant's own aliases) — never the whole cross-tenant `blob_claims`
+    /// table, so an anonymous `/list` flood cannot amplify into full-table
+    /// LMDB scans.
+    pub async fn blob_list(&self, tenant: &PublicKey) -> Vec<BlobDescriptor> {
+        let tenant_hex = tenant.to_hex();
+        let mut out = Vec::new();
+        let Ok(txn) = self.meta.read_txn() else {
+            return out;
+        };
+        let Ok(aliases) = self.meta.get_tenant_aliases(&txn, &tenant_hex) else {
+            return out;
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        for alias in &aliases {
+            let Ok(shas) = self.meta.alias_claim_shas(&txn, alias) else {
+                continue;
+            };
+            for sha in shas {
+                if seen.contains(&sha) {
+                    continue;
+                }
+                let Ok(Some(claim)) = self.meta.get_blob_claim(&txn, &sha) else {
+                    continue;
+                };
+                if !claim.stored {
+                    continue;
+                }
+                seen.insert(sha.clone());
+                out.push(BlobDescriptor {
+                    url: format!("https://{}/{}", self.cfg.domain, sha),
+                    sha256: sha,
+                    size: claim.size,
+                    uploaded: 0,
+                });
+            }
+        }
+        out
+    }
+
+    /// NIP-11 `private_repos` extension object.
+    pub fn nip11_extension(&self) -> serde_json::Value {
+        nip11_private_repos_value(
+            self.cfg.registration_mode,
+            self.cfg.pow_bits,
+            self.cfg.max_blob_bytes,
+            self.cfg.max_event_bytes,
+            self.cfg.quota_tenant_bytes,
+            self.cfg.quota_repo_bytes,
+            &self.cfg.domain,
+            &self.cfg.policy_fingerprint,
+        )
+    }
+
+    /// Spawn the background GC loop.
+    pub fn spawn_gc(self: &Arc<Self>) -> JoinHandle<()> {
+        gc::spawn(self.clone())
+    }
+
+    /// Spawn the background blob-mirror worker (Phase 2). Installs the job
+    /// queue sender so `handle_state_root` Accepts start enqueueing, then
+    /// runs a boot repair pass plus periodic repair scans that re-enqueue
+    /// referenced-but-missing blobs.
+    pub fn spawn_mirror(self: &Arc<Self>) -> JoinHandle<()> {
+        mirror::spawn(self.clone())
+    }
+}
+
+fn record_event_metric(kind: u16, result: &WritePolicyResult) {
+    match result {
+        WritePolicyResult::Accept => crate::metrics::record_private_event_accepted(kind),
+        _ => crate::metrics::record_private_event_rejected(kind),
+    }
+}
+
+/// Build the NIP-11 `private_repos` object. Shared by [`PrivateService`] and
+/// `http::nip11` (which only has a `Config`).
+#[allow(clippy::too_many_arguments)]
+pub fn nip11_private_repos_value(
+    mode: RegistrationMode,
+    pow_bits: u8,
+    max_blob_bytes: u64,
+    max_event_bytes: u64,
+    quota_tenant_bytes: u64,
+    quota_repo_bytes: u64,
+    domain: &str,
+    policy_fingerprint: &str,
+) -> serde_json::Value {
+    let mut object = serde_json::json!({
+        "kinds": [KIND_REGISTRATION, KIND_STATE_ROOT, KIND_WRAP, KIND_EPHEMERAL_WRAP],
+        "registration_mode": mode.to_string(),
+        "max_blob_bytes": max_blob_bytes,
+        "max_event_bytes": max_event_bytes,
+        "quota_tenant_bytes": quota_tenant_bytes,
+        "quota_repo_bytes": quota_repo_bytes,
+        "blob_endpoints": [format!("https://{domain}")],
+        // R6 parity: short hash of the admission-affecting config. Ops (and
+        // `doctor --two-node`) compare this across a node pair; a mismatch
+        // means silent per-repo replication desync. Never the raw whitelist.
+        "policy_fingerprint": policy_fingerprint,
+    });
+    if mode == RegistrationMode::Pow {
+        object["pow_bits"] = serde_json::json!(pow_bits);
+    }
+    object
+}
+
+/// NIP-11 helper for `http::nip11::RelayInformationDocument::from_config`.
+pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Value> {
+    if !config.private_repos_enable {
+        return None;
+    }
+    Some(nip11_private_repos_value(
+        config.private_registration_mode,
+        config.private_pow_bits,
+        config.private_max_blob_bytes,
+        config.private_max_event_bytes,
+        config.private_quota_tenant_bytes,
+        config.private_quota_repo_bytes,
+        &config.domain,
+        &policy_fingerprint(config),
+    ))
+}

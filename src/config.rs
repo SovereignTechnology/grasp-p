@@ -282,6 +282,32 @@ impl EventBlacklistConfig {
     }
 }
 
+/// GRASP-P private-repo registration admission mode for NEW aliases.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Accept any tenant's new alias registrations.
+    #[default]
+    Open,
+    /// Only tenants in NGIT_PRIVATE_TENANT_WHITELIST may register new aliases.
+    Whitelist,
+    /// New-alias 30640 events must carry NIP-13 proof of work.
+    Pow,
+    /// Paid registration (not yet available; selecting it fails validation).
+    Paid,
+}
+
+impl std::fmt::Display for RegistrationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Whitelist => write!(f, "whitelist"),
+            Self::Pow => write!(f, "pow"),
+            Self::Paid => write!(f, "paid"),
+        }
+    }
+}
+
 /// Database backend type for the relay
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -573,6 +599,128 @@ pub struct Config {
     /// Log level for application logging
     #[arg(long, env = "NGIT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    // ------------------------------------------------------------------
+    // GRASP-P private repositories (all no-ops unless enable=true)
+    // ------------------------------------------------------------------
+    /// GRASP-P master switch: enable private repository hosting (30640/30641/1059/21059 + blob routes)
+    #[arg(long, env = "NGIT_PRIVATE_REPOS_ENABLE", default_value_t = false)]
+    pub private_repos_enable: bool,
+
+    /// Admission mode for NEW private-repo aliases (open|whitelist|pow|paid)
+    #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_MODE", value_enum, default_value_t = RegistrationMode::Open)]
+    pub private_registration_mode: RegistrationMode,
+
+    /// NIP-13 bits required on kind-30640 registrations when mode=pow
+    #[arg(long, env = "NGIT_PRIVATE_POW_BITS", default_value_t = 20)]
+    pub private_pow_bits: u8,
+
+    /// Comma-separated npubs allowed to register new aliases when mode=whitelist
+    #[arg(long, env = "NGIT_PRIVATE_TENANT_WHITELIST", default_value = "")]
+    pub private_tenant_whitelist: String,
+
+    /// Per-blob size cap in bytes (enforced pre- and mid-stream)
+    #[arg(long, env = "NGIT_PRIVATE_MAX_BLOB_BYTES", default_value_t = 268_435_456)]
+    pub private_max_blob_bytes: u64,
+
+    /// Serialized-JSON size cap for private-repo events (30640/30641/1059/21059)
+    #[arg(long, env = "NGIT_PRIVATE_MAX_EVENT_BYTES", default_value_t = 131_072)]
+    pub private_max_event_bytes: u64,
+
+    /// Per hosting-npub total quota in bytes (events + blobs)
+    #[arg(long, env = "NGIT_PRIVATE_QUOTA_TENANT_BYTES", default_value_t = 1_073_741_824)]
+    pub private_quota_tenant_bytes: u64,
+
+    /// Per-alias total quota in bytes (events + blobs)
+    #[arg(long, env = "NGIT_PRIVATE_QUOTA_REPO_BYTES", default_value_t = 536_870_912)]
+    pub private_quota_repo_bytes: u64,
+
+    /// Whole private-subsystem storage cap in bytes
+    #[arg(long, env = "NGIT_PRIVATE_GLOBAL_BUDGET_BYTES", default_value_t = 53_687_091_200)]
+    pub private_global_budget_bytes: u64,
+
+    /// Maximum registrations (aliases) per hosting npub
+    #[arg(long, env = "NGIT_PRIVATE_MAX_ALIASES_PER_TENANT", default_value_t = 64)]
+    pub private_max_aliases_per_tenant: u32,
+
+    /// Maximum `w` + `aux` keys per alias registration
+    #[arg(long, env = "NGIT_PRIVATE_MAX_WRITE_KEYS_PER_ALIAS", default_value_t = 64)]
+    pub private_max_write_keys_per_alias: u32,
+
+    /// Kind-30641 edition ring depth kept in the private meta store (G7 amendment)
+    #[arg(long, env = "NGIT_PRIVATE_STATE_HISTORY_EDITIONS", default_value_t = 16)]
+    pub private_state_history_editions: u32,
+
+    /// Grace period in seconds before an unreferenced blob may be deleted by GC
+    #[arg(long, env = "NGIT_PRIVATE_GC_GRACE_SECS", default_value_t = 86_400)]
+    pub private_gc_grace_secs: u64,
+
+    /// Interval in seconds between private blob GC passes
+    #[arg(long, env = "NGIT_PRIVATE_GC_INTERVAL_SECS", default_value_t = 3_600)]
+    pub private_gc_interval_secs: u64,
+
+    /// Tombstoned-alias purge delay in seconds (stub in Phase 1)
+    #[arg(long, env = "NGIT_PRIVATE_OFFBOARD_RETENTION_SECS", default_value_t = 2_592_000)]
+    pub private_offboard_retention_secs: u64,
+
+    /// Blob store root (defaults to <relay_data_path>/blobs)
+    #[arg(long, env = "NGIT_PRIVATE_BLOB_DATA_PATH")]
+    pub private_blob_data_path: Option<String>,
+
+    /// Private meta store (heed env) root (defaults to <relay_data_path>/private-meta)
+    #[arg(long, env = "NGIT_PRIVATE_META_DATA_PATH")]
+    pub private_meta_data_path: Option<String>,
+
+    /// Optional denylist file: one sha256 per line; matching blob GETs return 451
+    #[arg(long, env = "NGIT_PRIVATE_DENYLIST_PATH")]
+    pub private_denylist_path: Option<String>,
+
+    /// Private-repo mirroring (Phase 2; knob exists, unused in Phase 1)
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_ENABLE", default_value_t = false)]
+    pub private_mirror_enable: bool,
+
+    /// Comma-separated peer blob-server base URLs for the Phase-2 mirror.
+    /// Default (unset): derive peers from each registration's `server` tags
+    /// (minus this node's own domain).
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_PEER_URLS")]
+    pub private_mirror_peer_urls: Option<String>,
+
+    /// Maximum concurrent blob mirror fetches
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_MAX_CONCURRENCY", default_value_t = 4)]
+    pub private_mirror_max_concurrency: u32,
+
+    /// Per-blob mirror fetch timeout in seconds
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_FETCH_TIMEOUT_SECS", default_value_t = 120)]
+    pub private_mirror_fetch_timeout_secs: u64,
+
+    /// Comma-separated operator-approved peer relay URLs for private-repo
+    /// sync. Outbound private-sync WebSocket connections are made ONLY to
+    /// this allowlist — tenant 30640 `relays` tags are advisory metadata and
+    /// never trigger a connection (SSRF / membership-map-leak guard). Unset
+    /// (default): no private-sync peer connections are initiated (bootstrap
+    /// relays still carry the private filters).
+    #[arg(long, env = "NGIT_PRIVATE_SYNC_PEER_URLS")]
+    pub private_sync_peer_urls: Option<String>,
+
+    /// SSRF guard: allow the blob mirror to fetch from peers that resolve to
+    /// loopback/private/link-local IPs (and over plain http), and private-sync
+    /// peer relays over plain ws:// or on internal IPs. Default false —
+    /// production drops such peers and only fetches over https/wss from public
+    /// hosts. Set true only for local testing (e.g. a 127.0.0.1 node pair).
+    #[arg(
+        long,
+        env = "NGIT_PRIVATE_MIRROR_ALLOW_PRIVATE_IPS",
+        default_value_t = false
+    )]
+    pub private_mirror_allow_private_ips: bool,
+
+    /// Accept kind-3313 direct invites for storage (Phase 1 only honors =false)
+    #[arg(long, env = "NGIT_PRIVATE_ACCEPT_DIRECT_INVITES", default_value_t = false)]
+    pub private_accept_direct_invites: bool,
+
+    /// Opt in to per-tenant metric labels (default: aggregate metrics only)
+    #[arg(long, env = "NGIT_PRIVATE_PER_TENANT_METRICS", default_value_t = false)]
+    pub private_per_tenant_metrics: bool,
 }
 
 impl Config {
@@ -780,7 +928,139 @@ impl Config {
             }
         }
 
+        // GRASP-P private repositories (only validated when enabled)
+        if self.private_repos_enable {
+            if self.private_registration_mode == RegistrationMode::Paid {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_REGISTRATION_MODE=paid: paid registration mode is not yet available"
+                ));
+            }
+            if !(1..=40).contains(&self.private_pow_bits) {
+                return Err(anyhow!("NGIT_PRIVATE_POW_BITS must be between 1 and 40"));
+            }
+            if self.private_state_history_editions < 1 {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_STATE_HISTORY_EDITIONS must be at least 1"
+                ));
+            }
+            for (value, name) in [
+                (self.private_max_blob_bytes, "NGIT_PRIVATE_MAX_BLOB_BYTES"),
+                (self.private_max_event_bytes, "NGIT_PRIVATE_MAX_EVENT_BYTES"),
+                (
+                    self.private_quota_tenant_bytes,
+                    "NGIT_PRIVATE_QUOTA_TENANT_BYTES",
+                ),
+                (
+                    self.private_quota_repo_bytes,
+                    "NGIT_PRIVATE_QUOTA_REPO_BYTES",
+                ),
+                (
+                    self.private_global_budget_bytes,
+                    "NGIT_PRIVATE_GLOBAL_BUDGET_BYTES",
+                ),
+            ] {
+                if value == 0 {
+                    return Err(anyhow!("{name} must be greater than 0"));
+                }
+            }
+            if self.private_quota_repo_bytes > self.private_quota_tenant_bytes {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_QUOTA_REPO_BYTES must not exceed NGIT_PRIVATE_QUOTA_TENANT_BYTES"
+                ));
+            }
+            if self.private_quota_tenant_bytes > self.private_global_budget_bytes {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_QUOTA_TENANT_BYTES must not exceed NGIT_PRIVATE_GLOBAL_BUDGET_BYTES"
+                ));
+            }
+            if self.effective_private_blob_path().trim().is_empty() {
+                return Err(anyhow!("NGIT_PRIVATE_BLOB_DATA_PATH must not be empty"));
+            }
+            if self.effective_private_meta_path().trim().is_empty() {
+                return Err(anyhow!("NGIT_PRIVATE_META_DATA_PATH must not be empty"));
+            }
+            if self.private_mirror_enable {
+                if self.private_mirror_max_concurrency == 0 {
+                    return Err(anyhow!(
+                        "NGIT_PRIVATE_MIRROR_MAX_CONCURRENCY must be greater than 0"
+                    ));
+                }
+                if self.private_mirror_fetch_timeout_secs == 0 {
+                    return Err(anyhow!(
+                        "NGIT_PRIVATE_MIRROR_FETCH_TIMEOUT_SECS must be greater than 0"
+                    ));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Effective blob store root for GRASP-P private repos.
+    ///
+    /// Defaults to `<relay_data_path>/blobs` so TestRelay tempdir isolation
+    /// holds without extra env vars.
+    pub fn effective_private_blob_path(&self) -> String {
+        self.private_blob_data_path.clone().unwrap_or_else(|| {
+            PathBuf::from(&self.relay_data_path)
+                .join("blobs")
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Effective private meta store (heed env) root for GRASP-P private repos.
+    ///
+    /// Defaults to `<relay_data_path>/private-meta`.
+    pub fn effective_private_meta_path(&self) -> String {
+        self.private_meta_data_path.clone().unwrap_or_else(|| {
+            PathBuf::from(&self.relay_data_path)
+                .join("private-meta")
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Parsed NGIT_PRIVATE_TENANT_WHITELIST (npub bech32 strings, CSV).
+    pub fn private_tenant_whitelist_entries(&self) -> Vec<String> {
+        self.private_tenant_whitelist
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Parsed NGIT_PRIVATE_MIRROR_PEER_URLS (base URLs, CSV). `None` when
+    /// unset or empty — the mirror then derives peers from each
+    /// registration's `server` tags.
+    pub fn private_mirror_peer_url_entries(&self) -> Option<Vec<String>> {
+        let raw = self.private_mirror_peer_urls.as_ref()?;
+        let entries: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Parsed NGIT_PRIVATE_SYNC_PEER_URLS (relay URLs, CSV). Empty when
+    /// unset — the sync layer then initiates NO private peer connections;
+    /// tenant 30640 `relays` tags are never a connection source.
+    pub fn private_sync_peer_url_entries(&self) -> Vec<String> {
+        self.private_sync_peer_urls
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Parse archive GRASP services from comma-separated string
@@ -960,6 +1240,32 @@ impl Config {
             deletion_request_disrespector: false,
             max_connections: None,
             log_level: "debug".to_string(),
+            private_repos_enable: false,
+            private_registration_mode: RegistrationMode::Open,
+            private_pow_bits: 20,
+            private_tenant_whitelist: String::new(),
+            private_max_blob_bytes: 268_435_456,
+            private_max_event_bytes: 131_072,
+            private_quota_tenant_bytes: 1_073_741_824,
+            private_quota_repo_bytes: 536_870_912,
+            private_global_budget_bytes: 53_687_091_200,
+            private_max_aliases_per_tenant: 64,
+            private_max_write_keys_per_alias: 64,
+            private_state_history_editions: 16,
+            private_gc_grace_secs: 86_400,
+            private_gc_interval_secs: 3_600,
+            private_offboard_retention_secs: 2_592_000,
+            private_blob_data_path: None,
+            private_meta_data_path: None,
+            private_denylist_path: None,
+            private_mirror_enable: false,
+            private_mirror_peer_urls: None,
+            private_sync_peer_urls: None,
+            private_mirror_max_concurrency: 4,
+            private_mirror_fetch_timeout_secs: 120,
+            private_mirror_allow_private_ips: false,
+            private_accept_direct_invites: false,
+            private_per_tenant_metrics: false,
         }
     }
 }

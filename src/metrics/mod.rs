@@ -176,6 +176,145 @@ lazy_static! {
             .expect("register manual ejection deleted metric");
         metric
     };
+    // ------------------------------------------------------------------
+    // GRASP-P private repositories (aggregate metrics only by default)
+    // ------------------------------------------------------------------
+    static ref PRIVATE_REGISTRATIONS_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_registrations_total",
+                "Accepted private-repo registrations by admission mode",
+            ),
+            &["mode"],
+        )
+        .expect("build private registrations metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private registrations metric");
+        metric
+    };
+    static ref PRIVATE_EVENTS_ACCEPTED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_events_accepted_total",
+                "Accepted private-repo events by kind",
+            ),
+            &["kind"],
+        )
+        .expect("build private events accepted metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private events accepted metric");
+        metric
+    };
+    static ref PRIVATE_EVENTS_REJECTED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_events_rejected_total",
+                "Rejected private-repo events by kind",
+            ),
+            &["kind"],
+        )
+        .expect("build private events rejected metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private events rejected metric");
+        metric
+    };
+    static ref PRIVATE_BLOB_BYTES_STORED: Gauge = {
+        let metric = Gauge::with_opts(Opts::new(
+            "ngit_private_blob_bytes_stored",
+            "Total bytes currently stored in the private blob store",
+        ))
+        .expect("build private blob bytes stored metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private blob bytes stored metric");
+        metric
+    };
+    static ref PRIVATE_BLOB_UPLOADS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_blob_uploads_total",
+            "Completed private blob uploads",
+        ))
+        .expect("build private blob uploads metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private blob uploads metric");
+        metric
+    };
+    static ref PRIVATE_BLOB_DOWNLOADS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_blob_downloads_total",
+            "Served private blob downloads",
+        ))
+        .expect("build private blob downloads metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private blob downloads metric");
+        metric
+    };
+    static ref PRIVATE_LEDGER_BYTES: GaugeVec = {
+        let metric = GaugeVec::new(
+            Opts::new(
+                "ngit_private_ledger_bytes",
+                "Private-subsystem ledger bytes by scope",
+            ),
+            &["scope"],
+        )
+        .expect("build private ledger bytes metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private ledger bytes metric");
+        metric
+    };
+    static ref PRIVATE_ALIASES_TOTAL: Gauge = {
+        let metric = Gauge::with_opts(Opts::new(
+            "ngit_private_aliases_total",
+            "Live private-repo alias registrations",
+        ))
+        .expect("build private aliases metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private aliases metric");
+        metric
+    };
+    static ref PRIVATE_MIRROR_LAG_BLOBS: Gauge = {
+        let metric = Gauge::with_opts(Opts::new(
+            "ngit_private_mirror_lag_blobs",
+            "Referenced private blobs not yet present in the local blob store (mirror backlog)",
+        ))
+        .expect("build private mirror lag metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private mirror lag metric");
+        metric
+    };
+    static ref PRIVATE_MIRROR_FETCHED_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_mirror_fetched_total",
+            "Private blobs successfully mirrored from a peer",
+        ))
+        .expect("build private mirror fetched metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private mirror fetched metric");
+        metric
+    };
+    static ref PRIVATE_MIRROR_FAILED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_mirror_failed_total",
+                "Failed private blob mirror fetch attempts by reason",
+            ),
+            &["reason"],
+        )
+        .expect("build private mirror failed metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private mirror failed metric");
+        metric
+    };
 }
 
 pub fn record_blacklist_deletion_attempt(phase: &str) {
@@ -326,6 +465,76 @@ pub fn record_manual_ejection(
     MANUAL_EJECTION_DELETED_TOTAL
         .with_label_values(&["archive_file"])
         .inc_by(archive_files_deleted as f64);
+}
+
+// ------------------------------------------------------------------
+// GRASP-P private repositories — free-function recorders
+// ------------------------------------------------------------------
+
+/// Record an accepted private-repo registration (kind 30640) by admission mode.
+pub fn record_private_registration(mode: &str) {
+    PRIVATE_REGISTRATIONS_TOTAL
+        .with_label_values(&[mode])
+        .inc();
+}
+
+/// Record an accepted private-repo event by kind.
+pub fn record_private_event_accepted(kind: u16) {
+    PRIVATE_EVENTS_ACCEPTED_TOTAL
+        .with_label_values(&[&kind.to_string()])
+        .inc();
+}
+
+/// Record a rejected private-repo event by kind.
+pub fn record_private_event_rejected(kind: u16) {
+    PRIVATE_EVENTS_REJECTED_TOTAL
+        .with_label_values(&[&kind.to_string()])
+        .inc();
+}
+
+/// Record a completed private blob upload of `bytes` bytes.
+pub fn record_private_blob_upload(bytes: u64) {
+    PRIVATE_BLOB_UPLOADS_TOTAL.inc();
+    PRIVATE_BLOB_BYTES_STORED.add(bytes as f64);
+}
+
+/// Record bytes removed from the private blob store (GC / delete).
+pub fn record_private_blob_removed(bytes: u64) {
+    PRIVATE_BLOB_BYTES_STORED.sub(bytes as f64);
+}
+
+/// Record a served private blob download.
+pub fn record_private_blob_download() {
+    PRIVATE_BLOB_DOWNLOADS_TOTAL.inc();
+}
+
+/// Update the global private ledger gauge (aggregate scope only by default).
+pub fn set_private_ledger_global_bytes(bytes: u64) {
+    PRIVATE_LEDGER_BYTES
+        .with_label_values(&["global"])
+        .set(bytes as f64);
+}
+
+/// Update the live private alias count gauge.
+pub fn set_private_aliases_total(count: u64) {
+    PRIVATE_ALIASES_TOTAL.set(count as f64);
+}
+
+/// Update the mirror backlog gauge (referenced-but-missing private blobs).
+pub fn set_private_mirror_lag_blobs(count: u64) {
+    PRIVATE_MIRROR_LAG_BLOBS.set(count as f64);
+}
+
+/// Record one private blob successfully mirrored from a peer.
+pub fn record_private_mirror_fetched() {
+    PRIVATE_MIRROR_FETCHED_TOTAL.inc();
+}
+
+/// Record one failed private blob mirror fetch attempt.
+pub fn record_private_mirror_failed(reason: &str) {
+    PRIVATE_MIRROR_FAILED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
 }
 
 /// Central metrics collection for ngit-grasp relay.

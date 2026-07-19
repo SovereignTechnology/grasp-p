@@ -31,6 +31,87 @@ pub fn build_announcement_filter(since: Option<Timestamp>) -> Filter {
     }
 }
 
+/// GRASP-P private-repo registration filter (kind 30640).
+///
+/// Layer-1-style: subscribed alongside the announcement filter on every
+/// connect when `NGIT_PRIVATE_REPOS_ENABLE=true`, NOT part of consolidation
+/// rebuilds. Registrations are small and bounded by the private global
+/// budget, so an unscoped 30640 subscription is acceptable (mirrors the
+/// unscoped 30617 Layer-1 treatment).
+pub fn build_private_registration_filter(since: Option<Timestamp>) -> Filter {
+    let filter = Filter::new().kind(Kind::Custom(crate::private::KIND_REGISTRATION));
+    match since {
+        Some(ts) => filter.since(ts),
+        None => filter,
+    }
+}
+
+/// GRASP-P derived private-repo filters, driven by accepted registrations.
+///
+/// For each 100-alias chunk: `kinds:[30641] #d:[aliases]` (state roots).
+/// For each 100-key chunk of the registrations' w+aux keys:
+/// `kinds:[1059] authors:[keys]` (stored wraps). Kind 21059 is ephemeral and
+/// deliberately never synced.
+///
+/// # Arguments
+/// * `regs` - (alias, w+aux key hex) pairs from accepted 30640 registrations
+/// * `since` - Optional timestamp for incremental sync
+pub fn build_private_derived_filters(
+    regs: &[(String, Vec<String>)],
+    since: Option<Timestamp>,
+) -> Vec<Filter> {
+    if regs.is_empty() {
+        return vec![];
+    }
+
+    let mut aliases: Vec<&String> = Vec::new();
+    let mut keys: HashSet<&String> = HashSet::new();
+    {
+        let mut seen_aliases: HashSet<&String> = HashSet::new();
+        for (alias, reg_keys) in regs {
+            if seen_aliases.insert(alias) {
+                aliases.push(alias);
+            }
+            for key in reg_keys {
+                keys.insert(key);
+            }
+        }
+    }
+
+    let mut filters = Vec::new();
+
+    // Kind 30641 state roots, chunked 100 aliases per filter (same batching
+    // as state_event_filters_for_our_repos).
+    for chunk in aliases.chunks(100) {
+        let mut filter = Filter::new().kind(Kind::Custom(crate::private::KIND_STATE_ROOT));
+        for alias in chunk {
+            filter = filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), alias.as_str());
+        }
+        if let Some(ts) = since {
+            filter = filter.since(ts);
+        }
+        filters.push(filter);
+    }
+
+    // Kind 1059 wraps authored by registered w/aux keys, chunked per 100.
+    let mut authors: Vec<PublicKey> = keys
+        .iter()
+        .filter_map(|k| PublicKey::from_hex(k).ok())
+        .collect();
+    authors.sort();
+    for chunk in authors.chunks(100) {
+        let mut filter = Filter::new()
+            .kind(Kind::Custom(crate::private::KIND_WRAP))
+            .authors(chunk.iter().copied());
+        if let Some(ts) = since {
+            filter = filter.since(ts);
+        }
+        filters.push(filter);
+    }
+
+    filters
+}
+
 /// State event filters for our hosted repositories
 ///
 /// Subscribes to kind 30618 state events using #d (identifier) tags.

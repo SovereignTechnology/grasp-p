@@ -51,6 +51,12 @@ pub struct RelayInformationDocument {
     /// Required by GRASP-01 specification line 28 when events are curated
     #[serde(skip_serializing_if = "Option::is_none")]
     pub curation: Option<String>,
+
+    /// GRASP-P private repositories advert (present only when
+    /// NGIT_PRIVATE_REPOS_ENABLE=true). Blossom-subset blob routes are
+    /// HTTP-side (BUDs), not NIPs — deliberately not in supported_nips.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_repos: Option<serde_json::Value>,
 }
 
 impl RelayInformationDocument {
@@ -136,6 +142,9 @@ impl RelayInformationDocument {
             supported_grasps,
             repo_acceptance_criteria: "None".to_string(),
             curation,
+
+            // GRASP-P private repositories
+            private_repos: crate::private::nip11_private_repos_from_config(config),
         }
     }
 
