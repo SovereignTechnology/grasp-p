@@ -6,6 +6,7 @@ pub mod grasp06;
 pub mod http;
 pub mod metrics;
 pub mod nostr;
+pub mod private;
 pub mod purgatory;
 pub mod server;
 pub mod sync;

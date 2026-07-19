@@ -1,6 +1,7 @@
 /// HTTP Server Module
 ///
 /// Provides hyper HTTP server with WebSocket upgrade support for the Nostr relay.
+mod blossom;
 pub mod landing;
 pub mod nip11;
 
@@ -37,10 +38,19 @@ use crate::sync::rejected_index::RejectedEventsIndex;
 
 type HttpBody = GitResponseBody;
 
-/// CORS headers required by GRASP-01 specification (lines 48-51)
+/// CORS headers required by GRASP-01 specification (stock values — emitted on
+/// every response so a disabled node is byte-identical to upstream).
 const CORS_ALLOW_ORIGIN: &str = "*";
 const CORS_ALLOW_METHODS: &str = "GET, POST";
 const CORS_ALLOW_HEADERS: &str = "Content-Type";
+
+/// Extended CORS advertised only when the GRASP-P Blossom-subset blob routes
+/// are live (`NGIT_PRIVATE_REPOS_ENABLE=true`): PUT/DELETE/HEAD +
+/// Authorization/X-SHA-256/X-Content-Length. Used by the universal OPTIONS
+/// preflight (so browser blob preflights succeed) and by the blob responses
+/// themselves, which only execute when private repos are enabled.
+const CORS_ALLOW_METHODS_PRIVATE: &str = "GET, POST, PUT, DELETE, HEAD";
+const CORS_ALLOW_HEADERS_PRIVATE: &str = "Content-Type, Authorization, X-SHA-256, X-Content-Length";
 
 /// Embedded icon image (Grasp logo)
 const ICON_PNG: &[u8] = include_bytes!("../../static/icon.png");
@@ -110,6 +120,18 @@ fn add_cors_headers(builder: hyper::http::response::Builder) -> hyper::http::res
         .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
 }
 
+/// CORS headers advertising the private-repo blob methods. Only used on paths
+/// that are reachable when `NGIT_PRIVATE_REPOS_ENABLE=true`, keeping a disabled
+/// node's responses identical to stock ngit-grasp.
+pub(crate) fn add_cors_headers_private(
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder
+        .header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
+        .header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS_PRIVATE)
+        .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS_PRIVATE)
+}
+
 /// HTTP Service that serves both WebSocket (relay) and HTML landing page
 struct HttpService {
     relay: LocalRelay,
@@ -130,6 +152,10 @@ struct HttpService {
     /// Per-path init mutexes for GRASP-06 `/prs/` on-demand bare-repo
     /// creation. See [`crate::grasp06::receive::RepoInitLocks`].
     repo_init_locks: RepoInitLocks,
+    /// GRASP-P private-repo service (blob routes). `None` unless
+    /// `NGIT_PRIVATE_REPOS_ENABLE=true`; when `None` the blob routes do not
+    /// exist and fall through to the generic 404.
+    private: Option<Arc<crate::private::PrivateService>>,
 }
 
 impl HttpService {
@@ -145,6 +171,7 @@ impl HttpService {
         lifecycle: Arc<RepositoryLifecycle>,
         rejected_events_index: Arc<RejectedEventsIndex>,
         repo_init_locks: RepoInitLocks,
+        private: Option<Arc<crate::private::PrivateService>>,
     ) -> Self {
         Self {
             relay,
@@ -157,6 +184,7 @@ impl HttpService {
             lifecycle,
             rejected_events_index,
             repo_init_locks,
+            private,
         }
     }
 }
@@ -180,15 +208,20 @@ impl Service<Request<Incoming>> for HttpService {
         let repo_init_locks = self.repo_init_locks.clone();
 
         // Handle OPTIONS preflight requests (CORS)
-        // GRASP-01 spec line 51: Respond to OPTIONS with 204 No Content
+        // GRASP-01 spec line 51: Respond to OPTIONS with 204 No Content.
+        // When private repos are enabled, advertise the extended blob methods
+        // so browser Blossom preflights succeed; otherwise emit stock CORS so a
+        // disabled node is byte-identical to upstream.
+        let private_enabled = self.private.is_some();
         if method == Method::OPTIONS {
             return Box::pin(async move {
-                Ok(
-                    add_cors_headers(Response::builder().header("server", "ngit-grasp"))
-                        .status(204)
-                        .body(empty_body())
-                        .unwrap(),
-                )
+                let builder = Response::builder().header("server", "ngit-grasp");
+                let builder = if private_enabled {
+                    add_cors_headers_private(builder)
+                } else {
+                    add_cors_headers(builder)
+                };
+                Ok(builder.status(204).body(empty_body()).unwrap())
             });
         }
 
@@ -636,6 +669,54 @@ impl Service<Request<Incoming>> for HttpService {
             });
         }
 
+        // GRASP-P Blossom-subset blob routes. Only routed when the private
+        // subsystem is enabled (self.private is Some); placed BEFORE the
+        // NIP-11 Accept check so nostr-aware clients fetching blobs are not
+        // shadowed by the relay info document. All paths here are 1-2
+        // segments, so they can never collide with parse_git_url (>=3
+        // segments) or the npub landing route.
+        if let Some(private) = self.private.clone() {
+            // HEAD|PUT /upload
+            if blossom::matches_upload_route(&path, &method) {
+                return Box::pin(async move {
+                    let response = if method == Method::HEAD {
+                        blossom::handle_upload_preflight(&private, &req).await
+                    } else {
+                        blossom::handle_upload_put(&private, req).await
+                    };
+                    Ok(response)
+                });
+            }
+
+            // GET|HEAD|DELETE /<64-lowercase-hex>
+            let segment = path.strip_prefix('/').unwrap_or(&path);
+            if blossom::is_sha256_path_segment(segment)
+                && (method == Method::GET || method == Method::HEAD || method == Method::DELETE)
+            {
+                let sha = segment.to_string();
+                return Box::pin(async move {
+                    let response = if method == Method::DELETE {
+                        blossom::handle_blob_delete(&private, &req, sha).await
+                    } else {
+                        blossom::handle_blob_get(&private, sha, method == Method::HEAD).await
+                    };
+                    Ok(response)
+                });
+            }
+
+            // GET /list/<pubkey-hex-or-npub>
+            if method == Method::GET {
+                if let Some(target) = path.strip_prefix("/list/") {
+                    if !target.is_empty() && !target.contains('/') {
+                        let target = target.to_string();
+                        return Box::pin(async move {
+                            Ok(blossom::handle_blob_list(&private, &target).await)
+                        });
+                    }
+                }
+            }
+        }
+
         // Check for NIP-11 relay information request (Accept: application/nostr+json)
         if let Some(accept) = req.headers().get("accept") {
             if accept
@@ -859,6 +940,7 @@ pub async fn run_server(
     lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
+    private: Option<Arc<crate::private::PrivateService>>,
 ) -> anyhow::Result<()> {
     let bind_addr: SocketAddr = config.bind_address.parse()?;
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -873,6 +955,7 @@ pub async fn run_server(
         lifecycle,
         rejected_events_index,
         repo_init_locks,
+        private,
     )
     .await
 }
@@ -901,6 +984,7 @@ pub async fn run_server_on_listener(
     lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
+    private: Option<Arc<crate::private::PrivateService>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
@@ -920,6 +1004,7 @@ pub async fn run_server_on_listener(
             lifecycle.clone(),
             rejected_events_index.clone(),
             repo_init_locks.clone(),
+            private.clone(),
         );
 
         tokio::spawn(async move {

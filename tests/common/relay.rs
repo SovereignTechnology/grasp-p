@@ -80,6 +80,10 @@ struct RelayOptions {
     git_data_path: Option<PathBuf>,
     relay_data_path: Option<PathBuf>,
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
+    /// Extra environment variables (name, value) passed verbatim to the
+    /// subprocess — used by the GRASP-P private-repo suite to drive the
+    /// `NGIT_PRIVATE_*` knob matrix without widening this struct per knob.
+    extra_env: Vec<(String, String)>,
 }
 
 /// Focused configuration for short-lived deletion-request lifecycle tests.
@@ -338,6 +342,81 @@ impl TestRelay {
         .await
     }
 
+    /// Start a relay with GRASP-P private repos ENABLED plus arbitrary
+    /// additional `NGIT_PRIVATE_*` env vars (memory backend).
+    ///
+    /// `NGIT_PRIVATE_REPOS_ENABLE=true` is always set; entries in
+    /// `extra_env` are applied afterwards so a caller could in principle
+    /// override it back off.
+    pub async fn start_with_private_repos(extra_env: &[(&str, &str)]) -> Self {
+        let mut env: Vec<(String, String)> = vec![(
+            "NGIT_PRIVATE_REPOS_ENABLE".to_string(),
+            "true".to_string(),
+        )];
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        );
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                extra_env: env,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start one node of a GRASP-P Phase-2 private two-node pair on a
+    /// pre-reserved port: private repos ENABLED, mirror ENABLED, optional
+    /// bootstrap peer (each node of a pair bootstraps to the other), and
+    /// optional persistent LMDB paths (for kill-and-restart backfill tests).
+    ///
+    /// `extra_env` is applied last, so callers can override any default
+    /// (including turning the mirror or private repos back off).
+    pub async fn start_private_pair_node(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        lmdb_backend: bool,
+        git_data_path: Option<PathBuf>,
+        relay_data_path: Option<PathBuf>,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let mut env: Vec<(String, String)> = vec![
+            ("NGIT_PRIVATE_REPOS_ENABLE".to_string(), "true".to_string()),
+            ("NGIT_PRIVATE_MIRROR_ENABLE".to_string(), "true".to_string()),
+            // Tests mirror over http://127.0.0.1 — allow the SSRF-guarded
+            // private-IP path (production defaults this off).
+            (
+                "NGIT_PRIVATE_MIRROR_ALLOW_PRIVATE_IPS".to_string(),
+                "true".to_string(),
+            ),
+        ];
+        // Private-sync peers come only from the operator allowlist — point
+        // each node of the pair at its peer explicitly (production posture).
+        if let Some(ref url) = bootstrap_relay_url {
+            env.push(("NGIT_PRIVATE_SYNC_PEER_URLS".to_string(), url.clone()));
+        }
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        );
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                lmdb_backend,
+                git_data_path,
+                relay_data_path,
+                extra_env: env,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -541,6 +620,12 @@ impl TestRelay {
                 "NGIT_HOLDING_CLEANUP_INTERVAL_SECS",
                 lifecycle.cleanup_interval_secs.to_string(),
             );
+        }
+
+        // GRASP-P private-repo (and any other ad-hoc) env vars, applied
+        // last so they can override the defaults above when a test needs to.
+        for (name, value) in &options.extra_env {
+            cmd.env(name, value);
         }
 
         // Release the port reservation immediately before spawning the

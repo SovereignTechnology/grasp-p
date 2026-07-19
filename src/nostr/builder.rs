@@ -53,6 +53,10 @@ pub struct Nip34WritePolicy {
     pr_event_policy: PrEventPolicy,
     related_event_policy: RelatedEventPolicy,
     deletion: DeletionService,
+    /// GRASP-P private-repo subsystem. `None` unless
+    /// `NGIT_PRIVATE_REPOS_ENABLE=true`; shared across clones (set once in
+    /// `create_relay`, mirroring the `set_local_relay` pattern).
+    private: Arc<std::sync::OnceLock<Arc<crate::private::PrivateService>>>,
 }
 
 impl std::fmt::Debug for Nip34WritePolicy {
@@ -101,7 +105,20 @@ impl Nip34WritePolicy {
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
             deletion: DeletionService::new(deletion_ctx),
             ctx,
+            private: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Install the GRASP-P private-repo service. Must be called before the
+    /// relay starts admitting events (done in `create_relay`); shared with all
+    /// clones of this policy.
+    pub fn set_private(&self, private: Arc<crate::private::PrivateService>) {
+        let _ = self.private.set(private);
+    }
+
+    /// The private-repo service, when enabled.
+    pub fn private(&self) -> Option<&Arc<crate::private::PrivateService>> {
+        self.private.get()
     }
 
     /// Check if an event author is blacklisted
@@ -747,7 +764,68 @@ impl WritePolicy for Nip34WritePolicy {
             // Sync uses localhost:0 as a dummy address
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
+            // GRASP-P private-repo kinds. Only routed when the subsystem is
+            // enabled; otherwise all four kinds fall through to the existing
+            // dispatch below (zero behavior change with enable=false). Synced
+            // events (loopback:0) intentionally get identical handling — a
+            // synced 30640/30641/1059 must apply under the same rules.
+            let private = self.private.get();
             let result = match event.kind {
+                k if private.is_some()
+                    && k.as_u16() == crate::private::KIND_REGISTRATION =>
+                {
+                    private.unwrap().handle_registration(event).await
+                }
+                k if private.is_some() && k.as_u16() == crate::private::KIND_STATE_ROOT => {
+                    let svc = private.unwrap();
+                    let result = svc.handle_state_root(event).await;
+                    // GRASP-P Phase 2 (design 1.4): a 30641 can be pushed
+                    // BEFORE its authorizing 30640 is known here (client
+                    // out-of-order push mirrors sync out-of-order arrival).
+                    // Hold the rejection keyed by target alias so the 30640
+                    // reprocess hook can resurrect it; dedup by event id
+                    // makes the sync path's own hold a no-op.
+                    if !matches!(result, WritePolicyResult::Accept) {
+                        let alias = event.tags.iter().find_map(|tag| {
+                            let v = tag.clone().to_vec();
+                            if v.len() >= 2 && v[0] == "d" {
+                                Some(v[1].clone())
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(alias) = alias {
+                            svc.sync_rejected().add_state_root(alias, event.clone());
+                        }
+                    }
+                    result
+                }
+                k if private.is_some() && k.as_u16() == crate::private::KIND_WRAP => {
+                    let svc = private.unwrap();
+                    match svc.try_handle_wrap(event, false).await {
+                        Some(result) => result,
+                        // Unregistered outer key: public path unchanged —
+                        // but if the public path ALSO rejects, hold the wrap
+                        // keyed by its outer author so a later 30640
+                        // registering that key reprocesses it (design 1.4).
+                        None => {
+                            let result = self.handle_related_event(event, "Event").await;
+                            if !matches!(result, WritePolicyResult::Accept) {
+                                svc.sync_rejected()
+                                    .add_wrap(event.pubkey.to_hex(), event.clone());
+                            }
+                            result
+                        }
+                    }
+                }
+                k if private.is_some()
+                    && k.as_u16() == crate::private::KIND_EPHEMERAL_WRAP =>
+                {
+                    match private.unwrap().try_handle_wrap(event, true).await {
+                        Some(result) => result,
+                        None => self.handle_related_event(event, "Event").await,
+                    }
+                }
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
                 Kind::RepoState => self.handle_state(event, is_synced).await,
                 Kind::GitPullRequest | Kind::GitPullRequestUpdate => {
@@ -799,6 +877,9 @@ pub struct RelayRuntime {
     pub lifecycle: RepositoryLifecycle,
     /// Storage handles used by the relay runtime.
     pub stores: RelayStores,
+    /// GRASP-P private-repo service (Some only when
+    /// `NGIT_PRIVATE_REPOS_ENABLE=true`).
+    pub private: Option<Arc<crate::private::PrivateService>>,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
@@ -924,6 +1005,16 @@ pub async fn create_relay(
         repo_init_locks,
     );
 
+    // GRASP-P private repositories: construct + install the service BEFORE the
+    // relay builder clones the write policy so every admission path sees it.
+    let private = if config.private_repos_enable {
+        let service = crate::private::PrivateService::new(config, database.clone()).await?;
+        write_policy.set_private(service.clone());
+        Some(service)
+    } else {
+        None
+    };
+
     let mut builder = LocalRelayBuilder::default()
         .database(database.clone())
         .write_policy(write_policy.clone())
@@ -966,5 +1057,6 @@ pub async fn create_relay(
             holding,
             history,
         },
+        private,
     })
 }
