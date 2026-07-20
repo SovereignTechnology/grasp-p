@@ -696,6 +696,24 @@ async fn exit3_wrap_admission() {
         "exit3: foreign-key 21059 must be vetoed; got accepted={accepted} {message:?}"
     );
 
+    // (e) REFERENCED junk: a 1059 from an unregistered key carrying an e-tag
+    // that references a STORED event must still be rejected (never the public
+    // related-event path). This is what makes deregistered rekey addresses
+    // unfloodable between rotations (§3.2: outer author must be registered).
+    let referenced_junk = EventBuilder::new(
+        Kind::Custom(1059),
+        "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
+    )
+    .tags(vec![Tag::event(wrap.id)])
+    .finalize(&Keys::generate())
+    .expect("sign junk wrap");
+    let (accepted, message) = publish_with_result(relay.url(), &referenced_junk).await;
+    assert!(
+        !accepted && message.contains("restricted:") && message.contains("unregistered key"),
+        "exit3: referenced junk from an unregistered key must be rejected; \
+         got accepted={accepted} {message:?}"
+    );
+
     relay.stop().await;
 }
 
@@ -1282,6 +1300,216 @@ async fn exit8_registration_deletion_liveness() {
     assert!(
         message.contains("restricted:") && message.contains("unregistered key"),
         "exit8: wrap liveness rejection; got {message:?}"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 9 — NIP-09 deletion of a 30640 FREES its key claims
+// ============================================================================
+// cord-git !13 verify-round: claims were freed only by a newer edition from
+// the same tenant, so a kind-5'd registration left them dangling forever —
+// a member could squat derivable rekey addresses, delete their registration,
+// and permanently wedge every rotation whose widen lists those keys.
+
+#[tokio::test]
+async fn exit9_registration_deletion_frees_key_claims() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let squatter = Keys::generate();
+    let squat_key = Keys::generate();
+    let owner = Keys::generate();
+    let owner_writer = Keys::generate();
+    let domain = relay.domain();
+
+    // The squatter claims `squat_key` as aux under their own alias (valid
+    // PoP — the squat threat model: rekey addresses are derivable keys).
+    let squat_alias = random_alias();
+    let t0 = Timestamp::now().as_secs();
+    let squat = registration_event(
+        &squatter,
+        &squat_alias,
+        &[key_entry(&Keys::generate(), &squatter.public_key(), &squat_alias)],
+        &[key_entry(&squat_key, &squatter.public_key(), &squat_alias)],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &squat).await;
+    assert!(accepted, "exit9: squat registration failed: {message:?}");
+
+    // While the squat holds, the owner's registration listing the same key
+    // is rejected (first-registrant-wins conflict).
+    let owner_alias = random_alias();
+    let widen = registration_event(
+        &owner,
+        &owner_alias,
+        &[key_entry(&owner_writer, &owner.public_key(), &owner_alias)],
+        &[key_entry(&squat_key, &owner.public_key(), &owner_alias)],
+        &domain,
+        Some(t0 + 1),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &widen).await;
+    assert!(!accepted, "exit9: registration listing the squatted key must be rejected");
+    assert!(
+        message.contains("write key already registered"),
+        "exit9: key-conflict message; got {message:?}"
+    );
+
+    // The squatter kind-5 deletes their registration's coordinate.
+    let deletion = EventBuilder::new(Kind::EventDeletion, "withdrawing the squat")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&squatter.public_key(), &squat_alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .finalize(&squatter)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &deletion).await;
+    assert!(accepted, "exit9: kind-5 deletion rejected: {message:?}");
+
+    // The squatted key is now FREE: the owner's registration listing it is
+    // accepted — no dangling "write key already registered" wedge.
+    let widen2 = registration_event(
+        &owner,
+        &owner_alias,
+        &[key_entry(&owner_writer, &owner.public_key(), &owner_alias)],
+        &[key_entry(&squat_key, &owner.public_key(), &owner_alias)],
+        &domain,
+        Some(t0 + 2),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &widen2).await;
+    assert!(
+        accepted,
+        "exit9: key claims must be freed with the deleted registration; got {message:?}"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 10 — claim-freeing honors the NIP-09 created_at cutoff + e-tags
+// ============================================================================
+
+#[tokio::test]
+async fn exit10_claim_freeing_cutoff_and_etags() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let tenant = Keys::generate();
+    let w1 = Keys::generate();
+    let w2 = Keys::generate();
+    let alias = random_alias();
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs();
+
+    // Register edition 1, then kind-5 (created_at t0+1) targeting the
+    // coordinate, then RE-register edition 2 (t0+2) with NEW keys.
+    let reg1 = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&w1, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    publish_with_result(relay.url(), &reg1).await;
+    let stale_deletion = EventBuilder::new(Kind::EventDeletion, "stale")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 1))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let reg2 = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&w2, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 2),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg2).await;
+    assert!(accepted, "exit10: re-registration failed: {message:?}");
+
+    // The STALE deletion (created before edition 2) must NOT free edition 2's
+    // claims: edition 2 stays the served latest AND its keys stay claimed —
+    // another tenant still cannot grab them.
+    let (accepted, message) = publish_with_result(relay.url(), &stale_deletion).await;
+    assert!(accepted, "exit10: stale kind-5 rejected: {message:?}");
+    let other = Keys::generate();
+    let grab_alias1 = random_alias();
+    let grab = registration_event(
+        &other,
+        &grab_alias1,
+        &[key_entry(&w2, &other.public_key(), &grab_alias1)],
+        &[],
+        &domain,
+        Some(t0 + 3),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &grab).await;
+    assert!(
+        !accepted && message.contains("write key already registered"),
+        "exit10: a newer edition's claims must survive a stale deletion; got {message:?}"
+    );
+
+    // e-tag deletion of the CURRENT edition frees its claims (the author
+    // knows their own event id; this is the same wedge vector as the a-tag).
+    let etag_deletion = EventBuilder::new(Kind::EventDeletion, "by id")
+        .tags(vec![
+            Tag::event(reg2.id),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 4))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &etag_deletion).await;
+    assert!(accepted, "exit10: e-tag kind-5 rejected: {message:?}");
+    let grab_alias2 = random_alias();
+    let grab2 = registration_event(
+        &other,
+        &grab_alias2,
+        &[key_entry(&w2, &other.public_key(), &grab_alias2)],
+        &[],
+        &domain,
+        Some(t0 + 5),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &grab2).await;
+    assert!(
+        accepted,
+        "exit10: e-tag deletion of the current edition must free its claims; got {message:?}"
+    );
+
+    // A FOREIGN author cannot free claims with a deletion naming the
+    // coordinate: register once more, then a stranger "deletes" it.
+    let reg3 = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&w2, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 6),
+    );
+    publish_with_result(relay.url(), &reg3).await;
+    let foreign = EventBuilder::new(Kind::EventDeletion, "malicious")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 7))
+        .finalize(&other)
+        .expect("sign foreign kind-5");
+    let _ = publish_with_result(relay.url(), &foreign).await;
+    let grab_alias3 = random_alias();
+    let grab3 = registration_event(
+        &other,
+        &grab_alias3,
+        &[key_entry(&w2, &other.public_key(), &grab_alias3)],
+        &[],
+        &domain,
+        Some(t0 + 8),
+    );
+    let (accepted, _message) = publish_with_result(relay.url(), &grab3).await;
+    assert!(
+        !accepted,
+        "exit10: a foreign deletion must never free the tenant's claims"
     );
 
     relay.stop().await;

@@ -206,6 +206,11 @@ impl MetaEnv {
         Ok(self.inner.registrations.put(txn, alias, record)?)
     }
 
+    pub fn delete_registration(&self, txn: &mut RwTxn, alias: &str) -> Result<()> {
+        self.inner.registrations.delete(txn, alias)?;
+        Ok(())
+    }
+
     pub fn registrations_len(&self, txn: &RoTxn) -> Result<u64> {
         Ok(self.inner.registrations.len(txn)?)
     }
