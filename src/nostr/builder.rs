@@ -804,17 +804,20 @@ impl WritePolicy for Nip34WritePolicy {
                     let svc = private.unwrap();
                     match svc.try_handle_wrap(event, false).await {
                         Some(result) => result,
-                        // Unregistered outer key: public path unchanged —
-                        // but if the public path ALSO rejects, hold the wrap
-                        // keyed by its outer author so a later 30640
-                        // registering that key reprocesses it (design 1.4).
+                        // Unregistered outer key: REJECT (never the public
+                        // related-event path). §3.2 is normative here: a
+                        // GRASP-P node admits 1059s only for outer authors in
+                        // w∪s of a live registration — accepting referenced
+                        // wraps from unregistered keys made every deregistered
+                        // rekey address permanently floodable (charged to
+                        // nobody), defeating the client's epoch-scoped
+                        // admission windows. The wrap is still held keyed by
+                        // its outer author so a later 30640 registering that
+                        // key reprocesses it (design 1.4, out-of-order sync).
                         None => {
-                            let result = self.handle_related_event(event, "Event").await;
-                            if !matches!(result, WritePolicyResult::Accept) {
-                                svc.sync_rejected()
-                                    .add_wrap(event.pubkey.to_hex(), event.clone());
-                            }
-                            result
+                            svc.sync_rejected()
+                                .add_wrap(event.pubkey.to_hex(), event.clone());
+                            reject_restricted("unregistered key")
                         }
                     }
                 }
@@ -823,7 +826,10 @@ impl WritePolicy for Nip34WritePolicy {
                 {
                     match private.unwrap().try_handle_wrap(event, true).await {
                         Some(result) => result,
-                        None => self.handle_related_event(event, "Event").await,
+                        // Ephemeral wraps are never stored, so there is no
+                        // out-of-order hold — reject outright (§3.2: outer
+                        // author must be registered).
+                        None => reject_restricted("unregistered key"),
                     }
                 }
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
@@ -841,8 +847,37 @@ impl WritePolicy for Nip34WritePolicy {
                     );
                     WritePolicyResult::Accept
                 }
-                Kind::EventDeletion => self.deletion.handle_nip09(event).await,
-                Kind::RequestToVanish => self.deletion.handle_vanish(event).await,
+                Kind::EventDeletion => {
+                    let result = self.deletion.handle_nip09(event).await;
+                    // GRASP-P: when an author-valid deletion of a private
+                    // 30640 is honored, free its key claims — claims must die
+                    // with the registration or they wedge future rotations
+                    // (dangling "write key already registered" conflicts).
+                    if matches!(result, WritePolicyResult::Accept)
+                        && self.deletion.actions_deletions()
+                    {
+                        if let Some(svc) = self.private.get() {
+                            svc.free_claims_for_deleted_registrations(event);
+                        }
+                    }
+                    result
+                }
+                Kind::RequestToVanish => {
+                    let result = self.deletion.handle_vanish(event).await;
+                    // GRASP-P: a vanish deletes every author event including
+                    // 30640s — free their key claims too (dangling-claim
+                    // wedge, same as the kind-5 path). Only when the vanish
+                    // actually targets this relay and is actioned locally.
+                    if matches!(result, WritePolicyResult::Accept)
+                        && self.deletion.actions_deletions()
+                        && self.deletion.vanish_targets_this_relay(event)
+                    {
+                        if let Some(svc) = self.private.get() {
+                            svc.free_claims_for_vanished_author(event);
+                        }
+                    }
+                    result
+                }
                 _ => self.handle_related_event(event, "Event").await,
             };
 

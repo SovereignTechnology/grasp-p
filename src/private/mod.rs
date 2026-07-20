@@ -576,6 +576,122 @@ impl PrivateService {
         Some(result)
     }
 
+    /// NIP-09 follow-up (cord-git !13 verify-round): free the key claims of
+    /// every private 30640 this author-valid deletion targets — by `a`-tag
+    /// coordinate or `e`-tag event id. Key claims are otherwise freed only
+    /// by a newer registration edition (the diff in `registration::handle`),
+    /// so a deleted registration left its claims dangling forever: a member
+    /// could squat an epoch's (derivable) rekey addresses, delete their own
+    /// registration, and permanently wedge every future rotation whose widen
+    /// lists those keys ("write key already registered"). Claims must die
+    /// with the registration. The NIP-09 cutoff is honored: a registration
+    /// edition NEWER than the deletion keeps its claims (a replayed stale
+    /// deletion cannot wipe a live edition). Blob/quota/ledger cleanup
+    /// remains the Phase-4 tombstone worker's job (backlog).
+    pub fn free_claims_for_deleted_registrations(&self, event: &Event) {
+        let author_hex = event.pubkey.to_hex();
+        let deletion_at = event.created_at.as_secs();
+        let mut coords: Vec<String> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        for tag in event.tags.iter() {
+            let v = tag.clone().to_vec();
+            if v.len() < 2 {
+                continue;
+            }
+            match v[0].as_str() {
+                "a" => {
+                    let mut parts = v[1].splitn(3, ':');
+                    if let (Some(kind), Some(pubkey), Some(alias)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        if kind == "30640"
+                            && pubkey == author_hex
+                            && registration::is_valid_alias(alias)
+                        {
+                            coords.push(alias.to_string());
+                        }
+                    }
+                }
+                "e" => ids.push(v[1].clone()),
+                _ => {}
+            }
+        }
+        if coords.is_empty() && ids.is_empty() {
+            return;
+        }
+        let freed = self.meta.with_write(|meta, txn| {
+            let mut n = 0usize;
+            for alias in &coords {
+                n += free_registration_claims(meta, txn, &author_hex, alias, deletion_at)?;
+            }
+            if !ids.is_empty() {
+                // e-tags carry only the event id — resolve it against the
+                // author's own registrations' current editions.
+                let aliases = meta.get_tenant_aliases(txn, &author_hex)?;
+                for alias in aliases {
+                    let Some(record) = meta.get_registration(txn, &alias)? else {
+                        continue;
+                    };
+                    if ids.iter().any(|id| *id == record.event_id) {
+                        n += free_registration_claims(meta, txn, &author_hex, &alias, deletion_at)?;
+                    }
+                }
+            }
+            Ok(n)
+        });
+        match freed {
+            Ok(n) if n > 0 => {
+                tracing::info!(author = %author_hex, keys = n, "freed private key claims of deleted registration(s)");
+                self.refresh_gauges();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to free private key claims of deleted registration")
+            }
+        }
+    }
+
+    /// NIP-62 follow-up: a vanish deletes ALL of the author's events,
+    /// including their 30640s — free every claim they hold (same
+    /// dangling-claim wedge as the kind-5 path). The kind-5 cutoff applies
+    /// here too: registrations newer than the vanish keep their claims (a
+    /// replayed stale vanish cannot wipe a re-registered edition).
+    pub fn free_claims_for_vanished_author(&self, event: &Event) {
+        let author_hex = event.pubkey.to_hex();
+        let vanish_at = event.created_at.as_secs();
+        let freed = self.meta.with_write(|meta, txn| {
+            let mut n = 0usize;
+            let aliases = meta.get_tenant_aliases(txn, &author_hex)?;
+            for alias in aliases {
+                let Some(record) = meta.get_registration(txn, &alias)? else {
+                    continue;
+                };
+                if record.created_at > vanish_at {
+                    continue;
+                }
+                for key in record.w_keys.iter().chain(record.aux_keys.iter()) {
+                    meta.delete_key_claim(txn, key)?;
+                    n += 1;
+                }
+                meta.delete_registration(txn, &alias)?;
+                let mut remaining = meta.get_tenant_aliases(txn, &author_hex)?;
+                remaining.retain(|a| a != &alias);
+                meta.put_tenant_aliases(txn, &author_hex, &remaining)?;
+            }
+            Ok(n)
+        });
+        match freed {
+            Ok(n) if n > 0 => {
+                tracing::info!(author = %author_hex, keys = n, "freed private key claims of vanished author");
+                self.refresh_gauges();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to free private key claims of vanished author")
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Blob routes
     // ------------------------------------------------------------------
@@ -833,6 +949,39 @@ impl PrivateService {
     pub fn spawn_mirror(self: &Arc<Self>) -> JoinHandle<()> {
         mirror::spawn(self.clone())
     }
+}
+
+/// Free one registration's key claims and remove its record (and its slot
+/// in the tenant's alias list) iff it belongs to `author_hex` and its
+/// current edition is not newer than `max_created_at` (the NIP-09 cutoff:
+/// editions after the deletion survive with claims intact). Returns the
+/// number of claims freed.
+fn free_registration_claims(
+    meta: &MetaEnv,
+    txn: &mut heed::RwTxn,
+    author_hex: &str,
+    alias: &str,
+    max_created_at: u64,
+) -> anyhow::Result<usize> {
+    let Some(record) = meta.get_registration(txn, alias)? else {
+        return Ok(0);
+    };
+    if record.tenant_hex != author_hex {
+        return Ok(0);
+    }
+    if record.created_at > max_created_at {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for key in record.w_keys.iter().chain(record.aux_keys.iter()) {
+        meta.delete_key_claim(txn, key)?;
+        n += 1;
+    }
+    meta.delete_registration(txn, alias)?;
+    let mut aliases = meta.get_tenant_aliases(txn, author_hex)?;
+    aliases.retain(|a| a != alias);
+    meta.put_tenant_aliases(txn, author_hex, &aliases)?;
+    Ok(n)
 }
 
 fn record_event_metric(kind: u16, result: &WritePolicyResult) {
