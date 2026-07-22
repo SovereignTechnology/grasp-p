@@ -71,17 +71,11 @@ async fn test_push_triggers_unified_processing() {
         .expect("Failed to add relay");
     client.connect().await;
 
-    // Wait for connection to be established
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Send announcement
     client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement");
-
-    // Small delay to ensure announcement is processed
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 4. Create and send state event referencing the commit
     // The state event has refs that point to commits we haven't pushed yet
@@ -104,9 +98,9 @@ async fn test_push_triggers_unified_processing() {
         .await
         .expect("Failed to send state event");
 
-    // 5. Verify event is NOT served yet (in purgatory)
-    // Give a moment for the event to be processed into purgatory
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 5. Verify event is NOT served yet (in purgatory). Deliberately add no
+    // pacing between accepting the state event and this check or the push:
+    // the post-push promotion path must handle either arrival ordering.
 
     verify_event_not_served(relay.url(), &state_event_id, Duration::from_secs(1))
         .await
