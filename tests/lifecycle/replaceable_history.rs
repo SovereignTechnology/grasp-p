@@ -77,6 +77,37 @@ fn build_state_version(
         .expect("build state version")
 }
 
+/// Build a state version with ngit's one-use nonce tag.  Varying the nonce
+/// lets the test deterministically produce an ID that wins NIP-01's
+/// equal-timestamp tie-break without changing the state coordinate.
+fn build_grinded_state_version(
+    client: &AuditClient,
+    repo_id: &str,
+    created_at: Timestamp,
+    nonce: u64,
+) -> Event {
+    EventBuilder::new(Kind::RepoState, "state-v2")
+        .tags(vec![
+            Tag::identifier(repo_id),
+            Tag::custom(
+                "refs/heads/main",
+                vec![DETERMINISTIC_COMMIT_HASH.to_string()],
+            ),
+            Tag::custom("HEAD", vec!["ref: refs/heads/main".to_string()]),
+            Tag::custom(
+                "nonce",
+                vec![
+                    nonce.to_string(),
+                    "0".to_string(),
+                    "ngit-created-at-tiebreak".to_string(),
+                ],
+            ),
+        ])
+        .custom_created_at(created_at)
+        .finalize(client.keys())
+        .expect("build grinded state version")
+}
+
 fn build_policy_for_history_regression(
     database: SharedDatabase,
     history: ReplaceableHistoryStore,
@@ -189,6 +220,92 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
     );
 
     relay.stop().await;
+}
+
+#[tokio::test]
+async fn same_second_30618_replacement_keeps_nip01_lowest_id() {
+    // Own the directories outside the fixture so the exact same LMDB database
+    // can be reopened after the relay subprocess is stopped.
+    let git_data_dir = tempfile::tempdir().expect("create git data directory");
+    let relay_data_dir = tempfile::tempdir().expect("create relay data directory");
+    let git_data_path = git_data_dir.path().to_path_buf();
+    let relay_data_path = relay_data_dir.path().to_path_buf();
+    let relay = TestRelay::start_with_existing_lmdb_paths(
+        git_data_path.clone(),
+        relay_data_path.clone(),
+        None,
+        false,
+    )
+    .await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .expect("create audit client");
+
+    let (_announcement, repo_id) = publish_served_repo(&client, "same-second-state").await;
+    // Keep the test sequence after the fixture's initial state event while
+    // deliberately making the two explicit versions share one timestamp.
+    let created_at = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
+    let existing = build_state_version(&client, &repo_id, created_at, "state-v1");
+    let replacement = (0..100_000)
+        .map(|nonce| build_grinded_state_version(&client, &repo_id, created_at, nonce))
+        .find(|candidate| candidate.id < existing.id)
+        .expect("nonce grinding must produce a lower NIP-01 event ID");
+
+    assert_eq!(existing.created_at, replacement.created_at);
+    assert!(
+        replacement.id < existing.id,
+        "ngit's equal-timestamp replacement must have the lower event ID"
+    );
+
+    client
+        .send_event(existing.clone())
+        .await
+        .expect("send existing state");
+    client
+        .send_event(replacement.clone())
+        .await
+        .expect("send NIP-01-preferred replacement state");
+
+    assert!(
+        !client
+            .is_event_on_relay(existing.id)
+            .await
+            .expect("query existing state by ID"),
+        "the larger-ID state must be removed after the same-second replacement"
+    );
+    assert!(
+        client
+            .is_event_on_relay(replacement.id)
+            .await
+            .expect("query replacement state by ID"),
+        "the lower-ID state must be returned as the NIP-01 winner"
+    );
+
+    relay.stop().await;
+
+    let restarted =
+        TestRelay::start_with_existing_lmdb_paths(git_data_path, relay_data_path, None, false)
+            .await;
+    let restarted_client = AuditClient::new(restarted.url(), AuditConfig::isolated())
+        .await
+        .expect("create client for restarted relay");
+
+    assert!(
+        !restarted_client
+            .is_event_on_relay(existing.id)
+            .await
+            .expect("query existing state by ID after restart"),
+        "the larger-ID state must remain absent after restart"
+    );
+    assert!(
+        restarted_client
+            .is_event_on_relay(replacement.id)
+            .await
+            .expect("query replacement state by ID after restart"),
+        "the lower-ID state must remain the NIP-01 winner after restart"
+    );
+
+    restarted.stop().await;
 }
 
 #[tokio::test]
