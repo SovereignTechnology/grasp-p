@@ -366,8 +366,13 @@ async fn fetch_from_peer(
     }
 
     // Reserve in-flight capacity + open the temp-file sink (mirrors a client
-    // PUT: reservation → sink → stream → finish).
-    let reservation = svc.reserve_upload(blob.size).map_err(|e| match e {
+    // PUT: reservation → sink → stream → finish). finish() releases any
+    // pending speculative charge before its quota check, so the reserve nets
+    // it too (FF).
+    let pending = svc
+        .pending_spec_release(&blob.sha256)
+        .map_err(|e| format!("reserve: {}", e.reason()))?;
+    let reservation = svc.reserve_upload(blob.size, pending).map_err(|e| match e {
         BlobError::QuotaExceeded => "quota".to_string(),
         other => format!("reserve: {}", other.reason()),
     })?;

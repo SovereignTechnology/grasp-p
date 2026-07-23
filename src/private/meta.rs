@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use nostr::Timestamp;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +54,34 @@ pub struct RegistrationRecord {
     pub registered_at: u64,
     /// Set when the alias has been offboarded (stub in Phase 1).
     pub tombstoned_at: Option<u64>,
+    /// created_at of the FIRST registration edition for this seat — the §3.2
+    /// conflict anchor (verify round 1, FA). Same-tenant replacement
+    /// overwrites `created_at`/`event_id` with each new edition, so without
+    /// this the seat's conflict priority DECAYS on every rotation: a squatter
+    /// whose registration was created between edition 1 and edition N would
+    /// start winning the deterministic merge after the rotation. `None` only
+    /// for records written before this field existed (see [`Self::anchor`]).
+    #[serde(default)]
+    pub first_created_at: Option<Timestamp>,
+    /// Event id (hex) of the first registration edition (see
+    /// `first_created_at`).
+    #[serde(default)]
+    pub first_event_id: Option<String>,
+}
+
+impl RegistrationRecord {
+    /// §3.2 conflict anchor: the FIRST edition's (created_at, event id) when
+    /// recorded, else the latest edition's — the fallback for pre-existing
+    /// records (first-edition history is unrecoverable there; accepted
+    /// pre-multi-node-traffic). NEVER `registered_at` — that is node-local
+    /// wall clock, and merge decisions must stay pure functions of
+    /// event-intrinsic data + meta state.
+    pub fn anchor(&self) -> (Timestamp, &str) {
+        match (&self.first_created_at, &self.first_event_id) {
+            (Some(created_at), Some(event_id)) => (*created_at, event_id.as_str()),
+            _ => (Timestamp::from_secs(self.created_at), self.event_id.as_str()),
+        }
+    }
 }
 
 /// Byte ledger entry for a tenant (`t:<hex>`), alias (`r:<alias>`), or the
@@ -67,6 +96,20 @@ impl LedgerEntry {
     pub fn total(&self) -> u64 {
         self.event_bytes.saturating_add(self.blob_bytes)
     }
+}
+
+/// Speculative (pre-upload) ledger charge attached to a `stored = false`
+/// blob claim: the declared bytes a 30641 charged to its (tenant, alias)
+/// when it referenced a blob that was not yet stored (issue !12 — without
+/// this, speculative claims accumulate unbilled and a tenant can grow the
+/// shared meta LMDB at zero ledger cost). Released exactly once: when the
+/// claim transitions to `stored` (the upload/mirror path takes over the
+/// accounting) or when the claim is deleted by GC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecCharge {
+    pub tenant: String,
+    pub alias: String,
+    pub bytes: u64,
 }
 
 /// Claim record for one stored (or referenced) blob.
@@ -84,6 +127,10 @@ pub struct BlobClaim {
     /// Scope the stored bytes were charged to (released on GC delete).
     pub charged_tenant: Option<String>,
     pub charged_alias: Option<String>,
+    /// Speculative charge for a not-yet-stored declared blob (issue !12).
+    /// `serde(default)` keeps records written before this field readable.
+    #[serde(default)]
+    pub spec_charge: Option<SpecCharge>,
 }
 
 struct MetaInner {

@@ -315,6 +315,24 @@ lazy_static! {
             .expect("register private mirror failed metric");
         metric
     };
+    static ref PRIVATE_REGISTRATION_CONFLICTS_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_registration_conflicts_total",
+                "Cross-tenant registration conflicts resolved by the deterministic \
+                 (created_at, id) merge, by resolution (stored_evicted = a previously \
+                 accepted registration lost its seat; incoming_rejected = the arriving \
+                 registration lost). Alert on any increase: every conflict is either a \
+                 split-brain heal or an attempted alias/key squat.",
+            ),
+            &["resolution"],
+        )
+        .expect("build private registration conflicts metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private registration conflicts metric");
+        metric
+    };
 }
 
 pub fn record_blacklist_deletion_attempt(phase: &str) {
@@ -534,6 +552,15 @@ pub fn record_private_mirror_fetched() {
 pub fn record_private_mirror_failed(reason: &str) {
     PRIVATE_MIRROR_FAILED_TOTAL
         .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record one cross-tenant registration conflict resolved by the
+/// deterministic merge. `resolution` is `stored_evicted` or
+/// `incoming_rejected` (§3.2 first-registrant-wins conflict alert).
+pub fn record_private_registration_conflict(resolution: &str) {
+    PRIVATE_REGISTRATION_CONFLICTS_TOTAL
+        .with_label_values(&[resolution])
         .inc();
 }
 
