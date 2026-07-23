@@ -37,6 +37,38 @@ use common::{
 use nostr_sdk::prelude::*;
 use std::time::Duration;
 
+/// Build a state event with a nonce that changes its ID without changing its
+/// replaceable coordinate or declared repository state.
+fn build_grinded_state_event(
+    keys: &Keys,
+    identifier: &str,
+    commit_hash: &str,
+    clone_url: &str,
+    relay_url: &str,
+    created_at: Timestamp,
+    nonce: u64,
+) -> Event {
+    EventBuilder::new(Kind::RepoState, "")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom("clone", vec![clone_url.to_string()]),
+            Tag::custom("relays", vec![relay_url.to_string()]),
+            Tag::custom("refs/heads/main", vec![commit_hash.to_string()]),
+            Tag::custom("HEAD", vec!["refs/heads/main".to_string()]),
+            Tag::custom(
+                "nonce",
+                vec![
+                    nonce.to_string(),
+                    "0".to_string(),
+                    "ngit-created-at-tiebreak".to_string(),
+                ],
+            ),
+        ])
+        .custom_created_at(created_at)
+        .finalize(keys)
+        .expect("build grinded state event")
+}
+
 /// Test that a git push triggers `process_newly_available_git_data` and
 /// releases state events from purgatory.
 ///
@@ -119,6 +151,91 @@ async fn test_push_triggers_unified_processing() {
     assert_eq!(found_event.id, state_event_id);
 
     // Cleanup
+    client.disconnect().await;
+    relay.stop().await;
+}
+
+/// Equal-timestamp state events from one author share a replaceable
+/// coordinate. Both must be held while their commit is missing, then only the
+/// NIP-01 winner (the lower event ID) may be promoted after the push.
+#[tokio::test]
+async fn same_second_same_author_states_in_purgatory_keep_nip01_lowest_id() {
+    let relay = TestRelay::start().await;
+    let keys = Keys::generate();
+    let identifier = "same-second-purgatory-state";
+    let temp_dir = tempfile::tempdir().expect("create test repository directory");
+    let commit_hash = create_test_repo_with_commit(temp_dir.path(), CommitVariant::StateTest)
+        .expect("create test repository");
+    let announcement = create_repo_announcement(&keys, &[&relay.domain()], identifier);
+
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
+    client.add_relay(relay.url()).await.expect("add relay");
+    client.connect().await;
+    client
+        .send_event(&announcement)
+        .await
+        .expect("send announcement");
+
+    let npub = keys.public_key().to_bech32().expect("encode public key");
+    let clone_url = format!("http://{}/{}/{}.git", relay.domain(), npub, identifier);
+    let created_at = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
+    let losing_state = build_grinded_state_event(
+        &keys,
+        identifier,
+        &commit_hash,
+        &clone_url,
+        relay.url(),
+        created_at,
+        0,
+    );
+    let winning_state = (1..100_000)
+        .map(|nonce| {
+            build_grinded_state_event(
+                &keys,
+                identifier,
+                &commit_hash,
+                &clone_url,
+                relay.url(),
+                created_at,
+                nonce,
+            )
+        })
+        .find(|candidate| candidate.id < losing_state.id)
+        .expect("nonce grinding must produce a lower NIP-01 event ID");
+
+    assert_eq!(losing_state.created_at, winning_state.created_at);
+    assert!(winning_state.id < losing_state.id);
+
+    // Submit the losing state first to prove promotion does not depend on
+    // arrival order when purgatory releases an equal-timestamp pair.
+    client
+        .send_event(&losing_state)
+        .await
+        .expect("send higher-ID state event");
+    client
+        .send_event(&winning_state)
+        .await
+        .expect("send lower-ID state event");
+
+    for event_id in [losing_state.id, winning_state.id] {
+        verify_event_not_served(relay.url(), &event_id, Duration::from_secs(1))
+            .await
+            .expect("both state events must remain in purgatory before the push");
+    }
+
+    push_to_relay(temp_dir.path(), &relay.domain(), &npub, identifier)
+        .expect("push state commit to relay");
+
+    let promoted = wait_for_event_served(relay.url(), &winning_state.id, Duration::from_secs(5))
+        .await
+        .expect("lower-ID state event must be promoted");
+    assert_eq!(promoted.id, winning_state.id);
+    verify_event_not_served(relay.url(), &losing_state.id, Duration::from_secs(1))
+        .await
+        .expect("higher-ID state event must not be promoted");
+
     client.disconnect().await;
     relay.stop().await;
 }

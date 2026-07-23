@@ -1055,10 +1055,15 @@ async fn process_purgatory_state_events(
         return result;
     }
 
-    // Sort by created_at (oldest first) so we process events in chronological order.
-    // This ensures that when multiple state events are in purgatory, older ones
-    // get processed first, allowing newer ones to correctly supersede them.
-    purgatory_states.sort_by_key(|entry| entry.event.created_at);
+    // Process oldest states first. NIP-01 breaks equal-timestamp replaceable
+    // event ties by retaining the lexicographically lowest event ID, so include
+    // that ordering here instead of relying on insertion order.
+    purgatory_states.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
 
     debug!(
         identifier = %identifier,
@@ -1161,23 +1166,26 @@ async fn process_purgatory_state_events(
         result.refs_deleted += process_result.refs_deleted;
         result.errors.extend(process_result.errors);
 
-        // Check if there's a newer state from the same author in the database
-        let has_newer_from_same_author = db_repo_data.states.iter().any(|s| {
+        // Check whether the database already has the NIP-01-preferred state
+        // for this author and coordinate. For equal timestamps, the lower
+        // event ID wins.
+        let has_preferred_state_from_same_author = db_repo_data.states.iter().any(|s| {
             s.event.pubkey == state.event.pubkey
                 && (s.event.created_at > state.event.created_at
                     || (s.event.created_at == state.event.created_at
-                        && s.event.id > state.event.id))
+                        && s.event.id < state.event.id))
         });
 
-        if has_newer_from_same_author {
-            // Just remove from purgatory without saving - a newer event from same author exists
+        if has_preferred_state_from_same_author {
+            // Just remove from purgatory without saving: a newer or NIP-01
+            // tie-break-preferred state from the same author already exists.
             purgatory.remove_state_event(identifier, &entry.event.id);
             result.states_released += 1;
 
             debug!(
                 identifier = %identifier,
                 event_id = %entry.event.id,
-                "Removed older state event from purgatory - newer event from same author exists in DB"
+                "Removed superseded state event from purgatory - preferred event from same author exists in DB"
             );
         } else {
             // Save to database
@@ -1330,25 +1338,28 @@ fn is_latest_authorized_state(
     maintainers: &[String],
     db_states: &[RepositoryState],
 ) -> bool {
-    // Find the latest authorized state from database
+    // Find the NIP-01-preferred authorized state from the database: newest
+    // timestamp wins, and the lowest event ID wins an equal-timestamp tie.
     let latest_db_state = db_states
         .iter()
         .filter(|s| maintainers.contains(&s.event.pubkey.to_hex()))
         .max_by(|a, b| {
-            // Compare by created_at, then by event id for tie-breaking
+            // Compare by created_at, then reverse event-ID order so `max_by`
+            // selects the lexicographically lowest ID on equal timestamps.
             a.event
                 .created_at
                 .cmp(&b.event.created_at)
-                .then_with(|| a.event.id.cmp(&b.event.id))
+                .then_with(|| b.event.id.cmp(&a.event.id))
         });
 
     match latest_db_state {
         None => true, // No other states exist in DB, this is the latest
         Some(latest) => {
-            // This state is latest if it's newer, or if equal timestamp with larger event id
+            // This state is preferred if it's newer, or if an equal timestamp
+            // has a lower event ID under NIP-01's replaceable-event tie-break.
             state.event.created_at > latest.event.created_at
                 || (state.event.created_at == latest.event.created_at
-                    && state.event.id >= latest.event.id)
+                    && state.event.id <= latest.event.id)
         }
     }
 }
@@ -2157,8 +2168,9 @@ mod tests {
 
         let maintainers = vec![keys.public_key().to_hex()];
 
-        // The one with larger event ID should be considered latest
-        let (latest, older) = if state1.event.id > state2.event.id {
+        // NIP-01 retains the lexicographically lower event ID on an
+        // equal-timestamp replaceable-event tie.
+        let (latest, older) = if state1.event.id < state2.event.id {
             (state1, state2)
         } else {
             (state2, state1)
