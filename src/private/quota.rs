@@ -8,7 +8,7 @@
 use anyhow::Result;
 use heed::{RoTxn, RwTxn};
 
-use super::meta::{BlobClaim, LedgerEntry, MetaEnv, LEDGER_GLOBAL_KEY};
+use super::meta::{BlobClaim, LedgerEntry, MetaEnv, SpecCharge, LEDGER_GLOBAL_KEY};
 use super::PrivateConfig;
 
 /// Ledger key for a tenant scope.
@@ -93,6 +93,22 @@ pub fn global_total(meta: &MetaEnv, txn: &RoTxn) -> Result<u64> {
     Ok(meta.get_ledger_txn(txn, LEDGER_GLOBAL_KEY)?.total())
 }
 
+/// Reset the EVENT-bytes column of an alias scope (`r:<alias>`) to zero
+/// (verify round 1, FC). The alias scope is keyed by the alias STRING, so
+/// wrap/30641 event bytes a dead registration charged there would otherwise
+/// outlive it and brick the seat for a conflict-merge winner: those bytes
+/// are unattributable per tenant and every prior event charge belonged to
+/// the dead holder(s). Blob/spec columns stay intact — those are real bytes
+/// on disk (or recorded speculative charges) that the GC/grace paths
+/// release. Pure function of meta state; ledger timing stays node-local, so
+/// the deterministic merge is unaffected.
+pub fn reset_alias_event_bytes(meta: &MetaEnv, txn: &mut RwTxn, alias: &str) -> Result<()> {
+    let key = alias_key(alias);
+    let mut entry = meta.get_ledger_txn(txn, &key)?;
+    entry.event_bytes = 0;
+    meta.put_ledger(txn, &key, &entry)
+}
+
 /// Release the ledger charge attached to a stored blob claim (GC).
 ///
 /// No-op when the claim was never charged: adopted orphans carry
@@ -110,6 +126,21 @@ pub fn release_claim(meta: &MetaEnv, txn: &mut RwTxn, claim: &BlobClaim) -> Resu
         claim.charged_tenant.as_deref(),
         claim.charged_alias.as_deref(),
         claim.size,
+        true,
+    )
+}
+
+/// Release a speculative (pre-upload) charge (issue !12). Releases exactly
+/// the bytes that were charged at 30641 declaration time, against the same
+/// (tenant, alias) scope — never `claim.size`, which the upload path may
+/// have since overwritten with the actual byte count.
+pub fn release_spec_charge(meta: &MetaEnv, txn: &mut RwTxn, spec: &SpecCharge) -> Result<()> {
+    release(
+        meta,
+        txn,
+        Some(&spec.tenant),
+        Some(&spec.alias),
+        spec.bytes,
         true,
     )
 }
@@ -140,6 +171,7 @@ mod tests {
             stored: true,
             charged_tenant: tenant.map(str::to_string),
             charged_alias: alias.map(str::to_string),
+            spec_charge: None,
         }
     }
 

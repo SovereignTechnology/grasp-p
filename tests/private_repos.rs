@@ -319,6 +319,24 @@ async fn get_blob(relay: &TestRelay, sha: &str) -> (u16, Vec<u8>) {
     (status, body)
 }
 
+/// DELETE /<sha> → (status, X-Reason).
+async fn delete_blob(relay: &TestRelay, sha: &str, auth: &Event) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .delete(format!("{}/{sha}", http_base(relay)))
+        .header("authorization", auth_header_value(auth))
+        .send()
+        .await
+        .expect("DELETE /<sha> transport");
+    let status = resp.status().as_u16();
+    let reason = resp
+        .headers()
+        .get("x-reason")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, reason)
+}
+
 /// Fetch the NIP-11 document.
 async fn nip11_doc(relay: &TestRelay) -> serde_json::Value {
     reqwest::Client::new()
@@ -1510,6 +1528,1862 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
     assert!(
         !accepted,
         "exit10: a foreign deletion must never free the tenant's claims"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 11 — §3.2 deterministic registration conflict merge (issue !11)
+// ============================================================================
+
+/// Cross-tenant conflicts must resolve by (created_at, id) — lowest wins —
+/// never by arrival order: an earlier-created registration arriving second
+/// takes the alias, the stored loser is evicted (claims freed, coordinate
+/// pruned from the relay DB), the conflict alert fires, and a later-created
+/// challenger keeps losing no matter when it arrives.
+#[tokio::test]
+async fn exit11_registration_conflict_merge() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+
+    let late_tenant = Keys::generate();
+    let late_writer = Keys::generate();
+    let early_tenant = Keys::generate();
+    let early_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    // (a) The LATER-created registration arrives first and is accepted.
+    let late_reg = registration_event(
+        &late_tenant,
+        &alias,
+        &[key_entry(&late_writer, &late_tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &late_reg).await;
+    assert!(accepted, "exit11: first-arriving registration failed: {message:?}");
+
+    // (b) The EARLIER-created registration arrives second and must WIN the
+    // deterministic merge (pre-!11 it was rejected as "alias already
+    // registered" — first-arrival-wins split-brain).
+    let early_reg = registration_event(
+        &early_tenant,
+        &alias,
+        &[key_entry(&early_writer, &early_tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &early_reg).await;
+    assert!(
+        accepted,
+        "exit11: the earlier-created registration must win the merge; got {message:?}"
+    );
+
+    // (c) REQ resolves ONLY the winner: the loser's coordinate is pruned.
+    let mut winner_only = false;
+    for _ in 0..50 {
+        let events = fetch_from(
+            relay.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+        )
+        .await;
+        if events.len() == 1 && events[0].id == early_reg.id {
+            winner_only = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        winner_only,
+        "exit11: REQ must resolve exactly the merge winner (loser pruned)"
+    );
+
+    // (d) The loser's writer key is DEAD for the alias: its wraps are
+    // rejected outright (claims were freed with the eviction).
+    let wrap = wrap_event(&late_writer, 1059);
+    let (accepted, _message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        !accepted,
+        "exit11: the evicted loser's writer key must not admit wraps"
+    );
+
+    // (e) …and freed means reusable: a third tenant claims the loser's
+    // writer key under a fresh alias with a fresh proof-of-possession.
+    let third = Keys::generate();
+    let alias2 = random_alias();
+    let reclaim = registration_event(
+        &third,
+        &alias2,
+        &[key_entry(&late_writer, &third.public_key(), &alias2)],
+        &[],
+        &domain,
+        Some(t0 + 200),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reclaim).await;
+    assert!(
+        accepted,
+        "exit11: the evicted loser's key must be claimable again; got {message:?}"
+    );
+
+    // (f) A later-created challenger still loses to the winner, whenever it
+    // arrives.
+    let challenger = Keys::generate();
+    let challenge = registration_event(
+        &challenger,
+        &alias,
+        &[key_entry(&Keys::generate(), &challenger.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 300),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &challenge).await;
+    assert!(
+        !accepted,
+        "exit11: a later-created registration must keep losing"
+    );
+    assert!(
+        message.contains("alias already registered"),
+        "exit11: conflict-loss message; got {message:?}"
+    );
+
+    // (g) The conflict alert fired for both resolutions.
+    let metrics = common::sync_helpers::ParsedMetrics::parse(
+        &common::sync_helpers::fetch_metrics(relay.url())
+            .await
+            .expect("metrics scrape"),
+    );
+    assert!(
+        metrics
+            .counter(
+                "ngit_private_registration_conflicts_total",
+                &[("resolution", "stored_evicted")],
+            )
+            .unwrap_or(0)
+            >= 1,
+        "exit11: stored_evicted conflict alert must fire"
+    );
+    assert!(
+        metrics
+            .counter(
+                "ngit_private_registration_conflicts_total",
+                &[("resolution", "incoming_rejected")],
+            )
+            .unwrap_or(0)
+            >= 1,
+        "exit11: incoming_rejected conflict alert must fire"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 13 — merge winner is exempt from node-local quota (issue !11)
+// ============================================================================
+
+/// The quota ledger is node-local state, so it must not be able to flip the
+/// deterministic merge: a squatter who saturates the shared r:<alias> scope
+/// (wraps up to the repo cap) must not get the genuine earlier registration
+/// rejected with "quota exceeded" on this node while it wins on the peer.
+/// A conflict-merge winner is admitted past the quota CHECK (still charged).
+#[tokio::test]
+async fn exit13_conflict_winner_exempt_from_node_local_quota() {
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", "4096"),
+    ])
+    .await;
+    let domain = relay.domain();
+
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let victim = Keys::generate();
+    let victim_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    // Squatter takes the alias (later created_at) and saturates the shared
+    // r:<alias> quota scope with wraps until one is refused.
+    let squat = registration_event(
+        &squatter,
+        &alias,
+        &[key_entry(&squat_writer, &squatter.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &squat).await;
+    assert!(accepted, "exit13: squatter registration failed: {message:?}");
+
+    let mut saturated = false;
+    for _ in 0..24 {
+        let wrap = wrap_event(&squat_writer, 1059);
+        let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+        if !accepted {
+            assert!(
+                message.contains("quota exceeded"),
+                "exit13: expected quota refusal while saturating; got {message:?}"
+            );
+            saturated = true;
+            break;
+        }
+    }
+    assert!(saturated, "exit13: alias quota must saturate within the loop");
+
+    // The genuine earlier registration must STILL win the merge here —
+    // pre-!11-fix this came back "restricted: quota exceeded" and the node
+    // would permanently disagree with its unsaturated peer.
+    let genuine = registration_event(
+        &victim,
+        &alias,
+        &[key_entry(&victim_writer, &victim.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &genuine).await;
+    assert!(
+        accepted,
+        "exit13: the merge winner must be exempt from node-local quota; got {message:?}"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 12 — speculative 30641 blob claims are charged + GC'd (issue !12)
+// ============================================================================
+
+/// A 30641 declaring never-uploaded blobs must charge the declared bytes to
+/// the declaring (tenant, alias) — speculative claims can no longer grow the
+/// meta store unbilled — and the charge must be released when the claim dies
+/// (edition superseded → ring trim → GC). Over-quota speculation is rejected
+/// up front.
+#[tokio::test]
+async fn exit12_speculative_blob_claims_charged_and_released() {
+    let relay = TestRelay::start_with_private_repos(&[
+        // One retained edition + immediate GC so a superseded edition's
+        // speculative claim is collectable within the test bound.
+        ("NGIT_PRIVATE_STATE_HISTORY_EDITIONS", "1"),
+        ("NGIT_PRIVATE_GC_GRACE_SECS", "0"),
+        ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", "16384"),
+    ])
+    .await;
+
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+    let g0 = global_ledger().await;
+    assert!(g0 > 0, "exit12: registration must already be on the ledger");
+
+    // (a) v1 declares a never-uploaded 4096-byte manifest blob: accepted,
+    // and the declared bytes are charged (speculative claim).
+    let t0 = Timestamp::now().as_secs();
+    let fake_sha = sha256_hex(&blob_bytes(91, 64));
+    let v1 = state_root_event(&writer, &tenant.public_key(), &alias, (&fake_sha, 4096), &[], t0);
+    let (accepted, message) = publish_with_result(relay.url(), &v1).await;
+    assert!(accepted, "exit12: v1 must be accepted; got {message:?}");
+    let v1_bytes = v1.as_json().len() as i64;
+
+    let mut g1 = -1;
+    for _ in 0..50 {
+        g1 = global_ledger().await;
+        if g1 == g0 + v1_bytes + 4096 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        g1,
+        g0 + v1_bytes + 4096,
+        "exit12: declared-but-unstored bytes must be charged speculatively"
+    );
+
+    // (b) Speculation cannot exceed quota: an edition declaring more bytes
+    // than the repo has left is rejected outright.
+    let big_sha = sha256_hex(&blob_bytes(92, 64));
+    let over = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&big_sha, 12_000),
+        &[],
+        t0 + 1,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &over).await;
+    assert!(
+        !accepted && message.contains("quota exceeded"),
+        "exit12: over-quota speculation must be rejected; got {message:?}"
+    );
+
+    // (c) v2 supersedes v1 (ring keeps 1 edition): v1's fake ref loses its
+    // alias, GC (grace 0) deletes the claim and refunds the 4096.
+    let sha2 = sha256_hex(&blob_bytes(93, 64));
+    let v2 = state_root_event(&writer, &tenant.public_key(), &alias, (&sha2, 100), &[], t0 + 2);
+    let (accepted, message) = publish_with_result(relay.url(), &v2).await;
+    assert!(accepted, "exit12: v2 must be accepted; got {message:?}");
+    let v2_bytes = v2.as_json().len() as i64;
+
+    let expected = g0 + v1_bytes + v2_bytes + 100;
+    let mut g2 = -1;
+    for _ in 0..100 {
+        g2 = global_ledger().await;
+        if g2 == expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        g2, expected,
+        "exit12: the superseded edition's speculative charge must be GC-refunded \
+         (v2's own 100-byte speculation stays charged)"
+    );
+
+    relay.stop().await;
+}
+
+
+// ============================================================================
+// Exit test 14 — rotation does not decay §3.2 conflict priority (verify FA)
+// ============================================================================
+
+/// FA: a seat's conflict priority is anchored to the FIRST registration
+/// edition, not the latest. Victim registers at t0; the squatter's t1
+/// registration (t0 < t1) loses; the victim then ROTATES (t2 > t1) and the
+/// squatter re-publishes the SAME t1 event — it must still lose. Pre-FA the
+/// rotation overwrote the stored created_at, the re-published squatter event
+/// won the merge, and the victim was evicted from its own alias.
+#[tokio::test]
+async fn exit14_rotation_preserves_conflict_anchor() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+
+    let victim = Keys::generate();
+    let victim_w1 = Keys::generate();
+    let victim_w2 = Keys::generate();
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    // Victim registers edition 1 at t0.
+    let reg1 = registration_event(
+        &victim,
+        &alias,
+        &[key_entry(&victim_w1, &victim.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg1).await;
+    assert!(accepted, "exit14: victim registration failed: {message:?}");
+
+    // The squatter's t1 registration loses (t0 < t1) and is rejected.
+    let squat = registration_event(
+        &squatter,
+        &alias,
+        &[key_entry(&squat_writer, &squatter.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, _) = publish_with_result(relay.url(), &squat).await;
+    assert!(!accepted, "exit14: the later squatter registration must lose");
+
+    // The victim rotates at t2 = t0+200 (new writer key, strictly newer).
+    let reg2 = registration_event(
+        &victim,
+        &alias,
+        &[key_entry(&victim_w2, &victim.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 200),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg2).await;
+    assert!(accepted, "exit14: rotation failed: {message:?}");
+
+    // The squatter re-publishes the SAME t1 event: must STILL lose — pre-FA
+    // this won the merge and evicted the victim (scenario A).
+    let (accepted, message) = publish_with_result(relay.url(), &squat).await;
+    assert!(
+        !accepted,
+        "exit14: re-published squatter must keep losing after the rotation"
+    );
+    assert!(
+        message.contains("alias already registered"),
+        "exit14: conflict-loss message; got {message:?}"
+    );
+
+    // The victim keeps the seat: its rotation is still the served 30640…
+    let served = fetch_from(
+        relay.url(),
+        Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+    )
+    .await;
+    assert_eq!(served.len(), 1, "exit14: exactly the victim's edition served");
+    assert_eq!(served[0].id, reg2.id, "exit14: the victim's rotation stays live");
+
+    // …and the seat is fully functional: 30641 + 1059 still accepted.
+    let sha = sha256_hex(&blob_bytes(61, 256));
+    let state = state_root_event(
+        &victim_w2,
+        &victim.public_key(),
+        &alias,
+        (&sha, 256),
+        &[],
+        t0 + 300,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &state).await;
+    assert!(accepted, "exit14: post-attack 30641 must be accepted; got {message:?}");
+    let wrap = wrap_event(&victim_w2, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(accepted, "exit14: post-attack 1059 must be accepted; got {message:?}");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 15 — same-second cross-tenant tie breaks by event id (Lens-4 F4)
+// ============================================================================
+
+/// Two tenants publish conflicting registrations with EQUAL created_at: the
+/// lowest event id must win on every node, regardless of publish order.
+#[tokio::test]
+async fn exit15_same_second_conflict_tie_breaks_by_event_id() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let tenant_a = Keys::generate();
+    let tenant_b = Keys::generate();
+    let mk = |tenant: &Keys, alias: &str| {
+        let writer = Keys::generate();
+        registration_event(
+            tenant,
+            alias,
+            &[key_entry(&writer, &tenant.public_key(), alias)],
+            &[],
+            &domain,
+            Some(t0),
+        )
+    };
+    let split = |x: Event, y: Event| {
+        assert_ne!(x.id, y.id);
+        if x.id.to_hex() < y.id.to_hex() {
+            (y, x) // (loser, winner)
+        } else {
+            (x, y)
+        }
+    };
+
+    // Order 1: the higher-id registration arrives FIRST (accepted), the
+    // lower-id one second — the lower-id one must win the tie and evict the
+    // first arrival.
+    let alias1 = random_alias();
+    let (loser1, winner1) = split(mk(&tenant_a, &alias1), mk(&tenant_b, &alias1));
+    let (accepted, message) = publish_with_result(relay.url(), &loser1).await;
+    assert!(accepted, "exit15: first arrival must be accepted: {message:?}");
+    let (accepted, message) = publish_with_result(relay.url(), &winner1).await;
+    assert!(
+        accepted,
+        "exit15: equal-created_at lower-id registration must win: {message:?}"
+    );
+    let mut converged = false;
+    for _ in 0..50 {
+        let events = fetch_from(
+            relay.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&alias1),
+        )
+        .await;
+        if events.len() == 1 && events[0].id == winner1.id {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        converged,
+        "exit15: REQ must resolve exactly the lower-id winner (loser pruned)"
+    );
+
+    // Order 2 (reverse): the lower-id winner arrives first, the loser second
+    // — the loser is rejected outright. Same winner either way.
+    let alias2 = random_alias();
+    let (loser2, winner2) = split(mk(&tenant_a, &alias2), mk(&tenant_b, &alias2));
+    let (accepted, message) = publish_with_result(relay.url(), &winner2).await;
+    assert!(accepted, "exit15: winner-first must be accepted: {message:?}");
+    let (accepted, message) = publish_with_result(relay.url(), &loser2).await;
+    assert!(
+        !accepted && message.contains("alias already registered"),
+        "exit15: equal-created_at higher-id registration must lose; got {message:?}"
+    );
+    let served = fetch_from(
+        relay.url(),
+        Filter::new().kind(Kind::Custom(30640)).identifier(&alias2),
+    )
+    .await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].id, winner2.id, "exit15: same winner in both orders");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 16 — merge winner is exempt from the alias limit (verify FB)
+// ============================================================================
+
+/// FB: the per-tenant alias limit is node-local OCCUPANCY state and must not
+/// flip the deterministic merge. The winner's tenant is AT
+/// `max_aliases_per_tenant`; its earlier-created conflicting registration
+/// must still win (the alias is recorded — overshoot by exactly one), the
+/// squatter is evicted, and a FRESH non-conflict alias past the limit keeps
+/// being rejected (the anti-sybil limit itself is intact).
+#[tokio::test]
+async fn exit16_conflict_winner_exempt_from_alias_limit() {
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_MAX_ALIASES_PER_TENANT", "1"),
+    ])
+    .await;
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let winner = Keys::generate();
+    // Key claims are one-alias-per-key: each of the winner's aliases needs
+    // its OWN writer key (sharing one would make the contested registration
+    // evict the filler alias on a key conflict instead of testing the limit).
+    let filler_writer = Keys::generate();
+    let contested_writer = Keys::generate();
+    let contested = random_alias();
+
+    // The squatter holds the contested alias (later created_at).
+    let squat = registration_event(
+        &squatter,
+        &contested,
+        &[key_entry(&squat_writer, &squatter.public_key(), &contested)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &squat).await;
+    assert!(accepted, "exit16: squatter registration failed: {message:?}");
+
+    // The winner is AT the limit with an unrelated alias.
+    let filler = random_alias();
+    let filler_reg = registration_event(
+        &winner,
+        &filler,
+        &[key_entry(&filler_writer, &winner.public_key(), &filler)],
+        &[],
+        &domain,
+        Some(t0 + 50),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &filler_reg).await;
+    assert!(accepted, "exit16: filler registration failed: {message:?}");
+
+    // A FRESH alias past the limit is still rejected (limit intact).
+    let over = random_alias();
+    let over_writer = Keys::generate();
+    let over_reg = registration_event(
+        &winner,
+        &over,
+        &[key_entry(&over_writer, &winner.public_key(), &over)],
+        &[],
+        &domain,
+        Some(t0 + 60),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &over_reg).await;
+    assert!(
+        !accepted && message.contains("alias limit"),
+        "exit16: a fresh non-conflict alias past the limit must be rejected; got {message:?}"
+    );
+
+    // The winner's EARLIER-created registration for the contested alias must
+    // STILL win the merge — exempt from the node-local limit (pre-FB this
+    // came back "tenant has reached the alias limit" and split the pair).
+    let genuine = registration_event(
+        &winner,
+        &contested,
+        &[key_entry(&contested_writer, &winner.public_key(), &contested)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &genuine).await;
+    assert!(
+        accepted,
+        "exit16: the merge winner must be exempt from the alias limit; got {message:?}"
+    );
+
+    // The squatter is evicted: REQ resolves only the winner's edition.
+    let mut converged = false;
+    for _ in 0..50 {
+        let events = fetch_from(
+            relay.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&contested),
+        )
+        .await;
+        if events.len() == 1 && events[0].id == genuine.id {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(converged, "exit16: the contested alias must resolve to the winner");
+
+    // The accounting was NOT exempted: the winner's tenant now holds both
+    // aliases (overshoot by exactly one) and both seats are live — a 30641
+    // for each is accepted.
+    let sha = sha256_hex(&blob_bytes(62, 128));
+    for (a, writer, at) in [
+        (&filler, &filler_writer, t0 + 150),
+        (&contested, &contested_writer, t0 + 160),
+    ] {
+        let state = state_root_event(writer, &winner.public_key(), a, (&sha, 128), &[], at);
+        let (accepted, message) = publish_with_result(relay.url(), &state).await;
+        assert!(
+            accepted,
+            "exit16: 30641 for {a} must be accepted after the merge; got {message:?}"
+        );
+    }
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 17 — eviction frees the loser's whole footprint (verify FC/FD)
+// ============================================================================
+
+/// FC/FD (subsumes Lens-4 F3): the squatter saturates `r:<alias>` with
+/// wraps, declares unstored blobs (speculatively charged), and stores one
+/// real blob; the genuine earlier registration then wins the merge. In the
+/// eviction's own txn the loser must lose its whole footprint: the alias
+/// scope's EVENT column is reset (the winner is not quota-bricked), the
+/// orphaned speculative charge is released from t:/r:/g: immediately, and
+/// the stored blob's claim is stripped so GC releases its charge after
+/// grace. (Ring-edition deletion is pinned at meta level in
+/// `registration::tests::eviction_cleans_loser_footprint` — the ring has no
+/// externally visible surface.)
+#[tokio::test]
+async fn exit17_eviction_releases_loser_footprint() {
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", "16384"),
+        // Short (non-zero) grace so the post-eviction spec-release sample is
+        // race-free while GC still collects within the test bound.
+        ("NGIT_PRIVATE_GC_GRACE_SECS", "3"),
+        ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+    ])
+    .await;
+    let domain = relay.domain();
+
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let victim = Keys::generate();
+    let victim_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+
+    // The squatter takes the alias (later created_at), stores one real blob,
+    // and declares a never-uploaded 4096-byte blob (speculatively charged).
+    let squat = registration_event(
+        &squatter,
+        &alias,
+        &[key_entry(&squat_writer, &squatter.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &squat).await;
+    assert!(accepted, "exit17: squatter registration failed: {message:?}");
+
+    let stored_blob = blob_bytes(63, 512);
+    let stored_sha = sha256_hex(&stored_blob);
+    let auth = blossom_auth_event(
+        &squat_writer,
+        "upload",
+        &stored_sha,
+        &squatter.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, stored_blob.clone(), &stored_sha, &auth).await;
+    assert_eq!(status, 200, "exit17: squatter blob PUT failed; X-Reason: {reason}");
+
+    // The 30641 declares a never-uploaded 4096-byte blob (speculatively
+    // charged) AND references the stored blob — an unreferenced PUT blob is
+    // unclaimed by the ring release loop at the next edition, and this test
+    // needs the stored claim alive (and charged) until the eviction.
+    let fake_sha = sha256_hex(&blob_bytes(64, 64));
+    let v1 = state_root_event(
+        &squat_writer,
+        &squatter.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[(stored_sha.clone(), 512)],
+        t0 + 110,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &v1).await;
+    assert!(accepted, "exit17: squatter 30641 failed: {message:?}");
+
+    // …and saturates the shared r:<alias> scope with wraps.
+    let mut saturated = false;
+    for _ in 0..64 {
+        let wrap = wrap_event(&squat_writer, 1059);
+        let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+        if !accepted {
+            assert!(
+                message.contains("quota exceeded"),
+                "exit17: expected quota refusal while saturating; got {message:?}"
+            );
+            saturated = true;
+            break;
+        }
+    }
+    assert!(saturated, "exit17: alias quota must saturate within the loop");
+    let g_before = global_ledger().await;
+    assert!(g_before > 0);
+
+    // The genuine earlier registration wins the merge.
+    let genuine = registration_event(
+        &victim,
+        &alias,
+        &[key_entry(&victim_writer, &victim.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &genuine).await;
+    assert!(
+        accepted,
+        "exit17: the earlier registration must win the merge; got {message:?}"
+    );
+    let winner_reg_bytes = genuine.as_json().len() as i64;
+
+    // (b) The loser's speculative 4096 was released from the ledger IN the
+    // eviction txn (not after GC grace): global drops by exactly the spec
+    // bytes and rises by exactly the winner's registration bytes. GC grace
+    // is 3s, so this sample (taken immediately) is race-free.
+    let mut g_after = -1;
+    for _ in 0..50 {
+        g_after = global_ledger().await;
+        if g_after == g_before - 4096 + winner_reg_bytes {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        g_after,
+        g_before - 4096 + winner_reg_bytes,
+        "exit17: the orphaned spec charge must be released in the eviction txn"
+    );
+
+    // (a) The winner is NOT quota-bricked: 30641, wrap, and upload all pass
+    // against the reset event column (pre-FC every one of these came back
+    // "quota exceeded" because the squatter had filled the shared scope).
+    let winner_fake = sha256_hex(&blob_bytes(65, 32));
+    let state = state_root_event(
+        &victim_writer,
+        &victim.public_key(),
+        &alias,
+        (&winner_fake, 100),
+        &[],
+        t0 + 200,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &state).await;
+    assert!(
+        accepted,
+        "exit17: winner's 30641 must not be quota-rejected; got {message:?}"
+    );
+    let state_bytes = state.as_json().len() as i64;
+    let wrap = wrap_event(&victim_writer, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        accepted,
+        "exit17: winner's wrap must not be quota-rejected; got {message:?}"
+    );
+    let wrap_bytes = wrap.as_json().len() as i64;
+    let winner_blob = blob_bytes(66, 256);
+    let winner_sha = sha256_hex(&winner_blob);
+    let auth = blossom_auth_event(
+        &victim_writer,
+        "upload",
+        &winner_sha,
+        &victim.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, winner_blob.clone(), &winner_sha, &auth).await;
+    assert_eq!(
+        status, 200,
+        "exit17: winner's upload must not be quota-rejected; X-Reason: {reason}"
+    );
+    // A trailing wrap: its charge refreshes the ledger gauge AFTER the PUT
+    // (PUT finish() does not refresh it), so the settled sample below is
+    // race-free against the GC collection.
+    let wrap2 = wrap_event(&victim_writer, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap2).await;
+    assert!(accepted, "exit17: trailing wrap must be accepted; got {message:?}");
+    let wrap2_bytes = wrap2.as_json().len() as i64;
+
+    // (c) The loser's stored-blob claim was stripped at eviction: after GC
+    // grace its 512 bytes are released (and the file removed). The winner's
+    // own claims (256-byte stored blob + 100-byte spec) are referenced and
+    // survive.
+    let settled = g_after + state_bytes + wrap_bytes + 100 + 256 + wrap2_bytes - 512;
+    let mut g_settled = -1;
+    for _ in 0..150 {
+        g_settled = global_ledger().await;
+        if g_settled == settled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if g_settled != settled {
+        let (loser_status, _) = get_blob(&relay, &stored_sha).await;
+        panic!(
+            "exit17: GC must release the stripped stored-blob charge after grace \
+             (port {}): gauge {g_settled} != expected {settled}; loser blob GET \
+             status {loser_status} (200 = GC never collected, 404 = collected)",
+            relay_port(&relay),
+        );
+    }
+    let (status, _) = get_blob(&relay, &stored_sha).await;
+    assert_eq!(status, 404, "exit17: the loser's stripped blob must be GC'd");
+    let (status, body) = get_blob(&relay, &winner_sha).await;
+    assert_eq!(status, 200, "exit17: the winner's blob must survive GC");
+    assert_eq!(body, winner_blob);
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 18 — kind-5 death releases the speculative footprint (verify FD)
+// ============================================================================
+
+/// FD: a tenant declares never-uploaded blobs (speculatively charged) and
+/// then kind-5-deletes its own registration — the death path must strip the
+/// dead alias from its blob claims and release the orphaned spec charges,
+/// not strand them in the ledger forever. The NIP-09 cutoff discipline is
+/// preserved: a kind-5 dated BEFORE the latest edition is partial survival
+/// and must NOT strip or release anything.
+#[tokio::test]
+async fn exit18_kind5_death_releases_speculative_footprint() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+
+    // Edition 1 (t0) + a 30641 declaring a never-uploaded 4096-byte blob.
+    let reg1 = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg1).await;
+    assert!(accepted, "exit18: registration failed: {message:?}");
+    let g0 = global_ledger().await;
+
+    let fake_sha = sha256_hex(&blob_bytes(67, 64));
+    let v1 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 10,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &v1).await;
+    assert!(accepted, "exit18: 30641 failed: {message:?}");
+    let v1_bytes = v1.as_json().len() as i64;
+    let mut g1 = -1;
+    for _ in 0..50 {
+        g1 = global_ledger().await;
+        if g1 == g0 + v1_bytes + 4096 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(g1, g0 + v1_bytes + 4096, "exit18: spec charge must land");
+
+    // Rotate (t0+20, anchor preserved) so a deletion dated between the
+    // editions is a PARTIAL-survival cutoff case.
+    let reg2 = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 20),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg2).await;
+    assert!(accepted, "exit18: rotation failed: {message:?}");
+    let reg2_bytes = reg2.as_json().len() as i64;
+    let g2 = g1 + reg2_bytes;
+
+    // NEGATIVE: a kind-5 dated t0+15 — BEFORE the latest edition (t0+20) —
+    // must NOT strip claims or release the spec charge, and the seat stays
+    // live.
+    let stale = EventBuilder::new(Kind::EventDeletion, "stale")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 15))
+        .finalize(&tenant)
+        .expect("sign stale kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &stale).await;
+    assert!(accepted, "exit18: stale kind-5 rejected: {message:?}");
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            global_ledger().await,
+            g2,
+            "exit18: partial-survival kind-5 must not release the spec charge"
+        );
+    }
+    let state = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 25,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &state).await;
+    assert!(
+        accepted,
+        "exit18: the seat must stay live after a stale deletion; got {message:?}"
+    );
+    let v2_bytes = state.as_json().len() as i64;
+    let g3 = g2 + v2_bytes;
+
+    // POSITIVE: a kind-5 dated AFTER the latest edition is honored — the
+    // death cleanup releases the orphaned 4096 spec charge and strips the
+    // dead alias from its claims.
+    let deletion = EventBuilder::new(Kind::EventDeletion, "offboarding")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 30))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &deletion).await;
+    assert!(accepted, "exit18: kind-5 deletion rejected: {message:?}");
+
+    let mut g4 = -1;
+    for _ in 0..75 {
+        g4 = global_ledger().await;
+        if g4 == g3 - 4096 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        g4,
+        g3 - 4096,
+        "exit18: honored kind-5 must release the dead registration's spec charge"
+    );
+
+    // The registration is gone and the seat is dead for new editions.
+    let mut deleted = false;
+    for _ in 0..50 {
+        let remaining = fetch_from(
+            relay.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(tenant.public_key())
+                .identifier(&alias),
+        )
+        .await;
+        if remaining.is_empty() {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(deleted, "exit18: the honored deletion must remove the 30640");
+    let state2 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 40,
+    );
+    let (accepted, _) = publish_with_result(relay.url(), &state2).await;
+    assert!(!accepted, "exit18: post-death 30641 must be rejected");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 19 — upload preflight nets the pending spec release (verify FF)
+// ============================================================================
+
+/// FF: a blob declared by a 30641 (speculatively charged) and then PUT must
+/// not be double-counted at preflight: finish() releases the spec charge
+/// before its quota check, and the preflight/reserve paths now mirror that
+/// netting. With the alias scope within `len` of the cap, preflight and PUT
+/// must be 200 — pre-FF both came back 507 until un-declare + GC grace.
+#[tokio::test]
+async fn exit19_upload_preflight_nets_pending_spec_release() {
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", "8192"),
+    ])
+    .await;
+
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    // Declare the real blob's sha at its true size: the ledger then holds
+    // 4096 speculative bytes for the claim (repo scope ≈ registration ~750
+    // + edition ~700 + spec 4096 ≈ 5.4k of the 8192 cap — within 4096 of it,
+    // so the un-netted preflight would see ≈9.6k and 507).
+    let data = blob_bytes(68, 4096);
+    let sha = sha256_hex(&data);
+    let t0 = Timestamp::now().as_secs();
+    let declare = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, 4096),
+        &[],
+        t0,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &declare).await;
+    assert!(accepted, "exit19: declaration must be accepted; got {message:?}");
+
+    // Preflight must net the pending spec release for the same (tenant,
+    // alias): effective additional bytes = 4096 - 4096 = 0 → 200, not 507.
+    let auth = blossom_auth_event(
+        &writer,
+        "upload",
+        &sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, reason) = head_upload(&relay, &sha, data.len() as u64, Some(&auth)).await;
+    assert_eq!(
+        status, 200,
+        "exit19: preflight must net the pending spec release; X-Reason: {reason}"
+    );
+
+    // The PUT itself (begin_upload re-runs preflight + reserve) → 200.
+    let (status, _, reason) = put_blob(&relay, data.clone(), &sha, &auth).await;
+    assert_eq!(
+        status, 200,
+        "exit19: declare-then-upload must succeed near the cap; X-Reason: {reason}"
+    );
+    let (status, body) = get_blob(&relay, &sha).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, data, "exit19: blob bytes must round-trip");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 20 — conflict alert deduped on replay (verify FG)
+// ============================================================================
+
+/// FG: the `incoming_rejected` conflict alert must fire once per loser
+/// EVENT id — replaying an already-resolved loser (sync redelivery, boot
+/// reconcile) must not re-alert — while a NEW conflict on the same alias
+/// (a different event id) must still alert.
+#[tokio::test]
+async fn exit20_conflict_alert_deduped_on_replay() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let conflicts = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .counter(
+            "ngit_private_registration_conflicts_total",
+            &[("resolution", "incoming_rejected")],
+        )
+        .unwrap_or(0)
+    };
+
+    let winner = Keys::generate();
+    let winner_writer = Keys::generate();
+    let loser = Keys::generate();
+    let loser_writer = Keys::generate();
+    let alias = random_alias();
+
+    let win = registration_event(
+        &winner,
+        &alias,
+        &[key_entry(&winner_writer, &winner.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &win).await;
+    assert!(accepted, "exit20: winner registration failed: {message:?}");
+
+    // The loser conflicts and is rejected: first firing increments.
+    let lose1 = registration_event(
+        &loser,
+        &alias,
+        &[key_entry(&loser_writer, &loser.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, _) = publish_with_result(relay.url(), &lose1).await;
+    assert!(!accepted, "exit20: loser must be rejected");
+    let mut c = 0;
+    for _ in 0..30 {
+        c = conflicts().await;
+        if c == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(c, 1, "exit20: first conflict firing must increment");
+
+    // Replay the SAME loser event: rejected again, but no second alert.
+    for _ in 0..3 {
+        let (accepted, _) = publish_with_result(relay.url(), &lose1).await;
+        assert!(!accepted, "exit20: replayed loser must still be rejected");
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        conflicts().await,
+        1,
+        "exit20: replays of a resolved loser must not re-alert"
+    );
+
+    // A NEW conflict on the same alias (new event id) still alerts.
+    let lose2 = registration_event(
+        &loser,
+        &alias,
+        &[key_entry(&loser_writer, &loser.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(t0 + 200),
+    );
+    let (accepted, _) = publish_with_result(relay.url(), &lose2).await;
+    assert!(!accepted, "exit20: second loser must be rejected");
+    let mut c = 0;
+    for _ in 0..30 {
+        c = conflicts().await;
+        if c == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(c, 2, "exit20: a new conflict on the same alias must alert");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 21 — spec charge released on declarer's supersede when a second
+// alias references the sha (verify FH)
+// ============================================================================
+
+/// FH: two aliases (different tenants) reference one unstored sha; the
+/// declarer's speculative charge must be released when its own edition
+/// flushes the reference (pre-FH it kept paying until claim death/upload).
+/// The claim survives for the second referrer, which is then charged on its
+/// next referencing 30641 (the dedup upgrade path). Exactly-once throughout.
+#[tokio::test]
+async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
+    let relay = TestRelay::start_with_private_repos(&[
+        // One retained edition so v2 flushes v1's reference (cf. exit12).
+        ("NGIT_PRIVATE_STATE_HISTORY_EDITIONS", "1"),
+        ("NGIT_PRIVATE_GC_GRACE_SECS", "0"),
+        ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+    ])
+    .await;
+
+    let tenant_v = Keys::generate();
+    let writer_v = Keys::generate();
+    let tenant_a = Keys::generate();
+    let writer_a = Keys::generate();
+    let alias_v = random_alias();
+    let alias_a = random_alias();
+    register_alias(&relay, &tenant_v, &writer_v, &alias_v).await;
+    register_alias(&relay, &tenant_a, &writer_a, &alias_a).await;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+    let poll_gauge = |want: i64| async move {
+        for _ in 0..75 {
+            let got = global_ledger().await;
+            if got == want {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        global_ledger().await
+    };
+
+    let g0 = global_ledger().await;
+    assert!(g0 > 0, "exit21: registrations must be on the ledger");
+    let t0 = Timestamp::now().as_secs();
+
+    // V declares the never-uploaded 4096-byte sha: speculatively charged.
+    let fake_sha = sha256_hex(&blob_bytes(69, 64));
+    let v1 = state_root_event(
+        &writer_v,
+        &tenant_v.public_key(),
+        &alias_v,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 10,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &v1).await;
+    assert!(accepted, "exit21: v1 must be accepted; got {message:?}");
+    let g1 = poll_gauge(g0 + v1.as_json().len() as i64 + 4096).await;
+    assert_eq!(g1, g0 + v1.as_json().len() as i64 + 4096, "exit21: V charged");
+
+    // A references the same sha: NOT charged again (single-charge dedup —
+    // second referrers stay free).
+    let a1 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 11,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a1).await;
+    assert!(accepted, "exit21: a1 must be accepted; got {message:?}");
+    let g2 = poll_gauge(g1 + a1.as_json().len() as i64).await;
+    assert_eq!(
+        g2,
+        g1 + a1.as_json().len() as i64,
+        "exit21: second referrer must not be double-charged"
+    );
+
+    // V supersedes with an edition that drops the sha (small replacement
+    // declaration keeps V's own accounting visible): V's 4096 charge is
+    // released while the claim survives on A's reference.
+    let replacement = sha256_hex(&blob_bytes(70, 32));
+    let v2 = state_root_event(
+        &writer_v,
+        &tenant_v.public_key(),
+        &alias_v,
+        (&replacement, 100),
+        &[],
+        t0 + 12,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &v2).await;
+    assert!(accepted, "exit21: v2 must be accepted; got {message:?}");
+    let g3 = poll_gauge(g2 + v2.as_json().len() as i64 + 100 - 4096).await;
+    assert_eq!(
+        g3,
+        g2 + v2.as_json().len() as i64 + 100 - 4096,
+        "exit21: the declarer must be refunded on supersede (FH)"
+    );
+
+    // The claim survived for A: A's next edition still references the sha,
+    // and the upgrade path charges A exactly once for it now.
+    let a2 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 13,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a2).await;
+    assert!(accepted, "exit21: a2 must be accepted; got {message:?}");
+    let g4 = poll_gauge(g3 + a2.as_json().len() as i64 + 4096).await;
+    assert_eq!(
+        g4,
+        g3 + a2.as_json().len() as i64 + 4096,
+        "exit21: the surviving referrer is charged exactly once on its next edition"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 22 — key-conflict merge + stale-edition prune guard (Lens-4 F2)
+// ============================================================================
+
+/// Two tenants with DIFFERENT aliases but an OVERLAPPING w key: the earlier
+/// created_at wins the key claim (and evicts the loser's whole
+/// registration). Separately, a same-tenant STALE edition that loses a key
+/// conflict must NOT prune the tenant's own live coordinate
+/// (`prune_incoming = false`): the live 30640 keeps serving and 30641/1059
+/// stay accepted.
+#[tokio::test]
+async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    // Part 1: cross-tenant key conflict resolves by created_at.
+    let tenant1 = Keys::generate();
+    let tenant2 = Keys::generate();
+    let shared_key = Keys::generate();
+    let alias1 = random_alias();
+    let alias2 = random_alias();
+
+    // tenant1 holds alias1 with the shared key (t0).
+    let reg1 = registration_event(
+        &tenant1,
+        &alias1,
+        &[key_entry(&shared_key, &tenant1.public_key(), &alias1)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg1).await;
+    assert!(accepted, "exit22: tenant1 registration failed: {message:?}");
+
+    // tenant2's LATER registration claiming the same key loses…
+    let late = registration_event(
+        &tenant2,
+        &alias2,
+        &[key_entry(&shared_key, &tenant2.public_key(), &alias2)],
+        &[],
+        &domain,
+        Some(t0 + 100),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &late).await;
+    assert!(
+        !accepted && message.contains("write key already registered"),
+        "exit22: later key claim must lose; got {message:?}"
+    );
+
+    // …but tenant2's EARLIER-created registration wins the key claim and
+    // evicts tenant1's whole registration.
+    let early = registration_event(
+        &tenant2,
+        &alias2,
+        &[key_entry(&shared_key, &tenant2.public_key(), &alias2)],
+        &[],
+        &domain,
+        Some(t0 - 50),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &early).await;
+    assert!(
+        accepted,
+        "exit22: the earlier-created key claim must win; got {message:?}"
+    );
+    let mut pruned = false;
+    for _ in 0..50 {
+        let events = fetch_from(
+            relay.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&alias1),
+        )
+        .await;
+        if events.is_empty() {
+            pruned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(pruned, "exit22: the key-loser's coordinate must be pruned");
+    let served = fetch_from(
+        relay.url(),
+        Filter::new().kind(Kind::Custom(30640)).identifier(&alias2),
+    )
+    .await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].id, early.id, "exit22: key-conflict winner served");
+
+    // Part 2: a same-tenant stale edition losing a key conflict must not
+    // prune its own live coordinate.
+    let tenant_b = Keys::generate();
+    let writer_b = Keys::generate();
+    let tenant_c = Keys::generate();
+    let key_c = Keys::generate();
+    let alias_b = random_alias();
+    let alias_c = random_alias();
+
+    // tenant_c holds key_c under alias_c (t1).
+    let reg_c = registration_event(
+        &tenant_c,
+        &alias_c,
+        &[key_entry(&key_c, &tenant_c.public_key(), &alias_c)],
+        &[],
+        &domain,
+        Some(t0 + 200),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg_c).await;
+    assert!(accepted, "exit22: tenant_c registration failed: {message:?}");
+
+    // tenant_b's alias_b: edition 1 (t2) then a live rotation (t4).
+    let reg_b1 = registration_event(
+        &tenant_b,
+        &alias_b,
+        &[key_entry(&writer_b, &tenant_b.public_key(), &alias_b)],
+        &[],
+        &domain,
+        Some(t0 + 210),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg_b1).await;
+    assert!(accepted, "exit22: tenant_b edition 1 failed: {message:?}");
+    let reg_b2 = registration_event(
+        &tenant_b,
+        &alias_b,
+        &[key_entry(&writer_b, &tenant_b.public_key(), &alias_b)],
+        &[],
+        &domain,
+        Some(t0 + 240),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &reg_b2).await;
+    assert!(accepted, "exit22: tenant_b live edition failed: {message:?}");
+
+    // A STALE edition of alias_b (t3, between t2 and t4) that ALSO claims
+    // tenant_c's key: it loses the key conflict (t1 < t3) and must NOT take
+    // down tenant_b's live coordinate (prune_incoming = false).
+    let stale = registration_event(
+        &tenant_b,
+        &alias_b,
+        &[
+            key_entry(&writer_b, &tenant_b.public_key(), &alias_b),
+            key_entry(&key_c, &tenant_b.public_key(), &alias_b),
+        ],
+        &[],
+        &domain,
+        Some(t0 + 230),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &stale).await;
+    assert!(
+        !accepted && message.contains("write key already registered"),
+        "exit22: the stale edition must lose the key conflict; got {message:?}"
+    );
+
+    // tenant_b's LIVE 30640 is still served…
+    let served = fetch_from(
+        relay.url(),
+        Filter::new()
+            .kind(Kind::Custom(30640))
+            .author(tenant_b.public_key())
+            .identifier(&alias_b),
+    )
+    .await;
+    assert_eq!(served.len(), 1, "exit22: the live coordinate must survive");
+    assert_eq!(served[0].id, reg_b2.id, "exit22: the live edition is served");
+
+    // …and the seat is fully functional: 30641 + 1059 still accepted.
+    let sha = sha256_hex(&blob_bytes(71, 256));
+    let state = state_root_event(
+        &writer_b,
+        &tenant_b.public_key(),
+        &alias_b,
+        (&sha, 256),
+        &[],
+        t0 + 250,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &state).await;
+    assert!(
+        accepted,
+        "exit22: 30641 must be accepted after the stale-edition loss; got {message:?}"
+    );
+    let wrap = wrap_event(&writer_b, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        accepted,
+        "exit22: 1059 must be accepted after the stale-edition loss; got {message:?}"
+    );
+
+    // tenant_c is untouched.
+    let served = fetch_from(
+        relay.url(),
+        Filter::new()
+            .kind(Kind::Custom(30640))
+            .author(tenant_c.public_key())
+            .identifier(&alias_c),
+    )
+    .await;
+    assert_eq!(served.len(), 1, "exit22: tenant_c must be unaffected");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 23 — duplicate sha within one edition is charged once
+// ============================================================================
+
+/// The single-charge dedup at state_root.rs: a 30641 whose `m` and `pack`
+/// tags name the SAME sha must speculatively charge it ONCE, not per tag.
+#[tokio::test]
+async fn exit23_duplicate_sha_in_one_edition_charged_once() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+    let g0 = global_ledger().await;
+
+    let fake_sha = sha256_hex(&blob_bytes(72, 64));
+    let t0 = Timestamp::now().as_secs();
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[(fake_sha.clone(), 4096)],
+        t0,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &edition).await;
+    assert!(accepted, "exit23: duplicate-sha edition must be accepted; got {message:?}");
+
+    let mut g1 = -1;
+    let want = g0 + edition.as_json().len() as i64 + 4096;
+    for _ in 0..50 {
+        g1 = global_ledger().await;
+        if g1 == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        g1, want,
+        "exit23: the same sha in m + pack must be charged exactly once"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 24 — eviction releases the dead charger's spec charge even when
+// a second live alias references the sha (verify round 2, R2-A scenario B)
+// ============================================================================
+
+/// R2-A: the squatter holds alias X, declares never-uploaded shas under X
+/// (speculatively charged), and re-references them under its own second live
+/// alias Y. The victim's earlier registration wins the merge for X: the dead
+/// charger's spec bytes must leave the r:X blob column even though Y keeps
+/// referencing — otherwise every victim upload 507s against a cap of dead
+/// bytes (and the global scope stays billed forever). The survivor is
+/// re-charged on its next referencing 30641 (exactly-once migration).
+#[tokio::test]
+async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", "8192"),
+    ])
+    .await;
+    let domain = relay.domain();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let squatter = Keys::generate();
+    let squat_wx = Keys::generate();
+    let squat_wy = Keys::generate();
+    let victim = Keys::generate();
+    let victim_writer = Keys::generate();
+    let alias_x = random_alias();
+    let alias_y = random_alias();
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+
+    // The squatter holds X (later created_at) and Y.
+    for (alias, writer, at) in [(&alias_x, &squat_wx, t0 + 100), (&alias_y, &squat_wy, t0 + 110)] {
+        let reg = registration_event(
+            &squatter,
+            alias,
+            &[key_entry(writer, &squatter.public_key(), alias)],
+            &[],
+            &domain,
+            Some(at),
+        );
+        let (accepted, message) = publish_with_result(relay.url(), &reg).await;
+        assert!(accepted, "exit24: squatter registration failed: {message:?}");
+    }
+
+    // X declares the never-uploaded 4096-byte sha (speculatively charged to
+    // (squatter, X))…
+    let fake_sha = sha256_hex(&blob_bytes(73, 64));
+    let x1 = state_root_event(
+        &squat_wx,
+        &squatter.public_key(),
+        &alias_x,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 120,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &x1).await;
+    assert!(accepted, "exit24: X declaration failed: {message:?}");
+
+    // …and Y re-references the same sha (dedup: no second charge; the claim
+    // now lists both aliases while the charge stays on X's scope).
+    let y1 = state_root_event(
+        &squat_wy,
+        &squatter.public_key(),
+        &alias_y,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 130,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &y1).await;
+    assert!(accepted, "exit24: Y re-reference failed: {message:?}");
+    let g_before = global_ledger().await;
+    assert!(g_before > 0);
+
+    // The victim's earlier registration wins the merge for X.
+    let genuine = registration_event(
+        &victim,
+        &alias_x,
+        &[key_entry(&victim_writer, &victim.public_key(), &alias_x)],
+        &[],
+        &domain,
+        Some(t0),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &genuine).await;
+    assert!(
+        accepted,
+        "exit24: the earlier registration must win the merge; got {message:?}"
+    );
+    let winner_reg_bytes = genuine.as_json().len() as i64;
+
+    // The dead charger's 4096 spec bytes are released in the eviction txn
+    // even though Y still references the claim.
+    let mut g_after = -1;
+    for _ in 0..50 {
+        g_after = global_ledger().await;
+        if g_after == g_before - 4096 + winner_reg_bytes {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        g_after,
+        g_before - 4096 + winner_reg_bytes,
+        "exit24: the dead charger's spec charge must be released at eviction"
+    );
+
+    // The r:X blob column dropped the dead spec bytes: the victim's 4096-byte
+    // upload PASSES (pre-R2-A it 507'd against a cap of dead bytes).
+    let blob = blob_bytes(74, 4096);
+    let sha = sha256_hex(&blob);
+    let auth = blossom_auth_event(
+        &victim_writer,
+        "upload",
+        &sha,
+        &victim.public_key(),
+        &alias_x,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, blob.clone(), &sha, &auth).await;
+    assert_eq!(
+        status, 200,
+        "exit24: the winner's upload must not be quota-bricked by dead spec bytes; X-Reason: {reason}"
+    );
+
+    // The survivor is re-charged exactly once on its next referencing 30641.
+    let y2 = state_root_event(
+        &squat_wy,
+        &squatter.public_key(),
+        &alias_y,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 140,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &y2).await;
+    assert!(accepted, "exit24: Y's next edition failed: {message:?}");
+    let mut g_migrated = -1;
+    // y2's accept also refreshes the gauge past the victim's PUT (finish()
+    // charges the ledger but does not refresh the gauge).
+    let want = g_after + 4096 + y2.as_json().len() as i64 + 4096;
+    for _ in 0..50 {
+        g_migrated = global_ledger().await;
+        if g_migrated == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        g_migrated, want,
+        "exit24: the surviving referrer must be re-charged exactly once"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 25 — Blossom DELETE releases the deleting charger's spec charge
+// (verify round 2, R2-D)
+// ============================================================================
+
+/// R2-D: the Blossom DELETE path strips the deleting alias but used to leave
+/// its spec_charge pinned while another alias referenced the sha (the same
+/// FH-class hole on a path FH didn't touch). The deleting charger's charge
+/// is released; the claim survives for the remaining referrer, which is
+/// re-charged exactly once on its next referencing 30641.
+#[tokio::test]
+async fn exit25_blob_delete_releases_deleting_charger_spec() {
+    let relay = TestRelay::start_with_private_repos(&[]).await;
+
+    let tenant_v = Keys::generate();
+    let writer_v = Keys::generate();
+    let tenant_a = Keys::generate();
+    let writer_a = Keys::generate();
+    let alias_v = random_alias();
+    let alias_a = random_alias();
+    register_alias(&relay, &tenant_v, &writer_v, &alias_v).await;
+    register_alias(&relay, &tenant_a, &writer_a, &alias_a).await;
+
+    let global_ledger = || async {
+        common::sync_helpers::ParsedMetrics::parse(
+            &common::sync_helpers::fetch_metrics(relay.url())
+                .await
+                .expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+    let poll_gauge = |want: i64| async move {
+        for _ in 0..75 {
+            let got = global_ledger().await;
+            if got == want {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        global_ledger().await
+    };
+
+    let g0 = global_ledger().await;
+    let t0 = Timestamp::now().as_secs();
+
+    // V declares the never-uploaded 4096-byte sha: speculatively charged.
+    let fake_sha = sha256_hex(&blob_bytes(75, 64));
+    let v1 = state_root_event(
+        &writer_v,
+        &tenant_v.public_key(),
+        &alias_v,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 10,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &v1).await;
+    assert!(accepted, "exit25: v1 failed: {message:?}");
+    let g1 = poll_gauge(g0 + v1.as_json().len() as i64 + 4096).await;
+    assert_eq!(g1, g0 + v1.as_json().len() as i64 + 4096, "exit25: V charged");
+
+    // A references the same sha: not charged again (dedup).
+    let a1 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 11,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a1).await;
+    assert!(accepted, "exit25: a1 failed: {message:?}");
+    let g2 = poll_gauge(g1 + a1.as_json().len() as i64).await;
+    assert_eq!(g2, g1 + a1.as_json().len() as i64, "exit25: dedup holds");
+
+    // V DELETEs the blob: its spec charge is released even though A still
+    // references the sha (pre-R2-D the charge stayed pinned on V's scope).
+    let delete_auth = blossom_auth_event(
+        &writer_v,
+        "delete",
+        &fake_sha,
+        &tenant_v.public_key(),
+        &alias_v,
+        future_expiration(),
+    );
+    let (status, reason) = delete_blob(&relay, &fake_sha, &delete_auth).await;
+    assert_eq!(status, 200, "exit25: DELETE must be 200; X-Reason: {reason}");
+    let g3 = poll_gauge(g2 - 4096).await;
+    assert_eq!(
+        g3,
+        g2 - 4096,
+        "exit25: the deleting charger's spec charge must be released"
+    );
+
+    // The claim survives for A: A's next edition still references the sha
+    // and the upgrade path charges A exactly once.
+    let a2 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&fake_sha, 4096),
+        &[],
+        t0 + 12,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a2).await;
+    assert!(accepted, "exit25: a2 failed: {message:?}");
+    let g4 = poll_gauge(g3 + a2.as_json().len() as i64 + 4096).await;
+    assert_eq!(
+        g4,
+        g3 + a2.as_json().len() as i64 + 4096,
+        "exit25: the surviving referrer is charged exactly once"
     );
 
     relay.stop().await;

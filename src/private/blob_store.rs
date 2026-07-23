@@ -232,6 +232,21 @@ impl UploadSink {
         // no unclaimed orphan is left on disk.
         let renamed = std::cell::Cell::new(false);
         let charged = self.meta.with_write(|meta, txn| {
+            // R2-C (verify round 2): FIRST fallible statement — re-verify
+            // the uploader's registration inside the charge txn, before the
+            // file-existence check (so the rename stays the last fallible
+            // step). The upload streamed between auth and finish; an
+            // eviction or honored deletion in between must not let the
+            // claim + charge commit against a dead scope. The bar here is
+            // existence + same tenant (NOT the latest event id): an honest
+            // same-tenant rotation mid-stream must not kill a legit upload.
+            let live = meta
+                .get_registration(txn, &alias)?
+                .map(|r| r.tombstoned_at.is_none() && r.tenant_hex == tenant)
+                .unwrap_or(false);
+            if !live {
+                return Err(anyhow::anyhow!("registration gone"));
+            }
             let file_present = final_path.is_file();
             let mut claim = meta.get_blob_claim(txn, &sha)?.unwrap_or(BlobClaim {
                 size,
@@ -240,7 +255,18 @@ impl UploadSink {
                 stored: false,
                 charged_tenant: None,
                 charged_alias: None,
+                spec_charge: None,
             });
+
+            // Issue !12: the claim is transitioning to stored — the upload
+            // path takes over the accounting, so release the speculative
+            // 30641-declaration charge first (before the quota check below,
+            // so a same-scope upload nets out instead of double-counting).
+            // Atomic with the charge: if this txn aborts, the release rolls
+            // back with it.
+            if let Some(spec) = claim.spec_charge.take() {
+                quota::release_spec_charge(meta, txn, &spec)?;
+            }
 
             let mut charged = false;
             if !claim.stored && !file_present {
@@ -306,6 +332,15 @@ impl UploadSink {
                 self.cleanup();
                 if e.to_string() == "quota" {
                     Err(BlobError::QuotaExceeded)
+                } else if e.to_string() == "registration gone" {
+                    // R2-C: the registration died mid-stream. The re-check
+                    // precedes the rename, so no file was placed on this
+                    // path (the tmp unlink above + reservation drop are the
+                    // whole cleanup); `remove_placed_file` stays exclusively
+                    // for LMDB-commit failures after a successful rename.
+                    Err(BlobError::Forbidden(
+                        "attributed alias is not a live registration".into(),
+                    ))
                 } else {
                     Err(BlobError::Internal(format!("meta update failed: {e}")))
                 }
@@ -366,6 +401,25 @@ mod tests {
         }
     }
 
+    /// A live registration for the harness ("tenant", "alias") — finish()
+    /// re-verifies it inside the charge txn (R2-C).
+    fn test_registration(tenant: &str, event_id: &str) -> crate::private::meta::RegistrationRecord {
+        crate::private::meta::RegistrationRecord {
+            tenant_hex: tenant.to_string(),
+            event_id: event_id.to_string(),
+            created_at: 1,
+            w_keys: vec![],
+            aux_keys: vec![],
+            relays: vec![],
+            servers: vec![],
+            quota_class: None,
+            registered_at: 1,
+            tombstoned_at: None,
+            first_created_at: None,
+            first_event_id: None,
+        }
+    }
+
     struct Harness {
         _dir: tempfile::TempDir,
         meta: MetaEnv,
@@ -378,6 +432,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let meta = MetaEnv::open(&dir.path().join("meta")).unwrap();
             let store = BlobStore::open(&dir.path().join("blobs")).unwrap();
+            meta
+                .with_write(|m, txn| {
+                    m.put_registration(txn, "alias", &test_registration("tenant", "ed1"))
+                })
+                .unwrap();
             Self {
                 _dir: dir,
                 meta,
@@ -573,6 +632,162 @@ mod tests {
         assert!(h.store.exists(&sha), "an adopted file must survive the cleanup");
     }
 
+    /// Issue !12: a 30641-declared (speculatively charged) blob that is then
+    /// actually uploaded must release the speculative charge and take the
+    /// normal stored charge — net exactly one charge, never two.
+    #[tokio::test]
+    async fn speculative_charge_released_when_upload_stores_blob() {
+        use crate::private::meta::SpecCharge;
+
+        let h = Harness::new(1 << 20);
+        let data = vec![21u8; 300];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        // Simulate the 30641 declaration path: stored=false claim carrying a
+        // speculative charge at a LYING declared size (500 ≠ actual 300) —
+        // the release must refund the declared bytes, not claim.size.
+        h.meta
+            .with_write(|m, txn| {
+                quota::charge(m, txn, "tenant", "alias", 500, true)?;
+                m.put_blob_claim(
+                    txn,
+                    &sha,
+                    &BlobClaim {
+                        size: 500,
+                        aliases: vec!["alias".to_string()],
+                        unreferenced_since: None,
+                        stored: false,
+                        charged_tenant: None,
+                        charged_alias: None,
+                        spec_charge: Some(SpecCharge {
+                            tenant: "tenant".to_string(),
+                            alias: "alias".to_string(),
+                            bytes: 500,
+                        }),
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(h.ledger_blob_bytes(), (500, 500, 500));
+
+        h.upload(&data).await.unwrap();
+
+        assert_eq!(
+            h.ledger_blob_bytes(),
+            (300, 300, 300),
+            "spec charge (500) must be released and the actual size (300) charged"
+        );
+        let claim = {
+            let txn = h.meta.read_txn().unwrap();
+            h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap()
+        };
+        assert!(claim.stored);
+        assert!(
+            claim.spec_charge.is_none(),
+            "spec charge must be cleared on the stored transition"
+        );
+        assert_eq!(claim.charged_tenant.as_deref(), Some("tenant"));
+        assert_eq!(claim.size, 300);
+    }
+
+    /// FF (verify round 1): finish() releases the speculative charge BEFORE
+    /// its quota check. With the repo cap BETWEEN the actual size and
+    /// spec+actual (cap 600, spec 500, actual 300), the upload passes ONLY
+    /// under release-before-check — check-before-release would see
+    /// 500 + 300 > 600 and reject. Pins the ordering the preflight mirrors.
+    #[tokio::test]
+    async fn speculative_release_precedes_quota_check() {
+        use crate::private::meta::SpecCharge;
+
+        let h = Harness::new(600);
+        let data = vec![31u8; 300];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        h.meta
+            .with_write(|m, txn| {
+                quota::charge(m, txn, "tenant", "alias", 500, true)?;
+                m.put_blob_claim(
+                    txn,
+                    &sha,
+                    &BlobClaim {
+                        size: 500,
+                        aliases: vec!["alias".to_string()],
+                        unreferenced_since: None,
+                        stored: false,
+                        charged_tenant: None,
+                        charged_alias: None,
+                        spec_charge: Some(SpecCharge {
+                            tenant: "tenant".to_string(),
+                            alias: "alias".to_string(),
+                            bytes: 500,
+                        }),
+                    },
+                )
+            })
+            .unwrap();
+
+        h.upload(&data)
+            .await
+            .expect("upload must pass: spec (500) is released before the check");
+        assert_eq!(
+            h.ledger_blob_bytes(),
+            (300, 300, 300),
+            "spec released, actual size charged — net exactly one charge"
+        );
+    }
+
+    /// Issue !12: adopting an already-present file (no stored charge taken)
+    /// must STILL release the speculative charge — the claim leaves the
+    /// speculative state either way.
+    #[tokio::test]
+    async fn speculative_charge_released_on_orphan_adoption() {
+        use crate::private::meta::SpecCharge;
+
+        let h = Harness::new(1 << 20);
+        let data = vec![23u8; 128];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        let path = h.store.path_for(&sha);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &data).unwrap();
+
+        h.meta
+            .with_write(|m, txn| {
+                quota::charge(m, txn, "tenant", "alias", 128, true)?;
+                m.put_blob_claim(
+                    txn,
+                    &sha,
+                    &BlobClaim {
+                        size: 128,
+                        aliases: vec!["alias".to_string()],
+                        unreferenced_since: None,
+                        stored: false,
+                        charged_tenant: None,
+                        charged_alias: None,
+                        spec_charge: Some(SpecCharge {
+                            tenant: "tenant".to_string(),
+                            alias: "alias".to_string(),
+                            bytes: 128,
+                        }),
+                    },
+                )
+            })
+            .unwrap();
+
+        h.upload(&data).await.unwrap();
+        assert_eq!(
+            h.ledger_blob_bytes(),
+            (0, 0, 0),
+            "adoption takes no stored charge, and the spec charge must be refunded"
+        );
+        let claim = {
+            let txn = h.meta.read_txn().unwrap();
+            h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap()
+        };
+        assert!(claim.stored);
+        assert!(claim.spec_charge.is_none());
+    }
+
     #[tokio::test]
     async fn commit_failure_cleanup_removes_unclaimed_orphan() {
         let h = Harness::new(1 << 20);
@@ -601,6 +816,7 @@ mod tests {
                         stored: false,
                         charged_tenant: None,
                         charged_alias: None,
+                        spec_charge: None,
                     },
                 )
             })
@@ -615,5 +831,76 @@ mod tests {
             h.meta.get_blob_claim(&txn, &sha).unwrap().is_some()
         };
         assert!(stored_claim_survives);
+    }
+
+    /// R2-C (verify round 2): an eviction/deletion between auth and finish()
+    /// must fail the upload WITHOUT placing the file, claiming, or charging —
+    /// the re-check inside the charge txn (existence + same tenant, never the
+    /// latest event id) is the last line of defense. An honest same-tenant
+    /// ROTATION mid-stream must not kill the upload.
+    #[tokio::test]
+    async fn finish_rejects_when_registration_dies_mid_upload() {
+        let h = Harness::new(1 << 20);
+        let data = vec![41u8; 256];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        let new_sink = |h: &Harness| {
+            let reservation = UploadReservation {
+                inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
+                bytes: 0,
+            };
+            UploadSink::create(
+                h.meta.clone(),
+                h.store.clone(),
+                h.cfg.clone(),
+                "tenant".to_string(),
+                "alias".to_string(),
+                sha.clone(),
+                data.len() as u64,
+                reservation,
+            )
+        };
+
+        // The sink streams while the registration is live; it dies before
+        // finish() (eviction/kind-5/vanish all take this path).
+        let mut sink = new_sink(&h).await.unwrap();
+        sink.write_chunk(&data).await.unwrap();
+        h.meta
+            .with_write(|m, txn| m.delete_registration(txn, "alias"))
+            .unwrap();
+        let err = sink.finish().await.unwrap_err();
+        assert!(
+            matches!(err, BlobError::Forbidden(_)),
+            "death mid-upload must be a 403, got {err:?}"
+        );
+        assert!(!h.store.exists(&sha), "rejected finish must place no file");
+        {
+            let txn = h.meta.read_txn().unwrap();
+            assert!(
+                h.meta.get_blob_claim(&txn, &sha).unwrap().is_none(),
+                "no claim may commit for a dead registration"
+            );
+        }
+        assert_eq!(h.ledger_blob_bytes(), (0, 0, 0), "nothing may be charged");
+
+        // A same-tenant ROTATION mid-stream (new event id, same tenant) must
+        // NOT kill the upload.
+        h.meta
+            .with_write(|m, txn| {
+                m.put_registration(txn, "alias", &test_registration("tenant", "ed2"))
+            })
+            .unwrap();
+        let mut sink = new_sink(&h).await.unwrap();
+        sink.write_chunk(&data).await.unwrap();
+        h.meta
+            .with_write(|m, txn| {
+                m.put_registration(txn, "alias", &test_registration("tenant", "ed3"))
+            })
+            .unwrap();
+        sink.finish()
+            .await
+            .expect("a same-tenant rotation must not kill the upload");
+        assert!(h.store.exists(&sha));
+        assert_eq!(h.ledger_blob_bytes(), (256, 256, 256));
     }
 }

@@ -77,6 +77,11 @@ pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
             if claim.stored {
                 quota::release_claim(meta, txn, &claim)?;
             }
+            // Issue !12: a never-stored claim dies with its speculative
+            // charge — release it or the declared bytes leak in the ledger.
+            if let Some(ref spec) = claim.spec_charge {
+                quota::release_spec_charge(meta, txn, spec)?;
+            }
             meta.delete_blob_claim(txn, &sha)?;
             Ok(Some((claim.stored, claim.size)))
         });

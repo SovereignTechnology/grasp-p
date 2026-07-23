@@ -899,3 +899,502 @@ async fn exit5_mirror_bounds_missing_blob() {
     b.stop().await;
     a.stop().await;
 }
+
+// ============================================================================
+// Exit test 6 — §3.2 split-brain registration merge converges (issue !11)
+// ============================================================================
+
+/// Conflicting registrations for the same alias injected on BOTH nodes
+/// (partition seat / alias squat) must converge to the same deterministic
+/// winner everywhere: lowest (created_at, id) wins, the loser is evicted
+/// (key claims freed, relay-DB coordinate pruned) and the conflict alert
+/// fires on the node that had accepted the loser.
+#[tokio::test]
+async fn exit6_registration_split_brain_merge() {
+    let (a, b) = start_pair(&[]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let victim = Keys::generate();
+    let victim_writer = Keys::generate();
+    let alias = random_alias();
+    let now = Timestamp::now().as_secs();
+
+    // The squatter's registration (HIGHER created_at) lands on B first and
+    // is accepted there — B now holds the future merge loser.
+    let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(now));
+    let (accepted, message) = publish_with_result(b.url(), &squat).await;
+    assert!(accepted, "exit6: squatter registration on B failed: {message:?}");
+
+    // The victim's registration (LOWER created_at) is published to A.
+    // Whether or not the squatter's edition already synced over, the
+    // deterministic merge makes the victim win on both nodes.
+    let genuine = registration_event(
+        &victim,
+        &alias,
+        &victim_writer,
+        &domain_refs,
+        Some(now - 300),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &genuine).await;
+    assert!(
+        accepted,
+        "exit6: the earlier-created registration must win everywhere; got {message:?}"
+    );
+
+    // Both nodes converge: REQ resolves exactly the winner's event (the
+    // loser's coordinate is pruned wherever it had been stored).
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let deadline = Instant::now() + REPLICATION_BOUND;
+        loop {
+            let events = fetch_from(
+                node.url(),
+                Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+            )
+            .await;
+            if events.len() == 1 && events[0].id == genuine.id {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exit6: node {name} must converge to the merge winner; still sees {:?}",
+                events.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    // The eviction freed the loser's write key on B: a third tenant can
+    // claim it under a fresh alias (fresh proof-of-possession).
+    let third = Keys::generate();
+    let alias2 = random_alias();
+    let reclaim = registration_event(&third, &alias2, &squat_writer, &domain_refs, Some(now + 10));
+    let (accepted, message) = publish_with_result(b.url(), &reclaim).await;
+    assert!(
+        accepted,
+        "exit6: the evicted loser's key must be claimable on B; got {message:?}"
+    );
+
+    // The conflict alert fired on B (it held the evicted loser when the
+    // winner synced over).
+    let alerted = wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+        m.counter(
+            "ngit_private_registration_conflicts_total",
+            &[("resolution", "stored_evicted")],
+        )
+        .unwrap_or(0)
+            >= 1
+    })
+    .await;
+    assert!(alerted, "exit6: stored_evicted conflict alert must fire on B");
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 7 — rotation/skew still converges on the first-edition anchor
+// (verify round 1 FA, scenario B)
+// ============================================================================
+
+/// FA scenario B: the victim rotates on A while B is still pre-rotation; the
+/// squatter's intermediate-created_at registration (t0 < t1 < t2) is pushed
+/// to BOTH nodes. Pre-FA the rotated node (latest edition = t2) ACCEPTED it
+/// and evicted the victim while the pre-rotation node rejected it —
+/// permanent cross-node disagreement. Anchored to the first edition, both
+/// nodes reject it in every order, and after sync both converge on the
+/// victim's rotation.
+#[tokio::test]
+async fn exit7_rotation_skew_converges_on_anchor() {
+    let (a, b) = start_pair(&[]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let victim = Keys::generate();
+    let victim_w1 = Keys::generate();
+    let victim_w2 = Keys::generate();
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    // Edition 1 (t0) on A replicates to B: both nodes pre-rotation.
+    let reg1 = registration_event(&victim, &alias, &victim_w1, &domain_refs, Some(t0));
+    let (accepted, message) = publish_with_result(a.url(), &reg1).await;
+    assert!(accepted, "exit7: victim registration failed: {message:?}");
+    assert!(
+        wait_for_event_on_relay(
+            b.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(victim.public_key())
+                .identifier(&alias),
+            REPLICATION_BOUND,
+        )
+        .await,
+        "exit7: edition 1 must replicate to B"
+    );
+
+    // The squatter (t1) reaches B while it is pre-rotation: rejected there.
+    let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(t0 + 100));
+    let (accepted, _) = publish_with_result(b.url(), &squat).await;
+    assert!(!accepted, "exit7: pre-rotation node must reject the squatter");
+
+    // The victim rotates on A (t2 > t1). The SAME squatter event reaching
+    // the rotated node must STILL lose — this is the pre-FA split-brain.
+    let reg2 = registration_event(&victim, &alias, &victim_w2, &domain_refs, Some(t0 + 200));
+    let (accepted, message) = publish_with_result(a.url(), &reg2).await;
+    assert!(accepted, "exit7: rotation failed: {message:?}");
+    let (accepted, _) = publish_with_result(a.url(), &squat).await;
+    assert!(
+        !accepted,
+        "exit7: rotated node must still reject the intermediate squatter (FA)"
+    );
+
+    // The rotation must actually reach B before the squatter re-try below
+    // (R2-E: the author+identifier filter alone matches edition 1 instantly
+    // — poll for the rotation's own event id, like the convergence loop).
+    let deadline = Instant::now() + REPLICATION_BOUND;
+    let mut rotation_synced = false;
+    while Instant::now() < deadline {
+        let events = fetch_from(
+            b.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(victim.public_key())
+                .identifier(&alias),
+        )
+        .await;
+        if events.iter().any(|e| e.id == reg2.id) {
+            rotation_synced = true;
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    assert!(rotation_synced, "exit7: the rotation (reg2) must replicate to B");
+    let (accepted, _) = publish_with_result(b.url(), &squat).await;
+    assert!(
+        !accepted,
+        "exit7: caught-up node must keep rejecting the squatter"
+    );
+
+    // Both nodes converge: REQ resolves exactly the victim's rotation.
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let deadline = Instant::now() + REPLICATION_BOUND;
+        loop {
+            let events = fetch_from(
+                node.url(),
+                Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+            )
+            .await;
+            if events.len() == 1 && events[0].id == reg2.id {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exit7: node {name} must converge on the victim's rotation; still sees {:?}",
+                events.iter().map(|e| e.id.to_hex()).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    // The victim's seat is live on both nodes: a fresh 30641 is accepted on
+    // each (distinct seconds — the editions sync and replace).
+    for (name, node, at) in [("A", &a, t0 + 300), ("B", &b, t0 + 301)] {
+        let sha = sha256_hex(&blob_bytes(71, 128));
+        let state = state_root_event(
+            &victim_w2,
+            &victim.public_key(),
+            &alias,
+            (&sha, 128),
+            &[],
+            at,
+        );
+        let (accepted, message) = publish_with_result(node.url(), &state).await;
+        assert!(
+            accepted,
+            "exit7: post-merge 30641 must be accepted on node {name}; got {message:?}"
+        );
+    }
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 8 — late-witness mis-anchor + backdated self-heal (verify R2-B)
+// ============================================================================
+
+/// R2-B: B joins AFTER the victim's rotation — edition 1 was already purged
+/// from A's relay DB by addressable replacement, so B anchors on edition 2
+/// and the intermediate-created_at squatter WINS there (while A, anchored on
+/// edition 1, rejects it). The documented self-heal then closes the gap: the
+/// victim re-mints a registration with created_at ≤ the squatter's — a
+/// same-tenant no-op that LOWERS the anchor on correctly-witnessed nodes
+/// (R2-B fix) and a cross-tenant winner on mis-anchored ones — and both
+/// nodes converge.
+#[tokio::test]
+async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
+    // A starts alone, bootstrapped at B's reserved (not yet bound) URL; B's
+    // domain is known up front, so registrations can list both nodes.
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+    let a = TestRelay::start_private_pair_node(res_a, Some(url_b.clone()), true, None, None, &[])
+        .await;
+
+    let victim = Keys::generate();
+    let victim_writer = Keys::generate();
+    let squatter = Keys::generate();
+    let squat_writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+    let domains = [a.domain(), format!("127.0.0.1:{}", res_b.port())];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    // The victim registers edition 1 AND rotates to edition 2 while B does
+    // not exist; A's relay DB keeps only edition 2 (addressable
+    // replacement), so B can never witness edition 1.
+    let ed1 = registration_event(&victim, &alias, &victim_writer, &domain_refs, Some(t0));
+    let (accepted, message) = publish_with_result(a.url(), &ed1).await;
+    assert!(accepted, "exit8: edition 1 failed: {message:?}");
+    let ed2 = registration_event(&victim, &alias, &victim_writer, &domain_refs, Some(t0 + 200));
+    let (accepted, message) = publish_with_result(a.url(), &ed2).await;
+    assert!(accepted, "exit8: edition 2 failed: {message:?}");
+
+    // B joins now: it syncs ONLY edition 2 and anchors on it (t2).
+    let b = TestRelay::start_private_pair_node(res_b, Some(a.url().to_string()), true, None, None, &[])
+        .await;
+    let deadline = Instant::now() + REPLICATION_BOUND;
+    let mut ed2_on_b = false;
+    while Instant::now() < deadline {
+        let events = fetch_from(
+            b.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(victim.public_key())
+                .identifier(&alias),
+        )
+        .await;
+        if events.iter().any(|e| e.id == ed2.id) {
+            ed2_on_b = true;
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    assert!(ed2_on_b, "exit8: edition 2 must sync to late-joining B");
+
+    // The squatter (t1, t0 < t1 < t2): LOSES on A (anchor = edition 1) but
+    // WINS on mis-anchored B (anchor = edition 2) — the R2-B split-brain.
+    let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(t0 + 100));
+    let (accepted, _) = publish_with_result(a.url(), &squat).await;
+    assert!(!accepted, "exit8: A (anchored on edition 1) must reject the squatter");
+    let (accepted, message) = publish_with_result(b.url(), &squat).await;
+    assert!(
+        accepted,
+        "exit8: late-witness B (anchored on edition 2) accepts the squatter — the mis-anchor being pinned; got {message:?}"
+    );
+
+    // Self-heal: the victim re-mints with created_at ≤ the squatter's
+    // (t0-50). On B it is a cross-tenant WINNER (squatter evicted); on A a
+    // same-tenant stale no-op that LOWERS the anchor to t0-50 (policy
+    // accepts, the relay DB reports "error: unknown" — it already holds the
+    // newer edition 2; gotcha 9).
+    let heal = registration_event(&victim, &alias, &victim_writer, &domain_refs, Some(t0 - 50));
+    let (accepted, message) = publish_with_result(b.url(), &heal).await;
+    assert!(
+        accepted,
+        "exit8: the backdated re-mint must win on mis-anchored B; got {message:?}"
+    );
+    let (accepted, message) = publish_with_result(a.url(), &heal).await;
+    assert!(
+        !accepted && message.contains("error: unknown"),
+        "exit8: on A the heal is a stale no-op (DB holds edition 2); got accepted={accepted} {message:?}"
+    );
+
+    // The victim re-publishes edition 2 directly to B (deterministic — no
+    // dependence on sync re-delivery after the eviction prune): both nodes
+    // now serve edition 2 with the anchor at t0-50.
+    let (accepted, message) = publish_with_result(b.url(), &ed2).await;
+    assert!(accepted, "exit8: edition 2 must land on healed B; got {message:?}");
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let served = fetch_from(
+            node.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+        )
+        .await;
+        assert_eq!(served.len(), 1, "exit8: node {name} serves exactly one 30640");
+        assert_eq!(served[0].id, ed2.id, "exit8: node {name} serves edition 2");
+    }
+
+    // Convergence pin, including A's LOWERED anchor: a second squatter at
+    // t0-25 (older than the squatter's t1, newer than the heal) loses on
+    // BOTH nodes — pre-lowering it would win on A (anchor was edition 1).
+    let squat2 = registration_event(
+        &squatter,
+        &alias,
+        &squat_writer,
+        &domain_refs,
+        Some(t0 - 25),
+    );
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let (accepted, _) = publish_with_result(node.url(), &squat2).await;
+        assert!(
+            !accepted,
+            "exit8: the t0-25 squatter must lose on node {name} (anchor lowered to the heal)"
+        );
+    }
+
+    // The victim's seat is functional on both nodes.
+    for (name, node, at) in [("A", &a, t0 + 300), ("B", &b, t0 + 301)] {
+        let sha = sha256_hex(&blob_bytes(82, 128));
+        let state = state_root_event(
+            &victim_writer,
+            &victim.public_key(),
+            &alias,
+            (&sha, 128),
+            &[],
+            at,
+        );
+        let (accepted, message) = publish_with_result(node.url(), &state).await;
+        assert!(
+            accepted,
+            "exit8: post-heal 30641 must be accepted on node {name}; got {message:?}"
+        );
+    }
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 9 — mirror finish() re-check + no re-enqueue after death (R2-C)
+// ============================================================================
+
+/// R2-C (mirror caller sweep): a registration death racing the mirror's
+/// fetch must fail finish() without storing/charging (or, if the fetch
+/// completed before the death, the death cleanup + GC still release it) —
+/// and afterwards repair scans must NOT re-enqueue (no live claimant), so
+/// the blob is never (re-)stored and no zombie charge survives.
+#[tokio::test]
+async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
+    let (a, b) = start_pair(&[
+        ("NGIT_PRIVATE_GC_GRACE_SECS", "0"),
+        ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+    ])
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let t0 = Timestamp::now().as_secs() - 600;
+
+    let b_global = || async {
+        ParsedMetrics::parse(
+            &fetch_metrics(b.url()).await.expect("metrics scrape"),
+        )
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
+    };
+
+    // Registration (created at t0 so the later kind-5 honors the cutoff) on
+    // A → syncs to B.
+    let reg = registration_event(&tenant, &alias, &writer, &domain_refs, Some(t0));
+    let (accepted, message) = publish_with_result(a.url(), &reg).await;
+    assert!(accepted, "exit9: registration failed: {message:?}");
+    assert!(
+        wait_for_event_on_relay(
+            b.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(tenant.public_key())
+                .identifier(&alias),
+            REPLICATION_BOUND,
+        )
+        .await,
+        "exit9: registration must replicate to B"
+    );
+
+    // The blob lives on A; a 30641 referencing it lands directly on B — B's
+    // mirror wants the blob from A (fetch may start immediately).
+    let blob = blob_bytes(83, 1024);
+    let sha = upload_blob(&a, &tenant, &writer, &alias, &blob).await;
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        t0 + 10,
+    );
+    let (accepted, message) = publish_with_result(b.url(), &edition).await;
+    assert!(accepted, "exit9: 30641 on B failed: {message:?}");
+
+    // The registration dies on B immediately (honored kind-5): any
+    // in-flight mirror finish() must now fail the identity re-check; if the
+    // fetch already completed, the death cleanup + GC release it instead.
+    let deletion = EventBuilder::new(Kind::EventDeletion, "offboard")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 20))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(b.url(), &deletion).await;
+    assert!(accepted, "exit9: kind-5 rejected: {message:?}");
+
+    // Settle: B's ledger falls back to registration + edition event bytes
+    // only — the 1024 declared/stored bytes are gone in every interleaving
+    // (spec released at death; stored charge released by GC after the
+    // strip; or never charged because finish() rejected). This also proves
+    // the death was processed.
+    let want = reg.as_json().len() as i64 + edition.as_json().len() as i64;
+    let mut settled = -1;
+    for _ in 0..100 {
+        settled = b_global().await;
+        if settled == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        settled, want,
+        "exit9: no zombie charge may survive the death (spec or stored)"
+    );
+
+    // Repair scans must NOT re-enqueue (no live claimant): the lag stays
+    // zero and the blob is never (re-)stored across several repair ticks.
+    assert!(
+        wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+            m.gauge("ngit_private_mirror_lag_blobs", &[])
+                .unwrap_or(-1)
+                == 0
+        })
+        .await,
+        "exit9: mirror lag must be zero after the death"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (status, _) = get_blob(&b, &sha).await;
+    assert_eq!(
+        status, 404,
+        "exit9: the blob must never be (re-)stored on B after the death"
+    );
+    assert!(
+        wait_for_metrics(&b, Duration::from_secs(5), |m| {
+            m.gauge("ngit_private_mirror_lag_blobs", &[])
+                .unwrap_or(-1)
+                == 0
+        })
+        .await,
+        "exit9: repair scans must not re-enqueue after the death"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}

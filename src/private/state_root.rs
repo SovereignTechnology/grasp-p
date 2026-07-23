@@ -6,19 +6,21 @@ use nostr_relay_builder::prelude::WritePolicyResult;
 
 use crate::nostr::policy::{reject_error, reject_invalid, reject_restricted};
 
-use super::meta::{BlobClaim, MetaEnv};
-use super::{quota, PrivateService};
+use super::meta::{BlobClaim, MetaEnv, RegistrationRecord, SpecCharge};
+use super::{quota, PrivateConfig, PrivateService};
 
 /// Hard cap on the number of blob references (`m` + `pack` tags) accepted per
 /// kind-30641. A 128 KiB event can pack ~1500 refs, and `handle()` creates a
-/// persistent `stored=false` [`BlobClaim`] per referenced sha that is NOT
-/// charged against the blob quota, then rescans every retained edition under
-/// the global meta write lock. Left unbounded, a flood of editions carrying
-/// fake pack refs could exhaust the shared 4 GiB meta LMDB and brick ALL
-/// private writes. 256 refs is far above any realistic repo edition.
+/// persistent `stored=false` [`BlobClaim`] per referenced sha, then rescans
+/// every retained edition under the global meta write lock. 256 refs is far
+/// above any realistic repo edition.
 ///
-/// NOTE: the deeper fix — charging/retaining these speculative claims against
-/// the ledger so they cannot accumulate unbilled — is tracked for Phase 4a.
+/// Since issue !12, not-yet-stored declared blobs are also CHARGED to the
+/// declaring (tenant, alias) at their declared size ([`SpecCharge`]), so a
+/// flood of editions carrying fake pack refs runs into the tenant's own
+/// quota instead of growing the shared meta LMDB unbilled. The charge is
+/// released when the blob is actually stored (the upload path takes over
+/// the accounting) or when the claim is GC'd after losing its last alias.
 const MAX_BLOB_REFS_PER_STATE_ROOT: usize = 256;
 
 /// One manifest/pack reference from a 30641: (sha256, declared size).
@@ -41,14 +43,13 @@ fn parse_blob_tag(values: &[String]) -> Result<BlobRef, String> {
     Ok(BlobRef { sha256, size })
 }
 
-struct ParsedStateRoot {
+pub(crate) struct ParsedStateRoot {
     alias: String,
     coordinate: String,
     blobs: Vec<BlobRef>,
 }
 
-fn parse_shape(event: &Event, max_blob_bytes: u64) -> Result<ParsedStateRoot, String> {
-    let mut alias: Option<String> = None;
+pub(crate) fn parse_shape(event: &Event, max_blob_bytes: u64) -> Result<ParsedStateRoot, String> {    let mut alias: Option<String> = None;
     let mut coordinate: Option<String> = None;
     let mut manifest: Option<BlobRef> = None;
     let mut packs: Vec<BlobRef> = Vec::new();
@@ -184,90 +185,8 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
         }
     }
 
-    let event_bytes = event_json.len() as u64;
-    let created_at = event.created_at.as_secs();
-    let event_id_hex = event.id.to_hex();
-    let alias = parsed.alias.clone();
-    let tenant_hex = record.tenant_hex.clone();
-    let editions = cfg.state_history_editions as usize;
-
     let result = svc.meta.with_write(|meta, txn| {
-        let ring_key = MetaEnv::state_ring_key(&alias, created_at, &event_id_hex);
-        if meta.state_ring_contains(txn, &ring_key)? {
-            // Idempotent by event id: replayed edition, nothing to do.
-            return Ok(None);
-        }
-
-        if !quota::check(meta, txn, cfg, &tenant_hex, &alias, event_bytes)? {
-            return Ok(Some(reject_restricted("quota exceeded")));
-        }
-
-        // Append to the ring, then trim to the newest N editions.
-        meta.put_state_ring(txn, &ring_key, &event_json)?;
-        let ring = meta.state_ring_for_alias(txn, &alias)?;
-        let excess = ring.len().saturating_sub(editions);
-        for (key, _) in ring.iter().take(excess) {
-            meta.delete_state_ring(txn, key)?;
-        }
-        let retained: Vec<(String, String)> = ring.into_iter().skip(excess).collect();
-
-        // Recompute the set of hashes referenced by ANY retained edition.
-        let mut referenced = std::collections::HashSet::new();
-        for (_, json) in &retained {
-            if let Ok(edition) = nostr::Event::from_json(json.as_bytes()) {
-                for tag in edition.tags.iter() {
-                    let v = tag.clone().to_vec();
-                    if v.len() >= 2 && (v[0] == "m" || v[0] == "pack") {
-                        referenced.insert(v[1].clone());
-                    }
-                }
-            }
-        }
-
-        let now = nostr::Timestamp::now().as_secs();
-
-        // Claim the hashes of the new edition for this alias.
-        for blob in &parsed.blobs {
-            let mut claim = meta
-                .get_blob_claim(txn, &blob.sha256)?
-                .unwrap_or(BlobClaim {
-                    size: blob.size,
-                    aliases: Vec::new(),
-                    unreferenced_since: None,
-                    stored: false,
-                    charged_tenant: None,
-                    charged_alias: None,
-                });
-            if !claim.aliases.contains(&alias) {
-                claim.aliases.push(alias.clone());
-                meta.put_alias_claim(txn, &alias, &blob.sha256)?;
-            }
-            claim.unreferenced_since = None;
-            meta.put_blob_claim(txn, &blob.sha256, &claim)?;
-        }
-
-        // Release this alias's claim on hashes no retained edition references
-        // (alias-index prefix scan, not a cross-tenant table scan).
-        for sha in meta.alias_claim_shas(txn, &alias)? {
-            if referenced.contains(&sha) {
-                continue;
-            }
-            let Some(mut claim) = meta.get_blob_claim(txn, &sha)? else {
-                meta.delete_alias_claim(txn, &alias, &sha)?;
-                continue;
-            };
-            if claim.aliases.contains(&alias) {
-                claim.aliases.retain(|a| a != &alias);
-                if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
-                    claim.unreferenced_since = Some(now);
-                }
-                meta.put_blob_claim(txn, &sha, &claim)?;
-            }
-            meta.delete_alias_claim(txn, &alias, &sha)?;
-        }
-
-        quota::charge(meta, txn, &tenant_hex, &alias, event_bytes, false)?;
-        Ok(None)
+        apply_state_root_txn(meta, txn, cfg, &record, &parsed, event, &event_json)
     });
 
     match result {
@@ -281,6 +200,184 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
             reject_error("private meta store failure")
         }
     }
+}
+
+/// The meta transaction for an accepted 30641 — extracted from [`handle`] so
+/// the R2-C in-txn identity re-check is testable against a stale pre-txn
+/// `record` without racing a live handler. Returns `Ok(None)` to accept,
+/// `Ok(Some(rejection))` to reject WITHOUT any mutation.
+pub(crate) fn apply_state_root_txn(
+    meta: &MetaEnv,
+    txn: &mut heed::RwTxn,
+    cfg: &PrivateConfig,
+    record: &RegistrationRecord,
+    parsed: &ParsedStateRoot,
+    event: &Event,
+    event_json: &str,
+) -> anyhow::Result<Option<WritePolicyResult>> {
+    let alias = &parsed.alias;
+    let tenant_hex = &record.tenant_hex;
+    let created_at = event.created_at.as_secs();
+    let event_id_hex = event.id.to_hex();
+    let event_bytes = event_json.len() as u64;
+    let editions = cfg.state_history_editions as usize;
+
+    // R2-C (verify round 2): FIRST, before any mutation, re-verify the
+    // registration's identity inside the txn. Liveness was checked outside
+    // it, and an eviction/death can land in between; committing with the
+    // stale record would re-create claims + spec charges billed to the dead
+    // scope with no cleanup trigger left (GC needs empty aliases, the
+    // release loop needs a live registration, the death path early-returns
+    // on replays, and zombie ring editions actively defend the zombie
+    // claims via the rescan below).
+    // The reason string is deliberately distinct from the genuine
+    // "alias is not registered" liveness rejection above: an honest
+    // same-tenant rotation also trips this arm (event_id moved), and that
+    // race is TRANSIENT — a retry under the new record succeeds. Callers
+    // must be able to tell the two apart (verify round 3).
+    if !super::registration_identity_intact(meta, txn, alias, tenant_hex, &record.event_id)? {
+        return Ok(Some(reject_restricted("alias registration changed; retry")));
+    }
+
+    let ring_key = MetaEnv::state_ring_key(alias, created_at, &event_id_hex);
+    if meta.state_ring_contains(txn, &ring_key)? {
+        // Idempotent by event id: replayed edition, nothing to do.
+        return Ok(None);
+    }
+
+    // Issue !12: blobs this edition declares that are not yet stored and
+    // carry no earlier speculative charge get charged NOW, at declared
+    // size, to this (tenant, alias). Compute the total first so the
+    // quota check covers event bytes + all new speculative bytes in one
+    // decision (two separate checks could each pass while the sum
+    // exceeds a cap).
+    let mut spec_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut spec_new_bytes = 0u64;
+    for blob in &parsed.blobs {
+        if spec_shas.contains(&blob.sha256) {
+            continue; // duplicate ref within one edition
+        }
+        let needs_spec_charge = match meta.get_blob_claim(txn, &blob.sha256)? {
+            None => true,
+            Some(c) => !c.stored && c.spec_charge.is_none(),
+        };
+        if needs_spec_charge {
+            spec_new_bytes = spec_new_bytes.saturating_add(blob.size);
+            spec_shas.insert(blob.sha256.clone());
+        }
+    }
+
+    if !quota::check(
+        meta,
+        txn,
+        cfg,
+        tenant_hex,
+        alias,
+        event_bytes.saturating_add(spec_new_bytes),
+    )? {
+        return Ok(Some(reject_restricted("quota exceeded")));
+    }
+
+    // Append to the ring, then trim to the newest N editions.
+    meta.put_state_ring(txn, &ring_key, event_json)?;
+    let ring = meta.state_ring_for_alias(txn, alias)?;
+    let excess = ring.len().saturating_sub(editions);
+    for (key, _) in ring.iter().take(excess) {
+        meta.delete_state_ring(txn, key)?;
+    }
+    let retained: Vec<(String, String)> = ring.into_iter().skip(excess).collect();
+
+    // Recompute the set of hashes referenced by ANY retained edition.
+    let mut referenced = std::collections::HashSet::new();
+    for (_, json) in &retained {
+        if let Ok(edition) = nostr::Event::from_json(json.as_bytes()) {
+            for tag in edition.tags.iter() {
+                let v = tag.clone().to_vec();
+                if v.len() >= 2 && (v[0] == "m" || v[0] == "pack") {
+                    referenced.insert(v[1].clone());
+                }
+            }
+        }
+    }
+
+    let now = nostr::Timestamp::now().as_secs();
+
+    // Claim the hashes of the new edition for this alias, attaching the
+    // speculative charge to the ones computed above (issue !12).
+    for blob in &parsed.blobs {
+        let mut claim = meta
+            .get_blob_claim(txn, &blob.sha256)?
+            .unwrap_or(BlobClaim {
+                size: blob.size,
+                aliases: Vec::new(),
+                unreferenced_since: None,
+                stored: false,
+                charged_tenant: None,
+                charged_alias: None,
+                spec_charge: None,
+            });
+        if spec_shas.remove(&blob.sha256) && !claim.stored && claim.spec_charge.is_none() {
+            claim.spec_charge = Some(SpecCharge {
+                tenant: tenant_hex.clone(),
+                alias: alias.clone(),
+                bytes: blob.size,
+            });
+        }
+        if !claim.aliases.contains(alias) {
+            claim.aliases.push(alias.clone());
+            meta.put_alias_claim(txn, alias, &blob.sha256)?;
+        }
+        claim.unreferenced_since = None;
+        meta.put_blob_claim(txn, &blob.sha256, &claim)?;
+    }
+    if spec_new_bytes > 0 {
+        // One aggregate blob-column charge for all new speculative
+        // declarations (all scoped to this same tenant + alias).
+        quota::charge(meta, txn, tenant_hex, alias, spec_new_bytes, true)?;
+    }
+
+    // Release this alias's claim on hashes no retained edition references
+    // (alias-index prefix scan, not a cross-tenant table scan).
+    for sha in meta.alias_claim_shas(txn, alias)? {
+        if referenced.contains(&sha) {
+            continue;
+        }
+        let Some(mut claim) = meta.get_blob_claim(txn, &sha)? else {
+            meta.delete_alias_claim(txn, alias, &sha)?;
+            continue;
+        };
+        if claim.aliases.contains(alias) {
+            claim.aliases.retain(|a| a != alias);
+            // FH (verify round 1): the removed alias was CARRYING the
+            // speculative charge and other aliases still reference the
+            // sha — release the charge (exactly once, against the
+            // recorded scope/bytes, never `claim.size`). The declarer no
+            // longer makes the declaration, so it must not keep paying;
+            // the remaining referrer is charged on its next referencing
+            // 30641 (spec_charge is `None` again, so the dedup above
+            // charges it then). Releasing only here — never while the
+            // charging alias still references the sha in a retained
+            // edition — keeps the declaration billed exactly once.
+            let release_spec = !claim.aliases.is_empty()
+                && claim
+                    .spec_charge
+                    .as_ref()
+                    .map(|spec| &spec.alias == alias)
+                    .unwrap_or(false);
+            if release_spec {
+                let spec = claim.spec_charge.take().expect("spec charge present");
+                quota::release_spec_charge(meta, txn, &spec)?;
+            }
+            if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
+                claim.unreferenced_since = Some(now);
+            }
+            meta.put_blob_claim(txn, &sha, &claim)?;
+        }
+        meta.delete_alias_claim(txn, alias, &sha)?;
+    }
+
+    quota::charge(meta, txn, tenant_hex, alias, event_bytes, false)?;
+    Ok(None)
 }
 
 #[cfg(test)]
