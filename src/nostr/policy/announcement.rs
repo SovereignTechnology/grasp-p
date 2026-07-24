@@ -194,6 +194,16 @@ impl AnnouncementPolicy {
             relays,
         );
 
+        if self
+            .ctx
+            .purgatory
+            .has_pending_events(&announcement.identifier)
+        {
+            self.ctx
+                .purgatory
+                .enqueue_sync_immediate(&announcement.identifier);
+        }
+
         // Extend the announcement's expiry (reset to full 30 min window)
         self.ctx.purgatory.extend_announcement_expiry(
             &event.pubkey,
@@ -312,6 +322,16 @@ impl AnnouncementPolicy {
             repo_path,
             relays,
         );
+
+        if self
+            .ctx
+            .purgatory
+            .has_pending_events(&announcement.identifier)
+        {
+            self.ctx
+                .purgatory
+                .enqueue_sync_immediate(&announcement.identifier);
+        }
 
         tracing::info!(
             identifier = %announcement.identifier,

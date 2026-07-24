@@ -2402,9 +2402,20 @@ impl SyncManager {
 
         // Collect all purgatory announcements (snapshot - no async holds)
         let announcements = self.purgatory.announcements_for_sync();
+        let announcement_events = self.purgatory.announcement_events_for_sync();
 
         if announcements.is_empty() {
             return;
+        }
+
+        // A maintainer announcement may have been fetched and rejected before the
+        // reciprocal owner announcement reached this relay. Retry those cached
+        // dependencies as soon as the owner announcement enters purgatory. Waiting
+        // for owner promotion would deadlock: promotion needs git data, while the
+        // source clone URL belongs to the rejected maintainer announcement.
+        for event in announcement_events {
+            self.reprocess_purgatory_announcement_dependencies(&event)
+                .await;
         }
 
         // Register any new entries in repo_sync_index as StateOnly
@@ -2460,6 +2471,108 @@ impl SyncManager {
                 );
                 self.handle_new_sync_filters(action).await;
             }
+        }
+    }
+
+    /// Retry events whose authorization depends on a newly admitted owner announcement.
+    ///
+    /// This mirrors the accepted-announcement dependency handling in
+    /// `process_event_static`, but runs while the owner announcement is still in
+    /// purgatory. Announcement policy already treats purgatory announcements as
+    /// maintainer authority; doing the retry here makes arrival order irrelevant.
+    async fn reprocess_purgatory_announcement_dependencies(&self, event: &Event) {
+        let announcement =
+            match crate::nostr::events::RepositoryAnnouncement::from_event(event.clone()) {
+                Ok(announcement) => announcement,
+                Err(error) => {
+                    tracing::warn!(
+                        event_id = %event.id,
+                        error = %error,
+                        "Failed to parse purgatory announcement for dependency retry"
+                    );
+                    return;
+                }
+            };
+
+        let relay_url = format!("ws://{}", self.service_domain);
+
+        for maintainer_hex in &announcement.maintainers {
+            let maintainer_pubkey = match PublicKey::from_hex(maintainer_hex) {
+                Ok(pubkey) => pubkey,
+                Err(error) => {
+                    tracing::warn!(
+                        maintainer_hex = %maintainer_hex,
+                        error = %error,
+                        "Invalid maintainer public key in purgatory announcement"
+                    );
+                    continue;
+                }
+            };
+
+            let (removed, hot_events) = self.rejected_events_index.invalidate_and_get(
+                &maintainer_pubkey,
+                &announcement.identifier,
+                Some(rejected_index::EventType::Announcement),
+            );
+
+            if removed > 0 {
+                tracing::info!(
+                    maintainer = %maintainer_hex,
+                    identifier = %announcement.identifier,
+                    removed_from_cold_index = removed,
+                    hot_cache_events = hot_events.len(),
+                    "Invalidated rejected maintainer announcements from purgatory owner relationship"
+                );
+            }
+
+            // A non-zero cold-index invalidation makes this retry one-shot while
+            // still allowing the next timer tick to catch a concurrent rejection.
+            if removed > 0 && !hot_events.is_empty() {
+                Self::reprocess_events_from_hot_cache(
+                    hot_events,
+                    "maintainer announcement",
+                    &maintainer_pubkey,
+                    &announcement.identifier,
+                    &relay_url,
+                    &self.database,
+                    &self.write_policy,
+                    &self.local_relay,
+                    &self.rejected_events_index,
+                )
+                .await;
+            }
+        }
+
+        // The owner's state may also have arrived before their announcement.
+        let (removed, hot_events) = self.rejected_events_index.invalidate_and_get(
+            &event.pubkey,
+            &announcement.identifier,
+            Some(rejected_index::EventType::State),
+        );
+
+        if removed > 0 {
+            tracing::info!(
+                owner = %event.pubkey,
+                identifier = %announcement.identifier,
+                removed_from_cold_index = removed,
+                hot_cache_events = hot_events.len(),
+                "Invalidated rejected owner state from purgatory announcement"
+            );
+        }
+
+        if removed > 0 && !hot_events.is_empty() {
+            Self::reprocess_events_from_hot_cache(
+                hot_events,
+                "state event",
+                &event.pubkey,
+                &announcement.identifier,
+                &relay_url,
+                &self.database,
+                &self.write_policy,
+                &self.local_relay,
+                &self.rejected_events_index,
+            )
+            .await;
         }
     }
 
@@ -2668,6 +2781,29 @@ impl SyncManager {
                         "{} added to purgatory (waiting for git data)",
                         context
                     );
+
+                    // Hot-cache retries are sync-originated events. Reset any
+                    // existing backoff so newly available announcement/clone
+                    // metadata is acted on immediately rather than inheriting
+                    // the direct-submission three-minute delay.
+                    let identifier = if event.kind == Kind::RepoState {
+                        event
+                            .tags
+                            .iter()
+                            .find(|tag| tag.kind() == "d")
+                            .and_then(|tag| tag.content())
+                            .map(str::to_owned)
+                    } else if event.kind == Kind::GitPullRequest
+                        || event.kind == Kind::GitPullRequestUpdate
+                    {
+                        crate::git::sync::extract_identifier_from_pr_event(&event)
+                    } else {
+                        None
+                    };
+
+                    if let Some(identifier) = identifier {
+                        write_policy.purgatory().enqueue_sync_immediate(&identifier);
+                    }
                 }
                 ProcessResult::Rejected => {
                     stats.rejected += 1;

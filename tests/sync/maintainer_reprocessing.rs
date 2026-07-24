@@ -22,11 +22,197 @@
 //! announcements are in relay_a's DB), wait briefly for the sync round-trip, then
 //! send the owner announcement + git push.
 
+use std::process::Command;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
 use crate::common::{sync_helpers::*, TestRelay};
+
+/// A reciprocal owner announcement in purgatory must be enough to unlock an
+/// earlier rejected maintainer announcement and use that maintainer's clone URL.
+///
+/// The new owner deliberately advertises only their own empty target-repo clone
+/// URL. The source clone remains owned by the existing maintainer announcement.
+/// No client-side copy of another maintainer's `clone` tag is required.
+#[tokio::test]
+async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
+    let source_relay = TestRelay::start().await;
+    let maintainer_keys = Keys::generate();
+    let owner_keys = Keys::generate();
+    let identifier = "purgatory-owner-maintainer-source";
+
+    let maintainer_npub = maintainer_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to get maintainer npub");
+    let maintainer_clone = format!(
+        "http://{}/{}/{}.git",
+        source_relay.domain(),
+        maintainer_npub,
+        identifier
+    );
+    let maintainer_announcement =
+        EventBuilder::new(Kind::GitRepoAnnouncement, "Existing maintainer repository")
+            .tags(vec![
+                Tag::identifier(identifier),
+                Tag::custom("clone", vec![maintainer_clone.clone()]),
+                Tag::custom("relays", vec![source_relay.url().to_string()]),
+            ])
+            .finalize(&maintainer_keys)
+            .expect("Failed to create maintainer announcement");
+
+    send_to_relay(&source_relay, &maintainer_announcement)
+        .await
+        .expect("Failed to send maintainer announcement");
+    let maintainer_git = push_git_data_to_relay(
+        &source_relay,
+        &maintainer_keys,
+        identifier,
+        &[&source_relay.domain()],
+    )
+    .await;
+    let commit_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(maintainer_git.path())
+        .output()
+        .expect("Failed to read maintainer commit");
+    assert!(commit_output.status.success());
+    let maintainer_commit = String::from_utf8(commit_output.stdout)
+        .expect("Commit hash should be UTF-8")
+        .trim()
+        .to_string();
+
+    let source_announcement_found = wait_for_event_on_relay(
+        source_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        source_announcement_found,
+        "Maintainer announcement should be served by source relay"
+    );
+
+    // Bootstrap first so the source announcement is rejected and cached before
+    // the reciprocal owner relationship exists.
+    let target_relay = TestRelay::start_with_sync(Some(source_relay.url().to_string())).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let owner_npub = owner_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to get owner npub");
+    let owner_clone = format!(
+        "http://{}/{}/{}.git",
+        target_relay.domain(),
+        owner_npub,
+        identifier
+    );
+    let owner_announcement =
+        EventBuilder::new(Kind::GitRepoAnnouncement, "New reciprocal owner repository")
+            .tags(vec![
+                Tag::identifier(identifier),
+                Tag::custom("clone", vec![owner_clone.clone()]),
+                Tag::custom(
+                    "relays",
+                    vec![
+                        source_relay.url().to_string(),
+                        target_relay.url().to_string(),
+                    ],
+                ),
+                Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
+            ])
+            .finalize(&owner_keys)
+            .expect("Failed to create owner announcement");
+
+    let owner_clone_values: Vec<String> = owner_announcement
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "clone")
+        .expect("Owner announcement should have clone tag")
+        .clone()
+        .to_vec()
+        .into_iter()
+        .skip(1)
+        .collect();
+    assert_eq!(owner_clone_values, vec![owner_clone]);
+    assert!(
+        !owner_clone_values.contains(&maintainer_clone),
+        "Owner must not claim the maintainer's clone URL"
+    );
+
+    let started = std::time::Instant::now();
+    send_to_relay(&target_relay, &owner_announcement)
+        .await
+        .expect("Failed to send reciprocal owner announcement");
+
+    let owner_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(owner_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        owner_found,
+        "Owner announcement should promote after fetching the maintainer's git data"
+    );
+
+    let maintainer_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        maintainer_found,
+        "Rejected maintainer announcement should be reprocessed before owner promotion"
+    );
+
+    let state_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::RepoState)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        state_found,
+        "Maintainer state should be served after git synchronization"
+    );
+
+    let ref_aligned = crate::common::check_ref_at_commit(
+        &target_relay.domain(),
+        &owner_npub,
+        identifier,
+        "refs/heads/main",
+        &maintainer_commit,
+    )
+    .await
+    .expect("Failed to inspect target owner ref");
+    assert!(
+        ref_aligned,
+        "Target owner repository should align to the maintainer's state"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "Reciprocal owner synchronization should not inherit a long retry delay"
+    );
+
+    target_relay.stop().await;
+    source_relay.stop().await;
+}
 
 /// Test that a maintainer announcement is re-processed immediately when the owner
 /// announcement is promoted from purgatory via a git push.

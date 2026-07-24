@@ -955,6 +955,18 @@ impl Purgatory {
             .collect()
     }
 
+    /// Collect announcement events currently awaiting git data.
+    ///
+    /// The proactive sync manager uses this snapshot to retry dependency events
+    /// that may have arrived before a new owner announcement established their
+    /// maintainer relationship.
+    pub fn announcement_events_for_sync(&self) -> Vec<Event> {
+        self.announcement_purgatory
+            .iter()
+            .map(|entry| entry.value().event.clone())
+            .collect()
+    }
+
     /// Get all event IDs currently stored in purgatory AND previously expired events.
     ///
     /// Returns a HashSet of all event IDs for:
