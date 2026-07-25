@@ -288,6 +288,10 @@ event ID. Valid existing metadata is preserved; missing metadata is written
 with one startup timestamp and the original payload is promoted to the served
 database for its fresh probation. The pass is restart-safe: replacement
 metadata preserves the earliest `first_seen_at` and greatest `last_used_at`.
+Missing lifecycle payloads and metadata are queued in bounded batches so LMDB
+can commit many migration writes in one transaction. The same startup snapshot
+tracks which requests are already served, avoiding a separate main-database
+lookup for every historical request while traffic is still paused.
 
 The same startup pass reclassifies retained requests using current relay
 configuration and reconciles served copies against the lifecycle deadline.

@@ -1,5 +1,5 @@
 use nostr::nips::nip19::ToBech32;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use nostr_relay_builder::prelude::{Event, Filter, Kind, PublicKey, Timestamp};
@@ -115,6 +115,7 @@ impl DeletionService {
         now: Timestamp,
     ) -> Result<RequestLifecycleStartupStats> {
         let main = self.request_payloads_from_main().await?;
+        let main_request_ids: HashSet<_> = main.iter().map(|request| request.id).collect();
         let tombstones = self.ctx.tombstones();
         // This bulk query resolves all payload/metadata pairs in one pass. Do
         // not call lifecycle_for_request_result once per request here: startup
@@ -139,26 +140,34 @@ impl DeletionService {
             requests.entry(request.id).or_insert(request);
         }
         stats.unique_requests_discovered = requests.len();
+        stats.valid_metadata_existing = existing_by_request.len();
+
+        let missing: Vec<_> = requests
+            .values()
+            .filter(|request| !existing_by_request.contains_key(&request.id))
+            .map(|request| (request.clone(), self.current_classification(request)))
+            .collect();
+        if !missing.is_empty() {
+            tracing::info!(
+                requests = missing.len(),
+                existing_lifecycles = stats.valid_metadata_existing,
+                "Batch-migrating historical deletion-request lifecycles"
+            );
+        }
+        let migrated = tombstones
+            .record_requests_for_startup_migration(missing, now)
+            .await?;
+        stats.requests_migrated = migrated.len();
+        existing_by_request.extend(
+            migrated
+                .into_iter()
+                .map(|record| (record.request.id, record)),
+        );
 
         for request in requests.into_values() {
-            let existing = existing_by_request.remove(&request.id);
-            let mut record = match existing {
-                Some(record) => {
-                    stats.valid_metadata_existing += 1;
-                    record
-                }
-                None => {
-                    let classification = self.current_classification(&request);
-                    let record = self
-                        .ctx
-                        .tombstones()
-                        .record_request(&request, now, classification)
-                        .await?;
-                    self.promote_request(&request, &mut stats).await?;
-                    stats.requests_migrated += 1;
-                    record
-                }
-            };
+            let mut record = existing_by_request.remove(&request.id).ok_or_else(|| {
+                anyhow::anyhow!("lifecycle missing after startup migration: {}", request.id)
+            })?;
 
             let desired = self.current_classification(&record.request);
             if record.classification != desired {
@@ -207,10 +216,19 @@ impl DeletionService {
                 && targeting
                 && record.last_used_at.is_some();
             if serve_indefinitely || self.request_is_served(&record, now)? {
-                self.promote_request(&record.request, &mut stats).await?;
+                self.promote_request(
+                    &record.request,
+                    main_request_ids.contains(&record.request.id),
+                    &mut stats,
+                )
+                .await?;
             } else {
-                self.remove_request_from_main(&record.request, &mut stats)
-                    .await?;
+                self.remove_request_from_main(
+                    &record.request,
+                    main_request_ids.contains(&record.request.id),
+                    &mut stats,
+                )
+                .await?;
             }
         }
         tracing::info!(
@@ -260,15 +278,10 @@ impl DeletionService {
     async fn promote_request(
         &self,
         request: &Event,
+        exists_in_main: bool,
         stats: &mut RequestLifecycleStartupStats,
     ) -> Result<()> {
-        let exists = self
-            .ctx
-            .database()
-            .event_by_id(&request.id)
-            .await?
-            .is_some();
-        if !exists {
+        if !exists_in_main {
             self.ctx.database().save_event(request).await?;
             stats.main_requests_promoted += 1;
         }
@@ -278,15 +291,10 @@ impl DeletionService {
     async fn remove_request_from_main(
         &self,
         request: &Event,
+        exists_in_main: bool,
         stats: &mut RequestLifecycleStartupStats,
     ) -> Result<()> {
-        let exists = self
-            .ctx
-            .database()
-            .event_by_id(&request.id)
-            .await?
-            .is_some();
-        if exists {
+        if exists_in_main {
             self.ctx
                 .database()
                 .delete(Filter::new().ids(vec![request.id]))
@@ -706,7 +714,7 @@ mod tests {
     };
     use crate::purgatory::Purgatory;
 
-    fn service(disrespector: bool) -> DeletionService {
+    fn service_with_tombstones(disrespector: bool, tombstones: Tombstones) -> DeletionService {
         let db = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let config = crate::config::Config {
             deletion_request_disrespector: disrespector,
@@ -718,7 +726,7 @@ mod tests {
         DeletionService::new(DeletionContext::new(
             "test.example.com",
             db,
-            Tombstones::in_memory(),
+            tombstones,
             HoldingStore::in_memory(),
             RepositoryLifecycle::in_memory(),
             ReplaceableHistoryStore::in_memory(),
@@ -727,6 +735,10 @@ mod tests {
             config,
             new_repo_init_locks(),
         ))
+    }
+
+    fn service(disrespector: bool) -> DeletionService {
+        service_with_tombstones(disrespector, Tombstones::in_memory())
     }
 
     fn deletion(keys: &Keys) -> Event {
@@ -802,6 +814,43 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_batch_migrates_thousands_of_main_only_requests() {
+        const REQUEST_COUNT: usize = 2_000;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let tombstones = Tombstones::open_lmdb(tempdir.path()).await.unwrap();
+        let service = service_with_tombstones(false, tombstones);
+        let keys = Keys::generate();
+        for sequence in 0..REQUEST_COUNT {
+            let request = EventBuilder::new(Kind::EventDeletion, sequence.to_string())
+                .finalize(&keys)
+                .unwrap();
+            service.ctx.database.save_event(&request).await.unwrap();
+        }
+
+        let stats = service
+            .run_request_lifecycle_startup_reconciliation(Timestamp::from_secs(100))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.main_payloads_scanned, REQUEST_COUNT);
+        assert_eq!(stats.unique_requests_discovered, REQUEST_COUNT);
+        assert_eq!(stats.valid_metadata_existing, 0);
+        assert_eq!(stats.requests_migrated, REQUEST_COUNT);
+        assert_eq!(stats.main_requests_promoted, 0);
+        assert_eq!(
+            service
+                .ctx
+                .tombstones()
+                .lifecycle_records_result()
+                .await
+                .unwrap()
+                .len(),
+            REQUEST_COUNT
+        );
     }
 
     #[tokio::test]

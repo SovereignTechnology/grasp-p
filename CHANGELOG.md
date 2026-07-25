@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.
 - Prevent invitation syncing from dropping a source relay while its initial repository history is still being downloaded.
 - Fix maintainership invitation syncing by retrying the source maintainer announcement once reciprocal membership is known, allowing GRASP to discover and copy the existing repository.
 - Purgatory promotion now applies NIP-01's lowest-event-ID tie-break for same-second repository state replacements.

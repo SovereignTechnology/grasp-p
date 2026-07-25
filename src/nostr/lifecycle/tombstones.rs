@@ -45,6 +45,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::future::join_all;
 use tokio::sync::{Mutex, MutexGuard};
 
 use nostr_lmdb::NostrLmdb;
@@ -69,6 +70,10 @@ pub const TOMBSTONE_REQUEST_CLASSIFICATION_TAG: &str = "tombstone-request-classi
 /// Bound the number of request IDs in a metadata `#e` query so a target with
 /// many deletion requests cannot create an unbounded database filter.
 const METADATA_REQUEST_ID_QUERY_CHUNK_SIZE: usize = 256;
+/// Number of request lifecycles queued together during the one-time migration
+/// from the main relay database. `nostr-lmdb` drains concurrent writes into a
+/// single transaction, avoiding one fsync-heavy transaction per event.
+const STARTUP_MIGRATION_CHUNK_SIZE: usize = 512;
 
 /// Relay policy classification retained with a deletion request's lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +284,63 @@ impl Tombstones {
             last_used_at: None,
             classification,
         })
+    }
+
+    /// Persist historical request lifecycles in write batches during startup.
+    ///
+    /// The caller has already enumerated canonical lifecycle metadata and only
+    /// passes requests that lack a valid record. Startup remains unavailable
+    /// until this completes, so a partial batch failure is safe to retry: a
+    /// payload without metadata is not a valid lifecycle and will be included
+    /// in the next migration pass.
+    pub(crate) async fn record_requests_for_startup_migration(
+        &self,
+        requests: Vec<(Event, RequestClassification)>,
+        first_seen_at: Timestamp,
+    ) -> anyhow::Result<Vec<RequestLifecycleRecord>> {
+        let _guard = self.lock_lifecycle().await;
+        let mut records = Vec::with_capacity(requests.len());
+
+        for chunk in requests.chunks(STARTUP_MIGRATION_CHUNK_SIZE) {
+            let mut metadata = Vec::with_capacity(chunk.len());
+            for (request, classification) in chunk {
+                if !Self::is_request_kind(request.kind) {
+                    anyhow::bail!("Tombstone lifecycle accepts only kind-5 or kind-62 requests");
+                }
+                metadata.push(self.build_metadata(
+                    request.id,
+                    first_seen_at,
+                    None,
+                    *classification,
+                )?);
+            }
+
+            // Poll every save future together. The LMDB backend's ingester can
+            // then drain these operations into a small number of transactions
+            // instead of committing each payload and metadata event separately.
+            let writes = chunk
+                .iter()
+                .map(|(request, _)| request)
+                .chain(metadata.iter())
+                .map(|event| self.db.save_event(event));
+            for result in join_all(writes).await {
+                result.map_err(|error| {
+                    anyhow::anyhow!("Failed to batch-migrate deletion-request lifecycle: {error}")
+                })?;
+            }
+
+            records.extend(chunk.iter().zip(metadata).map(
+                |((request, classification), metadata)| RequestLifecycleRecord {
+                    metadata_event_id: metadata.id,
+                    request: request.clone(),
+                    first_seen_at,
+                    last_used_at: None,
+                    classification: *classification,
+                },
+            ));
+        }
+
+        Ok(records)
     }
 
     /// Return the canonical lifecycle record, if both a valid payload and valid
