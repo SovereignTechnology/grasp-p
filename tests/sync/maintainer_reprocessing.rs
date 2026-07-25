@@ -22,12 +22,26 @@
 //! announcements are in relay_a's DB), wait briefly for the sync round-trip, then
 //! send the owner announcement + git push.
 
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
 use crate::common::{sync_helpers::*, TestRelay};
+
+async fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(path).is_ok_and(|contents| contents.contains(needle)) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 /// A reciprocal owner announcement in purgatory must be enough to unlock an
 /// earlier rejected maintainer announcement and use that maintainer's clone URL.
@@ -61,6 +75,10 @@ async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
             ])
             .finalize(&maintainer_keys)
             .expect("Failed to create maintainer announcement");
+    let maintainer_announcement_note = maintainer_announcement
+        .id
+        .to_bech32()
+        .expect("Failed to encode maintainer announcement ID");
 
     send_to_relay(&source_relay, &maintainer_announcement)
         .await
@@ -97,10 +115,23 @@ async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
         "Maintainer announcement should be served by source relay"
     );
 
-    // Bootstrap first so the source announcement is rejected and cached before
-    // the reciprocal owner relationship exists.
-    let target_relay = TestRelay::start_with_sync(Some(source_relay.url().to_string())).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Bootstrap first so the source announcement is rejected before the
+    // reciprocal owner relationship exists. Observe that rejection before
+    // waiting out a one-second hot-cache TTL; this makes the cold-only ordering
+    // deterministic even on a slow test host.
+    let target_relay =
+        TestRelay::start_with_sync_and_rejected_hot_cache(Some(source_relay.url().to_string()), 1)
+            .await;
+    assert!(
+        wait_for_log(
+            &target_relay.log_path(),
+            &maintainer_announcement_note,
+            Duration::from_secs(10),
+        )
+        .await,
+        "Target should reject and index the maintainer announcement before the invite arrives"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let owner_npub = owner_keys
         .public_key()

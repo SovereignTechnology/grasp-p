@@ -80,6 +80,7 @@ struct RelayOptions {
     git_data_path: Option<PathBuf>,
     relay_data_path: Option<PathBuf>,
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
+    rejected_hot_cache_duration_secs: Option<u64>,
 }
 
 /// Focused configuration for short-lived deletion-request lifecycle tests.
@@ -138,6 +139,26 @@ impl TestRelay {
             port::reserve_port(),
             RelayOptions {
                 bootstrap_relay_url,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a syncing relay with a short rejected-event hot-cache lifetime.
+    ///
+    /// This is used by ordering regressions that need an event to leave the
+    /// immediate retry window without making the test wait for the production
+    /// two-minute default.
+    pub async fn start_with_sync_and_rejected_hot_cache(
+        bootstrap_relay_url: Option<String>,
+        rejected_hot_cache_duration_secs: u64,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                rejected_hot_cache_duration_secs: Some(rejected_hot_cache_duration_secs),
                 ..RelayOptions::default()
             },
         )
@@ -471,7 +492,8 @@ impl TestRelay {
             .stdout(
                 std::fs::OpenOptions::new()
                     .create(true)
-                    .append(true)
+                    .write(true)
+                    .truncate(true)
                     .open(format!("/tmp/relay-{}.log", port))
                     .map(Stdio::from)
                     .unwrap_or(Stdio::null()),
@@ -490,6 +512,13 @@ impl TestRelay {
         // Add bootstrap relay URL if provided
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
             cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url);
+        }
+
+        if let Some(duration_secs) = options.rejected_hot_cache_duration_secs {
+            cmd.env(
+                "NGIT_REJECTED_HOT_CACHE_DURATION_SECS",
+                duration_secs.to_string(),
+            );
         }
 
         // Add negentropy disable flag if requested
@@ -581,6 +610,11 @@ impl TestRelay {
     /// Get the relay domain (host:port)
     pub fn domain(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    /// Get the subprocess log captured by the test harness.
+    pub fn log_path(&self) -> PathBuf {
+        PathBuf::from(format!("/tmp/relay-{}.log", self.port))
     }
 
     /// Get the git data directory path

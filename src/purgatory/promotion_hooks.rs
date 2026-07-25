@@ -102,19 +102,19 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
         for maintainer_hex in &announcement.maintainers {
             match PublicKey::from_hex(maintainer_hex) {
                 Ok(maintainer_pubkey) => {
-                    let (removed, hot_events) = rejected_events_index.invalidate_and_get(
+                    let (event_ids, hot_events) = rejected_events_index.dependency_candidates(
                         &maintainer_pubkey,
                         &announcement.identifier,
                         Some(EventType::Announcement),
                     );
 
-                    if removed > 0 {
+                    if !event_ids.is_empty() {
                         info!(
                             maintainer = %maintainer_hex,
                             identifier = %announcement.identifier,
-                            removed_from_cold_index = removed,
+                            dependency_event_count = event_ids.len(),
                             hot_cache_events = hot_events.len(),
-                            "Invalidated rejected maintainer announcements after git push promotion"
+                            "Found rejected maintainer dependencies after git push promotion"
                         );
                     }
 
@@ -134,6 +134,7 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                                     .await
                                 {
                                     Ok(_) => {
+                                        rejected_events_index.remove(&hot_event.id);
                                         relay.notify_event(hot_event.clone());
                                         info!(
                                             event_id = %hot_event.id,

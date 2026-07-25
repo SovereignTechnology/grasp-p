@@ -17,6 +17,7 @@
 
 use futures_util::StreamExt;
 use nostr_sdk::prelude::*;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::nostr::SharedDatabase;
@@ -397,6 +398,24 @@ impl RelayConnection {
         );
 
         Ok(output.value)
+    }
+
+    /// Fetch a bounded set of events directly from this relay.
+    ///
+    /// This is reserved for dependency recovery where exact event IDs are
+    /// already known. The caller remains responsible for applying the write
+    /// policy and persistence path.
+    pub async fn fetch_events(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+    ) -> Result<Vec<Event>, String> {
+        self.client
+            .fetch_events(filter)
+            .timeout(timeout)
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|error| format!("Failed to fetch events from {}: {}", self.url, error))
     }
 
     /// Get the relay URL

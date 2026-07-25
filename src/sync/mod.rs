@@ -42,11 +42,12 @@ pub use self_subscriber::SelfSubscriber;
 pub use health::RelayHealthTracker;
 use tokio::time::sleep;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
@@ -627,6 +628,8 @@ pub struct SyncManager {
     rejected_events_index: Arc<RejectedEventsIndex>,
     /// Active relay connections - keyed by relay URL
     connections: HashMap<String, RelayConnection>,
+    /// Last exact-ID dependency recovery attempt, used to bound retries.
+    dependency_refetch_attempts: Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
     /// Health tracker for relay connection state
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
@@ -712,6 +715,7 @@ impl SyncManager {
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
             connections: HashMap::new(),
+            dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
             disconnect_tx: None,
@@ -2429,16 +2433,6 @@ impl SyncManager {
             return;
         }
 
-        // A maintainer announcement may have been fetched and rejected before the
-        // reciprocal owner announcement reached this relay. Retry those cached
-        // dependencies as soon as the owner announcement enters purgatory. Waiting
-        // for owner promotion would deadlock: promotion needs git data, while the
-        // source clone URL belongs to the rejected maintainer announcement.
-        for event in announcement_events {
-            self.reprocess_purgatory_announcement_dependencies(&event)
-                .await;
-        }
-
         // Register any new entries in repo_sync_index as StateOnly
         let mut new_relay_urls: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -2466,32 +2460,39 @@ impl SyncManager {
             }
         }
 
-        if new_relay_urls.is_empty() {
-            return;
+        if !new_relay_urls.is_empty() {
+            // For any relay URLs that are new, compute and send AddFilters actions
+            let all_targets = {
+                let repo_index = self.repo_sync_index.read().await;
+                derive_relay_targets(&repo_index)
+            };
+
+            let actions = {
+                let pending_index = self.pending_sync_index.read().await;
+                let relay_index = self.relay_sync_index.read().await;
+                compute_actions(&all_targets, &pending_index, &relay_index)
+            };
+
+            for action in actions {
+                // Only act on relays that have new URLs (avoids redundant work)
+                if new_relay_urls.contains(&action.relay_url) {
+                    tracing::info!(
+                        relay = %action.relay_url,
+                        repos = action.items.repos.len(),
+                        "Purgatory sync timer: connecting to new relay from purgatory announcement"
+                    );
+                    self.handle_new_sync_filters(action).await;
+                }
+            }
         }
 
-        // For any relay URLs that are new, compute and send AddFilters actions
-        let all_targets = {
-            let repo_index = self.repo_sync_index.read().await;
-            derive_relay_targets(&repo_index)
-        };
-
-        let actions = {
-            let pending_index = self.pending_sync_index.read().await;
-            let relay_index = self.relay_sync_index.read().await;
-            compute_actions(&all_targets, &pending_index, &relay_index)
-        };
-
-        for action in actions {
-            // Only act on relays that have new URLs (avoids redundant work)
-            if new_relay_urls.contains(&action.relay_url) {
-                tracing::info!(
-                    relay = %action.relay_url,
-                    repos = action.items.repos.len(),
-                    "Purgatory sync timer: connecting to new relay from purgatory announcement"
-                );
-                self.handle_new_sync_filters(action).await;
-            }
+        // A maintainer announcement or state may have been fetched and rejected
+        // before the reciprocal owner announcement reached this relay. Retry those
+        // dependencies after connecting the owner's relay hints so cold-cache
+        // misses can be fetched directly by event ID.
+        for event in announcement_events {
+            self.reprocess_purgatory_announcement_dependencies(&event)
+                .await;
         }
     }
 
@@ -2516,9 +2517,16 @@ impl SyncManager {
             };
 
         let relay_url = format!("ws://{}", self.service_domain);
+        let mut dependency_refetch_ids = HashSet::new();
+        let mut hot_dependency_events = Vec::new();
+        let mut maintainer_queue: VecDeque<String> =
+            announcement.maintainers.iter().cloned().collect();
+        let mut visited_maintainers = HashSet::new();
+        let mut dependency_relay_urls: HashSet<String> =
+            announcement.relays.iter().cloned().collect();
 
-        for maintainer_hex in &announcement.maintainers {
-            let maintainer_pubkey = match PublicKey::from_hex(maintainer_hex) {
+        while let Some(maintainer_hex) = maintainer_queue.pop_front() {
+            let maintainer_pubkey = match PublicKey::from_hex(&maintainer_hex) {
                 Ok(pubkey) => pubkey,
                 Err(error) => {
                     tracing::warn!(
@@ -2529,71 +2537,288 @@ impl SyncManager {
                     continue;
                 }
             };
+            if !visited_maintainers.insert(maintainer_pubkey) {
+                continue;
+            }
 
-            let (removed, hot_events) = self.rejected_events_index.invalidate_and_get(
-                &maintainer_pubkey,
-                &announcement.identifier,
-                Some(rejected_index::EventType::Announcement),
-            );
+            for event_type in [
+                rejected_index::EventType::Announcement,
+                rejected_index::EventType::State,
+            ] {
+                let (event_ids, hot_events) = self.rejected_events_index.dependency_candidates(
+                    &maintainer_pubkey,
+                    &announcement.identifier,
+                    Some(event_type),
+                );
+                let hot_event_ids: HashSet<EventId> =
+                    hot_events.iter().map(|candidate| candidate.id).collect();
 
-            if removed > 0 {
-                tracing::info!(
-                    maintainer = %maintainer_hex,
-                    identifier = %announcement.identifier,
-                    removed_from_cold_index = removed,
-                    hot_cache_events = hot_events.len(),
-                    "Invalidated rejected maintainer announcements from purgatory owner relationship"
+                dependency_refetch_ids.extend(
+                    event_ids
+                        .into_iter()
+                        .filter(|event_id| !hot_event_ids.contains(event_id)),
+                );
+                hot_dependency_events.extend(
+                    hot_events
+                        .into_iter()
+                        .map(|candidate| (relay_url.clone(), candidate)),
                 );
             }
 
-            // A non-zero cold-index invalidation makes this retry one-shot while
-            // still allowing the next timer tick to catch a concurrent rejection.
-            if removed > 0 && !hot_events.is_empty() {
-                Self::reprocess_events_from_hot_cache(
-                    hot_events,
-                    "maintainer announcement",
-                    &maintainer_pubkey,
-                    &announcement.identifier,
-                    &relay_url,
-                    &self.database,
-                    &self.write_policy,
-                    &self.local_relay,
-                    &self.rejected_events_index,
+            // Follow already accepted announcements so expired dependencies in
+            // a transitive maintainer chain are recovered on subsequent ticks.
+            match self
+                .database
+                .query(
+                    Filter::new()
+                        .kind(Kind::GitRepoAnnouncement)
+                        .author(maintainer_pubkey)
+                        .identifier(&announcement.identifier),
                 )
-                .await;
+                .await
+            {
+                Ok(events) => {
+                    for accepted_event in events {
+                        if let Ok(accepted_announcement) =
+                            crate::nostr::events::RepositoryAnnouncement::from_event(accepted_event)
+                        {
+                            dependency_relay_urls.extend(accepted_announcement.relays);
+                            maintainer_queue.extend(accepted_announcement.maintainers);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        maintainer = %maintainer_hex,
+                        identifier = %announcement.identifier,
+                        error = %error,
+                        "Failed to resolve accepted transitive maintainer announcements"
+                    );
+                }
             }
         }
 
         // The owner's state may also have arrived before their announcement.
-        let (removed, hot_events) = self.rejected_events_index.invalidate_and_get(
+        let (event_ids, hot_events) = self.rejected_events_index.dependency_candidates(
             &event.pubkey,
             &announcement.identifier,
             Some(rejected_index::EventType::State),
         );
+        let hot_event_ids: HashSet<EventId> =
+            hot_events.iter().map(|candidate| candidate.id).collect();
+        dependency_refetch_ids.extend(
+            event_ids
+                .into_iter()
+                .filter(|event_id| !hot_event_ids.contains(event_id)),
+        );
+        hot_dependency_events.extend(
+            hot_events
+                .into_iter()
+                .map(|candidate| (relay_url.clone(), candidate)),
+        );
 
-        if removed > 0 {
-            tracing::info!(
-                owner = %event.pubkey,
-                identifier = %announcement.identifier,
-                removed_from_cold_index = removed,
-                hot_cache_events = hot_events.len(),
-                "Invalidated rejected owner state from purgatory announcement"
-            );
-        }
+        let reserved_hot_ids = self.reserve_dependency_refetch_attempts(
+            hot_dependency_events
+                .iter()
+                .map(|(_, candidate)| candidate.id),
+        );
+        hot_dependency_events.retain(|(_, candidate)| reserved_hot_ids.contains(&candidate.id));
 
-        if removed > 0 && !hot_events.is_empty() {
-            Self::reprocess_events_from_hot_cache(
-                hot_events,
-                "state event",
-                &event.pubkey,
+        if !hot_dependency_events.is_empty() {
+            Self::process_purgatory_dependency_events(
+                hot_dependency_events,
                 &announcement.identifier,
-                &relay_url,
                 &self.database,
                 &self.write_policy,
                 &self.local_relay,
                 &self.rejected_events_index,
+                &self.dependency_refetch_attempts,
             )
             .await;
+        }
+
+        if !dependency_refetch_ids.is_empty() {
+            let dependency_relay_urls: Vec<String> = dependency_relay_urls.into_iter().collect();
+            self.spawn_purgatory_dependency_refetch(
+                &dependency_relay_urls,
+                dependency_refetch_ids,
+                &announcement.identifier,
+            );
+        }
+    }
+
+    /// Fetch cold-cache dependency IDs without blocking the sync manager.
+    ///
+    /// Candidate IDs stay in the rejected index until policy processing
+    /// succeeds. Failed or empty requests are retried on a bounded cadence, and
+    /// all relay requests for one repository run in parallel.
+    fn spawn_purgatory_dependency_refetch(
+        &self,
+        relay_urls: &[String],
+        event_ids: HashSet<EventId>,
+        identifier: &str,
+    ) {
+        let connections: Vec<(String, RelayConnection)> = relay_urls
+            .iter()
+            .filter_map(|relay_url| {
+                self.connections
+                    .get(relay_url)
+                    .cloned()
+                    .map(|connection| (relay_url.clone(), connection))
+            })
+            .collect();
+
+        if connections.is_empty() {
+            tracing::debug!(
+                identifier = %identifier,
+                event_count = event_ids.len(),
+                "Cannot refetch purgatory dependencies before a relay connection is available"
+            );
+            return;
+        }
+
+        let event_ids: Vec<EventId> = self
+            .reserve_dependency_refetch_attempts(event_ids)
+            .into_iter()
+            .collect();
+
+        if event_ids.is_empty() {
+            return;
+        }
+
+        let identifier = identifier.to_string();
+        let database = self.database.clone();
+        let write_policy = self.write_policy.clone();
+        let local_relay = self.local_relay.clone();
+        let rejected_events_index = self.rejected_events_index.clone();
+        let dependency_refetch_attempts = self.dependency_refetch_attempts.clone();
+
+        tokio::spawn(async move {
+            let fetches = connections.into_iter().map(|(relay_url, connection)| {
+                let filter = Filter::new().ids(event_ids.clone());
+                async move {
+                    let result = connection
+                        .fetch_events(filter, Duration::from_secs(5))
+                        .await;
+                    (relay_url, result)
+                }
+            });
+
+            let mut fetched_events = Vec::new();
+            for (relay_url, result) in join_all(fetches).await {
+                match result {
+                    Ok(events) => {
+                        tracing::info!(
+                            relay = %relay_url,
+                            identifier = %identifier,
+                            requested_count = event_ids.len(),
+                            fetched_count = events.len(),
+                            "Fetched purgatory dependencies by exact event ID"
+                        );
+                        fetched_events.extend(
+                            events
+                                .into_iter()
+                                .map(|candidate| (relay_url.clone(), candidate)),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            identifier = %identifier,
+                            event_count = event_ids.len(),
+                            error = %error,
+                            "Failed to refetch purgatory dependencies"
+                        );
+                    }
+                }
+            }
+
+            Self::process_purgatory_dependency_events(
+                fetched_events,
+                &identifier,
+                &database,
+                &write_policy,
+                &local_relay,
+                &rejected_events_index,
+                &dependency_refetch_attempts,
+            )
+            .await;
+        });
+    }
+
+    /// Reserve due dependency IDs so timer ticks cannot create retry storms.
+    fn reserve_dependency_refetch_attempts(
+        &self,
+        event_ids: impl IntoIterator<Item = EventId>,
+    ) -> HashSet<EventId> {
+        let retry_after = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+            Duration::from_secs(6)
+        } else {
+            Duration::from_secs(30)
+        };
+        let now = Instant::now();
+        let mut attempts = self.dependency_refetch_attempts.lock().unwrap();
+        attempts.retain(|_, attempted_at| {
+            now.duration_since(*attempted_at) < Duration::from_secs(3600)
+        });
+
+        event_ids
+            .into_iter()
+            .filter(|event_id| {
+                let eligible = attempts
+                    .get(event_id)
+                    .is_none_or(|attempted_at| now.duration_since(*attempted_at) >= retry_after);
+                if eligible {
+                    attempts.insert(*event_id, now);
+                }
+                eligible
+            })
+            .collect()
+    }
+
+    /// Apply dependency events in authorization order and clear only successes.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_purgatory_dependency_events(
+        mut events: Vec<(String, Event)>,
+        identifier: &str,
+        database: &SharedDatabase,
+        write_policy: &Nip34WritePolicy,
+        local_relay: &LocalRelay,
+        rejected_events_index: &Arc<RejectedEventsIndex>,
+        dependency_refetch_attempts: &Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
+    ) {
+        // Authorization for a state can depend on the reciprocal announcement
+        // returned by the same request. Relays may return matches in any order.
+        events.sort_by_key(|(_, candidate)| candidate.kind != Kind::GitRepoAnnouncement);
+
+        let mut processed_event_ids = HashSet::new();
+        for (relay_url, event) in events {
+            if !processed_event_ids.insert(event.id) {
+                continue;
+            }
+
+            let result = Self::process_event_static(
+                &event,
+                &relay_url,
+                database,
+                write_policy,
+                local_relay,
+                rejected_events_index,
+                crate::nostr::persistence::SaveContext::RelaySync,
+            )
+            .await;
+
+            if result != ProcessResult::Rejected {
+                rejected_events_index.remove(&event.id);
+                dependency_refetch_attempts
+                    .lock()
+                    .unwrap()
+                    .remove(&event.id);
+            }
+
+            if result == ProcessResult::Purgatory && event.kind == Kind::RepoState {
+                write_policy.purgatory().enqueue_sync_immediate(identifier);
+            }
         }
     }
 
@@ -2761,9 +2986,9 @@ impl SyncManager {
 
             // Recursive call to process_event_static
             // This is safe because:
-            // 1. Event was removed from hot cache before this call
+            // 1. The caller has observed a newly available dependency
             // 2. Second attempt uses new context (different code path)
-            // 3. If second attempt fails, stays in cold index only (no third attempt)
+            // 3. A failed retry remains indexed for a later bounded attempt
             // Use Box::pin to avoid infinitely sized future
             let reprocess_result = Box::pin(Self::process_event_static(
                 &event,
@@ -2836,6 +3061,10 @@ impl SyncManager {
                         context
                     );
                 }
+            }
+
+            if reprocess_result != ProcessResult::Rejected {
+                rejected_events_index.remove(&event.id);
             }
         }
 
@@ -2928,20 +3157,20 @@ impl SyncManager {
                                     // Parse maintainer public key
                                     match PublicKey::from_hex(maintainer_hex) {
                                         Ok(maintainer_pubkey) => {
-                                            let (removed, hot_events) = rejected_events_index
-                                                .invalidate_and_get(
+                                            let (event_ids, hot_events) = rejected_events_index
+                                                .dependency_candidates(
                                                     &maintainer_pubkey,
                                                     &announcement.identifier,
                                                     Some(rejected_index::EventType::Announcement),
                                                 );
 
-                                            if removed > 0 {
+                                            if !event_ids.is_empty() {
                                                 tracing::info!(
                                                     maintainer = %maintainer_hex,
                                                     identifier = %announcement.identifier,
-                                                    removed_from_cold_index = removed,
+                                                    dependency_event_count = event_ids.len(),
                                                     hot_cache_events = hot_events.len(),
-                                                    "Invalidated rejected maintainer announcements"
+                                                    "Found rejected maintainer announcement dependencies"
                                                 );
                                             }
 
@@ -2973,19 +3202,20 @@ impl SyncManager {
                             }
 
                             // Re-process rejected state events for this announcement
-                            let (removed, hot_events) = rejected_events_index.invalidate_and_get(
-                                &event.pubkey,
-                                &announcement.identifier,
-                                Some(rejected_index::EventType::State),
-                            );
+                            let (event_ids, hot_events) = rejected_events_index
+                                .dependency_candidates(
+                                    &event.pubkey,
+                                    &announcement.identifier,
+                                    Some(rejected_index::EventType::State),
+                                );
 
-                            if removed > 0 {
+                            if !event_ids.is_empty() {
                                 tracing::info!(
                                     pubkey = %event.pubkey,
                                     identifier = %announcement.identifier,
-                                    removed_from_cold_index = removed,
+                                    dependency_event_count = event_ids.len(),
                                     hot_cache_events = hot_events.len(),
-                                    "Invalidated rejected state events (announcement now exists)"
+                                    "Found rejected state dependencies after announcement acceptance"
                                 );
                             }
 
@@ -3028,19 +3258,19 @@ impl SyncManager {
                         .and_then(|t| t.content())
                     {
                         // Get rejected state events for this pubkey + identifier
-                        let (removed, hot_events) = rejected_events_index.invalidate_and_get(
+                        let (event_ids, hot_events) = rejected_events_index.dependency_candidates(
                             &event.pubkey,
                             identifier,
                             Some(rejected_index::EventType::State),
                         );
 
-                        if removed > 0 {
+                        if !event_ids.is_empty() {
                             tracing::info!(
                                 pubkey = %event.pubkey,
                                 identifier = %identifier,
-                                removed_from_cold_index = removed,
+                                dependency_event_count = event_ids.len(),
                                 hot_cache_events = hot_events.len(),
-                                "Invalidated rejected state events (git data now available)"
+                                "Found rejected state dependencies after git data became available"
                             );
                         }
 

@@ -271,7 +271,6 @@ impl HotCache {
         entries
             .values()
             .filter(|entry| {
-                // Check if entry matches and hasn't expired
                 let matches_type = event_type.is_none_or(|et| entry.event_type == et);
                 entry.pubkey == *pubkey
                     && entry.identifier == identifier
@@ -280,6 +279,34 @@ impl HotCache {
             })
             .map(|entry| entry.event.clone())
             .collect()
+    }
+
+    /// Get unexpired events whose rejection can be resolved by maintainer metadata.
+    fn get_dependency_events(
+        &self,
+        pubkey: &PublicKey,
+        identifier: &str,
+        event_type: Option<EventType>,
+    ) -> Vec<Event> {
+        let entries = self.entries.read().unwrap();
+        let now = Instant::now();
+
+        entries
+            .values()
+            .filter(|entry| {
+                let matches_type = event_type.is_none_or(|et| entry.event_type == et);
+                entry.pubkey == *pubkey
+                    && entry.identifier == identifier
+                    && matches_type
+                    && entry.reason != RejectionReason::Other
+                    && now.duration_since(entry.cached_at) < self.expiry_duration
+            })
+            .map(|entry| entry.event.clone())
+            .collect()
+    }
+
+    fn remove(&self, event_id: &EventId) {
+        self.entries.write().unwrap().remove(event_id);
     }
 
     /// Remove expired entries from hot cache
@@ -373,12 +400,39 @@ impl ColdIndex {
         let initial_count = entries.len();
 
         entries.retain(|_, entry| {
-            // Keep entries that DON'T match the maintainer/identifier/type
             let matches_type = event_type.is_none_or(|et| entry.event_type == et);
             !(entry.pubkey == *maintainer_pubkey && entry.identifier == identifier && matches_type)
         });
 
         initial_count - entries.len()
+    }
+
+    /// Find unexpired IDs whose rejection can be resolved by maintainer metadata.
+    fn dependency_event_ids(
+        &self,
+        maintainer_pubkey: &PublicKey,
+        identifier: &str,
+        event_type: Option<EventType>,
+    ) -> Vec<EventId> {
+        let entries = self.entries.read().unwrap();
+        let now = Instant::now();
+
+        entries
+            .iter()
+            .filter_map(|(event_id, entry)| {
+                let matches_type = event_type.is_none_or(|et| entry.event_type == et);
+                (entry.pubkey == *maintainer_pubkey
+                    && entry.identifier == identifier
+                    && matches_type
+                    && entry.reason != RejectionReason::Other
+                    && now.duration_since(entry.rejected_at) < self.expiry_duration)
+                    .then_some(*event_id)
+            })
+            .collect()
+    }
+
+    fn remove(&self, event_id: &EventId) {
+        self.entries.write().unwrap().remove(event_id);
     }
 
     /// Remove expired entries from cold index
@@ -606,6 +660,31 @@ impl RejectedEventsIndex {
         (removed, events)
     }
 
+    /// Get dependency-resolvable rejected IDs and any unexpired full events.
+    ///
+    /// This is intentionally non-destructive. A caller may fetch the exact IDs
+    /// from a relay while the cold index continues suppressing broad duplicate
+    /// downloads, then call [`Self::remove`] only after processing succeeds.
+    pub fn dependency_candidates(
+        &self,
+        pubkey: &PublicKey,
+        identifier: &str,
+        event_type: Option<EventType>,
+    ) -> (Vec<EventId>, Vec<Event>) {
+        (
+            self.cold_index
+                .dependency_event_ids(pubkey, identifier, event_type),
+            self.hot_cache
+                .get_dependency_events(pubkey, identifier, event_type),
+        )
+    }
+
+    /// Remove a successfully processed event from both rejected-event tiers.
+    pub fn remove(&self, event_id: &EventId) {
+        self.hot_cache.remove(event_id);
+        self.cold_index.remove(event_id);
+    }
+
     /// Clean up expired entries from both tiers
     ///
     /// # Arguments
@@ -829,7 +908,7 @@ impl RejectedEventsIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::prelude::{FinalizeUnsignedEvent, Keys, SignEvent};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeUnsignedEvent, Keys, SignEvent};
 
     async fn create_test_event() -> Event {
         let keys = Keys::generate();
@@ -1022,8 +1101,44 @@ mod tests {
 
         assert_eq!(removed, 1); // Removed from cold index
         assert_eq!(hot_events.len(), 0); // Hot cache expired - miss!
+    }
 
-        // This is expected: events arrive >2 minutes apart, must wait for next sync
+    #[tokio::test]
+    async fn test_expired_dependency_candidate_keeps_id_for_targeted_refetch() {
+        let index =
+            RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_secs(604800));
+        let keys = Keys::generate();
+        let dependency_event = keys
+            .sign_event(EventBuilder::text_note("dependency").finalize_unsigned(keys.public_key()))
+            .unwrap();
+        let permanent_event = keys
+            .sign_event(EventBuilder::text_note("permanent").finalize_unsigned(keys.public_key()))
+            .unwrap();
+        let pubkey = keys.public_key();
+        let identifier = "test-repo".to_string();
+
+        index.add_state(
+            dependency_event.clone(),
+            pubkey,
+            identifier.clone(),
+            RejectionReason::MaintainerNotYetValid,
+        );
+        index.add_state(
+            permanent_event.clone(),
+            pubkey,
+            identifier.clone(),
+            RejectionReason::Other,
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        let (event_ids, hot_events) =
+            index.dependency_candidates(&pubkey, &identifier, Some(EventType::State));
+
+        assert_eq!(event_ids, vec![dependency_event.id]);
+        assert!(hot_events.is_empty());
+        assert!(index.contains(&dependency_event.id));
+        assert!(index.contains(&permanent_event.id));
     }
 
     #[tokio::test]
