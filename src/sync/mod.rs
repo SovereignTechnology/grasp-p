@@ -188,6 +188,27 @@ impl Default for RelayState {
 }
 
 impl RelayState {
+    /// Whether this relay has no remaining sync work and can be disconnected.
+    ///
+    /// A newly connected relay has no *confirmed* repos until its historic
+    /// subscriptions complete. Treating that temporary state as empty races
+    /// the two-second disconnect checker against the historic sync (whose
+    /// completion is deliberately delayed to cover the subscriber batch
+    /// window). Pending batches and an active incomplete historic sync must
+    /// therefore keep the relay connected.
+    fn is_disconnect_candidate(&self, has_pending_batches: bool) -> bool {
+        if self.is_bootstrap
+            || self.connection_status == ConnectionStatus::Disconnecting
+            || !self.repos.is_empty()
+            || !self.root_events.is_empty()
+            || has_pending_batches
+        {
+            return false;
+        }
+
+        self.connection_status == ConnectionStatus::Disconnected || self.historic_sync_completed
+    }
+
     /// Check if state should be cleared based on 15-minute rule
     pub fn should_clear_state(&self) -> bool {
         match self.disconnected_at {
@@ -3274,22 +3295,16 @@ impl SyncManager {
     async fn check_disconnects(&mut self) {
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
+            let pending = self.pending_sync_index.read().await;
             let index = self.relay_sync_index.read().await;
             index
                 .iter()
                 .filter_map(|(relay_url, state)| {
-                    // Skip bootstrap relays - they stay connected
-                    if state.is_bootstrap {
-                        return None;
-                    }
+                    let has_pending_batches = pending
+                        .get(relay_url)
+                        .is_some_and(|batches| !batches.is_empty());
 
-                    // Skip relays already disconnecting
-                    if state.connection_status == ConnectionStatus::Disconnecting {
-                        return None;
-                    }
-
-                    // Disconnect if no repos and no root events
-                    if state.repos.is_empty() && state.root_events.is_empty() {
+                    if state.is_disconnect_candidate(has_pending_batches) {
                         Some(relay_url.clone())
                     } else {
                         None
@@ -3961,6 +3976,54 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_disconnect_waits_for_pending_and_historic_sync_work() {
+        let mut source = RelayState {
+            connection_status: ConnectionStatus::Syncing,
+            ..RelayState::default()
+        };
+
+        assert!(
+            !source.is_disconnect_candidate(true),
+            "a source with missing-ID subscriptions in flight must stay connected"
+        );
+        assert!(
+            !source.is_disconnect_candidate(false),
+            "the historic-sync batch window must stay connected even between batches"
+        );
+
+        source.connection_status = ConnectionStatus::Connected;
+        assert!(
+            !source.is_disconnect_candidate(false),
+            "an active relay cannot be disconnected before historic sync settles"
+        );
+
+        source.historic_sync_completed = true;
+        assert!(
+            source.is_disconnect_candidate(false),
+            "an empty relay can be released after historic sync settles"
+        );
+        assert!(
+            !source.is_disconnect_candidate(true),
+            "a later pending batch still keeps an otherwise empty relay connected"
+        );
+
+        source
+            .repos
+            .insert("30617:maintainer:repository".to_string());
+        assert!(
+            !source.is_disconnect_candidate(false),
+            "confirmed repository work keeps the source connected"
+        );
+    }
+
+    #[test]
+    fn disconnected_empty_relay_can_still_be_cleaned_up() {
+        let source = RelayState::default();
+
+        assert!(source.is_disconnect_candidate(false));
+    }
 
     #[tokio::test]
     async fn test_rejected_events_index_tracks_announcements() {
