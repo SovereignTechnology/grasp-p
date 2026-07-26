@@ -1,14 +1,17 @@
 //! Integration coverage for Git Smart HTTP response streaming.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use clap::Parser;
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Frame};
 use ngit_grasp::config::Config;
 use ngit_grasp::git::handlers::handle_receive_pack;
+use ngit_grasp::git::sync::PurgatoryPromotionHooks;
 use ngit_grasp::grasp06::endpoint::PrsUrl;
 use ngit_grasp::grasp06::paths::prs_repo_path;
 use ngit_grasp::grasp06::receive::{handle_prs_receive_pack, new_repo_init_locks};
@@ -21,6 +24,7 @@ use ngit_grasp::purgatory::Purgatory;
 use ngit_grasp::sync::rejected_index::RejectedEventsIndex;
 use nostr_relay_builder::prelude::LocalRelayBuilder;
 use nostr_sdk::prelude::*;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -92,7 +96,11 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
         .expect("first stdout chunk should arrive before fake git exits")
         .expect("body should still be open")
         .expect("first frame should not be an HTTP body error");
-    assert_eq!(frame_data(first), Bytes::from_static(b"first-progress\n"));
+    let first = frame_data(first);
+    assert!(
+        !first.is_empty(),
+        "first progress frame should contain data"
+    );
 
     let no_second_yet = timeout(Duration::from_millis(250), body.frame()).await;
     assert!(
@@ -101,12 +109,190 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
          this test needs the first frame to be observed before subprocess EOF"
     );
 
-    let second = timeout(Duration::from_secs(3), body.frame())
+    let mut streamed = first.to_vec();
+    loop {
+        let frame = timeout(Duration::from_secs(3), body.frame())
+            .await
+            .expect("remaining stdout should arrive after fake git wakes");
+        let Some(frame) = frame else {
+            break;
+        };
+        streamed.extend_from_slice(
+            &frame
+                .expect("remaining frame should not be an HTTP body error")
+                .into_data()
+                .expect("remaining frame should contain data"),
+        );
+    }
+    assert_eq!(streamed, b"first-progress\nsecond-progress\n");
+}
+
+#[derive(Clone)]
+struct BlockingAnnouncementPromotion {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl PurgatoryPromotionHooks for BlockingAnnouncementPromotion {
+    async fn before_announcement_promote(&self, _event: &Event, _identifier: &str) {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("promotion release semaphore should remain open")
+            .forget();
+    }
+}
+
+#[tokio::test]
+async fn receive_pack_terminal_flush_waits_for_purgatory_promotion() {
+    let _env_lock = PATH_ENV_LOCK.lock().await;
+
+    let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
+    write_fake_git_with_terminal_flush(fake_bin.path());
+    let _path = PathOverride::prepend(fake_bin.path());
+
+    let keys = Keys::generate();
+    let owner_npub = keys.public_key().to_bech32().expect("encode owner npub");
+    let identifier = "push-readiness";
+    let git_data = tempfile::tempdir().expect("git data tempdir");
+    let repo_path = git_data
+        .path()
+        .join(&owner_npub)
+        .join(format!("{identifier}.git"));
+    std::fs::create_dir_all(&repo_path).expect("create fake bare repo path");
+
+    let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    let relay = LocalRelayBuilder::default().build();
+    let purgatory = Arc::new(Purgatory::new(git_data.path().to_path_buf()));
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![Tag::identifier(identifier)])
+        .finalize(&keys)
+        .expect("build announcement");
+    purgatory.add_announcement(
+        announcement.clone(),
+        identifier.to_string(),
+        keys.public_key(),
+        repo_path.clone(),
+        HashSet::new(),
+    );
+
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let hooks = BlockingAnnouncementPromotion {
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+
+    let response = handle_receive_pack(
+        repo_path,
+        receive_pack_request_body(),
+        database.clone(),
+        relay,
+        identifier,
+        &keys.public_key().to_hex(),
+        purgatory,
+        git_data.path().to_str().expect("utf-8 temp path"),
+        None,
+        None,
+        Some(Arc::new(hooks)),
+        None,
+    )
+    .await
+    .expect("receive-pack handler should start fake subprocess");
+
+    let mut body = response.into_body();
+    let first = timeout(Duration::from_secs(1), body.frame())
         .await
-        .expect("second stdout chunk should arrive after fake git wakes")
-        .expect("body should still be open for second chunk")
-        .expect("second frame should not be an HTTP body error");
-    assert_eq!(frame_data(second), Bytes::from_static(b"second-progress\n"));
+        .expect("receive-pack progress should stream before promotion")
+        .expect("body should contain progress")
+        .expect("progress frame should not be an HTTP body error");
+    let mut streamed = frame_data(first).to_vec();
+
+    timeout(Duration::from_secs(3), entered.acquire())
+        .await
+        .expect("post-push promotion hook should run")
+        .expect("promotion semaphore should remain open")
+        .forget();
+
+    let before_save = database
+        .query(Filter::new().id(announcement.id))
+        .await
+        .expect("query announcement before promotion");
+    assert!(
+        before_save.is_empty(),
+        "announcement must not be queryable while promotion is blocked"
+    );
+
+    while let Ok(Some(frame)) = timeout(Duration::from_millis(25), body.frame()).await {
+        streamed.extend_from_slice(
+            &frame
+                .expect("progress frame should not be an HTTP body error")
+                .into_data()
+                .expect("progress frame should contain data"),
+        );
+    }
+    assert!(
+        !streamed.ends_with(b"0000"),
+        "receive-pack terminal flush must remain hidden while promotion is blocked"
+    );
+
+    let keepalive = timeout(Duration::from_secs(6), body.frame())
+        .await
+        .expect("sideband keepalive should arrive during blocked promotion")
+        .expect("body should remain open while promotion is blocked")
+        .expect("keepalive should not be an HTTP body error");
+    streamed.extend_from_slice(
+        &keepalive
+            .into_data()
+            .expect("keepalive frame should contain data"),
+    );
+    assert!(
+        streamed
+            .windows(b"GRASP is finalizing the push\n".len())
+            .any(|window| window == b"GRASP is finalizing the push\n"),
+        "blocked post-push processing should emit sideband progress"
+    );
+    assert!(
+        !streamed.ends_with(b"0000"),
+        "keepalive must not expose the terminal flush"
+    );
+
+    release.add_permits(1);
+
+    loop {
+        let frame = timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("response should finish after promotion is released");
+        let Some(frame) = frame else {
+            break;
+        };
+        streamed.extend_from_slice(
+            &frame
+                .expect("terminal frame should not be an HTTP body error")
+                .into_data()
+                .expect("terminal frame should contain data"),
+        );
+    }
+
+    assert!(
+        streamed.starts_with(b"first-progress\nsecond-progress\n"),
+        "git progress should remain at the start of the response"
+    );
+    assert!(
+        streamed.ends_with(b"0000"),
+        "terminal flush should remain the final client-visible bytes"
+    );
+    let after_save = database
+        .query(Filter::new().id(announcement.id))
+        .await
+        .expect("query announcement after promotion");
+    assert_eq!(
+        after_save.len(),
+        1,
+        "announcement must be queryable before push success is exposed"
+    );
 }
 
 #[tokio::test]
@@ -251,7 +437,20 @@ fn test_write_policy(
 }
 
 fn write_fake_git(bin_dir: &Path) {
+    write_fake_git_script(bin_dir, false);
+}
+
+fn write_fake_git_with_terminal_flush(bin_dir: &Path) {
+    write_fake_git_script(bin_dir, true);
+}
+
+fn write_fake_git_script(bin_dir: &Path, terminal_flush: bool) {
     let git_path = bin_dir.join("git");
+    let terminal_flush = if terminal_flush {
+        "printf '0000'\n"
+    } else {
+        ""
+    };
     std::fs::write(
         &git_path,
         r#"#!/usr/bin/env bash
@@ -269,7 +468,7 @@ cat >/dev/null
 printf 'first-progress\n'
 sleep 2
 printf 'second-progress\n'
-exit 0
+__TERMINAL_FLUSH__exit 0
 fi
 
 if [ "$1" = "init" ]; then
@@ -284,7 +483,8 @@ fi
 
 echo "fake git only supports init, for-each-ref, and receive-pack" >&2
 exit 1
-"#,
+"#
+        .replace("__TERMINAL_FLUSH__", terminal_flush),
     )
     .expect("write fake git executable");
 
