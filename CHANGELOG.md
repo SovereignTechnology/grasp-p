@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Smart HTTP pushes now expose the terminal receive-pack flush only after GRASP has finished promoting the matching repository announcement and state from purgatory. Git progress remains streamed while large packs are resolved and checked, but an immediately following clone or proposal push can now rely on a completed push being queryable on the relay.
 - Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.
 - Prevent invitation syncing from dropping a source relay while its initial repository history is still being downloaded.
 - Fix maintainership invitation syncing by retaining and refetching expired inviter announcement and state IDs across the maintainer relay chain before promotion.

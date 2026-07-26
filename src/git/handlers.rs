@@ -325,6 +325,70 @@ where
     }
 }
 
+/// Forward receive-pack progress while retaining its protocol terminator.
+///
+/// A successful receive-pack response ends with a `0000` flush pkt-line.
+/// Git clients use that flush as the semantic end of the push and need not wait
+/// for the HTTP body to reach EOF. Retaining the final four bytes lets the
+/// caller finish GRASP post-push processing before making success visible,
+/// without buffering the progress stream that keeps clients alive during
+/// expensive pack processing.
+async fn pump_receive_pack_stdout_to_channel<R>(
+    mut stdout: R,
+    tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+) -> (PumpResult, Option<Vec<u8>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    const FLUSH_PKT: &[u8; 4] = b"0000";
+
+    let mut read_buf = [0_u8; STREAM_CHUNK_SIZE];
+    let mut pending = Vec::with_capacity(4);
+    let mut sent_stdout = false;
+
+    loop {
+        match stdout.read(&mut read_buf).await {
+            Ok(0) => {
+                if pending.as_slice() == FLUSH_PKT {
+                    return (
+                        PumpResult::Eof { sent_stdout },
+                        Some(std::mem::take(&mut pending)),
+                    );
+                }
+
+                if !pending.is_empty() {
+                    sent_stdout = true;
+                    if send_body_bytes(tx, std::mem::take(&mut pending))
+                        .await
+                        .is_err()
+                    {
+                        return (PumpResult::ClientDisconnected, None);
+                    }
+                }
+
+                return (PumpResult::Eof { sent_stdout }, None);
+            }
+            Ok(n) => {
+                pending.extend_from_slice(&read_buf[..n]);
+                if pending.len() > FLUSH_PKT.len() {
+                    let retained = pending.split_off(pending.len() - FLUSH_PKT.len());
+                    sent_stdout = true;
+                    if send_body_bytes(tx, std::mem::replace(&mut pending, retained))
+                        .await
+                        .is_err()
+                    {
+                        return (PumpResult::ClientDisconnected, None);
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return (PumpResult::ReadError, None);
+            }
+        }
+    }
+}
+
 /// Drain Git stderr for later logging or Git protocol error synthesis.
 ///
 /// Streaming handlers run this concurrently with stdout pumping so the child
@@ -637,7 +701,7 @@ async fn stream_receive_pack_output<S, E>(
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
-    let pump_result = pump_stdout_to_channel(stdout, &tx).await;
+    let (pump_result, terminal_flush) = pump_receive_pack_stdout_to_channel(stdout, &tx).await;
 
     if !matches!(pump_result, PumpResult::Eof { .. }) {
         let _ = git.kill().await;
@@ -658,7 +722,7 @@ async fn stream_receive_pack_output<S, E>(
         None => Vec::new(),
     };
 
-    let sent_stdout = match pump_result {
+    let mut sent_stdout = match pump_result {
         PumpResult::Eof { sent_stdout } => sent_stdout,
         PumpResult::ClientDisconnected | PumpResult::ReadError => {
             drop(repo_lifecycle_guard);
@@ -668,6 +732,15 @@ async fn stream_receive_pack_output<S, E>(
     };
 
     if !status.success() {
+        if let Some(flush) = terminal_flush {
+            sent_stdout = true;
+            if send_body_bytes(&tx, flush).await.is_err() {
+                drop(repo_lifecycle_guard);
+                record_git_operation(&metrics, "push", "error");
+                return;
+            }
+        }
+
         drop(repo_lifecycle_guard);
         record_git_operation(&metrics, "push", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
@@ -707,7 +780,6 @@ async fn stream_receive_pack_output<S, E>(
     }
 
     debug!("Git receive-pack stream completed successfully");
-    record_git_operation(&metrics, "push", "success");
 
     // Release the repository lifecycle read lock once git-receive-pack itself
     // has finished. The lock's purpose is to keep deletion/archive/restore from
@@ -718,11 +790,11 @@ async fn stream_receive_pack_output<S, E>(
     // the subprocess boundary would deadlock.
     drop(repo_lifecycle_guard);
 
-    // Git's receive-pack response has already been streamed verbatim, including
-    // its final flush. Run GRASP follow-up work before closing the HTTP body so
-    // push completion still implies local refs/HEAD are aligned, but treat those
-    // follow-up failures as internal/log-only rather than client-visible push
-    // rejections.
+    // Git's receive-pack progress has already been streamed verbatim, but its
+    // final flush remains withheld. Run GRASP follow-up work before releasing
+    // that client-visible success boundary so push completion implies local
+    // refs/HEAD and promoted events are ready. Follow-up failures remain
+    // internal/log-only rather than client-visible push rejections.
     match process_newly_available_git_data(
         &repo_path,
         &new_oids,
@@ -758,6 +830,18 @@ async fn stream_receive_pack_output<S, E>(
             );
         }
     }
+
+    // The final receive-pack flush is the client-visible success boundary.
+    // Release it only after promoted events have been saved and subscribers
+    // notified, so a completed push implies that local GRASP state is ready.
+    if let Some(flush) = terminal_flush {
+        if send_body_bytes(&tx, flush).await.is_err() {
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    }
+
+    record_git_operation(&metrics, "push", "success");
 }
 
 async fn send_body_bytes(
