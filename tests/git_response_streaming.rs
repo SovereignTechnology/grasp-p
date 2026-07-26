@@ -238,6 +238,27 @@ async fn receive_pack_terminal_flush_waits_for_purgatory_promotion() {
         "receive-pack terminal flush must remain hidden while promotion is blocked"
     );
 
+    let keepalive = timeout(Duration::from_secs(6), body.frame())
+        .await
+        .expect("sideband keepalive should arrive during blocked promotion")
+        .expect("body should remain open while promotion is blocked")
+        .expect("keepalive should not be an HTTP body error");
+    streamed.extend_from_slice(
+        &keepalive
+            .into_data()
+            .expect("keepalive frame should contain data"),
+    );
+    assert!(
+        streamed
+            .windows(b"GRASP is finalizing the push\n".len())
+            .any(|window| window == b"GRASP is finalizing the push\n"),
+        "blocked post-push processing should emit sideband progress"
+    );
+    assert!(
+        !streamed.ends_with(b"0000"),
+        "keepalive must not expose the terminal flush"
+    );
+
     release.add_permits(1);
 
     loop {
@@ -255,9 +276,13 @@ async fn receive_pack_terminal_flush_waits_for_purgatory_promotion() {
         );
     }
 
-    assert_eq!(
-        streamed, b"first-progress\nsecond-progress\n0000",
-        "terminal flush should be the final client-visible bytes"
+    assert!(
+        streamed.starts_with(b"first-progress\nsecond-progress\n"),
+        "git progress should remain at the start of the response"
+    );
+    assert!(
+        streamed.ends_with(b"0000"),
+        "terminal flush should remain the final client-visible bytes"
     );
     let after_save = database
         .query(Filter::new().id(announcement.id))

@@ -10,8 +10,10 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use super::protocol::{GitService, PktLine};
@@ -27,6 +29,8 @@ use crate::purgatory::Purgatory;
 
 pub(crate) const STREAM_CHANNEL_DEPTH: usize = 8;
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+const POST_PUSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const POST_PUSH_KEEPALIVE_MESSAGE: &[u8] = b"GRASP is finalizing the push\n";
 
 /// Handle GET /info/refs?service=git-{upload,receive}-pack
 ///
@@ -385,6 +389,59 @@ where
                 let _ = tx.send(Err(e)).await;
                 return (PumpResult::ReadError, None);
             }
+        }
+    }
+}
+
+/// Encode progress that keeps a sideband-aware receive-pack client alive.
+///
+/// Post-push purgatory promotion can copy objects and align several owner
+/// repositories. The terminal flush remains withheld until that work finishes,
+/// so send a valid band-2 pkt-line during a long finalization window instead of
+/// leaving libgit2 with no response bytes until its per-recv timeout expires.
+fn receive_pack_keepalive_pktline() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + POST_PUSH_KEEPALIVE_MESSAGE.len());
+    payload.push(0x02); // band 2 = progress
+    payload.extend_from_slice(POST_PUSH_KEEPALIVE_MESSAGE);
+    PktLine::data(payload).encode()
+}
+
+struct ReceivePackKeepalive {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ReceivePackKeepalive {
+    fn spawn(tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>, period: Duration) -> Self {
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+                if send_body_bytes(&tx, receive_pack_keepalive_pktline())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Self { task: Some(task) }
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ReceivePackKeepalive {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -795,7 +852,22 @@ async fn stream_receive_pack_output<S, E>(
     // that client-visible success boundary so push completion implies local
     // refs/HEAD and promoted events are ready. Follow-up failures remain
     // internal/log-only rather than client-visible push rejections.
-    match process_newly_available_git_data(
+    //
+    // A complex promotion may itself run longer than the client's receive
+    // timeout. Only clients that negotiated side-band-64k can safely receive
+    // invented progress pkt-lines, so keep those clients alive while leaving
+    // the response for non-sideband clients byte-for-byte unchanged.
+    let keepalive_task =
+        if terminal_flush.is_some() && client_negotiated_sideband_64k(&request_body) {
+            Some(ReceivePackKeepalive::spawn(
+                tx.clone(),
+                POST_PUSH_KEEPALIVE_INTERVAL,
+            ))
+        } else {
+            None
+        };
+
+    let processing_result = process_newly_available_git_data(
         &repo_path,
         &new_oids,
         &database,
@@ -804,8 +876,15 @@ async fn stream_receive_pack_output<S, E>(
         std::path::Path::new(&git_data_path),
         promotion_hooks.as_deref(),
     )
-    .await
-    {
+    .await;
+
+    // Stop and join the sender before releasing the flush so no keepalive can
+    // race behind the terminal protocol boundary.
+    if let Some(task) = keepalive_task {
+        task.stop().await;
+    }
+
+    match processing_result {
         Ok(result) => {
             if result.released_any() {
                 info!(
@@ -1052,6 +1131,29 @@ mod tests {
             pump_task.await.unwrap(),
             PumpResult::Eof { sent_stdout: true }
         );
+    }
+
+    #[tokio::test]
+    async fn post_push_keepalive_is_sideband_progress() {
+        use tokio::time::timeout;
+
+        let (tx, mut rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
+        let keepalive = ReceivePackKeepalive::spawn(tx, Duration::from_millis(10));
+
+        let frame = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("keepalive should arrive before timeout")
+            .expect("keepalive channel should remain open")
+            .expect("keepalive should not be an HTTP body error");
+        let data = frame.into_data().expect("keepalive should contain data");
+
+        assert_eq!(data.as_ref(), receive_pack_keepalive_pktline());
+        assert_eq!(
+            data[4], 0x02,
+            "keepalive pkt-line payload must use sideband band 2"
+        );
+
+        keepalive.stop().await;
     }
 
     #[tokio::test]
