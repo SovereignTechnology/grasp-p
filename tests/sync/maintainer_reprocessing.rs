@@ -5,15 +5,16 @@
 //!
 //! ## Test design
 //!
-//! Announcements now require git data before they are released from purgatory and
-//! served to other relays.  The hot-cache re-processing path we want to exercise is:
+//! Announcements require git data before they are released from purgatory and
+//! served to other relays. The tests exercise both dependency-recovery paths:
 //!
 //!   relay_b syncs maintainer announcement from relay_a
 //!     → write policy rejects it (no owner announcement in DB yet)
-//!     → event stored in hot cache
-//!   owner git push to relay_b promotes owner announcement from purgatory
-//!     → our new code calls rejected_events_index.invalidate_and_get()
-//!     → maintainer announcement re-processed and accepted
+//!     → event stored in hot cache and cold index
+//!   reciprocal owner announcement reaches relay_b
+//!     → hot copy is re-processed immediately when available
+//!     → expired hot copy is fetched by its retained cold-index event ID
+//!     → maintainer announcement supplies the source clone and git data syncs
 //!
 //! To guarantee the maintainer announcements arrive at relay_b *before* the owner
 //! git push, relay_b is started with relay_a as its bootstrap relay.  That way

@@ -796,14 +796,24 @@ Without the rejected events index, negentropy would repeatedly download events t
 
 **Re-Processing on Dependency Arrival:**
 
-When a dependency is satisfied (e.g., owner announcement accepted):
-1. Related entries are **invalidated** (removed) from cold index
-2. If event still in hot cache → immediate re-processing
-3. If event expired from hot cache → will be re-fetched on next sync (now that dependency exists)
+When a dependency is satisfied, an unexpired hot-cache event can be
+re-processed immediately. During reciprocal maintainership invitation
+bootstrap, the owner announcement may still be in purgatory because promotion
+needs the inviter's Git data. In that flow:
 
-This prevents permanently excluding events that could become valid after dependencies arrive.
+1. Dependency-resolvable entries remain in the cold index until processing succeeds.
+2. If the full event is still in the hot cache, it is re-processed immediately.
+3. If the full event expired, the sync manager requests only the retained event IDs from connected relays across the recursive maintainer chain.
+4. Relay requests run in parallel as bounded background work; announcements are processed before state events that may depend on them.
+5. Successful or duplicate events are removed from both tiers. Failed and empty requests retain their IDs for a throttled retry.
 
-See [work/rejected-events-index-summary.md](../../work/rejected-events-index-summary.md) for complete implementation details.
+This prevents both failure modes: broad synchronization does not repeatedly
+download known-invalid events, while a dependency-resolvable event cannot become
+permanently suppressed merely because its full hot-cache copy expired.
+
+See [Architecture: Rejected Events Index](architecture.md#rejected-events-index)
+and [`src/sync/rejected_index.rs`](../../src/sync/rejected_index.rs) for the
+design and implementation.
 
 ---
 

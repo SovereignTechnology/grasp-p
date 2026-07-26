@@ -454,10 +454,11 @@ NGIT_REJECTED_HOT_CACHE_DURATION_SECS=300
 
 **Notes:**
 
-- Hot cache stores full event objects for immediate re-processing when dependencies arrive
-- Events expire from hot cache after this duration and move to cold index
-- Shorter durations reduce memory usage but may miss dependency arrivals
-- Longer durations increase memory but improve race condition resolution
+- Rejected events are inserted into the hot cache and cold index at the same time
+- The hot cache stores full event objects for immediate re-processing when dependencies arrive
+- After the full event expires, dependency-resolvable announcement and state IDs remain in the cold index and can be fetched directly from maintainer-chain relays during reciprocal invitation bootstrap
+- Shorter durations reduce memory usage but may add an exact-ID relay round trip and its associated latency
+- Longer durations increase memory usage and make immediate, network-free recovery more likely
 - Memory impact: ~200 KB typical, ~20 MB worst case
 
 ---
@@ -486,8 +487,11 @@ NGIT_REJECTED_COLD_INDEX_EXPIRY_SECS=1209600
 
 - Cold index stores only metadata (event ID, pubkey, identifier, rejection reason)
 - Prevents re-downloading rejected events during negentropy sync
+- Retains the exact IDs required to recover dependency-resolvable events after their hot-cache copies expire
+- Successful recovery removes an ID; failed requests leave it indexed for a throttled retry
 - Entries automatically cleaned up daily
-- Longer durations prevent more wasteful re-fetching but use slightly more memory
+- The retention window must be long enough to cover expected invitation and maintainer-chain bootstrap delays
+- Longer durations preserve more recovery opportunities and prevent more wasteful broad re-fetching, but use slightly more memory
 - Memory impact: ~1 MB typical
 
 ---

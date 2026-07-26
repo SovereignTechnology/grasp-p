@@ -506,7 +506,7 @@ async fn test_nip01_websocket_connection() {
 
 ## Proactive Sync (GRASP-02)
 
-The ngit-grasp relay implements **Proactive Sync of Nostr Eevents**, which synchronizes repository data from external relays listed in 30617 repository announcements. This enables the relay to maintain complete repository graphs even when events are published to other listed relays.
+The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchronizes repository data from external relays listed in 30617 repository announcements. This enables the relay to maintain complete repository graphs even when events are published to other listed relays.
 
 **Key Features:**
 
@@ -516,7 +516,7 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Eevents**, which synch
 - **Health tracking** with exponential backoff for failing relays
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when count exceeds 70 to prevent subscription explosion
-- **Rejected events index** - prevents wasteful re-fetching during negentropy sync
+- **Rejected events index** - prevents wasteful broad re-fetching while retaining exact IDs for dependency recovery
 
 **Architecture:**
 
@@ -542,15 +542,15 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Eevents**, which synch
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  Rejected Events Index (Two-Tier)                   │  │
 │  │  ┌────────────────┐    ┌──────────────────────┐    │  │
-│  │  │  Hot Cache     │───▶│  Cold Index          │    │  │
+│  │  │  Hot Cache     │    │  Cold Index          │    │  │
 │  │  │  (2 min)       │    │  (7 days)            │    │  │
-│  │  │  Full events   │    │  Metadata only       │    │  │
+│  │  │  Full events   │    │  IDs + metadata      │    │  │
 │  │  └────────────────┘    └──────────────────────┘    │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Source Code:** [`src/sync/`](src/sync/)
+**Source Code:** [`src/sync/`](../../src/sync/)
 
 For full design details, see [grasp-02-proactive-sync-v4.md](grasp-02-proactive-sync-v4.md).
 
@@ -559,7 +559,7 @@ For full design details, see [grasp-02-proactive-sync-v4.md](grasp-02-proactive-
 The rejected events index solves two critical problems during sync:
 
 1. **Negentropy sync efficiency**: Prevents repeatedly downloading events that will be rejected again
-2. **Race condition resolution**: Enables immediate re-processing when event dependencies are satisfied
+2. **Race condition resolution**: Enables immediate hot-cache re-processing or an exact-ID fetch after the full event expires
 
 **Two-Tier Architecture:**
 
@@ -576,20 +576,34 @@ Event Rejected (e.g., maintainer before owner announcement)
     ├──▶ Store full event in Hot Cache (2 min expiry)
     └──▶ Store metadata in Cold Index (7 day expiry)
     
-Dependency Arrives (e.g., owner announcement accepted)
+Reciprocal Invitation Arrives (owner announcement enters purgatory)
     │
-    ├──▶ Invalidate from Cold Index
-    ├──▶ Retrieve from Hot Cache (if still available)
-    └──▶ Re-process immediately (<1 second vs 24 hours)
+    ├──▶ Keep dependency-resolvable IDs in Cold Index
+    ├──▶ Re-process from Hot Cache when the full event remains available
+    └──▶ Otherwise fetch only the retained IDs from the maintainer relay chain
+
+Exact-ID Recovery
+    │
+    ├──▶ Connect to relay hints before starting recovery
+    ├──▶ Query all connected maintainer-chain relays in parallel
+    ├──▶ Process announcements before dependent state events
+    └──▶ Remove IDs only after policy processing succeeds
 
 Negentropy Sync
     │
     └──▶ Exclude Cold Index IDs from "missing events" calculation
 ```
 
+Exact-ID recovery runs as bounded background work, so a slow relay does not hold
+the main sync-manager lock. Failed or empty requests retain their IDs and are
+retried no more than once every 30 seconds. Each relay request has a five-second
+timeout.
+
 **Tracked Events:**
-- Repository announcements (kind 30617) rejected for not listing this service or maintainer validation failure
-- State events (kind 30618) rejected for missing announcements or unauthorized authors
+
+- Repository announcements (kind 30617) rejected for not listing this service or a dependency-resolvable maintainer validation failure
+- State events (kind 30618) rejected for missing announcements or dependency-resolvable authorization failures
+- Permanently invalid events classified as `Other` remain excluded and are not exact-refetched
 
 **Source Code:** [`src/sync/rejected_index.rs`](../../src/sync/rejected_index.rs)
 

@@ -844,7 +844,17 @@ purgatory.extend_announcement_expiry(&owner_pk, &identifier, Duration::from_secs
 
 ### 5. Sync Registration (`src/sync/`)
 
-A background timer (`run_purgatory_announcement_sync`, every 5 seconds) ensures purgatory announcements are registered in `RepoSyncIndex` with `SyncLevel::StateOnly`. When an announcement is promoted, the `SelfSubscriber` upgrades it to `SyncLevel::Full`.
+A background timer (`run_purgatory_announcement_sync`, every 5 seconds) ensures purgatory announcements are registered in `RepoSyncIndex` with `SyncLevel::StateOnly`. It connects the announcement's relay hints before recovering rejected dependencies, walks accepted announcements to collect the recursive maintainer relay chain, and re-processes any dependency events still in the hot cache.
+
+If a dependency's full event has expired, the timer starts a background exact-ID
+request against all connected relays in that chain. Requests run in parallel and
+do not hold the sync-manager lock. Announcements are applied before state events;
+IDs remain in the cold index through empty or failed requests and are removed only
+after successful policy processing. Production retries are limited to once every
+30 seconds, with a five-second timeout per relay request.
+
+When an announcement is promoted, the `SelfSubscriber` upgrades it to
+`SyncLevel::Full`.
 
 ---
 

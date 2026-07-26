@@ -235,16 +235,22 @@ All metrics are parameterized by `event_type` label with values "announcement" o
 |--------|------|--------|-------------|
 | `ngit_rejected_hot_cache_current` | Gauge | event_type | Current number of entries in hot cache |
 | `ngit_rejected_cold_index_current` | Gauge | event_type | Current number of entries in cold index |
-| `ngit_rejected_hot_cache_hits` | Counter | event_type | Events successfully retrieved from hot cache for re-processing |
-| `ngit_rejected_hot_cache_misses` | Counter | event_type | Events expired from hot cache before dependency arrived |
+| `ngit_rejected_hot_cache_hits` | Counter | event_type | Events retrieved by the explicit invalidation API |
+| `ngit_rejected_hot_cache_misses` | Counter | event_type | Explicit invalidations whose full event had already expired |
 | `ngit_rejected_hot_cache_expired` | Counter | event_type | Entries cleaned up from hot cache (2 min expiry) |
 | `ngit_rejected_cold_index_expired` | Counter | event_type | Entries cleaned up from cold index (7 day expiry) |
-| `ngit_rejected_invalidated` | Counter | event_type | Entries invalidated when dependency was satisfied |
+| `ngit_rejected_invalidated` | Counter | event_type | Entries removed by the explicit invalidation API |
+
+The invitation dependency-recovery path is deliberately non-destructive and does
+not increment the hit, miss, or invalidation counters above. It retains cold IDs
+until processing succeeds. Operators can observe exact-ID attempts in structured
+logs containing `Fetched purgatory dependencies by exact event ID`; the current
+and expiry gauges still cover entries used by both paths.
 
 ### Example Grafana Queries
 
 ```promql
-# Hot cache efficiency - how often we successfully re-process from cache
+# Explicit invalidation API hot-cache efficiency
 rate(ngit_rejected_hot_cache_hits_total[5m])
 / (rate(ngit_rejected_hot_cache_hits_total[5m]) + rate(ngit_rejected_hot_cache_misses_total[5m]))
 
@@ -254,10 +260,10 @@ ngit_rejected_hot_cache_current{event_type="state"}
 ngit_rejected_cold_index_current{event_type="announcement"}
 ngit_rejected_cold_index_current{event_type="state"}
 
-# Race condition resolution rate - invalidations indicate successful dependency arrival
+# Explicit invalidation activity
 rate(ngit_rejected_invalidated_total[5m])
 
-# Cache hit ratio over time (higher is better, means dependencies arriving quickly)
+# Explicit invalidation cache hit ratio over time
 sum(rate(ngit_rejected_hot_cache_hits_total[5m]))
 / sum(rate(ngit_rejected_hot_cache_hits_total[5m]) + rate(ngit_rejected_hot_cache_misses_total[5m]))
 ```
@@ -265,19 +271,6 @@ sum(rate(ngit_rejected_hot_cache_hits_total[5m]))
 ### Example Alerts
 
 ```yaml
-# Alert if hot cache hit rate is too low (suggests timing issues)
-- alert: RejectedEventsCacheMissRate
-  expr: |
-    sum(rate(ngit_rejected_hot_cache_misses_total[5m]))
-    / sum(rate(ngit_rejected_hot_cache_hits_total[5m]) + rate(ngit_rejected_hot_cache_misses_total[5m]))
-    > 0.8
-  for: 15m
-  labels:
-    severity: warning
-  annotations:
-    summary: "High rejected events cache miss rate ({{ $value | humanizePercentage }})"
-    description: "Most rejected events are expiring before dependencies arrive"
-
 # Alert if cold index growing too large
 - alert: RejectedEventsColdIndexSize
   expr: ngit_rejected_cold_index_current > 10000
@@ -300,6 +293,7 @@ sum(rate(ngit_rejected_hot_cache_hits_total[5m]))
 **Cold Index (7 days):**
 - Stores metadata only (event ID, pubkey, identifier, reason)
 - Prevents re-downloading during negentropy sync
+- Supplies exact IDs when dependency-resolvable full events have left the hot cache
 - Cleaned up daily
 - Memory: ~1 MB typical
 
@@ -307,12 +301,16 @@ sum(rate(ngit_rejected_hot_cache_hits_total[5m]))
 
 **Race Condition Resolution:**
 When a maintainer announcement arrives before the owner announcement:
+
 1. Maintainer event rejected → hot cache + cold index
-2. Owner announcement accepted → invalidate from cold index
-3. If still in hot cache → immediate re-processing (<1 second)
-4. If expired from hot cache → will be re-fetched on next sync
+2. Reciprocal owner announcement enters purgatory → retain the cold ID until recovery succeeds
+3. If still in hot cache → immediate policy re-processing
+4. If expired from hot cache → exact-ID requests run in parallel across the recursive maintainer relay chain
+5. Empty or failed requests keep the ID for a throttled retry
+6. Successful processing removes the event from both tiers
 
 **Negentropy Sync Efficiency:**
 During sync, cold index IDs are excluded from "missing events" calculation, preventing wasteful re-download of events that will be rejected again.
 
-See [work/rejected-events-index-summary.md](../../work/rejected-events-index-summary.md) for complete implementation details.
+See [GRASP-02: Integration with Rejected Events Index](grasp-02-proactive-sync.md#integration-with-rejected-events-index)
+for the recovery flow.

@@ -9,7 +9,7 @@
 //!
 //! 2. **Cold Index (Tier 2)**: Stores metadata only for 7 days
 //!    - Prevents repeated downloads of rejected events
-//!    - Enables invalidation when dependencies change
+//!    - Retains exact IDs for dependency recovery after full events expire
 //!    - Typical memory: ~1 MB
 //!
 //! # Problem Solved
@@ -18,16 +18,17 @@
 //!
 //! ```text
 //! 00:00 - Maintainer announcement rejected → Event discarded
-//! 00:02 - Owner announcement accepted (lists maintainer) → Want to re-process
-//! 00:02 - ❌ Maintainer announcement GONE → Must wait 24h for next sync
+//! 00:03 - Owner announcement accepted (lists maintainer) → Want to re-process
+//! 00:03 - ❌ Maintainer announcement GONE → Completed historic sync will not fetch it
 //! ```
 //!
 //! With the two-tier system:
 //!
 //! ```text
 //! 00:00 - Maintainer announcement rejected → Stored in hot cache + cold index
-//! 00:02 - Owner announcement accepted → Invalidate + get from hot cache
-//! 00:02 - ✅ Re-process immediately → Accepted in <1 second
+//! 00:03 - Full event expired, but its cold-index ID remains available
+//! 00:03 - Exact-ID request recovers the event from the maintainer relay chain
+//! 00:03 - ✅ Remove from both tiers only after policy processing succeeds
 //! ```
 //!
 //! # Architecture
@@ -40,17 +41,18 @@
 //! │ - Auto-expires after 2 minutes                              │
 //! │ - Memory: ~200 KB typical, ~20 MB worst case                │
 //! └─────────────────────────────────────────────────────────────┘
-//!                         │
-//!                         │ After 2 minutes
-//!                         ▼
+//!                         +
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │ Tier 2: Cold Index (7 days)                                 │
 //! │ - Stores METADATA only (event_id, pubkey, identifier)       │
 //! │ - Prevents repeated downloads                               │
-//! │ - Enables invalidation                                      │
+//! │ - Enables targeted recovery after the full event expires    │
 //! │ - Memory: ~1 MB typical                                     │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! Rejected events enter both tiers at the same time. Expiry removes only the
+//! full hot-cache copy; the cold metadata remains until success or cold expiry.
 //!
 //! # Usage
 //!
@@ -72,17 +74,17 @@
 //!     RejectionReason::DoesNotListService,
 //! );
 //!
-//! // Later, when owner announcement accepted...
-//! let (removed, hot_events) = index.invalidate_and_get(
+//! // Later, when the owner announcement arrives...
+//! let (event_ids, hot_events) = index.dependency_candidates(
 //!     &maintainer_pubkey,
 //!     "my-repo",
 //!     Some(EventType::Announcement),
 //! );
 //!
-//! // Re-process events from hot cache immediately
-//! for event in hot_events {
-//!     process_event(&event).await;
-//! }
+//! // Re-process `hot_events` immediately. For candidate IDs without a full
+//! // hot-cache event, request that exact event from the recursive maintainer
+//! // relay chain. Keep each entry indexed until policy processing succeeds,
+//! // then call `index.remove(&event_id)`.
 //! ```
 
 use nostr_sdk::prelude::{Event, EventId, PublicKey};

@@ -440,14 +440,23 @@ State events rejected during authorization are tracked in the rejected events in
 - **Reason: MaintainerNotYetValid** - Author not in maintainer set (may become valid later)
 - **Reason: Other** - Other validation failures
 
-When a repository announcement is accepted, rejected state events for that repository are:
-1. **Invalidated** from cold index (removed from negentropy exclusion)
-2. **Retrieved** from hot cache (if still available within 2 minutes)
-3. **Re-processed** immediately with new maintainer set
+When a repository announcement is accepted, rejected state events still present
+in the hot cache are re-processed immediately. Reciprocal invitation
+announcements can enter purgatory before their source state and Git data are
+available. During that bootstrap flow, rejected state events are:
 
-This enables rapid recovery from race conditions where state events arrive before maintainer announcements.
+1. **Retained** in the cold index until policy processing succeeds
+2. **Retrieved** from the hot cache and re-processed immediately when the full event is still available
+3. **Fetched by exact event ID** from the recursive maintainer relay chain when the hot-cache copy has expired
+4. **Removed from both tiers** only after the event is accepted, enters purgatory, or is already stored
 
-See [work/rejected-events-index-summary.md](../../work/rejected-events-index-summary.md) for complete details on rejection tracking and re-processing.
+Repository announcements are processed before dependent state events. Network
+requests run outside the main sync-manager lock, and unsuccessful requests retain
+their IDs for a throttled retry. This enables rapid recovery from arrival-order
+races without reopening a broad synchronization query.
+
+See [GRASP-02: Integration with Rejected Events Index](grasp-02-proactive-sync.md#integration-with-rejected-events-index)
+for complete details on rejection tracking and re-processing.
 
 ---
 
