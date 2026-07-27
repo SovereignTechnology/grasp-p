@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix maintainer invitation recovery after a production restart by starting the
+  relay and SyncManager before scanning retained deletion requests. The
+  potentially long retention catch-up now begins immediately in the existing
+  background maintenance task instead of blocking purgatory processing.
+- Fix maintainer invitation recovery during a rate-limited historic sync by
+  resuming pagination outside the SyncManager lock. Fresh relay batches now
+  mark only their changed relays for recomputation, avoiding repeated
+  full-index filter construction while a large bootstrap history is arriving.
 - Fix maintainer invitation acceptance by prioritizing fresh purgatory
   dependencies within a bounded reconciliation pass and retaining the source
   relays needed to recover inviter events after the short-lived hot cache

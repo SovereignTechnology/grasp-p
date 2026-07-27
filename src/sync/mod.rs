@@ -40,8 +40,6 @@ pub use self_subscriber::SelfSubscriber;
 
 // Re-export health tracking types
 pub use health::RelayHealthTracker;
-use tokio::time::sleep;
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -437,6 +435,18 @@ fn take_drained_batch_as_failed(
         pending.remove(relay_url);
     }
     Some(batch)
+}
+
+fn mark_deferred_pagination(
+    batch: &mut PendingBatch,
+    completed_sub_id: &SubscriptionId,
+) -> SubscriptionId {
+    let deferred_sub_id = SubscriptionId::new(format!(
+        "deferred-pagination-{}-{completed_sub_id}",
+        batch.batch_id
+    ));
+    batch.outstanding_subs.insert(deferred_sub_id.clone());
+    deferred_sub_id
 }
 
 // =============================================================================
@@ -1118,47 +1128,42 @@ impl SyncManager {
                     let relay_url_for_pagination = relay_url.to_string();
                     let batch_id = batch.batch_id;
 
-                    // Drop the lock before async operations
-                    drop(pending);
-
-                    // Wait for rate limiting to clear before pagination continues
+                    // A NOTICE can arrive immediately before this page's EOSE.
+                    // Never wait for the cooldown here: the caller owns the
+                    // global SyncManager mutex, while the health checker that
+                    // clears the cooldown needs that same mutex. Keep a
+                    // sentinel in the batch and resume this exact page from a
+                    // detached worker so generic history is not lost or
+                    // restarted from page one.
                     if self.health_tracker.is_rate_limited(relay_url) {
-                        tracing::debug!(
-                            relay = %relay_url,
-                            batch_id = batch_id,
-                            "Relay is rate limited, waiting before pagination"
-                        );
+                        let deferred_sub_id = mark_deferred_pagination(batch, &sub_id);
+                        drop(pending);
 
-                        // Loop until rate limit clears, sleeping with jitter between checks
-                        while self.health_tracker.is_rate_limited(relay_url) {
-                            let jitter_secs = 1 + (rand::random::<u64>() % 5); // 1-5 seconds
-                            sleep(Duration::from_secs(jitter_secs)).await;
-                        }
-
-                        tracing::debug!(
-                            relay = %relay_url,
-                            batch_id = batch_id,
-                            "Rate limit cleared, continuing pagination"
-                        );
-                        let batch_exists = {
-                            let pending = self.pending_sync_index.read().await;
-                            pending
-                                .get(&relay_url_for_pagination)
-                                .map(|batches| batches.iter().any(|b| b.batch_id == batch_id))
-                                .unwrap_or(false)
-                        };
-
-                        // If we were rate limited, verify batch still exists after waiting
-                        // (batches are wiped during disconnect, so avoid orphaned pagination)
-                        if !batch_exists {
-                            tracing::debug!(
+                        let Some(connection) =
+                            self.connections.get(&relay_url_for_pagination).cloned()
+                        else {
+                            tracing::error!(
                                 relay = %relay_url_for_pagination,
-                                batch_id = batch_id,
-                                "Batch no longer exists after rate limit wait, skipping pagination"
+                                batch_id,
+                                "Cannot defer rate-limited pagination without a relay connection"
                             );
                             return;
-                        }
+                        };
+                        Self::spawn_deferred_pagination(
+                            connection,
+                            self.health_tracker.clone(),
+                            self.pending_sync_index.clone(),
+                            relay_url_for_pagination,
+                            batch_id,
+                            deferred_sub_id,
+                            next_filter,
+                            until_timestamp,
+                        );
+                        return;
                     }
+
+                    // Drop the lock before async operations
+                    drop(pending);
 
                     // Subscribe to next page and add to outstanding_subs
                     let mut next_page_started = false;
@@ -1513,6 +1518,86 @@ impl SyncManager {
 
         // 4. Confirm the batch (moves items to RelayState)
         self.confirm_batch(relay_url, completed_batch).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_deferred_pagination(
+        connection: RelayConnection,
+        health_tracker: Arc<RelayHealthTracker>,
+        pending_sync_index: PendingSyncIndex,
+        relay_url: String,
+        batch_id: u64,
+        deferred_sub_id: SubscriptionId,
+        next_filter: Filter,
+        until_timestamp: Timestamp,
+    ) {
+        tokio::spawn(async move {
+            tracing::info!(
+                relay = %relay_url,
+                batch_id,
+                until = %until_timestamp,
+                "Rate limited during historic pagination; deferring the exact next page without blocking the sync actor"
+            );
+
+            loop {
+                if let Some(remaining) = health_tracker.get_remaining_backoff(&relay_url) {
+                    tokio::time::sleep(remaining + Duration::from_millis(10)).await;
+                    continue;
+                }
+
+                // Hold only the pending-index lock while subscribing. This
+                // prevents a very fast EOSE from reaching the actor before its
+                // new subscription ID is registered, without blocking the
+                // SyncManager mutex or the purgatory timer.
+                let mut pending = pending_sync_index.write().await;
+                let Some(batch) = pending.get_mut(&relay_url).and_then(|batches| {
+                    batches.iter_mut().find(|batch| batch.batch_id == batch_id)
+                }) else {
+                    tracing::debug!(
+                        relay = %relay_url,
+                        batch_id,
+                        "Deferred pagination batch no longer exists"
+                    );
+                    return;
+                };
+                if !batch.outstanding_subs.contains(&deferred_sub_id) {
+                    return;
+                }
+
+                match connection.subscribe_filter(next_filter.clone(), true).await {
+                    Ok(new_sub_id) => {
+                        batch.outstanding_subs.remove(&deferred_sub_id);
+                        batch.outstanding_subs.insert(new_sub_id.clone());
+                        batch.pagination_state.insert(
+                            new_sub_id.clone(),
+                            PaginationState {
+                                event_count: 0,
+                                min_created_at: None,
+                                original_filter: next_filter,
+                            },
+                        );
+                        tracing::info!(
+                            relay = %relay_url,
+                            new_sub_id = %new_sub_id,
+                            batch_id,
+                            until = %until_timestamp,
+                            "Deferred pagination resumed after rate-limit cooldown"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        drop(pending);
+                        tracing::warn!(
+                            relay = %relay_url,
+                            batch_id,
+                            error = %error,
+                            "Deferred pagination subscription failed; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
     }
 
     /// Confirm a completed batch by moving items to RelayState
@@ -1898,9 +1983,14 @@ impl SyncManager {
                 action = action_rx.recv() => {
                     match action {
                         Some(add_filters) => {
-                            // Process AddFilters action directly
+                            // SelfSubscriber actions are dirty-relay signals.
+                            // Recompute against current pending and confirmed
+                            // state instead of trusting a queued full-index
+                            // snapshot that may already be stale.
                             let mut manager = sync_manager.lock().await;
-                            manager.handle_new_sync_filters(add_filters).await;
+                            manager
+                                .recompute_new_sync_filters_for_relay(&add_filters.relay_url)
+                                .await;
                         }
                         None => break,
                     }
@@ -2769,6 +2859,18 @@ impl SyncManager {
     async fn recompute_new_sync_filters_for_relay(&mut self, relay_url: &str) {
         use crate::sync::algorithms::{compute_actions, derive_relay_targets};
 
+        let relay_url = match canonical_relay_key(relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %relay_url,
+                    error = %error,
+                    "Ignoring invalid dirty relay signal"
+                );
+                return;
+            }
+        };
+
         // Get current state from indexes (need to collect to avoid holding locks)
         let all_targets = {
             let repo_index = self.repo_sync_index.read().await;
@@ -2776,7 +2878,7 @@ impl SyncManager {
         };
 
         // Filter to only targets for this specific relay
-        let relay_target = match all_targets.get(relay_url) {
+        let relay_target = match all_targets.get(&relay_url) {
             Some(target) => target.clone(),
             None => {
                 tracing::debug!(
@@ -2789,7 +2891,7 @@ impl SyncManager {
 
         // Build single-relay targets map for compute_actions
         let mut single_relay_targets = std::collections::HashMap::new();
-        single_relay_targets.insert(relay_url.to_string(), relay_target);
+        single_relay_targets.insert(relay_url.clone(), relay_target);
 
         // Compute actions for new items
         let actions = {
@@ -4413,8 +4515,7 @@ impl SyncManager {
                             filter_idx = idx,
                             remote_count = remote_count,
                             local_count = reconciliation.local.len(),
-                            remote_ids = ?remote_excluding_ids,
-                            "[DIAG TRACE] ✓ Negentropy diff results for filter {}", idx
+                            "Negentropy diff completed for filter"
                         );
                         if remote_count > 0 {
                             all_remote_ids.extend(remote_excluding_ids);
@@ -4502,16 +4603,12 @@ impl SyncManager {
                     .map(|c| Filter::new().ids(c.iter().copied()))
                     .collect();
 
-                // DEBUG TRACING: Log that we're requesting events by ID
                 tracing::info!(
                     relay = %relay_url,
                     batch_id = batch_id,
                     total_event_ids = all_remote_ids.len(),
                     filter_chunks = ids_filters.len(),
-                    event_ids = ?all_remote_ids,
-                    "[DIAG TRACE] ✓ Creating {} subscription(s) to fetch {} missing event(s) by ID",
-                    ids_filters.len(),
-                    all_remote_ids.len()
+                    "Creating subscriptions to fetch missing events by ID"
                 );
 
                 let mut subscription_ids = HashSet::new();
@@ -4992,6 +5089,32 @@ mod tests {
         assert!(take_drained_batch_as_failed(&mut pending, relay_url, 42).is_none());
         assert_eq!(pending[relay_url].len(), 1);
         assert!(!pending[relay_url][0].failed);
+    }
+
+    #[test]
+    fn rate_limited_pagination_keeps_batch_pending_without_actor_wait() {
+        let relay_url = "wss://pagination.example";
+        let completed_sub = SubscriptionId::new("completed-page");
+        let mut batch = PendingBatch {
+            batch_id: 73,
+            items: PendingItems::default(),
+            outstanding_subs: HashSet::new(),
+            sync_method: SyncMethod::ReqEose,
+            pagination_state: HashMap::new(),
+            requested_event_ids: None,
+            received_event_ids: None,
+            retry_count: 0,
+            failed: false,
+        };
+
+        let deferred = mark_deferred_pagination(&mut batch, &completed_sub);
+        assert!(batch.outstanding_subs.contains(&deferred));
+
+        let mut pending = HashMap::from([(relay_url.to_string(), vec![batch])]);
+        assert!(
+            take_drained_batch_as_failed(&mut pending, relay_url, 73).is_none(),
+            "the deferred exact page must prevent a generic historic batch from being confirmed early"
+        );
     }
 
     #[test]
