@@ -13,6 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix invitation acceptance sync by deferring subscription consolidation until
+  in-flight relay batches finish, keeping the sync actor available to process
+  EOSE messages and the five-second purgatory reconciliation pass.
+- Fix invitation acceptance sync when a listed source relay is initially
+  unavailable or empty by retaining and retrying desired GRASP-02 work until it
+  is confirmed. Root-slash URL variants now share one relay lifecycle instead
+  of multiplying connections and subscription batches.
+- Fix invitation acceptance sync across large relay lists by moving websocket
+  handshakes out of the sync actor, limiting them to eight concurrent attempts,
+  and waiting for each relay to be connected before starting subscriptions.
+- Fix invitation dependency recovery by targeting retained event IDs at their
+  associated relay and falling back from NIP-77 after a 15-second total
+  deadline, so a missing or endlessly active exchange cannot stall the actor.
+- Fix large invitation relay sets repeatedly rebuilding their subscriptions by
+  applying the 70-filter consolidation threshold only to fragmentation above
+  the relay's irreducible desired live-filter baseline.
+- Keep invitation relay connection ownership inside the bounded scheduler by
+  disabling the SDK's independent auto-reconnect loop and cancelling queued or
+  active connection workers when the sync manager shuts down.
+- Fix invitation acceptance on a shared GRASP server by reapplying an existing
+  owner state event to the invitee's newly created repository, so GRASP-02 can
+  align it without an invitee state event or Git push.
+- Fix invitation acceptance when the invitee already owns the same repository
+  identifier by routing maintainer-changing replacements through purgatory and
+  reprocessing the owner dependencies that align the existing Git repository.
 - Sideband-aware Git clients now receive periodic progress while GRASP performs post-push purgatory promotion and cross-owner repository alignment, preventing the client I/O timeout from expiring during unusually complex finalization.
 - Smart HTTP pushes now expose the terminal receive-pack flush only after GRASP has finished promoting the matching repository announcement and state from purgatory. Git progress remains streamed while large packs are resolved and checked, but an immediately following clone or proposal push can now rely on a completed push being queryable on the relay.
 - Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.

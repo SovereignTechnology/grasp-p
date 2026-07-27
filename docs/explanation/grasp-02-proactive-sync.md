@@ -25,8 +25,14 @@ Key Architectural Points:
 - **Discovery management**: The nature of discovery inherently leads to a drip feed of root_events (e.g., Repo Announcements, Issues, Patches and PRs) that require additional subscriptions. Without careful management this can lead to large numbers of subscriptions and potentially rate limiting. Mitigation strategies:
   - Self-subscriber waits for 5s to batch updates before creating new filters / subscriptions, allowing time for most events to be received from outstanding subscriptions from connected relays
   - PendingBatch tracks each new set of filters that may require pagination until they are complete
-  - Avoid long awaits - recompute desired filters when connection is established to ensure filters are as consolidated as possible
-  - Consolidation function ensures number of live_sync subscriptions don't reach rate-limiting limits (threshold: 70 filters)
+  - Websocket handshakes run in at most eight bounded workers outside the sync
+    actor; only the actor applies their results, and subscriptions start only
+    after the relay reports `Connected`. The sync manager owns retry/backoff
+    rather than the SDK, and shutdown cancels queued or active workers
+  - Recompute desired filters when connection is established to ensure filters are as consolidated as possible
+  - Consolidation bounds incremental fragmentation to 70 subscriptions above
+    the irreducible desired live-filter baseline, so large desired sets remain
+    stable after rebuilding
 - **Quick Reconnect** (< 15mins) - doesn't do a full reconciliation vs fresh start (longer disconnect or relaunch binary)
 - **Background timers** handle relay connection health and metrics, handling reconnects after backoff and recovery after rate-limiting
 
@@ -334,8 +340,11 @@ The sync system uses three background tasks that run continuously:
 
 **Actions**:
 
-1. **Disconnect checking**: Calls `check_disconnects()` to remove relays with no repos/events (except bootstrap)
-2. **Retry disconnected**: Calls `retry_disconnected_relays()` to attempt reconnection per health tracker backoff
+1. **Disconnect checking**: Calls `check_disconnects()` to remove relays with
+   neither confirmed nor desired repository work (except bootstrap)
+2. **Retry disconnected**: Calls `retry_disconnected_relays()` to attempt
+   reconnection per health tracker backoff while either confirmed or desired
+   `RepoSyncIndex` work remains
 3. **Rate limit recovery**: Calls `check_rate_limit_recovery()` to clear expired rate limits
 4. **Metrics update**: Updates Prometheus metrics with current health states
 
@@ -691,7 +700,10 @@ fn compute_actions(
 - **`fresh_start()`**: Full sync - clears all state, L1 historic (with negentropy if available), then L2+L3 via recompute
 - **`quick_reconnect()`**: Incremental sync - preserves confirmed state, L1 historic with `since`, L2+L3 rebuild with `since`, then recompute for new items
 - **`daily_sync()`**: Wrapper around `fresh_start()` without disconnect metrics
-- **`consolidate()`**: Reduces filter count - clears pending, unsubscribes all, rebuilds live subscriptions only, then recompute for new items
+- **`consolidate()`**: Reduces filter count after in-flight historic batches have
+  drained. If a relay crosses the threshold while batches are pending,
+  consolidation is queued and batch completion wakes the sync actor to rebuild
+  subscriptions. The actor never polls for EOSE while holding its own lock.
 
 ### Sync Primitives
 
@@ -770,6 +782,11 @@ If negentropy fails (relay doesn't support NIP-77, network error, etc.):
 2. The sync falls back to traditional REQ+EOSE
 3. No error is raised - fallback is automatic
 
+Each dry-run diff also has a 15-second total wall-clock deadline. This is
+separate from the SDK's initial-response and idle timers: a relay that keeps an
+exchange active without completing it cannot hold the sync actor indefinitely.
+Reaching the deadline uses the same unsupported-relay fallback path.
+
 ### Integration with Rejected Events Index
 
 The rejected events index prevents wasteful re-fetching during negentropy sync by excluding rejected event IDs from the reconciliation process:
@@ -803,7 +820,10 @@ needs the inviter's Git data. In that flow:
 
 1. Dependency-resolvable entries remain in the cold index until processing succeeds.
 2. If the full event is still in the hot cache, it is re-processed immediately.
-3. If the full event expired, the sync manager requests only the retained event IDs from connected relays across the recursive maintainer chain.
+3. If the full event expired, the sync manager requests only the retained event
+   IDs from connected relays across the recursive maintainer chain. Each
+   request explicitly targets its associated relay connection instead of the
+   SDK's automatic pool-wide relay selection.
 4. Relay requests run in parallel as bounded background work; announcements are processed before state events that may depend on them.
 5. Successful or duplicate events are removed from both tiers. Failed and empty requests retain their IDs for a throttled retry.
 
@@ -970,8 +990,13 @@ RateLimited -> previous state: After 65-second cooldown expires
 ### Special Behaviors
 
 - **Bootstrap relays**: Never disconnected by cleanup system, even if empty
+- **Desired GRASP-02 sources**: Remain registered and retryable before their
+  first successful historic batch; an initially empty or unavailable source
+  cannot make a purgatory invitation permanently lose its sync path
 - **Rate limiting**: Distinct from connection failures - triggered by relay NOTICE messages
 - **Connection timeout**: Set to `base_backoff_secs` to ensure retry timing works correctly
+- **Connection concurrency**: At most eight DNS/websocket attempts run at once;
+  queued attempts do not start health backoff until a worker slot is available
 
 ---
 

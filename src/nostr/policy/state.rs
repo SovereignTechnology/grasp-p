@@ -172,10 +172,31 @@ impl StatePolicy {
             }
         }
 
-        // Duplicate check in db
-        if db_repo_data.states.iter().any(|e| e.event.id.eq(&event.id)) {
+        // A state already stored in the database may still need to be applied to
+        // a newly-created maintainer repository. This happens when an invitee
+        // publishes only their reciprocal announcement to a GRASP server that
+        // already serves the owner's state and Git data. Reconcile that state
+        // while the authorized invitee announcement is in purgatory instead of
+        // returning early as an ordinary duplicate.
+        let state_already_in_db = db_repo_data.states.iter().any(|e| e.event.id.eq(&event.id));
+        let has_authorized_purgatory_announcement = authorized_owners.iter().any(|owner_hex| {
+            nostr_sdk::prelude::PublicKey::from_hex(owner_hex).is_ok_and(|owner| {
+                self.ctx
+                    .purgatory
+                    .has_purgatory_announcement(&owner, &state.identifier)
+            })
+        });
+
+        if state_already_in_db && !has_authorized_purgatory_announcement {
             tracing::debug!("processed state event duplicate (in db): {}", event.id);
             return Ok(duplicate("already have this event"));
+        }
+        if state_already_in_db {
+            tracing::info!(
+                event_id = %event.id,
+                identifier = %state.identifier,
+                "Reapplying stored state to a new maintainer repository"
+            );
         }
 
         // Check if git data is available
@@ -220,7 +241,7 @@ impl StatePolicy {
             // for repos that became populated by the copy.
             let local_relay = self.ctx.get_local_relay();
             let promotion_result = crate::git::sync::process_repos_populated_by_state_copy(
-                &repo_with_git_data,
+                &state,
                 &db_repo_data,
                 &self.ctx.database,
                 local_relay.as_ref(),
@@ -239,8 +260,14 @@ impl StatePolicy {
                 );
             }
 
-            // Event will be saved and broadcast by relay builder
-            Ok(WritePolicyResult::Accept)
+            if state_already_in_db {
+                Ok(duplicate(
+                    "already stored; reapplied to pending maintainer repository",
+                ))
+            } else {
+                // Event will be saved and broadcast by relay builder
+                Ok(WritePolicyResult::Accept)
+            }
         } else {
             // Only reject expired events if they're from sync (not user-submitted)
             // User-submitted events should be allowed to retry in case git data became available

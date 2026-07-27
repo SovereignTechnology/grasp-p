@@ -78,16 +78,28 @@ impl AnnouncementPolicy {
 
                         // Owner de-list replacement for an already served repo:
                         // do NOT allow maintainer-exception acceptance to bypass
-                        // de-list enforcement. Let the caller treat this as a
-                        // reject path so runtime deletion parity can run.
+                        // de-list enforcement when the previous announcement
+                        // actually listed this service. An external maintainer
+                        // announcement never listed this service, so its
+                        // replacement must remain eligible for the maintainer
+                        // exception instead of being mistaken for a de-list.
                         let lists_service = announcement.lists_service(&self.config.domain);
                         if !lists_service {
                             match self
-                                .has_db_announcement(&event.pubkey, &announcement.identifier)
+                                .db_announcement(&event.pubkey, &announcement.identifier)
                                 .await
                             {
-                                Ok(true) => return AnnouncementResult::Reject(reason),
-                                Ok(false) => {}
+                                Ok(Some(current_event)) => {
+                                    let current =
+                                        match RepositoryAnnouncement::from_event(current_event) {
+                                            Ok(current) => current,
+                                            Err(_) => return AnnouncementResult::Reject(reason),
+                                        };
+                                    if current.lists_service(&self.config.domain) {
+                                        return AnnouncementResult::Reject(reason);
+                                    }
+                                }
+                                Ok(None) => {}
                                 Err(_) => return AnnouncementResult::Reject(reason),
                             }
                         }
@@ -114,11 +126,11 @@ impl AnnouncementPolicy {
                 // Parse announcement to check for existing active announcement
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
-                        let in_db = match self
-                            .has_db_announcement(&event.pubkey, &announcement.identifier)
+                        let db_announcement = match self
+                            .db_announcement(&event.pubkey, &announcement.identifier)
                             .await
                         {
-                            Ok(v) => v,
+                            Ok(event) => event,
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
@@ -131,7 +143,30 @@ impl AnnouncementPolicy {
                             }
                         };
 
-                        if in_db {
+                        if let Some(current_event) = db_announcement {
+                            let current = match RepositoryAnnouncement::from_event(current_event) {
+                                Ok(current) => current,
+                                Err(e) => {
+                                    return AnnouncementResult::Reject(format!(
+                                        "Failed to parse stored announcement: {e}"
+                                    ))
+                                }
+                            };
+                            let current_maintainers: HashSet<&str> =
+                                current.maintainers.iter().map(String::as_str).collect();
+                            let incoming_maintainers: HashSet<&str> = announcement
+                                .maintainers
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                            if current_maintainers != incoming_maintainers {
+                                tracing::debug!(
+                                    identifier = %announcement.identifier,
+                                    "Replacement announcement changes maintainers - routing through purgatory"
+                                );
+                                return AnnouncementResult::AcceptPurgatory;
+                            }
+
                             // Replacement announcement with DB entry - accept immediately
                             tracing::debug!(
                                 identifier = %announcement.identifier,
@@ -272,15 +307,12 @@ impl AnnouncementPolicy {
         );
     }
 
-    /// Check if there's an announcement in the database for this (pubkey, identifier).
-    ///
-    /// Only checks the database (promoted announcements). For purgatory checks use
-    /// `purgatory.has_purgatory_announcement()` directly.
-    async fn has_db_announcement(
+    /// Return the NIP-01-preferred served announcement for this coordinate.
+    async fn db_announcement(
         &self,
         pubkey: &PublicKey,
         identifier: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<Event>, String> {
         let filter = Filter::new()
             .kind(Kind::GitRepoAnnouncement)
             .author(*pubkey)
@@ -294,7 +326,11 @@ impl AnnouncementPolicy {
             Err(e) => return Err(format!("Database query failed: {}", e)),
         };
 
-        Ok(!events.is_empty())
+        Ok(events.into_iter().max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        }))
     }
 
     /// Add an announcement to purgatory

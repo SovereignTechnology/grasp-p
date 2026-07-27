@@ -49,12 +49,54 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use nostr_sdk::prelude::*;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
 use nostr_relay_builder::prelude::LocalRelay;
+
+/// Return one stable identity for a relay URL throughout all sync indexes.
+///
+/// URL parsers represent a root path as `/`, so announcements that alternate
+/// between `wss://relay.example` and `wss://relay.example/` must not create
+/// separate connections and duplicate subscription work. Non-root paths remain
+/// distinct relay endpoints.
+pub(crate) fn canonical_relay_key(relay_url: &str) -> Result<String, String> {
+    let normalized = if relay_url.starts_with("wss://") || relay_url.starts_with("ws://") {
+        relay_url.to_string()
+    } else {
+        format!("wss://{relay_url}")
+    };
+    let relay = RelayUrl::parse(&normalized).map_err(|error| error.to_string())?;
+    let mut canonical = relay.to_string();
+    let after_scheme = canonical
+        .split_once("://")
+        .map(|(_, value)| value)
+        .unwrap_or(canonical.as_str());
+    if after_scheme.ends_with('/') && after_scheme.matches('/').count() == 1 {
+        canonical.pop();
+    }
+    Ok(canonical)
+}
+
+fn connections_for_relay_urls<T: Clone>(
+    connections: &HashMap<String, T>,
+    relay_urls: &[String],
+) -> Vec<(String, T)> {
+    let mut seen = HashSet::new();
+    relay_urls
+        .iter()
+        .filter_map(|relay_url| canonical_relay_key(relay_url).ok())
+        .filter(|relay_url| seen.insert(relay_url.clone()))
+        .filter_map(|relay_url| {
+            connections
+                .get(&relay_url)
+                .cloned()
+                .map(|connection| (relay_url, connection))
+        })
+        .collect()
+}
 
 // =============================================================================
 // Type Aliases for Index Structures
@@ -197,12 +239,14 @@ impl RelayState {
     /// completion is deliberately delayed to cover the subscriber batch
     /// window). Pending batches and an active incomplete historic sync must
     /// therefore keep the relay connected.
-    fn is_disconnect_candidate(&self, has_pending_batches: bool) -> bool {
+    fn is_disconnect_candidate(&self, has_pending_batches: bool, has_desired_work: bool) -> bool {
         if self.is_bootstrap
+            || self.connection_status == ConnectionStatus::Connecting
             || self.connection_status == ConnectionStatus::Disconnecting
             || !self.repos.is_empty()
             || !self.root_events.is_empty()
             || has_pending_batches
+            || has_desired_work
         {
             return false;
         }
@@ -316,6 +360,30 @@ pub struct PendingItems {
     pub root_events: HashSet<EventId>,
 }
 
+fn take_drained_batch_as_failed(
+    pending: &mut HashMap<String, Vec<PendingBatch>>,
+    relay_url: &str,
+    batch_id: u64,
+) -> Option<PendingBatch> {
+    let (batch_index, remove_relay) = {
+        let batches = pending.get(relay_url)?;
+        let batch_index = batches
+            .iter()
+            .position(|batch| batch.batch_id == batch_id)?;
+        if !batches[batch_index].outstanding_subs.is_empty() {
+            return None;
+        }
+        (batch_index, batches.len() == 1)
+    };
+
+    let mut batch = pending.get_mut(relay_url)?.remove(batch_index);
+    batch.failed = true;
+    if remove_relay {
+        pending.remove(relay_url);
+    }
+    Some(batch)
+}
+
 // =============================================================================
 // SyncManager - Main Entry Point
 // =============================================================================
@@ -336,25 +404,134 @@ pub struct EoseNotification {
     pub sub_id: SubscriptionId,
 }
 
-/// Notification from spawned tasks about successful connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectAttemptToken(u64);
+
 #[derive(Debug)]
-pub struct ConnectNotification {
-    /// The relay URL that connected
-    pub relay_url: String,
+enum ConnectAttemptOutcome {
+    Connected,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct ConnectAttemptResult {
+    relay_url: String,
+    token: ConnectAttemptToken,
+    outcome: ConnectAttemptOutcome,
 }
 
 /// Quick reconnect window in seconds (15 minutes)
 const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 
-/// Maximum filter count before triggering consolidation
+/// Maximum incremental filter fragmentation above the desired live baseline
+/// before triggering consolidation.
 const CONSOLIDATION_THRESHOLD: usize = 70;
 
-/// Maximum time to wait for pending batches (30 seconds)
-const CONSOLIDATION_WAIT_TIMEOUT_SECS: u64 = 30;
+/// Bound concurrent DNS and websocket handshakes so a large relay list cannot
+/// exhaust network resources while keeping the sync actor responsive.
+const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
 /// Page size threshold for historic sync pagination (non-negentropy)
 /// If a subscription receives >= 75 events, we fetch the next page
 const PAGINATION_THRESHOLD: usize = 75;
+
+fn reserve_connect_attempt(
+    in_flight: &mut HashMap<String, ConnectAttemptToken>,
+    next_token: &mut u64,
+    relay_url: &str,
+) -> Option<ConnectAttemptToken> {
+    if in_flight.contains_key(relay_url) {
+        return None;
+    }
+    *next_token = next_token
+        .checked_add(1)
+        .expect("connect attempt token exhausted");
+    let token = ConnectAttemptToken(*next_token);
+    in_flight.insert(relay_url.to_string(), token);
+    Some(token)
+}
+
+fn take_connect_attempt(
+    in_flight: &mut HashMap<String, ConnectAttemptToken>,
+    relay_url: &str,
+    token: ConnectAttemptToken,
+) -> bool {
+    if in_flight.get(relay_url) != Some(&token) {
+        return false;
+    }
+    in_flight.remove(relay_url);
+    true
+}
+
+async fn begin_connect_attempt(
+    semaphore: Arc<Semaphore>,
+    health_tracker: Arc<RelayHealthTracker>,
+    relay_url: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = semaphore.acquire_owned().await.ok()?;
+    health_tracker.record_attempt(relay_url);
+    Some(permit)
+}
+
+fn consolidation_fragmentation(
+    current_count: usize,
+    new_count: usize,
+    desired_baseline: usize,
+) -> usize {
+    current_count
+        .saturating_add(new_count)
+        .saturating_sub(desired_baseline)
+}
+
+fn should_consolidate(current_count: usize, new_count: usize, desired_baseline: usize) -> bool {
+    consolidation_fragmentation(current_count, new_count, desired_baseline)
+        > CONSOLIDATION_THRESHOLD
+}
+
+#[derive(Debug, Default)]
+struct DeferredConsolidations {
+    relays: HashSet<String>,
+}
+
+impl DeferredConsolidations {
+    fn request(&mut self, relay_url: &str, has_pending_batches: bool) -> bool {
+        if has_pending_batches {
+            self.relays.insert(relay_url.to_string());
+            false
+        } else {
+            self.relays.remove(relay_url);
+            true
+        }
+    }
+
+    fn take_ready(&mut self, relay_url: &str, has_pending_batches: bool) -> bool {
+        !has_pending_batches && self.relays.remove(relay_url)
+    }
+
+    fn contains(&self, relay_url: &str) -> bool {
+        self.relays.contains(relay_url)
+    }
+
+    fn cancel(&mut self, relay_url: &str) -> bool {
+        self.relays.remove(relay_url)
+    }
+
+    fn clear(&mut self) {
+        self.relays.clear();
+    }
+}
+
+fn notify_deferred_consolidation_after_batch_completion(
+    deferred: &DeferredConsolidations,
+    sender: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    relay_url: &str,
+) {
+    if deferred.contains(relay_url) {
+        if let Some(sender) = sender {
+            let _ = sender.send(relay_url.to_string());
+        }
+    }
+}
 
 // =============================================================================
 // Daily Timer
@@ -634,12 +811,22 @@ pub struct SyncManager {
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
     next_batch_id: u64,
+    /// Monotonic identity for rejecting stale connection results.
+    next_connect_attempt_token: u64,
+    /// One active or queued connection attempt per canonical relay URL.
+    in_flight_connect_attempts: HashMap<String, ConnectAttemptToken>,
+    /// Shared bound for DNS and websocket handshakes.
+    connect_attempt_semaphore: Arc<Semaphore>,
+    /// Relays whose subscription consolidation waits for in-flight batches to drain.
+    deferred_consolidations: DeferredConsolidations,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
     eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
-    /// Channel for connect notifications (set during run)
-    connect_tx: Option<tokio::sync::mpsc::Sender<ConnectNotification>>,
+    /// Returns connection outcomes to the sync actor for serialized state changes.
+    connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
+    /// Wakes the actor when a batch completion may unblock consolidation.
+    deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -718,9 +905,14 @@ impl SyncManager {
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
+            next_connect_attempt_token: 0,
+            in_flight_connect_attempts: HashMap::new(),
+            connect_attempt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS)),
+            deferred_consolidations: DeferredConsolidations::default(),
             disconnect_tx: None,
             eose_tx: None,
-            connect_tx: None,
+            connect_attempt_result_tx: None,
+            deferred_consolidation_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
         }
@@ -908,6 +1100,7 @@ impl SyncManager {
                     }
 
                     // Subscribe to next page and add to outstanding_subs
+                    let mut next_page_started = false;
                     if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
                         match conn.subscribe_filter(next_filter.clone(), true).await {
                             Ok(new_sub_id) => {
@@ -918,6 +1111,7 @@ impl SyncManager {
                                         batches.iter_mut().find(|b| b.batch_id == batch_id)
                                     {
                                         batch.outstanding_subs.insert(new_sub_id.clone());
+                                        next_page_started = true;
                                         // Initialize pagination state for new subscription
                                         batch.pagination_state.insert(
                                             new_sub_id.clone(),
@@ -945,6 +1139,25 @@ impl SyncManager {
                                     "Failed to create pagination subscription, continuing without next page"
                                 );
                             }
+                        }
+                    }
+
+                    if !next_page_started {
+                        let completed_batch = {
+                            let mut pending = self.pending_sync_index.write().await;
+                            take_drained_batch_as_failed(
+                                &mut pending,
+                                &relay_url_for_pagination,
+                                batch_id,
+                            )
+                        };
+                        if let Some(batch) = completed_batch {
+                            tracing::warn!(
+                                relay = %relay_url_for_pagination,
+                                batch_id,
+                                "Pagination could not continue; completing drained batch as failed"
+                            );
+                            self.confirm_batch(&relay_url_for_pagination, batch).await;
                         }
                     }
 
@@ -1335,6 +1548,12 @@ impl SyncManager {
         // Release lock before checking if historic sync is complete
         drop(relay_index);
 
+        notify_deferred_consolidation_after_batch_completion(
+            &self.deferred_consolidations,
+            self.deferred_consolidation_tx.as_ref(),
+            relay_url,
+        );
+
         // Spawn background task to check if historic sync is complete
         // This avoids blocking the confirm_batch flow for 6 seconds
         let relay_url = relay_url.to_string();
@@ -1452,6 +1671,7 @@ impl SyncManager {
     /// This is triggered by the daily timer to detect state drift over time.
     async fn daily_sync(&mut self, relay_url: &str) {
         tracing::info!(relay = %relay_url, "Starting daily sync");
+        self.cancel_deferred_consolidation(relay_url, "daily sync reset");
 
         // Get connection
         let connection = match self.connections.get(relay_url) {
@@ -1507,7 +1727,7 @@ impl SyncManager {
     /// 2. Spawns daily timer for periodic fresh syncs
     /// 3. Connects to bootstrap relay if configured
     /// 4. Handles relay actions from self-subscriber
-    /// 5. Handles disconnect, EOSE, and connect notifications from spawned relay tasks
+    /// 5. Handles disconnect/EOSE notifications and connection-worker results
     pub async fn run(mut self) {
         use tokio::sync::mpsc;
 
@@ -1526,8 +1746,15 @@ impl SyncManager {
         // 3. Create EOSE channel for spawned tasks -> manager communication
         let (eose_tx, mut eose_rx) = mpsc::channel::<EoseNotification>(100);
 
-        // 4. Create connect channel for spawned tasks -> manager communication
-        let (connect_tx, mut connect_rx) = mpsc::channel::<ConnectNotification>(100);
+        // 4. Connection workers never mutate manager state. Their unbounded
+        // result channel cannot make a completed worker wait behind the actor.
+        let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
+            mpsc::unbounded_channel::<ConnectAttemptResult>();
+
+        // Batch completion can be synchronous, so use a non-blocking wakeup
+        // instead of waiting for pending work while holding the actor lock.
+        let (deferred_consolidation_tx, mut deferred_consolidation_rx) =
+            mpsc::unbounded_channel::<String>();
 
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -1546,13 +1773,25 @@ impl SyncManager {
         // 5b. Store channel senders for use by handlers
         self.disconnect_tx = Some(disconnect_tx.clone());
         self.eose_tx = Some(eose_tx.clone());
-        self.connect_tx = Some(connect_tx.clone());
+        self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
+        self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
         // 6. Connect to bootstrap relay if configured
         if let Some(ref bootstrap_url) = self.bootstrap_relay_url.clone() {
-            self.register_relay(bootstrap_url.clone(), true).await;
-            self.try_connect_relay(bootstrap_url).await;
+            match canonical_relay_key(bootstrap_url) {
+                Ok(relay_url) => {
+                    self.register_relay(relay_url.clone(), true).await;
+                    self.schedule_connect_relay(&relay_url).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        relay = %bootstrap_url,
+                        error = %error,
+                        "Rejecting invalid bootstrap relay target"
+                    );
+                }
+            }
         }
 
         // 7. Wrap self in Arc<Mutex> for sharing with timer task
@@ -1591,7 +1830,7 @@ impl SyncManager {
             run_purgatory_announcement_sync(purgatory_sync_manager, purgatory_sync_shutdown).await;
         });
 
-        // 12. Main loop - handle actions from self-subscriber, disconnect, EOSE, and connect notifications
+        // 12. Main loop - handle actions, lifecycle notifications, and worker results
         loop {
             // Wait for an event without holding the lock
             tokio::select! {
@@ -1631,17 +1870,22 @@ impl SyncManager {
                         }
                     }
                 }
-                connect = connect_rx.recv() => {
-                    match connect {
-                        Some(notification) => {
-                            // Acquire lock to process connect
+                result = connect_attempt_result_rx.recv() => {
+                    match result {
+                        Some(result) => {
+                            // Connection state changes remain serialized through the actor.
                             let mut manager = sync_manager.lock().await;
-                            manager.handle_connect_or_reconnect(&notification.relay_url).await;
+                            manager.handle_connect_attempt_result(result).await;
                         }
                         None => {
-                            // All connect senders dropped - unlikely but handle gracefully
-                            tracing::debug!("Connect channel closed");
+                            tracing::debug!("Connect attempt result channel closed");
                         }
+                    }
+                }
+                relay_url = deferred_consolidation_rx.recv() => {
+                    if let Some(relay_url) = relay_url {
+                        let mut manager = sync_manager.lock().await;
+                        manager.process_deferred_consolidation(&relay_url).await;
                     }
                 }
             }
@@ -1654,7 +1898,19 @@ impl SyncManager {
     /// - For new relays: creates entry with Connecting status, spawns connection
     /// - For existing connected relays: subscribes to filters, creates PendingBatch
     /// - For disconnected/connecting relays: returns (will be handled on connection)
-    async fn handle_new_sync_filters(&mut self, action: AddFilters) {
+    async fn handle_new_sync_filters(&mut self, mut action: AddFilters) {
+        action.relay_url = match canonical_relay_key(&action.relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %action.relay_url,
+                    error = %error,
+                    "Rejecting invalid sync relay target"
+                );
+                return;
+            }
+        };
+
         // Step 1: Check if relay exists in relay_sync_index
         let connection_status = {
             let index = self.relay_sync_index.read().await;
@@ -1672,7 +1928,7 @@ impl SyncManager {
 
                 // Register relay (creates RelayConnection, initializes RelayState, updates metrics)
                 self.register_relay(action.relay_url.clone(), false).await;
-                self.try_connect_relay(&action.relay_url).await;
+                self.schedule_connect_relay(&action.relay_url).await;
                 // Connection will trigger handle_connect_or_reconnect which will process items
                 return;
             }
@@ -2036,6 +2292,7 @@ impl SyncManager {
         let _now = Timestamp::now();
 
         tracing::info!(relay = %relay_url, "Starting fresh_start");
+        self.cancel_deferred_consolidation(relay_url, "fresh start");
 
         // Step 1: Clear PendingSyncIndex for this relay
         {
@@ -2099,6 +2356,8 @@ impl SyncManager {
     /// Basic connection state and metrics are managed by handle_connect_or_reconnect.
     /// This method handles reconnect-specific concerns (health tracking, reconnect metrics).
     async fn quick_reconnect(&mut self, relay_url: &str, since: Timestamp) {
+        self.cancel_deferred_consolidation(relay_url, "quick reconnect");
+
         // Step 1: Clear PendingSyncIndex for this relay
         // Old subscriptions are dead after disconnect
         {
@@ -2190,9 +2449,21 @@ impl SyncManager {
     ///
     /// Creates a RelayConnection object and stores it in the connections HashMap.
     /// Also initializes RelayState if it doesn't exist.
-    /// Does NOT connect - connection happens via try_connect_relay or retry_disconnected_relays.
+    /// Does NOT connect - connection happens via the bounded scheduler.
     /// The RelayConnection persists forever and is reused on reconnects.
     async fn register_relay(&mut self, relay_url: String, is_bootstrap: bool) {
+        let relay_url = match canonical_relay_key(&relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %relay_url,
+                    error = %error,
+                    "Rejecting invalid relay registration"
+                );
+                return;
+            }
+        };
+
         // Create RelayConnection if not exists
         if !self.connections.contains_key(&relay_url) {
             // Get relay owner keys for NIP-42 authentication
@@ -2250,109 +2521,183 @@ impl SyncManager {
         }
     }
 
-    /// Attempt a single connection to a registered relay
+    /// Queue one connection attempt without blocking the sync actor.
     ///
-    /// Uses the existing RelayConnection from the HashMap and attempts to connect.
-    /// On success, sends ConnectNotification which triggers handle_connect_or_reconnect.
-    /// On failure, updates state and health tracker.
-    async fn try_connect_relay(&mut self, relay_url: &str) {
-        // 1. Mark attempting and update metrics
-        {
-            let mut index = self.relay_sync_index.write().await;
-            if let Some(state) = index.get_mut(relay_url) {
-                state.connection_status = ConnectionStatus::Connecting;
+    /// DNS and the websocket handshake run in a spawned worker, bounded globally
+    /// by `MAX_CONCURRENT_CONNECT_ATTEMPTS`. The actor owns every lifecycle
+    /// transition when it receives the worker result.
+    async fn schedule_connect_relay(&mut self, relay_url: &str) {
+        let relay_url = match canonical_relay_key(relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(relay = %relay_url, error = %error, "Rejecting invalid sync relay target");
+                return;
             }
+        };
+        let Some(result_tx) = self.connect_attempt_result_tx.clone() else {
+            tracing::error!(relay = %relay_url, "Connection scheduler is not running");
+            return;
+        };
+        let Some(connection) = self.connections.get(&relay_url).cloned() else {
+            tracing::error!(relay = %relay_url, "No RelayConnection registered");
+            return;
+        };
+
+        let can_schedule = {
+            let mut index = self.relay_sync_index.write().await;
+            let can_schedule = index
+                .get(&relay_url)
+                .is_some_and(|state| state.connection_status == ConnectionStatus::Disconnected);
+            if can_schedule {
+                index
+                    .get_mut(&relay_url)
+                    .expect("relay state checked immediately above")
+                    .connection_status = ConnectionStatus::Connecting;
+            }
+            can_schedule
+        };
+        if !can_schedule {
+            tracing::trace!(relay = %relay_url, "Relay does not need another connection attempt");
+            return;
         }
 
-        // Update metrics to show connecting status
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_connection_status(relay_url, ConnectionStatus::Connecting);
-        }
-
-        // 2. Record attempt in health tracker
-        self.health_tracker.record_attempt(relay_url);
-
-        // 3. Get connection and attempt
-        let connection = match self.connections.get(relay_url) {
-            Some(c) => c,
+        let token = match reserve_connect_attempt(
+            &mut self.in_flight_connect_attempts,
+            &mut self.next_connect_attempt_token,
+            &relay_url,
+        ) {
+            Some(token) => token,
             None => {
-                tracing::error!(relay = %relay_url, "No RelayConnection registered");
+                tracing::trace!(relay = %relay_url, "Connection attempt already queued");
                 return;
             }
         };
 
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_connection_status(&relay_url, ConnectionStatus::Connecting);
+        }
+
+        let health_tracker = Arc::clone(&self.health_tracker);
+        let semaphore = Arc::clone(&self.connect_attempt_semaphore);
         let timeout = self.health_tracker.base_backoff_secs();
-
-        match connection.connect(timeout).await {
-            Ok(()) => {
-                // Success - record and send notification
-                self.health_tracker.record_success(relay_url);
-
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_connection_attempt(relay_url, true);
+        let Some(mut shutdown_rx) = self.shutdown_tx.as_ref().map(|sender| sender.subscribe())
+        else {
+            tracing::error!(relay = %relay_url, "Connection scheduler has no shutdown signal");
+            return;
+        };
+        tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = begin_connect_attempt(semaphore, health_tracker, &relay_url) => permit,
+                _ = shutdown_rx.recv() => return,
+            };
+            let Some(_permit) = permit else {
+                return;
+            };
+            let outcome = tokio::select! {
+                result = connection.connect(timeout) => match result {
+                    Ok(()) => ConnectAttemptOutcome::Connected,
+                    Err(error) => ConnectAttemptOutcome::Failed(error),
+                },
+                _ = shutdown_rx.recv() => {
+                    connection.disconnect().await;
+                    return;
                 }
-
-                if let Some(ref connect_tx) = self.connect_tx {
-                    let _ = connect_tx
-                        .send(ConnectNotification {
-                            relay_url: relay_url.to_string(),
-                        })
-                        .await;
-                }
+            };
+            if result_tx
+                .send(ConnectAttemptResult {
+                    relay_url,
+                    token,
+                    outcome,
+                })
+                .is_err()
+            {
+                connection.disconnect().await;
             }
-            Err(e) => {
-                // Classify error to determine if it's a naughty relay or transient issue
-                let error_str = e.to_string();
+        });
+    }
 
-                if let Some(category) = naughty_list::NaughtyListTracker::classify_error(&error_str)
-                {
-                    // Persistent infrastructure issue - use naughty list
+    async fn handle_connect_attempt_result(&mut self, result: ConnectAttemptResult) {
+        if !take_connect_attempt(
+            &mut self.in_flight_connect_attempts,
+            &result.relay_url,
+            result.token,
+        ) {
+            tracing::debug!(
+                relay = %result.relay_url,
+                token = result.token.0,
+                "Ignoring stale connection attempt result"
+            );
+            return;
+        }
+
+        let still_connecting = self
+            .relay_sync_index
+            .read()
+            .await
+            .get(&result.relay_url)
+            .is_some_and(|state| state.connection_status == ConnectionStatus::Connecting);
+        if !still_connecting {
+            tracing::debug!(
+                relay = %result.relay_url,
+                token = result.token.0,
+                "Ignoring connection result after lifecycle state changed"
+            );
+            return;
+        }
+
+        match result.outcome {
+            ConnectAttemptOutcome::Connected => {
+                self.health_tracker.record_success(&result.relay_url);
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_connection_attempt(&result.relay_url, true);
+                }
+                self.handle_connect_or_reconnect(&result.relay_url).await;
+            }
+            ConnectAttemptOutcome::Failed(error) => {
+                if let Some(category) = naughty_list::NaughtyListTracker::classify_error(&error) {
                     if let Some(ref naughty_list) = self.health_tracker.naughty_list() {
-                        let is_new = naughty_list.record(relay_url, category, error_str.clone());
-
+                        let is_new =
+                            naughty_list.record(&result.relay_url, category, error.clone());
                         if is_new {
                             tracing::warn!(
-                                relay = %relay_url,
+                                relay = %result.relay_url,
                                 category = ?category,
-                                error = %e,
+                                error = %error,
                                 "Relay has persistent configuration issue, added to naughty list"
                             );
                         } else {
                             tracing::debug!(
-                                relay = %relay_url,
+                                relay = %result.relay_url,
                                 category = ?category,
                                 "Naughty relay failure (already tracked)"
                             );
                         }
                     }
                 } else {
-                    // Transient network issue - use existing backoff flow
                     tracing::debug!(
-                        relay = %relay_url,
-                        error = %e,
+                        relay = %result.relay_url,
+                        error = %error,
                         "Connection failed (transient issue, backoff active)"
                     );
                 }
-
-                // 4. Update state back to Disconnected on failure
-                {
-                    let mut index = self.relay_sync_index.write().await;
-                    if let Some(state) = index.get_mut(relay_url) {
-                        state.connection_status = ConnectionStatus::Disconnected;
-                    }
-                }
-
-                // 5. Record failure in health tracker
-                self.health_tracker.record_failure(relay_url);
-
-                // 6. Update metrics
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_connection_attempt(relay_url, false);
-                    metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
-                    metrics
-                        .record_health_state(relay_url, self.health_tracker.get_state(relay_url));
-                }
+                self.record_connection_attempt_failure(&result.relay_url)
+                    .await;
             }
+        }
+    }
+
+    async fn record_connection_attempt_failure(&self, relay_url: &str) {
+        {
+            let mut index = self.relay_sync_index.write().await;
+            if let Some(state) = index.get_mut(relay_url) {
+                state.connection_status = ConnectionStatus::Disconnected;
+            }
+        }
+        self.health_tracker.record_failure(relay_url);
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_connection_attempt(relay_url, false);
+            metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
+            metrics.record_health_state(relay_url, self.health_tracker.get_state(relay_url));
         }
     }
 
@@ -2658,15 +3003,7 @@ impl SyncManager {
         event_ids: HashSet<EventId>,
         identifier: &str,
     ) {
-        let connections: Vec<(String, RelayConnection)> = relay_urls
-            .iter()
-            .filter_map(|relay_url| {
-                self.connections
-                    .get(relay_url)
-                    .cloned()
-                    .map(|connection| (relay_url.clone(), connection))
-            })
-            .collect();
+        let connections = connections_for_relay_urls(&self.connections, relay_urls);
 
         if connections.is_empty() {
             tracing::debug!(
@@ -2837,6 +3174,7 @@ impl SyncManager {
                 .map(|s| s.connection_status == ConnectionStatus::Disconnecting)
                 .unwrap_or(false)
         };
+        self.cancel_deferred_consolidation(relay_url, "relay disconnect");
 
         if was_intentional {
             // Intentional disconnect - complete cleanup by removing state
@@ -3387,103 +3725,118 @@ impl SyncManager {
     // Consolidation System
     // =========================================================================
 
-    /// Wait until all pending batches for a relay are complete
-    ///
-    /// Polls the pending_sync_index until the relay has no pending batches.
-    /// Returns error if timeout (30 seconds) is exceeded.
-    async fn wait_pending_complete(&self, relay_url: &str) -> Result<(), String> {
-        use std::time::Duration;
-        use tokio::time::{sleep, Instant};
-
-        let start = Instant::now();
-        let timeout = Duration::from_secs(CONSOLIDATION_WAIT_TIMEOUT_SECS);
-
-        tracing::debug!(
-            relay = %relay_url,
-            timeout_secs = CONSOLIDATION_WAIT_TIMEOUT_SECS,
-            "Waiting for pending batches to complete"
-        );
-
-        loop {
-            // Check if no pending batches
-            {
-                let pending = self.pending_sync_index.read().await;
-                if !pending.contains_key(relay_url) {
-                    tracing::debug!(
-                        relay = %relay_url,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "All pending batches complete"
-                    );
-                    return Ok(());
-                }
-            }
-
-            // Check timeout
-            if start.elapsed() > timeout {
-                tracing::warn!(
-                    relay = %relay_url,
-                    timeout_secs = CONSOLIDATION_WAIT_TIMEOUT_SECS,
-                    "Timeout waiting for pending batches"
-                );
-                return Err(format!(
-                    "Timeout waiting for pending batches on {} after {}s",
-                    relay_url, CONSOLIDATION_WAIT_TIMEOUT_SECS
-                ));
-            }
-
-            // Short poll interval
-            sleep(Duration::from_millis(100)).await;
-        }
+    async fn has_pending_batches(&self, relay_url: &str) -> bool {
+        self.pending_sync_index
+            .read()
+            .await
+            .get(relay_url)
+            .is_some_and(|batches| !batches.is_empty())
     }
 
-    /// Check if consolidation is needed and trigger if threshold exceeded
+    async fn desired_live_filter_count(&self, relay_url: &str) -> usize {
+        let target = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index).remove(relay_url)
+        };
+        let desired_repo_filters = target.map_or(0, |target| {
+            filters::build_sync_level_aware_filters(
+                &target.repos,
+                &target.state_only_repos,
+                &target.root_events,
+                None,
+            )
+            .len()
+        });
+
+        // Every connected relay carries one consolidated generic announcement
+        // subscription in addition to its repository-specific desired filters.
+        1 + desired_repo_filters
+    }
+
+    /// Check if incremental fragmentation exceeds the consolidation threshold.
     ///
-    /// Compares current filter count + new filter count against the threshold.
-    /// If exceeded, triggers consolidation before adding new filters.
+    /// The desired live set is an irreducible baseline, so a repository whose
+    /// consolidated filters already exceed 70 must remain stable.
     async fn maybe_consolidate(&mut self, relay_url: &str, new_count: usize) {
         let current_count = if let Some(connection) = self.connections.get(relay_url) {
             connection.subscription_count().await
         } else {
             0
         };
+        let desired_baseline = self.desired_live_filter_count(relay_url).await;
+        let fragmentation = consolidation_fragmentation(current_count, new_count, desired_baseline);
 
-        if current_count + new_count > CONSOLIDATION_THRESHOLD {
+        if should_consolidate(current_count, new_count, desired_baseline) {
+            let has_pending_batches = self.has_pending_batches(relay_url).await;
+            if !self
+                .deferred_consolidations
+                .request(relay_url, has_pending_batches)
+            {
+                tracing::info!(
+                    relay = %relay_url,
+                    current_count,
+                    new_count,
+                    desired_baseline,
+                    fragmentation,
+                    threshold = CONSOLIDATION_THRESHOLD,
+                    "Incremental filter fragmentation exceeds threshold; deferring consolidation until pending batches drain"
+                );
+                return;
+            }
+
             tracing::info!(
                 relay = %relay_url,
                 current_count = current_count,
                 new_count = new_count,
+                desired_baseline,
+                fragmentation,
                 threshold = CONSOLIDATION_THRESHOLD,
-                "Filter count exceeds threshold, consolidating"
+                "Incremental filter fragmentation exceeds threshold, consolidating"
             );
 
-            if let Err(e) = self.consolidate(relay_url).await {
-                tracing::error!(
-                    relay = %relay_url,
-                    error = %e,
-                    "Consolidation failed"
-                );
-            }
+            self.consolidate(relay_url).await;
+        }
+    }
+
+    async fn process_deferred_consolidation(&mut self, relay_url: &str) {
+        let has_pending_batches = self.has_pending_batches(relay_url).await;
+        if !self
+            .deferred_consolidations
+            .take_ready(relay_url, has_pending_batches)
+        {
+            return;
+        }
+
+        tracing::info!(
+            relay = %relay_url,
+            "Pending batches drained; running deferred consolidation"
+        );
+        self.consolidate(relay_url).await;
+    }
+
+    fn cancel_deferred_consolidation(&mut self, relay_url: &str, reason: &'static str) {
+        if self.deferred_consolidations.cancel(relay_url) {
+            tracing::debug!(
+                relay = %relay_url,
+                reason,
+                "Cancelled deferred consolidation"
+            );
         }
     }
 
     /// Consolidate all subscriptions for a relay
     ///
-    /// This method:
-    /// 1. Waits for all pending batches to complete
-    /// 2. Unsubscribes from all active subscriptions
-    /// 3. Rebuilds Layer 2 and Layer 3 with since filter
+    /// The caller must ensure pending batches have drained so EOSE processing
+    /// never waits behind the sync actor lock.
     ///
     /// Layer 1 (announcements) remains active and is NOT unsubscribed.
-    async fn consolidate(&mut self, relay_url: &str) -> Result<(), String> {
+    async fn consolidate(&mut self, relay_url: &str) {
         tracing::info!(
             relay = %relay_url,
             "Starting consolidation"
         );
 
-        // Step 1: Wait for all pending batches to complete
-        self.wait_pending_complete(relay_url).await?;
-
-        // Step 2: Get connection and unsubscribe all
+        // Get connection and unsubscribe all
         let connection = match self.connections.get(relay_url) {
             Some(conn) => conn,
             None => {
@@ -3491,13 +3844,13 @@ impl SyncManager {
                     relay = %relay_url,
                     "No connection found, skipping consolidation"
                 );
-                return Ok(()); // No connection, nothing to consolidate
+                return;
             }
         };
 
         connection.unsubscribe_all().await;
 
-        // Step 3: Rebuild all subscriptions with since filter
+        // Rebuild all subscriptions with since filter
         let now = Timestamp::now();
         let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
 
@@ -3511,8 +3864,6 @@ impl SyncManager {
             since = %since,
             "Consolidation complete - filter count reset"
         );
-
-        Ok(())
     }
 
     /// Check for relays that should be disconnected
@@ -3523,6 +3874,13 @@ impl SyncManager {
     ///
     /// Bootstrap relays are NEVER disconnected, even if empty.
     async fn check_disconnects(&mut self) {
+        let desired_relays: HashSet<String> = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index)
+                .into_keys()
+                .collect()
+        };
+
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
             let pending = self.pending_sync_index.read().await;
@@ -3534,7 +3892,10 @@ impl SyncManager {
                         .get(relay_url)
                         .is_some_and(|batches| !batches.is_empty());
 
-                    if state.is_disconnect_candidate(has_pending_batches) {
+                    if state.is_disconnect_candidate(
+                        has_pending_batches,
+                        desired_relays.contains(relay_url),
+                    ) {
                         Some(relay_url.clone())
                     } else {
                         None
@@ -3609,8 +3970,15 @@ impl SyncManager {
     /// - Have repos or root events to sync (not empty)
     /// - Have passed the exponential backoff period (respects health tracker)
     ///
-    /// For each eligible relay, a reconnection is attempted via try_connect_relay.
+    /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
+        let desired_relays: HashSet<String> = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index)
+                .into_keys()
+                .collect()
+        };
+
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {
             let index = self.relay_sync_index.read().await;
@@ -3622,8 +3990,12 @@ impl SyncManager {
                         return None;
                     }
 
-                    // Skip empty relays - they'll be cleaned up by check_disconnects
-                    if state.repos.is_empty() && state.root_events.is_empty() {
+                    // A source can have desired StateOnly invitation work before
+                    // its first successful historic batch confirms anything.
+                    if state.repos.is_empty()
+                        && state.root_events.is_empty()
+                        && !desired_relays.contains(relay_url)
+                    {
                         return None;
                     }
 
@@ -3655,7 +4027,7 @@ impl SyncManager {
                 health_state = %self.health_tracker.get_state(&relay_url),
                 "Attempting reconnection"
             );
-            self.try_connect_relay(&relay_url).await;
+            self.schedule_connect_relay(&relay_url).await;
         }
     }
 
@@ -4198,6 +4570,7 @@ impl SyncManager {
             pending.clear();
             tracing::debug!(count = count, "Cleared pending_sync_index");
         }
+        self.deferred_consolidations.clear();
 
         tracing::info!("SyncManager shutdown complete");
     }
@@ -4208,6 +4581,253 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connect_attempt_tokens_deduplicate_and_reject_stale_results() {
+        let relay = "wss://relay.example";
+        let mut in_flight = HashMap::new();
+        let mut next_token = 0;
+
+        let first = reserve_connect_attempt(&mut in_flight, &mut next_token, relay)
+            .expect("first attempt should be reserved");
+        assert!(
+            reserve_connect_attempt(&mut in_flight, &mut next_token, relay).is_none(),
+            "a queued or running relay must not be scheduled twice"
+        );
+        assert!(
+            !take_connect_attempt(&mut in_flight, relay, ConnectAttemptToken(first.0 + 1)),
+            "a stale worker result must not consume the active attempt"
+        );
+        assert_eq!(in_flight.get(relay), Some(&first));
+        assert!(take_connect_attempt(&mut in_flight, relay, first));
+
+        let second = reserve_connect_attempt(&mut in_flight, &mut next_token, relay)
+            .expect("relay should be schedulable after completion");
+        assert_ne!(first, second, "attempt identities must not be reused");
+    }
+
+    #[tokio::test]
+    async fn connect_attempt_semaphore_caps_parallel_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const WORKERS: usize = MAX_CONCURRENT_CONNECT_ATTEMPTS * 3;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS));
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..WORKERS {
+            let semaphore = Arc::clone(&semaphore);
+            let release = Arc::clone(&release);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let started_tx = started_tx.clone();
+            workers.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.unwrap();
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now_active, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                let _release = release.acquire().await.unwrap();
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        drop(started_tx);
+
+        for _ in 0..MAX_CONCURRENT_CONNECT_ATTEMPTS {
+            started_rx.recv().await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
+                .await
+                .is_err(),
+            "a ninth worker started while all eight permits were occupied"
+        );
+
+        release.add_permits(WORKERS);
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            MAX_CONCURRENT_CONNECT_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_connect_attempt_records_health_only_when_worker_starts() {
+        let relay = "wss://queued.example";
+        let semaphore = Arc::new(Semaphore::new(0));
+        let health_tracker = Arc::new(RelayHealthTracker::with_defaults());
+        let worker_semaphore = Arc::clone(&semaphore);
+        let worker_health = Arc::clone(&health_tracker);
+
+        let worker = tokio::spawn(async move {
+            begin_connect_attempt(worker_semaphore, worker_health, relay).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            health_tracker.get_health(relay).is_none(),
+            "waiting for scheduler capacity must not start backoff"
+        );
+
+        semaphore.add_permits(1);
+        let _permit = worker
+            .await
+            .unwrap()
+            .expect("worker should start after a permit becomes available");
+        assert!(
+            health_tracker
+                .get_health(relay)
+                .is_some_and(|health| health.last_attempt_time.is_some()),
+            "health attempt time must be recorded when the worker starts"
+        );
+    }
+
+    #[test]
+    fn canonical_relay_keys_dedupe_only_the_root_slash() {
+        assert_eq!(
+            canonical_relay_key("wss://relay.example").unwrap(),
+            "wss://relay.example"
+        );
+        assert_eq!(
+            canonical_relay_key("wss://relay.example/").unwrap(),
+            "wss://relay.example"
+        );
+        assert_eq!(
+            canonical_relay_key("wss://relay.example/nostr/").unwrap(),
+            "wss://relay.example/nostr/"
+        );
+        assert_eq!(
+            canonical_relay_key("relay.example/").unwrap(),
+            "wss://relay.example"
+        );
+    }
+
+    #[test]
+    fn connection_lookup_deduplicates_relay_url_variants() {
+        let canonical = canonical_relay_key("wss://relay.example").unwrap();
+        let connections = HashMap::from([(canonical.clone(), 7_u8)]);
+        let candidates = vec![
+            "wss://relay.example".to_string(),
+            "wss://relay.example/".to_string(),
+        ];
+
+        assert_eq!(
+            connections_for_relay_urls(&connections, &candidates),
+            vec![(canonical, 7)]
+        );
+    }
+
+    #[test]
+    fn desired_baseline_above_threshold_does_not_reconsolidate() {
+        let desired_baseline = 178;
+
+        assert!(
+            !should_consolidate(desired_baseline, 1, desired_baseline),
+            "the irreducible desired set must be a stable post-rebuild baseline"
+        );
+        assert!(
+            !should_consolidate(
+                desired_baseline + CONSOLIDATION_THRESHOLD - 1,
+                1,
+                desired_baseline,
+            ),
+            "the configured fragmentation headroom is allowed above the baseline"
+        );
+        assert!(should_consolidate(
+            desired_baseline + CONSOLIDATION_THRESHOLD,
+            1,
+            desired_baseline,
+        ));
+    }
+
+    #[test]
+    fn deferred_consolidation_runs_only_after_final_batch_completion() {
+        let relay_url = "wss://relay.example";
+        let mut deferred = DeferredConsolidations::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(
+            !deferred.request(relay_url, true),
+            "an in-flight batch must defer instead of waiting in the sync actor"
+        );
+        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            relay_url,
+            "batch completion must wake the actor without awaiting under its lock"
+        );
+        assert!(
+            !deferred.take_ready(relay_url, true),
+            "consolidation must remain queued while another batch is pending"
+        );
+
+        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
+        assert_eq!(receiver.try_recv().unwrap(), relay_url);
+        assert!(
+            deferred.take_ready(relay_url, false),
+            "the final batch completion must make consolidation runnable"
+        );
+        assert!(
+            !deferred.take_ready(relay_url, false),
+            "taking deferred work must be idempotent"
+        );
+    }
+
+    #[test]
+    fn reset_or_disconnect_cancels_deferred_consolidation_and_stale_wakeup() {
+        for reason in ["reset", "disconnect"] {
+            let relay_url = format!("wss://{reason}.example");
+            let mut deferred = DeferredConsolidations::default();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+            assert!(!deferred.request(&relay_url, true));
+            notify_deferred_consolidation_after_batch_completion(
+                &deferred,
+                Some(&sender),
+                &relay_url,
+            );
+            assert!(deferred.cancel(&relay_url));
+            assert_eq!(receiver.try_recv().unwrap(), relay_url);
+            assert!(
+                !deferred.take_ready(&relay_url, false),
+                "a queued wakeup must not resurrect consolidation after {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_pagination_completes_only_a_fully_drained_batch() {
+        let relay_url = "wss://pagination.example";
+        let still_pending = SubscriptionId::new("still-pending");
+        let make_batch = |batch_id, outstanding_subs| PendingBatch {
+            batch_id,
+            items: PendingItems::default(),
+            outstanding_subs,
+            sync_method: SyncMethod::ReqEose,
+            pagination_state: HashMap::new(),
+            requested_event_ids: None,
+            received_event_ids: None,
+            retry_count: 0,
+            failed: false,
+        };
+        let mut pending = HashMap::from([(
+            relay_url.to_string(),
+            vec![
+                make_batch(41, HashSet::new()),
+                make_batch(42, HashSet::from([still_pending])),
+            ],
+        )]);
+
+        let completed = take_drained_batch_as_failed(&mut pending, relay_url, 41)
+            .expect("failed pagination must complete a drained batch");
+        assert!(completed.failed);
+        assert!(take_drained_batch_as_failed(&mut pending, relay_url, 42).is_none());
+        assert_eq!(pending[relay_url].len(), 1);
+        assert!(!pending[relay_url][0].failed);
+    }
+
+    #[test]
     fn relay_disconnect_waits_for_pending_and_historic_sync_work() {
         let mut source = RelayState {
             connection_status: ConnectionStatus::Syncing,
@@ -4215,44 +4835,56 @@ mod tests {
         };
 
         assert!(
-            !source.is_disconnect_candidate(true),
+            !source.is_disconnect_candidate(true, false),
             "a source with missing-ID subscriptions in flight must stay connected"
         );
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "the historic-sync batch window must stay connected even between batches"
         );
 
         source.connection_status = ConnectionStatus::Connected;
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "an active relay cannot be disconnected before historic sync settles"
         );
 
         source.historic_sync_completed = true;
         assert!(
-            source.is_disconnect_candidate(false),
+            source.is_disconnect_candidate(false, false),
             "an empty relay can be released after historic sync settles"
         );
         assert!(
-            !source.is_disconnect_candidate(true),
+            !source.is_disconnect_candidate(true, false),
             "a later pending batch still keeps an otherwise empty relay connected"
+        );
+        assert!(
+            !source.is_disconnect_candidate(false, true),
+            "unconfirmed desired invitation work keeps its source connected"
         );
 
         source
             .repos
             .insert("30617:maintainer:repository".to_string());
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "confirmed repository work keeps the source connected"
         );
     }
 
     #[test]
     fn disconnected_empty_relay_can_still_be_cleaned_up() {
-        let source = RelayState::default();
+        let mut source = RelayState::default();
 
-        assert!(source.is_disconnect_candidate(false));
+        assert!(source.is_disconnect_candidate(false, false));
+        assert!(!source.is_disconnect_candidate(false, true));
+
+        source.historic_sync_completed = true;
+        source.connection_status = ConnectionStatus::Connecting;
+        assert!(
+            !source.is_disconnect_candidate(false, false),
+            "cleanup must not race an in-flight connection worker"
+        );
     }
 
     #[tokio::test]
