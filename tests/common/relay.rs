@@ -464,12 +464,12 @@ impl TestRelay {
             .expect("Failed to get grandparent dir")
             .join("ngit-grasp");
 
-        // Generate a test owner npub (using a random keypair)
+        // Give the relay a stable signing identity for NIP-11 and NIP-42.
         let test_keys = nostr_sdk::prelude::Keys::generate();
-        let test_npub = test_keys
-            .public_key()
+        let test_nsec = test_keys
+            .secret_key()
             .to_bech32()
-            .expect("Failed to generate test npub");
+            .expect("Failed to generate test nsec");
 
         // Build the Command *before* releasing the reservation so that
         // none of the env-setting allocations happen while the listener
@@ -479,7 +479,7 @@ impl TestRelay {
             .env("NGIT_DOMAIN", &bind_address) // Set domain to match bind address
             .env("NGIT_GIT_DATA_PATH", &git_data_path)
             .env("NGIT_RELAY_DATA_PATH", &relay_data_path)
-            .env("NGIT_OWNER_NPUB", &test_npub)
+            .env("NGIT_RELAY_OWNER_NSEC", &test_nsec)
             .env("NGIT_TEST", "1") // Enable test mode: fast timers (200ms batch window, 200ms purgatory sync)
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
             .env("NGIT_SYNC_STARTUP_JITTER_MS", "0") // No jitter for tests

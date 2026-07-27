@@ -644,7 +644,8 @@ Relax the write policy to accept all repository announcements regardless of clon
 
 ```bash
 cargo build --release
-./target/release/ngit-grasp --domain example.com --owner-npub npub1...
+NGIT_RELAY_OWNER_NSEC=nsec1... \
+  ./target/release/ngit-grasp --domain example.com
 ```
 
 ### Docker
