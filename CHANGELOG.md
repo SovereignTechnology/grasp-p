@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Metrics compatibility: removed the
+  `ngit_sync_naughty_relay_info{relay,category,reason}` metric because its relay
+  and raw reason labels were peer-controlled and unbounded. Use the unchanged
+  `ngit_sync_naughty_relays_total{category}` metric for fixed-cardinality
+  aggregate quarantine counts.
+
 - Minimise live-subscription churn as repository coverage grows: stable full
   core groups and descendant groups remain open. The mutable core tail is
   repacked in full when doing so releases slots; otherwise only the smallest
@@ -256,7 +262,6 @@ defensive limits explicit and operator-configurable.
   replacement is promoted when the locally available Git data cannot
   reconstruct them. Reconstructable rollback states and other maintainers'
   states are retained.
-
 ## [2.0.0] - 2026-07-27
 
 ### Breaking changes
