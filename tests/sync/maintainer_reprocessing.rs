@@ -29,6 +29,7 @@
 //! announcements are in relay_a's DB), wait briefly for the sync round-trip, then
 //! send the owner announcement + git push.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -125,6 +126,63 @@ async fn push_counts(relay: &TestRelay) -> (u64, u64) {
     (success, error)
 }
 
+fn list_remote_refs(clone_url: &str) -> Result<BTreeMap<String, String>, String> {
+    let output = Command::new("git")
+        .args(["ls-remote", "--refs", clone_url])
+        .output()
+        .map_err(|error| format!("Failed to list refs from {clone_url}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to list refs from {clone_url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("Invalid UTF-8 from {clone_url}: {error}"))?
+        .lines()
+        .map(|line| {
+            let (commit, name) = line
+                .split_once('\t')
+                .ok_or_else(|| format!("Invalid ls-remote line from {clone_url}: {line}"))?;
+            Ok((name.to_string(), commit.to_string()))
+        })
+        .collect()
+}
+
+fn announcement_clone_urls(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.kind() == "clone")
+        .expect("Repository announcement should have a clone tag")
+        .clone()
+        .to_vec()
+        .into_iter()
+        .skip(1)
+        .collect()
+}
+
+async fn assert_remote_refs(
+    clone_url: &str,
+    expected: &BTreeMap<String, String>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let actual = list_remote_refs(clone_url);
+        if actual.as_ref().is_ok_and(|refs| refs == expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Announced Git endpoint should exactly match the owner state: {clone_url}\n\
+             expected: {expected:?}\nactual: {actual:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Exercise the production invitation flow for a repository that already has
 /// owner state and Git data.
 ///
@@ -182,16 +240,13 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
         send_to_relay(relay, &owner_state)
             .await
             .expect("Failed to publish owner state");
-    }
-    crate::common::push_to_relay(
-        owner_git.path(),
-        &owner_relay.domain(),
-        &owner_npub,
-        identifier,
-    )
-    .expect("Failed to push existing owner repository");
-
-    for relay in owner_servers {
+        crate::common::push_to_relay(
+            owner_git.path(),
+            &relay.domain(),
+            &owner_npub,
+            identifier,
+        )
+        .expect("Failed to push existing owner repository");
         assert_exact_event_served(relay, &initial_announcement, "Initial owner announcement").await;
         assert_exact_event_served(relay, &owner_state, "Owner state event").await;
         let owner_ref_aligned = crate::common::check_ref_at_commit(
@@ -242,6 +297,7 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
     )
     .finalize(&invitee_keys)
     .expect("Failed to create invitee acceptance announcement");
+    let (invitee_clone_urls, _) = repository_urls(&invitee_keys, &invitee_servers, identifier);
     for relay in invitee_servers {
         send_to_relay(relay, &acceptance)
             .await
@@ -250,10 +306,8 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
 
     for relay in [&owner_relay, &invitee_relay, &shared_relay] {
         assert_exact_event_served(relay, &invitation, "Owner invitation announcement").await;
-        assert_exact_event_served(relay, &owner_state, "Owner state event").await;
-    }
-    for relay in invitee_servers {
         assert_exact_event_served(relay, &acceptance, "Invitee acceptance announcement").await;
+        assert_exact_event_served(relay, &owner_state, "Owner state event").await;
     }
     for relay in [&owner_relay, &invitee_relay, &shared_relay] {
         let invitee_state_exists = wait_for_event_on_relay(
@@ -282,25 +336,23 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
         "Invitation acceptance must not perform or attempt a client Git push"
     );
 
-    let invitee_npub = invitee_keys
-        .public_key()
-        .to_bech32()
-        .expect("Failed to encode invitee npub");
-    for relay in invitee_servers {
-        let ref_aligned = crate::common::check_ref_at_commit(
-            &relay.domain(),
-            &invitee_npub,
-            identifier,
-            "refs/heads/main",
-            &commit,
-        )
-        .await
-        .expect("Failed to inspect invitee repository ref");
-        assert!(
-            ref_aligned,
-            "GRASP-02 should align the invitee repository on {} without an invitee push",
-            relay.domain()
-        );
+    let expected_refs = BTreeMap::from([
+        ("refs/heads/main".to_string(), commit.clone()),
+    ]);
+    let announced_owner_clones = announcement_clone_urls(&invitation);
+    let announced_invitee_clones = announcement_clone_urls(&acceptance);
+    assert_eq!(announced_owner_clones, owner_clone_urls);
+    assert_eq!(announced_invitee_clones, invitee_clone_urls);
+    assert_eq!(
+        announced_owner_clones.len() + announced_invitee_clones.len(),
+        4,
+        "Owner and invitee announcements should advertise two Git endpoints each"
+    );
+    for clone_url in announced_owner_clones
+        .iter()
+        .chain(announced_invitee_clones.iter())
+    {
+        assert_remote_refs(clone_url, &expected_refs, Duration::from_secs(20)).await;
     }
 
     shared_relay.stop().await;
