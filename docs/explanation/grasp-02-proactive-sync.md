@@ -779,6 +779,11 @@ If negentropy fails (relay doesn't support NIP-77, network error, etc.):
 2. The sync falls back to traditional REQ+EOSE
 3. No error is raised - fallback is automatic
 
+Each dry-run diff also has a 15-second total wall-clock deadline. This is
+separate from the SDK's initial-response and idle timers: a relay that keeps an
+exchange active without completing it cannot hold the sync actor indefinitely.
+Reaching the deadline uses the same unsupported-relay fallback path.
+
 ### Integration with Rejected Events Index
 
 The rejected events index prevents wasteful re-fetching during negentropy sync by excluding rejected event IDs from the reconciliation process:
@@ -812,7 +817,10 @@ needs the inviter's Git data. In that flow:
 
 1. Dependency-resolvable entries remain in the cold index until processing succeeds.
 2. If the full event is still in the hot cache, it is re-processed immediately.
-3. If the full event expired, the sync manager requests only the retained event IDs from connected relays across the recursive maintainer chain.
+3. If the full event expired, the sync manager requests only the retained event
+   IDs from connected relays across the recursive maintainer chain. Each
+   request explicitly targets its associated relay connection instead of the
+   SDK's automatic pool-wide relay selection.
 4. Relay requests run in parallel as bounded background work; announcements are processed before state events that may depend on them.
 5. Successful or duplicate events are removed from both tiers. Failed and empty requests retain their IDs for a throttled retry.
 

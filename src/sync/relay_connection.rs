@@ -17,10 +17,17 @@
 
 use futures_util::StreamExt;
 use nostr_sdk::prelude::*;
+use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::nostr::SharedDatabase;
+
+/// Maximum wall-clock time for one dry-run NIP-77 reconciliation.
+///
+/// The SDK has initial-response and idle timers, but a relay can keep an
+/// exchange alive indefinitely by continuing to send reconciliation messages.
+const NEGENTROPY_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Interval between relay-status checks while a connection attempt is in flight.
 ///
@@ -454,7 +461,24 @@ impl RelayConnection {
         filter: Filter,
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
-        self.client
+        let relay = self
+            .client
+            .relay(&self.url)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to fetch events from {}: failed to resolve relay: {}",
+                    self.url, error
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "Failed to fetch events from {}: relay is not registered",
+                    self.url
+                )
+            })?;
+
+        relay
             .fetch_events(filter)
             .timeout(timeout)
             .await
@@ -581,7 +605,32 @@ impl RelayConnection {
     ) -> Result<nostr_sdk::client::SyncSummary, String> {
         // Use dry_run to only identify differences without downloading events
         let sync_opts = SyncOptions::default().dry_run();
+        let client = self.client.clone();
+        let sync_task = async move {
+            match client.sync(filter).opts(sync_opts).await {
+                Ok(output) => {
+                    if !output.failed.is_empty() {
+                        Err(format!("Negentropy diff had failures: {:?}", output.failed))
+                    } else {
+                        Ok(output.value)
+                    }
+                }
+                Err(error) => Err(format!("Negentropy diff failed: {}", error)),
+            }
+        };
 
+        self.run_negentropy_diff_with_timeout(sync_task, NEGENTROPY_DIFF_TIMEOUT)
+            .await
+    }
+
+    async fn run_negentropy_diff_with_timeout<F>(
+        &self,
+        sync_task: F,
+        timeout_duration: Duration,
+    ) -> Result<nostr_sdk::client::SyncSummary, String>
+    where
+        F: Future<Output = Result<nostr_sdk::client::SyncSummary, String>>,
+    {
         // Clone the atomic for the polling task
         let nip77_status = self.nip77_supported.clone();
         let url = self.url.clone();
@@ -601,29 +650,23 @@ impl RelayConnection {
             }
         };
 
-        // Race the sync operation against the polling task
-        let sync_task = self.client.sync(filter.clone()).opts(sync_opts);
-
-        let result = tokio::select! {
-            poll_result = poll_task => {
-                // Polling detected NIP-77 not supported
-                poll_result
-            }
-            sync_result = sync_task => {
-                // Sync completed (or failed) first
-                match sync_result {
-                    Ok(output) => {
-                        // Check for any failures
-                        // Note: Timeouts are common for relays without NIP-77 support
-                        if !output.failed.is_empty() {
-                            Err(format!("Negentropy diff had failures: {:?}", output.failed))
-                        } else {
-                            Ok(output.value)
-                        }
-                    }
-                    Err(e) => Err(format!("Negentropy diff failed: {}", e))
+        let result = match tokio::time::timeout(timeout_duration, async {
+            tokio::select! {
+                poll_result = poll_task => {
+                    poll_result
+                }
+                sync_result = sync_task => {
+                    sync_result
                 }
             }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Negentropy diff timed out after {:.3}s",
+                timeout_duration.as_secs_f64()
+            )),
         };
 
         match result {
@@ -664,6 +707,8 @@ impl RelayConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_relay_builder::prelude::LocalRelayBuilder;
+    use std::future::pending;
 
     #[tokio::test]
     async fn connection_readiness_waits_until_status_is_connected() {
@@ -700,6 +745,92 @@ mod tests {
         assert_eq!(
             wait_for_connected_status(|| statuses.next().expect("status sequence exhausted")).await,
             Err(RelayStatus::Disconnected)
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_negentropy_diff_times_out_and_disables_future_attempts() {
+        let connection = RelayConnection::new("ws://127.0.0.1:1".to_string(), Keys::generate());
+        assert!(connection.supports_negentropy().await);
+
+        let result = connection
+            .run_negentropy_diff_with_timeout(
+                pending::<Result<nostr_sdk::client::SyncSummary, String>>(),
+                Duration::from_millis(20),
+            )
+            .await;
+
+        assert!(result
+            .expect_err("a hung NIP-77 exchange must reach its local deadline")
+            .contains("timed out"));
+        assert!(
+            !connection.supports_negentropy().await,
+            "a timed-out relay must use REQ+EOSE for future historic batches"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_events_targets_the_connections_exact_relay() {
+        let configured = LocalRelayBuilder::default().build();
+        configured.run().await.expect("start configured relay");
+        let other = LocalRelayBuilder::default().build();
+        other.run().await.expect("start other relay");
+
+        let expected = EventBuilder::text_note("only on the other relay")
+            .finalize(&Keys::generate())
+            .expect("build event");
+        other
+            .add_event(expected.clone())
+            .await
+            .expect("seed other relay");
+
+        let connection = RelayConnection::new(configured.url().await.to_string(), Keys::generate());
+        connection
+            .connect(3)
+            .await
+            .expect("connect configured relay");
+        let other_url = other.url().await;
+        connection
+            .client
+            .add_relay(other_url.clone())
+            .await
+            .expect("register other relay");
+        connection
+            .client
+            .try_connect_relay(other_url, Duration::from_secs(3))
+            .await
+            .expect("connect other relay");
+
+        let fetched = connection
+            .fetch_events(Filter::new().id(expected.id), Duration::from_secs(2))
+            .await
+            .expect("fetch from configured relay");
+        assert!(
+            fetched.is_empty(),
+            "a relay-specific fetch must not return an event from another client relay"
+        );
+
+        connection.disconnect().await;
+        configured.shutdown();
+        other.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fetch_events_reports_an_unregistered_exact_relay() {
+        let connection = RelayConnection::new("ws://127.0.0.1:1".to_string(), Keys::generate());
+
+        let error = connection
+            .fetch_events(
+                Filter::new().kind(Kind::TextNote),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("an unregistered relay must fail explicitly");
+
+        assert!(error.contains("relay is not registered"), "{error}");
+        assert!(
+            !error.contains("relay/s not specified"),
+            "exact-relay fetch must not use an empty automatic target: {error}"
         );
     }
 
