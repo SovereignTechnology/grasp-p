@@ -424,6 +424,170 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
     owner_relay.stop().await;
 }
 
+/// Acceptance on an invitee-only server must recover an expired owner
+/// invitation from the owner-only server that originally supplied it.
+///
+/// This matches the CLI flow where the owner has already pushed and issued a
+/// state event, while the invitee publishes only a reciprocal announcement.
+/// The rejected owner announcement is allowed to leave the one-second hot
+/// cache before acceptance, so convergence depends on the persisted source
+/// relay hint and exact-ID recovery rather than a shared GRASP server.
+#[tokio::test]
+async fn test_invitee_only_acceptance_recovers_cold_owner_invitation() {
+    use crate::common::{create_state_event, create_test_repo_with_commit, CommitVariant};
+
+    let owner_relay = TestRelay::start_with_sync(None).await;
+    let owner_keys = Keys::generate();
+    let invitee_keys = Keys::generate();
+    let identifier = "cold-owner-invitation-acceptance";
+    let owner_git = tempfile::tempdir().expect("Failed to create owner repository directory");
+    let owner_commit = create_test_repo_with_commit(owner_git.path(), CommitVariant::StateTest)
+        .expect("Failed to create owner repository commit");
+    let owner_npub = owner_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to encode owner npub");
+    let owner_servers = [&owner_relay];
+    let (owner_clone_urls, owner_relay_urls) =
+        repository_urls(&owner_keys, &owner_servers, identifier);
+    let invitation = repository_announcement(
+        &owner_keys,
+        &owner_servers,
+        &[invitee_keys.public_key()],
+        identifier,
+    )
+    .finalize(&owner_keys)
+    .expect("Failed to create owner invitation");
+    let owner_state = create_state_event(
+        &owner_keys,
+        identifier,
+        &[("main", &owner_commit)],
+        &[],
+        &owner_clone_urls
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &owner_relay_urls
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+    .expect("Failed to create owner state");
+
+    send_to_relay(&owner_relay, &invitation)
+        .await
+        .expect("Failed to publish owner invitation");
+    send_to_relay(&owner_relay, &owner_state)
+        .await
+        .expect("Failed to publish owner state");
+    crate::common::push_to_relay(
+        owner_git.path(),
+        &owner_relay.domain(),
+        &owner_npub,
+        identifier,
+    )
+    .expect("Failed to push owner repository");
+    assert_exact_event_served(&owner_relay, &invitation, "Owner invitation").await;
+    assert_exact_event_served(&owner_relay, &owner_state, "Owner state").await;
+
+    let invitee_relay =
+        TestRelay::start_with_sync_and_rejected_hot_cache(Some(owner_relay.url().to_string()), 1)
+            .await;
+    let invitation_note = invitation
+        .id
+        .to_bech32()
+        .expect("Failed to encode invitation event ID");
+    assert!(
+        wait_for_log(
+            &invitee_relay.log_path(),
+            &invitation_note,
+            Duration::from_secs(10),
+        )
+        .await,
+        "Invitee-only server should reject and index the owner invitation"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let pushes_before_acceptance = [
+        push_counts(&owner_relay).await,
+        push_counts(&invitee_relay).await,
+    ];
+    let invitee_servers = [&invitee_relay];
+    let acceptance = repository_announcement(
+        &invitee_keys,
+        &invitee_servers,
+        &[owner_keys.public_key()],
+        identifier,
+    )
+    .custom_created_at(Timestamp::from_secs(invitation.created_at.as_secs() + 1))
+    .finalize(&invitee_keys)
+    .expect("Failed to create invitee acceptance");
+    let (invitee_clone_urls, _) = repository_urls(&invitee_keys, &invitee_servers, identifier);
+    assert_eq!(announcement_clone_urls(&acceptance), invitee_clone_urls);
+    assert!(
+        !announcement_clone_urls(&acceptance)
+            .iter()
+            .any(|url| owner_clone_urls.contains(url)),
+        "Acceptance must not copy the owner's Git endpoint"
+    );
+
+    send_to_relay(&invitee_relay, &acceptance)
+        .await
+        .expect("Failed to publish invitee acceptance");
+    assert!(
+        wait_for_log(
+            &invitee_relay.log_path(),
+            "Fetched purgatory dependencies by exact event ID",
+            Duration::from_secs(20),
+        )
+        .await,
+        "Invitee-only server should recover the expired invitation by exact event ID"
+    );
+
+    assert_exact_event_served(&invitee_relay, &invitation, "Recovered owner invitation").await;
+    assert_exact_event_served(&invitee_relay, &owner_state, "Recovered owner state").await;
+    assert_exact_event_served(&invitee_relay, &acceptance, "Invitee acceptance").await;
+
+    let expected_refs = BTreeMap::from([("refs/heads/main".to_string(), owner_commit.clone())]);
+    assert_remote_refs(
+        &invitee_clone_urls[0],
+        &expected_refs,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_remote_default_branch(
+        &invitee_clone_urls[0],
+        "refs/heads/main",
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let invitee_state_exists = wait_for_event_on_relay(
+        invitee_relay.url(),
+        Filter::new()
+            .kind(Kind::RepoState)
+            .author(invitee_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        !invitee_state_exists,
+        "Invitation acceptance must not publish an invitee state event"
+    );
+    assert_eq!(
+        [
+            push_counts(&owner_relay).await,
+            push_counts(&invitee_relay).await,
+        ],
+        pushes_before_acceptance,
+        "Invitation acceptance must converge without a client Git push"
+    );
+
+    invitee_relay.stop().await;
+    owner_relay.stop().await;
+}
+
 /// Listing a maintainer immediately authorizes that maintainer's state for the
 /// inviting owner's repository; reciprocal acceptance is not required.
 ///
@@ -974,13 +1138,10 @@ async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
             .tags(vec![
                 Tag::identifier(identifier),
                 Tag::custom("clone", vec![owner_clone.clone()]),
-                Tag::custom(
-                    "relays",
-                    vec![
-                        source_relay.url().to_string(),
-                        target_relay.url().to_string(),
-                    ],
-                ),
+                // The reciprocal announcement intentionally advertises only the
+                // target. Cold dependency recovery must remember that the
+                // rejected maintainer event was actually received from source.
+                Tag::custom("relays", vec![target_relay.url().to_string()]),
                 Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
             ])
             .finalize(&owner_keys)
@@ -1213,100 +1374,6 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
 
     relay_a.stop().await;
     relay_b.stop().await;
-}
-
-/// Test that maintainer announcements NOT in hot cache are still prevented from re-fetching
-///
-/// Flow:
-/// 1. Maintainer announcement arrives → Rejected (added to hot cache + cold index)
-/// 2. Wait for hot cache to expire (2+ minutes)
-/// 3. Owner announcement arrives → Invalidates cold index
-/// 4. Maintainer announcement should NOT be re-fetched (cold index prevents)
-/// 5. Only owner announcement should be in database
-///
-/// This test verifies the cold index prevents repeated downloads after hot cache expiry.
-/// Note: This test is slow (2+ minutes) so we'll skip it in normal test runs.
-#[tokio::test]
-#[ignore] // Skip by default due to 2+ minute duration
-async fn test_maintainer_announcement_cold_index_prevents_refetch() {
-    let relay = TestRelay::start().await;
-
-    // Create keys
-    let owner_keys = Keys::generate();
-    let maintainer_keys = Keys::generate();
-
-    let identifier = "test-repo-cold";
-
-    // Create client using TestClient helper
-    let client = TestClient::new(relay.url(), maintainer_keys.clone())
-        .await
-        .expect("Failed to connect to relay");
-
-    // Step 1: Send maintainer announcement (will be rejected - doesn't list our relay)
-    let maintainer_announcement =
-        EventBuilder::new(Kind::GitRepoAnnouncement, "Maintainer's repository")
-            .tags(vec![
-                Tag::identifier(identifier),
-                Tag::custom(
-                    "clone",
-                    vec![format!("https://example.com/{}.git", identifier)],
-                ),
-                Tag::custom("relays", vec!["wss://example.com".to_string()]),
-            ])
-            .finalize(&maintainer_keys)
-            .unwrap();
-
-    // Send maintainer announcement - expect it to be rejected
-    let _ = client.send_event(&maintainer_announcement).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Step 2: Wait for hot cache to expire (default: 120 seconds)
-    println!("⏳ Waiting for hot cache to expire (120 seconds)...");
-    tokio::time::sleep(Duration::from_secs(125)).await;
-
-    // Step 3: Send owner announcement (lists maintainer)
-    let owner_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Owner's repository")
-        .tags(vec![
-            Tag::identifier(identifier),
-            Tag::custom(
-                "clone",
-                vec![format!("https://{}/{}.git", relay.domain(), identifier)],
-            ),
-            Tag::custom("relays", vec![relay.url().to_string()]),
-            Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
-        ])
-        .finalize(&owner_keys)
-        .unwrap();
-
-    client.send_event(&owner_announcement).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Step 4: Verify only owner announcement is in database
-    let owner_filter = Filter::new()
-        .kind(Kind::GitRepoAnnouncement)
-        .author(owner_keys.public_key())
-        .identifier(identifier);
-
-    let owner_found =
-        wait_for_event_on_relay(relay.url(), owner_filter, Duration::from_secs(2)).await;
-    assert!(owner_found, "Owner announcement should be accepted");
-
-    let maintainer_filter = Filter::new()
-        .kind(Kind::GitRepoAnnouncement)
-        .author(maintainer_keys.public_key())
-        .identifier(identifier);
-
-    let maintainer_found =
-        wait_for_event_on_relay(relay.url(), maintainer_filter, Duration::from_millis(500)).await;
-    assert!(
-        !maintainer_found,
-        "Maintainer announcement should NOT be re-processed (hot cache expired)"
-    );
-
-    println!("✅ Cold index prevented re-fetch after hot cache expiry");
-
-    client.disconnect().await;
-    relay.stop().await;
 }
 
 /// Test that all maintainer announcements are re-processed when the owner announcement

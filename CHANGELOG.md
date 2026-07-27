@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix maintainer invitation acceptance by prioritizing fresh purgatory
+  dependencies within a bounded reconciliation pass and retaining the source
+  relays needed to recover inviter events after the short-lived hot cache
+  expires.
 - Fix invitation acceptance sync by deferring subscription consolidation until
   in-flight relay batches finish, keeping the sync actor available to process
   EOSE messages and the five-second purgatory reconciliation pass.
