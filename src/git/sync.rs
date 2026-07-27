@@ -987,10 +987,12 @@ pub async fn process_newly_available_git_data(
 /// source repo to other authorized owner repos for the same identifier. Those
 /// target repos may now satisfy purgatory announcements even though no direct
 /// push or fetch happened for the target repo path. This helper runs the normal
-/// newly-available-git-data pipeline for each populated target repo so promotion
-/// behavior stays centralized in this module.
+/// newly-available-git-data pipeline only for target repos authorized by the
+/// preferred state and containing every required OID, so an unrelated or failed
+/// copy cannot promote an empty announcement.
 pub async fn process_repos_populated_by_state_copy(
     source_repo_path: &Path,
+    state: &RepositoryState,
     repo_data: &RepositoryData,
     database: &SharedDatabase,
     local_relay: Option<&nostr_relay_builder::LocalRelay>,
@@ -1000,10 +1002,22 @@ pub async fn process_repos_populated_by_state_copy(
 ) -> ProcessResult {
     let empty_oids: HashSet<String> = HashSet::new();
     let mut aggregate = ProcessResult::default();
+    let maintainers_by_owner = collect_authorized_maintainers(&repo_data.announcements);
 
     for announcement in &repo_data.announcements {
         let target_repo_path = git_data_path.join(announcement.repo_path());
         if target_repo_path == source_repo_path {
+            continue;
+        }
+
+        let owner = announcement.event.pubkey.to_hex();
+        let Some(maintainers) = maintainers_by_owner.get(&owner) else {
+            continue;
+        };
+        if !maintainers.contains(&state.event.pubkey.to_hex())
+            || !is_latest_authorized_state(state, maintainers, &repo_data.states)
+            || !can_apply_state(&state.event, &target_repo_path)
+        {
             continue;
         }
 

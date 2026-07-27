@@ -310,6 +310,13 @@ impl Nip34WritePolicy {
                 // New announcement - add to purgatory
                 match self.announcement_policy.add_to_purgatory(event) {
                     Ok(()) => {
+                        // The server may already have the repository's owner-authored state
+                        // and Git objects. Reapply that stored state now so a newly accepted
+                        // maintainer announcement can be promoted without waiting for the
+                        // same replaceable state event to arrive over sync again.
+                        self.reconcile_stored_state_events_for_identifier(&announcement.identifier)
+                            .await;
+
                         tracing::info!(
                             "Accepted announcement to purgatory: {} (waiting for git data)",
                             event_id_str
@@ -646,6 +653,55 @@ impl Nip34WritePolicy {
                         "Error re-evaluating state event in purgatory"
                     );
                 }
+            }
+        }
+    }
+
+    /// Reapply stored state after a new maintainer repository enters purgatory.
+    ///
+    /// A shared GRASP server can already hold the owner's latest state and Git
+    /// objects when an invitee publishes their reciprocal announcement. Since
+    /// the state is replaceable and already stored, sync may not deliver it
+    /// again. Processing stored candidates newest-first lets each maintainer
+    /// chain apply its preferred state before considering older candidates,
+    /// without requiring an invitee-authored state event or push.
+    async fn reconcile_stored_state_events_for_identifier(&self, identifier: &str) {
+        let filter = Filter::new().kind(Kind::RepoState).custom_tag(
+            SingleLetterTag::lowercase(Alphabet::D),
+            identifier.to_string(),
+        );
+        let mut states: Vec<Event> = match self.ctx.database.query(filter).await {
+            Ok(events) => events.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(
+                    identifier = %identifier,
+                    error = %error,
+                    "Failed to query stored state for new maintainer repository"
+                );
+                return;
+            }
+        };
+
+        states.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        for state in states {
+            let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self);
+            if let Err(error) = self
+                .state_policy
+                .process_state_event(&state, true, Some(&promotion_hooks))
+                .await
+            {
+                tracing::warn!(
+                    identifier = %identifier,
+                    event_id = %state.id,
+                    error = %error,
+                    "Failed to reapply stored state to new maintainer repository"
+                );
             }
         }
     }
