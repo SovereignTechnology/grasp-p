@@ -56,6 +56,61 @@ use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
 use nostr_relay_builder::prelude::LocalRelay;
 
+const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
+const MAX_PURGATORY_FILTER_ACTIONS_PER_TICK: usize = 1;
+
+fn purgatory_dependency_retry_after() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+fn dependency_relay_retention() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+fn select_purgatory_dependency_events(
+    mut events: Vec<Event>,
+    attempts: &mut HashMap<EventId, Instant>,
+    now: Instant,
+    retry_after: Duration,
+    limit: usize,
+) -> Vec<Event> {
+    let current_ids: HashSet<EventId> = events.iter().map(|event| event.id).collect();
+    attempts.retain(|event_id, _| current_ids.contains(event_id));
+
+    events.sort_by(|left, right| {
+        let left_is_new = !attempts.contains_key(&left.id);
+        let right_is_new = !attempts.contains_key(&right.id);
+        right_is_new
+            .cmp(&left_is_new)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+
+    let selected: Vec<Event> = events
+        .into_iter()
+        .filter(|event| {
+            attempts
+                .get(&event.id)
+                .is_none_or(|attempted_at| now.duration_since(*attempted_at) >= retry_after)
+        })
+        .take(limit)
+        .collect();
+
+    for event in &selected {
+        attempts.insert(event.id, now);
+    }
+
+    selected
+}
+
 /// Return one stable identity for a relay URL throughout all sync indexes.
 ///
 /// URL parsers represent a root path as `/`, so announcements that alternate
@@ -807,6 +862,10 @@ pub struct SyncManager {
     connections: HashMap<String, RelayConnection>,
     /// Last exact-ID dependency recovery attempt, used to bound retries.
     dependency_refetch_attempts: Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
+    /// Last dependency pass for each purgatory announcement.
+    purgatory_dependency_attempts: HashMap<EventId, Instant>,
+    /// Temporary source relays retained while rejected dependencies are recovered.
+    dependency_relay_deadlines: HashMap<String, Instant>,
     /// Health tracker for relay connection state
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
@@ -903,6 +962,8 @@ impl SyncManager {
             rejected_events_index,
             connections: HashMap::new(),
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            purgatory_dependency_attempts: HashMap::new(),
+            dependency_relay_deadlines: HashMap::new(),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
             next_connect_attempt_token: 0,
@@ -2778,9 +2839,7 @@ impl SyncManager {
             return;
         }
 
-        // Register any new entries in repo_sync_index as StateOnly
-        let mut new_relay_urls: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        // Register any new entries in repo_sync_index as StateOnly.
         {
             let mut index = self.repo_sync_index.write().await;
             for (repo_id, relays) in &announcements {
@@ -2798,35 +2857,7 @@ impl SyncManager {
                 // Don't downgrade an already-Full entry
                 // Add any new relay URLs
                 for relay in relays {
-                    if entry.relays.insert(relay.clone()) {
-                        new_relay_urls.insert(relay.clone());
-                    }
-                }
-            }
-        }
-
-        if !new_relay_urls.is_empty() {
-            // For any relay URLs that are new, compute and send AddFilters actions
-            let all_targets = {
-                let repo_index = self.repo_sync_index.read().await;
-                derive_relay_targets(&repo_index)
-            };
-
-            let actions = {
-                let pending_index = self.pending_sync_index.read().await;
-                let relay_index = self.relay_sync_index.read().await;
-                compute_actions(&all_targets, &pending_index, &relay_index)
-            };
-
-            for action in actions {
-                // Only act on relays that have new URLs (avoids redundant work)
-                if new_relay_urls.contains(&action.relay_url) {
-                    tracing::info!(
-                        relay = %action.relay_url,
-                        repos = action.items.repos.len(),
-                        "Purgatory sync timer: connecting to new relay from purgatory announcement"
-                    );
-                    self.handle_new_sync_filters(action).await;
+                    entry.relays.insert(relay.clone());
                 }
             }
         }
@@ -2835,9 +2866,46 @@ impl SyncManager {
         // before the reciprocal owner announcement reached this relay. Retry those
         // dependencies after connecting the owner's relay hints so cold-cache
         // misses can be fetched directly by event ID.
-        for event in announcement_events {
+        let dependency_events = select_purgatory_dependency_events(
+            announcement_events,
+            &mut self.purgatory_dependency_attempts,
+            Instant::now(),
+            purgatory_dependency_retry_after(),
+            MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK,
+        );
+        for event in dependency_events {
             self.reprocess_purgatory_announcement_dependencies(&event)
                 .await;
+        }
+
+        // Recompute all outstanding actions on every pass. A bounded pass may
+        // intentionally defer some relays, so restricting this to newly seen
+        // URLs would lose that work on the next tick.
+        let all_targets = {
+            let repo_index = self.repo_sync_index.read().await;
+            derive_relay_targets(&repo_index)
+        };
+        let mut actions = {
+            let pending_index = self.pending_sync_index.read().await;
+            let relay_index = self.relay_sync_index.read().await;
+            compute_actions(&all_targets, &pending_index, &relay_index)
+        };
+        actions.sort_by_key(|action| {
+            !self
+                .dependency_relay_deadlines
+                .contains_key(&action.relay_url)
+        });
+
+        for action in actions
+            .into_iter()
+            .take(MAX_PURGATORY_FILTER_ACTIONS_PER_TICK)
+        {
+            tracing::info!(
+                relay = %action.relay_url,
+                repos = action.items.repos.len(),
+                "Purgatory sync timer: processing one bounded relay action"
+            );
+            self.handle_new_sync_filters(action).await;
         }
     }
 
@@ -2847,7 +2915,7 @@ impl SyncManager {
     /// `process_event_static`, but runs while the owner announcement is still in
     /// purgatory. Announcement policy already treats purgatory announcements as
     /// maintainer authority; doing the retry here makes arrival order irrelevant.
-    async fn reprocess_purgatory_announcement_dependencies(&self, event: &Event) {
+    async fn reprocess_purgatory_announcement_dependencies(&mut self, event: &Event) {
         let announcement =
             match crate::nostr::events::RepositoryAnnouncement::from_event(event.clone()) {
                 Ok(announcement) => announcement,
@@ -2890,6 +2958,11 @@ impl SyncManager {
                 rejected_index::EventType::Announcement,
                 rejected_index::EventType::State,
             ] {
+                dependency_relay_urls.extend(self.rejected_events_index.dependency_relay_hints(
+                    &maintainer_pubkey,
+                    &announcement.identifier,
+                    Some(event_type),
+                ));
                 let (event_ids, hot_events) = self.rejected_events_index.dependency_candidates(
                     &maintainer_pubkey,
                     &announcement.identifier,
@@ -2944,6 +3017,11 @@ impl SyncManager {
         }
 
         // The owner's state may also have arrived before their announcement.
+        dependency_relay_urls.extend(self.rejected_events_index.dependency_relay_hints(
+            &event.pubkey,
+            &announcement.identifier,
+            Some(rejected_index::EventType::State),
+        ));
         let (event_ids, hot_events) = self.rejected_events_index.dependency_candidates(
             &event.pubkey,
             &announcement.identifier,
@@ -2983,9 +3061,43 @@ impl SyncManager {
         }
 
         if !dependency_refetch_ids.is_empty() {
-            let dependency_relay_urls: Vec<String> = dependency_relay_urls.into_iter().collect();
+            let mut canonical_dependency_relays = Vec::new();
+            for relay_url in dependency_relay_urls {
+                let relay_url = match canonical_relay_key(&relay_url) {
+                    Ok(relay_url) => relay_url,
+                    Err(error) => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            error = %error,
+                            "Ignoring invalid rejected dependency source relay"
+                        );
+                        continue;
+                    }
+                };
+                self.dependency_relay_deadlines.insert(
+                    relay_url.clone(),
+                    Instant::now() + dependency_relay_retention(),
+                );
+                if !self.connections.contains_key(&relay_url) {
+                    self.register_relay(relay_url.clone(), false).await;
+                    self.schedule_connect_relay(&relay_url).await;
+                }
+                canonical_dependency_relays.push(relay_url);
+            }
+
+            let connected_dependency_relays: Vec<String> = {
+                let relay_index = self.relay_sync_index.read().await;
+                canonical_dependency_relays
+                    .into_iter()
+                    .filter(|relay_url| {
+                        relay_index
+                            .get(relay_url)
+                            .is_some_and(|state| state.connection_status.is_live_sync_active())
+                    })
+                    .collect()
+            };
             self.spawn_purgatory_dependency_refetch(
-                &dependency_relay_urls,
+                &connected_dependency_relays,
                 dependency_refetch_ids,
                 &announcement.identifier,
             );
@@ -3679,11 +3791,12 @@ impl SyncManager {
 
                             // Use appropriate method based on event kind
                             if event.kind == Kind::RepoState {
-                                rejected_events_index.add_state(
+                                rejected_events_index.add_state_from_relay(
                                     event.clone(),
                                     event.pubkey,
                                     identifier.to_string(),
                                     reason,
+                                    Some(relay_url.to_string()),
                                 );
                                 tracing::debug!(
                                     event_id = %event.id,
@@ -3692,11 +3805,12 @@ impl SyncManager {
                                     "Added rejected state event to two-tier index"
                                 );
                             } else {
-                                rejected_events_index.add_announcement(
+                                rejected_events_index.add_announcement_from_relay(
                                     event.clone(),
                                     event.pubkey,
                                     identifier.to_string(),
                                     reason,
+                                    Some(relay_url.to_string()),
                                 );
                                 tracing::debug!(
                                     event_id = %event.id,
@@ -3874,12 +3988,17 @@ impl SyncManager {
     ///
     /// Bootstrap relays are NEVER disconnected, even if empty.
     async fn check_disconnects(&mut self) {
-        let desired_relays: HashSet<String> = {
+        let now = Instant::now();
+        self.dependency_relay_deadlines
+            .retain(|_, deadline| *deadline > now);
+
+        let mut desired_relays: HashSet<String> = {
             let repo_index = self.repo_sync_index.read().await;
             algorithms::derive_relay_targets(&repo_index)
                 .into_keys()
                 .collect()
         };
+        desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
 
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
@@ -4579,6 +4698,54 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purgatory_dependency_budget_prioritizes_a_fresh_announcement() {
+        let keys = Keys::generate();
+        let now = Instant::now();
+        let retry_after = Duration::from_secs(30);
+        let mut attempts = HashMap::new();
+        let mut events = Vec::new();
+
+        for created_at in 1..=1000 {
+            let event = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+                .tag(Tag::identifier(format!("old-{created_at}")))
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .expect("Failed to create old purgatory announcement");
+            attempts.insert(event.id, now);
+            events.push(event);
+        }
+
+        let fresh = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+            .tag(Tag::identifier("fresh"))
+            .custom_created_at(Timestamp::from_secs(1001))
+            .finalize(&keys)
+            .expect("Failed to create fresh purgatory announcement");
+        events.push(fresh.clone());
+
+        let selected = select_purgatory_dependency_events(
+            events,
+            &mut attempts,
+            now,
+            retry_after,
+            MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, fresh.id);
+        assert!(
+            select_purgatory_dependency_events(
+                vec![fresh],
+                &mut attempts,
+                now,
+                retry_after,
+                MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK,
+            )
+            .is_empty(),
+            "an attempted announcement must wait for its bounded retry deadline"
+        );
+    }
 
     #[test]
     fn connect_attempt_tokens_deduplicate_and_reject_stale_results() {

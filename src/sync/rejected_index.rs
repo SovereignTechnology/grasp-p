@@ -140,6 +140,7 @@ struct HotCacheEntry {
     pubkey: PublicKey,
     identifier: String,
     event_type: EventType,
+    relay_hints: HashSet<String>,
     #[allow(dead_code)] // Used for metrics/debugging in future
     reason: RejectionReason,
     cached_at: Instant,
@@ -154,6 +155,8 @@ struct SerializableHotCacheEntry {
     pubkey: PublicKey,
     identifier: String,
     event_type: EventType,
+    #[serde(default)]
+    relay_hints: HashSet<String>,
     reason: RejectionReason,
     /// Duration since saved_at when this entry was cached
     cached_at_offset_secs: u64,
@@ -167,6 +170,7 @@ struct ColdIndexEntry {
     pubkey: PublicKey,
     identifier: String,
     event_type: EventType,
+    relay_hints: HashSet<String>,
     #[allow(dead_code)] // Used for metrics/debugging in future
     reason: RejectionReason,
     rejected_at: Instant,
@@ -180,6 +184,8 @@ struct SerializableColdIndexEntry {
     pubkey: PublicKey,
     identifier: String,
     event_type: EventType,
+    #[serde(default)]
+    relay_hints: HashSet<String>,
     reason: RejectionReason,
     /// Duration since saved_at when this entry was rejected
     rejected_at_offset_secs: u64,
@@ -237,6 +243,7 @@ impl HotCache {
     }
 
     /// Add event to hot cache
+    #[cfg(test)]
     fn add(
         &self,
         event: Event,
@@ -245,11 +252,31 @@ impl HotCache {
         event_type: EventType,
         reason: RejectionReason,
     ) {
+        self.add_with_relay_hints(
+            event,
+            pubkey,
+            identifier,
+            event_type,
+            HashSet::new(),
+            reason,
+        );
+    }
+
+    fn add_with_relay_hints(
+        &self,
+        event: Event,
+        pubkey: PublicKey,
+        identifier: String,
+        event_type: EventType,
+        relay_hints: HashSet<String>,
+        reason: RejectionReason,
+    ) {
         let entry = HotCacheEntry {
             event,
             pubkey,
             identifier,
             event_type,
+            relay_hints,
             reason,
             cached_at: Instant::now(),
         };
@@ -355,6 +382,7 @@ impl ColdIndex {
     }
 
     /// Add metadata to cold index
+    #[cfg(test)]
     fn add(
         &self,
         event_id: EventId,
@@ -363,15 +391,41 @@ impl ColdIndex {
         event_type: EventType,
         reason: RejectionReason,
     ) {
+        self.add_with_relay_hints(
+            event_id,
+            pubkey,
+            identifier,
+            event_type,
+            HashSet::new(),
+            reason,
+        );
+    }
+
+    fn add_with_relay_hints(
+        &self,
+        event_id: EventId,
+        pubkey: PublicKey,
+        identifier: String,
+        event_type: EventType,
+        relay_hints: HashSet<String>,
+        reason: RejectionReason,
+    ) {
+        let mut entries = self.entries.write().unwrap();
+        if let Some(entry) = entries.get_mut(&event_id) {
+            entry.relay_hints.extend(relay_hints);
+            return;
+        }
+
         let entry = ColdIndexEntry {
             pubkey,
             identifier,
             event_type,
+            relay_hints,
             reason,
             rejected_at: Instant::now(),
         };
 
-        self.entries.write().unwrap().insert(event_id, entry);
+        entries.insert(event_id, entry);
     }
 
     /// Check if event is in cold index
@@ -430,6 +484,29 @@ impl ColdIndex {
                     && now.duration_since(entry.rejected_at) < self.expiry_duration)
                     .then_some(*event_id)
             })
+            .collect()
+    }
+
+    fn dependency_relay_hints(
+        &self,
+        maintainer_pubkey: &PublicKey,
+        identifier: &str,
+        event_type: Option<EventType>,
+    ) -> HashSet<String> {
+        let entries = self.entries.read().unwrap();
+        let now = Instant::now();
+
+        entries
+            .values()
+            .filter(|entry| {
+                let matches_type = event_type.is_none_or(|et| entry.event_type == et);
+                entry.pubkey == *maintainer_pubkey
+                    && entry.identifier == identifier
+                    && matches_type
+                    && entry.reason != RejectionReason::Other
+                    && now.duration_since(entry.rejected_at) < self.expiry_duration
+            })
+            .flat_map(|entry| entry.relay_hints.iter().cloned())
             .collect()
     }
 
@@ -542,21 +619,36 @@ impl RejectedEventsIndex {
         identifier: String,
         reason: RejectionReason,
     ) {
+        self.add_announcement_from_relay(event, pubkey, identifier, reason, None);
+    }
+
+    pub fn add_announcement_from_relay(
+        &self,
+        event: Event,
+        pubkey: PublicKey,
+        identifier: String,
+        reason: RejectionReason,
+        relay_url: Option<String>,
+    ) {
+        let relay_hints: HashSet<String> = relay_url.into_iter().collect();
+
         // Add to hot cache (full event)
-        self.hot_cache.add(
+        self.hot_cache.add_with_relay_hints(
             event.clone(),
             pubkey,
             identifier.clone(),
             EventType::Announcement,
+            relay_hints.clone(),
             reason,
         );
 
         // Add to cold index (metadata only)
-        self.cold_index.add(
+        self.cold_index.add_with_relay_hints(
             event.id,
             pubkey,
             identifier,
             EventType::Announcement,
+            relay_hints,
             reason,
         );
 
@@ -579,18 +671,38 @@ impl RejectedEventsIndex {
         identifier: String,
         reason: RejectionReason,
     ) {
+        self.add_state_from_relay(event, pubkey, identifier, reason, None);
+    }
+
+    pub fn add_state_from_relay(
+        &self,
+        event: Event,
+        pubkey: PublicKey,
+        identifier: String,
+        reason: RejectionReason,
+        relay_url: Option<String>,
+    ) {
+        let relay_hints: HashSet<String> = relay_url.into_iter().collect();
+
         // Add to hot cache (full event)
-        self.hot_cache.add(
+        self.hot_cache.add_with_relay_hints(
             event.clone(),
             pubkey,
             identifier.clone(),
             EventType::State,
+            relay_hints.clone(),
             reason,
         );
 
         // Add to cold index (metadata only)
-        self.cold_index
-            .add(event.id, pubkey, identifier, EventType::State, reason);
+        self.cold_index.add_with_relay_hints(
+            event.id,
+            pubkey,
+            identifier,
+            EventType::State,
+            relay_hints,
+            reason,
+        );
 
         // Update metrics
         self.update_metrics_for_type("state");
@@ -679,6 +791,16 @@ impl RejectedEventsIndex {
             self.hot_cache
                 .get_dependency_events(pubkey, identifier, event_type),
         )
+    }
+
+    pub fn dependency_relay_hints(
+        &self,
+        pubkey: &PublicKey,
+        identifier: &str,
+        event_type: Option<EventType>,
+    ) -> HashSet<String> {
+        self.cold_index
+            .dependency_relay_hints(pubkey, identifier, event_type)
     }
 
     /// Remove a successfully processed event from both rejected-event tiers.
@@ -776,6 +898,7 @@ impl RejectedEventsIndex {
                     pubkey: entry.pubkey,
                     identifier: entry.identifier.clone(),
                     event_type: entry.event_type,
+                    relay_hints: entry.relay_hints.clone(),
                     reason: entry.reason,
                     cached_at_offset_secs,
                 };
@@ -794,6 +917,7 @@ impl RejectedEventsIndex {
                     pubkey: entry.pubkey,
                     identifier: entry.identifier.clone(),
                     event_type: entry.event_type,
+                    relay_hints: entry.relay_hints.clone(),
                     reason: entry.reason,
                     rejected_at_offset_secs,
                 };
@@ -869,6 +993,7 @@ impl RejectedEventsIndex {
                 pubkey: serializable_entry.pubkey,
                 identifier: serializable_entry.identifier,
                 event_type: serializable_entry.event_type,
+                relay_hints: serializable_entry.relay_hints,
                 reason: serializable_entry.reason,
                 cached_at,
             };
@@ -889,6 +1014,7 @@ impl RejectedEventsIndex {
                 pubkey: serializable_entry.pubkey,
                 identifier: serializable_entry.identifier,
                 event_type: serializable_entry.event_type,
+                relay_hints: serializable_entry.relay_hints,
                 reason: serializable_entry.reason,
                 rejected_at,
             };
@@ -939,6 +1065,59 @@ mod tests {
         let retrieved = cache.get_maintainer_events(&pubkey, &identifier, None);
         assert_eq!(retrieved.len(), 1);
         assert_eq!(retrieved[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn test_cold_dependency_relay_hints_are_unioned_and_persisted() {
+        let index = RejectedEventsIndex::new(Duration::from_millis(1), Duration::from_secs(604800));
+        let event = create_test_event().await;
+        let identifier = "relay-hint-recovery".to_string();
+        let reason = RejectionReason::MaintainerNotYetValid;
+
+        index.add_announcement_from_relay(
+            event.clone(),
+            event.pubkey,
+            identifier.clone(),
+            reason,
+            Some("wss://relay-a.example".to_string()),
+        );
+        index.add_announcement_from_relay(
+            event.clone(),
+            event.pubkey,
+            identifier.clone(),
+            reason,
+            Some("wss://relay-b.example".to_string()),
+        );
+
+        assert_eq!(
+            index
+                .dependency_relay_hints(&event.pubkey, &identifier, Some(EventType::Announcement),),
+            HashSet::from([
+                "wss://relay-a.example".to_string(),
+                "wss://relay-b.example".to_string(),
+            ])
+        );
+
+        let directory = tempfile::tempdir().expect("Failed to create cache directory");
+        let path = directory.path().join("rejected-events-cache.json");
+        index.save_to_disk(&path).expect("Failed to save cache");
+
+        let restored =
+            RejectedEventsIndex::new(Duration::from_millis(1), Duration::from_secs(604800));
+        restored
+            .restore_from_disk(&path)
+            .expect("Failed to restore cache");
+        assert_eq!(
+            restored.dependency_relay_hints(
+                &event.pubkey,
+                &identifier,
+                Some(EventType::Announcement),
+            ),
+            HashSet::from([
+                "wss://relay-a.example".to_string(),
+                "wss://relay-b.example".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]
