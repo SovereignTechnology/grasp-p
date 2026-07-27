@@ -77,6 +77,13 @@ impl PendingUpdates {
     }
 }
 
+fn dirty_relays(updates: &HashMap<String, RepoSyncNeeds>) -> HashSet<String> {
+    updates
+        .values()
+        .flat_map(|needs| needs.relays.iter().cloned())
+        .collect()
+}
+
 // =============================================================================
 // SelfSubscriber - Main Component
 // =============================================================================
@@ -549,11 +556,9 @@ impl SelfSubscriber {
 
     /// Process accumulated batch
     ///
-    /// Updates the RepoSyncIndex with discovered repos, then derives per-relay
-    /// targets and sends RelayAction messages to the SyncManager.
+    /// Updates the RepoSyncIndex with discovered repos, then marks only the
+    /// relays changed by this batch for SyncManager recomputation.
     async fn process_batch(&self, pending: &mut PendingUpdates) {
-        use crate::sync::algorithms::derive_relay_targets;
-
         let updates = pending.take();
 
         if updates.is_empty() {
@@ -573,6 +578,8 @@ impl SelfSubscriber {
                 "Discovered repo with relay URLs"
             );
         }
+
+        let dirty_relays = dirty_relays(&updates);
 
         // Update RepoSyncIndex
         let mut index = self.repo_sync_index.write().await;
@@ -601,41 +608,22 @@ impl SelfSubscriber {
             );
         }
 
-        // Derive per-relay targets from the updated index
-        let targets = derive_relay_targets(&index);
-        drop(index); // Release lock before async operations
+        drop(index);
 
-        // For each relay, send AddFilters action directly
-        // SyncManager's handle_new_sync_filters auto-spawns connection for unknown relays
-        for (relay_url, needs) in targets {
+        // Send only the relay keys dirtied by this batch. The SyncManager
+        // recomputes their current desired work against pending and confirmed
+        // state, avoiding an O(all repositories × all relays) rebuild for
+        // every historic batch.
+        for relay_url in dirty_relays {
             // Skip our own relay URL (we're subscribed to ourselves via self-subscription)
             if relay_url.contains(&self.relay_domain) {
                 continue;
             }
 
-            // Build filters for these repos (sync-level-aware)
-            let filters = crate::sync::filters::build_sync_level_aware_filters(
-                &needs.repos,
-                &needs.state_only_repos,
-                &needs.root_events,
-                None,
-            );
-
-            // Log before moving values
-            let repo_count = needs.repos.len() + needs.state_only_repos.len();
-            let event_count = needs.root_events.len();
-
-            // Combine all repos into pending items
-            let mut all_repos = needs.repos;
-            all_repos.extend(needs.state_only_repos);
-
             let action = AddFilters {
                 relay_url: relay_url.clone(),
-                items: crate::sync::PendingItems {
-                    repos: all_repos,
-                    root_events: needs.root_events,
-                },
-                filters,
+                items: crate::sync::PendingItems::default(),
+                filters: Vec::new(),
             };
 
             if let Err(e) = self.action_tx.send(action).await {
@@ -647,9 +635,7 @@ impl SelfSubscriber {
             } else {
                 tracing::info!(
                     relay = %relay_url,
-                    repo_count = repo_count,
-                    event_count = event_count,
-                    "Sent AddFilters action to SyncManager"
+                    "Marked relay dirty for SyncManager recomputation"
                 );
             }
         }
@@ -714,6 +700,30 @@ mod tests {
         assert_eq!(
             clone_url_to_relay_url("ssh://git@example.com/repo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn dirty_relay_signals_are_limited_to_the_current_batch() {
+        let updates = HashMap::from([(
+            "30617:owner:new-repo".to_string(),
+            RepoSyncNeeds {
+                relays: HashSet::from([
+                    "wss://owner.example".to_string(),
+                    "wss://shared.example".to_string(),
+                ]),
+                root_events: HashSet::new(),
+                sync_level: SyncLevel::Full,
+            },
+        )]);
+
+        assert_eq!(
+            dirty_relays(&updates),
+            HashSet::from([
+                "wss://owner.example".to_string(),
+                "wss://shared.example".to_string(),
+            ]),
+            "a fresh historic batch must not rebuild work for unrelated indexed relays"
         );
     }
 }
