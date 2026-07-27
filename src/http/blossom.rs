@@ -33,11 +33,16 @@ fn base_builder() -> hyper::http::response::Builder {
 }
 
 fn error_response(err: &BlobError) -> Response<HttpBody> {
-    base_builder()
+    let builder = base_builder()
         .status(err.status())
-        .header("X-Reason", err.reason().replace(['\r', '\n'], " "))
-        .body(empty_body())
-        .unwrap()
+        .header("X-Reason", err.reason().replace(['\r', '\n'], " "));
+    let builder = match err {
+        BlobError::RateLimited { retry_after_secs } => {
+            builder.header("Retry-After", retry_after_secs.to_string())
+        }
+        _ => builder,
+    };
+    builder.body(empty_body()).unwrap()
 }
 
 fn json_response(status: u16, json: String) -> Response<HttpBody> {
@@ -155,6 +160,16 @@ pub(crate) async fn handle_upload_put(
             }
         }
     };
+
+    // Phase-4b A1: per-write-key token bucket — one token per PUT request,
+    // keyed by the verified auth (write) pubkey. Blob PUTs are client-only
+    // (the mirror pulls over GET; sync never PUTs), so no bypass is needed.
+    if !private.client_write_allowed(&auth.pubkey_hex) {
+        crate::metrics::record_private_rate_limited("upload");
+        return error_response(&BlobError::RateLimited {
+            retry_after_secs: private.write_rate_retry_after_secs(),
+        });
+    }
 
     // Preflight against quota / max size before reading the body, then open
     // the streaming sink.

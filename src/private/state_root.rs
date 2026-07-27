@@ -133,9 +133,14 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
 
     // Registration must be live (meta record + 30640 coordinate still in the
     // relay DB — self-healing against missed deletes).
+    // FS-7 (review G2-F2): the message must contain "unregistered" — the
+    // cord-git widen trigger is that substring (HANDOFF gotcha 11: any
+    // "unregistered" message is the widenable case); the previous
+    // "alias is not registered" did not match and was fatal client-side
+    // instead of recoverable.
     let record = match svc.live_registration(&parsed.alias).await {
         Ok(Some(record)) => record,
-        Ok(None) => return reject_restricted("alias is not registered"),
+        Ok(None) => return reject_restricted("unregistered alias"),
         Err(e) => {
             tracing::warn!("private state-root liveness check failed: {e}");
             return reject_error("private liveness check failed");
@@ -231,7 +236,7 @@ pub(crate) fn apply_state_root_txn(
     // on replays, and zombie ring editions actively defend the zombie
     // claims via the rescan below).
     // The reason string is deliberately distinct from the genuine
-    // "alias is not registered" liveness rejection above: an honest
+    // "unregistered alias" liveness rejection above: an honest
     // same-tenant rotation also trips this arm (event_id moved), and that
     // race is TRANSIENT — a retry under the new record succeeds. Callers
     // must be able to tell the two apart (verify round 3).

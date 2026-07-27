@@ -19,13 +19,6 @@ pub(crate) fn is_valid_alias(alias: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Trailing-slash-normalized substring match, mirroring
-/// `events.rs::has_clone_url/has_relay` semantics against `config.domain`.
-fn value_lists_domain(value: &str, domain: &str) -> bool {
-    let normalized_domain = domain.trim_end_matches('/');
-    value.trim_end_matches('/').contains(normalized_domain)
-}
-
 /// All values of every tag named `name` (tags may carry multiple values).
 fn tag_values(event: &Event, name: &str) -> Vec<String> {
     event
@@ -155,10 +148,19 @@ fn parse_shape(event: &Event, cfg: &PrivateConfig) -> Result<ParsedRegistration,
 
     let relays = tag_values(event, "relays");
     let servers = tag_values(event, "server");
-    if !relays.iter().any(|v| value_lists_domain(v, &cfg.domain)) {
+    // Phase-4b A3: exact-host match against the configured domain (the old
+    // substring check let "wss://evil.com/x?example.com" and
+    // "example.com.attacker.tld" pass as listing this node).
+    if !relays
+        .iter()
+        .any(|v| super::host::url_denotes_domain(v, &cfg.domain))
+    {
         return Err("registration relays tag must list this node".to_string());
     }
-    if !servers.iter().any(|v| value_lists_domain(v, &cfg.domain)) {
+    if !servers
+        .iter()
+        .any(|v| super::host::url_denotes_domain(v, &cfg.domain))
+    {
         return Err("registration server tag must list this node".to_string());
     }
 
@@ -221,6 +223,13 @@ pub(crate) struct RegistrationOutcome {
 /// much later still earns one fresh alert.
 pub(crate) const CONFLICT_ALERT_DEDUP_TTL: std::time::Duration =
     std::time::Duration::from_secs(3600);
+
+/// The A2 replacement-cadence rejection message (FS-2). Shared constant so
+/// the sync layer and the client write path can recognize THIS rejection —
+/// and only this one — as hold-and-retry-able: a cadence-rejected same-
+/// tenant replacement is held in the PrivateRejectedIndex and re-offered
+/// after bucket refill instead of depending on the client to retry.
+pub(crate) const REPLACE_CADENCE_REJECT_MESSAGE: &str = "replacement rate-limited; retry later";
 
 /// FG (verify round 1): dedup for the `incoming_rejected` conflict alert,
 /// keyed on the loser EVENT id (never the alias — a NEW conflict on the
@@ -323,7 +332,30 @@ impl TxnOutcome {
 }
 
 /// Handle a kind-30640 registration event (admission + meta application).
+///
+/// Live admission: the Phase-4b A2 same-tenant replacement-cadence bucket
+/// applies (client-submitted AND synced events — the knob is part of the
+/// policy fingerprint, so both paths must behave identically).
 pub(crate) fn handle(svc: &PrivateService, event: &Event) -> RegistrationOutcome {
+    handle_inner(svc, event, Admission::Live)
+}
+
+/// Re-admission of an event this node already holds (boot_reconcile).
+/// Identical to [`handle`] except the A2 replacement-cadence bucket is not
+/// consulted: replays must not consume replacement budget.
+pub(crate) fn handle_replay(svc: &PrivateService, event: &Event) -> RegistrationOutcome {
+    handle_inner(svc, event, Admission::Replay)
+}
+
+/// Whether a 30640 admission consumes A2 replacement-cadence budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Live,
+    Replay,
+}
+
+/// Handle a kind-30640 registration event (admission + meta application).
+fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> RegistrationOutcome {
     let cfg = &svc.cfg;
 
     if let Some(rejection) = super::check_not_future_dated(event) {
@@ -518,6 +550,52 @@ pub(crate) fn handle(svc: &PrivateService, event: &Event) -> RegistrationOutcome
             && !quota::check(meta, txn, cfg, &tenant_hex, &parsed.alias, event_bytes)?
         {
             return Ok(TxnOutcome::reject(reject_restricted("quota exceeded")));
+        }
+
+        // Phase-4b A2: 30640 replacement-cadence limit — SAME-TENANT NEWER
+        // replacements only (exactly the branch that survives to here with
+        // `stored` belonging to this tenant; every other admission is
+        // exempt by construction):
+        // - new aliases (`is_new_alias`) — the bucket is keyed
+        //   (tenant, alias), and fresh seats are bounded by the alias limit;
+        // - cross-tenant conflict-merge losers — they returned above;
+        // - conflict-merge WINNERS (`evict` non-empty): an alias takeover
+        //   has a different-tenant `stored` and never reaches here, but a
+        //   same-tenant newer replacement that WINS A KEY CONFLICT against
+        //   another tenant's alias DOES reach here with a non-empty evict
+        //   list — and it is exempt for the same reason the quota and
+        //   alias-limit gates above are (§3.2 hard invariant): the bucket is
+        //   node-local state, and node-local state must NEVER gate the
+        //   deterministic merge. A cadence-rejected key-conflict winner
+        //   evicts the loser on nodes that admit it while leaving the loser
+        //   live on nodes that reject it — permanent split-brain once a
+        //   newer edition supersedes the winner everywhere (the loser can
+        //   no longer be re-evicted). Only the tenant can mint same-tenant
+        //   replacements, so the exemption cannot be abused to evict
+        //   others: the merge decides those.
+        // - stale same-tenant editions — the accept-no-op anchor-repair
+        //   path returned above;
+        // - boot_reconcile replays (Admission::Replay) — already-admitted
+        //   events must not consume budget.
+        // A rejected replacement is HELD (FS-2: PrivateRejectedIndex) and
+        // retried by the sync layer after bucket refill, with the hourly
+        // re-issue as backstop; the knob values are part of the
+        // policy_fingerprint preimage (v2) so paired nodes run identical
+        // cadence config. Bucket state itself is node-local, so a transient
+        // divergence after a flood is possible — it heals on refill +
+        // redelivery.
+        let is_same_tenant_replacement = stored
+            .as_ref()
+            .map(|r| r.tenant_hex == tenant_hex)
+            .unwrap_or(false);
+        if is_same_tenant_replacement
+            && admission == Admission::Live
+            && evict.is_empty()
+            && !svc.registration_replace_allowed(&tenant_hex, &parsed.alias)
+        {
+            return Ok(TxnOutcome::reject(reject_restricted(
+                REPLACE_CADENCE_REJECT_MESSAGE,
+            )));
         }
 
         // ---- Mutation phase: every check has passed, apply atomically.
@@ -1471,5 +1549,214 @@ mod tests {
             dedup.should_alert_at("flood-0", t0 + std::time::Duration::from_secs(3)),
             "the oldest entry was evicted to make room"
         );
+    }
+
+    /// Phase-4b A2: same-tenant 30640 replacements are cadence-gated (a
+    /// rotation burst within capacity is allowed, the sustained flood is
+    /// blocked), while new-alias registrations, stale same-tenant editions
+    /// (anchor repair), cross-tenant conflict merges, and boot_reconcile
+    /// replays are ALL exempt.
+    #[tokio::test]
+    async fn same_tenant_replacement_cadence() {
+        use nostr_sdk::prelude::Keys;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        config.private_registration_replace_capacity = 2;
+        config.private_registration_replace_refill_per_hour = 1;
+        let database: crate::nostr::SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let _dir = dir;
+
+        let tenant = Keys::generate();
+        let alias = "c".repeat(32);
+
+        // New-alias registration: exempt, consumes no replacement budget.
+        let ed1 = registration_event(&tenant, &alias, 1000);
+        assert!(matches!(handle(&svc, &ed1).result, WritePolicyResult::Accept));
+
+        // Rotation burst within capacity (2) is allowed — a §3.3 widen->
+        // narrow rotation plus retries must never trip at sane defaults.
+        let ed2 = registration_event(&tenant, &alias, 2000);
+        assert!(matches!(handle(&svc, &ed2).result, WritePolicyResult::Accept));
+        let ed3 = registration_event(&tenant, &alias, 3000);
+        assert!(matches!(handle(&svc, &ed3).result, WritePolicyResult::Accept));
+
+        // The flood beyond capacity is blocked, and the stored record is
+        // untouched (rejection mutates nothing).
+        let ed4 = registration_event(&tenant, &alias, 4000);
+        let outcome = handle(&svc, &ed4);
+        assert!(
+            !matches!(outcome.result, WritePolicyResult::Accept),
+            "the replacement flood must be cadence-rejected"
+        );
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+            assert_eq!(r.event_id, ed3.id.to_hex(), "rejection must not mutate");
+        }
+
+        // Stale same-tenant edition (accept-no-op anchor repair): exempt.
+        let stale = registration_event(&tenant, &alias, 2500);
+        assert!(
+            matches!(handle(&svc, &stale).result, WritePolicyResult::Accept),
+            "stale editions must not be cadence-gated"
+        );
+
+        // New alias from the same tenant: exempt (fresh (tenant, alias)
+        // bucket key AND the new-alias path never consults the bucket).
+        // A dedicated writer key — reusing the tenant key would collide
+        // with the first alias's key claim.
+        let alias2 = "d".repeat(32);
+        let writer2 = Keys::generate();
+        let reg2 = registration_event_with_w(
+            &tenant,
+            &alias2,
+            3500,
+            vec![key_entry(&writer2, &tenant, &alias2)],
+        );
+        assert!(matches!(handle(&svc, &reg2).result, WritePolicyResult::Accept));
+
+        // boot_reconcile replay of the cadence-rejected edition: bypasses
+        // the bucket entirely (replays must not consume budget).
+        let outcome = handle_replay(&svc, &ed4);
+        assert!(
+            matches!(outcome.result, WritePolicyResult::Accept),
+            "replay admission must bypass the cadence bucket"
+        );
+
+        // §3.2 hard invariant: a cross-tenant conflict-merge WINNER is
+        // never gated by node-local state. The bucket is irrelevant here,
+        // but pin it anyway: an earlier-created squatter takes alias2 even
+        // with the tenant's cadence budget for OTHER aliases exhausted.
+        let squatter = Keys::generate();
+        let squat = registration_event(&squatter, &alias2, 3400);
+        let outcome = handle(&svc, &squat);
+        assert!(
+            matches!(outcome.result, WritePolicyResult::Accept),
+            "a conflict-merge winner must never be cadence-gated"
+        );
+        let txn = svc.meta.read_txn().unwrap();
+        let r = svc.meta.get_registration(&txn, &alias2).unwrap().unwrap();
+        assert_eq!(r.tenant_hex, squatter.public_key().to_hex());
+    }
+
+    /// FS-1 (review L1-F1): the cadence gate must exempt a same-tenant
+    /// newer replacement that WINS A KEY CONFLICT (evict non-empty) — the
+    /// §3.2 merge is event-intrinsic and node-local bucket state must never
+    /// gate it, exactly like the quota and alias-limit guards above it.
+    /// Otherwise the winner evicts the loser's alias on nodes whose bucket
+    /// had budget but is cadence-rejected on exhausted nodes, and once a
+    /// newer edition supersedes the winner everywhere the loser can never
+    /// be re-evicted: permanent split-brain. The pure same-tenant flood
+    /// (no conflict won) must STILL be cadence-rejected.
+    #[tokio::test]
+    async fn key_conflict_winning_replacement_exempt_from_cadence() {
+        use nostr_sdk::prelude::Keys;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        // One replacement token, no meaningful refill: the bucket is
+        // EXHAUSTED when the conflict winner arrives.
+        config.private_registration_replace_capacity = 1;
+        config.private_registration_replace_refill_per_hour = 1;
+        let database: crate::nostr::SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let _dir = dir;
+
+        let tenant = Keys::generate();
+        let other = Keys::generate();
+        let shared = Keys::generate(); // the contested key k2
+        let alias = "0".repeat(32);
+        let other_alias = "1".repeat(32);
+
+        // The tenant's seat (anchor t=1000); the other tenant's alias
+        // anchors LATER (t=2000) and claims the shared key with a valid
+        // proof-of-possession.
+        let ed1 = registration_event(&tenant, &alias, 1000);
+        assert!(matches!(handle(&svc, &ed1).result, WritePolicyResult::Accept));
+        let reg_other = registration_event_with_w(
+            &other,
+            &other_alias,
+            2000,
+            vec![key_entry(&shared, &other, &other_alias)],
+        );
+        assert!(matches!(
+            handle(&svc, &reg_other).result,
+            WritePolicyResult::Accept
+        ));
+
+        // Drain the tenant's single replacement token with a pure rotation.
+        let rot = registration_event(&tenant, &alias, 1100);
+        assert!(matches!(handle(&svc, &rot).result, WritePolicyResult::Accept));
+
+        // The backdated key-conflict WINNER: a same-tenant NEWER edition
+        // (1500 > 1100) that is OLDER than the other alias's anchor
+        // (1500 < 2000) and claims the shared key. On an exhausted bucket
+        // it must STILL be admitted and apply the eviction — the merge is
+        // not cadence-gated.
+        let winner = registration_event_with_w(
+            &tenant,
+            &alias,
+            1500,
+            vec![key_entry(&shared, &tenant, &alias)],
+        );
+        let outcome = handle(&svc, &winner);
+        assert!(
+            matches!(outcome.result, WritePolicyResult::Accept),
+            "a key-conflict-winning replacement must bypass the cadence gate"
+        );
+        assert_eq!(
+            outcome.prune,
+            vec![(other.public_key().to_hex(), other_alias.clone())],
+            "the loser's coordinate must be pruned"
+        );
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            assert!(
+                svc.meta
+                    .get_registration(&txn, &other_alias)
+                    .unwrap()
+                    .is_none(),
+                "the conflict loser must be evicted"
+            );
+            assert_eq!(
+                svc.meta
+                    .get_key_claim(&txn, &shared.public_key().to_hex())
+                    .unwrap(),
+                Some(alias.clone()),
+                "the contested key must move to the winner's alias"
+            );
+            let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+            assert_eq!(r.event_id, winner.id.to_hex());
+        }
+
+        // The pure same-tenant flood (no conflict won) is STILL
+        // cadence-rejected on the exhausted bucket, mutating nothing.
+        let flood = registration_event(&tenant, &alias, 1600);
+        let outcome = handle(&svc, &flood);
+        assert!(
+            !matches!(outcome.result, WritePolicyResult::Accept),
+            "a plain same-tenant replacement must stay cadence-gated"
+        );
+        let txn = svc.meta.read_txn().unwrap();
+        let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+        assert_eq!(r.event_id, winner.id.to_hex(), "rejection must not mutate");
     }
 }

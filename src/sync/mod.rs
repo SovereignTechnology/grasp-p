@@ -335,6 +335,48 @@ const CONSOLIDATION_WAIT_TIMEOUT_SECS: u64 = 30;
 /// If a subscription receives >= 75 events, we fetch the next page
 const PAGINATION_THRESHOLD: usize = 75;
 
+/// FS-3 (review L2-F4): per-peer min-interval floor between private
+/// sync-filter re-issues. Past [`CONSOLIDATION_THRESHOLD`] derived filters,
+/// every index-dirty 5s tick used to trigger a full consolidate
+/// (unsubscribe-all + resubscribe + since=None backfill) on every live
+/// peer — at 128 aliases x the 4/hour cadence budget that is a dirty tick
+/// every ~7s, i.e. near-continuous consolidation. Both re-issue triggers
+/// (PrivateSyncIndex change and the hourly full re-issue timer) share this
+/// floor per peer.
+#[derive(Debug, Default)]
+struct PrivateReissueFloor {
+    /// peer relay URL → when it last received a re-issue.
+    last_sent: HashMap<String, std::time::Instant>,
+}
+
+impl PrivateReissueFloor {
+    /// True (recording the send) when `relay_url` may be re-issued under
+    /// `floor`; false while the previous send is inside the interval. A
+    /// zero floor disables gating. Entries older than the floor are pruned
+    /// on each call so the map stays bounded by the recently-seen peer set.
+    fn admit(&mut self, relay_url: &str, floor: Duration, now: std::time::Instant) -> bool {
+        if floor.is_zero() {
+            return true;
+        }
+        self.last_sent.retain(|_, at| now.duration_since(*at) < floor);
+        if let Some(at) = self.last_sent.get(relay_url) {
+            if now.duration_since(*at) < floor {
+                return false;
+            }
+        }
+        self.last_sent.insert(relay_url.to_string(), now);
+        true
+    }
+}
+
+/// Result of a private filter re-issue round (FS-3/FS-8): how many live
+/// peers were actually re-issued vs skipped by the FS-3 floor.
+#[derive(Debug, Default, Clone, Copy)]
+struct PrivateReissueOutcome {
+    sent: usize,
+    floor_skipped: usize,
+}
+
 // =============================================================================
 // Daily Timer
 // =============================================================================
@@ -465,6 +507,59 @@ async fn run_private_registration_sync(
     }
 }
 
+/// GRASP-P Phase-4b B1: periodic since=None full re-issue of the private
+/// sync filters (Layer-1 kind-30640 + the current derived 30641/1059
+/// filters) to every live peer. Sibling to `run_private_registration_sync`,
+/// spawned ONLY when `config.private_repos_enable` and
+/// `NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS` > 0 (0 = disabled).
+///
+/// Gaps that live delivery cannot heal — expired rejected-hot-cache entries,
+/// negentropy blind spots, cadence-limited 30640 rejections (WP-A A2, which
+/// deliberately rely on redelivery) — otherwise wait for a reconnect or the
+/// daily fresh sync; this timer bounds that wait to ~1 hour. Each sleep is
+/// jittered (±10%) so paired nodes do not re-issue in lockstep. Under
+/// `NGIT_TEST=1` the interval is clamped to <= 2s (the 5s→200ms idiom,
+/// scaled for an hourly timer) so integration tests can observe it.
+async fn run_private_full_reissue_timer(
+    sync_manager: Arc<Mutex<SyncManager>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    use ::rand::RngExt;
+
+    let base_secs = {
+        let manager = sync_manager.lock().await;
+        let secs = manager.config.private_full_reissue_interval_secs;
+        if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+            secs.min(2)
+        } else {
+            secs
+        }
+    };
+    if base_secs == 0 {
+        tracing::debug!("Private full re-issue timer disabled (interval 0)");
+        return;
+    }
+    tracing::info!(
+        interval_secs = base_secs,
+        "Private full re-issue timer started"
+    );
+    loop {
+        // ±10% jitter around the configured interval.
+        let jitter = 0.9 + ::rand::rng().random::<f64>() * 0.2;
+        let interval = Duration::from_secs_f64(base_secs as f64 * jitter);
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                let mut manager = sync_manager.lock().await;
+                manager.reissue_private_filters_full().await;
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::debug!("Private full re-issue timer received shutdown signal");
+                break;
+            }
+        }
+    }
+}
+
 // Combined Health and Metrics Checker
 
 /// Background task for cleaning up expired entries from the rejected events index
@@ -482,7 +577,14 @@ async fn run_rejected_index_cleanup(
     sync_manager: Arc<Mutex<SyncManager>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let hot_cache_interval = Duration::from_secs(60);
+    // FS-4 (review L3-F5): NGIT_TEST-clamped like the other timers — the
+    // physical expiry of held/rejected entries otherwise lags the lazy TTL
+    // filtering by up to 60s, slowing every heal-path test.
+    let hot_cache_interval = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(60)
+    };
     let cold_index_interval = Duration::from_secs(86400); // 24 hours
 
     tracing::info!("Rejected index cleanup started (hot cache: 60s, cold index: daily)");
@@ -653,6 +755,12 @@ pub struct SyncManager {
     /// relay DB's kind-30640 events. Only populated when
     /// `config.private_repos_enable`; drives the derived 30641/1059 filters.
     private_sync_index: Arc<RwLock<private_index::PrivateSyncIndex>>,
+    /// FS-3 (review L2-F4): per-peer floor between private filter
+    /// re-issues (index-change-triggered consolidations AND the hourly
+    /// full re-issue), plus the sticky flag that retries a floor-skipped
+    /// index-change re-issue on a later tick.
+    private_reissue_floor: PrivateReissueFloor,
+    private_reissue_pending: bool,
     /// Active relay connections - keyed by relay URL
     connections: HashMap<String, RelayConnection>,
     /// Health tracker for relay connection state
@@ -742,6 +850,8 @@ impl SyncManager {
             private_sync_index: Arc::new(RwLock::new(
                 private_index::PrivateSyncIndex::default(),
             )),
+            private_reissue_floor: PrivateReissueFloor::default(),
+            private_reissue_pending: false,
             connections: HashMap::new(),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
@@ -1630,6 +1740,14 @@ impl SyncManager {
             tokio::spawn(async move {
                 run_private_registration_sync(private_sync_manager, private_sync_shutdown).await;
             });
+
+            // 12c. GRASP-P Phase-4b B1: hourly since=None full re-issue of
+            // the private sync filters (0 = disabled).
+            let full_reissue_manager = Arc::clone(&sync_manager);
+            let full_reissue_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                run_private_full_reissue_timer(full_reissue_manager, full_reissue_shutdown).await;
+            });
         }
 
         // 12. Main loop - handle actions from self-subscriber, disconnect, EOSE, and connect notifications
@@ -2268,7 +2386,70 @@ impl SyncManager {
             }
         }
 
-        if !diff.changed {
+        // FS-2 (review L3-F4) + R2-1 (verify round 2): retry held
+        // cadence-rejected 30640 replacements on EVERY tick (not just index
+        // changes), but bounded: per-entry refill-aware eligibility (the
+        // drain skips not-yet-eligible entries — retrying faster than the
+        // bucket refills is pure waste), newest-only-per-(tenant,alias)
+        // holds, and a per-tick FIFO drain cap. Worst case per 5s tick:
+        // MAX_REGISTRATION_RETRIES_PER_TICK x full Live admission (parse +
+        // up to 64 PoP schnorr verifies ~4-7ms + one LMDB write txn that
+        // commits even on reject) ~= 0.26-0.45s under the SyncManager
+        // mutex — vs ~3.3-5.7 cores sustained for the pre-R2-1 design
+        // (a 4096-deep hold retried every tick). Bucket refill is
+        // wall-clock-lazy (the token bucket accrues on the next try_take),
+        // so a retry after enough wall time succeeds under normal Live
+        // admission; a retry still over cadence is re-held by the rejection
+        // path (fresh eligibility + TTL), and an edition that went stale
+        // while held is absorbed by the accept-no-op anchor-repair path.
+        // This runs before the diff gate: the retry must not wait for an
+        // index change.
+        if let Some(private) = self.write_policy.private() {
+            let drain = private.sync_rejected().drain_registrations(
+                std::time::Instant::now(),
+                private_index::MAX_REGISTRATION_RETRIES_PER_TICK,
+            );
+            let retried = drain.events.len();
+            for event in drain.events {
+                let result = Box::pin(Self::process_event_static(
+                    &event,
+                    "private-cadence-retry",
+                    &self.database,
+                    &self.write_policy,
+                    &self.local_relay,
+                    &self.rejected_events_index,
+                    crate::nostr::persistence::SaveContext::HotCacheReprocess,
+                ))
+                .await;
+                // R2-1(d): per-retry outcomes at debug — the info-level
+                // signal is the per-tick summary below (a flooded hold
+                // used to emit ~820 info lines/s).
+                tracing::debug!(
+                    event_id = %event.id,
+                    kind = %event.kind.as_u16(),
+                    result = ?result,
+                    "Re-processed held cadence-rejected 30640 replacement"
+                );
+            }
+            // R2-1(d): one counts-only info line per tick while the hold
+            // is non-empty.
+            if retried > 0 || drain.remaining > 0 {
+                tracing::info!(
+                    retried,
+                    held_remaining = drain.remaining,
+                    "Private cadence-rejected 30640 retry drain"
+                );
+            }
+        }
+
+        // FS-3 (review L2-F4): a re-issue is due when the index changed OR
+        // a previous re-issue was floor-skipped. The replace_all diff is
+        // NOT sticky (rebuilding an unchanged index reports
+        // changed=false), so the pending flag is what retries a skipped
+        // re-issue on a later tick — skipped consolidations are deferred,
+        // never dropped.
+        let wants_reissue = diff.changed || self.private_reissue_pending;
+        if !wants_reissue {
             return;
         }
 
@@ -2313,11 +2494,41 @@ impl SyncManager {
         }
 
         if derived.is_empty() {
+            // No aliases means nothing to re-issue; any pending retry is
+            // moot (a peer that connects later gets the current — empty —
+            // derived set at connect time).
+            self.private_reissue_pending = false;
             return;
         }
 
         // Re-issue the derived filters to every live-connected relay
-        // (since=None backfill, mirroring handle_new_sync_filters).
+        // (since=None backfill, mirroring handle_new_sync_filters). A peer
+        // skipped by the FS-3 floor keeps the retry pending for a later
+        // tick; a clean round clears it.
+        let outcome = self.reissue_filters_to_live_relays(derived).await;
+        self.private_reissue_pending = outcome.floor_skipped > 0;
+    }
+
+    /// Re-issue private sync filters to every live-connected relay with a
+    /// since=None backfill (mirrors handle_new_sync_filters). Shared by the
+    /// PrivateSyncIndex change path above and the Phase-4b B1 periodic full
+    /// re-issue timer below.
+    ///
+    /// FS-3 (review L2-F4): each peer is additionally gated by the
+    /// NGIT_PRIVATE_REISSUE_MIN_INTERVAL_SECS floor (NGIT_TEST-clamped to
+    /// <= 1s, the hourly-timer idiom scaled down) — past the consolidation
+    /// threshold a churning derived-filter set would otherwise consolidate
+    /// a peer on every dirty 5s tick. Rate-limited relays are skipped as
+    /// before (their recovery is the health tracker's, not this floor's).
+    async fn reissue_filters_to_live_relays(&mut self, filters: Vec<Filter>) -> PrivateReissueOutcome {
+        let floor_secs = self.config.private_reissue_min_interval_secs;
+        let floor_secs = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+            floor_secs.min(1)
+        } else {
+            floor_secs
+        };
+        let floor = Duration::from_secs(floor_secs);
+        let now = std::time::Instant::now();
         let live_relays: Vec<String> = {
             let index = self.relay_sync_index.read().await;
             index
@@ -2326,14 +2537,61 @@ impl SyncManager {
                 .map(|(url, _)| url.clone())
                 .collect()
         };
+        let mut outcome = PrivateReissueOutcome::default();
         for relay_url in live_relays {
             if self.health_tracker.is_rate_limited(&relay_url) {
                 continue;
             }
-            self.maybe_consolidate(&relay_url, derived.len()).await;
-            self.sync_live(&relay_url, &derived).await;
-            self.historic_sync(&relay_url, derived.clone(), PendingItems::default(), None)
+            if !self.private_reissue_floor.admit(&relay_url, floor, now) {
+                outcome.floor_skipped += 1;
+                continue;
+            }
+            self.maybe_consolidate(&relay_url, filters.len()).await;
+            self.sync_live(&relay_url, &filters).await;
+            self.historic_sync(&relay_url, filters.clone(), PendingItems::default(), None)
                 .await;
+            outcome.sent += 1;
+        }
+        outcome
+    }
+
+    /// GRASP-P Phase-4b B1: periodic since=None full re-issue of the private
+    /// sync filters — the Layer-1 kind-30640 registration filter PLUS the
+    /// current derived 30641/1059 filters — to every live peer (driven by
+    /// `run_private_full_reissue_timer`, hourly by default).
+    ///
+    /// Exactly mirrors the index-change path's delivery mechanism (live
+    /// re-subscribe + since=None historic backfill) but is NOT gated on an
+    /// index diff: it heals gaps the change path cannot see — expired
+    /// rejected-hot-cache entries, negentropy blind spots, and
+    /// cadence-limited 30640 rejections (WP-A A2) that deliberately rely on
+    /// redelivery. With an empty index (zero aliases) the bare 30640 filter
+    /// is still re-issued (cheap self-heal for missed registrations).
+    /// Public subscriptions are deliberately NOT torn down — that is
+    /// fresh_start/daily_sync territory and far too heavy for an hourly
+    /// timer.
+    async fn reissue_private_filters_full(&mut self) {
+        if !self.config.private_repos_enable {
+            return;
+        }
+        // Same filter build as the connect-time path (sync_generic_filters):
+        // 30640 first, then the derived filters from the CURRENT index.
+        let mut filters = vec![filters::build_private_registration_filter(None)];
+        let derived_inputs = self.private_sync_index.read().await.derived_inputs();
+        filters.extend(filters::build_private_derived_filters(
+            &derived_inputs,
+            None,
+        ));
+        let outcome = self.reissue_filters_to_live_relays(filters).await;
+        // FS-8 (review L3-F7): the counter must tell the truth — increment
+        // only when at least one peer was actually re-issued. A round where
+        // every live relay was skipped (rate-limit cooldown or the FS-3
+        // floor) counts separately so a chronically-skipped peer is visible
+        // instead of masquerading as a healthy re-issue cadence.
+        if outcome.sent > 0 {
+            crate::metrics::record_private_full_reissue();
+        } else {
+            crate::metrics::record_private_full_reissue_skipped();
         }
     }
 
@@ -3334,9 +3592,25 @@ impl SyncManager {
                     if let Some(private) = write_policy.private() {
                         match event.kind.as_u16() {
                             crate::private::KIND_REGISTRATION => {
-                                // No missing-dependency semantics: id-only
-                                // skip-set entry to stop refetch loops.
-                                private.sync_rejected().add_id_only(event.id);
+                                // FS-2 (review L3-F4): a cadence-rejected
+                                // same-tenant replacement is HELD (full
+                                // event) and retried by the
+                                // sync_private_registrations_to_index timer
+                                // after the bucket refills — when every
+                                // node rejects the same replacement in
+                                // lockstep, an id-only skip-set entry would
+                                // leave the event stored nowhere and
+                                // unhealable (re-issue only re-fetches what
+                                // a peer holds). Every other 30640
+                                // rejection keeps the id-only semantics
+                                // (no missing dependency to wait for).
+                                if message.contains(
+                                    crate::private::registration::REPLACE_CADENCE_REJECT_MESSAGE,
+                                ) {
+                                    private.sync_rejected().add_registration(event.clone());
+                                } else {
+                                    private.sync_rejected().add_id_only(event.id);
+                                }
                             }
                             crate::private::KIND_STATE_ROOT => {
                                 let alias = event.tags.iter().find_map(|tag| {
@@ -4400,5 +4674,40 @@ mod tests {
         assert!(batch.received_event_ids.is_none());
         assert_eq!(batch.sync_method, SyncMethod::ReqEose);
         assert!(!batch.failed);
+    }
+
+    /// FS-3 (review L2-F4): back-to-back dirty ticks produce at most one
+    /// re-issue per peer per min-interval; a skipped re-issue is deferred
+    /// (admitted once the interval lapses), never dropped permanently; the
+    /// floor is per-peer and zero disables it; the map self-prunes.
+    #[test]
+    fn test_private_reissue_floor_gates_and_defers() {
+        let mut floor = PrivateReissueFloor::default();
+        let t0 = std::time::Instant::now();
+        let f = Duration::from_secs(30);
+
+        // First dirty tick sends; the back-to-back second tick is gated.
+        assert!(floor.admit("wss://a", f, t0));
+        assert!(!floor.admit("wss://a", f, t0 + Duration::from_secs(5)));
+
+        // The floor is per-peer: another relay is unaffected.
+        assert!(floor.admit("wss://b", f, t0 + Duration::from_secs(6)));
+
+        // After the interval lapses the deferred re-issue lands — no
+        // re-issue is ever dropped permanently.
+        assert!(floor.admit("wss://a", f, t0 + Duration::from_secs(31)));
+        assert!(!floor.admit("wss://a", f, t0 + Duration::from_secs(32)));
+
+        // A zero floor disables gating entirely (pre-FS-3 behavior).
+        assert!(floor.admit("wss://a", Duration::ZERO, t0 + Duration::from_secs(33)));
+
+        // Self-pruning: entries older than the floor are dropped on the
+        // next call, bounding the map by the recently-seen peer set.
+        assert!(floor.admit("wss://c", f, t0 + Duration::from_secs(62)));
+        assert!(
+            floor.last_sent.len() <= 2,
+            "stale entries must be pruned: {:?}",
+            floor.last_sent.keys()
+        );
     }
 }

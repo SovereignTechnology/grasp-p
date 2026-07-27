@@ -141,6 +141,8 @@ scrape_configs:
 
 ## Example Alerts
 
+GRASP-P (private repos) alert rules ship separately: see `docs/grasp-p/ops/prometheus-alerts.yaml`.
+
 Add to your Prometheus alerting rules:
 
 ```yaml

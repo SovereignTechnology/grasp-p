@@ -1,0 +1,304 @@
+# =============================================================================
+# ngit-grasp :: GRASP-P operations alert rules
+# =============================================================================
+# Load via `rule_files` in prometheus.yml (or a PrometheusRule CRD):
+#
+#   rule_files:
+#     - /etc/prometheus/rules/ngit-grasp-private.yaml
+#
+# Metric sources: src/metrics/mod.rs (ngit_private_*), src/sync/metrics.rs
+# (ngit_sync_*). Scrape target: ngit-grasp /metrics (see
+# docs/how-to/prometheus-setup.md). Runbook anchors reference
+# docs/grasp-p/ops/runbook.md (§3 alert response playbook).
+#
+# NOT scrapeable (covered at the bottom of this file):
+#   * NIP-11 private_repos.policy_fingerprint parity between peers
+#   * kind-30641 manifest parity between peers
+# Those need the external ngit-private-watchdog checker; see the comment
+# block after the rule groups for the blackbox/textfile wiring pattern.
+# =============================================================================
+
+groups:
+  # ---------------------------------------------------------------------------
+  # GRASP-P private-repo subsystem
+  # ---------------------------------------------------------------------------
+  - name: ngit-grasp-private
+    interval: 30s
+    rules:
+      # Mirror backlog: blobs referenced by synced manifests but not yet
+      # fetched from the peer. A brief non-zero value is normal (fetch in
+      # flight); sustained > 0 means the mirror is stuck or starved.
+      - alert: NgitPrivateMirrorLag
+        expr: ngit_private_mirror_lag_blobs > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private blob mirror backlog: {{ $value }} blobs unfetched"
+          description: "ngit_private_mirror_lag_blobs has been > 0 for 15m. Context: Phase-4b B2 backoff parks retryable blobs at the max retry interval by design (they stay counted in the gauge), so sustained lag with NgitPrivateMirrorFailures reasons no_peer/http_status = investigate the peer set or far side; lag during known peer downtime = expected (self-heals via the repair scan). Check NgitPrivateMirrorFailures for the failure reason."
+          runbook: "docs/grasp-p/ops/runbook.md#mirror-lag"
+
+      # Mirror fetch failures, split by the server's `reason` label.
+      - alert: NgitPrivateMirrorFailures
+        expr: sum by (reason) (rate(ngit_private_mirror_failed_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private blob mirror fetches failing (reason={{ $labels.reason }})"
+          description: "Continuous mirror fetch failures for 10m with reason={{ $labels.reason }}. Correlate with NgitPrivateMirrorLag; a growing backlog plus failures usually means an unreachable/misconfigured peer or a budget/quota refusal on the far side."
+          runbook: "docs/grasp-p/ops/runbook.md#mirror-failures"
+
+      # Registration conflicts. The metric's own help text: "Alert on any
+      # increase: every conflict is either a split-brain heal or an attempted
+      # alias/key squat." Page-worthy — no `for`, fire on the first increase.
+      - alert: NgitPrivateRegistrationConflict
+        expr: sum by (resolution) (increase(ngit_private_registration_conflicts_total[5m])) > 0
+        labels:
+          severity: critical
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Cross-tenant registration conflict (resolution={{ $labels.resolution }})"
+          description: "The deterministic (created_at, id) merge resolved a conflict in the last 5m. stored_evicted = a previously accepted registration lost its seat; incoming_rejected = the arriving registration lost. Investigate both nodes for split-brain or squat attempts before the next sync round."
+          runbook: "docs/grasp-p/ops/runbook.md#registration-conflict"
+
+      # Global ledger budget pressure. The budget is CONFIG
+      # (NGIT_PRIVATE_GLOBAL_BUDGET_BYTES, default 53687091200 = 50 GiB), not
+      # a metric — keep the literal below in sync with the deployed value.
+      - alert: NgitPrivateLedgerBudgetHigh
+        # BUDGET: replace 53687091200 with the configured
+        # NGIT_PRIVATE_GLOBAL_BUDGET_BYTES on the scraped host.
+        expr: ngit_private_ledger_bytes{scope="global"} > 0.80 * 53687091200
+        for: 30m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private ledger at {{ $value | humanize1024 }}B (>80% of global budget)"
+          description: "Global private-subsystem ledger exceeded 80% of NGIT_PRIVATE_GLOBAL_BUDGET_BYTES for 30m. Plan GC verification, tenant quota review, or a budget increase; new admissions start failing at 100%."
+          runbook: "docs/grasp-p/ops/runbook.md#ledger-budget"
+
+      - alert: NgitPrivateLedgerBudgetCritical
+        # BUDGET: same literal as NgitPrivateLedgerBudgetHigh.
+        expr: ngit_private_ledger_bytes{scope="global"} > 0.95 * 53687091200
+        for: 15m
+        labels:
+          severity: critical
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private ledger at {{ $value | humanize1024 }}B (>95% of global budget)"
+          description: "Global private-subsystem ledger exceeded 95% of NGIT_PRIVATE_GLOBAL_BUDGET_BYTES for 15m. Admission refusals are imminent; act now (GC, offboard, quota enforcement, or raise the budget and update this rule)."
+          runbook: "docs/grasp-p/ops/runbook.md#ledger-budget"
+
+      # Admission rejection spike: possible flood, or a misconfigured client
+      # hammering the relay with events it will never accept. Threshold is a
+      # starting default — tune to the instance baseline; for per-kind
+      # visibility use sum by (kind) (...).
+      - alert: NgitPrivateAdmissionRejectionSpike
+        expr: sum(rate(ngit_private_events_rejected_total[10m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private admission rejections at {{ $value | humanize }}/s for 15m"
+          description: "Sustained rejection rate above 1/s (10m avg). Check the kind label mix on /metrics: a single kind dominating suggests one misbehaving writer; a broad mix suggests a flood or a policy misconfiguration rejecting legit members."
+          runbook: "docs/grasp-p/ops/runbook.md#admission-rejection-spike"
+
+      # Server-side rate limiting (nginx outer layer + in-server per-write-key
+      # token bucket; the metric ships in src/metrics/mod.rs:336 with labels
+      # set at src/nostr/builder.rs:787-858 and src/http/blossom.rs:167-172).
+      # Sustained limiting = active flood OR a legit client in a retry loop.
+      - alert: NgitPrivateRateLimited
+        expr: sum by (path) (increase(ngit_private_rate_limited_total[10m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Sustained rate limiting on path={{ $labels.path }}"
+          description: "Clients have been continuously rate-limited on {{ $labels.path }} for 30m. If paired with NgitPrivateAdmissionRejectionSpike, treat as a flood (tighten the nginx zone in docs/grasp-p/ops/nginx-upload-zones.conf); if isolated, a legit client is likely misconfigured — identify via access logs before relaxing limits."
+          runbook: "docs/grasp-p/ops/runbook.md#rate-limited"
+
+      # Full re-issue silence (Phase-4b B1). The timer fires one since=None
+      # re-issue round per NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS (default
+      # 3600, +-10% jitter; first fire one interval after boot). FS-8: a
+      # round that delivered at least one peer increments
+      # ngit_private_full_reissue_total; a round where every live peer was
+      # skipped (rate-limit cooldown / FS-3 re-issue floor) increments
+      # ngit_private_full_reissue_skipped_total instead. Silence of BOTH
+      # over 2x the default interval = the self-heal timer is dead (a flat
+      # delivered counter alone can be a legitimately floor-skipped peer).
+      # NOTE: the series appear at their first increment — if the timer
+      # never fired since boot this rule is inert; add
+      # `or (absent(ngit_private_full_reissue_total) and absent(ngit_private_full_reissue_skipped_total))`
+      # for boot-silence detection, and DROP this rule entirely if you run
+      # NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS=0 (disabled) — flat counters
+      # are expected then. If you tune the interval, scale the window to 2x
+      # the deployed value. Sustained increases of
+      # ngit_private_full_reissue_skipped_total alone = a chronically-skipped
+      # peer (see the metric help): check the FS-3 floor
+      # (NGIT_PRIVATE_REISSUE_MIN_INTERVAL_SECS) and peer health.
+      - alert: NgitPrivateFullReissueSilent
+        expr: increase(ngit_private_full_reissue_total[2h]) == 0 and increase(ngit_private_full_reissue_skipped_total[2h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private full re-issue timer silent for >2h"
+          description: "Neither ngit_private_full_reissue_total nor ngit_private_full_reissue_skipped_total has increased over 2x the default re-issue interval — the timer itself is not firing. Redelivery-dependent sync gaps (expired rejected-hot-cache entries, cadence-limited 30640 rejections, negentropy blind spots) stop healing; expect slow divergence until the timer or process is restored."
+          runbook: "docs/grasp-p/ops/runbook.md#full-re-issue-silent"
+
+      # Denylist entries dropped (Phase-4b D1). The gauge is set at boot and
+      # on every reload swap; any decrease means files were edited (intended)
+      # or went missing/shrunk (unintended). A drop to 0 on a node that
+      # should be enforcing a takedown list = the files are gone (metric help
+      # text, src/metrics/mod.rs:367-379). Already-purged bytes stay gone
+      # either way; reads re-open for anything still stored.
+      - alert: NgitPrivateDenylistEntriesDropped
+        expr: delta(ngit_private_denylist_entries[1h]) < 0
+        for: 5m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Private denylist shrank by {{ $value | humanize }} entries in 1h"
+          description: "ngit_private_denylist_entries decreased. If you did not edit the denylist files, treat as missing files (mount/permission drift) — taken-down content still on disk becomes readable again after one reload interval."
+          runbook: "docs/grasp-p/ops/runbook.md#denylist-entries-dropped"
+
+      # Denylist purge happened (Phase-4b D1/D2). Informational page: every
+      # increase is a takedown action (reload purge-on-add or GC denylist
+      # sweep) — confirm it was intended. No `for`: fire on the first
+      # increase so an unexpected purge is caught immediately.
+      - alert: NgitPrivateDenylistPurged
+        expr: increase(ngit_private_denylist_purged_total[10m]) > 0
+        labels:
+          severity: info
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "{{ $value | humanize }} private blob(s) purged via denylist"
+          description: "A takedown purge ran (reload purge-on-add or the GC denylist sweep). Confirm the denylist addition was intended and work the takedown runbook; an unexpected purge means the denylist files carry hashes you did not put there."
+          runbook: "docs/grasp-p/ops/runbook.md#denylist-purged"
+
+      # NIP-56 report intake (Phase-4b D3). Kind-1984 events are
+      # intake-logged (event id, reporter, sha256-looking tags; content never
+      # logged) and v1 takes NO automatic action — a rising count is a page
+      # to work the manual takedown runbook.
+      - alert: NgitPrivateReportEvents
+        expr: increase(ngit_private_report_events_total[1h]) > 0
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "{{ $value | humanize }} NIP-56 report event(s) in 1h"
+          description: "Kind-1984 reports are arriving. Pull the intake log lines (event_id, reporter, sha256_tags), verify the evidence per the takedown runbook (decrypt-to-confirm), then denylist if actionable."
+          runbook: "docs/grasp-p/ops/runbook.md#report-events"
+
+  # ---------------------------------------------------------------------------
+  # Sync health (GRASP-02 proactive sync; private L1 sync rides these conns)
+  # ---------------------------------------------------------------------------
+  - name: ngit-grasp-sync
+    interval: 30s
+    rules:
+      # A configured peer disconnected. ngit_sync_relay_connected is a state
+      # gauge per relay: 0=disconnected, 1=connecting, 2=syncing,
+      # 3=connected, 4=connected_historic_sync_failures. == 0 for 10m means
+      # the peer is down or unreachable, not just re-handshaking.
+      - alert: NgitSyncPeerDisconnected
+        expr: ngit_sync_relay_connected == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p-sync
+        annotations:
+          summary: "Sync peer {{ $labels.relay }} disconnected for 10m"
+          description: "ngit_sync_relay_connected{relay={{ $labels.relay }}} == 0 for 10m. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog; check peer process, DNS/TLS (see ngit_sync_naughty_relay_info), and network path."
+          runbook: "docs/grasp-p/ops/runbook.md#sync-peer-disconnected"
+
+      # All tracked peers disconnected simultaneously — almost always a LOCAL
+      # outage (network, DNS, sync subsystem), not a mass peer failure.
+      - alert: NgitSyncAllPeersDisconnected
+        expr: ngit_sync_relays_connected_total == 0 and ngit_sync_relays_tracked_total > 0
+        for: 10m
+        labels:
+          severity: critical
+          service: ngit-grasp
+          component: grasp-p-sync
+        annotations:
+          summary: "No sync peers connected ({{ $value }} tracked)"
+          description: "ngit_sync_relays_connected_total == 0 while peers are configured, for 10m. The node is fully partitioned from its replication set; treat as a local outage until proven otherwise."
+          runbook: "docs/grasp-p/ops/runbook.md#sync-all-disconnected"
+
+      # Consecutive-failure count growth. ngit_sync_relay_failures is a GAUGE
+      # (consecutive failures per relay, reset on success), so use delta() to
+      # detect growth — rate()/increase() are counter semantics and misreport
+      # on gauge resets.
+      - alert: NgitSyncPeerFailuresGrowing
+        expr: delta(ngit_sync_relay_failures[30m]) >= 3
+        for: 30m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p-sync
+        annotations:
+          summary: "Sync failures for {{ $labels.relay }} still climbing ({{ $value }} in 30m)"
+          description: "Consecutive failure count for {{ $labels.relay }} grew by >= 3 over 30m and kept growing for another 30m without a successful reset. Precedes the peer being marked dead (ngit_sync_relay_status == 4)."
+          runbook: "docs/grasp-p/ops/runbook.md#sync-failures-growing"
+
+# =============================================================================
+# NOT SCRAPEABLE: policy_fingerprint parity + 30641 manifest parity
+# =============================================================================
+# Cross-node parity of the NIP-11 `private_repos.policy_fingerprint` and of
+# kind-30641 blob manifests is checked by the EXTERNAL watchdog
+# (ngit-private-watchdog — compares two nodes' adverts/manifests and exits
+# non-zero on divergence). It is not a /metrics series, so alerting on it
+# requires one of these bridges:
+#
+# (a) blackbox-style: run the watchdog as a scheduled probe and expose the
+#     result as a probe metric, e.g. via a tiny exporter or prometheus
+#     pushgateway:
+#       ngit_private_watchdog_exit_status{check="policy_fingerprint"} 0|1
+#       ngit_private_watchdog_exit_status{check="manifest_parity"}    0|1
+#     then alert:
+#       - alert: NgitPrivateWatchdogFailing
+#         expr: ngit_private_watchdog_exit_status != 0
+#         for: 30m
+#         labels: {severity: critical, service: ngit-grasp, component: grasp-p}
+#         annotations:
+#           summary: "Watchdog check {{ $labels.check }} failing"
+#           runbook: "docs/grasp-p/ops/runbook.md#watchdog"
+#
+# (b) node-exporter textfile collector: cron the watchdog and write
+#     /var/lib/node_exporter/textfile_collector/ngit_private_watchdog.prom:
+#       ngit_private_watchdog_exit_status{check="policy_fingerprint"} 0
+#       ngit_private_watchdog_exit_status{check="manifest_parity"} 0
+#       ngit_private_watchdog_last_run_timestamp 1753500000
+#     same alert as (a), plus a staleness guard so a dead cron is caught:
+#       - alert: NgitPrivateWatchdogStale
+#         expr: time() - ngit_private_watchdog_last_run_timestamp > 7200
+#         for: 15m
+#         labels: {severity: warning, service: ngit-grasp, component: grasp-p}
+#         annotations:
+#           summary: "Watchdog has not reported in >2h"
+#           runbook: "docs/grasp-p/ops/runbook.md#watchdog"
+#
+# Add an absent(ngit_private_watchdog_exit_status) guard if you want a page
+# when the bridge was never deployed. Either way, a divergence page means
+# split-brain or operator-side withholding — see the threat model in
+# docs/grasp-p/plan-v2-fix-log.md (T1) before mutating either node.
+# =============================================================================

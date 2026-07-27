@@ -537,6 +537,45 @@ mod tests {
     }
 
     #[test]
+    fn test_private_full_reissue_filter_construction() {
+        // Phase-4b B1: the periodic full re-issue set is the bare 30640
+        // registration filter plus the current derived filters, ALL with
+        // since=None (full backfill, never incremental).
+
+        // Empty index (zero aliases): exactly the bare 30640 filter — still
+        // re-issued as a cheap self-heal for missed registrations.
+        let empty: Vec<(String, Vec<String>)> = vec![];
+        let mut filters = vec![build_private_registration_filter(None)];
+        filters.extend(build_private_derived_filters(&empty, None));
+        assert_eq!(filters.len(), 1);
+        assert!(
+            filters[0]
+                .kinds
+                .as_ref()
+                .is_some_and(|k| k.contains(&Kind::Custom(30640)))
+        );
+        assert_eq!(filters[0].since, None);
+
+        // Populated index: 30640 + one 30641 #d chunk + one 1059 authors
+        // chunk, none carrying a since filter.
+        let regs = vec![(
+            "a".repeat(32),
+            vec![PublicKey::from_slice(&[1u8; 32]).unwrap().to_hex()],
+        )];
+        let mut filters = vec![build_private_registration_filter(None)];
+        filters.extend(build_private_derived_filters(&regs, None));
+        assert_eq!(filters.len(), 3);
+        let want_kinds = [Kind::Custom(30640), Kind::Custom(30641), Kind::Custom(1059)];
+        for (filter, want) in filters.iter().zip(want_kinds.iter()) {
+            assert!(
+                filter.kinds.as_ref().is_some_and(|k| k.contains(want)),
+                "expected kind {want:?} in {filter:?}"
+            );
+            assert_eq!(filter.since, None, "re-issue filters must be since=None");
+        }
+    }
+
+    #[test]
     fn test_state_event_filters_empty() {
         let repos: HashSet<String> = HashSet::new();
         let filters = state_event_filters_for_our_repos(&repos, None);

@@ -85,6 +85,10 @@ uuid = { version = "1", features = ["v4"] }
 # features are needed.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
+# GRASP-P Phase 4b: exact-host URL matching for domain references in 30640
+# tags / peer allowlists (already compiled transitively via reqwest).
+url = "2"
+
 # Git (for future use)
 # git-http-backend = "0.3"
 
@@ -100,6 +104,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "ngit-grasp"
 path = "src/main.rs"
+
+# Phase-4b WP-F: external split-view watchdog for GRASP-P two-node pairs.
+[[bin]]
+name = "ngit-private-watchdog"
+path = "src/bin/ngit-private-watchdog.rs"
 
 [[test]]
 name = "nip09_announcement_cascade"

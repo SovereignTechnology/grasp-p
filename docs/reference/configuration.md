@@ -79,6 +79,21 @@ NGIT_DOMAIN=localhost:7334  # Development only
 - Must be accessible from the internet for production
 - Include port if non-standard (e.g., `localhost:7334`)
 - Used in repository clone URLs: `https://{NGIT_DOMAIN}/{npub}/{repo}.git`
+- **GRASP-P exact-host checks (Phase-4b A3, src/private/host.rs):** a
+  **port-less** `NGIT_DOMAIN` matches registration `relays`/`server` tag
+  URLs on **any** port (host alone). Consequence: a `server` tag carrying
+  the wrong port on this host still counts as "listing this node" at
+  admission and is then **self-excluded from this node's mirror peer set** —
+  if every listed tag resolves to this node, the mirror has no peer
+  (`ngit_private_mirror_failed_total{reason="no_peer"}`, backlog visible via
+  the `ngit_private_mirror_lag_blobs` gauge) instead of a fetch attempt
+  failing. Spell the port explicitly (`host:port`) when the blob endpoint
+  is not the scheme default; a ported `NGIT_DOMAIN` requires tag URLs to
+  match that effective port exactly.
+- **IPv6:** always use the bracketed form (`[::1]`, `[2001:db8::1]:7334`).
+  A bare unbracketed IPv6 `NGIT_DOMAIN` (e.g. `::1`) is degenerate — the
+  authority splitter misparses it into a garbage host/port pair and the
+  exact-host checks never match.
 
 ---
 
@@ -1301,6 +1316,420 @@ Per-connection limits (built-in to relay-builder, not configurable):
 - Max events per minute per connection: 60
 - Max subscription ID length: 250 characters
 - Max results per filter: 500
+
+---
+
+### GRASP-P Private Repositories (Phase 1–2)
+
+Multi-tenant private repository hosting: kind-30640 registrations, 30641
+state roots, 1059/21059 wraps, Blossom-style blob routes, and the quota
+ledger. Every `NGIT_PRIVATE_*` knob is a no-op unless
+`NGIT_PRIVATE_REPOS_ENABLE=true`.
+
+The admission-affecting knobs (mode, pow bits, whitelist, event/blob caps,
+the three quota scopes, alias/key limits, and the Phase-4b
+replacement-cadence pair) form the `policy_fingerprint` preimage
+(`grasp-p-policy-v2`): paired nodes MUST run identical values or
+registrations accepted on one node can be silently rejected on the other.
+Compare fingerprints via NIP-11 `private_repos.policy_fingerprint` or the
+startup log line.
+
+#### `NGIT_PRIVATE_REPOS_ENABLE`
+
+**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay is byte-identical to a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section.  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No
+
+#### `NGIT_PRIVATE_MAX_BLOB_BYTES`
+
+**Description:** Per-blob size cap in bytes, enforced pre-stream (upload preflight) and mid-stream (chunked PUT aborts). Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `268435456` (256 MiB)  
+**Required:** No
+
+#### `NGIT_PRIVATE_MAX_EVENT_BYTES`
+
+**Description:** Serialized-JSON size cap in bytes for private-repo events (30640/30641/1059/21059). Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `131072` (128 KiB)  
+**Required:** No
+
+#### `NGIT_PRIVATE_QUOTA_TENANT_BYTES`
+
+**Description:** Per hosting-npub total quota in bytes (events + blobs) tracked by the private ledger. Must be greater than `0` and no larger than `NGIT_PRIVATE_GLOBAL_BUDGET_BYTES`. Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `1073741824` (1 GiB)  
+**Required:** No
+
+#### `NGIT_PRIVATE_QUOTA_REPO_BYTES`
+
+**Description:** Per-alias total quota in bytes (events + blobs). Must be greater than `0` and no larger than `NGIT_PRIVATE_QUOTA_TENANT_BYTES`. Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `536870912` (512 MiB)  
+**Required:** No
+
+#### `NGIT_PRIVATE_GLOBAL_BUDGET_BYTES`
+
+**Description:** Whole private-subsystem storage cap in bytes; the ledger refuses charges that would exceed it (HTTP 507 on the blob path). Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `53687091200` (50 GiB)  
+**Required:** No
+
+#### `NGIT_PRIVATE_MAX_ALIASES_PER_TENANT`
+
+**Description:** Maximum registrations (aliases) per hosting npub (anti-sybil). Conflict-merge winners are exempt from the check (never from the accounting) so node-local occupancy cannot flip the deterministic merge. Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `64`  
+**Required:** No
+
+#### `NGIT_PRIVATE_MAX_WRITE_KEYS_PER_ALIAS`
+
+**Description:** Maximum `w` + `aux` write keys per alias registration. Part of the `policy_fingerprint` preimage.  
+**Type:** Integer  
+**Default:** `64`  
+**Required:** No
+
+#### `NGIT_PRIVATE_STATE_HISTORY_EDITIONS`
+
+**Description:** Kind-30641 edition ring depth kept in the private meta store (superseded editions stay fetchable this many deep). Must be at least `1`.  
+**Type:** Integer  
+**Default:** `16`  
+**Required:** No
+
+#### `NGIT_PRIVATE_GC_GRACE_SECS`
+
+**Description:** Grace period in seconds before an unreferenced blob may be deleted by the GC pass (denylisted blobs bypass the grace).  
+**Type:** Integer  
+**Default:** `86400` (24 hours)  
+**Required:** No
+
+#### `NGIT_PRIVATE_GC_INTERVAL_SECS`
+
+**Description:** Interval in seconds between private blob GC passes.  
+**Type:** Integer  
+**Default:** `3600` (1 hour)  
+**Required:** No
+
+#### `NGIT_PRIVATE_OFFBOARD_RETENTION_SECS`
+
+**Description:** Tombstoned-alias purge delay in seconds.  
+**Type:** Integer  
+**Default:** `2592000` (30 days)  
+**Required:** No
+
+#### `NGIT_PRIVATE_BLOB_DATA_PATH`
+
+**Description:** Blob store root directory. When unset the relay derives `<relay_data_path>/blobs`. Must not be empty when set.  
+**Type:** String (path)  
+**Default:** unset (`<relay_data_path>/blobs`)  
+**Required:** No
+
+#### `NGIT_PRIVATE_META_DATA_PATH`
+
+**Description:** Private meta store (heed/LMDB env) root holding registrations, key claims, and the quota ledger. When unset the relay derives `<relay_data_path>/private-meta`. Must not be empty when set.  
+**Type:** String (path)  
+**Default:** unset (`<relay_data_path>/private-meta`)  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_ENABLE`
+
+**Description:** Enable the Phase-2 blob mirror: this node fetches blobs referenced by synced 30641 editions from peer blob servers so a pair converges on bytes as well as events.  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_PEER_URLS`
+
+**Description:** Comma-separated peer blob-server base URLs for the mirror. When unset, peers are derived from each registration's `server` tags (minus this node's own domain).  
+**Type:** String (CSV URLs)  
+**Default:** unset (derive from `server` tags)  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_MAX_CONCURRENCY`
+
+**Description:** Maximum concurrent blob mirror fetches. Must be greater than `0` when the mirror is enabled.  
+**Type:** Integer  
+**Default:** `4`  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_FETCH_TIMEOUT_SECS`
+
+**Description:** Per-blob mirror fetch timeout in seconds. Must be greater than `0` when the mirror is enabled.  
+**Type:** Integer  
+**Default:** `120`  
+**Required:** No
+
+#### `NGIT_PRIVATE_SYNC_PEER_URLS`
+
+**Description:** Comma-separated operator-approved peer relay URLs for private-repo sync. Outbound private-sync WebSocket connections are made ONLY to this allowlist — tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). When unset, no private-sync peer connections are initiated (bootstrap relays still carry the private filters).  
+**Type:** String (CSV URLs)  
+**Default:** unset (no private-sync peers)  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_ALLOW_PRIVATE_IPS`
+
+**Description:** SSRF guard override: when `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and private-sync peer relays may use plain `ws://` or internal IPs. The default `false` drops such peers — production fetches only over `https`/`wss` from public hosts. Set `true` only for local testing (e.g. a `127.0.0.1` node pair).  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No
+
+#### `NGIT_PRIVATE_ACCEPT_DIRECT_INVITES`
+
+**Description:** Accept kind-3313 direct invites for storage. Currently only `false` is honored (invites are rejected).  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No
+
+#### `NGIT_PRIVATE_PER_TENANT_METRICS`
+
+**Description:** Opt in to per-tenant metric labels. The default `false` exposes aggregate metrics only, keeping Prometheus label cardinality bounded regardless of tenant count.  
+**Type:** Boolean  
+**Default:** `false`  
+**Required:** No
+
+---
+
+### GRASP-P Registration Admission Mode (WP-E)
+
+These knobs gate kind-30640 **new-alias** registrations when
+`NGIT_PRIVATE_REPOS_ENABLE=true`. (The master switch and the quota,
+storage, GC, and mirror/sync knobs are documented in the Phase 1–2
+section above.)
+
+#### `NGIT_PRIVATE_REGISTRATION_MODE`
+
+**Description:** Admission mode for **new** private-repo aliases: `open` (any tenant), `whitelist` (only `NGIT_PRIVATE_TENANT_WHITELIST` npubs), `pow` (NIP-13 proof of work on the 30640), `paid` (reserved — fails `Config::validate()`). The mode gate applies to NEW aliases only: same-tenant replacements/rotations of an existing alias and cross-tenant conflict-merge survivors are never re-gated.  
+**Type:** Enum (`open` \| `whitelist` \| `pow` \| `paid`)  
+**Default:** `whitelist`  
+**Required:** No
+
+**Notes:**
+
+- **Default changed in WP-E (was `open` in Phase 1–4b).** The locked operator decision: launch posture is whitelist — in open mode every fresh key receives the full per-tenant blob quota, so ~50 pseudonymous tenants can lawfully exhaust the whole-subsystem storage budget (server issue !7). `open` is intended for staging/self-use only and must now be selected explicitly.
+- **`policy_fingerprint` change on upgrade.** The mode is part of the `grasp-p-policy-v2` fingerprint preimage. An operator who never set the mode explicitly will see their fingerprint change on upgrade (`open` → `whitelist`): paired nodes must upgrade together (or set the mode explicitly on both) to keep fingerprints — and therefore cross-node acceptance — in parity.
+- **Empty whitelist = accept-nothing (safe default).** `whitelist` mode with an empty `NGIT_PRIVATE_TENANT_WHITELIST` rejects every new registration; startup emits a loud `tracing::warn!` ("all new private-repo registrations will be rejected") so an operator who expected open mode sees it immediately.
+
+**Boot-time re-enforcement (exact behavior, pinned by the exit12 integration test):**
+
+On boot, stored kind-30640 events are replayed through the registration handler only when the private meta index is missing or holds a different edition (`boot_reconcile`). Mode changes are re-enforced **only** where a replay is a *fresh* admission — a meta-index rebuild after a wipe, or a cross-tenant conflict winner. Crucially this is **non-destructive**:
+
+- An operator who accumulated registrations under `open` and upgrades to the `whitelist` default keeps every existing tenant across reboots: the meta record matches the stored event, no replay happens, and tenants keep serving (30640 REQ, blob GET, new 30641 editions, rotations).
+- A replay that no longer passes registration checks is **warn-logged only** — no meta mutation, no eviction, no relay-DB coordinate pruned. Mode enforcement belongs at admission time, never as retroactive eviction.
+- Exception to be aware of: after a **meta-store wipe** (disaster recovery from the relay DB), replays *are* fresh admissions, so a stricter mode blocks the rebuild. Remedy: temporarily set `open` (or list the affected npubs), restart to rebuild the index, then flip back.
+
+#### `NGIT_PRIVATE_POW_BITS`
+
+**Description:** NIP-13 leading-zero bits required on kind-30640 registrations when `NGIT_PRIVATE_REGISTRATION_MODE=pow`.  
+**Type:** Integer  
+**Default:** `20`  
+**Required:** No (must be 1–40 when private repos are enabled)
+
+#### `NGIT_PRIVATE_TENANT_WHITELIST`
+
+**Description:** Comma-separated npubs (bech32) allowed to register new aliases when `NGIT_PRIVATE_REGISTRATION_MODE=whitelist`. Part of the `policy_fingerprint` preimage — paired nodes must run identical lists.  
+**Type:** String (CSV)  
+**Default:** `""` (empty — rejects all new registrations)  
+**Required:** No
+
+---
+
+### GRASP-P Private Repository Rate Limits (Phase 4b)
+
+These knobs tune the per-write-key token bucket for **client-submitted**
+private writes. They only have an effect when `NGIT_PRIVATE_REPOS_ENABLE=true`.
+Synced/replayed traffic (loopback sync delivery, hot-cache reprocess) always
+bypasses this limiter — it is node-local DoS protection with no cross-node
+convergence impact, and is therefore deliberately NOT part of the
+`policy_fingerprint` preimage. (The master switch, quota/storage, and
+mirror/sync knobs are documented in the Phase 1–2 section above.)
+
+#### `NGIT_PRIVATE_WRITE_RATE_CAPACITY`
+
+**Description:** Per-write-key token bucket capacity for client-submitted private writes: kind 30641/1059/21059 events (1 token per event) and blob PUTs (1 token per request). `0` = unlimited (limiter disabled). The default is deliberately generous: legitimate client flows — including cord-git widen→narrow key rotations — must never trip it; only abuse floods (e.g. quota-uncharged 21059 spam, which is never quota-charged) get capped. Exceeding clients receive NIP-20 OK false with `rate-limited; retry later` (blob PUT: HTTP 429 with `Retry-After`).  
+**Type:** Integer  
+**Default:** `120`  
+**Required:** No
+
+#### `NGIT_PRIVATE_WRITE_RATE_REFILL_PER_MIN`
+
+**Description:** Refill rate (tokens per minute) for the per-write-key client write bucket. Must be greater than `0` when `NGIT_PRIVATE_WRITE_RATE_CAPACITY` is non-zero.  
+**Type:** Integer  
+**Default:** `60`  
+**Required:** No
+
+**Metrics:**
+
+- `ngit_private_rate_limited_total{path}` — rejections by path (`state_root`, `wrap`, `ewrap`, `upload`)
+
+**Churn caveat (per-KEY, not per-IP):** the bucket is keyed by the event's
+write pubkey, so an attacker cycling fresh keys gets a fresh bucket per key
+and is NOT bounded by this limiter — the effective per-IP bounds are the
+generic connection limit (`NGIT_MAX_CONNECTIONS`) plus the nginx rate zones
+(docs/grasp-p/ops/nginx-upload-zones.conf). The bucket's real value is
+bounding **registered** keys gone rogue (a compromised w-key can't exceed
+its capacity/refill) and making quota-uncharged kind-21059 spam cost a key
+per bucket instead of being free.
+
+---
+
+### GRASP-P Registration Replacement Cadence (Phase 4b)
+
+Kind-30640 is addressable, so replacements are free — and each one
+re-triggers sync index rebuilds plus derived-filter re-issues to all peers
+within seconds. These knobs bound the same-tenant replacement rate per
+`(tenant, alias)`. Unlike the write-rate bucket above, these knobs affect
+**cross-node acceptance** (a same-tenant newer edition can be accepted on
+one node and cadence-rejected on another), so they are part of the
+`policy_fingerprint` preimage (label `grasp-p-policy-v2`) — paired nodes
+MUST run identical values.
+
+Rejected replacements are HELD by the relay and retried without any client
+republish (FS-2/R2-1): the newest cadence-rejected edition per
+`(tenant, alias)` bucket is kept in the rejected index — newest-only, so a
+strictly newer edition replaces the held one and an older-or-equal one is
+id-only dropped — and the 5s registration-sync timer re-offers it once the
+wall-clock bucket has refilled (refill-aware eligibility: the per-token
+refill period, clamped to [60s, 1h], with ±20% per-hold jitter). The hold
+is bounded by a 1024-entry registrations sub-cap within the 4096-entry
+global rejected-event hold and drains at most 64 retries per tick (FIFO,
+oldest-insertion first). A retry still over cadence is re-held; an edition
+that went stale while held is absorbed by the anchor-repair accept-no-op;
+the hourly full re-issue (below) is the backstop healer for holds that
+expire or overflow.
+
+#### `NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY`
+
+**Description:** Per-`(tenant, alias)` token bucket capacity for same-tenant kind-30640 replacements. `0` = unlimited. Keep the burst at `>= 4`: a revocation rotation is widen→narrow = 2 replacements in quick succession, plus client error retries. Only same-tenant newer replacements are gated — new-alias registrations, stale editions (anchor repair), cross-tenant conflict merges (§3.2 hard invariant), and boot replays are exempt. Exceeding tenants receive NIP-20 OK false with `replacement rate-limited; retry later`.  
+**Type:** Integer  
+**Default:** `8`  
+**Required:** No
+
+#### `NGIT_PRIVATE_REGISTRATION_REPLACE_REFILL_PER_HOUR`
+
+**Description:** Refill rate (replacements per hour) for the per-`(tenant, alias)` replacement bucket — bounds sustained replacement floods. Must be greater than `0` when `NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY` is non-zero.  
+**Type:** Integer  
+**Default:** `4`  
+**Required:** No
+
+---
+
+### GRASP-P Periodic Full Re-issue (Phase 4b)
+
+Live delivery plus the index-change re-issue path cannot heal every gap:
+rejected-hot-cache entries expire, negentropy reconciliation has blind
+spots, and held cadence-limited kind-30640 rejections (above) can leave
+the hold unaccepted (expiry/overflow). This timer re-issues the **current** private sync filters —
+the Layer-1 kind-30640 registration filter plus the derived 30641 `#d` /
+1059 author filters — to every live peer with `since=None` (full
+backfill), with ±10% jitter so paired nodes do not fire in lockstep. With
+an empty index (zero aliases) the bare 30640 filter is still re-issued as
+a cheap self-heal for missed registrations. Public subscriptions are never
+torn down (that remains `daily_sync` territory).
+
+This is a node-local recovery knob: it does not affect acceptance, so it
+is **not** part of the `policy_fingerprint` preimage and paired nodes may
+run different values.
+
+#### `NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS`
+
+**Description:** Interval in seconds between full re-issue rounds. `0` = disabled (not recommended outside single-node deployments: redelivery-dependent gaps then only heal on reconnect or the daily fresh sync).  
+**Type:** Integer  
+**Default:** `3600`  
+**Required:** No
+
+**Metrics:**
+
+- `ngit_private_full_reissue_total` — rounds that ACTUALLY re-issued at least one live peer
+- `ngit_private_full_reissue_skipped_total` — rounds where EVERY live relay was skipped (health-tracker rate-limit cooldown or the FS-3 re-issue floor below)
+
+Alert only when BOTH stop increasing while private repos are enabled: a
+flat delivered counter with a rising skipped counter means a
+chronically-skipped peer (check the FS-3 floor value and peer health), not
+a dead timer.
+
+---
+
+### GRASP-P Re-issue Floor (Phase 4b)
+
+#### `NGIT_PRIVATE_REISSUE_MIN_INTERVAL_SECS`
+
+**Description:** Minimum interval (seconds) between private sync-filter re-issues to the same peer, across BOTH triggers (PrivateSyncIndex-change-derived filter pushes and the `NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS` full re-issue above). Past the 70-filter consolidation threshold, a churning derived-filter set would otherwise force a full consolidate (unsubscribe-all + resubscribe + since=None backfill) on every index-dirty 5s tick — at 128 aliases × the 4/hour replacement-cadence budget that is a dirty tick every ~7s, i.e. near-continuous consolidation. A re-issue skipped by this floor is retried once the interval lapses (deferred, never dropped). Node-local recovery knob only — acceptance is unaffected, so paired nodes may run different values (NOT part of the `policy_fingerprint` preimage).  
+**Type:** Integer (seconds)  
+**Default:** `30`  
+**Required:** No  
+**Special values:** `0` = unlimited (pre-FS-3 behavior).
+
+---
+
+### GRASP-P Blob Mirror Retry Backoff (Phase 4b)
+
+The blob mirror classifies every fetch failure and gates **transient**
+classes per blob with an exponential backoff (`base * 2^(attempt-1)`,
+capped at `max`, ±20% jitter): transport errors, peer HTTP 5xx, no
+available peer, and `404` on all peers — the latter always retries at the
+max interval because a late upload is legitimate. **Deterministic**
+classes (`quota`, `too_large`, `verify:`, `store:`, `blocked`, `reserve:`,
+`sink:`, `write:`) are NOT gated: they keep the flat repair-scan cadence
+and only succeed once the underlying condition changes (GC frees space,
+config changes, …). Backoff-gated blobs stay counted in
+`ngit_private_mirror_lag_blobs` — the gate suppresses re-enqueue, never
+the gauge. There is no give-up: a referenced blob may legitimately appear
+late. Retry state is in-memory only; a restart resets every blob to the
+base interval (the boot repair scan re-derives all wants anyway).
+
+These are node-local recovery knobs: they do not affect acceptance, so
+they are **not** part of the `policy_fingerprint` preimage.
+
+#### `NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS`
+
+**Description:** Base delay in seconds for the per-blob exponential retry backoff. Must be greater than `0` when `NGIT_PRIVATE_MIRROR_ENABLE=true`.  
+**Type:** Integer  
+**Default:** `60`  
+**Required:** No
+
+#### `NGIT_PRIVATE_MIRROR_RETRY_MAX_SECS`
+
+**Description:** Cap in seconds for the retry backoff; also the fixed retry interval for blobs the peers answer `404` (possible late upload). Must be greater than or equal to `NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS`.  
+**Type:** Integer  
+**Default:** `3600`  
+**Required:** No
+
+---
+
+### GRASP-P Blob Denylist / Takedown (Phase 4b)
+
+The denylist is the node-local legal takedown mechanism: blob sha256
+digests this node must not serve (`GET`/`HEAD` → `451`), not accept
+(upload preflight → `451`; in-flight uploads whose hash becomes denylisted
+mid-stream fail at commit with `451`), not store (hashes newly present
+after a reload are purged immediately — all claims freed, ledger charges
+released, bytes unlinked), and not mirror (all mirror enqueue/fetch/lag
+paths skip denylisted shas).
+
+Paired nodes in different jurisdictions may legitimately run different
+lists: the denylist is deliberately **not** part of the
+`policy_fingerprint` preimage, and its enforcement never changes event
+acceptance.
+
+#### `NGIT_PRIVATE_DENYLIST_PATH`
+
+**Description:** Comma-separated list of denylist files (per-node / per-jurisdiction lists), each containing one sha256 hex digest per line (trimmed, lowercased; blank/comment/garbage lines ignored). A **missing** file is tolerated (warning + treated as empty); a **present-but-unreadable** file is a hard boot error (fail loud on misconfiguration). Each file is capped at **64 MiB / 1M lines** (FS-6): exceeding either cap is a hard boot error, and on reload the file keeps its last-known entries with an error log every tick — the same boot-loud / reload-keep semantics as an unreadable file. Writers MUST update files **atomically** (write a temp file, then rename over the live path): the reload keys off mtime, and a torn write is a known staleness window. Unset = empty denylist.  
+**Type:** String (comma-separated paths)  
+**Default:** unset  
+**Required:** No
+
+#### `NGIT_PRIVATE_DENYLIST_RELOAD_SECS`
+
+**Description:** Interval in seconds between denylist file reloads. Only changed files are re-read; the live set is swapped atomically. Hashes **newly present** after a reload are purged immediately (see above); hashes **removed** from the files unblock reads, but bytes already purged stay gone — clients must re-upload. `0` = reload disabled (the boot-time set is kept). During reload a present-but-unreadable file keeps its last-known entries and is retried every tick (a transient read error must not silently unblock taken-down content).  
+**Type:** Integer  
+**Default:** `60`  
+**Required:** No
+
+**Metrics:**
+
+- `ngit_private_denylist_entries` — live denylist size (set at boot and on every reload swap); alert on an unexpected drop to 0
+- `ngit_private_denylist_purged_total` — blobs purged because their sha256 is denylisted (reload purge-on-add + GC denylist sweep)
 
 ---
 
