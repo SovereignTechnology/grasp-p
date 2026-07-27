@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prevent relay-owner private keys from appearing in process arguments by
+  loading NixOS secret files through a systemd credential. Configured empty or
+  invalid keys now stop startup instead of silently generating a new identity,
+  and existing persistent fallback key files are restricted to mode `0600`
+  before being read.
 - Fix maintainer invitation recovery after a production restart by starting the
   relay and SyncManager before scanning retained deletion requests. The
   potentially long retention catch-up now begins immediately in the existing
@@ -59,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Relay-owner private keys are no longer accepted through
+  `--relay-owner-nsec`; use the `relay_owner_nsec` systemd credential,
+  `NGIT_RELAY_OWNER_NSEC`, or `.relay-owner.nsec`.
 - Addressed a production storage imbalance where roughly 50k of 60k stored events were deletion requests. Deletion requests now have a bounded lifecycle, so requests that are no longer relevant are reconciled and retired while requests that may still affect valid event handling are preserved.
 - Deletion-disrespector mode now explicitly applies to both NIP-09 deletion requests and NIP-62 request-to-vanish events.
 - Retired the hidden `repair-deletion-requests` maintenance command.

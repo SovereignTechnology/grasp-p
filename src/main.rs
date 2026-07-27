@@ -53,13 +53,7 @@ async fn main() -> Result<()> {
         Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
         Cli::Serve(config) => {
             let mut config = *config;
-            // Finish initialising the Config (load relay owner key if not provided).
-            if config.relay_owner_nsec.is_none() {
-                config.relay_owner_nsec = Some(Config::load_or_generate_relay_owner_key()?);
-            } else {
-                config.relay_owner_nsec =
-                    config.relay_owner_nsec.take().map(|s| s.trim().to_string());
-            }
+            config.relay_owner_nsec = Some(Config::load_relay_owner_key()?);
             run_relay(config).await
         }
     }
