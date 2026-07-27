@@ -22,6 +22,32 @@ use tokio::sync::mpsc;
 
 use crate::nostr::SharedDatabase;
 
+/// Interval between relay-status checks while a connection attempt is in flight.
+///
+/// nostr-sdk may return from `try_connect_relay` while another task still has
+/// the relay in `Connecting`; subscriptions must wait for actual readiness.
+const CONNECTION_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+async fn wait_for_connected_status<F>(mut relay_status: F) -> Result<(), RelayStatus>
+where
+    F: FnMut() -> RelayStatus,
+{
+    loop {
+        let status = relay_status();
+        match status {
+            RelayStatus::Connected => return Ok(()),
+            RelayStatus::Disconnected
+            | RelayStatus::Terminated
+            | RelayStatus::Banned
+            | RelayStatus::Sleeping
+            | RelayStatus::Shutdown => return Err(status),
+            RelayStatus::Initialized | RelayStatus::Pending | RelayStatus::Connecting => {
+                tokio::time::sleep(CONNECTION_STATUS_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
 /// Events from a relay connection
 #[derive(Debug)]
 pub enum RelayEvent {
@@ -150,7 +176,7 @@ impl RelayConnection {
     /// This method:
     /// 1. Adds the relay to the client
     /// 2. Establishes the WebSocket connection
-    /// 3. Verifies connection was established
+    /// 3. Waits for the relay status to report `Connected`
     ///
     /// Subscriptions are handled separately via handle_connect_or_reconnect.
     ///
@@ -163,33 +189,51 @@ impl RelayConnection {
     /// * `Ok(())` - Connection established successfully
     /// * `Err(String)` with error description on failure
     pub async fn connect(&self, connection_timeout_secs: u64) -> Result<(), String> {
-        // Add relay to client
-        self.client
-            .add_relay(&self.url)
-            .await
-            .map_err(|e| format!("Failed to add relay {}: {}", self.url, e))?;
-
-        // Establish connection using try_connect_relay for immediate failure detection
-        //
-        // Key difference from client.connect():
-        // - try_connect_relay: Single attempt with timeout, returns Err on failure,
-        //   does NOT spawn background retry task (we control retries via HealthTracker)
-        // - connect(): Spawns background task, returns immediately, auto-retries forever
-        //
-        // Using try_connect_relay gives us:
-        // 1. Immediate error return on connection failure
-        // 2. Configurable timeout (set to base_backoff_secs to ensure retry timing works)
-        // 3. No conflicting retry logic (we use HealthTracker for backoff)
-        // 4. Cleaner error messages for metrics recording
-        //
-        // See: nostr-sdk-0.44 Client::try_connect_relay documentation
-        self.client
-            .try_connect_relay(
-                &self.url,
-                std::time::Duration::from_secs(connection_timeout_secs),
+        let connection_timeout = Duration::from_secs(connection_timeout_secs);
+        let connection_deadline = tokio::time::Instant::now() + connection_timeout;
+        let timeout_error = || {
+            format!(
+                "Timed out connecting to relay {} after {} seconds",
+                self.url, connection_timeout_secs
             )
+        };
+
+        let relay = tokio::time::timeout_at(connection_deadline, async {
+            self.client
+                .add_relay(&self.url)
+                .await
+                .map_err(|e| format!("Failed to add relay {}: {}", self.url, e))?;
+
+            self.client
+                .relay(&self.url)
+                .await
+                .map_err(|e| format!("Failed to get relay {}: {}", self.url, e))?
+                .ok_or_else(|| format!("Relay {} was not added to the client", self.url))
+        })
+        .await
+        .map_err(|_| timeout_error())??;
+
+        // Use one deadline for both the SDK attempt and readiness verification.
+        // Cancelling the SDK call with an outer timeout can leave its relay
+        // status stranded at Connecting, so pass it the remaining budget.
+        let remaining = connection_deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.client
+            .try_connect_relay(&self.url, remaining)
             .await
             .map_err(|e| format!("Failed to connect to relay {}: {}", self.url, e))?;
+
+        tokio::time::timeout_at(
+            connection_deadline,
+            wait_for_connected_status(|| relay.status()),
+        )
+        .await
+        .map_err(|_| timeout_error())?
+        .map_err(|status| {
+            format!(
+                "Relay {} entered terminal status {} before connecting",
+                self.url, status
+            )
+        })?;
 
         tracing::info!(url = %self.url, "Connected to relay");
         Ok(())
@@ -620,6 +664,44 @@ impl RelayConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_readiness_waits_until_status_is_connected() {
+        let mut statuses = [
+            RelayStatus::Connecting,
+            RelayStatus::Connecting,
+            RelayStatus::Connected,
+        ]
+        .into_iter();
+
+        wait_for_connected_status(|| statuses.next().expect("status sequence exhausted"))
+            .await
+            .expect("delayed connection should become ready");
+    }
+
+    #[tokio::test]
+    async fn connection_readiness_remains_bounded_when_connecting_never_completes() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(60),
+            wait_for_connected_status(|| RelayStatus::Connecting),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a relay stuck in Connecting must not be reported as ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_readiness_fails_on_terminal_status() {
+        let mut statuses = [RelayStatus::Connecting, RelayStatus::Disconnected].into_iter();
+
+        assert_eq!(
+            wait_for_connected_status(|| statuses.next().expect("status sequence exhausted")).await,
+            Err(RelayStatus::Disconnected)
+        );
+    }
 
     #[test]
     fn test_normalize_url_with_wss_scheme() {

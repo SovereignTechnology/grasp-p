@@ -514,6 +514,8 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 - **Three-way diff** (`compute_actions`) determines new subscriptions needed
 - **Smart reconnection** - uses `since` filter for quick reconnects (<15 min), fresh sync otherwise
 - **Health tracking** with exponential backoff for failing relays
+- **Bounded connection workers** keep slow DNS and websocket handshakes out of
+  the sync actor while limiting network pressure to eight concurrent attempts
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when count exceeds 70 to prevent subscription
   explosion; rebuilds are deferred until in-flight batches drain so EOSE and

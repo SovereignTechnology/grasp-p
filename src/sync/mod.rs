@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use nostr_sdk::prelude::*;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
@@ -241,6 +241,7 @@ impl RelayState {
     /// therefore keep the relay connected.
     fn is_disconnect_candidate(&self, has_pending_batches: bool, has_desired_work: bool) -> bool {
         if self.is_bootstrap
+            || self.connection_status == ConnectionStatus::Connecting
             || self.connection_status == ConnectionStatus::Disconnecting
             || !self.repos.is_empty()
             || !self.root_events.is_empty()
@@ -403,11 +404,20 @@ pub struct EoseNotification {
     pub sub_id: SubscriptionId,
 }
 
-/// Notification from spawned tasks about successful connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectAttemptToken(u64);
+
 #[derive(Debug)]
-pub struct ConnectNotification {
-    /// The relay URL that connected
-    pub relay_url: String,
+enum ConnectAttemptOutcome {
+    Connected,
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct ConnectAttemptResult {
+    relay_url: String,
+    token: ConnectAttemptToken,
+    outcome: ConnectAttemptOutcome,
 }
 
 /// Quick reconnect window in seconds (15 minutes)
@@ -416,9 +426,51 @@ const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 /// Maximum filter count before triggering consolidation
 const CONSOLIDATION_THRESHOLD: usize = 70;
 
+/// Bound concurrent DNS and websocket handshakes so a large relay list cannot
+/// exhaust network resources while keeping the sync actor responsive.
+const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
+
 /// Page size threshold for historic sync pagination (non-negentropy)
 /// If a subscription receives >= 75 events, we fetch the next page
 const PAGINATION_THRESHOLD: usize = 75;
+
+fn reserve_connect_attempt(
+    in_flight: &mut HashMap<String, ConnectAttemptToken>,
+    next_token: &mut u64,
+    relay_url: &str,
+) -> Option<ConnectAttemptToken> {
+    if in_flight.contains_key(relay_url) {
+        return None;
+    }
+    *next_token = next_token
+        .checked_add(1)
+        .expect("connect attempt token exhausted");
+    let token = ConnectAttemptToken(*next_token);
+    in_flight.insert(relay_url.to_string(), token);
+    Some(token)
+}
+
+fn take_connect_attempt(
+    in_flight: &mut HashMap<String, ConnectAttemptToken>,
+    relay_url: &str,
+    token: ConnectAttemptToken,
+) -> bool {
+    if in_flight.get(relay_url) != Some(&token) {
+        return false;
+    }
+    in_flight.remove(relay_url);
+    true
+}
+
+async fn begin_connect_attempt(
+    semaphore: Arc<Semaphore>,
+    health_tracker: Arc<RelayHealthTracker>,
+    relay_url: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = semaphore.acquire_owned().await.ok()?;
+    health_tracker.record_attempt(relay_url);
+    Some(permit)
+}
 
 #[derive(Debug, Default)]
 struct DeferredConsolidations {
@@ -743,14 +795,20 @@ pub struct SyncManager {
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
     next_batch_id: u64,
+    /// Monotonic identity for rejecting stale connection results.
+    next_connect_attempt_token: u64,
+    /// One active or queued connection attempt per canonical relay URL.
+    in_flight_connect_attempts: HashMap<String, ConnectAttemptToken>,
+    /// Shared bound for DNS and websocket handshakes.
+    connect_attempt_semaphore: Arc<Semaphore>,
     /// Relays whose subscription consolidation waits for in-flight batches to drain.
     deferred_consolidations: DeferredConsolidations,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
     eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
-    /// Channel for connect notifications (set during run)
-    connect_tx: Option<tokio::sync::mpsc::Sender<ConnectNotification>>,
+    /// Returns connection outcomes to the sync actor for serialized state changes.
+    connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
     deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Channel for broadcasting shutdown signal to all background tasks
@@ -831,10 +889,13 @@ impl SyncManager {
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
+            next_connect_attempt_token: 0,
+            in_flight_connect_attempts: HashMap::new(),
+            connect_attempt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS)),
             deferred_consolidations: DeferredConsolidations::default(),
             disconnect_tx: None,
             eose_tx: None,
-            connect_tx: None,
+            connect_attempt_result_tx: None,
             deferred_consolidation_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
@@ -1650,7 +1711,7 @@ impl SyncManager {
     /// 2. Spawns daily timer for periodic fresh syncs
     /// 3. Connects to bootstrap relay if configured
     /// 4. Handles relay actions from self-subscriber
-    /// 5. Handles disconnect, EOSE, and connect notifications from spawned relay tasks
+    /// 5. Handles disconnect/EOSE notifications and connection-worker results
     pub async fn run(mut self) {
         use tokio::sync::mpsc;
 
@@ -1669,8 +1730,10 @@ impl SyncManager {
         // 3. Create EOSE channel for spawned tasks -> manager communication
         let (eose_tx, mut eose_rx) = mpsc::channel::<EoseNotification>(100);
 
-        // 4. Create connect channel for spawned tasks -> manager communication
-        let (connect_tx, mut connect_rx) = mpsc::channel::<ConnectNotification>(100);
+        // 4. Connection workers never mutate manager state. Their unbounded
+        // result channel cannot make a completed worker wait behind the actor.
+        let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
+            mpsc::unbounded_channel::<ConnectAttemptResult>();
 
         // Batch completion can be synchronous, so use a non-blocking wakeup
         // instead of waiting for pending work while holding the actor lock.
@@ -1694,7 +1757,7 @@ impl SyncManager {
         // 5b. Store channel senders for use by handlers
         self.disconnect_tx = Some(disconnect_tx.clone());
         self.eose_tx = Some(eose_tx.clone());
-        self.connect_tx = Some(connect_tx.clone());
+        self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
         self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
@@ -1703,7 +1766,7 @@ impl SyncManager {
             match canonical_relay_key(bootstrap_url) {
                 Ok(relay_url) => {
                     self.register_relay(relay_url.clone(), true).await;
-                    self.try_connect_relay(&relay_url).await;
+                    self.schedule_connect_relay(&relay_url).await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1751,7 +1814,7 @@ impl SyncManager {
             run_purgatory_announcement_sync(purgatory_sync_manager, purgatory_sync_shutdown).await;
         });
 
-        // 12. Main loop - handle actions from self-subscriber, disconnect, EOSE, and connect notifications
+        // 12. Main loop - handle actions, lifecycle notifications, and worker results
         loop {
             // Wait for an event without holding the lock
             tokio::select! {
@@ -1791,16 +1854,15 @@ impl SyncManager {
                         }
                     }
                 }
-                connect = connect_rx.recv() => {
-                    match connect {
-                        Some(notification) => {
-                            // Acquire lock to process connect
+                result = connect_attempt_result_rx.recv() => {
+                    match result {
+                        Some(result) => {
+                            // Connection state changes remain serialized through the actor.
                             let mut manager = sync_manager.lock().await;
-                            manager.handle_connect_or_reconnect(&notification.relay_url).await;
+                            manager.handle_connect_attempt_result(result).await;
                         }
                         None => {
-                            // All connect senders dropped - unlikely but handle gracefully
-                            tracing::debug!("Connect channel closed");
+                            tracing::debug!("Connect attempt result channel closed");
                         }
                     }
                 }
@@ -1850,7 +1912,7 @@ impl SyncManager {
 
                 // Register relay (creates RelayConnection, initializes RelayState, updates metrics)
                 self.register_relay(action.relay_url.clone(), false).await;
-                self.try_connect_relay(&action.relay_url).await;
+                self.schedule_connect_relay(&action.relay_url).await;
                 // Connection will trigger handle_connect_or_reconnect which will process items
                 return;
             }
@@ -2371,7 +2433,7 @@ impl SyncManager {
     ///
     /// Creates a RelayConnection object and stores it in the connections HashMap.
     /// Also initializes RelayState if it doesn't exist.
-    /// Does NOT connect - connection happens via try_connect_relay or retry_disconnected_relays.
+    /// Does NOT connect - connection happens via the bounded scheduler.
     /// The RelayConnection persists forever and is reused on reconnects.
     async fn register_relay(&mut self, relay_url: String, is_bootstrap: bool) {
         let relay_url = match canonical_relay_key(&relay_url) {
@@ -2443,109 +2505,164 @@ impl SyncManager {
         }
     }
 
-    /// Attempt a single connection to a registered relay
+    /// Queue one connection attempt without blocking the sync actor.
     ///
-    /// Uses the existing RelayConnection from the HashMap and attempts to connect.
-    /// On success, sends ConnectNotification which triggers handle_connect_or_reconnect.
-    /// On failure, updates state and health tracker.
-    async fn try_connect_relay(&mut self, relay_url: &str) {
-        // 1. Mark attempting and update metrics
-        {
-            let mut index = self.relay_sync_index.write().await;
-            if let Some(state) = index.get_mut(relay_url) {
-                state.connection_status = ConnectionStatus::Connecting;
+    /// DNS and the websocket handshake run in a spawned worker, bounded globally
+    /// by `MAX_CONCURRENT_CONNECT_ATTEMPTS`. The actor owns every lifecycle
+    /// transition when it receives the worker result.
+    async fn schedule_connect_relay(&mut self, relay_url: &str) {
+        let relay_url = match canonical_relay_key(relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(relay = %relay_url, error = %error, "Rejecting invalid sync relay target");
+                return;
             }
+        };
+        let Some(result_tx) = self.connect_attempt_result_tx.clone() else {
+            tracing::error!(relay = %relay_url, "Connection scheduler is not running");
+            return;
+        };
+        let Some(connection) = self.connections.get(&relay_url).cloned() else {
+            tracing::error!(relay = %relay_url, "No RelayConnection registered");
+            return;
+        };
+
+        let can_schedule = {
+            let mut index = self.relay_sync_index.write().await;
+            let can_schedule = index
+                .get(&relay_url)
+                .is_some_and(|state| state.connection_status == ConnectionStatus::Disconnected);
+            if can_schedule {
+                index
+                    .get_mut(&relay_url)
+                    .expect("relay state checked immediately above")
+                    .connection_status = ConnectionStatus::Connecting;
+            }
+            can_schedule
+        };
+        if !can_schedule {
+            tracing::trace!(relay = %relay_url, "Relay does not need another connection attempt");
+            return;
         }
 
-        // Update metrics to show connecting status
-        if let Some(ref metrics) = self.metrics {
-            metrics.record_connection_status(relay_url, ConnectionStatus::Connecting);
-        }
-
-        // 2. Record attempt in health tracker
-        self.health_tracker.record_attempt(relay_url);
-
-        // 3. Get connection and attempt
-        let connection = match self.connections.get(relay_url) {
-            Some(c) => c,
+        let token = match reserve_connect_attempt(
+            &mut self.in_flight_connect_attempts,
+            &mut self.next_connect_attempt_token,
+            &relay_url,
+        ) {
+            Some(token) => token,
             None => {
-                tracing::error!(relay = %relay_url, "No RelayConnection registered");
+                tracing::trace!(relay = %relay_url, "Connection attempt already queued");
                 return;
             }
         };
 
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_connection_status(&relay_url, ConnectionStatus::Connecting);
+        }
+
+        let health_tracker = Arc::clone(&self.health_tracker);
+        let semaphore = Arc::clone(&self.connect_attempt_semaphore);
         let timeout = self.health_tracker.base_backoff_secs();
+        tokio::spawn(async move {
+            let Some(_permit) = begin_connect_attempt(semaphore, health_tracker, &relay_url).await
+            else {
+                return;
+            };
+            let outcome = match connection.connect(timeout).await {
+                Ok(()) => ConnectAttemptOutcome::Connected,
+                Err(error) => ConnectAttemptOutcome::Failed(error),
+            };
+            let _ = result_tx.send(ConnectAttemptResult {
+                relay_url,
+                token,
+                outcome,
+            });
+        });
+    }
 
-        match connection.connect(timeout).await {
-            Ok(()) => {
-                // Success - record and send notification
-                self.health_tracker.record_success(relay_url);
+    async fn handle_connect_attempt_result(&mut self, result: ConnectAttemptResult) {
+        if !take_connect_attempt(
+            &mut self.in_flight_connect_attempts,
+            &result.relay_url,
+            result.token,
+        ) {
+            tracing::debug!(
+                relay = %result.relay_url,
+                token = result.token.0,
+                "Ignoring stale connection attempt result"
+            );
+            return;
+        }
 
+        let still_connecting = self
+            .relay_sync_index
+            .read()
+            .await
+            .get(&result.relay_url)
+            .is_some_and(|state| state.connection_status == ConnectionStatus::Connecting);
+        if !still_connecting {
+            tracing::debug!(
+                relay = %result.relay_url,
+                token = result.token.0,
+                "Ignoring connection result after lifecycle state changed"
+            );
+            return;
+        }
+
+        match result.outcome {
+            ConnectAttemptOutcome::Connected => {
+                self.health_tracker.record_success(&result.relay_url);
                 if let Some(ref metrics) = self.metrics {
-                    metrics.record_connection_attempt(relay_url, true);
+                    metrics.record_connection_attempt(&result.relay_url, true);
                 }
-
-                if let Some(ref connect_tx) = self.connect_tx {
-                    let _ = connect_tx
-                        .send(ConnectNotification {
-                            relay_url: relay_url.to_string(),
-                        })
-                        .await;
-                }
+                self.handle_connect_or_reconnect(&result.relay_url).await;
             }
-            Err(e) => {
-                // Classify error to determine if it's a naughty relay or transient issue
-                let error_str = e.to_string();
-
-                if let Some(category) = naughty_list::NaughtyListTracker::classify_error(&error_str)
-                {
-                    // Persistent infrastructure issue - use naughty list
+            ConnectAttemptOutcome::Failed(error) => {
+                if let Some(category) = naughty_list::NaughtyListTracker::classify_error(&error) {
                     if let Some(ref naughty_list) = self.health_tracker.naughty_list() {
-                        let is_new = naughty_list.record(relay_url, category, error_str.clone());
-
+                        let is_new =
+                            naughty_list.record(&result.relay_url, category, error.clone());
                         if is_new {
                             tracing::warn!(
-                                relay = %relay_url,
+                                relay = %result.relay_url,
                                 category = ?category,
-                                error = %e,
+                                error = %error,
                                 "Relay has persistent configuration issue, added to naughty list"
                             );
                         } else {
                             tracing::debug!(
-                                relay = %relay_url,
+                                relay = %result.relay_url,
                                 category = ?category,
                                 "Naughty relay failure (already tracked)"
                             );
                         }
                     }
                 } else {
-                    // Transient network issue - use existing backoff flow
                     tracing::debug!(
-                        relay = %relay_url,
-                        error = %e,
+                        relay = %result.relay_url,
+                        error = %error,
                         "Connection failed (transient issue, backoff active)"
                     );
                 }
-
-                // 4. Update state back to Disconnected on failure
-                {
-                    let mut index = self.relay_sync_index.write().await;
-                    if let Some(state) = index.get_mut(relay_url) {
-                        state.connection_status = ConnectionStatus::Disconnected;
-                    }
-                }
-
-                // 5. Record failure in health tracker
-                self.health_tracker.record_failure(relay_url);
-
-                // 6. Update metrics
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_connection_attempt(relay_url, false);
-                    metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
-                    metrics
-                        .record_health_state(relay_url, self.health_tracker.get_state(relay_url));
-                }
+                self.record_connection_attempt_failure(&result.relay_url)
+                    .await;
             }
+        }
+    }
+
+    async fn record_connection_attempt_failure(&self, relay_url: &str) {
+        {
+            let mut index = self.relay_sync_index.write().await;
+            if let Some(state) = index.get_mut(relay_url) {
+                state.connection_status = ConnectionStatus::Disconnected;
+            }
+        }
+        self.health_tracker.record_failure(relay_url);
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_connection_attempt(relay_url, false);
+            metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
+            metrics.record_health_state(relay_url, self.health_tracker.get_state(relay_url));
         }
     }
 
@@ -3792,7 +3909,7 @@ impl SyncManager {
     /// - Have repos or root events to sync (not empty)
     /// - Have passed the exponential backoff period (respects health tracker)
     ///
-    /// For each eligible relay, a reconnection is attempted via try_connect_relay.
+    /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
         let desired_relays: HashSet<String> = {
             let repo_index = self.repo_sync_index.read().await;
@@ -3849,7 +3966,7 @@ impl SyncManager {
                 health_state = %self.health_tracker.get_state(&relay_url),
                 "Attempting reconnection"
             );
-            self.try_connect_relay(&relay_url).await;
+            self.schedule_connect_relay(&relay_url).await;
         }
     }
 
@@ -4403,6 +4520,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connect_attempt_tokens_deduplicate_and_reject_stale_results() {
+        let relay = "wss://relay.example";
+        let mut in_flight = HashMap::new();
+        let mut next_token = 0;
+
+        let first = reserve_connect_attempt(&mut in_flight, &mut next_token, relay)
+            .expect("first attempt should be reserved");
+        assert!(
+            reserve_connect_attempt(&mut in_flight, &mut next_token, relay).is_none(),
+            "a queued or running relay must not be scheduled twice"
+        );
+        assert!(
+            !take_connect_attempt(&mut in_flight, relay, ConnectAttemptToken(first.0 + 1)),
+            "a stale worker result must not consume the active attempt"
+        );
+        assert_eq!(in_flight.get(relay), Some(&first));
+        assert!(take_connect_attempt(&mut in_flight, relay, first));
+
+        let second = reserve_connect_attempt(&mut in_flight, &mut next_token, relay)
+            .expect("relay should be schedulable after completion");
+        assert_ne!(first, second, "attempt identities must not be reused");
+    }
+
+    #[tokio::test]
+    async fn connect_attempt_semaphore_caps_parallel_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const WORKERS: usize = MAX_CONCURRENT_CONNECT_ATTEMPTS * 3;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS));
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..WORKERS {
+            let semaphore = Arc::clone(&semaphore);
+            let release = Arc::clone(&release);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let started_tx = started_tx.clone();
+            workers.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.unwrap();
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now_active, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                let _release = release.acquire().await.unwrap();
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        drop(started_tx);
+
+        for _ in 0..MAX_CONCURRENT_CONNECT_ATTEMPTS {
+            started_rx.recv().await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
+                .await
+                .is_err(),
+            "a ninth worker started while all eight permits were occupied"
+        );
+
+        release.add_permits(WORKERS);
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            MAX_CONCURRENT_CONNECT_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_connect_attempt_records_health_only_when_worker_starts() {
+        let relay = "wss://queued.example";
+        let semaphore = Arc::new(Semaphore::new(0));
+        let health_tracker = Arc::new(RelayHealthTracker::with_defaults());
+        let worker_semaphore = Arc::clone(&semaphore);
+        let worker_health = Arc::clone(&health_tracker);
+
+        let worker = tokio::spawn(async move {
+            begin_connect_attempt(worker_semaphore, worker_health, relay).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            health_tracker.get_health(relay).is_none(),
+            "waiting for scheduler capacity must not start backoff"
+        );
+
+        semaphore.add_permits(1);
+        let _permit = worker
+            .await
+            .unwrap()
+            .expect("worker should start after a permit becomes available");
+        assert!(
+            health_tracker
+                .get_health(relay)
+                .is_some_and(|health| health.last_attempt_time.is_some()),
+            "health attempt time must be recorded when the worker starts"
+        );
+    }
+
+    #[test]
     fn canonical_relay_keys_dedupe_only_the_root_slash() {
         assert_eq!(
             canonical_relay_key("wss://relay.example").unwrap(),
@@ -4570,10 +4790,17 @@ mod tests {
 
     #[test]
     fn disconnected_empty_relay_can_still_be_cleaned_up() {
-        let source = RelayState::default();
+        let mut source = RelayState::default();
 
         assert!(source.is_disconnect_candidate(false, false));
         assert!(!source.is_disconnect_candidate(false, true));
+
+        source.historic_sync_completed = true;
+        source.connection_status = ConnectionStatus::Connecting;
+        assert!(
+            !source.is_disconnect_candidate(false, false),
+            "cleanup must not race an in-flight connection worker"
+        );
     }
 
     #[tokio::test]

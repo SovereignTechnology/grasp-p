@@ -25,7 +25,10 @@ Key Architectural Points:
 - **Discovery management**: The nature of discovery inherently leads to a drip feed of root_events (e.g., Repo Announcements, Issues, Patches and PRs) that require additional subscriptions. Without careful management this can lead to large numbers of subscriptions and potentially rate limiting. Mitigation strategies:
   - Self-subscriber waits for 5s to batch updates before creating new filters / subscriptions, allowing time for most events to be received from outstanding subscriptions from connected relays
   - PendingBatch tracks each new set of filters that may require pagination until they are complete
-  - Avoid long awaits - recompute desired filters when connection is established to ensure filters are as consolidated as possible
+  - Websocket handshakes run in at most eight bounded workers outside the sync
+    actor; only the actor applies their results, and subscriptions start only
+    after the relay reports `Connected`
+  - Recompute desired filters when connection is established to ensure filters are as consolidated as possible
   - Consolidation function ensures number of live_sync subscriptions don't reach rate-limiting limits (threshold: 70 filters)
 - **Quick Reconnect** (< 15mins) - doesn't do a full reconciliation vs fresh start (longer disconnect or relaunch binary)
 - **Background timers** handle relay connection health and metrics, handling reconnects after backoff and recovery after rate-limiting
@@ -981,6 +984,8 @@ RateLimited -> previous state: After 65-second cooldown expires
   cannot make a purgatory invitation permanently lose its sync path
 - **Rate limiting**: Distinct from connection failures - triggered by relay NOTICE messages
 - **Connection timeout**: Set to `base_backoff_secs` to ensure retry timing works correctly
+- **Connection concurrency**: At most eight DNS/websocket attempts run at once;
+  queued attempts do not start health backoff until a worker slot is available
 
 ---
 
