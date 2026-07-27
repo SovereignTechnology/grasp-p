@@ -34,9 +34,9 @@
     relayDescription =
       "personal instance of ngit-grasp, a Rust GRASP implementation with proactive sync";
 
-    # Option 1: Use nsec file (recommended - more secure)
-    relayOwnerNsecFile =
-      "/persistent/ngit-danconwaydev-com-ngit-grasp/relay-owner.nsec";
+    # Option 1: Use a runtime secret file (recommended). The module loads it
+    # as a systemd credential, keeping the nsec out of the process command line.
+    relayOwnerNsecFile = "/run/agenix/ngit-grasp-relay-owner-nsec";
 
     # Option 2: Inline nsec (less secure, ends up in nix store)
     # relayOwnerNsec = "nsec1...";

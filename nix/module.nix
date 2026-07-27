@@ -20,6 +20,8 @@ let
     doCheck = false;
   };
 
+  relayOwnerNsecCredential = "relay_owner_nsec";
+
   # Per-instance options
   instanceOptions = { name, ... }: {
     options = {
@@ -67,11 +69,16 @@ let
       relayOwnerNsecFile = mkOption {
         type = types.nullOr types.path;
         default = null;
-        example = "/persistent/ngit-grasp/relay-owner.nsec";
+        example = "/run/agenix/ngit-grasp-relay-owner-nsec";
         description = ''
-          Path to file containing relay owner's nsec (private key).
-          If file doesn't exist, ngit-grasp will auto-generate a random nsec and save it.
-          Takes precedence over relayOwnerNsec if both are set.
+          Runtime secret file containing the relay owner's nsec (private key).
+          The service receives it as a systemd credential named
+          `${relayOwnerNsecCredential}`, so the secret is never placed in the
+          process command line.
+
+          Leave this null to use relayOwnerNsec or to load/generate
+          .relay-owner.nsec in dataDir. If set, point it at a runtime secret
+          file (agenix, sops-nix, etc.), not a Nix-store path.
         '';
       };
 
@@ -416,7 +423,11 @@ let
   };
 
   # Create systemd service config for an instance
-  mkService = name: cfg: {
+  mkService = name: cfg:
+  let
+    loadCredentials = optional (cfg.relayOwnerNsecFile != null)
+      "${relayOwnerNsecCredential}:${toString cfg.relayOwnerNsecFile}";
+  in {
     description = "ngit-grasp GRASP relay (${name})";
     after = [ "network.target" "ngit-grasp-${name}-setup.service" ];
     requires = [ "ngit-grasp-${name}-setup.service" ];
@@ -498,17 +509,14 @@ let
       Environment =
         "PATH=${pkgs.git}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin";
 
-      # Command to run
-      ExecStart = if cfg.relayOwnerNsecFile != null then
-      # Use nsec from file - need to use shell to read the file
-        "${pkgs.bash}/bin/bash -c '${ngit-grasp}/bin/ngit-grasp --relay-owner-nsec \"$(${pkgs.coreutils}/bin/cat ${cfg.relayOwnerNsecFile})\"'"
-      else
-      # Let ngit-grasp auto-generate nsec in .relay-owner.nsec file in dataDir
-        "${ngit-grasp}/bin/ngit-grasp";
+      # The binary reads systemd credentials and environment configuration
+      # itself, keeping relay-owner secrets out of process arguments.
+      ExecStart = "${ngit-grasp}/bin/ngit-grasp";
 
       # Restart policy
       Restart = "always";
       RestartSec = "10s";
+      UMask = "0077";
 
       # Hardening
       NoNewPrivileges = true;
@@ -516,10 +524,6 @@ let
       ProtectSystem = "strict";
       ProtectHome = true;
       ReadWritePaths = [ cfg.dataDir ];
-
-      # If using nsecFile, grant read access
-      ReadOnlyPaths =
-        optionals (cfg.relayOwnerNsecFile != null) [ cfg.relayOwnerNsecFile ];
 
       # Additional hardening
       ProtectKernelTunables = true;
@@ -539,6 +543,8 @@ let
       # System call filtering
       SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
       SystemCallErrorNumber = "EPERM";
+    } // optionalAttrs (loadCredentials != [ ]) {
+      LoadCredential = loadCredentials;
     };
 
     # Directory creation handled by both ExecStartPre (above) and tmpfiles (below)

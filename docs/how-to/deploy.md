@@ -79,7 +79,7 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
     # Identity
     relayName = "My GRASP Relay";
     relayDescription = "A Rust GRASP implementation with proactive sync";
-    relayOwnerNsecFile = "/persistent/ngit-grasp/relay-owner.nsec";
+    relayOwnerNsecFile = "/run/agenix/ngit-grasp-relay-owner-nsec";
     
     # Sync - bootstrap from relay.ngit.dev
     syncBootstrapRelayUrl = "wss://relay.ngit.dev";
@@ -110,8 +110,10 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
 - **port**: Local port (use reverse proxy for HTTPS)
 - **dataDir**: Where git repos and database are stored
 - **relayOwnerNsecFile**: Path to file containing relay owner's nsec
-  - If file doesn't exist, ngit-grasp will auto-generate one
+  - Passed to ngit-grasp as a protected systemd credential, not a process argument
+  - The runtime secret file must already exist (for example through agenix or sops-nix)
   - Alternative: `relayOwnerNsec = "nsec1..."` (less secure, in nix store)
+  - If neither option is set, ngit-grasp loads or creates `.relay-owner.nsec` in `dataDir`
 - **syncBootstrapRelayUrl**: Bootstrap relay to sync from on startup
 
 See [nix/example-configuration.nix](../../nix/example-configuration.nix) for more examples.
@@ -238,7 +240,7 @@ git ls-remote https://ngit.example.com/<npub>/<repo>.git
 ### Identity
 - `relayName` - Relay name for NIP-11 (default: "{domain} grasp relay")
 - `relayDescription` - Relay description
-- `relayOwnerNsecFile` - Path to file with relay owner nsec (recommended)
+- `relayOwnerNsecFile` - Runtime secret file loaded as a systemd credential (recommended)
 - `relayOwnerNsec` - Inline nsec (less secure)
 
 ### Sync
@@ -420,11 +422,15 @@ The NixOS module includes systemd hardening:
 
 Additional recommendations:
 
-1. **Use nsec file instead of inline:**
+1. **Use a runtime secret file instead of an inline key:**
    ```nix
-   relayOwnerNsecFile = "/persistent/ngit-grasp/relay-owner.nsec";
+   relayOwnerNsecFile = "/run/agenix/ngit-grasp-relay-owner-nsec";
    # NOT: relayOwnerNsec = "nsec1...";  # Ends up in nix store!
    ```
+
+   The module exposes the file to ngit-grasp as the `relay_owner_nsec`
+   systemd credential. The key does not appear in `ExecStart` or the process
+   command line.
 
 2. **Restrict data directory permissions:**
    ```bash

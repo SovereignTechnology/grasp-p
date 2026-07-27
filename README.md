@@ -434,12 +434,17 @@ This means CLI flags always take precedence over environment variables, which ta
 # View all options with defaults
 ngit-grasp --help
 
-# Run with CLI flags (override everything else)
-ngit-grasp --domain relay.example.com --relay-owner-nsec nsec1... --bind-address 0.0.0.0:7334
+# Run with CLI flags and let ngit-grasp create .relay-owner.nsec
+ngit-grasp --domain relay.example.com --bind-address 0.0.0.0:7334
 
-# Mix CLI flags with environment variables
+# Supply an existing owner key through the environment
 NGIT_RELAY_OWNER_NSEC=nsec1... ngit-grasp --domain relay.example.com
 ```
+
+The relay-owner nsec is deliberately not accepted as a command-line argument,
+because process arguments are visible through tools such as `ps` and
+`/proc/<pid>/cmdline`. NixOS deployments should use `relayOwnerNsecFile`, which
+passes the key through a protected systemd credential.
 
 ### Configuration Options
 
@@ -448,7 +453,7 @@ NGIT_RELAY_OWNER_NSEC=nsec1... ngit-grasp --domain relay.example.com
 | Option            | CLI Flag              | Environment Variable     | Default                                      |
 | ----------------- | --------------------- | ------------------------ | -------------------------------------------- |
 | Domain            | `--domain`            | `NGIT_DOMAIN`            | (required)                                   |
-| Relay owner nsec  | `--relay-owner-nsec`  | `NGIT_RELAY_OWNER_NSEC`  | `.relay-owner.nsec` file (auto-generated)    |
+| Relay owner nsec  | —                     | `NGIT_RELAY_OWNER_NSEC`  | systemd credential, then `.relay-owner.nsec` |
 | Relay name        | `--relay-name`        | `NGIT_RELAY_NAME`        | `${domain} grasp relay`                      |
 | Relay description | `--relay-description` | `NGIT_RELAY_DESCRIPTION` | `Git Nostr Relay - a grasp implementation`   |
 | Git data path     | `--git-data-path`     | `NGIT_GIT_DATA_PATH`     | `./data/git` (temp dir for memory backend)   |
@@ -504,7 +509,7 @@ NGIT_RELAY_OWNER_NSEC=nsec1... ngit-grasp --domain relay.example.com
 ### Example: Production Deployment
 
 ```bash
-# Using environment variables (recommended for production)
+# Using environment variables (for containers and other non-systemd deployments)
 export NGIT_DOMAIN=gitnostr.com
 export NGIT_RELAY_OWNER_NSEC=nsec1...  # Or let it auto-generate from .relay-owner.nsec
 export NGIT_BIND_ADDRESS=0.0.0.0:7334

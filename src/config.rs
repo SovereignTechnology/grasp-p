@@ -3,9 +3,12 @@ use clap::{Parser, ValueEnum};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const RELAY_OWNER_NSEC_ENV: &str = "NGIT_RELAY_OWNER_NSEC";
+const RELAY_OWNER_NSEC_CREDENTIAL: &str = "relay_owner_nsec";
 const DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS: u64 =
     180 * 24 * 60 * 60;
@@ -317,17 +320,16 @@ pub struct Config {
     #[arg(long, env = "NGIT_DOMAIN")]
     pub domain: String,
 
-    /// Relay operator's nsec (private key) for signing and authentication
+    /// Relay operator's nsec (private key) for signing and authentication.
     ///
     /// Used for:
     /// - NIP-11 relay information document (pubkey field derived from this nsec)
     /// - NIP-42 authentication when syncing from other relays
     /// - Future: signing events, WoT-based rate limiting of syncing relays
     ///
-    /// If not provided via CLI/env, will be loaded from/saved to `.relay-owner.nsec` file
-    /// in the current directory. If the file doesn't exist, a new key will be generated
-    /// and saved automatically.
-    #[arg(long, env = "NGIT_RELAY_OWNER_NSEC")]
+    /// Loaded from the `relay_owner_nsec` systemd credential,
+    /// `NGIT_RELAY_OWNER_NSEC`, or `.relay-owner.nsec`; never accepted on argv.
+    #[arg(skip)]
     pub relay_owner_nsec: Option<String>,
 
     /// Relay name for NIP-11 information document (defaults to "${domain} grasp relay")
@@ -593,16 +595,100 @@ impl Config {
         // Parse CLI args (clap automatically handles env var fallback)
         let mut config = Self::parse();
 
-        // If relay_owner_nsec not provided, load from file or generate
-        if config.relay_owner_nsec.is_none() {
-            config.relay_owner_nsec = Some(Self::load_or_generate_relay_owner_key()?);
-        } else {
-            // If provided via CLI/env, trim any whitespace (newlines, spaces, etc.)
-            // This handles cases where the value is read from a file with trailing newline
-            config.relay_owner_nsec = config.relay_owner_nsec.map(|s| s.trim().to_string());
-        }
+        config.relay_owner_nsec = Some(Self::load_relay_owner_key()?);
 
         Ok(config)
+    }
+
+    /// Load the relay owner key without ever accepting the secret on argv.
+    ///
+    /// A systemd credential is the most deliberate provision, followed by the
+    /// environment (including `.env` loaded by [`Self::load`]), then the
+    /// persistent `.relay-owner.nsec` file.
+    pub fn load_relay_owner_key() -> Result<String> {
+        let credentials_dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+        let env_value = std::env::var(RELAY_OWNER_NSEC_ENV).ok();
+        Self::load_relay_owner_key_from_sources(
+            credentials_dir.as_deref(),
+            env_value,
+            Self::load_or_generate_relay_owner_key,
+        )
+    }
+
+    fn load_relay_owner_key_from_sources<F>(
+        credentials_dir: Option<&Path>,
+        env_value: Option<String>,
+        fallback: F,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Result<String>,
+    {
+        if let Some(dir) = credentials_dir {
+            if let Some(nsec) = Self::load_relay_owner_key_credential_from_dir(dir)? {
+                Self::validate_relay_owner_nsec(&nsec, "relay_owner_nsec credential")?;
+                tracing::info!(
+                    credential = RELAY_OWNER_NSEC_CREDENTIAL,
+                    "Loaded relay owner key"
+                );
+                return Ok(nsec);
+            }
+        }
+
+        if let Some(nsec) = Self::relay_owner_key_from_env_value(env_value)? {
+            Self::validate_relay_owner_nsec(&nsec, RELAY_OWNER_NSEC_ENV)?;
+            tracing::info!(env = RELAY_OWNER_NSEC_ENV, "Loaded relay owner key");
+            return Ok(nsec);
+        }
+
+        fallback()
+    }
+
+    fn load_relay_owner_key_credential_from_dir(dir: &Path) -> Result<Option<String>> {
+        let key_path = dir.join(RELAY_OWNER_NSEC_CREDENTIAL);
+        if !key_path.exists() {
+            return Ok(None);
+        }
+        if !key_path
+            .metadata()
+            .with_context(|| format!("stat relay owner credential '{}'", key_path.display()))?
+            .is_file()
+        {
+            return Err(anyhow!(
+                "Relay owner credential '{}' is not a regular file",
+                key_path.display()
+            ));
+        }
+        let nsec = fs::read_to_string(&key_path)
+            .with_context(|| format!("read relay owner credential '{}'", key_path.display()))?
+            .trim()
+            .to_string();
+        if nsec.is_empty() {
+            return Err(anyhow!(
+                "Relay owner credential '{}' is empty",
+                key_path.display()
+            ));
+        }
+        Ok(Some(nsec))
+    }
+
+    fn relay_owner_key_from_env_value(value: Option<String>) -> Result<Option<String>> {
+        let Some(raw) = value else {
+            return Ok(None);
+        };
+        let nsec = raw.trim().to_string();
+        if nsec.is_empty() {
+            return Err(anyhow!(
+                "{RELAY_OWNER_NSEC_ENV} is set but empty; unset it to load/generate \
+                 {key_file}, or provide a valid nsec",
+                key_file = Self::RELAY_OWNER_KEY_FILE
+            ));
+        }
+        Ok(Some(nsec))
+    }
+
+    fn validate_relay_owner_nsec(nsec: &str, source: &str) -> Result<()> {
+        Keys::parse(nsec).with_context(|| format!("Invalid relay owner nsec in {source}"))?;
+        Ok(())
     }
 
     /// Load relay owner key from file, or generate and save a new one
@@ -616,8 +702,10 @@ impl Config {
                 .trim()
                 .to_string();
 
-            // Validate it's a valid nsec
-            Keys::parse(&nsec).context("Invalid nsec in relay owner key file")?;
+            Self::validate_relay_owner_nsec(
+                &nsec,
+                &format!("relay owner key file {}", key_path.display()),
+            )?;
 
             tracing::info!("Loaded relay owner key from {}", key_path.display());
             return Ok(nsec);
@@ -627,8 +715,7 @@ impl Config {
         let keys = Keys::generate();
         let nsec = keys.secret_key().to_bech32()?;
 
-        // Save to file
-        fs::write(&key_path, &nsec).context("Failed to write relay owner key file")?;
+        write_secret_file(&key_path, &nsec).context("Failed to write relay owner key file")?;
 
         tracing::info!(
             "Generated new relay owner key and saved to {}",
@@ -964,6 +1051,20 @@ impl Config {
     }
 }
 
+fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,35 +1289,122 @@ mod tests {
     }
 
     #[test]
-    fn test_relay_owner_nsec_trims_whitespace() {
-        // Test that Config::load() trims whitespace from provided nsec
-        // This simulates what happens when nsec is read from a file with trailing newline
-        let nsec_clean = "nsec1rt5f3gfnktvd77fdarg00ff94l8j833y778ym3xlzkx89g9v5zvq4y2qee";
-        let nsec_with_newline = format!("{}\n", nsec_clean);
-        let nsec_with_spaces = format!("  {}  ", nsec_clean);
+    fn relay_owner_nsec_is_not_accepted_on_argv() {
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        assert!(Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--relay-owner-nsec",
+            nsec.as_str(),
+        ])
+        .is_err());
+    }
 
-        // Test that trimming happens by directly creating config with whitespace
-        let mut config1 = Config::for_testing();
-        config1.relay_owner_nsec = Some(nsec_with_newline.clone());
-        // Simulate what Config::load() does
-        config1.relay_owner_nsec = config1.relay_owner_nsec.map(|s| s.trim().to_string());
+    #[test]
+    fn relay_owner_nsec_credential_is_loaded_and_trimmed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        fs::write(
+            tempdir.path().join(RELAY_OWNER_NSEC_CREDENTIAL),
+            format!(" {nsec}\n"),
+        )
+        .unwrap();
 
-        let mut config2 = Config::for_testing();
-        config2.relay_owner_nsec = Some(nsec_with_spaces.clone());
-        config2.relay_owner_nsec = config2.relay_owner_nsec.map(|s| s.trim().to_string());
+        let loaded = Config::load_relay_owner_key_credential_from_dir(tempdir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, nsec);
+    }
 
-        // Both should parse successfully after trimming
-        assert!(config1.relay_owner_keys().is_ok());
-        assert!(config2.relay_owner_keys().is_ok());
+    #[test]
+    fn relay_owner_nsec_credential_rejects_empty_and_invalid_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let credential = tempdir.path().join(RELAY_OWNER_NSEC_CREDENTIAL);
+        fs::write(&credential, "\n").unwrap();
+        assert!(Config::load_relay_owner_key_credential_from_dir(tempdir.path()).is_err());
 
-        // Both should produce the same public key
-        let keys1 = config1.relay_owner_keys().unwrap();
-        let keys2 = config2.relay_owner_keys().unwrap();
-        assert_eq!(keys1.public_key(), keys2.public_key());
+        fs::write(&credential, "nsec1invalid").unwrap();
+        let error = Config::load_relay_owner_key_from_sources(
+            Some(tempdir.path()),
+            None,
+            || -> Result<String> { panic!("invalid credential must not fall through") },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("relay_owner_nsec credential"));
+    }
 
-        // Verify trimmed nsec equals clean nsec
-        assert_eq!(config1.relay_owner_nsec.unwrap(), nsec_clean);
-        assert_eq!(config2.relay_owner_nsec.unwrap(), nsec_clean);
+    #[test]
+    fn relay_owner_nsec_credential_takes_precedence_over_environment() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let credential_nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        fs::write(
+            tempdir.path().join(RELAY_OWNER_NSEC_CREDENTIAL),
+            &credential_nsec,
+        )
+        .unwrap();
+
+        let loaded = Config::load_relay_owner_key_from_sources(
+            Some(tempdir.path()),
+            Some("nsec1invalid".to_string()),
+            || -> Result<String> { panic!("credential must prevent fallback") },
+        )
+        .unwrap();
+        assert_eq!(loaded, credential_nsec);
+    }
+
+    #[test]
+    fn relay_owner_nsec_environment_is_trimmed_and_precedes_fallback() {
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let loaded = Config::load_relay_owner_key_from_sources(
+            None,
+            Some(format!(" {nsec}\n")),
+            || -> Result<String> { panic!("environment must prevent fallback") },
+        )
+        .unwrap();
+        assert_eq!(loaded, nsec);
+    }
+
+    #[test]
+    fn relay_owner_nsec_environment_rejects_empty_and_invalid_values() {
+        for raw in ["", " ", "\n"] {
+            assert!(
+                Config::relay_owner_key_from_env_value(Some(raw.to_string())).is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
+
+        let error = Config::load_relay_owner_key_from_sources(
+            None,
+            Some("nsec1invalid".to_string()),
+            || -> Result<String> { panic!("invalid environment must not fall through") },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(RELAY_OWNER_NSEC_ENV));
+    }
+
+    #[test]
+    fn relay_owner_nsec_missing_sources_use_persistent_fallback() {
+        let fallback_nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let loaded =
+            Config::load_relay_owner_key_from_sources(None, None, || Ok(fallback_nsec.clone()))
+                .unwrap();
+        assert_eq!(loaded, fallback_nsec);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_relay_owner_key_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let key_path = tempdir.path().join(".relay-owner.nsec");
+        write_secret_file(&key_path, "secret").unwrap();
+
+        assert_eq!(
+            fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
