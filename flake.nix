@@ -42,7 +42,7 @@
 
         packages.ngit-grasp = pkgs.rustPlatform.buildRustPackage {
           pname = "ngit-grasp";
-          version = "1.2.0";
+          version = "2.0.0";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;

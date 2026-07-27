@@ -7,72 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-27
+
+### Breaking changes
+
+- Removed `--relay-owner-nsec` because command-line secrets are exposed through
+  process listings and service diagnostics. Use the `relay_owner_nsec` systemd
+  credential, `NGIT_RELAY_OWNER_NSEC`, or `.relay-owner.nsec`. The NixOS
+  `relayOwnerNsecFile` option remains supported and now supplies a protected
+  systemd credential.
+- Removed the hidden `repair-deletion-requests` command and the public
+  `ngit_grasp::repair_deletion_requests` module. Deletion-request lifecycle
+  reconciliation now runs automatically.
+- Added four deletion-request retention fields to the public `Config` struct.
+  Rust consumers that construct `Config` with a struct literal must provide
+  them.
+
 ### Added
 
-- Added four configuration options for bounded retention of NIP-09 deletion requests and NIP-62 request-to-vanish events, together with cleanup telemetry for operators.
-
-### Fixed
-
-- Fix promoted repositories remaining on state-only GRASP sync filters, which
-  prevented remote issues, patches, and pull requests from being discovered
-  after their Git data arrived.
-- Prevent relay-owner private keys from appearing in process arguments by
-  loading NixOS secret files through a systemd credential. Configured empty or
-  invalid keys now stop startup instead of silently generating a new identity,
-  and existing persistent fallback key files are restricted to mode `0600`
-  before being read.
-- Fix maintainer invitation recovery after a production restart by starting the
-  relay and SyncManager before scanning retained deletion requests. The
-  potentially long retention catch-up now begins immediately in the existing
-  background maintenance task instead of blocking purgatory processing.
-- Fix maintainer invitation recovery during a rate-limited historic sync by
-  resuming pagination outside the SyncManager lock. Fresh relay batches now
-  mark only their changed relays for recomputation, avoiding repeated
-  full-index filter construction while a large bootstrap history is arriving.
-- Fix maintainer invitation acceptance by prioritizing fresh purgatory
-  dependencies within a bounded reconciliation pass and retaining the source
-  relays needed to recover inviter events after the short-lived hot cache
-  expires.
-- Fix invitation acceptance sync by deferring subscription consolidation until
-  in-flight relay batches finish, keeping the sync actor available to process
-  EOSE messages and the five-second purgatory reconciliation pass.
-- Fix invitation acceptance sync when a listed source relay is initially
-  unavailable or empty by retaining and retrying desired GRASP-02 work until it
-  is confirmed. Root-slash URL variants now share one relay lifecycle instead
-  of multiplying connections and subscription batches.
-- Fix invitation acceptance sync across large relay lists by moving websocket
-  handshakes out of the sync actor, limiting them to eight concurrent attempts,
-  and waiting for each relay to be connected before starting subscriptions.
-- Fix invitation dependency recovery by targeting retained event IDs at their
-  associated relay and falling back from NIP-77 after a 15-second total
-  deadline, so a missing or endlessly active exchange cannot stall the actor.
-- Fix large invitation relay sets repeatedly rebuilding their subscriptions by
-  applying the 70-filter consolidation threshold only to fragmentation above
-  the relay's irreducible desired live-filter baseline.
-- Keep invitation relay connection ownership inside the bounded scheduler by
-  disabling the SDK's independent auto-reconnect loop and cancelling queued or
-  active connection workers when the sync manager shuts down.
-- Fix invitation acceptance on a shared GRASP server by reapplying an existing
-  owner state event to the invitee's newly created repository, so GRASP-02 can
-  align it without an invitee state event or Git push.
-- Fix invitation acceptance when the invitee already owns the same repository
-  identifier by routing maintainer-changing replacements through purgatory and
-  reprocessing the owner dependencies that align the existing Git repository.
-- Sideband-aware Git clients now receive periodic progress while GRASP performs post-push purgatory promotion and cross-owner repository alignment, preventing the client I/O timeout from expiring during unusually complex finalization.
-- Smart HTTP pushes now expose the terminal receive-pack flush only after GRASP has finished promoting the matching repository announcement and state from purgatory. Git progress remains streamed while large packs are resolved and checked, but an immediately following clone or proposal push can now rely on a completed push being queryable on the relay.
-- Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.
-- Prevent invitation syncing from dropping a source relay while its initial repository history is still being downloaded.
-- Fix maintainership invitation syncing by retaining and refetching expired inviter announcement and state IDs across the maintainer relay chain before promotion.
-- Purgatory promotion now applies NIP-01's lowest-event-ID tie-break for same-second repository state replacements.
+- Added configurable bounded retention for NIP-09 deletion requests and NIP-62
+  request-to-vanish events, with cleanup telemetry for operators.
 
 ### Changed
 
-- Relay-owner private keys are no longer accepted through
-  `--relay-owner-nsec`; use the `relay_owner_nsec` systemd credential,
-  `NGIT_RELAY_OWNER_NSEC`, or `.relay-owner.nsec`.
-- Addressed a production storage imbalance where roughly 50k of 60k stored events were deletion requests. Deletion requests now have a bounded lifecycle, so requests that are no longer relevant are reconciled and retired while requests that may still affect valid event handling are preserved.
-- Deletion-disrespector mode now explicitly applies to both NIP-09 deletion requests and NIP-62 request-to-vanish events.
-- Retired the hidden `repair-deletion-requests` maintenance command.
+- Deletion requests now move through a bounded served and gating lifecycle
+  based on whether they affected accepted events. Retention catch-up runs in
+  the background after the relay and synchronization workers start.
+- Deletion-disrespector mode now applies to both NIP-09 deletion requests and
+  NIP-62 request-to-vanish events.
+
+### Fixed
+
+- Fixed maintainer invitation acceptance and synchronization across owner-only,
+  invitee-only, shared, and temporarily unavailable GRASP servers. Acceptance
+  now converges without an invitee state event or additional Git push, handles
+  an invitee repository that already exists, and preserves the one-way
+  authority granted by an invitation before reciprocal acceptance.
+- Kept invitation recovery responsive during restarts, rate limits, large relay
+  sets, and expired dependency caches by bounding actor work, retaining exact
+  relay hints, and keeping connection and subscription retries scheduler-owned.
+- Fixed promoted repositories remaining on state-only GRASP sync filters, which
+  prevented remote issues, patches, and pull requests from being discovered
+  after their Git data arrived.
+- Delayed the terminal smart-HTTP receive-pack flush until matching repository
+  events are promoted and queryable. Sideband clients receive progress during
+  long Git processing and post-push repository alignment.
+- Batched the one-time deletion-request lifecycle migration so large databases
+  do not remain unavailable while historical requests are reconciled.
+- Applied NIP-01's lowest-event-ID tie-break to same-second repository state
+  replacements in purgatory.
+
+### Security
+
+- Kept relay-owner private keys out of process arguments by loading NixOS
+  secret files through a protected systemd credential. Empty or invalid
+  configured keys now stop startup instead of rotating identity, generated
+  fallback keys use mode `0600`, and existing fallback files are restricted
+  before being read.
 
 ## [1.2.0] - 2026-07-06
 
@@ -134,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.2.0...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.0.0...HEAD
+[2.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.2.0...v2.0.0
 [1.2.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.2...v1.1.0
 [1.0.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.0.1...v1.0.2
