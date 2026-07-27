@@ -240,8 +240,10 @@ impl ConnectionStatus {
 /// Complete state for a single relay - combines sync needs with connection lifecycle
 #[derive(Debug)]
 pub struct RelayState {
-    /// Repos we have confirmed syncing from this relay
+    /// Repos we have confirmed full L2/L3 syncing from this relay
     pub repos: HashSet<String>,
+    /// Repos we have confirmed state-only syncing from this relay
+    pub state_only_repos: HashSet<String>,
     /// Root events we have confirmed tracking
     pub root_events: HashSet<EventId>,
     /// If true, never disconnect this relay
@@ -270,6 +272,7 @@ impl Default for RelayState {
     fn default() -> Self {
         Self {
             repos: HashSet::new(),
+            state_only_repos: HashSet::new(),
             root_events: HashSet::new(),
             is_bootstrap: false,
             connection_status: ConnectionStatus::Disconnected,
@@ -297,6 +300,7 @@ impl RelayState {
             || self.connection_status == ConnectionStatus::Connecting
             || self.connection_status == ConnectionStatus::Disconnecting
             || !self.repos.is_empty()
+            || !self.state_only_repos.is_empty()
             || !self.root_events.is_empty()
             || has_pending_batches
             || has_desired_work
@@ -321,6 +325,7 @@ impl RelayState {
     /// Clear repos and root_events - called when reconnect takes > 15 minutes
     pub fn clear_sync_state(&mut self) {
         self.repos.clear();
+        self.state_only_repos.clear();
         self.root_events.clear();
         self.announcements_synced = false;
         self.historic_sync_completed = false;
@@ -407,8 +412,10 @@ pub struct PendingBatch {
 /// Items included in a pending batch
 #[derive(Debug, Clone, Default)]
 pub struct PendingItems {
-    /// Repos being synced in this batch
+    /// Repos receiving full L2/L3 sync in this batch
     pub repos: HashSet<String>,
+    /// Repos receiving state-only sync in this batch
+    pub state_only_repos: HashSet<String>,
     /// Root events being synced in this batch
     pub root_events: HashSet<EventId>,
 }
@@ -1281,7 +1288,8 @@ impl SyncManager {
                         // (not ID-based queries which already failed)
                         let relay_url_for_fallback = relay_url.to_string();
                         let batch_id = batch.batch_id;
-                        let batch_repos = batch.items.repos.clone();
+                        let batch_full_repos = batch.items.repos.clone();
+                        let batch_state_only_repos = batch.items.state_only_repos.clone();
                         let batch_root_events = batch.items.root_events.clone();
                         let missing_count = missing.len();
 
@@ -1291,28 +1299,12 @@ impl SyncManager {
                         // Create REQ+EOSE subscriptions using original semantic filters
                         // This queries by kind/author/tags instead of by ID, which may
                         // succeed even when ID-based queries fail.
-                        // Split batch_repos by SyncLevel to avoid sending Layer 2 filters
-                        // (#a/#A/#q) for StateOnly (purgatory) repos - those PRs would be
-                        // rejected as orphan and then silently dropped by nostr-sdk deduplication.
-                        let (full_repos, state_only_repos) = {
-                            let repo_index = self.repo_sync_index.read().await;
-                            let mut full = HashSet::new();
-                            let mut state_only = HashSet::new();
-                            for repo_ref in &batch_repos {
-                                match repo_index.get(repo_ref).map(|n| n.sync_level) {
-                                    Some(SyncLevel::StateOnly) => {
-                                        state_only.insert(repo_ref.clone());
-                                    }
-                                    _ => {
-                                        full.insert(repo_ref.clone());
-                                    }
-                                }
-                            }
-                            (full, state_only)
-                        };
+                        // Preserve the level this batch was created with. The desired
+                        // level may have advanced from StateOnly to Full while the
+                        // historic request was in flight.
                         let fallback_filters = filters::build_sync_level_aware_filters(
-                            &full_repos,
-                            &state_only_repos,
+                            &batch_full_repos,
+                            &batch_state_only_repos,
                             &batch_root_events,
                             None,
                         );
@@ -1321,7 +1313,8 @@ impl SyncManager {
                             tracing::warn!(
                                 relay = %relay_url_for_fallback,
                                 batch_id = batch_id,
-                                repos = batch_repos.len(),
+                                full_repos = batch_full_repos.len(),
+                                state_only_repos = batch_state_only_repos.len(),
                                 root_events = batch_root_events.len(),
                                 "Cannot create semantic fallback filters - no repos or root_events in batch"
                             );
@@ -1614,16 +1607,30 @@ impl SyncManager {
     /// * `batch` - The completed batch to confirm
     async fn confirm_batch(&self, relay_url: &str, batch: PendingBatch) {
         let batch_id = batch.batch_id;
-        let repos_count = batch.items.repos.len();
+        let full_repos_count = batch.items.repos.len();
+        let state_only_repos_count = batch.items.state_only_repos.len();
         let events_count = batch.items.root_events.len();
         let sync_method = batch.sync_method;
-        let is_generic_filter = repos_count == 0 && events_count == 0;
+        let is_generic_filter =
+            full_repos_count == 0 && state_only_repos_count == 0 && events_count == 0;
 
         let mut relay_index = self.relay_sync_index.write().await;
 
         if let Some(state) = relay_index.get_mut(relay_url) {
-            // Move repos to confirmed
+            // A completed Full batch upgrades any earlier StateOnly
+            // confirmation. A late StateOnly completion must not downgrade a
+            // repository whose Full batch already completed.
+            state
+                .state_only_repos
+                .retain(|repo| !batch.items.repos.contains(repo));
             state.repos.extend(batch.items.repos);
+            state.state_only_repos.extend(
+                batch
+                    .items
+                    .state_only_repos
+                    .into_iter()
+                    .filter(|repo| !state.repos.contains(repo)),
+            );
             // Move root_events to confirmed
             state.root_events.extend(batch.items.root_events.clone());
 
@@ -1672,10 +1679,12 @@ impl SyncManager {
                 relay = %relay_url,
                 batch_id = batch_id,
                 sync_method = ?sync_method,
-                repos_confirmed = repos_count,
+                full_repos_confirmed = full_repos_count,
+                state_only_repos_confirmed = state_only_repos_count,
                 root_events_confirmed = events_count,
                 root_events_ids = ?batch.items.root_events.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
-                total_repos = state.repos.len(),
+                total_full_repos = state.repos.len(),
+                total_state_only_repos = state.state_only_repos.len(),
                 total_root_events = state.root_events.len(),
                 all_root_events = ?state.root_events.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
                 is_generic_filter = is_generic_filter,
@@ -1790,7 +1799,8 @@ impl SyncManager {
 
                 tracing::info!(
                     relay = %relay_url,
-                    repos_synced = state.repos.len(),
+                    full_repos_synced = state.repos.len(),
+                    state_only_repos_synced = state.state_only_repos.len(),
                     root_events_synced = state.root_events.len(),
                     had_failures = state.historic_sync_had_failures,
                     status = ?new_status,
@@ -1844,7 +1854,7 @@ impl SyncManager {
         {
             let mut index = self.relay_sync_index.write().await;
             if let Some(state) = index.get_mut(relay_url) {
-                let repos_cleared = state.repos.len();
+                let repos_cleared = state.repos.len() + state.state_only_repos.len();
                 let events_cleared = state.root_events.len();
                 state.clear_sync_state();
                 tracing::debug!(
@@ -2073,7 +2083,8 @@ impl SyncManager {
                 // New relay - register and connect
                 tracing::info!(
                     relay = %action.relay_url,
-                    repos = action.items.repos.len(),
+                    full_repos = action.items.repos.len(),
+                    state_only_repos = action.items.state_only_repos.len(),
                     "Registering and connecting to new relay"
                 );
 
@@ -2105,7 +2116,8 @@ impl SyncManager {
         if self.health_tracker.is_rate_limited(&action.relay_url) {
             tracing::debug!(
                 relay = %action.relay_url,
-                repos = action.items.repos.len(),
+                full_repos = action.items.repos.len(),
+                state_only_repos = action.items.state_only_repos.len(),
                 root_events = action.items.root_events.len(),
                 "Skipping AddFilters for rate-limited relay, will recompute after cooldown"
             );
@@ -2120,7 +2132,8 @@ impl SyncManager {
         tracing::info!(
             relay = %action.relay_url,
             filter_count = action.filters.len(),
-            repo_count = action.items.repos.len(),
+            full_repo_count = action.items.repos.len(),
+            state_only_repo_count = action.items.state_only_repos.len(),
             root_event_count = action.items.root_events.len(),
             "handle_add_filters: calling sync_live and historic_sync"
         );
@@ -2460,7 +2473,7 @@ impl SyncManager {
         {
             let mut index = self.relay_sync_index.write().await;
             if let Some(state) = index.get_mut(relay_url) {
-                let repos_cleared = state.repos.len();
+                let repos_cleared = state.repos.len() + state.state_only_repos.len();
                 let events_cleared = state.root_events.len();
                 state.clear_sync_state();
                 if repos_cleared > 0 || events_cleared > 0 {
@@ -2549,7 +2562,7 @@ impl SyncManager {
         self.recompute_new_sync_filters_for_relay(relay_url).await;
     }
 
-    /// Rebuild Layer 2 and Layer 3 subscriptions for a relay
+    /// Rebuild level-aware repository subscriptions for a relay
     ///
     /// Uses the confirmed repos and root_events from RelayState to build filters.
     /// If since is provided, applies it to all filters for incremental sync.
@@ -2557,13 +2570,15 @@ impl SyncManager {
     /// CRITICAL: This method now creates a PendingBatch to track subscriptions,
     /// ensuring EOSE handling works correctly for live sync scenarios.
     async fn rebuild_layer2_and_layer3(&mut self, relay_url: &str, since: Option<Timestamp>) {
-        use crate::sync::filters::build_layer2_and_layer3_filters;
-
         // Get confirmed state from relay_sync_index
-        let (repos, root_events) = {
+        let (full_repos, state_only_repos, root_events) = {
             let index = self.relay_sync_index.read().await;
             match index.get(relay_url) {
-                Some(state) => (state.repos.clone(), state.root_events.clone()),
+                Some(state) => (
+                    state.repos.clone(),
+                    state.state_only_repos.clone(),
+                    state.root_events.clone(),
+                ),
                 None => {
                     tracing::warn!(
                         relay = %relay_url,
@@ -2575,7 +2590,7 @@ impl SyncManager {
         };
 
         // Nothing to rebuild if no confirmed items
-        if repos.is_empty() && root_events.is_empty() {
+        if full_repos.is_empty() && state_only_repos.is_empty() && root_events.is_empty() {
             tracing::debug!(
                 relay = %relay_url,
                 "No confirmed items to rebuild Layer 2/3 for"
@@ -2583,8 +2598,12 @@ impl SyncManager {
             return;
         }
 
-        // Build Layer 2 and Layer 3 filters
-        let filters = build_layer2_and_layer3_filters(&repos, &root_events, since);
+        let filters = filters::build_sync_level_aware_filters(
+            &full_repos,
+            &state_only_repos,
+            &root_events,
+            since,
+        );
 
         if filters.is_empty() {
             tracing::debug!(
@@ -2642,6 +2661,7 @@ impl SyncManager {
                     last_connected: None,
                     disconnected_at: None,
                     repos: HashSet::new(),
+                    state_only_repos: HashSet::new(),
                     root_events: HashSet::new(),
                     announcements_synced: false,
                     historic_sync_completed: false,
@@ -2912,7 +2932,8 @@ impl SyncManager {
         for action in actions {
             tracing::info!(
                 relay = %action.relay_url,
-                new_repos = action.items.repos.len(),
+                new_full_repos = action.items.repos.len(),
+                new_state_only_repos = action.items.state_only_repos.len(),
                 new_root_events = action.items.root_events.len(),
                 filters = action.filters.len(),
                 "Processing AddFilters for new items"
@@ -3004,7 +3025,8 @@ impl SyncManager {
         {
             tracing::info!(
                 relay = %action.relay_url,
-                repos = action.items.repos.len(),
+                full_repos = action.items.repos.len(),
+                state_only_repos = action.items.state_only_repos.len(),
                 "Purgatory sync timer: processing one bounded relay action"
             );
             self.handle_new_sync_filters(action).await;
@@ -3447,7 +3469,8 @@ impl SyncManager {
                     state.disconnected_at = Some(Timestamp::now());
                     tracing::info!(
                         relay = %relay_url,
-                        repos_tracked = state.repos.len(),
+                        full_repos_tracked = state.repos.len(),
+                        state_only_repos_tracked = state.state_only_repos.len(),
                         "Relay state updated to disconnected"
                     );
                 } else {
@@ -4214,6 +4237,7 @@ impl SyncManager {
                     // A source can have desired StateOnly invitation work before
                     // its first successful historic batch confirms anything.
                     if state.repos.is_empty()
+                        && state.state_only_repos.is_empty()
                         && state.root_events.is_empty()
                         && !desired_relays.contains(relay_url)
                     {
@@ -4299,7 +4323,8 @@ impl SyncManager {
                 for action in actions {
                     tracing::info!(
                         relay = %action.relay_url,
-                        repo_count = action.items.repos.len(),
+                        full_repo_count = action.items.repos.len(),
+                        state_only_repo_count = action.items.state_only_repos.len(),
                         event_count = action.items.root_events.len(),
                         "Submitting recovered actions after rate limit"
                     );

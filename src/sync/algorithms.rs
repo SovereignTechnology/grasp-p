@@ -120,12 +120,22 @@ pub fn compute_actions(
         }
 
         // Calculate what's already pending
-        let pending_repos: HashSet<String> = pending
+        let pending_full_repos: HashSet<String> = pending
             .get(relay_url)
             .map(|batches| {
                 batches
                     .iter()
                     .flat_map(|batch| batch.items.repos.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let pending_state_only_repos: HashSet<String> = pending
+            .get(relay_url)
+            .map(|batches| {
+                batches
+                    .iter()
+                    .flat_map(|batch| batch.items.state_only_repos.iter().cloned())
                     .collect()
             })
             .unwrap_or_default();
@@ -141,9 +151,14 @@ pub fn compute_actions(
             .unwrap_or_default();
 
         // Calculate what's already confirmed
-        let confirmed_repos: HashSet<String> = confirmed
+        let confirmed_full_repos: HashSet<String> = confirmed
             .get(relay_url)
             .map(|state| state.repos.clone())
+            .unwrap_or_default();
+
+        let confirmed_state_only_repos: HashSet<String> = confirmed
+            .get(relay_url)
+            .map(|state| state.state_only_repos.clone())
             .unwrap_or_default();
 
         let confirmed_events: HashSet<EventId> = confirmed
@@ -154,16 +169,20 @@ pub fn compute_actions(
         // Calculate what's NEW for full repos (not in pending, not in confirmed)
         let new_full_repos: HashSet<String> = target_needs
             .repos
-            .difference(&pending_repos)
-            .filter(|repo| !confirmed_repos.contains(*repo))
+            .difference(&pending_full_repos)
+            .filter(|repo| !confirmed_full_repos.contains(*repo))
             .cloned()
             .collect();
 
         // Calculate what's NEW for state-only repos
         let new_state_only_repos: HashSet<String> = target_needs
             .state_only_repos
-            .difference(&pending_repos)
-            .filter(|repo| !confirmed_repos.contains(*repo))
+            .difference(&pending_state_only_repos)
+            .filter(|repo| {
+                !pending_full_repos.contains(*repo)
+                    && !confirmed_full_repos.contains(*repo)
+                    && !confirmed_state_only_repos.contains(*repo)
+            })
             .cloned()
             .collect();
 
@@ -184,14 +203,11 @@ pub fn compute_actions(
                 None,
             );
 
-            // Combine all repos into pending items (pending tracking doesn't need sync level)
-            let mut all_new_repos = new_full_repos;
-            all_new_repos.extend(new_state_only_repos);
-
             actions.push(AddFilters {
                 relay_url: relay_url.clone(),
                 items: PendingItems {
-                    repos: all_new_repos,
+                    repos: new_full_repos,
+                    state_only_repos: new_state_only_repos,
                     root_events: new_events,
                 },
                 filters,
@@ -411,6 +427,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             RelayState {
                 repos: HashSet::new(),
+                state_only_repos: HashSet::new(),
                 root_events: HashSet::new(),
                 is_bootstrap: false,
                 connection_status: ConnectionStatus::Disconnected,
@@ -470,6 +487,7 @@ mod tests {
                 batch_id: 1,
                 items: super::super::PendingItems {
                     repos: vec!["repo1".to_string()].into_iter().collect(),
+                    state_only_repos: HashSet::new(),
                     root_events: HashSet::new(),
                 },
                 outstanding_subs: HashSet::new(),
@@ -510,6 +528,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             RelayState {
                 repos: vec!["repo1".to_string()].into_iter().collect(),
+                state_only_repos: HashSet::new(),
                 root_events: HashSet::new(),
                 is_bootstrap: false,
                 connection_status: ConnectionStatus::Connected,
@@ -527,6 +546,72 @@ mod tests {
             actions.is_empty(),
             "Should not create action for confirmed items"
         );
+    }
+
+    #[test]
+    fn test_compute_actions_upgrades_confirmed_state_only_repo_to_full() {
+        let relay_url = "wss://relay1.com";
+        let targets = HashMap::from([(
+            relay_url.to_string(),
+            RelaySyncNeeds {
+                repos: HashSet::from(["repo1".to_string()]),
+                state_only_repos: HashSet::new(),
+                root_events: HashSet::new(),
+            },
+        )]);
+        let confirmed = HashMap::from([(
+            relay_url.to_string(),
+            RelayState {
+                state_only_repos: HashSet::from(["repo1".to_string()]),
+                connection_status: ConnectionStatus::Connected,
+                ..RelayState::default()
+            },
+        )]);
+
+        let actions = compute_actions(&targets, &HashMap::new(), &confirmed);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].items.repos, HashSet::from(["repo1".to_string()]));
+        assert!(actions[0].items.state_only_repos.is_empty());
+        assert!(!actions[0].filters.is_empty());
+    }
+
+    #[test]
+    fn test_compute_actions_upgrades_pending_state_only_repo_to_full() {
+        let relay_url = "wss://relay1.com";
+        let targets = HashMap::from([(
+            relay_url.to_string(),
+            RelaySyncNeeds {
+                repos: HashSet::from(["repo1".to_string()]),
+                state_only_repos: HashSet::new(),
+                root_events: HashSet::new(),
+            },
+        )]);
+        let pending = HashMap::from([(
+            relay_url.to_string(),
+            vec![super::super::PendingBatch {
+                batch_id: 1,
+                items: PendingItems {
+                    repos: HashSet::new(),
+                    state_only_repos: HashSet::from(["repo1".to_string()]),
+                    root_events: HashSet::new(),
+                },
+                outstanding_subs: HashSet::new(),
+                sync_method: SyncMethod::ReqEose,
+                pagination_state: HashMap::new(),
+                requested_event_ids: None,
+                received_event_ids: None,
+                retry_count: 0,
+                failed: false,
+            }],
+        )]);
+
+        let actions = compute_actions(&targets, &pending, &HashMap::new());
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].items.repos, HashSet::from(["repo1".to_string()]));
+        assert!(actions[0].items.state_only_repos.is_empty());
+        assert!(!actions[0].filters.is_empty());
     }
 
     #[test]
@@ -548,6 +633,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             RelayState {
                 repos: HashSet::new(),
+                state_only_repos: HashSet::new(),
                 root_events: HashSet::new(),
                 is_bootstrap: false,
                 connection_status: ConnectionStatus::Connecting,
@@ -595,6 +681,7 @@ mod tests {
                 batch_id: 1,
                 items: super::super::PendingItems {
                     repos: vec!["repo1".to_string()].into_iter().collect(),
+                    state_only_repos: HashSet::new(),
                     root_events: HashSet::new(),
                 },
                 outstanding_subs: HashSet::new(),
@@ -613,6 +700,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             RelayState {
                 repos: vec!["repo2".to_string()].into_iter().collect(),
+                state_only_repos: HashSet::new(),
                 root_events: HashSet::new(),
                 is_bootstrap: false,
                 connection_status: ConnectionStatus::Connected,

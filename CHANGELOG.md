@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix promoted repositories remaining on state-only GRASP sync filters, which
+  prevented remote issues, patches, and pull requests from being discovered
+  after their Git data arrived.
 - Prevent relay-owner private keys from appearing in process arguments by
   loading NixOS secret files through a systemd credential. Configured empty or
   invalid keys now stop startup instead of silently generating a new identity,
