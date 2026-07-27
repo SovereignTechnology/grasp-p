@@ -27,7 +27,8 @@ Key Architectural Points:
   - PendingBatch tracks each new set of filters that may require pagination until they are complete
   - Websocket handshakes run in at most eight bounded workers outside the sync
     actor; only the actor applies their results, and subscriptions start only
-    after the relay reports `Connected`
+    after the relay reports `Connected`. The sync manager owns retry/backoff
+    rather than the SDK, and shutdown cancels queued or active workers
   - Recompute desired filters when connection is established to ensure filters are as consolidated as possible
   - Consolidation bounds incremental fragmentation to 70 subscriptions above
     the irreducible desired live-filter baseline, so large desired sets remain

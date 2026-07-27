@@ -2580,20 +2580,39 @@ impl SyncManager {
         let health_tracker = Arc::clone(&self.health_tracker);
         let semaphore = Arc::clone(&self.connect_attempt_semaphore);
         let timeout = self.health_tracker.base_backoff_secs();
+        let Some(mut shutdown_rx) = self.shutdown_tx.as_ref().map(|sender| sender.subscribe())
+        else {
+            tracing::error!(relay = %relay_url, "Connection scheduler has no shutdown signal");
+            return;
+        };
         tokio::spawn(async move {
-            let Some(_permit) = begin_connect_attempt(semaphore, health_tracker, &relay_url).await
-            else {
+            let permit = tokio::select! {
+                permit = begin_connect_attempt(semaphore, health_tracker, &relay_url) => permit,
+                _ = shutdown_rx.recv() => return,
+            };
+            let Some(_permit) = permit else {
                 return;
             };
-            let outcome = match connection.connect(timeout).await {
-                Ok(()) => ConnectAttemptOutcome::Connected,
-                Err(error) => ConnectAttemptOutcome::Failed(error),
+            let outcome = tokio::select! {
+                result = connection.connect(timeout) => match result {
+                    Ok(()) => ConnectAttemptOutcome::Connected,
+                    Err(error) => ConnectAttemptOutcome::Failed(error),
+                },
+                _ = shutdown_rx.recv() => {
+                    connection.disconnect().await;
+                    return;
+                }
             };
-            let _ = result_tx.send(ConnectAttemptResult {
-                relay_url,
-                token,
-                outcome,
-            });
+            if result_tx
+                .send(ConnectAttemptResult {
+                    relay_url,
+                    token,
+                    outcome,
+                })
+                .is_err()
+            {
+                connection.disconnect().await;
+            }
         });
     }
 

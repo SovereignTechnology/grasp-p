@@ -208,6 +208,7 @@ impl RelayConnection {
         let relay = tokio::time::timeout_at(connection_deadline, async {
             self.client
                 .add_relay(&self.url)
+                .reconnect(false)
                 .await
                 .map_err(|e| format!("Failed to add relay {}: {}", self.url, e))?;
 
