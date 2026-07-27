@@ -241,7 +241,6 @@ impl StatePolicy {
             // for repos that became populated by the copy.
             let local_relay = self.ctx.get_local_relay();
             let promotion_result = crate::git::sync::process_repos_populated_by_state_copy(
-                &repo_with_git_data,
                 &state,
                 &db_repo_data,
                 &self.ctx.database,

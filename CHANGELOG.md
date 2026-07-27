@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix invitation acceptance on a shared GRASP server by reapplying an existing
   owner state event to the invitee's newly created repository, so GRASP-02 can
   align it without an invitee state event or Git push.
+- Fix invitation acceptance when the invitee already owns the same repository
+  identifier by routing maintainer-changing replacements through purgatory and
+  reprocessing the owner dependencies that align the existing Git repository.
 - Sideband-aware Git clients now receive periodic progress while GRASP performs post-push purgatory promotion and cross-owner repository alignment, preventing the client I/O timeout from expiring during unusually complex finalization.
 - Smart HTTP pushes now expose the terminal receive-pack flush only after GRASP has finished promoting the matching repository announcement and state from purgatory. Git progress remains streamed while large packs are resolved and checked, but an immediately following clone or proposal push can now rely on a completed push being queryable on the relay.
 - Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.

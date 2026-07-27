@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use nostr::nips::nip19::ToBech32;
@@ -29,6 +29,7 @@ use crate::nostr::policy::{
 };
 use crate::nostr::SharedDatabase;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
+use crate::sync::rejected_index::RejectedEventsIndex;
 
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
@@ -53,6 +54,7 @@ pub struct Nip34WritePolicy {
     pr_event_policy: PrEventPolicy,
     related_event_policy: RelatedEventPolicy,
     deletion: DeletionService,
+    rejected_events_index: Arc<RwLock<Option<Arc<RejectedEventsIndex>>>>,
 }
 
 impl std::fmt::Debug for Nip34WritePolicy {
@@ -100,6 +102,7 @@ impl Nip34WritePolicy {
             pr_event_policy: PrEventPolicy::new(ctx.clone(), repo_init_locks),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
             deletion: DeletionService::new(deletion_ctx),
+            rejected_events_index: Arc::new(RwLock::new(None)),
             ctx,
         }
     }
@@ -142,6 +145,26 @@ impl Nip34WritePolicy {
     /// on this policy, but purgatory sync needs the relay to notify subscribers.
     pub fn set_local_relay(&self, relay: nostr_relay_builder::LocalRelay) {
         self.ctx.set_local_relay(relay);
+    }
+
+    /// Make sync's rejected-event dependencies available to direct-write
+    /// purgatory promotions.
+    pub fn set_rejected_events_index(&self, index: Arc<RejectedEventsIndex>) {
+        *self
+            .rejected_events_index
+            .write()
+            .expect("rejected events index lock poisoned") = Some(index);
+    }
+
+    pub(crate) fn rejected_events_index(&self) -> Option<Arc<RejectedEventsIndex>> {
+        self.rejected_events_index
+            .read()
+            .expect("rejected events index lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn local_relay(&self) -> Option<nostr_relay_builder::LocalRelay> {
+        self.ctx.get_local_relay()
     }
 
     /// Access the deletion subsystem directly.

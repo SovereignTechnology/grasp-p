@@ -280,7 +280,14 @@ pub async fn fetch_repository_data_with_purgatory(
 
     for entry in purgatory_announcements {
         if let Ok(announcement) = RepositoryAnnouncement::from_event(entry.event) {
-            repo_data.announcements.push(announcement);
+            if let Some(current) = repo_data.announcements.iter_mut().find(|current| {
+                current.event.pubkey == announcement.event.pubkey
+                    && current.identifier == announcement.identifier
+            }) {
+                *current = announcement;
+            } else {
+                repo_data.announcements.push(announcement);
+            }
         }
     }
 

@@ -242,6 +242,9 @@ impl RelayServer {
         // Get a reference to the rejected events index for shutdown persistence
         // and for the HTTP server's git push path (hot-cache re-processing)
         let rejected_events_index = sync_manager.rejected_events_index();
+        relay_runtime
+            .write_policy
+            .set_rejected_events_index(rejected_events_index.clone());
 
         let mut background_tasks = Vec::new();
 

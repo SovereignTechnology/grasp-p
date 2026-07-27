@@ -29,13 +29,13 @@ pub struct NostrPurgatoryPromotionHooks {
 }
 
 impl NostrPurgatoryPromotionHooks {
-    /// Run deletion recovery and accepted-event persistence hooks only.
+    /// Run deletion recovery and any configured rejected-event dependency hooks.
     pub fn recovery_only(write_policy: &Nip34WritePolicy) -> Self {
         Self {
             deletion: write_policy.deletion().clone(),
             write_policy: Some(Arc::new(write_policy.clone())),
-            rejected_events_index: None,
-            local_relay: None,
+            rejected_events_index: write_policy.rejected_events_index(),
+            local_relay: write_policy.local_relay(),
         }
     }
 
@@ -50,6 +50,68 @@ impl NostrPurgatoryPromotionHooks {
             write_policy: Some(write_policy),
             rejected_events_index: Some(rejected_events_index),
             local_relay,
+        }
+    }
+
+    async fn reprocess_state_dependencies(
+        &self,
+        write_policy: &Nip34WritePolicy,
+        rejected_events_index: &RejectedEventsIndex,
+        relay: &LocalRelay,
+        author: &PublicKey,
+        identifier: &str,
+    ) {
+        let (event_ids, hot_events) =
+            rejected_events_index.dependency_candidates(author, identifier, Some(EventType::State));
+        if !event_ids.is_empty() {
+            info!(
+                pubkey = %author,
+                identifier = %identifier,
+                dependency_event_count = event_ids.len(),
+                hot_cache_events = hot_events.len(),
+                "Found rejected state dependencies after purgatory announcement promotion"
+            );
+        }
+
+        let dummy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        for state in hot_events {
+            info!(
+                event_id = %state.id,
+                pubkey = %author,
+                identifier = %identifier,
+                "Re-processing state event after purgatory announcement promotion"
+            );
+
+            match write_policy.admit_event(&state, &dummy_addr).await {
+                WritePolicyResult::Accept => {
+                    match write_policy
+                        .save_accepted_event(&state, SaveContext::HotCacheReprocess)
+                        .await
+                    {
+                        Ok(_) => {
+                            rejected_events_index.remove(&state.id);
+                            relay.notify_event(state.clone());
+                        }
+                        Err(e) => {
+                            warn!(
+                                event_id = %state.id,
+                                error = %e,
+                                "Failed to save re-processed state event"
+                            );
+                        }
+                    }
+                }
+                WritePolicyResult::Reject { status: true, .. } => {
+                    rejected_events_index.remove(&state.id);
+                    write_policy.purgatory().enqueue_sync_immediate(identifier);
+                }
+                _ => {
+                    warn!(
+                        event_id = %state.id,
+                        "State event still rejected after announcement promotion"
+                    );
+                }
+            }
         }
     }
 }
@@ -88,15 +150,11 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
             return;
         };
 
-        if announcement.maintainers.is_empty() {
-            return;
-        }
-
         debug!(
             identifier = %announcement.identifier,
             event_id = %event.id,
             maintainer_count = announcement.maintainers.len(),
-            "Owner announcement promoted via git push, checking hot cache for rejected maintainer announcements"
+            "Owner announcement promoted from purgatory, checking hot cache for rejected maintainer announcements"
         );
 
         for maintainer_hex in &announcement.maintainers {
@@ -114,7 +172,7 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                             identifier = %announcement.identifier,
                             dependency_event_count = event_ids.len(),
                             hot_cache_events = hot_events.len(),
-                            "Found rejected maintainer dependencies after git push promotion"
+                            "Found rejected maintainer dependencies after purgatory promotion"
                         );
                     }
 
@@ -124,7 +182,7 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                             event_id = %hot_event.id,
                             maintainer = %maintainer_hex,
                             identifier = %announcement.identifier,
-                            "Re-processing maintainer announcement from hot cache after git push promotion"
+                            "Re-processing maintainer announcement from hot cache after purgatory promotion"
                         );
 
                         match write_policy.admit_event(&hot_event, &dummy_addr).await {
@@ -136,6 +194,14 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                                     Ok(_) => {
                                         rejected_events_index.remove(&hot_event.id);
                                         relay.notify_event(hot_event.clone());
+                                        self.reprocess_state_dependencies(
+                                            write_policy,
+                                            rejected_events_index,
+                                            relay,
+                                            &hot_event.pubkey,
+                                            &announcement.identifier,
+                                        )
+                                        .await;
                                         info!(
                                             event_id = %hot_event.id,
                                             "Maintainer announcement accepted and saved on re-processing"
@@ -168,5 +234,14 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                 }
             }
         }
+
+        self.reprocess_state_dependencies(
+            write_policy,
+            rejected_events_index,
+            relay,
+            &event.pubkey,
+            &announcement.identifier,
+        )
+        .await;
     }
 }
