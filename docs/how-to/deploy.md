@@ -112,6 +112,7 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
 - **relayOwnerNsecFile**: Path to file containing relay owner's nsec
   - Passed to ngit-grasp as a protected systemd credential, not a process argument
   - The runtime secret file must already exist (for example through agenix or sops-nix)
+  - Permissions on that external source file remain the operator or secret manager's responsibility
   - Alternative: `relayOwnerNsec = "nsec1..."` (less secure, in nix store)
   - If neither option is set, ngit-grasp loads or creates `.relay-owner.nsec` in `dataDir`
 - **syncBootstrapRelayUrl**: Bootstrap relay to sync from on startup
@@ -430,7 +431,8 @@ Additional recommendations:
 
    The module exposes the file to ngit-grasp as the `relay_owner_nsec`
    systemd credential. The key does not appear in `ExecStart` or the process
-   command line.
+   command line. ngit-grasp does not modify the external source file; keep its
+   ownership and permissions restricted through your secret manager.
 
 2. **Restrict data directory permissions:**
    ```bash

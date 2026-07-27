@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Prevent relay-owner private keys from appearing in process arguments by
   loading NixOS secret files through a systemd credential. Configured empty or
-  invalid keys now stop startup instead of silently generating a new identity.
+  invalid keys now stop startup instead of silently generating a new identity,
+  and existing persistent fallback key files are restricted to mode `0600`
+  before being read.
 - Fix maintainer invitation recovery after a production restart by starting the
   relay and SyncManager before scanning retained deletion requests. The
   potentially long retention catch-up now begins immediately in the existing

@@ -79,6 +79,8 @@ let
           Leave this null to use relayOwnerNsec or to load/generate
           .relay-owner.nsec in dataDir. If set, point it at a runtime secret
           file (agenix, sops-nix, etc.), not a Nix-store path.
+          ngit-grasp does not modify this external source file; its ownership
+          and permissions remain the operator or secret manager's responsibility.
         '';
       };
 

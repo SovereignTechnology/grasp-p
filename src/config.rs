@@ -694,10 +694,20 @@ impl Config {
     /// Load relay owner key from file, or generate and save a new one
     pub fn load_or_generate_relay_owner_key() -> Result<String> {
         let key_path = PathBuf::from(Self::RELAY_OWNER_KEY_FILE);
+        Self::load_or_generate_relay_owner_key_at(&key_path)
+    }
 
+    fn load_or_generate_relay_owner_key_at(key_path: &Path) -> Result<String> {
         // Try to load existing key
         if key_path.exists() {
-            let nsec = fs::read_to_string(&key_path)
+            secure_secret_file_permissions(key_path).with_context(|| {
+                format!(
+                    "Failed to secure relay owner key file {}",
+                    key_path.display()
+                )
+            })?;
+
+            let nsec = fs::read_to_string(key_path)
                 .context("Failed to read relay owner key file")?
                 .trim()
                 .to_string();
@@ -715,7 +725,7 @@ impl Config {
         let keys = Keys::generate();
         let nsec = keys.secret_key().to_bech32()?;
 
-        write_secret_file(&key_path, &nsec).context("Failed to write relay owner key file")?;
+        write_secret_file(key_path, &nsec).context("Failed to write relay owner key file")?;
 
         tracing::info!(
             "Generated new relay owner key and saved to {}",
@@ -1065,6 +1075,31 @@ fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+fn secure_secret_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to inspect secret file {}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o777 != 0o600 {
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions).with_context(|| {
+                format!(
+                    "Failed to restrict secret file {} to mode 0600",
+                    path.display()
+                )
+            })?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1401,6 +1436,26 @@ mod tests {
         let key_path = tempdir.path().join(".relay-owner.nsec");
         write_secret_file(&key_path, "secret").unwrap();
 
+        assert_eq!(
+            fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_relay_owner_key_file_permissions_are_repaired_before_loading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let key_path = tempdir.path().join(".relay-owner.nsec");
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        fs::write(&key_path, &nsec).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let loaded = Config::load_or_generate_relay_owner_key_at(&key_path).unwrap();
+
+        assert_eq!(loaded, nsec);
         assert_eq!(
             fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
             0o600
