@@ -147,10 +147,45 @@ git commit -m "Add ngit-grasp and update flake.lock"
 
 ### Step 5: Validate Configuration
 
-Before deploying, validate the configuration builds:
+Before deploying, validate that the flake evaluates without starting its builds:
 
 ```bash
-nix flake check
+nix flake check --no-build
+```
+
+#### Resource-safe module validation
+
+Nix copies path-valued build inputs into the store when they are forced. A Git
+flake is materialized from its tracked files first, but a standalone path into a
+working tree does not inherit that Git filtering.
+
+This matters when testing ngit-grasp's NixOS module locally. Importing
+`nix/module.nix` is lazy by itself, but rendering an enabled service forces the
+module-built package through `ExecStart`. The package's `src = ../.` then
+resolves relative to that module. If the module was imported directly from a
+working tree, Nix may recursively hash or copy ignored `target/`, `.git`, and
+linked-worktree data while it appears to be evaluating the configuration.
+
+Use `inputs.ngit-grasp.nixosModules.default` from a Git-backed flake input, as
+shown above. For local module changes, commit them to a temporary Git branch and
+use that Git source, or replace `buildRustPackage` with a test stub that ignores
+all build attributes so `src` remains unforced. Do not use a direct
+working-tree module import for a test that enables an instance.
+
+Inspect the derivation plan before starting a build:
+
+```bash
+nixos-rebuild dry-build --flake .#your-hostname
+```
+
+Multiple ngit-grasp instances should normally share one ngit-grasp package
+derivation. Avoid service-level `ExecStart` overrides that force another flake
+package or Rust toolchain. If distinct versions are intentional, build them
+sequentially or on appropriately sized remote builders. For an initial local
+build, constrain Nix while confirming the plan behaves as expected:
+
+```bash
+nixos-rebuild build --flake .#your-hostname --max-jobs 1 --cores 2
 ```
 
 ---
