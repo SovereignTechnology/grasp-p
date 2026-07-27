@@ -316,6 +316,30 @@ pub struct PendingItems {
     pub root_events: HashSet<EventId>,
 }
 
+fn take_drained_batch_as_failed(
+    pending: &mut HashMap<String, Vec<PendingBatch>>,
+    relay_url: &str,
+    batch_id: u64,
+) -> Option<PendingBatch> {
+    let (batch_index, remove_relay) = {
+        let batches = pending.get(relay_url)?;
+        let batch_index = batches
+            .iter()
+            .position(|batch| batch.batch_id == batch_id)?;
+        if !batches[batch_index].outstanding_subs.is_empty() {
+            return None;
+        }
+        (batch_index, batches.len() == 1)
+    };
+
+    let mut batch = pending.get_mut(relay_url)?.remove(batch_index);
+    batch.failed = true;
+    if remove_relay {
+        pending.remove(relay_url);
+    }
+    Some(batch)
+}
+
 // =============================================================================
 // SyncManager - Main Entry Point
 // =============================================================================
@@ -349,12 +373,54 @@ const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 /// Maximum filter count before triggering consolidation
 const CONSOLIDATION_THRESHOLD: usize = 70;
 
-/// Maximum time to wait for pending batches (30 seconds)
-const CONSOLIDATION_WAIT_TIMEOUT_SECS: u64 = 30;
-
 /// Page size threshold for historic sync pagination (non-negentropy)
 /// If a subscription receives >= 75 events, we fetch the next page
 const PAGINATION_THRESHOLD: usize = 75;
+
+#[derive(Debug, Default)]
+struct DeferredConsolidations {
+    relays: HashSet<String>,
+}
+
+impl DeferredConsolidations {
+    fn request(&mut self, relay_url: &str, has_pending_batches: bool) -> bool {
+        if has_pending_batches {
+            self.relays.insert(relay_url.to_string());
+            false
+        } else {
+            self.relays.remove(relay_url);
+            true
+        }
+    }
+
+    fn take_ready(&mut self, relay_url: &str, has_pending_batches: bool) -> bool {
+        !has_pending_batches && self.relays.remove(relay_url)
+    }
+
+    fn contains(&self, relay_url: &str) -> bool {
+        self.relays.contains(relay_url)
+    }
+
+    fn cancel(&mut self, relay_url: &str) -> bool {
+        self.relays.remove(relay_url)
+    }
+
+    fn clear(&mut self) {
+        self.relays.clear();
+    }
+}
+
+fn notify_deferred_consolidation_after_batch_completion(
+    deferred: &DeferredConsolidations,
+    sender: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    relay_url: &str,
+) {
+    if deferred.contains(relay_url) {
+        if let Some(sender) = sender {
+            let _ = sender.send(relay_url.to_string());
+        }
+    }
+}
 
 // =============================================================================
 // Daily Timer
@@ -634,12 +700,16 @@ pub struct SyncManager {
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
     next_batch_id: u64,
+    /// Relays whose subscription consolidation waits for in-flight batches to drain.
+    deferred_consolidations: DeferredConsolidations,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
     eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
     /// Channel for connect notifications (set during run)
     connect_tx: Option<tokio::sync::mpsc::Sender<ConnectNotification>>,
+    /// Wakes the actor when a batch completion may unblock consolidation.
+    deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -718,9 +788,11 @@ impl SyncManager {
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
+            deferred_consolidations: DeferredConsolidations::default(),
             disconnect_tx: None,
             eose_tx: None,
             connect_tx: None,
+            deferred_consolidation_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
         }
@@ -908,6 +980,7 @@ impl SyncManager {
                     }
 
                     // Subscribe to next page and add to outstanding_subs
+                    let mut next_page_started = false;
                     if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
                         match conn.subscribe_filter(next_filter.clone(), true).await {
                             Ok(new_sub_id) => {
@@ -918,6 +991,7 @@ impl SyncManager {
                                         batches.iter_mut().find(|b| b.batch_id == batch_id)
                                     {
                                         batch.outstanding_subs.insert(new_sub_id.clone());
+                                        next_page_started = true;
                                         // Initialize pagination state for new subscription
                                         batch.pagination_state.insert(
                                             new_sub_id.clone(),
@@ -945,6 +1019,25 @@ impl SyncManager {
                                     "Failed to create pagination subscription, continuing without next page"
                                 );
                             }
+                        }
+                    }
+
+                    if !next_page_started {
+                        let completed_batch = {
+                            let mut pending = self.pending_sync_index.write().await;
+                            take_drained_batch_as_failed(
+                                &mut pending,
+                                &relay_url_for_pagination,
+                                batch_id,
+                            )
+                        };
+                        if let Some(batch) = completed_batch {
+                            tracing::warn!(
+                                relay = %relay_url_for_pagination,
+                                batch_id,
+                                "Pagination could not continue; completing drained batch as failed"
+                            );
+                            self.confirm_batch(&relay_url_for_pagination, batch).await;
                         }
                     }
 
@@ -1335,6 +1428,12 @@ impl SyncManager {
         // Release lock before checking if historic sync is complete
         drop(relay_index);
 
+        notify_deferred_consolidation_after_batch_completion(
+            &self.deferred_consolidations,
+            self.deferred_consolidation_tx.as_ref(),
+            relay_url,
+        );
+
         // Spawn background task to check if historic sync is complete
         // This avoids blocking the confirm_batch flow for 6 seconds
         let relay_url = relay_url.to_string();
@@ -1452,6 +1551,7 @@ impl SyncManager {
     /// This is triggered by the daily timer to detect state drift over time.
     async fn daily_sync(&mut self, relay_url: &str) {
         tracing::info!(relay = %relay_url, "Starting daily sync");
+        self.cancel_deferred_consolidation(relay_url, "daily sync reset");
 
         // Get connection
         let connection = match self.connections.get(relay_url) {
@@ -1529,6 +1629,11 @@ impl SyncManager {
         // 4. Create connect channel for spawned tasks -> manager communication
         let (connect_tx, mut connect_rx) = mpsc::channel::<ConnectNotification>(100);
 
+        // Batch completion can be synchronous, so use a non-blocking wakeup
+        // instead of waiting for pending work while holding the actor lock.
+        let (deferred_consolidation_tx, mut deferred_consolidation_rx) =
+            mpsc::unbounded_channel::<String>();
+
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
@@ -1547,6 +1652,7 @@ impl SyncManager {
         self.disconnect_tx = Some(disconnect_tx.clone());
         self.eose_tx = Some(eose_tx.clone());
         self.connect_tx = Some(connect_tx.clone());
+        self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
         // 6. Connect to bootstrap relay if configured
@@ -1642,6 +1748,12 @@ impl SyncManager {
                             // All connect senders dropped - unlikely but handle gracefully
                             tracing::debug!("Connect channel closed");
                         }
+                    }
+                }
+                relay_url = deferred_consolidation_rx.recv() => {
+                    if let Some(relay_url) = relay_url {
+                        let mut manager = sync_manager.lock().await;
+                        manager.process_deferred_consolidation(&relay_url).await;
                     }
                 }
             }
@@ -2036,6 +2148,7 @@ impl SyncManager {
         let _now = Timestamp::now();
 
         tracing::info!(relay = %relay_url, "Starting fresh_start");
+        self.cancel_deferred_consolidation(relay_url, "fresh start");
 
         // Step 1: Clear PendingSyncIndex for this relay
         {
@@ -2099,6 +2212,8 @@ impl SyncManager {
     /// Basic connection state and metrics are managed by handle_connect_or_reconnect.
     /// This method handles reconnect-specific concerns (health tracking, reconnect metrics).
     async fn quick_reconnect(&mut self, relay_url: &str, since: Timestamp) {
+        self.cancel_deferred_consolidation(relay_url, "quick reconnect");
+
         // Step 1: Clear PendingSyncIndex for this relay
         // Old subscriptions are dead after disconnect
         {
@@ -2837,6 +2952,7 @@ impl SyncManager {
                 .map(|s| s.connection_status == ConnectionStatus::Disconnecting)
                 .unwrap_or(false)
         };
+        self.cancel_deferred_consolidation(relay_url, "relay disconnect");
 
         if was_intentional {
             // Intentional disconnect - complete cleanup by removing state
@@ -3387,53 +3503,12 @@ impl SyncManager {
     // Consolidation System
     // =========================================================================
 
-    /// Wait until all pending batches for a relay are complete
-    ///
-    /// Polls the pending_sync_index until the relay has no pending batches.
-    /// Returns error if timeout (30 seconds) is exceeded.
-    async fn wait_pending_complete(&self, relay_url: &str) -> Result<(), String> {
-        use std::time::Duration;
-        use tokio::time::{sleep, Instant};
-
-        let start = Instant::now();
-        let timeout = Duration::from_secs(CONSOLIDATION_WAIT_TIMEOUT_SECS);
-
-        tracing::debug!(
-            relay = %relay_url,
-            timeout_secs = CONSOLIDATION_WAIT_TIMEOUT_SECS,
-            "Waiting for pending batches to complete"
-        );
-
-        loop {
-            // Check if no pending batches
-            {
-                let pending = self.pending_sync_index.read().await;
-                if !pending.contains_key(relay_url) {
-                    tracing::debug!(
-                        relay = %relay_url,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "All pending batches complete"
-                    );
-                    return Ok(());
-                }
-            }
-
-            // Check timeout
-            if start.elapsed() > timeout {
-                tracing::warn!(
-                    relay = %relay_url,
-                    timeout_secs = CONSOLIDATION_WAIT_TIMEOUT_SECS,
-                    "Timeout waiting for pending batches"
-                );
-                return Err(format!(
-                    "Timeout waiting for pending batches on {} after {}s",
-                    relay_url, CONSOLIDATION_WAIT_TIMEOUT_SECS
-                ));
-            }
-
-            // Short poll interval
-            sleep(Duration::from_millis(100)).await;
-        }
+    async fn has_pending_batches(&self, relay_url: &str) -> bool {
+        self.pending_sync_index
+            .read()
+            .await
+            .get(relay_url)
+            .is_some_and(|batches| !batches.is_empty())
     }
 
     /// Check if consolidation is needed and trigger if threshold exceeded
@@ -3448,6 +3523,21 @@ impl SyncManager {
         };
 
         if current_count + new_count > CONSOLIDATION_THRESHOLD {
+            let has_pending_batches = self.has_pending_batches(relay_url).await;
+            if !self
+                .deferred_consolidations
+                .request(relay_url, has_pending_batches)
+            {
+                tracing::info!(
+                    relay = %relay_url,
+                    current_count,
+                    new_count,
+                    threshold = CONSOLIDATION_THRESHOLD,
+                    "Filter count exceeds threshold; deferring consolidation until pending batches drain"
+                );
+                return;
+            }
+
             tracing::info!(
                 relay = %relay_url,
                 current_count = current_count,
@@ -3456,34 +3546,49 @@ impl SyncManager {
                 "Filter count exceeds threshold, consolidating"
             );
 
-            if let Err(e) = self.consolidate(relay_url).await {
-                tracing::error!(
-                    relay = %relay_url,
-                    error = %e,
-                    "Consolidation failed"
-                );
-            }
+            self.consolidate(relay_url).await;
+        }
+    }
+
+    async fn process_deferred_consolidation(&mut self, relay_url: &str) {
+        let has_pending_batches = self.has_pending_batches(relay_url).await;
+        if !self
+            .deferred_consolidations
+            .take_ready(relay_url, has_pending_batches)
+        {
+            return;
+        }
+
+        tracing::info!(
+            relay = %relay_url,
+            "Pending batches drained; running deferred consolidation"
+        );
+        self.consolidate(relay_url).await;
+    }
+
+    fn cancel_deferred_consolidation(&mut self, relay_url: &str, reason: &'static str) {
+        if self.deferred_consolidations.cancel(relay_url) {
+            tracing::debug!(
+                relay = %relay_url,
+                reason,
+                "Cancelled deferred consolidation"
+            );
         }
     }
 
     /// Consolidate all subscriptions for a relay
     ///
-    /// This method:
-    /// 1. Waits for all pending batches to complete
-    /// 2. Unsubscribes from all active subscriptions
-    /// 3. Rebuilds Layer 2 and Layer 3 with since filter
+    /// The caller must ensure pending batches have drained so EOSE processing
+    /// never waits behind the sync actor lock.
     ///
     /// Layer 1 (announcements) remains active and is NOT unsubscribed.
-    async fn consolidate(&mut self, relay_url: &str) -> Result<(), String> {
+    async fn consolidate(&mut self, relay_url: &str) {
         tracing::info!(
             relay = %relay_url,
             "Starting consolidation"
         );
 
-        // Step 1: Wait for all pending batches to complete
-        self.wait_pending_complete(relay_url).await?;
-
-        // Step 2: Get connection and unsubscribe all
+        // Get connection and unsubscribe all
         let connection = match self.connections.get(relay_url) {
             Some(conn) => conn,
             None => {
@@ -3491,13 +3596,13 @@ impl SyncManager {
                     relay = %relay_url,
                     "No connection found, skipping consolidation"
                 );
-                return Ok(()); // No connection, nothing to consolidate
+                return;
             }
         };
 
         connection.unsubscribe_all().await;
 
-        // Step 3: Rebuild all subscriptions with since filter
+        // Rebuild all subscriptions with since filter
         let now = Timestamp::now();
         let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
 
@@ -3511,8 +3616,6 @@ impl SyncManager {
             since = %since,
             "Consolidation complete - filter count reset"
         );
-
-        Ok(())
     }
 
     /// Check for relays that should be disconnected
@@ -4198,6 +4301,7 @@ impl SyncManager {
             pending.clear();
             tracing::debug!(count = count, "Cleared pending_sync_index");
         }
+        self.deferred_consolidations.clear();
 
         tracing::info!("SyncManager shutdown complete");
     }
@@ -4206,6 +4310,92 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_consolidation_runs_only_after_final_batch_completion() {
+        let relay_url = "wss://relay.example";
+        let mut deferred = DeferredConsolidations::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(
+            !deferred.request(relay_url, true),
+            "an in-flight batch must defer instead of waiting in the sync actor"
+        );
+        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            relay_url,
+            "batch completion must wake the actor without awaiting under its lock"
+        );
+        assert!(
+            !deferred.take_ready(relay_url, true),
+            "consolidation must remain queued while another batch is pending"
+        );
+
+        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
+        assert_eq!(receiver.try_recv().unwrap(), relay_url);
+        assert!(
+            deferred.take_ready(relay_url, false),
+            "the final batch completion must make consolidation runnable"
+        );
+        assert!(
+            !deferred.take_ready(relay_url, false),
+            "taking deferred work must be idempotent"
+        );
+    }
+
+    #[test]
+    fn reset_or_disconnect_cancels_deferred_consolidation_and_stale_wakeup() {
+        for reason in ["reset", "disconnect"] {
+            let relay_url = format!("wss://{reason}.example");
+            let mut deferred = DeferredConsolidations::default();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+            assert!(!deferred.request(&relay_url, true));
+            notify_deferred_consolidation_after_batch_completion(
+                &deferred,
+                Some(&sender),
+                &relay_url,
+            );
+            assert!(deferred.cancel(&relay_url));
+            assert_eq!(receiver.try_recv().unwrap(), relay_url);
+            assert!(
+                !deferred.take_ready(&relay_url, false),
+                "a queued wakeup must not resurrect consolidation after {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_pagination_completes_only_a_fully_drained_batch() {
+        let relay_url = "wss://pagination.example";
+        let still_pending = SubscriptionId::new("still-pending");
+        let make_batch = |batch_id, outstanding_subs| PendingBatch {
+            batch_id,
+            items: PendingItems::default(),
+            outstanding_subs,
+            sync_method: SyncMethod::ReqEose,
+            pagination_state: HashMap::new(),
+            requested_event_ids: None,
+            received_event_ids: None,
+            retry_count: 0,
+            failed: false,
+        };
+        let mut pending = HashMap::from([(
+            relay_url.to_string(),
+            vec![
+                make_batch(41, HashSet::new()),
+                make_batch(42, HashSet::from([still_pending])),
+            ],
+        )]);
+
+        let completed = take_drained_batch_as_failed(&mut pending, relay_url, 41)
+            .expect("failed pagination must complete a drained batch");
+        assert!(completed.failed);
+        assert!(take_drained_batch_as_failed(&mut pending, relay_url, 42).is_none());
+        assert_eq!(pending[relay_url].len(), 1);
+        assert!(!pending[relay_url][0].failed);
+    }
 
     #[test]
     fn relay_disconnect_waits_for_pending_and_historic_sync_work() {

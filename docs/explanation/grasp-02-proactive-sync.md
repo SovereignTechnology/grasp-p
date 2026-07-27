@@ -691,7 +691,10 @@ fn compute_actions(
 - **`fresh_start()`**: Full sync - clears all state, L1 historic (with negentropy if available), then L2+L3 via recompute
 - **`quick_reconnect()`**: Incremental sync - preserves confirmed state, L1 historic with `since`, L2+L3 rebuild with `since`, then recompute for new items
 - **`daily_sync()`**: Wrapper around `fresh_start()` without disconnect metrics
-- **`consolidate()`**: Reduces filter count - clears pending, unsubscribes all, rebuilds live subscriptions only, then recompute for new items
+- **`consolidate()`**: Reduces filter count after in-flight historic batches have
+  drained. If a relay crosses the threshold while batches are pending,
+  consolidation is queued and batch completion wakes the sync actor to rebuild
+  subscriptions. The actor never polls for EOSE while holding its own lock.
 
 ### Sync Primitives
 

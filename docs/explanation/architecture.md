@@ -515,7 +515,9 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 - **Smart reconnection** - uses `since` filter for quick reconnects (<15 min), fresh sync otherwise
 - **Health tracking** with exponential backoff for failing relays
 - **Daily sync** with random 23-25h timer to detect state drift
-- **Filter consolidation** when count exceeds 70 to prevent subscription explosion
+- **Filter consolidation** when count exceeds 70 to prevent subscription
+  explosion; rebuilds are deferred until in-flight batches drain so EOSE and
+  purgatory work remain responsive
 - **Rejected events index** - prevents wasteful broad re-fetching while retaining exact IDs for dependency recovery
 
 **Architecture:**
