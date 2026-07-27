@@ -423,7 +423,8 @@ struct ConnectAttemptResult {
 /// Quick reconnect window in seconds (15 minutes)
 const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 
-/// Maximum filter count before triggering consolidation
+/// Maximum incremental filter fragmentation above the desired live baseline
+/// before triggering consolidation.
 const CONSOLIDATION_THRESHOLD: usize = 70;
 
 /// Bound concurrent DNS and websocket handshakes so a large relay list cannot
@@ -470,6 +471,21 @@ async fn begin_connect_attempt(
     let permit = semaphore.acquire_owned().await.ok()?;
     health_tracker.record_attempt(relay_url);
     Some(permit)
+}
+
+fn consolidation_fragmentation(
+    current_count: usize,
+    new_count: usize,
+    desired_baseline: usize,
+) -> usize {
+    current_count
+        .saturating_add(new_count)
+        .saturating_sub(desired_baseline)
+}
+
+fn should_consolidate(current_count: usize, new_count: usize, desired_baseline: usize) -> bool {
+    consolidation_fragmentation(current_count, new_count, desired_baseline)
+        > CONSOLIDATION_THRESHOLD
 }
 
 #[derive(Debug, Default)]
@@ -3698,18 +3714,40 @@ impl SyncManager {
             .is_some_and(|batches| !batches.is_empty())
     }
 
-    /// Check if consolidation is needed and trigger if threshold exceeded
+    async fn desired_live_filter_count(&self, relay_url: &str) -> usize {
+        let target = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index).remove(relay_url)
+        };
+        let desired_repo_filters = target.map_or(0, |target| {
+            filters::build_sync_level_aware_filters(
+                &target.repos,
+                &target.state_only_repos,
+                &target.root_events,
+                None,
+            )
+            .len()
+        });
+
+        // Every connected relay carries one consolidated generic announcement
+        // subscription in addition to its repository-specific desired filters.
+        1 + desired_repo_filters
+    }
+
+    /// Check if incremental fragmentation exceeds the consolidation threshold.
     ///
-    /// Compares current filter count + new filter count against the threshold.
-    /// If exceeded, triggers consolidation before adding new filters.
+    /// The desired live set is an irreducible baseline, so a repository whose
+    /// consolidated filters already exceed 70 must remain stable.
     async fn maybe_consolidate(&mut self, relay_url: &str, new_count: usize) {
         let current_count = if let Some(connection) = self.connections.get(relay_url) {
             connection.subscription_count().await
         } else {
             0
         };
+        let desired_baseline = self.desired_live_filter_count(relay_url).await;
+        let fragmentation = consolidation_fragmentation(current_count, new_count, desired_baseline);
 
-        if current_count + new_count > CONSOLIDATION_THRESHOLD {
+        if should_consolidate(current_count, new_count, desired_baseline) {
             let has_pending_batches = self.has_pending_batches(relay_url).await;
             if !self
                 .deferred_consolidations
@@ -3719,8 +3757,10 @@ impl SyncManager {
                     relay = %relay_url,
                     current_count,
                     new_count,
+                    desired_baseline,
+                    fragmentation,
                     threshold = CONSOLIDATION_THRESHOLD,
-                    "Filter count exceeds threshold; deferring consolidation until pending batches drain"
+                    "Incremental filter fragmentation exceeds threshold; deferring consolidation until pending batches drain"
                 );
                 return;
             }
@@ -3729,8 +3769,10 @@ impl SyncManager {
                 relay = %relay_url,
                 current_count = current_count,
                 new_count = new_count,
+                desired_baseline,
+                fragmentation,
                 threshold = CONSOLIDATION_THRESHOLD,
-                "Filter count exceeds threshold, consolidating"
+                "Incremental filter fragmentation exceeds threshold, consolidating"
             );
 
             self.consolidate(relay_url).await;
@@ -4655,6 +4697,29 @@ mod tests {
             connections_for_relay_urls(&connections, &candidates),
             vec![(canonical, 7)]
         );
+    }
+
+    #[test]
+    fn desired_baseline_above_threshold_does_not_reconsolidate() {
+        let desired_baseline = 178;
+
+        assert!(
+            !should_consolidate(desired_baseline, 1, desired_baseline),
+            "the irreducible desired set must be a stable post-rebuild baseline"
+        );
+        assert!(
+            !should_consolidate(
+                desired_baseline + CONSOLIDATION_THRESHOLD - 1,
+                1,
+                desired_baseline,
+            ),
+            "the configured fragmentation headroom is allowed above the baseline"
+        );
+        assert!(should_consolidate(
+            desired_baseline + CONSOLIDATION_THRESHOLD,
+            1,
+            desired_baseline,
+        ));
     }
 
     #[test]

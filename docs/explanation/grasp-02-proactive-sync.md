@@ -29,7 +29,9 @@ Key Architectural Points:
     actor; only the actor applies their results, and subscriptions start only
     after the relay reports `Connected`
   - Recompute desired filters when connection is established to ensure filters are as consolidated as possible
-  - Consolidation function ensures number of live_sync subscriptions don't reach rate-limiting limits (threshold: 70 filters)
+  - Consolidation bounds incremental fragmentation to 70 subscriptions above
+    the irreducible desired live-filter baseline, so large desired sets remain
+    stable after rebuilding
 - **Quick Reconnect** (< 15mins) - doesn't do a full reconciliation vs fresh start (longer disconnect or relaunch binary)
 - **Background timers** handle relay connection health and metrics, handling reconnects after backoff and recovery after rate-limiting
 

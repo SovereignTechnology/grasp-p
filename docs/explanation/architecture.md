@@ -517,9 +517,9 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 - **Bounded connection workers** keep slow DNS and websocket handshakes out of
   the sync actor while limiting network pressure to eight concurrent attempts
 - **Daily sync** with random 23-25h timer to detect state drift
-- **Filter consolidation** when count exceeds 70 to prevent subscription
-  explosion; rebuilds are deferred until in-flight batches drain so EOSE and
-  purgatory work remain responsive
+- **Filter consolidation** when incremental fragmentation exceeds the desired
+  live-filter baseline by 70; rebuilds are deferred until in-flight batches
+  drain so EOSE and purgatory work remain responsive
 - **Rejected events index** - prevents wasteful broad re-fetching while retaining exact IDs for dependency recovery
 - **Desired-source retention** keeps listed GRASP-02 relays retryable until
   repository work is actually confirmed, including StateOnly invitation sync
