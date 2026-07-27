@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix invitation acceptance sync by deferring subscription consolidation until
   in-flight relay batches finish, keeping the sync actor available to process
   EOSE messages and the five-second purgatory reconciliation pass.
+- Fix invitation acceptance sync when a listed source relay is initially
+  unavailable or empty by retaining and retrying desired GRASP-02 work until it
+  is confirmed. Root-slash URL variants now share one relay lifecycle instead
+  of multiplying connections and subscription batches.
 - Sideband-aware Git clients now receive periodic progress while GRASP performs post-push purgatory promotion and cross-owner repository alignment, preventing the client I/O timeout from expiring during unusually complex finalization.
 - Smart HTTP pushes now expose the terminal receive-pack flush only after GRASP has finished promoting the matching repository announcement and state from purgatory. Git progress remains streamed while large packs are resolved and checked, but an immediately following clone or proposal push can now rely on a completed push being queryable on the relay.
 - Batch the one-time deletion-request lifecycle migration so large production databases do not remain unavailable while LMDB commits every historical request in separate transactions.

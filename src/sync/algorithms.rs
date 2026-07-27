@@ -67,7 +67,9 @@ pub fn derive_relay_targets(
 
     for (repo_id, needs) in repo_index {
         for relay_url in &needs.relays {
-            let entry = relay_targets.entry(relay_url.clone()).or_default();
+            let relay_key =
+                super::canonical_relay_key(relay_url).unwrap_or_else(|_| relay_url.clone());
+            let entry = relay_targets.entry(relay_key).or_default();
 
             match needs.sync_level {
                 super::SyncLevel::Full => {
@@ -267,6 +269,39 @@ mod tests {
         assert_eq!(targets.len(), 1);
         let relay_needs = targets.get("wss://relay1.com").unwrap();
         assert_eq!(relay_needs.repos.len(), 3);
+    }
+
+    #[test]
+    fn test_derive_relay_targets_deduplicates_root_slash_variants() {
+        let repo_index = HashMap::from([
+            (
+                "repo1".to_string(),
+                ModRepoSyncNeeds {
+                    relays: HashSet::from(["wss://relay1.com".to_string()]),
+                    root_events: HashSet::new(),
+                    sync_level: Default::default(),
+                },
+            ),
+            (
+                "repo2".to_string(),
+                ModRepoSyncNeeds {
+                    relays: HashSet::from(["wss://relay1.com/".to_string()]),
+                    root_events: HashSet::new(),
+                    sync_level: Default::default(),
+                },
+            ),
+        ]);
+
+        let targets = derive_relay_targets(&repo_index);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets
+                .get("wss://relay1.com")
+                .expect("root slash variants must share one key")
+                .repos,
+            HashSet::from(["repo1".to_string(), "repo2".to_string()])
+        );
     }
 
     #[test]

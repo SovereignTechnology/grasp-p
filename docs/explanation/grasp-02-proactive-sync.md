@@ -334,8 +334,11 @@ The sync system uses three background tasks that run continuously:
 
 **Actions**:
 
-1. **Disconnect checking**: Calls `check_disconnects()` to remove relays with no repos/events (except bootstrap)
-2. **Retry disconnected**: Calls `retry_disconnected_relays()` to attempt reconnection per health tracker backoff
+1. **Disconnect checking**: Calls `check_disconnects()` to remove relays with
+   neither confirmed nor desired repository work (except bootstrap)
+2. **Retry disconnected**: Calls `retry_disconnected_relays()` to attempt
+   reconnection per health tracker backoff while either confirmed or desired
+   `RepoSyncIndex` work remains
 3. **Rate limit recovery**: Calls `check_rate_limit_recovery()` to clear expired rate limits
 4. **Metrics update**: Updates Prometheus metrics with current health states
 
@@ -973,6 +976,9 @@ RateLimited -> previous state: After 65-second cooldown expires
 ### Special Behaviors
 
 - **Bootstrap relays**: Never disconnected by cleanup system, even if empty
+- **Desired GRASP-02 sources**: Remain registered and retryable before their
+  first successful historic batch; an initially empty or unavailable source
+  cannot make a purgatory invitation permanently lose its sync path
 - **Rate limiting**: Distinct from connection failures - triggered by relay NOTICE messages
 - **Connection timeout**: Set to `base_backoff_secs` to ensure retry timing works correctly
 

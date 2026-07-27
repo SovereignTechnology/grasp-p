@@ -56,6 +56,48 @@ use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
 use nostr_relay_builder::prelude::LocalRelay;
 
+/// Return one stable identity for a relay URL throughout all sync indexes.
+///
+/// URL parsers represent a root path as `/`, so announcements that alternate
+/// between `wss://relay.example` and `wss://relay.example/` must not create
+/// separate connections and duplicate subscription work. Non-root paths remain
+/// distinct relay endpoints.
+pub(crate) fn canonical_relay_key(relay_url: &str) -> Result<String, String> {
+    let normalized = if relay_url.starts_with("wss://") || relay_url.starts_with("ws://") {
+        relay_url.to_string()
+    } else {
+        format!("wss://{relay_url}")
+    };
+    let relay = RelayUrl::parse(&normalized).map_err(|error| error.to_string())?;
+    let mut canonical = relay.to_string();
+    let after_scheme = canonical
+        .split_once("://")
+        .map(|(_, value)| value)
+        .unwrap_or(canonical.as_str());
+    if after_scheme.ends_with('/') && after_scheme.matches('/').count() == 1 {
+        canonical.pop();
+    }
+    Ok(canonical)
+}
+
+fn connections_for_relay_urls<T: Clone>(
+    connections: &HashMap<String, T>,
+    relay_urls: &[String],
+) -> Vec<(String, T)> {
+    let mut seen = HashSet::new();
+    relay_urls
+        .iter()
+        .filter_map(|relay_url| canonical_relay_key(relay_url).ok())
+        .filter(|relay_url| seen.insert(relay_url.clone()))
+        .filter_map(|relay_url| {
+            connections
+                .get(&relay_url)
+                .cloned()
+                .map(|connection| (relay_url, connection))
+        })
+        .collect()
+}
+
 // =============================================================================
 // Type Aliases for Index Structures
 // =============================================================================
@@ -197,12 +239,13 @@ impl RelayState {
     /// completion is deliberately delayed to cover the subscriber batch
     /// window). Pending batches and an active incomplete historic sync must
     /// therefore keep the relay connected.
-    fn is_disconnect_candidate(&self, has_pending_batches: bool) -> bool {
+    fn is_disconnect_candidate(&self, has_pending_batches: bool, has_desired_work: bool) -> bool {
         if self.is_bootstrap
             || self.connection_status == ConnectionStatus::Disconnecting
             || !self.repos.is_empty()
             || !self.root_events.is_empty()
             || has_pending_batches
+            || has_desired_work
         {
             return false;
         }
@@ -1657,8 +1700,19 @@ impl SyncManager {
 
         // 6. Connect to bootstrap relay if configured
         if let Some(ref bootstrap_url) = self.bootstrap_relay_url.clone() {
-            self.register_relay(bootstrap_url.clone(), true).await;
-            self.try_connect_relay(bootstrap_url).await;
+            match canonical_relay_key(bootstrap_url) {
+                Ok(relay_url) => {
+                    self.register_relay(relay_url.clone(), true).await;
+                    self.try_connect_relay(&relay_url).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        relay = %bootstrap_url,
+                        error = %error,
+                        "Rejecting invalid bootstrap relay target"
+                    );
+                }
+            }
         }
 
         // 7. Wrap self in Arc<Mutex> for sharing with timer task
@@ -1766,7 +1820,19 @@ impl SyncManager {
     /// - For new relays: creates entry with Connecting status, spawns connection
     /// - For existing connected relays: subscribes to filters, creates PendingBatch
     /// - For disconnected/connecting relays: returns (will be handled on connection)
-    async fn handle_new_sync_filters(&mut self, action: AddFilters) {
+    async fn handle_new_sync_filters(&mut self, mut action: AddFilters) {
+        action.relay_url = match canonical_relay_key(&action.relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %action.relay_url,
+                    error = %error,
+                    "Rejecting invalid sync relay target"
+                );
+                return;
+            }
+        };
+
         // Step 1: Check if relay exists in relay_sync_index
         let connection_status = {
             let index = self.relay_sync_index.read().await;
@@ -2308,6 +2374,18 @@ impl SyncManager {
     /// Does NOT connect - connection happens via try_connect_relay or retry_disconnected_relays.
     /// The RelayConnection persists forever and is reused on reconnects.
     async fn register_relay(&mut self, relay_url: String, is_bootstrap: bool) {
+        let relay_url = match canonical_relay_key(&relay_url) {
+            Ok(relay_url) => relay_url,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %relay_url,
+                    error = %error,
+                    "Rejecting invalid relay registration"
+                );
+                return;
+            }
+        };
+
         // Create RelayConnection if not exists
         if !self.connections.contains_key(&relay_url) {
             // Get relay owner keys for NIP-42 authentication
@@ -2773,15 +2851,7 @@ impl SyncManager {
         event_ids: HashSet<EventId>,
         identifier: &str,
     ) {
-        let connections: Vec<(String, RelayConnection)> = relay_urls
-            .iter()
-            .filter_map(|relay_url| {
-                self.connections
-                    .get(relay_url)
-                    .cloned()
-                    .map(|connection| (relay_url.clone(), connection))
-            })
-            .collect();
+        let connections = connections_for_relay_urls(&self.connections, relay_urls);
 
         if connections.is_empty() {
             tracing::debug!(
@@ -3626,6 +3696,13 @@ impl SyncManager {
     ///
     /// Bootstrap relays are NEVER disconnected, even if empty.
     async fn check_disconnects(&mut self) {
+        let desired_relays: HashSet<String> = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index)
+                .into_keys()
+                .collect()
+        };
+
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
             let pending = self.pending_sync_index.read().await;
@@ -3637,7 +3714,10 @@ impl SyncManager {
                         .get(relay_url)
                         .is_some_and(|batches| !batches.is_empty());
 
-                    if state.is_disconnect_candidate(has_pending_batches) {
+                    if state.is_disconnect_candidate(
+                        has_pending_batches,
+                        desired_relays.contains(relay_url),
+                    ) {
                         Some(relay_url.clone())
                     } else {
                         None
@@ -3714,6 +3794,13 @@ impl SyncManager {
     ///
     /// For each eligible relay, a reconnection is attempted via try_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
+        let desired_relays: HashSet<String> = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index)
+                .into_keys()
+                .collect()
+        };
+
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {
             let index = self.relay_sync_index.read().await;
@@ -3725,8 +3812,12 @@ impl SyncManager {
                         return None;
                     }
 
-                    // Skip empty relays - they'll be cleaned up by check_disconnects
-                    if state.repos.is_empty() && state.root_events.is_empty() {
+                    // A source can have desired StateOnly invitation work before
+                    // its first successful historic batch confirms anything.
+                    if state.repos.is_empty()
+                        && state.root_events.is_empty()
+                        && !desired_relays.contains(relay_url)
+                    {
                         return None;
                     }
 
@@ -4312,6 +4403,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_relay_keys_dedupe_only_the_root_slash() {
+        assert_eq!(
+            canonical_relay_key("wss://relay.example").unwrap(),
+            "wss://relay.example"
+        );
+        assert_eq!(
+            canonical_relay_key("wss://relay.example/").unwrap(),
+            "wss://relay.example"
+        );
+        assert_eq!(
+            canonical_relay_key("wss://relay.example/nostr/").unwrap(),
+            "wss://relay.example/nostr/"
+        );
+        assert_eq!(
+            canonical_relay_key("relay.example/").unwrap(),
+            "wss://relay.example"
+        );
+    }
+
+    #[test]
+    fn connection_lookup_deduplicates_relay_url_variants() {
+        let canonical = canonical_relay_key("wss://relay.example").unwrap();
+        let connections = HashMap::from([(canonical.clone(), 7_u8)]);
+        let candidates = vec![
+            "wss://relay.example".to_string(),
+            "wss://relay.example/".to_string(),
+        ];
+
+        assert_eq!(
+            connections_for_relay_urls(&connections, &candidates),
+            vec![(canonical, 7)]
+        );
+    }
+
+    #[test]
     fn deferred_consolidation_runs_only_after_final_batch_completion() {
         let relay_url = "wss://relay.example";
         let mut deferred = DeferredConsolidations::default();
@@ -4405,35 +4531,39 @@ mod tests {
         };
 
         assert!(
-            !source.is_disconnect_candidate(true),
+            !source.is_disconnect_candidate(true, false),
             "a source with missing-ID subscriptions in flight must stay connected"
         );
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "the historic-sync batch window must stay connected even between batches"
         );
 
         source.connection_status = ConnectionStatus::Connected;
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "an active relay cannot be disconnected before historic sync settles"
         );
 
         source.historic_sync_completed = true;
         assert!(
-            source.is_disconnect_candidate(false),
+            source.is_disconnect_candidate(false, false),
             "an empty relay can be released after historic sync settles"
         );
         assert!(
-            !source.is_disconnect_candidate(true),
+            !source.is_disconnect_candidate(true, false),
             "a later pending batch still keeps an otherwise empty relay connected"
+        );
+        assert!(
+            !source.is_disconnect_candidate(false, true),
+            "unconfirmed desired invitation work keeps its source connected"
         );
 
         source
             .repos
             .insert("30617:maintainer:repository".to_string());
         assert!(
-            !source.is_disconnect_candidate(false),
+            !source.is_disconnect_candidate(false, false),
             "confirmed repository work keeps the source connected"
         );
     }
@@ -4442,7 +4572,8 @@ mod tests {
     fn disconnected_empty_relay_can_still_be_cleaned_up() {
         let source = RelayState::default();
 
-        assert!(source.is_disconnect_candidate(false));
+        assert!(source.is_disconnect_candidate(false, false));
+        assert!(!source.is_disconnect_candidate(false, true));
     }
 
     #[tokio::test]
