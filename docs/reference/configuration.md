@@ -84,30 +84,36 @@ NGIT_DOMAIN=localhost:7334  # Development only
 
 ### Nostr Relay Configuration
 
-#### `NGIT_OWNER_NPUB`
+#### Relay owner identity
 
-**Description:** Nostr public key (npub format) of the relay operator  
-**Type:** String (npub1... format)  
-**Default:** None  
-**Required:** Yes
+**Description:** Nostr secret key used for the relay operator identity
+**Type:** String (`nsec1...` format)
+**Default:** Load or create `.relay-owner.nsec` in the working directory
+**Required:** No
 
 **Examples:**
 
 ```bash
-NGIT_OWNER_NPUB=npub1alice...
+NGIT_RELAY_OWNER_NSEC=nsec1...
 ```
 
 **Used for:**
 
-- NIP-11 relay information document
-- Contact information
-- Administrative operations (future)
+- Deriving the operator pubkey in the NIP-11 relay information document
+- NIP-42 authentication when synchronizing from other relays
 
 **Notes:**
 
-- Must be valid npub format (starts with `npub1`)
-- Can be generated with Nostr tools
-- Publicly visible in relay metadata
+- The key is never accepted on the command line, where it would be exposed by
+  process listings.
+- Loading precedence is the systemd credential named `relay_owner_nsec`,
+  `NGIT_RELAY_OWNER_NSEC` (including `.env`), then `.relay-owner.nsec`.
+- NixOS operators should set `relayOwnerNsecFile`; the module supplies that
+  file as a protected systemd credential.
+- A configured credential or environment value that is empty or invalid stops
+  startup. It never falls through to generating a replacement identity.
+- If no source is configured and `.relay-owner.nsec` does not exist,
+  ngit-grasp generates it with mode `0600`.
 
 ---
 
@@ -1404,7 +1410,7 @@ For development, create a `.env` file in the project root:
 ```bash
 # .env file example
 NGIT_DOMAIN=localhost:7334
-NGIT_OWNER_NPUB=npub1alice...
+NGIT_RELAY_OWNER_NSEC=nsec1...
 NGIT_RELAY_NAME="Development Relay"
 NGIT_RELAY_DESCRIPTION="Local development instance"
 NGIT_GIT_DATA_PATH=./data/git
@@ -1429,7 +1435,7 @@ Configuration is validated at startup:
 // Example validation errors:
 Error: Invalid configuration
   - NGIT_DOMAIN is required
-  - NGIT_OWNER_NPUB must start with 'npub1'
+  - Invalid relay owner nsec in NGIT_RELAY_OWNER_NSEC
   - NGIT_GIT_DATA_PATH is not writable
 ```
 
@@ -1439,7 +1445,7 @@ Error: Invalid configuration
 - Values have correct format
 - Paths are accessible and writable
 - Ports are available
-- npub keys are valid
+- Relay owner nsec is valid
 
 ---
 
@@ -1448,7 +1454,7 @@ Error: Invalid configuration
 ```bash
 # Production .env
 NGIT_DOMAIN=gitnostr.com
-NGIT_OWNER_NPUB=npub1alice...
+NGIT_RELAY_OWNER_NSEC=nsec1...
 NGIT_RELAY_NAME="GitNostr Public Relay"
 NGIT_RELAY_DESCRIPTION="Public GRASP relay for open source projects"
 NGIT_GIT_DATA_PATH=/var/lib/ngit-grasp/git
@@ -1473,7 +1479,7 @@ RUST_LOG=info,ngit_grasp=debug
 ```bash
 # Development .env
 NGIT_DOMAIN=localhost:7334
-NGIT_OWNER_NPUB=npub1test...
+NGIT_RELAY_OWNER_NSEC=nsec1...
 NGIT_RELAY_NAME="Dev Relay"
 NGIT_RELAY_DESCRIPTION="Local development"
 NGIT_GIT_DATA_PATH=./data/git
@@ -1489,7 +1495,7 @@ RUST_LOG=debug
 ```bash
 # Testing .env
 NGIT_DOMAIN=localhost:9999
-NGIT_OWNER_NPUB=npub1test...
+NGIT_RELAY_OWNER_NSEC=nsec1...
 NGIT_RELAY_NAME="Test Relay"
 NGIT_RELAY_DESCRIPTION="Automated testing"
 NGIT_GIT_DATA_PATH=/tmp/ngit-test/git
