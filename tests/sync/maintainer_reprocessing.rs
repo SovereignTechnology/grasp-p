@@ -6,7 +6,7 @@
 //! ## Test design
 //!
 //! Announcements require git data before they are released from purgatory and
-//! served to other relays. The tests exercise both dependency-recovery paths:
+//! served to other relays. The tests exercise dependency and source recovery:
 //!
 //!   relay_b syncs maintainer announcement from relay_a
 //!     → write policy rejects it (no owner announcement in DB yet)
@@ -15,6 +15,9 @@
 //!     → hot copy is re-processed immediately when available
 //!     → expired hot copy is fetched by its retained cold-index event ID
 //!     → maintainer announcement supplies the source clone and git data syncs
+//!   reciprocal owner announcement reaches relay_b before relay_a is ready
+//!     → an empty relay_a remains live for later repository events
+//!     → an unavailable relay_a remains desired and is retried after startup
 //!
 //! To guarantee the maintainer announcements arrive at relay_b *before* the owner
 //! git push, relay_b is started with relay_a as its bootstrap relay.  That way
@@ -42,6 +45,285 @@ async fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn invitation_acceptance_announcement(
+    target_relay: &TestRelay,
+    source_relay_url: &str,
+    owner_keys: &Keys,
+    maintainer_keys: &Keys,
+    identifier: &str,
+) -> Event {
+    let owner_npub = owner_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to encode owner npub");
+    EventBuilder::new(Kind::GitRepoAnnouncement, "Accepted maintainer invitation")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom(
+                "clone",
+                vec![format!(
+                    "http://{}/{}/{}.git",
+                    target_relay.domain(),
+                    owner_npub,
+                    identifier
+                )],
+            ),
+            Tag::custom(
+                "relays",
+                vec![source_relay_url.to_string(), target_relay.url().to_string()],
+            ),
+            Tag::custom("maintainers", vec![maintainer_keys.public_key().to_hex()]),
+        ])
+        .finalize(owner_keys)
+        .expect("Failed to create invitation acceptance announcement")
+}
+
+async fn seed_inviter_repository(
+    source_relay: &TestRelay,
+    maintainer_keys: &Keys,
+    invited_owner_keys: &Keys,
+    identifier: &str,
+) -> (tempfile::TempDir, String) {
+    let maintainer_npub = maintainer_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to encode maintainer npub");
+    let announcement =
+        EventBuilder::new(Kind::GitRepoAnnouncement, "Inviting maintainer repository")
+            .tags(vec![
+                Tag::identifier(identifier),
+                Tag::custom(
+                    "clone",
+                    vec![format!(
+                        "http://{}/{}/{}.git",
+                        source_relay.domain(),
+                        maintainer_npub,
+                        identifier
+                    )],
+                ),
+                Tag::custom("relays", vec![source_relay.url().to_string()]),
+                Tag::custom(
+                    "maintainers",
+                    vec![invited_owner_keys.public_key().to_hex()],
+                ),
+            ])
+            .finalize(maintainer_keys)
+            .expect("Failed to create inviter announcement");
+
+    send_to_relay(source_relay, &announcement)
+        .await
+        .expect("Failed to send inviter announcement");
+    let git_dir = push_git_data_to_relay(
+        source_relay,
+        maintainer_keys,
+        identifier,
+        &[&source_relay.domain()],
+    )
+    .await;
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(git_dir.path())
+        .output()
+        .expect("Failed to read inviter commit");
+    assert!(output.status.success(), "Failed to resolve inviter commit");
+    let commit = String::from_utf8(output.stdout)
+        .expect("Inviter commit should be UTF-8")
+        .trim()
+        .to_string();
+
+    let announcement_found = wait_for_event_on_relay(
+        source_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        announcement_found,
+        "Inviter announcement should be available before target assertions"
+    );
+
+    (git_dir, commit)
+}
+
+async fn assert_invitation_sync_completed(
+    target_relay: &TestRelay,
+    owner_keys: &Keys,
+    maintainer_keys: &Keys,
+    identifier: &str,
+    expected_commit: &str,
+) {
+    let owner_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(owner_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        owner_found,
+        "Invitation acceptance announcement should leave purgatory after source recovery"
+    );
+
+    let maintainer_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        maintainer_found,
+        "Target should sync the inviter announcement from the recovered source"
+    );
+
+    let state_found = wait_for_event_on_relay(
+        target_relay.url(),
+        Filter::new()
+            .kind(Kind::RepoState)
+            .author(maintainer_keys.public_key())
+            .identifier(identifier),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        state_found,
+        "Target should sync the inviter state needed to align git data"
+    );
+
+    let owner_npub = owner_keys
+        .public_key()
+        .to_bech32()
+        .expect("Failed to encode owner npub");
+    let ref_aligned = crate::common::check_ref_at_commit(
+        &target_relay.domain(),
+        &owner_npub,
+        identifier,
+        "refs/heads/main",
+        expected_commit,
+    )
+    .await
+    .expect("Failed to inspect accepted owner's ref");
+    assert!(
+        ref_aligned,
+        "Accepted owner's repository should align to the inviter state"
+    );
+}
+
+/// An invitation may be accepted before its listed source contains any
+/// announcements or state. Empty initial history must not make the target drop
+/// that still-desired source before the inviter publishes its repository data.
+#[tokio::test]
+async fn test_empty_invitation_source_remains_live_until_inviter_data_arrives() {
+    let source_relay = TestRelay::start().await;
+    let target_relay = TestRelay::start_with_sync(None).await;
+    let owner_keys = Keys::generate();
+    let maintainer_keys = Keys::generate();
+    let identifier = "invitation-empty-source-recovery";
+
+    let acceptance = invitation_acceptance_announcement(
+        &target_relay,
+        source_relay.url(),
+        &owner_keys,
+        &maintainer_keys,
+        identifier,
+    );
+    send_to_relay(&target_relay, &acceptance)
+        .await
+        .expect("Failed to publish invitation acceptance");
+
+    assert!(
+        wait_for_log(
+            &target_relay.log_path(),
+            "Historic sync complete - transitioned",
+            Duration::from_secs(10),
+        )
+        .await,
+        "Target should complete the source relay's initially empty historic sync"
+    );
+
+    // The test relay checks for empty connections every second. Waiting beyond
+    // that interval reproduces the old cleanup path before publishing data.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (_source_git, commit) =
+        seed_inviter_repository(&source_relay, &maintainer_keys, &owner_keys, identifier).await;
+    assert_invitation_sync_completed(
+        &target_relay,
+        &owner_keys,
+        &maintainer_keys,
+        identifier,
+        &commit,
+    )
+    .await;
+
+    target_relay.stop().await;
+    source_relay.stop().await;
+}
+
+/// A listed invitation source can be offline when acceptance is published.
+/// Once it starts, desired StateOnly work must make the target retry even
+/// though no source repository has yet entered confirmed relay state.
+#[tokio::test]
+async fn test_unavailable_invitation_source_is_retried_after_startup() {
+    let source_reservation = crate::common::reserve_port();
+    let source_url = format!("ws://127.0.0.1:{}", source_reservation.port());
+    let target_relay = TestRelay::start_with_sync(None).await;
+    let owner_keys = Keys::generate();
+    let maintainer_keys = Keys::generate();
+    let identifier = "invitation-unavailable-source-retry";
+
+    let acceptance = invitation_acceptance_announcement(
+        &target_relay,
+        &source_url,
+        &owner_keys,
+        &maintainer_keys,
+        identifier,
+    );
+    send_to_relay(&target_relay, &acceptance)
+        .await
+        .expect("Failed to publish invitation acceptance");
+
+    let source_failure = format!("Relay {source_url} degraded, backoff");
+    assert!(
+        wait_for_log(
+            &target_relay.log_path(),
+            &source_failure,
+            Duration::from_secs(10),
+        )
+        .await,
+        "Target should attempt the unavailable invitation source before it starts"
+    );
+
+    let source_relay =
+        TestRelay::start_on_reservation_with_options(source_reservation, None, false).await;
+    assert_eq!(
+        source_relay.url(),
+        source_url,
+        "Source must start at the URL embedded in the acceptance announcement"
+    );
+    let (_source_git, commit) =
+        seed_inviter_repository(&source_relay, &maintainer_keys, &owner_keys, identifier).await;
+
+    assert_invitation_sync_completed(
+        &target_relay,
+        &owner_keys,
+        &maintainer_keys,
+        identifier,
+        &commit,
+    )
+    .await;
+
+    target_relay.stop().await;
+    source_relay.stop().await;
 }
 
 /// A reciprocal owner announcement in purgatory must be enough to unlock an
