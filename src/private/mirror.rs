@@ -18,11 +18,43 @@
 //! - Idempotent: a job whose blob is already local is a no-op; repair scans
 //!   re-derive want sets from blob claims (which 30641 handling maintains),
 //!   so a restart or a transiently unreachable peer heals automatically.
+//!
+//! ## Phase-4b B2: retry taxonomy (exponential backoff with jitter)
+//!
+//! Every fetch failure is classified from its reason string and either
+//! gated by the per-blob backoff schedule or left to the flat repair scan:
+//!
+//! | Reason                              | Class         | Retry behavior                                    |
+//! |-------------------------------------|---------------|---------------------------------------------------|
+//! | `network: …` (transport)            | transient     | backoff `base * 2^attempt` (capped, ±20% jitter)  |
+//! | `http_status: 5xx`                  | transient     | same backoff schedule                             |
+//! | `http_status: <other>`              | transient     | same backoff schedule (proxy/edge oddities)       |
+//! | `no_peer`                           | transient     | same backoff schedule (peer set may appear)       |
+//! | `http_status: 404` (all peers)      | late upload   | backoff retry but always at the MAX interval      |
+//! | `too_large`                         | deterministic | NO hot retry — flat repair-scan cadence only      |
+//! | `verify: …` (bad bytes/size)        | deterministic | NO hot retry (peer serves poison — content-fixed) |
+//! | `store: …` (incl. finish() 403)     | deterministic | NO hot retry (registration/quota state must move) |
+//! | `blocked` (SSRF guard)              | deterministic | NO hot retry (config must change)                 |
+//! | `quota`                             | deterministic | NO hot retry (GC/ledger must free space)          |
+//! | `reserve: …` / `sink: …` / `write: …` | deterministic | NO hot retry (local state must change)            |
+//!
+//! "NO hot retry" keeps the pre-B2 behavior exactly: the blob is not gated,
+//! so the flat repair scan re-enqueues it every tick and it succeeds as
+//! soon as the underlying condition changes (persist-skips like the
+//! denylist never reach this table at all — they are filtered earlier).
+//! Backoff-gated blobs stay counted in `ngit_private_mirror_lag_blobs`;
+//! the gate only suppresses re-ENQUEUE, never the gauge. There is no
+//! give-up: a referenced blob may legitimately appear late.
+//!
+//! Retry state is per-blob `(attempt count, next-eligible Instant)` held
+//! in memory next to the worker's `inflight` set; a restart resets every
+//! blob to the base interval (documented behavior — the boot repair scan
+//! immediately re-derives all wants anyway).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nostr::Event;
 use tokio::sync::mpsc::unbounded_channel;
@@ -197,12 +229,13 @@ async fn host_resolves_public_only(rest: &str) -> bool {
 /// Peer servers for an alias: the configured override when present,
 /// otherwise the registration's `server` tags minus this node's own domain.
 fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> Vec<String> {
-    let own = svc.cfg.domain.trim_end_matches('/');
     let candidates: Vec<&String> = match svc.cfg.mirror_peer_urls {
         Some(ref configured) => configured.iter().collect(),
         None => registration_servers
             .iter()
-            .filter(|v| !v.trim_end_matches('/').contains(own))
+            // Phase-4b A3: exact-host own-domain exclusion (host + port —
+            // loopback test pairs are host-equal but port-distinct).
+            .filter(|v| !is_own_server(v, &svc.cfg.domain))
             .collect(),
     };
     let mut out = Vec::new();
@@ -214,6 +247,272 @@ fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> Ve
         }
     }
     out
+}
+
+/// Own-domain exclusion for a `server` tag value: exact-host match on the
+/// value as given, plus on its scheme-defaulted base-URL form so a bare
+/// `host[:port]` self-reference is still recognized as this node (the pre-A3
+/// substring check excluded those too).
+fn is_own_server(value: &str, own_domain: &str) -> bool {
+    if super::host::url_denotes_domain(value, own_domain) {
+        return true;
+    }
+    match server_base_url(value) {
+        Some(base) => super::host::url_denotes_domain(&base, own_domain),
+        None => false,
+    }
+}
+
+// =============================================================================
+// Phase-4b B2: per-blob retry state (exponential backoff with jitter)
+// =============================================================================
+
+/// Per-blob retry state: consecutive failure count + the Instant the blob
+/// next becomes eligible for re-enqueue. In-memory only (restart resets to
+/// the base interval — see module docs).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryState {
+    pub attempts: u32,
+    pub next_eligible: Instant,
+}
+
+/// Failure classification for the retry taxonomy (module-doc table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryClass {
+    /// Transient: retry on the exponential schedule.
+    Backoff,
+    /// 404 on all peers — possibly a late upload: retry at the MAX interval.
+    BackoffAtMax,
+    /// Deterministic-given-state: do NOT hot-retry; the flat repair scan
+    /// keeps re-enqueueing and success requires the condition to change.
+    NoRetry,
+}
+
+/// Classify a `fetch_from_peer` reason string (module-doc table).
+fn classify_failure(reason: &str) -> RetryClass {
+    if reason == "no_peer" || reason.starts_with("network:") {
+        return RetryClass::Backoff;
+    }
+    if let Some(rest) = reason.strip_prefix("http_status:") {
+        return match rest.trim().parse::<u16>() {
+            Ok(404) => RetryClass::BackoffAtMax,
+            _ => RetryClass::Backoff,
+        };
+    }
+    // too_large / verify: / store: / blocked / quota / reserve: / sink: /
+    // write: and anything unrecognized — deterministic-given-state.
+    RetryClass::NoRetry
+}
+
+/// Delay before the next retry after `attempts` consecutive failures
+/// (`attempts >= 1`): `base * 2^(attempts-1)` capped at `max`, scaled by
+/// `jitter` (the caller passes a uniform sample from [0.8, 1.2]).
+fn retry_delay(attempts: u32, base: Duration, max: Duration, jitter: f64) -> Duration {
+    // Shift capped so base * 2^shift cannot overflow before the max cap.
+    let shift = attempts.saturating_sub(1).min(20);
+    let capped = base.saturating_mul(1u32 << shift).min(max);
+    Duration::from_secs_f64((capped.as_secs_f64() * jitter).max(0.0))
+}
+
+/// Is `sha` currently gated (its next-eligible Instant lies in the future)?
+/// Gated blobs stay counted in the lag gauge; only re-enqueue is suppressed.
+fn retry_gated(retry: &HashMap<String, RetryState>, sha: &str) -> bool {
+    retry
+        .get(sha)
+        .map(|state| state.next_eligible > Instant::now())
+        .unwrap_or(false)
+}
+
+/// Record one all-peers fetch failure for `sha`, updating the backoff gate
+/// per the taxonomy. `NoRetry` classes clear any stale gate so the flat
+/// repair-scan cadence applies (pre-B2 behavior).
+fn record_mirror_failure(
+    retry: &mut HashMap<String, RetryState>,
+    sha: &str,
+    reason: &str,
+    base: Duration,
+    max: Duration,
+) {
+    use ::rand::RngExt;
+
+    let class = classify_failure(reason);
+    match class {
+        RetryClass::NoRetry => {
+            retry.remove(sha);
+        }
+        RetryClass::Backoff | RetryClass::BackoffAtMax => {
+            // ±20% jitter, sampled once per failure.
+            let jitter = 0.8 + ::rand::rng().random::<f64>() * 0.4;
+            let entry = retry.entry(sha.to_string()).or_insert(RetryState {
+                attempts: 0,
+                next_eligible: Instant::now(),
+            });
+            entry.attempts = entry.attempts.saturating_add(1);
+            let delay = match class {
+                RetryClass::BackoffAtMax => retry_delay(u32::MAX, base, max, jitter),
+                _ => retry_delay(entry.attempts, base, max, jitter),
+            };
+            entry.next_eligible = Instant::now() + delay;
+        }
+    }
+}
+
+/// Clear the retry gate for `sha` (successful fetch, or the blob turned up
+/// by other means).
+fn record_mirror_success(retry: &mut HashMap<String, RetryState>, sha: &str) {
+    retry.remove(sha);
+}
+
+/// FS-5 (review L2-F7): warn-log dedup for all-peers fetch failures. At
+/// attacker-sized lag sets the flat repair scan re-failed every missing
+/// blob every tick and logged one warn per blob per attempt (~73 warns/s);
+/// the `ngit_private_mirror_failed_total{reason}` metric already carries
+/// the per-attempt signal for alerting, so the warn needs only the FIRST
+/// failure and a periodic re-log per (sha256, reason) pair.
+///
+/// R2-2 (verify-round-2): the per-key dedup alone collapses when MORE THAN
+/// [`FailureLogDedup::MAX_ENTRIES`] distinct (sha256, reason) pairs fail
+/// inside one TTL — oldest-evict keeps every entry younger than the TTL, so
+/// each re-attempt passes the dedup and re-logs (~37-73 warns/s at
+/// K=4400). A GLOBAL token bucket downstream of the per-key dedup bounds
+/// the total warn rate: burst [`FailureLogDedup::BUCKET_CAPACITY`], refill
+/// 1 warn/s. Warns the bucket drops are counted per reason label (the
+/// metric's bounded-cardinality prefix — the full reason can carry
+/// unbounded peer error text) and summarized by one warn per
+/// [`FailureLogDedup::SUMMARY_INTERVAL`], so the signal survives without
+/// the flood. Worst-case sustained warn rate is therefore
+/// 1 warn/s + 1 summary/min, independent of the number of failing pairs.
+/// Per-attempt metrics fire before this gate and are unaffected.
+pub(crate) struct FailureLogDedup {
+    seen: HashMap<(String, String), Instant>,
+    ttl: Duration,
+    bucket_tokens: f64,
+    bucket_last: Instant,
+    suppressed: HashMap<String, u64>,
+    window_start: Instant,
+}
+
+/// Metric/summary label for a failure reason: the stable prefix before the
+/// first ':' (same label the `ngit_private_mirror_failed_total` metric
+/// uses, so the summary breakdown joins cleanly against it).
+fn reason_label(reason: &str) -> &str {
+    reason.split(':').next().unwrap_or("unknown")
+}
+
+impl FailureLogDedup {
+    /// Re-log cadence for a still-failing (sha256, reason) pair.
+    const TTL: Duration = Duration::from_secs(600);
+    /// Flood backstop (same bound as the conflict-alert dedup): expired
+    /// entries are reclaimed on insert, and at the cap the OLDEST entry is
+    /// evicted — a fresh failure must always be able to log once.
+    const MAX_ENTRIES: usize = 4096;
+    /// R2-2: global warn token bucket — burst capacity, then a sustained
+    /// refill of one warn per second.
+    const BUCKET_CAPACITY: f64 = 16.0;
+    const BUCKET_REFILL_PER_SEC: f64 = 1.0;
+    /// R2-2: cadence of the suppressed-count summary warn.
+    const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            ttl: Self::TTL,
+            bucket_tokens: Self::BUCKET_CAPACITY,
+            bucket_last: Instant::now(),
+            suppressed: HashMap::new(),
+            window_start: Instant::now(),
+        }
+    }
+
+    /// True when this (sha256, reason) failure should log now: the first
+    /// sighting, or once per TTL while it keeps failing — further bounded
+    /// by the global bucket (R2-2). Emits the suppressed-count summary warn
+    /// when a window closes.
+    pub(crate) fn should_log(&mut self, sha256: &str, reason: &str) -> bool {
+        let now = Instant::now();
+        if let Some(summary) = self.summary_if_due_at(now) {
+            tracing::warn!("private mirror: {summary}");
+        }
+        self.should_log_at(sha256, reason, now)
+    }
+
+    fn should_log_at(&mut self, sha256: &str, reason: &str, now: Instant) -> bool {
+        if !self.dedup_pass_at(sha256, reason, now) {
+            return false;
+        }
+        // R2-2: global bucket, refilled lazily on each dedup-passing
+        // failure (accrual is wall-clock, capped at the burst capacity).
+        let elapsed = now.duration_since(self.bucket_last).as_secs_f64();
+        self.bucket_tokens =
+            (self.bucket_tokens + elapsed * Self::BUCKET_REFILL_PER_SEC).min(Self::BUCKET_CAPACITY);
+        self.bucket_last = now;
+        if self.bucket_tokens >= 1.0 {
+            self.bucket_tokens -= 1.0;
+            return true;
+        }
+        *self
+            .suppressed
+            .entry(reason_label(reason).to_string())
+            .or_insert(0) += 1;
+        false
+    }
+
+    /// Per-key dedup gate: true on the first sighting of a (sha256, reason)
+    /// pair, or once per TTL while it keeps failing.
+    fn dedup_pass_at(&mut self, sha256: &str, reason: &str, now: Instant) -> bool {
+        let key = (sha256.to_string(), reason.to_string());
+        if let Some(at) = self.seen.get(&key) {
+            if now.duration_since(*at) < self.ttl {
+                return false;
+            }
+        }
+        let ttl = self.ttl;
+        self.seen.retain(|_, at| now.duration_since(*at) < ttl);
+        if self.seen.len() >= Self::MAX_ENTRIES {
+            if let Some(oldest) = self
+                .seen
+                .iter()
+                .max_by_key(|(_, at)| now.duration_since(**at))
+                .map(|(k, _)| k.clone())
+            {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(key, now);
+        true
+    }
+
+    /// R2-2: when a summary window has closed, return the summary line for
+    /// the warns the global bucket dropped in that window (None when the
+    /// window is still open or nothing was dropped) and open a fresh one.
+    fn summary_if_due_at(&mut self, now: Instant) -> Option<String> {
+        if now.duration_since(self.window_start) < Self::SUMMARY_INTERVAL {
+            return None;
+        }
+        self.window_start = now;
+        if self.suppressed.is_empty() {
+            return None;
+        }
+        let total: u64 = self.suppressed.values().sum();
+        let mut by_reason: Vec<(String, u64)> =
+            std::mem::take(&mut self.suppressed).into_iter().collect();
+        by_reason.sort();
+        let breakdown = by_reason
+            .iter()
+            .map(|(label, n)| format!("{label}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "{total} failure warn(s) dropped by the global rate limit in the last {}s \
+             ({breakdown}); per-attempt counts remain in ngit_private_mirror_failed_total",
+            Self::SUMMARY_INTERVAL.as_secs()
+        ))
+    }
+
+    #[cfg(test)]
+    fn suppressed_total(&self) -> u64 {
+        self.suppressed.values().sum()
+    }
 }
 
 /// Enqueue a mirror job for an accepted 30641. No-op when the mirror worker
@@ -255,8 +554,18 @@ pub(crate) fn enqueue_for_state_root(svc: &PrivateService, event: &Event) {
         return;
     }
 
-    // Skip blobs already local (client-push path on the origin node).
-    want.retain(|w| !svc.blobs.exists(&w.sha256) && !svc.is_denylisted(&w.sha256));
+    // Skip blobs already local (client-push path on the origin node),
+    // denylisted, or currently backoff-gated (B2): a gated blob stays
+    // missing until its next-eligible Instant and must not be hot-enqueued
+    // by every arriving 30641 edition.
+    {
+        let retry = svc.mirror_retry.lock();
+        want.retain(|w| {
+            !svc.blobs.exists(&w.sha256)
+                && !svc.is_denylisted(&w.sha256)
+                && !retry_gated(&retry, &w.sha256)
+        });
+    }
     if want.is_empty() {
         return;
     }
@@ -293,11 +602,33 @@ fn scan_missing(svc: &PrivateService) -> Vec<MirrorJob> {
         return jobs;
     };
 
+    // B2: prune retry gates for blobs that are no longer lagging (locally
+    // stored, denylisted, or fully unclaimed — e.g. after a registration
+    // death) so the map stays bounded by the live backlog.
+    {
+        let lagging: HashSet<&String> = claims
+            .iter()
+            .filter(|(sha, claim)| {
+                !claim.aliases.is_empty() && !svc.blobs.exists(sha) && !svc.is_denylisted(sha)
+            })
+            .map(|(sha, _)| sha)
+            .collect();
+        svc.mirror_retry
+            .lock()
+            .retain(|sha, _| lagging.contains(sha));
+    }
+
     for (sha, claim) in claims {
         if claim.aliases.is_empty() || svc.blobs.exists(&sha) || svc.is_denylisted(&sha) {
             continue;
         }
         lag += 1;
+
+        // B2: backoff-gated blobs remain lag (the gauge is NOT hidden) but
+        // are not re-enqueued until their next-eligible Instant.
+        if retry_gated(&svc.mirror_retry.lock(), &sha) {
+            continue;
+        }
 
         // First claiming alias with a live (non-tombstoned) registration.
         let mut resolved = None;
@@ -385,6 +716,7 @@ async fn fetch_from_peer(
         blob.sha256.clone(),
         blob.size,
         reservation,
+        svc.denylist.clone(),
     )
     .await
     .map_err(|e| format!("sink: {}", e.reason()))?;
@@ -428,18 +760,35 @@ async fn fetch_from_peer(
 
 /// Fetch one blob, trying each peer in order. Success is sticky (idempotent
 /// no-op when the blob landed via a concurrent job).
-async fn fetch_blob(svc: &Arc<PrivateService>, client: &reqwest::Client, job: &MirrorJob, blob: &WantBlob) {
+///
+/// Returns `None` on success (or when no fetch was needed: already local /
+/// denylisted) and `Some(reason)` when every peer failed or no peer was
+/// available — the worker feeds the reason into the B2 backoff classifier.
+async fn fetch_blob(
+    svc: &Arc<PrivateService>,
+    client: &reqwest::Client,
+    job: &MirrorJob,
+    blob: &WantBlob,
+) -> Option<String> {
     if svc.blobs.exists(&blob.sha256) || svc.is_denylisted(&blob.sha256) {
-        return;
+        return None;
     }
     if job.peer_servers.is_empty() {
         crate::metrics::record_private_mirror_failed("no_peer");
-        tracing::warn!(
-            alias = %job.alias,
-            sha256 = %blob.sha256,
-            "private mirror: no peer server available for blob"
-        );
-        return;
+        // FS-5 + R2-2: deduped and globally rate-limited — the metric
+        // carries the per-attempt count.
+        if svc
+            .mirror_failure_log
+            .lock()
+            .should_log(&blob.sha256, "no_peer")
+        {
+            tracing::warn!(
+                alias = %job.alias,
+                sha256 = %blob.sha256,
+                "private mirror: no peer server available for blob"
+            );
+        }
+        return Some("no_peer".to_string());
     }
 
     let mut last_error = String::new();
@@ -455,7 +804,7 @@ async fn fetch_blob(svc: &Arc<PrivateService>, client: &reqwest::Client, job: &M
                     size = blob.size,
                     "private mirror: blob fetched from peer"
                 );
-                return;
+                return None;
             }
             Err(reason) => {
                 tracing::debug!(
@@ -476,18 +825,279 @@ async fn fetch_blob(svc: &Arc<PrivateService>, client: &reqwest::Client, job: &M
         .unwrap_or("unknown")
         .to_string();
     crate::metrics::record_private_mirror_failed(&reason_label);
-    tracing::warn!(
-        alias = %job.alias,
-        sha256 = %blob.sha256,
-        reason = %last_error,
-        "private mirror: blob fetch failed on all peers (will retry on repair scan)"
-    );
+    // FS-5 (review L2-F7) + R2-2: one warn per (sha256, reason) per 10
+    // minutes, bounded globally to a 16-warn burst then 1 warn/s — not one
+    // per failed attempt. At attacker-sized lag sets the per-attempt warn
+    // was ~73 warns/s, drowning every other log line. The metric above
+    // keeps the full per-attempt count for alerting.
+    if svc
+        .mirror_failure_log
+        .lock()
+        .should_log(&blob.sha256, &last_error)
+    {
+        tracing::warn!(
+            alias = %job.alias,
+            sha256 = %blob.sha256,
+            reason = %last_error,
+            "private mirror: blob fetch failed on all peers (will retry on repair scan)"
+        );
+    }
+    Some(last_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn retry_class_taxonomy() {
+        // Transient classes → exponential backoff.
+        assert_eq!(classify_failure("no_peer"), RetryClass::Backoff);
+        assert_eq!(
+            classify_failure("network: connection refused"),
+            RetryClass::Backoff
+        );
+        assert_eq!(classify_failure("http_status: 500"), RetryClass::Backoff);
+        assert_eq!(classify_failure("http_status: 502"), RetryClass::Backoff);
+        // Unusual non-404 statuses are treated as transient edge oddities.
+        assert_eq!(classify_failure("http_status: 403"), RetryClass::Backoff);
+        // 404 on all peers → retry, but at the max interval (late upload).
+        assert_eq!(
+            classify_failure("http_status: 404"),
+            RetryClass::BackoffAtMax
+        );
+        // Deterministic classes → no hot retry.
+        for reason in [
+            "too_large",
+            "verify: size mismatch",
+            "verify: sha256 mismatch",
+            "store: forbidden",
+            "blocked",
+            "quota",
+            "reserve: cap reached",
+            "sink: io error",
+            "write: io error",
+            "anything-else",
+        ] {
+            assert_eq!(
+                classify_failure(reason),
+                RetryClass::NoRetry,
+                "{reason} must be NoRetry"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_schedule_cap_and_jitter_bounds() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(3600);
+
+        // Exponential growth with jitter=1.0 (exact schedule, no jitter).
+        assert_eq!(retry_delay(1, base, max, 1.0), Duration::from_secs(60));
+        assert_eq!(retry_delay(2, base, max, 1.0), Duration::from_secs(120));
+        assert_eq!(retry_delay(3, base, max, 1.0), Duration::from_secs(240));
+        assert_eq!(retry_delay(4, base, max, 1.0), Duration::from_secs(480));
+
+        // Cap: attempt 7 would be 60 * 64 = 3840 > 3600 → capped at max.
+        assert_eq!(retry_delay(7, base, max, 1.0), max);
+        assert_eq!(retry_delay(100, base, max, 1.0), max);
+        // u32::MAX attempts (the BackoffAtMax path) is always the cap.
+        assert_eq!(retry_delay(u32::MAX, base, max, 1.0), max);
+
+        // Jitter bounds: 1000 samples per attempt stay within ±20% of the
+        // un-jittered value.
+        for attempt in 1..=8u32 {
+            let exact = retry_delay(attempt, base, max, 1.0).as_secs_f64();
+            for _ in 0..1000 {
+                let jitter = 0.8 + rand::random::<f64>() * 0.4;
+                let sampled = retry_delay(attempt, base, max, jitter).as_secs_f64();
+                assert!(
+                    (exact * 0.8..=exact * 1.2).contains(&sampled),
+                    "attempt {attempt}: {sampled} outside ±20% of {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_gate_skip_and_release() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(3600);
+        let sha = "ab".repeat(32);
+        let mut retry: HashMap<String, RetryState> = HashMap::new();
+
+        // Ungated initially.
+        assert!(!retry_gated(&retry, &sha));
+
+        // First transient failure: gated, next-eligible in the future.
+        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
+        assert!(retry_gated(&retry, &sha));
+        assert_eq!(retry.get(&sha).unwrap().attempts, 1);
+
+        // Success clears the gate.
+        record_mirror_success(&mut retry, &sha);
+        assert!(!retry_gated(&retry, &sha));
+        assert!(retry.get(&sha).is_none());
+
+        // Deterministic failure: no gate is installed (flat repair-scan
+        // cadence preserved).
+        record_mirror_failure(&mut retry, &sha, "quota", base, max);
+        assert!(!retry_gated(&retry, &sha));
+        assert!(retry.get(&sha).is_none());
+
+        // A deterministic failure also CLEARS a stale transient gate: the
+        // blob drops back to the flat repair-scan cadence (the gate would
+        // otherwise delay a retry whose condition already changed).
+        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
+        assert!(retry_gated(&retry, &sha));
+        record_mirror_failure(&mut retry, &sha, "too_large", base, max);
+        assert!(!retry_gated(&retry, &sha));
+
+        // Backoff attempts accumulate while failures stay transient.
+        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
+        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
+        assert_eq!(retry.get(&sha).unwrap().attempts, 2);
+    }
+
+    /// FS-5: the failure warn dedups per (sha256, reason) — the first
+    /// failure logs, repeats inside the TTL are suppressed, a DIFFERENT
+    /// reason for the same sha logs, and the pair re-logs after the TTL.
+    #[test]
+    fn failure_log_dedup_per_sha_and_reason() {
+        let ttl = FailureLogDedup::TTL;
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+
+        assert!(dedup.should_log_at("sha1", "network: refused", t0));
+        assert!(
+            !dedup.should_log_at("sha1", "network: refused", t0 + Duration::from_secs(1)),
+            "repeat inside the TTL must be suppressed"
+        );
+        assert!(
+            dedup.should_log_at("sha1", "http_status: 500", t0 + Duration::from_secs(2)),
+            "a different reason for the same sha is a different pair"
+        );
+        assert!(
+            dedup.should_log_at("sha2", "network: refused", t0 + Duration::from_secs(3)),
+            "a different sha is a different pair"
+        );
+        assert!(
+            dedup.should_log_at("sha1", "network: refused", t0 + ttl + Duration::from_secs(1)),
+            "a still-failing pair re-logs after the TTL"
+        );
+    }
+
+    /// FS-5: at the cap the OLDEST entry is evicted to make room — a fresh
+    /// failure must always be able to log once. (Exercises the per-key
+    /// dedup gate directly: with K at/above the cap the global bucket is
+    /// exactly the R2-2 flood scenario and would bound the full gate.)
+    #[test]
+    fn failure_log_dedup_cap_evicts_oldest() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        for i in 0..FailureLogDedup::MAX_ENTRIES {
+            assert!(dedup.dedup_pass_at(
+                &format!("flood-{i}"),
+                "network: refused",
+                t0 + Duration::from_millis(i as u64)
+            ));
+        }
+        assert!(
+            dedup.dedup_pass_at("fresh", "network: refused", t0 + Duration::from_secs(1)),
+            "a fresh failure must log even at the cap"
+        );
+        assert!(
+            !dedup.dedup_pass_at("flood-1", "network: refused", t0 + Duration::from_secs(2)),
+            "survivors stay suppressed"
+        );
+        assert!(
+            dedup.dedup_pass_at("flood-0", "network: refused", t0 + Duration::from_secs(3)),
+            "the oldest entry was evicted to make room"
+        );
+    }
+
+    /// R2-2: with K > MAX_ENTRIES distinct failing pairs, oldest-evict
+    /// keeps every per-key entry younger than the TTL, so the per-key
+    /// dedup alone passes every attempt; the GLOBAL bucket must bound the
+    /// warn rate to the burst, then the 1/s refill.
+    #[test]
+    fn failure_log_global_bucket_bounds_flood() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        let k = FailureLogDedup::MAX_ENTRIES + 400;
+        let mut allowed = 0u32;
+        for i in 0..k {
+            if dedup.should_log_at(&format!("flood-{i}"), "network: refused", t0) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed,
+            FailureLogDedup::BUCKET_CAPACITY as u32,
+            "the burst is bounded by the bucket capacity"
+        );
+        assert_eq!(
+            dedup.suppressed_total(),
+            (k - allowed as usize) as u64,
+            "every dropped warn is counted for the window summary"
+        );
+        // No token has refilled yet: a fresh failure in the same instant
+        // still drops.
+        assert!(!dedup.should_log_at("late", "network: refused", t0));
+        // Refill is 1 token/s: ten seconds later exactly ten more pass.
+        let mut allowed = 0u32;
+        for i in 0..100 {
+            if dedup.should_log_at(
+                &format!("later-{i}"),
+                "network: refused",
+                t0 + Duration::from_secs(10),
+            ) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "the sustained rate is the 1/s refill");
+    }
+
+    /// R2-2: dropped warns are summarized once per window with per-reason
+    /// counts; the window then resets and stays quiet while nothing drops.
+    #[test]
+    fn failure_log_summary_counts_drops_per_reason() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        // Drain the burst: these pass, nothing is counted yet.
+        for i in 0..16 {
+            assert!(dedup.should_log_at(&format!("burst-{i}"), "network: refused", t0));
+        }
+        assert_eq!(dedup.suppressed_total(), 0);
+        // The bucket is empty: further first-sightings drop and are counted
+        // per reason LABEL (the metric's bounded-cardinality prefix).
+        for i in 0..3 {
+            assert!(!dedup.should_log_at(&format!("net-{i}"), "network: refused", t0));
+        }
+        for i in 0..2 {
+            assert!(!dedup.should_log_at(&format!("http-{i}"), "http_status: 500", t0));
+        }
+        assert_eq!(dedup.suppressed_total(), 5);
+        // No summary before the interval elapses.
+        assert!(dedup
+            .summary_if_due_at(t0 + Duration::from_secs(30))
+            .is_none());
+        // At the window close: one summary with the total and per-reason
+        // counts.
+        let summary = dedup
+            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL)
+            .expect("a summary is due with drops pending");
+        assert!(summary.starts_with("5 failure warn(s)"), "{summary}");
+        assert!(summary.contains("http_status=2"), "{summary}");
+        assert!(summary.contains("network=3"), "{summary}");
+        // The window reset: with nothing new dropped there is nothing to
+        // say at the next close.
+        assert!(dedup
+            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL * 2)
+            .is_none());
+        assert_eq!(dedup.suppressed_total(), 0);
+    }
 
     #[test]
     fn disallowed_ip_covers_internal_ranges() {
@@ -580,6 +1190,19 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
 
     let fetch_timeout = Duration::from_secs(svc.cfg.mirror_fetch_timeout_secs.max(1));
     let max_concurrency = svc.cfg.mirror_max_concurrency.max(1) as usize;
+    // B2 backoff knobs: base is clamped to 1s under NGIT_TEST (the existing
+    // repair-interval idiom below); max stays as configured.
+    let retry_base = Duration::from_secs(svc.cfg.mirror_retry_base_secs.max(1));
+    let retry_base = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        retry_base.min(Duration::from_secs(1))
+    } else {
+        retry_base
+    };
+    let retry_max = Duration::from_secs(
+        svc.cfg
+            .mirror_retry_max_secs
+            .max(svc.cfg.mirror_retry_base_secs.max(1)),
+    );
     let repair_interval = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
         Duration::from_secs(1)
     } else {
@@ -603,11 +1226,16 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
         // Blobs currently being fetched — dedups queue jobs vs repair scans.
         let inflight: Arc<parking_lot::Mutex<HashSet<String>>> =
             Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        // B2: per-blob retry state (attempt count + next-eligible Instant),
+        // shared with scan_missing / enqueue_for_state_root via the service.
+        let retry = svc.mirror_retry.clone();
 
         tracing::info!(
             max_concurrency = max_concurrency,
             fetch_timeout_secs = fetch_timeout.as_secs(),
             repair_interval_secs = repair_interval.as_secs(),
+            retry_base_secs = retry_base.as_secs(),
+            retry_max_secs = retry_max.as_secs(),
             "private blob mirror worker started"
         );
 
@@ -630,6 +1258,13 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
                     if svc.blobs.exists(&blob.sha256) || svc.is_denylisted(&blob.sha256) {
                         continue;
                     }
+                    // B2: skip blobs whose backoff gate is still closed —
+                    // they were enqueued before the gate was set (or by a
+                    // racing job) and must wait for their next-eligible
+                    // Instant.
+                    if retry_gated(&retry.lock(), &blob.sha256) {
+                        continue;
+                    }
                     if !inflight.lock().insert(blob.sha256.clone()) {
                         continue; // already being fetched
                     }
@@ -641,9 +1276,26 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
                     let client = client.clone();
                     let job = job.clone();
                     let inflight = inflight.clone();
+                    let retry = retry.clone();
                     handles.push(tokio::spawn(async move {
                         let _permit = permit;
-                        fetch_blob(&svc, &client, &job, &blob).await;
+                        let outcome = fetch_blob(&svc, &client, &job, &blob).await;
+                        // B2: update the backoff gate from the outcome —
+                        // success clears it, failure classifies and schedules
+                        // the next-eligible Instant (or clears the gate for
+                        // deterministic failure classes).
+                        let mut guard = retry.lock();
+                        match outcome {
+                            None => record_mirror_success(&mut guard, &blob.sha256),
+                            Some(reason) => record_mirror_failure(
+                                &mut guard,
+                                &blob.sha256,
+                                &reason,
+                                retry_base,
+                                retry_max,
+                            ),
+                        }
+                        drop(guard);
                         inflight.lock().remove(&blob.sha256);
                     }));
                 }

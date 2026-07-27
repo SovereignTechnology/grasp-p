@@ -333,6 +333,98 @@ lazy_static! {
             .expect("register private registration conflicts metric");
         metric
     };
+    static ref PRIVATE_RATE_LIMITED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_rate_limited_total",
+                "Client-submitted private writes rejected by the per-write-key token \
+                 bucket, by path (state_root|wrap|ewrap|upload). Alert on sustained \
+                 increases from a single source; brief spikes during legit cord-git \
+                 rotation bursts should not occur at default capacity.",
+            ),
+            &["path"],
+        )
+        .expect("build private rate limited metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private rate limited metric");
+        metric
+    };
+    static ref PRIVATE_FULL_REISSUE_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_full_reissue_total",
+            "Periodic since=None full re-issue rounds of the private sync filters \
+             (kind-30640 + derived 30641/1059) that ACTUALLY re-issued at least one \
+             live peer (Phase-4b B1). Steady ~1/NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS. \
+             Rounds where every peer was skipped (rate-limited or inside the FS-3 \
+             re-issue floor) count into ngit_private_full_reissue_skipped_total \
+             instead; silence of BOTH while private repos are enabled means the \
+             self-heal timer is dead.",
+        ))
+        .expect("build private full reissue metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private full reissue metric");
+        metric
+    };
+    static ref PRIVATE_FULL_REISSUE_SKIPPED_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_full_reissue_skipped_total",
+            "Periodic full re-issue timer rounds (Phase-4b B1) that re-issued NO peer \
+             because every live relay was skipped (health-tracker rate-limit cooldown \
+             or the FS-3 NGIT_PRIVATE_REISSUE_MIN_INTERVAL_SECS floor). Sustained \
+             increases mean a chronically-skipped peer: the self-heal timer fires but \
+             never delivers.",
+        ))
+        .expect("build private full reissue skipped metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private full reissue skipped metric");
+        metric
+    };
+    static ref PRIVATE_DENYLIST_ENTRIES: Gauge = {
+        let metric = Gauge::with_opts(Opts::new(
+            "ngit_private_denylist_entries",
+            "Sha256 entries in the live private blob denylist (set at boot and on \
+             every reload swap; Phase-4b D1). A drop to 0 on a node that should be \
+             enforcing a takedown list means the files went missing.",
+        ))
+        .expect("build private denylist entries metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private denylist entries metric");
+        metric
+    };
+    static ref PRIVATE_DENYLIST_PURGED_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_denylist_purged_total",
+            "Private blobs purged because their sha256 is denylisted — reload \
+             purge-on-add plus the GC denylist sweep (Phase-4b D1/D2). Every \
+             increase is a takedown action; alert-worthy in both directions \
+             (unexpected purges, or a known takedown that never purges).",
+        ))
+        .expect("build private denylist purged metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private denylist purged metric");
+        metric
+    };
+    static ref PRIVATE_REPORT_EVENTS_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_report_events_total",
+            "Kind-1984 (NIP-56 report) events observed while private repos are \
+             enabled (Phase-4b D3). Reports are intake-logged with their \
+             sha256-looking tag values (takedown evidence) and then admitted \
+             under the unchanged related-event rules; v1 takes NO automatic \
+             action, so a rising count is an operator page to work the \
+             manual denylist runbook.",
+        ))
+        .expect("build private report events metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private report events metric");
+        metric
+    };
 }
 
 pub fn record_blacklist_deletion_attempt(phase: &str) {
@@ -562,6 +654,43 @@ pub fn record_private_registration_conflict(resolution: &str) {
     PRIVATE_REGISTRATION_CONFLICTS_TOTAL
         .with_label_values(&[resolution])
         .inc();
+}
+
+/// Record one client private write rejected by the per-write-key token
+/// bucket. `path` is `state_root`, `wrap`, `ewrap`, or `upload`.
+pub fn record_private_rate_limited(path: &str) {
+    PRIVATE_RATE_LIMITED_TOTAL
+        .with_label_values(&[path])
+        .inc();
+}
+
+/// Record one periodic since=None full re-issue round of the private sync
+/// filters (Phase-4b B1) that actually re-issued at least one live peer.
+pub fn record_private_full_reissue() {
+    PRIVATE_FULL_REISSUE_TOTAL.inc();
+}
+
+/// Record one full re-issue timer round that re-issued NO peer (every
+/// live relay rate-limit- or floor-skipped, FS-8 review L3-F7).
+pub fn record_private_full_reissue_skipped() {
+    PRIVATE_FULL_REISSUE_SKIPPED_TOTAL.inc();
+}
+
+/// Update the live denylist entry-count gauge (boot load + every reload
+/// swap, Phase-4b D1).
+pub fn set_private_denylist_entries(count: usize) {
+    PRIVATE_DENYLIST_ENTRIES.set(count as f64);
+}
+
+/// Record `n` blobs purged because their sha256 is denylisted (reload
+/// purge-on-add or GC denylist sweep, Phase-4b D1/D2).
+pub fn record_private_denylist_purged(n: u64) {
+    PRIVATE_DENYLIST_PURGED_TOTAL.inc_by(n as f64);
+}
+
+/// Record one observed kind-1984 (NIP-56 report) event (Phase-4b D3).
+pub fn record_private_report_event() {
+    PRIVATE_REPORT_EVENTS_TOTAL.inc();
 }
 
 /// Central metrics collection for ngit-grasp relay.

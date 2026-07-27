@@ -25,6 +25,7 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::prelude::BASE64_STANDARD;
@@ -110,6 +111,21 @@ async fn fetch_from(relay_url: &str, filter: Filter) -> Vec<Event> {
 /// A valid alias: exactly 32 lowercase hex chars.
 fn random_alias() -> String {
     Keys::generate().public_key().to_hex()[..32].to_string()
+}
+
+/// `NGIT_PRIVATE_TENANT_WHITELIST` value (comma-separated npubs) covering
+/// every tenant key that authors a kind-30640 in a test. WP-E flipped the
+/// shipped admission default to whitelist: pair tests run under the new
+/// default with their tenants listed explicitly. The SAME value goes to
+/// both nodes (identical extra_env) so the policy_fingerprint preimage —
+/// which includes the whitelist — stays in parity and synced registrations
+/// pass the gate on the peer.
+fn whitelist_npubs(tenants: &[&Keys]) -> String {
+    tenants
+        .iter()
+        .map(|k| k.public_key().to_bech32().expect("npub"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -220,6 +236,40 @@ fn blossom_auth_event(
 
 fn auth_header_value(event: &Event) -> String {
     format!("Nostr {}", BASE64_STANDARD.encode(event.as_json()))
+}
+
+/// Signed kind-24242 Blossom DELETE auth event.
+fn blossom_delete_auth_event(signer: &Keys, sha: &str, tenant: &PublicKey, alias: &str) -> Event {
+    EventBuilder::new(Kind::Custom(24242), "grasp-p two-node test auth")
+        .tags(vec![
+            Tag::custom("t", vec!["delete".to_string()]),
+            Tag::custom("x", vec![sha.to_string()]),
+            Tag::custom(
+                "expiration",
+                vec![(Timestamp::now().as_secs() + 600).to_string()],
+            ),
+            Tag::custom("a", vec![reg_coord(tenant, alias)]),
+        ])
+        .finalize(signer)
+        .expect("sign 24242")
+}
+
+/// DELETE /<sha> → (status, X-Reason).
+async fn delete_blob(relay: &TestRelay, sha: &str, auth: &Event) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .delete(format!("{}/{sha}", http_base(relay)))
+        .header("authorization", auth_header_value(auth))
+        .send()
+        .await
+        .expect("DELETE /<sha> transport");
+    let status = resp.status().as_u16();
+    let reason = resp
+        .headers()
+        .get("x-reason")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, reason)
 }
 
 /// Deterministic pseudo-random blob content of `len` bytes, unique per seed.
@@ -393,11 +443,12 @@ async fn upload_blob(
 
 #[tokio::test]
 async fn exit1_replication_e2e() {
-    let (a, b) = start_pair(&[]).await;
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())]).await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
 
@@ -531,11 +582,12 @@ async fn exit1_replication_e2e() {
 
 #[tokio::test]
 async fn exit2_out_of_order_reprocess() {
-    let (a, b) = start_pair(&[]).await;
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())]).await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
 
@@ -629,11 +681,16 @@ async fn exit3_kill_node_backfill() {
         b_relay_dir.path().to_path_buf(),
     );
 
-    let (a, b) = start_pair_with_b_paths(&[], Some(b_paths.clone())).await;
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair_with_b_paths(
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
+        Some(b_paths.clone()),
+    )
+    .await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
 
@@ -683,7 +740,8 @@ async fn exit3_kill_node_backfill() {
 
     // Restart B on the SAME data paths (fresh port; it re-bootstraps to A —
     // backfill comes from its own since=None historic sync + boot mirror
-    // repair scan, not from A dialing in).
+    // repair scan, not from A dialing in). Same whitelist as before the
+    // kill — policy-fingerprint parity must survive the restart.
     let res_b2 = reserve_port();
     let b = TestRelay::start_private_pair_node(
         res_b2,
@@ -691,7 +749,7 @@ async fn exit3_kill_node_backfill() {
         true,
         Some(b_paths.0.clone()),
         Some(b_paths.1.clone()),
-        &[],
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
     )
     .await;
 
@@ -811,11 +869,12 @@ async fn exit4_disabled_is_noop() {
 
 #[tokio::test]
 async fn exit5_mirror_bounds_missing_blob() {
-    let (a, b) = start_pair(&[]).await;
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())]).await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
     register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
@@ -911,13 +970,15 @@ async fn exit5_mirror_bounds_missing_blob() {
 /// fires on the node that had accepted the loser.
 #[tokio::test]
 async fn exit6_registration_split_brain_merge() {
-    let (a, b) = start_pair(&[]).await;
+    let squatter = Keys::generate();
+    let victim = Keys::generate();
+    let third = Keys::generate();
+    let whitelist = whitelist_npubs(&[&squatter, &victim, &third]);
+    let (a, b) = start_pair(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())]).await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let squatter = Keys::generate();
     let squat_writer = Keys::generate();
-    let victim = Keys::generate();
     let victim_writer = Keys::generate();
     let alias = random_alias();
     let now = Timestamp::now().as_secs();
@@ -968,7 +1029,6 @@ async fn exit6_registration_split_brain_merge() {
 
     // The eviction freed the loser's write key on B: a third tenant can
     // claim it under a fresh alias (fresh proof-of-possession).
-    let third = Keys::generate();
     let alias2 = random_alias();
     let reclaim = registration_event(&third, &alias2, &squat_writer, &domain_refs, Some(now + 10));
     let (accepted, message) = publish_with_result(b.url(), &reclaim).await;
@@ -1008,14 +1068,15 @@ async fn exit6_registration_split_brain_merge() {
 /// victim's rotation.
 #[tokio::test]
 async fn exit7_rotation_skew_converges_on_anchor() {
-    let (a, b) = start_pair(&[]).await;
+    let victim = Keys::generate();
+    let squatter = Keys::generate();
+    let whitelist = whitelist_npubs(&[&victim, &squatter]);
+    let (a, b) = start_pair(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())]).await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let victim = Keys::generate();
     let victim_w1 = Keys::generate();
     let victim_w2 = Keys::generate();
-    let squatter = Keys::generate();
     let squat_writer = Keys::generate();
     let alias = random_alias();
     let t0 = Timestamp::now().as_secs() - 600;
@@ -1140,15 +1201,23 @@ async fn exit7_rotation_skew_converges_on_anchor() {
 async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
     // A starts alone, bootstrapped at B's reserved (not yet bound) URL; B's
     // domain is known up front, so registrations can list both nodes.
+    let victim = Keys::generate();
+    let squatter = Keys::generate();
+    let whitelist = whitelist_npubs(&[&victim, &squatter]);
     let res_a = reserve_port();
     let res_b = reserve_port();
     let url_b = format!("ws://127.0.0.1:{}", res_b.port());
-    let a = TestRelay::start_private_pair_node(res_a, Some(url_b.clone()), true, None, None, &[])
-        .await;
+    let a = TestRelay::start_private_pair_node(
+        res_a,
+        Some(url_b.clone()),
+        true,
+        None,
+        None,
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
+    )
+    .await;
 
-    let victim = Keys::generate();
     let victim_writer = Keys::generate();
-    let squatter = Keys::generate();
     let squat_writer = Keys::generate();
     let alias = random_alias();
     let t0 = Timestamp::now().as_secs() - 600;
@@ -1166,8 +1235,15 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
     assert!(accepted, "exit8: edition 2 failed: {message:?}");
 
     // B joins now: it syncs ONLY edition 2 and anchors on it (t2).
-    let b = TestRelay::start_private_pair_node(res_b, Some(a.url().to_string()), true, None, None, &[])
-        .await;
+    let b = TestRelay::start_private_pair_node(
+        res_b,
+        Some(a.url().to_string()),
+        true,
+        None,
+        None,
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
+    )
+    .await;
     let deadline = Instant::now() + REPLICATION_BOUND;
     let mut ed2_on_b = false;
     while Instant::now() < deadline {
@@ -1281,15 +1357,17 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
 /// the blob is never (re-)stored and no zombie charge survives.
 #[tokio::test]
 async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
     let (a, b) = start_pair(&[
         ("NGIT_PRIVATE_GC_GRACE_SECS", "0"),
         ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+        ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
     ])
     .await;
     let domains = [a.domain(), b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
     let t0 = Timestamp::now().as_secs() - 600;
@@ -1397,4 +1475,597 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
 
     a.stop().await;
     b.stop().await;
+}
+
+// ============================================================================
+// Exit test 10 — Phase-4b B1: periodic since=None full re-issue heals a
+// missed 30641 WITHOUT any index change
+// ============================================================================
+
+/// Signed kind-30640 registration with MULTIPLE writer keys (edition
+/// upgrades that widen the writer set).
+fn registration_event_multi(
+    tenant: &Keys,
+    alias: &str,
+    writers: &[&Keys],
+    domains: &[&str],
+    created_at: Option<u64>,
+) -> Event {
+    let relays: Vec<String> = domains.iter().map(|d| format!("ws://{d}")).collect();
+    let servers: Vec<String> = domains.iter().map(|d| format!("http://{d}")).collect();
+    let mut tags = vec![
+        Tag::identifier(alias),
+        Tag::custom("relays", relays),
+        Tag::custom("server", servers),
+    ];
+    for writer in writers {
+        tags.push(Tag::custom(
+            "w",
+            key_entry(*writer, &tenant.public_key(), alias),
+        ));
+    }
+    let mut builder = EventBuilder::new(Kind::Custom(30640), "");
+    if let Some(secs) = created_at {
+        builder = builder.custom_created_at(Timestamp::from_secs(secs));
+    }
+    builder.tags(tags).finalize(tenant).expect("sign 30640")
+}
+
+/// A 30641 that missed live delivery must be healed by the periodic
+/// since=None re-issue timer — and NOT by any PrivateSyncIndex change.
+///
+/// Scenario (carefully arranged so the timer is the ONLY possible healer):
+/// B's registration set never changes after boot, so neither the inline
+/// take_for_alias reprocess (which fires on every 30640 accept) nor the
+/// index-change re-issue can fire. B quota-rejects the 30641 on its first
+/// (live) delivery — a TRANSIENT rejection under a fixed registration —
+/// which holds it and poisons the skip-set; A's one live push is spent, so
+/// only a since=None historic redelivery can bring it back. Freeing the
+/// quota (blob DELETE, not a registration change) plus the skip-set TTL
+/// lapse leaves the re-issue timer as the sole path.
+///
+/// Run on both historic transports: REQ+EOSE (negentropy disabled) and
+/// negentropy (FS-4: the rejected-id exclusion now filters TTL-expired
+/// entries lazily, so the exclusion no longer outlives the skip-set TTL).
+#[tokio::test]
+async fn exit10_full_reissue_heals_missed_state_root() {
+    exit10_full_reissue_heals_missed_state_root_inner(true).await;
+}
+
+/// FS-4 (review L3-F5) negentropy leg: same heal, with the negentropy
+/// transport ENABLED — pre-FS-4 the exclusion set kept the expired
+/// rejected id until the 60s physical cleanup, so redelivery had to ride
+/// the REQ path.
+#[tokio::test]
+async fn exit10_full_reissue_heals_missed_state_root_negentropy() {
+    exit10_full_reissue_heals_missed_state_root_inner(false).await;
+}
+
+async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: bool) {
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_a = format!("ws://127.0.0.1:{}", res_a.port());
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+    let domain_a = format!("127.0.0.1:{}", res_a.port());
+    let domain_b = format!("127.0.0.1:{}", res_b.port());
+    let domains = [domain_a.as_str(), domain_b.as_str()];
+
+    let tenant = Keys::generate();
+    let writer1 = Keys::generate();
+    let writer2 = Keys::generate();
+    // Key claims are unique: alias2 gets its own writer (filler auth).
+    let writer3 = Keys::generate();
+    let alias1 = random_alias();
+    let alias2 = random_alias();
+    let t0 = Timestamp::now().as_secs() - 60;
+
+    // Build every event BEFORE boot so exact charged sizes are known.
+    let reg1 =
+        registration_event_multi(&tenant, &alias1, &[&writer1, &writer2], &domains, Some(t0));
+    let reg2 = registration_event(&tenant, &alias2, &writer3, &domains, Some(t0));
+    let manifest = blob_bytes(61, 1024);
+    let manifest_sha = sha256_hex(&manifest);
+    let edition = state_root_event(
+        &writer2,
+        &tenant.public_key(),
+        &alias1,
+        (&manifest_sha, manifest.len() as u64),
+        &[],
+        t0 + 10,
+    );
+    let filler = blob_bytes(62, 4096);
+
+    // B's tenant quota: both registrations + the filler + 100 bytes of
+    // slack. The 30641 (event bytes + 1024 speculative manifest bytes)
+    // does NOT fit until the filler is deleted; after the delete it does.
+    let reg_bytes = (reg1.as_json().len() + reg2.as_json().len()) as u64;
+    let tenant_quota = reg_bytes + filler.len() as u64 + 100;
+    let need = edition.as_json().len() as u64 + manifest.len() as u64;
+    assert!(100 < need, "exit10: slack must not fit the 30641");
+    assert!(
+        filler.len() as u64 + 100 >= need,
+        "exit10: post-delete headroom must fit the 30641"
+    );
+
+    let quota_s = tenant_quota.to_string();
+    let huge = (1u64 << 40).to_string();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let a_env: Vec<(&str, &str)> = vec![
+        ("NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS", "2"),
+        ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+    ];
+    let mut b_env: Vec<(&str, &str)> = vec![
+        ("NGIT_PRIVATE_QUOTA_TENANT_BYTES", quota_s.as_str()),
+        ("NGIT_PRIVATE_QUOTA_REPO_BYTES", quota_s.as_str()),
+        ("NGIT_PRIVATE_GLOBAL_BUDGET_BYTES", huge.as_str()),
+        // Short skip-set TTL so redelivery unblocks inside the test bound.
+        ("NGIT_REJECTED_HOT_CACHE_DURATION_SECS", "8"),
+        // Instant GC so the DELETEd filler's stored charge is released
+        // within ~1 GC pass (blob DELETE only unreferences; GC releases).
+        ("NGIT_PRIVATE_GC_GRACE_SECS", "0"),
+        ("NGIT_PRIVATE_GC_INTERVAL_SECS", "1"),
+        ("NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS", "2"),
+        ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+    ];
+    if disable_negentropy {
+        // REQ+EOSE leg: the REQ pre-filter has always honored the hot-cache
+        // TTL (the negentropy exclusion only learned to with FS-4).
+        b_env.push(("NGIT_SYNC_DISABLE_NEGENTROPY", "true"));
+    }
+    let a = TestRelay::start_private_pair_node(res_a, Some(url_b), true, None, None, &a_env).await;
+    let b = TestRelay::start_private_pair_node(res_b, Some(url_a), true, None, None, &b_env).await;
+
+    // Both registrations land on B (the LAST registration changes of the
+    // test — from here on B's index is fixed).
+    for (reg, alias) in [(&reg1, &alias1), (&reg2, &alias2)] {
+        let (accepted, message) = publish_with_result(a.url(), reg).await;
+        assert!(accepted, "exit10: registration {alias} failed: {message:?}");
+        assert!(
+            wait_for_event_on_relay(
+                b.url(),
+                Filter::new().kind(Kind::Custom(30640)).identifier(alias),
+                REPLICATION_BOUND,
+            )
+            .await,
+            "exit10: registration {alias} must sync to B"
+        );
+    }
+
+    // The filler fills B's tenant quota (stored charge under alias2); the
+    // manifest blob lives on A under alias1.
+    let filler_sha = upload_blob(&b, &tenant, &writer3, &alias2, &filler).await;
+    let m_sha = upload_blob(&a, &tenant, &writer1, &alias1, &manifest).await;
+    assert_eq!(m_sha, manifest_sha);
+
+    // The 30641 is accepted on A (default quotas) and live-delivered to B,
+    // which quota-rejects it: held by alias + id into the skip-set.
+    let (accepted, message) = publish_with_result(a.url(), &edition).await;
+    assert!(accepted, "exit10: 30641 must be accepted on A: {message:?}");
+    assert!(
+        wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+            m.counter("ngit_private_events_rejected_total", &[("kind", "30641")])
+                .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "exit10: B must quota-reject the 30641 on first delivery"
+    );
+    let served = fetch_from(
+        b.url(),
+        Filter::new().kind(Kind::Custom(30641)).identifier(&alias1),
+    )
+    .await;
+    assert!(
+        served.is_empty(),
+        "exit10: B must not serve the 30641 while quota-blocked"
+    );
+
+    // Free the quota WITHOUT any registration change: writer3 deletes the
+    // filler from B (unreferences the claim; the instant GC pass releases
+    // the stored charge). Still no healer: the skip-set blocks redelivery
+    // for the TTL, and no 30640 ever lands to drain the hold.
+    let delete_auth =
+        blossom_delete_auth_event(&writer3, &filler_sha, &tenant.public_key(), &alias2);
+    let (status, reason) = delete_blob(&b, &filler_sha, &delete_auth).await;
+    assert_eq!(
+        status, 200,
+        "exit10: filler DELETE must be 200; X-Reason: {reason}"
+    );
+
+    // The re-issue timer is firing on B...
+    assert!(
+        wait_for_metrics(&b, Duration::from_secs(20), |m| {
+            m.counter("ngit_private_full_reissue_total", &[])
+                .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "exit10: B's full re-issue timer must be firing"
+    );
+
+    // ...and once the skip-set TTL lapses, its since=None backfill
+    // redelivers the 30641, which now fits the quota — healed with zero
+    // index changes.
+    assert!(
+        wait_for_event_on_relay(
+            b.url(),
+            Filter::new().kind(Kind::Custom(30641)).identifier(&alias1),
+            Duration::from_secs(45),
+        )
+        .await,
+        "exit10: the re-issue timer must heal the missed 30641 without any index change"
+    );
+    let served = fetch_from(
+        b.url(),
+        Filter::new().kind(Kind::Custom(30641)).identifier(&alias1),
+    )
+    .await;
+    assert_eq!(served.len(), 1);
+    assert_eq!(
+        served[0].id, edition.id,
+        "exit10: healed 30641 must be the exact event B missed"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 11 — Phase-4b B2: mirror retry backoff (no tight retry loop,
+// eventual success after the peer recovers)
+// ============================================================================
+
+/// A minimal flake-serving blob peer: 500s every GET while `serve` is
+/// false, then serves the seeded blobs (404 for unknown hashes).
+struct FlakyBlobServer {
+    base_url: String,
+    serve: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl FlakyBlobServer {
+    async fn start(blobs: Vec<(String, Vec<u8>)>) -> Self {
+        let std_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind flaky blob server");
+        let port = std_listener.local_addr().expect("local addr").port();
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+        let serve = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blobs = Arc::new(std::sync::Mutex::new(
+            blobs
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        ));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_loop = serve.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept_result = listener.accept() => {
+                        let Ok((stream, _)) = accept_result else { continue };
+                        let serve = serve_loop.clone();
+                        let blobs = blobs.clone();
+                        tokio::spawn(async move {
+                            use http_body_util::Full;
+                            use hyper::body::Bytes;
+                            let service = hyper::service::service_fn(
+                                move |req: hyper::Request<hyper::body::Incoming>| {
+                                    let serve = serve.clone();
+                                    let blobs = blobs.clone();
+                                    async move {
+                                        let sha =
+                                            req.uri().path().trim_start_matches('/').to_string();
+                                        let (status, body) = if !serve
+                                            .load(std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            (500, Vec::new())
+                                        } else {
+                                            match blobs.lock().expect("blobs lock").get(&sha) {
+                                                Some(bytes) => (200, bytes.clone()),
+                                                None => (404, Vec::new()),
+                                            }
+                                        };
+                                        Ok::<_, std::convert::Infallible>(
+                                            hyper::Response::builder()
+                                                .status(status)
+                                                .body(Full::new(Bytes::from(body)))
+                                                .expect("response"),
+                                        )
+                                    }
+                                },
+                            );
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                .await;
+                        });
+                    }
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            serve,
+            shutdown: Some(shutdown_tx),
+        }
+    }
+}
+
+impl Drop for FlakyBlobServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// While the peer 500s every fetch, B's per-blob backoff must keep the
+/// failure count growing SLOWER than the 1s repair tick (no tight retry
+/// loop) with lag held > 0; once the peer recovers, the next eligible
+/// retry succeeds and the failures stop.
+#[tokio::test]
+async fn exit11_mirror_retry_backoff() {
+    let blob = blob_bytes(71, 1024);
+    let sha = sha256_hex(&blob);
+    let stub = FlakyBlobServer::start(vec![(sha.clone(), blob.clone())]).await;
+
+    // The mirror peer override (both nodes) points at the stub — the
+    // registration's own server tags are bypassed. NGIT_TEST clamps the
+    // backoff base to 1s and the repair tick is 1s.
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[
+        ("NGIT_PRIVATE_MIRROR_PEER_URLS", &stub.base_url),
+        ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+    ])
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let b_failed = || async {
+        ParsedMetrics::parse(&fetch_metrics(b.url()).await.expect("metrics scrape"))
+            .counter(
+                "ngit_private_mirror_failed_total",
+                &[("reason", "http_status")],
+            )
+            .unwrap_or(0)
+    };
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let sha = upload_blob(&a, &tenant, &writer, &alias, &blob).await;
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &edition).await;
+    assert!(accepted, "exit11: 30641 failed on A: {message:?}");
+
+    // Phase 1 — peer down: failures accumulate, but the backoff gate keeps
+    // them well below one-per-repair-tick, and the blob stays lagging.
+    assert!(
+        wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+            m.counter(
+                "ngit_private_mirror_failed_total",
+                &[("reason", "http_status")],
+            )
+            .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "exit11: B must record mirror failures while the peer 500s"
+    );
+    let c0 = b_failed().await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let c1 = b_failed().await;
+    assert!(
+        c1 - c0 <= 4,
+        "exit11: backoff must prevent a tight retry loop: failed went {c0} -> {c1} \
+         across 6s of 1s repair ticks (unthrottled would be ~6)"
+    );
+    assert!(
+        wait_for_metrics(&b, Duration::from_secs(10), |m| {
+            m.gauge("ngit_private_mirror_lag_blobs", &[]).unwrap_or(0) > 0
+        })
+        .await,
+        "exit11: the gated blob must remain counted in the lag gauge"
+    );
+
+    // Phase 2 — peer recovers: the next eligible retry succeeds.
+    stub.serve.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mirrored = wait_for_blob(&b, &sha, Duration::from_secs(30))
+        .await
+        .expect("exit11: blob must be mirrored once the peer recovers");
+    assert_eq!(mirrored, blob, "exit11: mirrored blob bytes intact");
+    assert!(
+        wait_for_metrics(&b, Duration::from_secs(10), |m| {
+            m.gauge("ngit_private_mirror_lag_blobs", &[]).unwrap_or(-1) == 0
+        })
+        .await,
+        "exit11: lag must drain after the successful retry"
+    );
+    assert!(
+        wait_for_metrics(&b, Duration::from_secs(10), |m| {
+            m.counter("ngit_private_mirror_fetched_total", &[])
+                .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "exit11: the recovered fetch must be counted as mirrored"
+    );
+
+    // Failures stop entirely once the blob is local.
+    let c2 = b_failed().await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let c3 = b_failed().await;
+    assert_eq!(
+        c2, c3,
+        "exit11: failure counter must stop growing once the blob is mirrored"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 12 — WP-E upgrade path: open-mode registrations survive the
+// whitelist-default flip (boot_reconcile is non-destructive)
+// ============================================================================
+
+/// Server issue !7 upgrade footgun, pinned: registrations accumulated under
+/// open mode must SURVIVE a reboot into whitelist-with-empty-whitelist (the
+/// WP-E shipped default). boot_reconcile re-runs a stored 30640 only when
+/// the meta record is missing/stale, and a replay rejection never evicts or
+/// prunes — mode enforcement happens at admission time, not retroactively.
+/// After the flip: existing tenants keep serving (30640 REQ, blob GET, new
+/// 30641 editions), while NEW aliases are rejected by the whitelist gate.
+#[tokio::test]
+async fn exit12_open_registrations_survive_whitelist_flip() {
+    // Persistent LMDB paths so the node reboots onto the same data.
+    let git_dir = tempfile::tempdir().expect("git dir");
+    let relay_dir = tempfile::tempdir().expect("relay dir");
+    let paths = (
+        git_dir.path().to_path_buf(),
+        relay_dir.path().to_path_buf(),
+    );
+
+    // --- Boot 1: OPEN mode (the pre-WP-E default) --------------------------
+    let tenant = Keys::generate();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let res1 = reserve_port();
+    let node = TestRelay::start_private_pair_node(
+        res1,
+        None,
+        true,
+        Some(paths.0.clone()),
+        Some(paths.1.clone()),
+        &[("NGIT_PRIVATE_REGISTRATION_MODE", "open")],
+    )
+    .await;
+    let domains = [node.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    let reg = register_on(&node, &domain_refs, &tenant, &writer, &alias).await;
+    let blob = blob_bytes(81, 1024);
+    let sha = upload_blob(&node, &tenant, &writer, &alias, &blob).await;
+    let t0 = Timestamp::now().as_secs();
+    let edition1 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        t0,
+    );
+    let (accepted, message) = publish_with_result(node.url(), &edition1).await;
+    assert!(accepted, "exit12: boot-1 edition failed: {message:?}");
+    node.stop().await;
+
+    // --- Boot 2: shipped defaults — whitelist mode, EMPTY whitelist --------
+    let res2 = reserve_port();
+    let boot2_port = res2.port();
+    // The relay log is opened APPEND-mode (/tmp/relay-<port>.log): a stale
+    // file from a prior run that happened to reuse this port could
+    // false-pass the warn assertion below. Record the length BEFORE boot 2
+    // and search only what this boot appended.
+    let boot2_log_path = format!("/tmp/relay-{boot2_port}.log");
+    let boot2_log_offset = std::fs::metadata(&boot2_log_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let node = TestRelay::start_private_pair_node(
+        res2,
+        None,
+        true,
+        Some(paths.0.clone()),
+        Some(paths.1.clone()),
+        &[],
+    )
+    .await;
+
+    // The startup warn fired loudly for the empty-whitelist posture.
+    let log = std::fs::read_to_string(&boot2_log_path).expect("boot-2 relay log");
+    let log_tail = log.get(boot2_log_offset as usize..).unwrap_or("");
+    assert!(
+        log_tail.contains("all new private-repo registrations will be rejected"),
+        "exit12: boot 2 must warn about whitelist mode with an empty whitelist"
+    );
+
+    // NIP-11 confirms the flipped posture.
+    let doc = nip11_doc(&node).await;
+    assert_eq!(
+        doc["private_repos"]["registration_mode"], "whitelist",
+        "exit12: boot 2 must advertise whitelist mode"
+    );
+
+    // The pre-flip registration is still served (relay DB kept it; the meta
+    // record matched its event id, so boot_reconcile did not even replay it).
+    let served = fetch_from(
+        node.url(),
+        Filter::new()
+            .kind(Kind::Custom(30640))
+            .author(tenant.public_key())
+            .identifier(&alias),
+    )
+    .await;
+    assert_eq!(
+        served.len(),
+        1,
+        "exit12: the open-mode registration must survive the flip"
+    );
+    assert_eq!(served[0].id, reg.id);
+
+    // Its blobs still read back (meta ledger + blob store intact).
+    let (status, body) = get_blob(&node, &sha).await;
+    assert_eq!(status, 200, "exit12: pre-flip blob must still be served");
+    assert_eq!(body, blob, "exit12: blob bytes intact");
+
+    // The existing tenant can still write to the EXISTING alias (mode gates
+    // are NEW-alias only): a newer 30641 edition is accepted.
+    let blob2 = blob_bytes(82, 512);
+    let sha2 = upload_blob(&node, &tenant, &writer, &alias, &blob2).await;
+    let edition2 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha2, blob2.len() as u64),
+        &[(sha.clone(), blob.len() as u64)],
+        t0 + 5,
+    );
+    let (accepted, message) = publish_with_result(node.url(), &edition2).await;
+    assert!(
+        accepted,
+        "exit12: existing-alias writes must keep working post-flip: {message:?}"
+    );
+
+    // A NEW alias — even from the pre-existing tenant — is rejected by the
+    // whitelist gate. It must name boot-2's domain so the relays/server tag
+    // checks pass, and use a FRESH writer key so the key-conflict check
+    // passes — the whitelist gate is then what fires.
+    let domains2 = [node.domain()];
+    let domain2_refs: Vec<&str> = domains2.iter().map(|s| s.as_str()).collect();
+    let alias2 = random_alias();
+    let writer2 = Keys::generate();
+    let reg2 = registration_event(&tenant, &alias2, &writer2, &domain2_refs, None);
+    let (accepted, message) = publish_with_result(node.url(), &reg2).await;
+    assert!(
+        !accepted && message.contains("whitelist"),
+        "exit12: a new alias must be whitelist-rejected post-flip; got accepted={accepted} {message:?}"
+    );
+
+    // And a brand-new tenant is rejected the same way.
+    let fresh = Keys::generate();
+    let fresh_writer = Keys::generate();
+    let reg3 = registration_event(&fresh, &random_alias(), &fresh_writer, &domain2_refs, None);
+    let (accepted, message) = publish_with_result(node.url(), &reg3).await;
+    assert!(
+        !accepted && message.contains("whitelist"),
+        "exit12: a fresh tenant must be whitelist-rejected; got accepted={accepted} {message:?}"
+    );
+
+    node.stop().await;
 }

@@ -12,6 +12,7 @@ use nostr::hashes::{sha256, Hash, HashEngine};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
+use super::denylist::{self, SharedDenylist};
 use super::meta::{BlobClaim, MetaEnv};
 use super::{quota, BlobError, PrivateConfig, UploadReservation};
 
@@ -114,6 +115,10 @@ pub struct UploadSink {
     /// Held for the lifetime of the sink: releases the in-flight
     /// byte/concurrency reservation on drop or finish.
     _reservation: UploadReservation,
+    /// Node-local takedown list, re-checked inside finish()'s meta txn
+    /// (Phase-4b D1): an upload whose hash became denylisted between PUT
+    /// begin and finish must not land.
+    denylist: SharedDenylist,
 }
 
 impl UploadSink {
@@ -126,6 +131,7 @@ impl UploadSink {
         expected_sha: String,
         declared_len: u64,
         reservation: UploadReservation,
+        denylist: SharedDenylist,
     ) -> Result<Self, BlobError> {
         let tmp_path = store.new_tmp_path();
         let file = tokio::fs::File::create(&tmp_path)
@@ -147,6 +153,7 @@ impl UploadSink {
             tmp_path,
             finished: false,
             _reservation: reservation,
+            denylist,
         })
     }
 
@@ -215,6 +222,7 @@ impl UploadSink {
         let alias = self.alias.clone();
         let cfg = self.cfg.clone();
         let tmp_path = self.tmp_path.clone();
+        let denylist = self.denylist.clone();
 
         // Existence check, rename, and claim/charge ALL inside the one meta
         // write txn. GC unlinks blob files under the same write lock, so the
@@ -246,6 +254,17 @@ impl UploadSink {
                 .unwrap_or(false);
             if !live {
                 return Err(anyhow::anyhow!("registration gone"));
+            }
+            // Phase-4b D1: denylist re-check inside the charge txn (R2-C
+            // pattern). The body streamed between PUT begin and finish; a
+            // denylist reload in between must not let the bytes land (they
+            // would resurrect content the reload's purge-on-add just
+            // removed). Like the registration re-verify this precedes the
+            // file-existence check, keeping the rename the last fallible
+            // step, and the abort takes the shared commit-failure cleanup
+            // path below (tmp unlink + reservation drop; nothing placed).
+            if denylist::read_set(&denylist).contains(&sha) {
+                return Err(anyhow::anyhow!("denylisted"));
             }
             let file_present = final_path.is_file();
             let mut claim = meta.get_blob_claim(txn, &sha)?.unwrap_or(BlobClaim {
@@ -341,6 +360,11 @@ impl UploadSink {
                     Err(BlobError::Forbidden(
                         "attributed alias is not a live registration".into(),
                     ))
+                } else if e.to_string() == "denylisted" {
+                    // D1: the hash was denylisted mid-stream. Same cleanup
+                    // shape as "registration gone" (re-check precedes the
+                    // rename), but the status is the read path's 451.
+                    Err(BlobError::Denylisted)
                 } else {
                     Err(BlobError::Internal(format!("meta update failed: {e}")))
                 }
@@ -396,8 +420,16 @@ mod tests {
             mirror_peer_urls: None,
             mirror_max_concurrency: 1,
             mirror_fetch_timeout_secs: 5,
+            mirror_retry_base_secs: 1,
+            mirror_retry_max_secs: 60,
             mirror_allow_private_ips: false,
             policy_fingerprint: String::new(),
+            write_rate_capacity: 0,
+            write_rate_refill_per_min: 0,
+            registration_replace_capacity: 0,
+            registration_replace_refill_per_hour: 0,
+            denylist_paths: vec![],
+            denylist_reload_secs: 0,
         }
     }
 
@@ -425,6 +457,7 @@ mod tests {
         meta: MetaEnv,
         store: BlobStore,
         cfg: PrivateConfig,
+        denylist: SharedDenylist,
     }
 
     impl Harness {
@@ -442,6 +475,9 @@ mod tests {
                 meta,
                 store,
                 cfg: test_cfg(quota_repo_bytes),
+                denylist: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::collections::HashSet::new(),
+                )),
             }
         }
 
@@ -461,6 +497,7 @@ mod tests {
                 sha,
                 data.len() as u64,
                 reservation,
+                self.denylist.clone(),
             )
             .await?;
             sink.write_chunk(data).await?;
@@ -858,6 +895,7 @@ mod tests {
                 sha.clone(),
                 data.len() as u64,
                 reservation,
+                h.denylist.clone(),
             )
         };
 
@@ -902,5 +940,60 @@ mod tests {
             .expect("a same-tenant rotation must not kill the upload");
         assert!(h.store.exists(&sha));
         assert_eq!(h.ledger_blob_bytes(), (256, 256, 256));
+    }
+
+    /// Phase-4b D1: the finish() race — the hash is denylisted (by a
+    /// reload) between PUT begin and finish. The in-txn re-check must fail
+    /// the upload with 451 WITHOUT placing the file, claiming, or charging
+    /// (same cleanup shape as the R2-C registration-gone path). A
+    /// non-denylisted upload on the same denylist handle is unaffected.
+    #[tokio::test]
+    async fn finish_rejects_when_hash_denylisted_mid_upload() {
+        let h = Harness::new(1 << 20);
+        let data = vec![43u8; 256];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        let reservation = UploadReservation {
+            inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
+            bytes: 0,
+        };
+        let mut sink = UploadSink::create(
+            h.meta.clone(),
+            h.store.clone(),
+            h.cfg.clone(),
+            "tenant".to_string(),
+            "alias".to_string(),
+            sha.clone(),
+            data.len() as u64,
+            reservation,
+            h.denylist.clone(),
+        )
+        .await
+        .unwrap();
+        sink.write_chunk(&data).await.unwrap();
+
+        // The reload swaps the set between begin and finish.
+        h.denylist.write().unwrap().insert(sha.clone());
+
+        let err = sink.finish().await.unwrap_err();
+        assert!(
+            matches!(err, BlobError::Denylisted),
+            "denylisted mid-upload must be a 451, got {err:?}"
+        );
+        assert!(!h.store.exists(&sha), "rejected finish must place no file");
+        {
+            let txn = h.meta.read_txn().unwrap();
+            assert!(
+                h.meta.get_blob_claim(&txn, &sha).unwrap().is_none(),
+                "no claim may commit for denylisted bytes"
+            );
+        }
+        assert_eq!(h.ledger_blob_bytes(), (0, 0, 0), "nothing may be charged");
+
+        // Control: a different, non-denylisted hash still lands.
+        let ok_data = vec![44u8; 128];
+        h.upload(&ok_data)
+            .await
+            .expect("non-denylisted upload must succeed");
     }
 }

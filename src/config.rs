@@ -283,13 +283,19 @@ impl EventBlacklistConfig {
 }
 
 /// GRASP-P private-repo registration admission mode for NEW aliases.
+///
+/// The shipped default is Whitelist (locked operator decision, server issue
+/// !7: in open mode any fresh key receives the full per-tenant blob quota,
+/// so ~50 pseudonymous tenants can lawfully exhaust the 50 GiB global
+/// budget). Open is intended for staging/self-use only and must be selected
+/// explicitly.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RegistrationMode {
-    /// Accept any tenant's new alias registrations.
-    #[default]
+    /// Accept any tenant's new alias registrations (staging/self-use only).
     Open,
     /// Only tenants in NGIT_PRIVATE_TENANT_WHITELIST may register new aliases.
+    #[default]
     Whitelist,
     /// New-alias 30640 events must carry NIP-13 proof of work.
     Pow,
@@ -607,8 +613,10 @@ pub struct Config {
     #[arg(long, env = "NGIT_PRIVATE_REPOS_ENABLE", default_value_t = false)]
     pub private_repos_enable: bool,
 
-    /// Admission mode for NEW private-repo aliases (open|whitelist|pow|paid)
-    #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_MODE", value_enum, default_value_t = RegistrationMode::Open)]
+    /// Admission mode for NEW private-repo aliases (open|whitelist|pow|paid).
+    /// Defaults to whitelist (safe "accept nothing without an explicit
+    /// tenant list" posture); open is staging/self-use only.
+    #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_MODE", value_enum, default_value_t = RegistrationMode::Whitelist)]
     pub private_registration_mode: RegistrationMode,
 
     /// NIP-13 bits required on kind-30640 registrations when mode=pow
@@ -671,9 +679,23 @@ pub struct Config {
     #[arg(long, env = "NGIT_PRIVATE_META_DATA_PATH")]
     pub private_meta_data_path: Option<String>,
 
-    /// Optional denylist file: one sha256 per line; matching blob GETs return 451
+    /// Optional denylist file(s): comma-separated paths, one sha256 per
+    /// line; matching blob GETs return 451. A missing file is tolerated
+    /// (warn + treated as empty) so per-jurisdiction lists can be mounted
+    /// per node; a present-but-unreadable file is a hard boot error. Each
+    /// file is capped (64 MiB / 1M lines); an over-cap file is a hard boot
+    /// error and keeps its last-known entries on reload. Writers MUST
+    /// update files atomically (write-temp-then-rename): the reload keys
+    /// off mtime and a torn write is a known staleness window.
     #[arg(long, env = "NGIT_PRIVATE_DENYLIST_PATH")]
     pub private_denylist_path: Option<String>,
+
+    /// Interval in seconds between denylist file reloads (0 = reload
+    /// disabled; the boot-time set is kept). Hashes newly present after a
+    /// reload trigger an immediate purge of the stored bytes; removed
+    /// hashes unblock reads but purged bytes stay gone (re-upload needed).
+    #[arg(long, env = "NGIT_PRIVATE_DENYLIST_RELOAD_SECS", default_value_t = 60)]
+    pub private_denylist_reload_secs: u64,
 
     /// Private-repo mirroring (Phase 2; knob exists, unused in Phase 1)
     #[arg(long, env = "NGIT_PRIVATE_MIRROR_ENABLE", default_value_t = false)]
@@ -721,6 +743,84 @@ pub struct Config {
     /// Opt in to per-tenant metric labels (default: aggregate metrics only)
     #[arg(long, env = "NGIT_PRIVATE_PER_TENANT_METRICS", default_value_t = false)]
     pub private_per_tenant_metrics: bool,
+
+    /// Per-write-key token bucket capacity for CLIENT-submitted private
+    /// writes (kind 30641/1059/21059 events + blob PUTs). 0 = unlimited
+    /// (limiter disabled). The default is deliberately generous: legitimate
+    /// client flows — including cord-git widen→narrow key rotations — must
+    /// never trip it; only abuse floods (e.g. quota-uncharged 21059 spam)
+    /// get capped. Node-local DoS protection only: synced/replayed traffic
+    /// bypasses it, so it has no cross-node convergence impact.
+    #[arg(long, env = "NGIT_PRIVATE_WRITE_RATE_CAPACITY", default_value_t = 120)]
+    pub private_write_rate_capacity: u32,
+
+    /// Refill rate (tokens per minute) for the per-write-key client write
+    /// bucket. Must be > 0 when NGIT_PRIVATE_WRITE_RATE_CAPACITY is non-zero.
+    #[arg(long, env = "NGIT_PRIVATE_WRITE_RATE_REFILL_PER_MIN", default_value_t = 60)]
+    pub private_write_rate_refill_per_min: u32,
+
+    /// Per-(tenant, alias) token bucket capacity for same-tenant kind-30640
+    /// REPLACEMENTS (free addressable replacements re-trigger sync index
+    /// rebuilds + filter re-issues to all peers within seconds). 0 =
+    /// unlimited. The burst MUST stay >= 4: a §3.3 revocation rotation is
+    /// widen->narrow = 2 replacements in quick succession, plus client error
+    /// retries. A rejected replacement is HELD locally and retried after
+    /// bucket refill (the hourly re-issue is the backstop healer).
+    /// Cross-node acceptance knob — part of the policy_fingerprint
+    /// preimage (v2).
+    #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY", default_value_t = 8)]
+    pub private_registration_replace_capacity: u32,
+
+    /// Refill rate (replacements per hour) for the per-(tenant, alias)
+    /// replacement bucket — bounds SUSTAINED replacement floods. Must be > 0
+    /// when NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY is non-zero.
+    #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_REPLACE_REFILL_PER_HOUR", default_value_t = 4)]
+    pub private_registration_replace_refill_per_hour: u32,
+
+    /// Interval (seconds) for the periodic since=None full re-issue of the
+    /// private sync filters (Layer-1 kind-30640 + the current derived
+    /// 30641/1059 filters) to every live peer, with a small random jitter to
+    /// avoid cross-node lockstep. Heals delivery gaps that otherwise only a
+    /// reconnect or daily_sync fixes: expired rejected-hot-cache entries,
+    /// negentropy blind spots, and cadence-limited 30640 rejections (WP-A
+    /// A2) that deliberately rely on redelivery. 0 = disabled. Node-local
+    /// recovery knob only — acceptance is unaffected, so it is NOT part of
+    /// the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS", default_value_t = 3600)]
+    pub private_full_reissue_interval_secs: u64,
+
+    /// Minimum interval (seconds) between private sync-filter re-issues to
+    /// the same peer, across BOTH triggers (PrivateSyncIndex-change-derived
+    /// filter pushes and the hourly full re-issue). Bounds how often a
+    /// churning derived-filter set can force a full consolidate
+    /// (unsubscribe-all + resubscribe + since=None backfill) on a peer:
+    /// past CONSOLIDATION_THRESHOLD derived filters, every index-dirty 5s
+    /// tick used to consolidate again (~near-continuous at 128 aliases x
+    /// 4/hour cadence). A re-issue skipped by this floor is retried once
+    /// the interval lapses (never dropped). 0 = unlimited (pre-FS-3
+    /// behavior). Node-local recovery knob only — acceptance is unaffected,
+    /// so it is NOT part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_PRIVATE_REISSUE_MIN_INTERVAL_SECS", default_value_t = 30)]
+    pub private_reissue_min_interval_secs: u64,
+
+    /// Base delay (seconds) for the blob mirror's per-blob exponential
+    /// retry backoff: after n consecutive fetch failures the next attempt
+    /// waits base * 2^(n-1) (capped at NGIT_PRIVATE_MIRROR_RETRY_MAX_SECS,
+    /// ±20% jitter). Applies to transient failure classes only (transport
+    /// errors, peer HTTP 5xx, no available peer, and 404-on-all-peers —
+    /// the latter always at the max interval for late uploads).
+    /// Deterministic failure classes (quota, too_large, verify/store/blocked,
+    /// reserve/sink) are NOT gated: they keep the flat repair-scan cadence
+    /// and only succeed once the underlying condition changes. Node-local
+    /// recovery knob — NOT part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS", default_value_t = 60)]
+    pub private_mirror_retry_base_secs: u64,
+
+    /// Cap (seconds) for the blob mirror retry backoff; also the fixed
+    /// retry interval for blobs the peers answer 404 (possible late
+    /// upload). Must be >= NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS.
+    #[arg(long, env = "NGIT_PRIVATE_MIRROR_RETRY_MAX_SECS", default_value_t = 3600)]
+    pub private_mirror_retry_max_secs: u64,
 }
 
 impl Config {
@@ -935,6 +1035,19 @@ impl Config {
                     "NGIT_PRIVATE_REGISTRATION_MODE=paid: paid registration mode is not yet available"
                 ));
             }
+            // Whitelist mode with an empty whitelist is a valid
+            // "accept nothing" posture (it is the shipped default), but an
+            // operator who expected open mode must see it immediately.
+            if self.private_registration_mode == RegistrationMode::Whitelist
+                && self.private_tenant_whitelist_entries().is_empty()
+            {
+                tracing::warn!(
+                    "NGIT_PRIVATE_REGISTRATION_MODE=whitelist with an empty \
+                     NGIT_PRIVATE_TENANT_WHITELIST: all new private-repo \
+                     registrations will be rejected (existing registrations \
+                     are unaffected)"
+                );
+            }
             if !(1..=40).contains(&self.private_pow_bits) {
                 return Err(anyhow!("NGIT_PRIVATE_POW_BITS must be between 1 and 40"));
             }
@@ -990,6 +1103,32 @@ impl Config {
                         "NGIT_PRIVATE_MIRROR_FETCH_TIMEOUT_SECS must be greater than 0"
                     ));
                 }
+                if self.private_mirror_retry_base_secs == 0 {
+                    return Err(anyhow!(
+                        "NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS must be greater than 0"
+                    ));
+                }
+                if self.private_mirror_retry_max_secs < self.private_mirror_retry_base_secs {
+                    return Err(anyhow!(
+                        "NGIT_PRIVATE_MIRROR_RETRY_MAX_SECS must be greater than or equal to \
+                         NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS"
+                    ));
+                }
+            }
+            if self.private_write_rate_capacity > 0 && self.private_write_rate_refill_per_min == 0
+            {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_WRITE_RATE_REFILL_PER_MIN must be greater than 0 when \
+                     NGIT_PRIVATE_WRITE_RATE_CAPACITY is non-zero"
+                ));
+            }
+            if self.private_registration_replace_capacity > 0
+                && self.private_registration_replace_refill_per_hour == 0
+            {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_REGISTRATION_REPLACE_REFILL_PER_HOUR must be greater than 0 \
+                     when NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY is non-zero"
+                ));
             }
         }
 
@@ -1047,6 +1186,19 @@ impl Config {
         } else {
             Some(entries)
         }
+    }
+
+    /// Parsed NGIT_PRIVATE_DENYLIST_PATH (file paths, CSV). Empty when
+    /// unset — the denylist is then empty and no reload task runs.
+    pub fn private_denylist_paths(&self) -> Vec<String> {
+        self.private_denylist_path
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Parsed NGIT_PRIVATE_SYNC_PEER_URLS (relay URLs, CSV). Empty when
@@ -1258,6 +1410,7 @@ impl Config {
             private_blob_data_path: None,
             private_meta_data_path: None,
             private_denylist_path: None,
+            private_denylist_reload_secs: 60,
             private_mirror_enable: false,
             private_mirror_peer_urls: None,
             private_sync_peer_urls: None,
@@ -1266,6 +1419,14 @@ impl Config {
             private_mirror_allow_private_ips: false,
             private_accept_direct_invites: false,
             private_per_tenant_metrics: false,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 60,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 4,
+            private_full_reissue_interval_secs: 3600,
+            private_reissue_min_interval_secs: 30,
+            private_mirror_retry_base_secs: 60,
+            private_mirror_retry_max_secs: 3600,
         }
     }
 }
@@ -1358,6 +1519,32 @@ mod tests {
         }
 
         assert_eq!(config.deletion_request_retention_unused_served_secs, 42);
+    }
+
+    #[test]
+    fn test_private_registration_mode_shipped_default_is_whitelist() {
+        // WP-E / server issue !7: the shipped default admission mode is
+        // whitelist (open is staging/self-use only and must be opted into).
+        // Pin it so a regression of the clap/derive default fails loudly.
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_PRIVATE_REGISTRATION_MODE";
+        let original = std::env::var_os(VARIABLE);
+        std::env::remove_var(VARIABLE);
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default private registration mode configuration should parse");
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
+
+        assert_eq!(
+            config.private_registration_mode,
+            RegistrationMode::Whitelist,
+            "shipped default registration mode must be whitelist (open is opt-in only)"
+        );
+        assert_eq!(RegistrationMode::default(), RegistrationMode::Whitelist);
     }
 
     #[test]
@@ -2265,5 +2452,242 @@ mod tests {
         assert!(
             !config.matches_grasp_services(&["github.com".to_string(), "gitlab.org".to_string(),])
         );
+    }
+
+    #[test]
+    fn test_private_write_rate_validation() {
+        // Defaults (enabled, generous) validate.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // capacity = 0 disables the limiter; refill is then unconstrained.
+        let config = Config {
+            private_repos_enable: true,
+            private_write_rate_capacity: 0,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Non-zero capacity with zero refill is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero refill must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_PRIVATE_WRITE_RATE_REFILL_PER_MIN"),
+            "unexpected error: {error}"
+        );
+
+        // The knobs are only validated when the subsystem is enabled.
+        let config = Config {
+            private_repos_enable: false,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_registration_replace_validation() {
+        // Defaults (capacity 8, refill 4/hour) validate.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // capacity = 0 disables the cadence limiter; refill is then
+        // unconstrained.
+        let config = Config {
+            private_repos_enable: true,
+            private_registration_replace_capacity: 0,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Non-zero capacity with zero refill is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero refill must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_PRIVATE_REGISTRATION_REPLACE_REFILL_PER_HOUR"),
+            "unexpected error: {error}"
+        );
+
+        // Only validated when the subsystem is enabled.
+        let config = Config {
+            private_repos_enable: false,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_full_reissue_interval_validation() {
+        // Default (3600s) validates.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.private_full_reissue_interval_secs, 3600);
+
+        // 0 disables the timer and is always valid.
+        let config = Config {
+            private_repos_enable: true,
+            private_full_reissue_interval_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Any positive interval is valid (no constraint to violate).
+        let config = Config {
+            private_repos_enable: true,
+            private_full_reissue_interval_secs: 1,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_mirror_retry_validation() {
+        // Defaults (base 60, max 3600) validate.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Zero base is a misconfiguration (would hot-loop retries).
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            private_mirror_retry_base_secs: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero base must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_PRIVATE_MIRROR_RETRY_BASE_SECS"),
+            "unexpected error: {error}"
+        );
+
+        // max < base is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            private_mirror_retry_base_secs: 120,
+            private_mirror_retry_max_secs: 60,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("max < base must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_PRIVATE_MIRROR_RETRY_MAX_SECS"),
+            "unexpected error: {error}"
+        );
+
+        // Only validated when the mirror is enabled.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: false,
+            private_mirror_retry_base_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_denylist_path_parsing() {
+        // Unset → no paths.
+        let config = Config::for_testing();
+        assert!(config.private_denylist_paths().is_empty());
+
+        // Single path.
+        let config = Config {
+            private_denylist_path: Some("/etc/ngit/denylist.txt".to_string()),
+            ..Config::for_testing()
+        };
+        assert_eq!(
+            config.private_denylist_paths(),
+            vec!["/etc/ngit/denylist.txt".to_string()]
+        );
+
+        // Comma-separated multi-path: whitespace trimmed, empty segments
+        // dropped. (Long line left as-is: rustfmt's 100-col split hurts
+        // the readability of this fixture.)
+        let config = Config {
+            private_denylist_path: Some(" /a/deny.txt ,/b/deny.txt,,  /c/deny.txt  ,".to_string()),
+            ..Config::for_testing()
+        };
+        assert_eq!(
+            config.private_denylist_paths(),
+            vec![
+                "/a/deny.txt".to_string(),
+                "/b/deny.txt".to_string(),
+                "/c/deny.txt".to_string()
+            ]
+        );
+
+        // Set-but-empty / all-separators → no paths.
+        for raw in ["", ",", " , , "] {
+            let config = Config {
+                private_denylist_path: Some(raw.to_string()),
+                ..Config::for_testing()
+            };
+            assert!(
+                config.private_denylist_paths().is_empty(),
+                "raw={raw:?} must yield no paths"
+            );
+        }
+    }
+
+    #[test]
+    fn test_private_denylist_reload_secs_validation() {
+        // Default (60s) validates.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.private_denylist_reload_secs, 60);
+
+        // 0 disables the reload task and is always valid.
+        let config = Config {
+            private_repos_enable: true,
+            private_denylist_reload_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Any other u64 is valid (no constraint to violate).
+        let config = Config {
+            private_repos_enable: true,
+            private_denylist_reload_secs: u64::MAX,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
     }
 }

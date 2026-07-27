@@ -774,10 +774,39 @@ impl WritePolicy for Nip34WritePolicy {
                 k if private.is_some()
                     && k.as_u16() == crate::private::KIND_REGISTRATION =>
                 {
-                    private.unwrap().handle_registration(event).await
+                    let svc = private.unwrap();
+                    let result = svc.handle_registration(event).await;
+                    // FS-2 (review L3-F4): a cadence-rejected same-tenant
+                    // replacement is held AND rejected to the client — the
+                    // NIP-20 message still says retry-later, but
+                    // convergence must not depend on the client actually
+                    // retrying: the sync timer re-offers the held event
+                    // after the bucket refills. Dedup by event id makes the
+                    // sync path's own hold a no-op.
+                    if let WritePolicyResult::Reject { ref message, .. } = result {
+                        if message.contains(
+                            crate::private::registration::REPLACE_CADENCE_REJECT_MESSAGE,
+                        ) {
+                            svc.sync_rejected().add_registration(event.clone());
+                        }
+                    }
+                    result
                 }
                 k if private.is_some() && k.as_u16() == crate::private::KIND_STATE_ROOT => {
                     let svc = private.unwrap();
+                    // Phase-4b A1: per-write-key token bucket — CLIENT
+                    // submissions only. Synced events and SaveContext
+                    // reprocess traffic arrive via the loopback:0 dummy
+                    // address and bypass the bucket (node-local DoS knob,
+                    // no convergence impact). A rate-limited 30641 is NOT
+                    // added to the out-of-order hold: the client retries.
+                    if !is_synced && !svc.client_write_allowed(&event.pubkey.to_hex()) {
+                        crate::metrics::record_private_rate_limited("state_root");
+                        crate::metrics::record_private_event_rejected(
+                            crate::private::KIND_STATE_ROOT,
+                        );
+                        return reject_restricted("rate-limited; retry later");
+                    }
                     let result = svc.handle_state_root(event).await;
                     // GRASP-P Phase 2 (design 1.4): a 30641 can be pushed
                     // BEFORE its authorizing 30640 is known here (client
@@ -802,6 +831,15 @@ impl WritePolicy for Nip34WritePolicy {
                 }
                 k if private.is_some() && k.as_u16() == crate::private::KIND_WRAP => {
                     let svc = private.unwrap();
+                    // Phase-4b A1: per-write-key token bucket (client
+                    // submissions only — see the 30641 arm). Charged wraps
+                    // and never-charged spam both spend one token; a
+                    // rate-limited wrap is rejected outright (no hold).
+                    if !is_synced && !svc.client_write_allowed(&event.pubkey.to_hex()) {
+                        crate::metrics::record_private_rate_limited("wrap");
+                        crate::metrics::record_private_event_rejected(crate::private::KIND_WRAP);
+                        return reject_restricted("rate-limited; retry later");
+                    }
                     match svc.try_handle_wrap(event, false).await {
                         Some(result) => result,
                         // Unregistered outer key: REJECT (never the public
@@ -824,7 +862,18 @@ impl WritePolicy for Nip34WritePolicy {
                 k if private.is_some()
                     && k.as_u16() == crate::private::KIND_EPHEMERAL_WRAP =>
                 {
-                    match private.unwrap().try_handle_wrap(event, true).await {
+                    let svc = private.unwrap();
+                    // Phase-4b A1: 21059 wraps are never quota-charged, so
+                    // this bucket is their ONLY cost — client submissions
+                    // only (see the 30641 arm).
+                    if !is_synced && !svc.client_write_allowed(&event.pubkey.to_hex()) {
+                        crate::metrics::record_private_rate_limited("ewrap");
+                        crate::metrics::record_private_event_rejected(
+                            crate::private::KIND_EPHEMERAL_WRAP,
+                        );
+                        return reject_restricted("rate-limited; retry later");
+                    }
+                    match svc.try_handle_wrap(event, true).await {
                         Some(result) => result,
                         // Ephemeral wraps are never stored, so there is no
                         // out-of-order hold — reject outright (§3.2: outer
@@ -877,6 +926,34 @@ impl WritePolicy for Nip34WritePolicy {
                         }
                     }
                     result
+                }
+                k if private.is_some() && k.as_u16() == crate::private::KIND_REPORT => {
+                    // GRASP-P Phase-4b D3: NIP-56 report intake —
+                    // observe-then-defer. Log the event id, the reporter,
+                    // and any sha256-looking tag values (the takedown
+                    // evidence an operator needs — e.g. `x` tags carrying
+                    // blob digests); the event CONTENT is never logged.
+                    // Admission then runs through the EXISTING related-event
+                    // rules unchanged: reports referencing accepted content
+                    // are stored as today, others are rejected as orphans as
+                    // today. v1 takes no automatic action; v2 may auto-act
+                    // on verified reports — until then the runbook documents
+                    // the manual denylist workflow (Phase-4b D1).
+                    let sha256_tags: Vec<String> = event
+                        .tags
+                        .iter()
+                        .flat_map(|tag| tag.clone().to_vec())
+                        .filter(|v| crate::private::blossom_auth::is_lower_hex_64(v))
+                        .take(16)
+                        .collect();
+                    tracing::info!(
+                        event_id = %event.id.to_hex(),
+                        reporter = %event.pubkey.to_hex(),
+                        sha256_tags = ?sha256_tags,
+                        "NIP-56 report event received"
+                    );
+                    crate::metrics::record_private_report_event();
+                    self.handle_related_event(event, "NIP-56 report").await
                 }
                 _ => self.handle_related_event(event, "Event").await,
             };

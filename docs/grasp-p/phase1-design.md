@@ -24,7 +24,7 @@ All fields on `Config`, `#[arg(long, env = "...", default_value...)]`. Update
 | env | type | default | meaning |
 |---|---|---|---|
 | NGIT_PRIVATE_REPOS_ENABLE | bool | false | master switch |
-| NGIT_PRIVATE_REGISTRATION_MODE | enum open\|whitelist\|pow\|paid | open | admission mode for NEW aliases |
+| NGIT_PRIVATE_REGISTRATION_MODE | enum open\|whitelist\|pow\|paid | whitelist (WP-E; was open in Phase 1–4b) | admission mode for NEW aliases |
 | NGIT_PRIVATE_POW_BITS | u8 | 20 | NIP-13 bits required on 30640 when mode=pow |
 | NGIT_PRIVATE_TENANT_WHITELIST | String CSV npubs | "" | tenants allowed when mode=whitelist |
 | NGIT_PRIVATE_MAX_BLOB_BYTES | u64 | 268435456 (256 MiB) | per-blob cap, enforced pre- and mid-stream |

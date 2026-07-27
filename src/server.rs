@@ -340,6 +340,14 @@ impl RelayServer {
                 background_tasks.push(private_service.spawn_mirror());
                 info!("Private blob mirror task started");
             }
+
+            // GRASP-P Phase-4b D1: periodic denylist reload (atomic swap +
+            // purge-on-add). None when reload is disabled or no files are
+            // configured.
+            if let Some(reload) = private_service.spawn_denylist_reload() {
+                background_tasks.push(reload);
+                info!("Private denylist reload task started");
+            }
         }
 
         let git_data_path = config.effective_git_data_path();

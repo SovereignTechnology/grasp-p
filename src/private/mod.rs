@@ -10,19 +10,22 @@
 
 pub mod blob_store;
 pub mod blossom_auth;
+pub mod denylist;
 pub mod gc;
+pub mod host;
 pub mod meta;
 pub mod mirror;
 pub mod quota;
+pub mod rate;
 pub mod registration;
 pub mod state_root;
 pub mod write_keys;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use nostr::{Event, Filter, Kind, PublicKey};
 use nostr_relay_builder::prelude::WritePolicyResult;
 use tokio::task::JoinHandle;
@@ -40,6 +43,8 @@ pub const KIND_REGISTRATION: u16 = 30640;
 pub const KIND_STATE_ROOT: u16 = 30641;
 pub const KIND_WRAP: u16 = 1059;
 pub const KIND_EPHEMERAL_WRAP: u16 = 21059;
+/// NIP-56 report (Phase-4b D3 intake: log + metric only).
+pub const KIND_REPORT: u16 = 1984;
 
 /// Hard cap on concurrent in-flight blob uploads. Together with the in-flight
 /// byte reservation this bounds transient `<blob_root>/tmp` disk usage, file
@@ -87,6 +92,11 @@ pub enum BlobError {
     Denylisted,
     /// 507 — tenant/repo/global quota exceeded.
     QuotaExceeded,
+    /// 429 — per-write-key rate limit exhausted (client write spam).
+    RateLimited {
+        /// `Retry-After` hint in seconds.
+        retry_after_secs: u64,
+    },
     /// 500 — internal failure.
     Internal(String),
 }
@@ -101,6 +111,7 @@ impl BlobError {
             Self::TooLarge => 413,
             Self::Denylisted => 451,
             Self::QuotaExceeded => 507,
+            Self::RateLimited { .. } => 429,
             Self::Internal(_) => 500,
         }
     }
@@ -114,6 +125,7 @@ impl BlobError {
             Self::TooLarge => "blob exceeds the maximum blob size".to_string(),
             Self::Denylisted => "content unavailable for legal reasons".to_string(),
             Self::QuotaExceeded => "quota exceeded".to_string(),
+            Self::RateLimited { .. } => "rate-limited; retry later".to_string(),
             Self::Internal(reason) => reason.clone(),
         }
     }
@@ -144,6 +156,12 @@ pub struct PrivateConfig {
     pub mirror_peer_urls: Option<Vec<String>>,
     pub mirror_max_concurrency: u32,
     pub mirror_fetch_timeout_secs: u64,
+    /// Phase-4b B2: base delay for the per-blob mirror retry backoff
+    /// (transient failure classes only — see mirror.rs taxonomy).
+    pub mirror_retry_base_secs: u64,
+    /// Phase-4b B2: backoff cap; also the fixed retry interval for
+    /// 404-on-all-peers (possible late upload).
+    pub mirror_retry_max_secs: u64,
     /// SSRF guard: when false (default), mirror fetch peers resolving to
     /// loopback/private/link-local/unspecified/multicast IPs are dropped and
     /// only https peers are contacted. Tests set this true to mirror over
@@ -151,6 +169,29 @@ pub struct PrivateConfig {
     pub mirror_allow_private_ips: bool,
     /// R6 parity fingerprint over the admission-affecting config.
     pub policy_fingerprint: String,
+    /// Phase-4b A1: per-write-key token bucket capacity for CLIENT-submitted
+    /// private writes (30641/1059/21059 events + blob PUTs). 0 = unlimited
+    /// (limiter disabled). Node-local DoS protection only — synced/loopback
+    /// traffic bypasses it, so it has no cross-node convergence impact and is
+    /// deliberately NOT part of `policy_fingerprint`.
+    pub write_rate_capacity: u32,
+    /// Phase-4b A1: bucket refill in tokens per minute.
+    pub write_rate_refill_per_min: u32,
+    /// Phase-4b A2: per-(tenant, alias) token bucket capacity for same-tenant
+    /// kind-30640 REPLACEMENTS (0 = unlimited). Cross-node acceptance knob —
+    /// part of the `policy_fingerprint` preimage (v2): a same-tenant newer
+    /// 30640 accepted on one node may be cadence-rejected on another running
+    /// different knobs, and the divergence heals only via refill + sync
+    /// redelivery, so paired nodes must run identical values.
+    pub registration_replace_capacity: u32,
+    /// Phase-4b A2: bucket refill in replacements per hour.
+    pub registration_replace_refill_per_hour: u32,
+    /// Phase-4b D1: denylist file paths (CSV-expanded). Node-local legal
+    /// config — deliberately NOT part of `policy_fingerprint`.
+    pub denylist_paths: Vec<String>,
+    /// Phase-4b D1: denylist reload interval in seconds (0 = reload
+    /// disabled; the boot-time set is kept).
+    pub denylist_reload_secs: u64,
 }
 
 impl PrivateConfig {
@@ -177,8 +218,17 @@ impl PrivateConfig {
             mirror_peer_urls: config.private_mirror_peer_url_entries(),
             mirror_max_concurrency: config.private_mirror_max_concurrency,
             mirror_fetch_timeout_secs: config.private_mirror_fetch_timeout_secs,
+            mirror_retry_base_secs: config.private_mirror_retry_base_secs,
+            mirror_retry_max_secs: config.private_mirror_retry_max_secs,
             mirror_allow_private_ips: config.private_mirror_allow_private_ips,
             policy_fingerprint: policy_fingerprint(config),
+            write_rate_capacity: config.private_write_rate_capacity,
+            write_rate_refill_per_min: config.private_write_rate_refill_per_min,
+            registration_replace_capacity: config.private_registration_replace_capacity,
+            registration_replace_refill_per_hour: config
+                .private_registration_replace_refill_per_hour,
+            denylist_paths: config.private_denylist_paths(),
+            denylist_reload_secs: config.private_denylist_reload_secs,
         }
     }
 }
@@ -217,7 +267,18 @@ pub fn policy_fingerprint(config: &Config) -> String {
     whitelist.sort();
 
     let preimage = format!(
-        "grasp-p-policy-v1|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|domains={}",
+        // v1 -> v2 (Phase-4b A2): the 30640 replacement-cadence knobs now
+        // affect cross-node acceptance (a same-tenant newer edition can be
+        // accepted on one node and cadence-rejected on another), so they
+        // join the preimage AND the label bumps — a v1/v2 fingerprint
+        // mismatch is itself the divergence signal an operator must see.
+        // The A1 client-write-rate knobs are deliberately ABSENT: they are
+        // node-local DoS protection (sync/loopback traffic bypasses them)
+        // with no convergence impact. The D1 denylist knobs are likewise
+        // ABSENT: the denylist is node-local LEGAL config (per-jurisdiction
+        // takedown lists legitimately differ across paired nodes) and its
+        // enforcement (451s, purges) never changes event acceptance.
+        "grasp-p-policy-v2|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|domains={}",
         config.private_registration_mode,
         config.private_pow_bits,
         whitelist.join(","),
@@ -228,6 +289,8 @@ pub fn policy_fingerprint(config: &Config) -> String {
         config.private_global_budget_bytes,
         config.private_max_aliases_per_tenant,
         config.private_max_write_keys_per_alias,
+        config.private_registration_replace_capacity,
+        config.private_registration_replace_refill_per_hour,
         domains.join(","),
     );
     let digest = sha256::Hash::hash(preimage.as_bytes()).to_string();
@@ -264,7 +327,11 @@ pub struct PrivateService {
     pub(crate) meta: MetaEnv,
     pub(crate) blobs: BlobStore,
     pub(crate) database: SharedDatabase,
-    denylist: HashSet<String>,
+    /// Node-local legal takedown list (Phase-4b D1), behind an RwLock for
+    /// the periodic reload's atomic swap. Deliberately NOT part of the
+    /// policy_fingerprint: paired nodes in different jurisdictions may
+    /// legitimately enforce different lists.
+    pub(crate) denylist: denylist::SharedDenylist,
     /// In-flight upload reservations (see [`UploadReservation`]).
     inflight: Arc<parking_lot::Mutex<InflightUploads>>,
     /// Phase 2: hot cache of 30641/1059 events rejected before their 30640
@@ -277,6 +344,24 @@ pub struct PrivateService {
     /// Phase 2: blob mirror job queue sender (set by [`Self::spawn_mirror`],
     /// absent when mirroring is disabled).
     mirror_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<mirror::MirrorJob>>,
+    /// Phase-4b B2: per-blob mirror retry state (attempt count + next-eligible
+    /// Instant) for the exponential backoff. In-memory only — a restart
+    /// resets every blob to the base interval (documented behavior).
+    pub(crate) mirror_retry: Arc<parking_lot::Mutex<HashMap<String, mirror::RetryState>>>,
+    /// FS-5 (review L2-F7): per-(sha256, reason) dedup for the mirror's
+    /// all-peers-failed warn — the metric carries the per-attempt signal;
+    /// the warn logs the first failure and re-logs once per 10 minutes.
+    pub(crate) mirror_failure_log: parking_lot::Mutex<mirror::FailureLogDedup>,
+    /// Phase-4b A1: per-write-key token bucket bounding CLIENT-submitted
+    /// private writes (30641/1059/21059 + blob PUT). Synced/loopback traffic
+    /// never touches this — the WS arms gate on the loopback:0 marker, and
+    /// the mirror never PUTs.
+    write_rate: parking_lot::Mutex<rate::KeyedTokenBucket>,
+    /// Phase-4b A2: per-(tenant, alias) token bucket bounding same-tenant
+    /// kind-30640 REPLACEMENT cadence (client AND synced live admission —
+    /// this knob is consensus-relevant, hence the fingerprint preimage;
+    /// only boot_reconcile replays bypass it).
+    registration_replace_rate: parking_lot::Mutex<rate::KeyedTokenBucket>,
 }
 
 impl std::fmt::Debug for PrivateService {
@@ -298,33 +383,40 @@ impl PrivateService {
         let meta = MetaEnv::open(&meta_path)?;
         let blobs = BlobStore::open(&blob_path)?;
 
-        let denylist = match &config.private_denylist_path {
-            Some(path) => {
-                let contents = std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read private denylist at {path}"))?;
-                contents
-                    .lines()
-                    .map(|l| l.trim().to_lowercase())
-                    .filter(|l| blossom_auth::is_lower_hex_64(l))
-                    .collect()
-            }
-            None => HashSet::new(),
-        };
+        let denylist_paths = config.private_denylist_paths();
+        let denylist = denylist::load_boot(&denylist_paths)?;
+        crate::metrics::set_private_denylist_entries(denylist.len());
 
         let svc = Arc::new(Self {
             cfg: PrivateConfig::from_config(config),
             meta,
             blobs,
             database,
-            denylist,
+            denylist: std::sync::Arc::new(std::sync::RwLock::new(denylist)),
             inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
             sync_rejected: crate::sync::private_index::PrivateRejectedIndex::new(
                 std::time::Duration::from_secs(config.rejected_hot_cache_duration_secs),
+                // R2-1(b): refill-aware per-registration retry eligibility,
+                // derived from the cadence refill knob (clamped; NGIT_TEST
+                // caps at 1s).
+                crate::sync::private_index::registration_retry_period(
+                    config.private_registration_replace_refill_per_hour,
+                ),
             ),
             conflict_alert_dedup: parking_lot::Mutex::new(
                 registration::ConflictAlertDedup::new(registration::CONFLICT_ALERT_DEDUP_TTL),
             ),
             mirror_tx: std::sync::OnceLock::new(),
+            mirror_retry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            mirror_failure_log: parking_lot::Mutex::new(mirror::FailureLogDedup::new()),
+            write_rate: parking_lot::Mutex::new(rate::KeyedTokenBucket::new(
+                config.private_write_rate_capacity,
+                config.private_write_rate_refill_per_min as f64 / 60.0,
+            )),
+            registration_replace_rate: parking_lot::Mutex::new(rate::KeyedTokenBucket::new(
+                config.private_registration_replace_capacity,
+                config.private_registration_replace_refill_per_hour as f64 / 3600.0,
+            )),
         });
 
         svc.boot_reconcile().await?;
@@ -344,6 +436,31 @@ impl PrivateService {
     /// registration, and 30640-Accept reprocess hook.
     pub fn sync_rejected(&self) -> &crate::sync::private_index::PrivateRejectedIndex {
         &self.sync_rejected
+    }
+
+    /// Phase-4b A1: spend one token from the CLIENT write bucket of
+    /// `pubkey_hex` (a secp256k1 write key). Callers MUST gate on the
+    /// submission path — this is for client WS events and blob PUTs only,
+    /// never for synced/loopback/reprocess traffic (the whole point is that
+    /// quota-uncharged spam like 21059 floods gets capped without touching
+    /// convergence traffic).
+    pub fn client_write_allowed(&self, pubkey_hex: &str) -> bool {
+        self.write_rate.lock().try_take(pubkey_hex, 1)
+    }
+
+    /// Phase-4b A1: `Retry-After` hint (seconds) for a rate-limited blob PUT.
+    pub fn write_rate_retry_after_secs(&self) -> u64 {
+        self.write_rate.lock().retry_after_secs(1)
+    }
+
+    /// Phase-4b A2: spend one same-tenant 30640 REPLACEMENT token for
+    /// `(tenant_hex, alias)`. Live admission only (client AND synced) —
+    /// boot_reconcile replays must not consume budget (they re-run events
+    /// this node already admitted).
+    pub(crate) fn registration_replace_allowed(&self, tenant_hex: &str, alias: &str) -> bool {
+        self.registration_replace_rate
+            .lock()
+            .try_take(&format!("{tenant_hex}:{alias}"), 1)
     }
 
     /// Rebuild registrations/key_claims/tenant_aliases from the relay DB's
@@ -380,10 +497,24 @@ impl PrivateService {
                 }
             };
             if needs_apply {
-                // Re-run the registration handler; admission-mode gates only
-                // apply to NEW aliases, which is correct for replays of events
-                // this node already admitted, except whitelist/pow changes —
-                // those are intentionally re-enforced for consistency.
+                // Re-run the registration handler. Admission-mode gates only
+                // apply to aliases that are NEW to the meta index, so a
+                // same-tenant replay of an event this node already admitted
+                // skips them: an operator flipping mode (e.g. open ->
+                // whitelist via the WP-E shipped-default change) keeps every
+                // existing tenant across reboots.
+                //
+                // Whitelist/pow changes ARE re-enforced when the replay
+                // rebuilds a missing meta index (stored == None) or the
+                // incoming event wins a cross-tenant conflict — those are
+                // intentionally treated as fresh admissions for consistency.
+                // A rejected replay is NON-DESTRUCTIVE: the reject path
+                // performs no meta mutation, prunes no relay-DB coordinate,
+                // and only warn-logs below — mode enforcement belongs at
+                // admission time, never as retroactive eviction. (Operator
+                // remedy for a meta-wipe rebuild under a stricter mode:
+                // temporarily reopen / whitelist the affected npubs,
+                // restart, then flip back.)
                 //
                 // The §3.2 conflict merge makes PAIRWISE conflicts converge
                 // order-independently: if the DB somehow holds two
@@ -399,7 +530,11 @@ impl PrivateService {
                 // and recovery relies on sync redelivery of the dropped
                 // event (the earliest registrant always keeps its seat in
                 // every order).
-                let outcome = registration::handle(self, &event);
+                //
+                // Phase-4b A2: REPLAY admission — the replacement-cadence
+                // bucket is skipped (these events were already admitted
+                // once; replays must not consume budget).
+                let outcome = registration::handle_replay(self, &event);
                 self.prune_evicted_registrations(&outcome.prune).await;
                 if matches!(outcome.result, WritePolicyResult::Accept) {
                     applied += 1;
@@ -956,6 +1091,7 @@ impl PrivateService {
             auth.sha256.clone(),
             declared_len,
             reservation,
+            self.denylist.clone(),
         )
         .await
     }
@@ -968,7 +1104,7 @@ impl PrivateService {
     }
 
     pub fn is_denylisted(&self, sha256: &str) -> bool {
-        self.denylist.contains(sha256)
+        denylist::read_set(&self.denylist).contains(sha256)
     }
 
     /// Remove this alias's claim on a blob (Blossom DELETE). File removal is
@@ -1086,6 +1222,13 @@ impl PrivateService {
     /// referenced-but-missing blobs.
     pub fn spawn_mirror(self: &Arc<Self>) -> JoinHandle<()> {
         mirror::spawn(self.clone())
+    }
+
+    /// Spawn the periodic denylist reload task (Phase-4b D1). Returns None
+    /// (no task) when reload is disabled or no denylist files are
+    /// configured.
+    pub fn spawn_denylist_reload(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        denylist::spawn(self.clone())
     }
 }
 
@@ -1331,4 +1474,49 @@ pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Va
         &config.domain,
         &policy_fingerprint(config),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase-4b A2: the replacement-cadence knobs are admission-affecting
+    /// (cross-node acceptance), so they feed the policy_fingerprint
+    /// preimage; the A1 client-write-rate knobs are node-local DoS
+    /// protection and must NOT.
+    #[test]
+    fn fingerprint_covers_cadence_knobs_not_write_rate_knobs() {
+        let base = Config::for_testing();
+        let same = Config::for_testing();
+        assert_eq!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&same),
+            "identical config must fingerprint identically"
+        );
+
+        let mut cadence = Config::for_testing();
+        cadence.private_registration_replace_capacity = 16;
+        assert_ne!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&cadence),
+            "cadence capacity must change the fingerprint"
+        );
+
+        let mut cadence_refill = Config::for_testing();
+        cadence_refill.private_registration_replace_refill_per_hour = 8;
+        assert_ne!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&cadence_refill),
+            "cadence refill must change the fingerprint"
+        );
+
+        let mut write_rate = Config::for_testing();
+        write_rate.private_write_rate_capacity = 0;
+        write_rate.private_write_rate_refill_per_min = 0;
+        assert_eq!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&write_rate),
+            "node-local write-rate knobs must NOT change the fingerprint"
+        );
+    }
 }
