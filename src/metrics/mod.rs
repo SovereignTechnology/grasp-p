@@ -354,7 +354,7 @@ lazy_static! {
         let metric = Counter::with_opts(Opts::new(
             "ngit_private_full_reissue_total",
             "Periodic since=None full re-issue rounds of the private sync filters \
-             (kind-30640 + derived 30641/1059) that ACTUALLY re-issued at least one \
+             (kind-30640 + derived 30641/stream-wrap) that ACTUALLY re-issued at least one \
              live peer (Phase-4b B1). Steady ~1/NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS. \
              Rounds where every peer was skipped (rate-limited or inside the FS-3 \
              re-issue floor) count into ngit_private_full_reissue_skipped_total \

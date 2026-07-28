@@ -404,7 +404,7 @@ let
           open mode any fresh key receives the full per-tenant quota, so
           ~50 pseudonymous tenants can exhaust the global budget). paid is
           reserved and fails validation. Part of the policy_fingerprint
-          preimage (grasp-p-policy-v2): operators who never set the mode
+          preimage (grasp-p-policy-v3): operators who never set the mode
           will see their fingerprint change on upgrade — paired nodes must
           run identical values.
         '';
@@ -618,6 +618,26 @@ let
         '';
       };
 
+      privateAcceptLegacyWrapKind = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          GRASP-P: also accept the LEGACY stream-wrap kinds 1059/21059
+          alongside the dedicated CORD stream-wrap kinds 3359/23359.
+          Default true: a node must accept 3359 BEFORE any client emits
+          it, and legacy wraps already published (or held for
+          out-of-order reprocess) must keep draining. Set false only once
+          every client on this node has migrated — the legacy kinds are
+          then RETIRED: while private repos are enabled a 1059/21059 is
+          refused outright, never reclassified onto the public
+          related-event path (which would store an a/e-tagged 1059 from
+          any key, uncharged and outside private quota/GC). Nodes with
+          private repos disabled are unaffected. Cross-node acceptance
+          knob: it feeds the policy_fingerprint (v3), so a node pair MUST
+          agree on it.
+        '';
+      };
+
       privatePerTenantMetrics = mkOption {
         type = types.bool;
         default = false;
@@ -660,7 +680,7 @@ let
           succession plus retries. Rejected replacements are HELD locally
           and retried after bucket refill (the hourly re-issue is the
           backstop healer). Cross-node acceptance knob (part of the
-          policy_fingerprint preimage, v2) — paired nodes must run
+          policy_fingerprint preimage, v3) — paired nodes must run
           identical values.
         '';
       };
@@ -881,6 +901,8 @@ let
         if cfg.privateMirrorAllowPrivateIps then "true" else "false";
       NGIT_PRIVATE_ACCEPT_DIRECT_INVITES =
         if cfg.privateAcceptDirectInvites then "true" else "false";
+      NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND =
+        if cfg.privateAcceptLegacyWrapKind then "true" else "false";
       NGIT_PRIVATE_PER_TENANT_METRICS =
         if cfg.privatePerTenantMetrics then "true" else "false";
       NGIT_PRIVATE_WRITE_RATE_CAPACITY = toString cfg.privateWriteRateCapacity;

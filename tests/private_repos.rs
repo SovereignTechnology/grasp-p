@@ -493,8 +493,12 @@ async fn exit2_open_mode_e2e() {
         .filter_map(|k| k.as_u64())
         .collect();
     assert!(
-        kinds.contains(&30640) && kinds.contains(&30641) && kinds.contains(&1059),
-        "exit2: NIP-11 kinds must list the private kinds; got {kinds:?}"
+        kinds.contains(&30640)
+            && kinds.contains(&30641)
+            && kinds.contains(&3359)
+            && kinds.contains(&1059),
+        "exit2: NIP-11 kinds must list the private kinds (incl. both stream-wrap \
+         kinds while legacy accept is on); got {kinds:?}"
     );
     assert_eq!(private["registration_mode"], "open");
 
@@ -648,13 +652,25 @@ async fn exit3_wrap_admission() {
         "exit3: foreign wrap rejection must be 'restricted:'; got {message:?}"
     );
 
-    // (b) 1059 signed by the registered write key: accepted, stored, and
-    // served to a completely anonymous client.
+    // (b) 1059 signed by the registered write key: accepted, stored,
+    // quota-charged its event bytes, and served to a completely anonymous
+    // client.
+    let ledger_before_wrap = global_ledger_bytes(relay.url()).await;
+    assert!(
+        ledger_before_wrap > 0,
+        "exit3: the registration must already be on the ledger"
+    );
     let wrap = wrap_event(&writer, 1059);
     let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
     assert!(
         accepted,
         "exit3: registered-key 1059 must be accepted; got {message:?}"
+    );
+    let want = ledger_before_wrap + wrap.as_json().len() as i64;
+    let ledger_after_wrap = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    assert_eq!(
+        ledger_after_wrap, want,
+        "exit3: the stored 1059 must be quota-charged its event bytes"
     );
     let anon = connect_anonymous_client(relay.url()).await;
     let served = anon
@@ -721,6 +737,30 @@ async fn exit3_wrap_admission() {
         stored.is_empty(),
         "exit3: 21059 must never be stored; got {} event(s)",
         stored.len()
+    );
+
+    // ...and never QUOTA-CHARGED (the invariant `try_handle_wrap(_, true)`
+    // exists for — see exit37 for the full rationale: ephemeral wrap bytes
+    // have no credit path, so charging them would let a registered write
+    // key brick a scope with zero bytes stored). Positive control: a second
+    // STORED 1059 published right after must move the ledger by exactly its
+    // own size, so this cannot pass vacuously.
+    let control = wrap_event(&writer, 1059);
+    assert_ne!(control.id, wrap.id, "exit3: the control must be a fresh id");
+    let (accepted, message) = publish_with_result(relay.url(), &control).await;
+    assert!(
+        accepted,
+        "exit3: the control 1059 must be accepted; got {message:?}"
+    );
+    let want = ledger_after_wrap + control.as_json().len() as i64;
+    let ledger_after_control = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    assert_eq!(
+        ledger_after_control, want,
+        "exit3: the ledger must move by the STORED 1059 only — the ephemeral \
+         21059 must never be quota-charged. before={ledger_after_wrap} \
+         control_1059_bytes={} ephemeral_21059_bytes={}",
+        control.as_json().len(),
+        ephemeral.as_json().len()
     );
 
     // (d) 21059 from an unregistered key also falls through and is vetoed.
@@ -4743,6 +4783,329 @@ async fn exit35_sybil_soak_under_whitelist() {
         "exit35: post-flood tenant blob must be GET-able"
     );
     assert_eq!(body, blob, "exit35: post-flood tenant blob must round-trip");
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit tests 36-39 — stream wraps in the shape GRASP-P actually ships
+// ============================================================================
+//
+// The pre-existing wrap coverage does NOT pin this shape. G3
+// (tests/phase0_gates.rs) runs with NGIT_PRIVATE_REPOS_ENABLE unset and uses
+// a p-tagged AND a-tagged fixture, so it only exercises the PUBLIC
+// related-event path. exit3 above does enable private repos with a
+// registered outer author, but its fixture is p-tagged too — so the wrap
+// would satisfy the public policy even if the private arm vanished.
+//
+// A real GRASP-P stream wrap is TAGLESS: no `p` (there is no NIP-59
+// recipient — the wrap is symmetric-AEAD to an epoch key), and no `a` (the
+// server must not learn which repo a wrap belongs to). Such an event is an
+// ORPHAN to the public related-event policy, so admission can ONLY come from
+// the private wrap arm. These tests pin that, on both wire kinds across the
+// 1059 -> 3359 migration window.
+
+/// A stream wrap as actually shipped: opaque ciphertext, NO `p` tag, NO `a`
+/// tag. Admission is possible only via the GRASP-P private wrap arm.
+fn tagless_wrap_event(signer: &Keys, kind: u16) -> Event {
+    EventBuilder::new(
+        Kind::Custom(kind),
+        "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
+    )
+    .finalize(signer)
+    .expect("sign tagless wrap")
+}
+
+/// Full admission contract for a TAGLESS stream wrap of `wrap_kind`:
+/// admitted from a registered outer key, quota-charged, stored, and served
+/// to a completely anonymous (never-AUTHed) reader.
+async fn assert_tagless_wrap_admitted(wrap_kind: u16, extra_env: &[(&str, &str)]) {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let mut env: Vec<(&str, &str)> = vec![("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())];
+    env.extend_from_slice(extra_env);
+    let relay = TestRelay::start_with_private_repos(&env).await;
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    let before = global_ledger_bytes(relay.url()).await;
+    assert!(
+        before > 0,
+        "kind {wrap_kind}: the registration must already be on the ledger"
+    );
+
+    let wrap = tagless_wrap_event(&writer, wrap_kind);
+    assert!(
+        wrap.tags.is_empty(),
+        "kind {wrap_kind}: the fixture must carry NO tags — a p/a-tagged wrap \
+         could be admitted by the public related-event path instead"
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        accepted,
+        "kind {wrap_kind}: a tagless wrap from a registered write key must be \
+         admitted by the private arm; got {message:?}"
+    );
+
+    // Quota: a stored wrap is charged its serialized size, exactly once.
+    let wrap_bytes = wrap.as_json().len() as i64;
+    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(relay.url())).await;
+    assert_eq!(
+        after,
+        before + wrap_bytes,
+        "kind {wrap_kind}: the stored wrap must be quota-charged its event bytes"
+    );
+
+    // Stored AND served to a client that never AUTHed (§ no read gate).
+    let anon = connect_anonymous_client(relay.url()).await;
+    let served = anon
+        .fetch_events(Filter::new().kind(Kind::Custom(wrap_kind)))
+        .timeout(Duration::from_secs(10))
+        .await
+        .expect("anonymous fetch failed");
+    let served: Vec<Event> = served.into_iter().collect();
+    assert!(
+        served.iter().any(|e| e.id == wrap.id),
+        "kind {wrap_kind}: the stored tagless wrap must be served to an \
+         anonymous REQ"
+    );
+    anon.disconnect().await;
+
+    relay.stop().await;
+}
+
+/// The legacy wire kind, under the shipped dual-accept default.
+#[tokio::test]
+async fn exit36_tagless_stream_wrap_legacy_kind() {
+    assert_tagless_wrap_admitted(1059, &[]).await;
+}
+
+/// The new dedicated wire kind. This is the ordering-critical half of the
+/// migration: the server must accept 3359 BEFORE any client emits it.
+///
+/// Numbered exit39, out of file order, because it is exit36's twin: exit
+/// numbers are quoted from the ops docs, so "exit36 failed" must name
+/// exactly one test.
+#[tokio::test]
+async fn exit39_tagless_stream_wrap_new_kind() {
+    assert_tagless_wrap_admitted(3359, &[]).await;
+}
+
+/// §3.2 gating and the ephemeral contract on the NEW kinds: an unregistered
+/// outer key is rejected outright on both 3359 and 23359, and a 23359 from a
+/// registered key is admitted but NEVER stored.
+#[tokio::test]
+async fn exit37_new_wrap_kind_gating_and_ephemerality() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay =
+        TestRelay::start_with_private_repos(&[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    // (a) 3359 from an unregistered key: rejected outright. NOT a
+    // fall-through to the public related-event path — §3.2 requires the
+    // outer author to be in w∪aux of a live registration, otherwise every
+    // deregistered rekey address is permanently floodable.
+    let foreign = tagless_wrap_event(&Keys::generate(), 3359);
+    let (accepted, message) = publish_with_result(relay.url(), &foreign).await;
+    assert!(!accepted, "exit37: unregistered 3359 must be rejected");
+    assert!(
+        message.contains("restricted:") && message.contains("unregistered key"),
+        "exit37: unregistered 3359 must be refused as an unregistered key; got {message:?}"
+    );
+
+    // (b) 23359 from an unregistered key: same gate on the ephemeral arm.
+    let foreign_ephemeral = tagless_wrap_event(&Keys::generate(), 23359);
+    let (accepted, message) = publish_with_result(relay.url(), &foreign_ephemeral).await;
+    assert!(!accepted, "exit37: unregistered 23359 must be rejected");
+    assert!(
+        message.contains("unregistered key"),
+        "exit37: unregistered 23359 must be refused as an unregistered key; got {message:?}"
+    );
+
+    // (c) 23359 from the registered key: accepted, never stored, and — the
+    // invariant that actually bounds the abuse — NEVER QUOTA-CHARGED.
+    //
+    // Ephemeral wraps have no credit path: `quota::charge` is unwound only
+    // by `reset_alias_event_bytes` at registration death, and the GC sweeps
+    // blobs, never event bytes. So if an ephemeral wrap were charged, a
+    // registered write key could drive (tenant, alias).event_bytes to the
+    // cap with distinct-id wraps that store ZERO bytes — the repo is then
+    // permanently bricked and invisible as "storage used". The whole
+    // defence is `try_handle_wrap(event, /* ephemeral */ true)` in
+    // builder.rs; NGIT_PRIVATE_WRITE_RATE_CAPACITY's doc names this abuse
+    // and ASSUMES this invariant, so pin it here.
+    //
+    // The assertion is bracketed with a POSITIVE CONTROL (a stored 3359
+    // charged in the same window) so it cannot pass vacuously: the final
+    // ledger must equal before + the 3359's bytes EXACTLY — a charged
+    // ephemeral shows up as the extra term.
+    let before = global_ledger_bytes(relay.url()).await;
+    assert!(
+        before > 0,
+        "exit37: the registration must already be on the ledger"
+    );
+
+    let ephemeral = tagless_wrap_event(&writer, 23359);
+    let (accepted, message) = publish_with_result(relay.url(), &ephemeral).await;
+    assert!(
+        accepted,
+        "exit37: registered-key 23359 must be accepted; got {message:?}"
+    );
+    let stored = fetch_from(relay.url(), Filter::new().kind(Kind::Custom(23359))).await;
+    assert!(
+        stored.is_empty(),
+        "exit37: 23359 is ephemeral and must never be stored; got {} events",
+        stored.len()
+    );
+
+    // Positive control: a STORED 3359 in the same window must move the
+    // ledger by exactly its own serialized size.
+    let charged = tagless_wrap_event(&writer, 3359);
+    let (accepted, message) = publish_with_result(relay.url(), &charged).await;
+    assert!(
+        accepted,
+        "exit37: registered-key 3359 must be accepted; got {message:?}"
+    );
+    let charged_bytes = charged.as_json().len() as i64;
+    let want = before + charged_bytes;
+    let after = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    assert_eq!(
+        after, want,
+        "exit37: the ledger must move by the STORED 3359 only — the \
+         ephemeral 23359 must never be quota-charged (ephemeral wrap bytes \
+         have no credit path, so charging them bricks the scope with zero \
+         bytes stored). before={before} charged_3359_bytes={charged_bytes} \
+         ephemeral_23359_bytes={}",
+        ephemeral.as_json().len()
+    );
+
+    relay.stop().await;
+}
+
+/// NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false closes the migration window:
+/// the legacy kinds stop being stream wraps (a tagless 1059 is then just an
+/// orphan) while 3359 keeps working — and the NIP-11 advert follows, so a
+/// client can discover the change instead of guessing.
+#[tokio::test]
+async fn exit38_legacy_wrap_kind_can_be_disabled() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay = TestRelay::start_with_private_repos(&[
+        ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+        ("NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND", "false"),
+    ])
+    .await;
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    // The advert drops the legacy kinds and keeps the new ones.
+    let doc = nip11_doc(&relay).await;
+    let private = doc
+        .get("private_repos")
+        .expect("exit38: NIP-11 must contain private_repos when enabled");
+    let kinds: Vec<u64> = private["kinds"]
+        .as_array()
+        .expect("private_repos.kinds array")
+        .iter()
+        .filter_map(|k| k.as_u64())
+        .collect();
+    assert!(
+        kinds.contains(&3359) && kinds.contains(&23359),
+        "exit38: the new stream-wrap kinds must stay advertised; got {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&1059) && !kinds.contains(&21059),
+        "exit38: the legacy wrap kinds must leave the advert; got {kinds:?}"
+    );
+
+    // A tagless 1059 from the REGISTERED write key is no longer a stream
+    // wrap: the legacy kinds are RETIRED and refused outright.
+    let legacy = tagless_wrap_event(&writer, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &legacy).await;
+    assert!(
+        !accepted,
+        "exit38: a legacy 1059 stream wrap must be rejected once legacy \
+         accept is off; got {message:?}"
+    );
+    assert!(
+        message.contains("restricted:") && message.contains("legacy stream-wrap kind"),
+        "exit38: the retired legacy wrap must be refused by the private \
+         retired-kind arm; got {message:?}"
+    );
+    let stored = fetch_from(relay.url(), Filter::new().kind(Kind::Custom(1059))).await;
+    assert!(
+        stored.is_empty(),
+        "exit38: the rejected legacy wrap must not be stored"
+    );
+
+    // The case that decides whether "off" NARROWS the accepted set: a 1059
+    // carrying an `a` tag that references accepted content. Without an
+    // explicit retired-kind arm, such an event falls past every private arm
+    // onto the PUBLIC related-event policy, which stores anything
+    // referencing an accepted coordinate — from ANY key, with no §3.2
+    // registered-key gate, no private_max_event_bytes cap, no private quota
+    // charge and no private GC. That would make legacy-OFF strictly more
+    // permissive than legacy-ON (where an unregistered 1059 is rejected
+    // outright), so the retired kinds are refused before that path.
+    //
+    // The coordinate is the tenant's own 30640 — derivable by anyone who
+    // can read the registration, so this is an UNREGISTERED author.
+    let coordinate = format!("30640:{}:{alias}", tenant.public_key().to_hex());
+    let a_tagged = EventBuilder::new(
+        Kind::Custom(1059),
+        "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
+    )
+    .tags(vec![Tag::custom("a", vec![coordinate.clone()])])
+    .finalize(&Keys::generate())
+    .expect("sign a-tagged legacy wrap");
+    let (accepted, message) = publish_with_result(relay.url(), &a_tagged).await;
+    assert!(
+        !accepted,
+        "exit38: an `a`-tagged 1059 must NOT be reclassified onto the public \
+         related-event path once legacy accept is off — that path would store \
+         it from any key, uncharged and outside private quota/GC; got \
+         {message:?}"
+    );
+    assert!(
+        message.contains("restricted:") && message.contains("legacy stream-wrap kind"),
+        "exit38: the `a`-tagged legacy wrap must be refused by the retired-kind \
+         arm, not by the public orphan check; got {message:?}"
+    );
+    let stored = fetch_from(relay.url(), Filter::new().kind(Kind::Custom(1059))).await;
+    assert!(
+        stored.is_empty(),
+        "exit38: no 1059 may be stored once legacy accept is off; got {} event(s)",
+        stored.len()
+    );
+
+    // The ephemeral legacy kind is retired on the same terms.
+    let legacy_ephemeral = tagless_wrap_event(&writer, 21059);
+    let (accepted, message) = publish_with_result(relay.url(), &legacy_ephemeral).await;
+    assert!(
+        !accepted && message.contains("legacy stream-wrap kind"),
+        "exit38: a legacy 21059 must be rejected once legacy accept is off; \
+         got accepted={accepted} {message:?}"
+    );
+
+    // ...while the new kind still round-trips end to end.
+    let wrap = tagless_wrap_event(&writer, 3359);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        accepted,
+        "exit38: 3359 must still be admitted with legacy accept off; got {message:?}"
+    );
+    let served = fetch_from(relay.url(), Filter::new().kind(Kind::Custom(3359))).await;
+    assert!(
+        served.iter().any(|e| e.id == wrap.id),
+        "exit38: the 3359 wrap must be stored and served"
+    );
 
     relay.stop().await;
 }

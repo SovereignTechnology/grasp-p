@@ -50,15 +50,22 @@ pub fn build_private_registration_filter(since: Option<Timestamp>) -> Filter {
 ///
 /// For each 100-alias chunk: `kinds:[30641] #d:[aliases]` (state roots).
 /// For each 100-key chunk of the registrations' w+aux keys:
-/// `kinds:[1059] authors:[keys]` (stored wraps). Kind 21059 is ephemeral and
-/// deliberately never synced.
+/// `kinds:[3359(,1059)] authors:[keys]` (stored stream wraps). The ephemeral
+/// wrap kinds are deliberately never synced.
+///
+/// Both stream-wrap kinds ride ONE filter while legacy accept is on, so
+/// held/in-flight 1059s still drain during the migration window; the set
+/// comes from [`crate::private::stream_wrap_kinds`] so it cannot drift from
+/// what admission actually accepts.
 ///
 /// # Arguments
 /// * `regs` - (alias, w+aux key hex) pairs from accepted 30640 registrations
 /// * `since` - Optional timestamp for incremental sync
+/// * `accept_legacy_wrap_kind` - dual-accept 1059 alongside 3359
 pub fn build_private_derived_filters(
     regs: &[(String, Vec<String>)],
     since: Option<Timestamp>,
+    accept_legacy_wrap_kind: bool,
 ) -> Vec<Filter> {
     if regs.is_empty() {
         return vec![];
@@ -93,7 +100,11 @@ pub fn build_private_derived_filters(
         filters.push(filter);
     }
 
-    // Kind 1059 wraps authored by registered w/aux keys, chunked per 100.
+    // Stream wraps authored by registered w/aux keys, chunked per 100.
+    let wrap_kinds: Vec<Kind> = crate::private::stream_wrap_kinds(accept_legacy_wrap_kind)
+        .into_iter()
+        .map(Kind::Custom)
+        .collect();
     let mut authors: Vec<PublicKey> = keys
         .iter()
         .filter_map(|k| PublicKey::from_hex(k).ok())
@@ -101,7 +112,7 @@ pub fn build_private_derived_filters(
     authors.sort();
     for chunk in authors.chunks(100) {
         let mut filter = Filter::new()
-            .kind(Kind::Custom(crate::private::KIND_WRAP))
+            .kinds(wrap_kinds.iter().copied())
             .authors(chunk.iter().copied());
         if let Some(ts) = since {
             filter = filter.since(ts);
@@ -546,7 +557,7 @@ mod tests {
         // re-issued as a cheap self-heal for missed registrations.
         let empty: Vec<(String, Vec<String>)> = vec![];
         let mut filters = vec![build_private_registration_filter(None)];
-        filters.extend(build_private_derived_filters(&empty, None));
+        filters.extend(build_private_derived_filters(&empty, None, true));
         assert_eq!(filters.len(), 1);
         assert!(
             filters[0]
@@ -556,16 +567,16 @@ mod tests {
         );
         assert_eq!(filters[0].since, None);
 
-        // Populated index: 30640 + one 30641 #d chunk + one 1059 authors
-        // chunk, none carrying a since filter.
+        // Populated index: 30640 + one 30641 #d chunk + one stream-wrap
+        // authors chunk, none carrying a since filter.
         let regs = vec![(
             "a".repeat(32),
             vec![PublicKey::from_slice(&[1u8; 32]).unwrap().to_hex()],
         )];
         let mut filters = vec![build_private_registration_filter(None)];
-        filters.extend(build_private_derived_filters(&regs, None));
+        filters.extend(build_private_derived_filters(&regs, None, true));
         assert_eq!(filters.len(), 3);
-        let want_kinds = [Kind::Custom(30640), Kind::Custom(30641), Kind::Custom(1059)];
+        let want_kinds = [Kind::Custom(30640), Kind::Custom(30641), Kind::Custom(3359)];
         for (filter, want) in filters.iter().zip(want_kinds.iter()) {
             assert!(
                 filter.kinds.as_ref().is_some_and(|k| k.contains(want)),
@@ -573,6 +584,32 @@ mod tests {
             );
             assert_eq!(filter.since, None, "re-issue filters must be since=None");
         }
+    }
+
+    /// Wire-kind migration: while legacy accept is on the derived wrap
+    /// filter must request BOTH kinds in ONE filter, so held/in-flight
+    /// 1059s keep draining from peers; with legacy accept off it must ask
+    /// for 3359 only (asking for a kind we would reject is a refetch loop).
+    #[test]
+    fn test_private_derived_wrap_filter_kinds_follow_legacy_accept() {
+        let regs = vec![(
+            "b".repeat(32),
+            vec![PublicKey::from_slice(&[2u8; 32]).unwrap().to_hex()],
+        )];
+
+        let dual = build_private_derived_filters(&regs, None, true);
+        let wrap = dual.last().expect("wrap filter");
+        let kinds = wrap.kinds.as_ref().expect("wrap filter kinds");
+        assert!(kinds.contains(&Kind::Custom(3359)));
+        assert!(kinds.contains(&Kind::Custom(1059)));
+        assert_eq!(kinds.len(), 2, "both wrap kinds ride ONE filter");
+
+        let strict = build_private_derived_filters(&regs, None, false);
+        let wrap = strict.last().expect("wrap filter");
+        let kinds = wrap.kinds.as_ref().expect("wrap filter kinds");
+        assert!(kinds.contains(&Kind::Custom(3359)));
+        assert!(!kinds.contains(&Kind::Custom(1059)));
+        assert_eq!(kinds.len(), 1);
     }
 
     #[test]

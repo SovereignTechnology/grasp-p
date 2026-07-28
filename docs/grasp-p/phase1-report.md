@@ -53,7 +53,9 @@ proof-of-possession negatives), lib 533/533. Runtime-smoked both enabled and dis
 - `PrivateService::new(&Config, SharedDatabase)`; `handle_registration/handle_state_root`,
   `try_handle_wrap(&Event, ephemeral) -> Option<WritePolicyResult>` (None = fall through),
   `begin_upload -> UploadSink`, `blob_path/is_denylisted/blob_delete/blob_list`,
-  `nip11_extension`, `spawn_gc`; `gc::run_pass(&PrivateService)` is pub for deterministic tests.
+  `spawn_gc`; `gc::run_pass(&PrivateService)` is pub for deterministic tests. The NIP-11
+  advert is built by the free function `private::nip11_private_repos_from_config(&Config)` —
+  the single advert constructor (a second, service-bound one existed and was deleted unwired).
 - Wiring: `create_relay` builds it when enabled and calls `write_policy.set_private()`;
   `RelayRuntime.private: Option<Arc<PrivateService>>`; threaded into `HttpService`.
 - Meta tables: registrations, key_claims, tenant_aliases, ledger, blob_claims, alias_claims,

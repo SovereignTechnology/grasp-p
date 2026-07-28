@@ -481,7 +481,7 @@ async fn run_purgatory_announcement_sync(
 /// Spawned ONLY when `config.private_repos_enable`. This is the single
 /// registration path into the private index and covers both sources
 /// uniformly (client-pushed AND synced 30640s both live in the relay DB).
-/// On change it re-issues derived 30641/1059 filters to connected peers,
+/// On change it re-issues derived 30641/stream-wrap filters to connected peers,
 /// connects any newly-listed peer relays, and reprocesses held out-of-order
 /// events whose registration just became available.
 async fn run_private_registration_sync(
@@ -508,7 +508,7 @@ async fn run_private_registration_sync(
 }
 
 /// GRASP-P Phase-4b B1: periodic since=None full re-issue of the private
-/// sync filters (Layer-1 kind-30640 + the current derived 30641/1059
+/// sync filters (Layer-1 kind-30640 + the current derived 30641/stream-wrap
 /// filters) to every live peer. Sibling to `run_private_registration_sync`,
 /// spawned ONLY when `config.private_repos_enable` and
 /// `NGIT_PRIVATE_FULL_REISSUE_INTERVAL_SECS` > 0 (0 = disabled).
@@ -753,7 +753,7 @@ pub struct SyncManager {
     rejected_events_index: Arc<RejectedEventsIndex>,
     /// GRASP-P Phase 2: alias → registration sync needs, rebuilt from the
     /// relay DB's kind-30640 events. Only populated when
-    /// `config.private_repos_enable`; drives the derived 30641/1059 filters.
+    /// `config.private_repos_enable`; drives the derived 30641/stream-wrap filters.
     private_sync_index: Arc<RwLock<private_index::PrivateSyncIndex>>,
     /// FS-3 (review L2-F4): per-peer floor between private filter
     /// re-issues (index-change-triggered consolidations AND the hourly
@@ -1966,25 +1966,23 @@ impl SyncManager {
                         }
 
                         // GRASP-P Phase 2: skip known-rejected private events
-                        // (30640/30641/1059) — same refetch-loop protection,
-                        // via the dedicated private rejected index. Inert
-                        // when private repos are disabled (private() is None).
-                        if matches!(
-                            event.kind.as_u16(),
-                            crate::private::KIND_REGISTRATION
-                                | crate::private::KIND_STATE_ROOT
-                                | crate::private::KIND_WRAP
-                        ) {
-                            if let Some(private) = write_policy.private() {
-                                if private.sync_rejected().contains(&event.id) {
-                                    tracing::trace!(
-                                        event_id = %event.id,
-                                        kind = %event.kind.as_u16(),
-                                        relay = %relay_url_clone,
-                                        "Skipping previously rejected private event"
-                                    );
-                                    continue;
-                                }
+                        // (30640/30641 + the accepted stream-wrap kinds) —
+                        // same refetch-loop protection, via the dedicated
+                        // private rejected index. Inert when private repos
+                        // are disabled (private() is None).
+                        if let Some(private) = write_policy.private() {
+                            let kind = event.kind.as_u16();
+                            let is_private_kind = kind == crate::private::KIND_REGISTRATION
+                                || kind == crate::private::KIND_STATE_ROOT
+                                || private.accepts_stream_wrap_kind(kind);
+                            if is_private_kind && private.sync_rejected().contains(&event.id) {
+                                tracing::trace!(
+                                    event_id = %event.id,
+                                    kind = %kind,
+                                    relay = %relay_url_clone,
+                                    "Skipping previously rejected private event"
+                                );
+                                continue;
                             }
                         }
 
@@ -2263,7 +2261,7 @@ impl SyncManager {
 
         // GRASP-P Phase 2: the private registration filter (kind 30640) is a
         // Layer-1 sibling — always subscribed alongside announcements — and
-        // the current derived 30641/1059 filters ride the same connect-time
+        // the current derived 30641/stream-wrap filters ride the same connect-time
         // subscription so a (re)connected peer is fully covered. Strictly
         // additive: with private repos disabled the filter set is unchanged.
         if self.config.private_repos_enable {
@@ -2272,6 +2270,7 @@ impl SyncManager {
             filters.extend(filters::build_private_derived_filters(
                 &derived_inputs,
                 None,
+                self.config.private_accept_legacy_wrap_kind,
             ));
         }
 
@@ -2351,7 +2350,7 @@ impl SyncManager {
         };
 
         // Out-of-order reprocess (design 1.4): drain held 30641s keyed by a
-        // newly-registered alias and held 1059s authored by a newly-claimed
+        // newly-registered alias and held stream wraps authored by a newly-claimed
         // key, then re-run them through the standard application path. The
         // sync path ALSO reprocesses inline on 30640 Accept; this timer pass
         // covers registrations that arrived via client WebSocket push.
@@ -2455,7 +2454,11 @@ impl SyncManager {
 
         let derived = {
             let index = self.private_sync_index.read().await;
-            filters::build_private_derived_filters(&index.derived_inputs(), None)
+            filters::build_private_derived_filters(
+                &index.derived_inputs(),
+                None,
+                self.config.private_accept_legacy_wrap_kind,
+            )
         };
 
         // Connect operator-allowlisted peer relays not yet registered. Peers
@@ -2557,7 +2560,7 @@ impl SyncManager {
 
     /// GRASP-P Phase-4b B1: periodic since=None full re-issue of the private
     /// sync filters — the Layer-1 kind-30640 registration filter PLUS the
-    /// current derived 30641/1059 filters — to every live peer (driven by
+    /// current derived 30641/stream-wrap filters — to every live peer (driven by
     /// `run_private_full_reissue_timer`, hourly by default).
     ///
     /// Exactly mirrors the index-change path's delivery mechanism (live
@@ -2581,6 +2584,7 @@ impl SyncManager {
         filters.extend(filters::build_private_derived_filters(
             &derived_inputs,
             None,
+            self.config.private_accept_legacy_wrap_kind,
         ));
         let outcome = self.reissue_filters_to_live_relays(filters).await;
         // FS-8 (review L3-F7): the counter must tell the truth — increment
@@ -3439,7 +3443,7 @@ impl SyncManager {
 
                 // GRASP-P Phase 2 (design 1.4): a 30640 registration was
                 // accepted — re-process held 30641s targeting the registered
-                // alias and held 1059 wraps authored by any newly-registered
+                // alias and held stream wraps authored by any newly-registered
                 // w/aux key. Inert when private repos are disabled.
                 if event.kind.as_u16() == crate::private::KIND_REGISTRATION {
                     if let Some(private) = write_policy.private() {
@@ -3586,9 +3590,12 @@ impl SyncManager {
                     // GRASP-P Phase 2 (design 1.4): hold rejected private
                     // events in the dedicated index. The existing (pubkey,
                     // d-tag) registration above does NOT fit these kinds —
-                    // 1059 wraps have an ephemeral outer pubkey and no `d`
-                    // tag — so 30641s are keyed by their target alias and
-                    // 1059s by their outer author. Inert when disabled.
+                    // stream wraps have an ephemeral outer pubkey and no
+                    // `d` tag — so 30641s are keyed by their target alias
+                    // and stream wraps by their outer author (which is
+                    // kind-agnostic: a held 1059 and a held 3359 from the
+                    // same write key share a bucket and are released
+                    // together). Inert when disabled.
                     if let Some(private) = write_policy.private() {
                         match event.kind.as_u16() {
                             crate::private::KIND_REGISTRATION => {
@@ -3628,7 +3635,7 @@ impl SyncManager {
                                     None => private.sync_rejected().add_id_only(event.id),
                                 }
                             }
-                            crate::private::KIND_WRAP => {
+                            k if private.accepts_stream_wrap_kind(k) => {
                                 private
                                     .sync_rejected()
                                     .add_wrap(event.pubkey.to_hex(), event.clone());
@@ -4191,7 +4198,7 @@ impl SyncManager {
             let mut excluded_ids: HashSet<EventId> =
                 purgatory_ids.union(&rejected_ids).cloned().collect();
             // GRASP-P Phase 2: also exclude known-rejected private events
-            // (30640/30641/1059) so negentropy doesn't refetch them.
+            // (30640/30641/stream wraps) so negentropy doesn't refetch them.
             if let Some(private) = self.write_policy.private() {
                 excluded_ids.extend(private.sync_rejected().all_event_ids());
             }

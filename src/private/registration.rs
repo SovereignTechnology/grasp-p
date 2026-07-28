@@ -580,7 +580,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         // A rejected replacement is HELD (FS-2: PrivateRejectedIndex) and
         // retried by the sync layer after bucket refill, with the hourly
         // re-issue as backstop; the knob values are part of the
-        // policy_fingerprint preimage (v2) so paired nodes run identical
+        // policy_fingerprint preimage (v3) so paired nodes run identical
         // cadence config. Bucket state itself is node-local, so a transient
         // divergence after a flood is possible — it heals on refill +
         // redelivery.

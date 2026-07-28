@@ -5,15 +5,18 @@
 //!
 //! - [`PrivateSyncIndex`]: alias → {w+aux keys, relay URLs, server URLs},
 //!   rebuilt from the relay DB's accepted kind-30640 registrations. Parallel
-//!   to `RepoSyncIndex`; drives the derived 30641/1059 sync filters. The
+//!   to `RepoSyncIndex`; drives the derived 30641/stream-wrap sync filters. The
 //!   private peer-relay set is NOT derived from it — outbound sync peers
 //!   come only from the operator allowlist
 //!   ([`configured_peer_relay_urls`]).
-//! - [`PrivateRejectedIndex`]: a dedicated hot cache for 30641/1059 events
-//!   rejected because their authorizing 30640 has not arrived yet
+//! - [`PrivateRejectedIndex`]: a dedicated hot cache for 30641/stream-wrap
+//!   events rejected because their authorizing 30640 has not arrived yet
 //!   (out-of-order sync). Keyed by target alias (30641) and outer author
-//!   pubkey (1059) — gift wraps have an ephemeral pubkey and no `d` tag, so
-//!   the existing (pubkey, d-tag) `RejectedEventsIndex` keying cannot apply.
+//!   pubkey (stream wraps) — wraps have an ephemeral pubkey and no `d` tag,
+//!   so the existing (pubkey, d-tag) `RejectedEventsIndex` keying cannot
+//!   apply. The author keying is deliberately KIND-AGNOSTIC: the 1059 ->
+//!   3359 wire-kind migration needs no change here, and a write key whose
+//!   registration lands late releases its held wraps of both kinds at once.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -148,7 +151,7 @@ pub fn normalize_relay_url(value: &str) -> Option<String> {
 const MAX_HELD_EVENTS: usize = 4096;
 
 /// R2-1 (verify round 2): registrations sub-cap within MAX_HELD_EVENTS so a
-/// registration-hold flood cannot crowd out the 30641/1059 dependency
+/// registration-hold flood cannot crowd out the 30641/stream-wrap dependency
 /// holds. Newest-only replacement (below) bounds the hold by the live
 /// (tenant, alias) universe in practice; this cap is the flood backstop.
 const MAX_HELD_REGISTRATIONS: usize = 1024;
@@ -208,7 +211,7 @@ struct HeldRegistration {
 struct PrivateRejectedInner {
     /// 30641 rejections keyed by target alias (`d` tag).
     by_alias: HashMap<String, Vec<HeldEvent>>,
-    /// 1059 rejections keyed by outer author pubkey hex.
+    /// Stream-wrap rejections keyed by outer author pubkey hex (kind-agnostic).
     by_author: HashMap<String, Vec<HeldEvent>>,
     /// FS-2 (review L3-F4) + R2-1 (verify round 2): cadence-rejected
     /// same-tenant 30640 REPLACEMENTS held for retry by the 5s
@@ -231,7 +234,7 @@ struct PrivateRejectedInner {
     /// Next insertion sequence for held registrations (FIFO drain order).
     next_reg_seq: u64,
     /// All known-rejected private event ids (incl. id-only 30640 rejections
-    /// and the ids of 30641/1059 holds) with their rejection time — drives
+    /// and the ids of 30641/stream-wrap holds) with their rejection time — drives
     /// the sync pre-filter skip and the negentropy exclusion set.
     ids: HashMap<EventId, Instant>,
     held_count: usize,
@@ -315,7 +318,9 @@ impl PrivateRejectedIndex {
         });
     }
 
-    /// Hold a rejected 1059 keyed by its outer author pubkey.
+    /// Hold a rejected stream wrap keyed by its outer author pubkey. The
+    /// wire kind is irrelevant to the hold: legacy 1059 and 3359 wraps
+    /// share the author bucket and are released by the same 30640.
     pub fn add_wrap(&self, author_hex: String, event: Event) {
         let mut inner = self.inner.lock();
         Self::add_held(&mut inner, event, |inner, held| {
@@ -461,7 +466,7 @@ impl PrivateRejectedIndex {
     }
 
     /// Remove and return all held events authored by any of `authors`
-    /// (1059 wraps), clearing their skip-set entries.
+    /// (stream wraps of any accepted kind), clearing their skip-set entries.
     pub fn take_for_authors(&self, authors: &[String]) -> Vec<Event> {
         let mut inner = self.inner.lock();
         let mut held = Vec::new();
@@ -682,6 +687,57 @@ mod tests {
         let taken = index.take_for_authors(&[keys.public_key().to_hex()]);
         assert_eq!(taken.len(), 1);
         assert!(!index.contains(&id));
+    }
+
+    /// The hold's kind-AGNOSTIC author keying — the contract the sync
+    /// ingest dispatch arm (`sync/mod.rs`, `accepts_stream_wrap_kind`)
+    /// depends on across the 1059 -> 3359 migration: wraps of BOTH wire
+    /// kinds from one write key share a bucket and are released together by
+    /// the single 30640 that registers that key, with the skip-set cleared
+    /// so the reprocess is not pre-filtered.
+    ///
+    /// Coverage note: this pins the INDEX, not the call site. That dispatch
+    /// arm is unreachable from the two-node harness by construction (a node
+    /// only asks a peer for wraps by an author whose 30640 it has already
+    /// accepted, so a synced wrap preceding its own registration is a race
+    /// the harness cannot order) and deleting it leaves the suite green; it
+    /// remains verified by inspection only.
+    #[test]
+    fn test_wrap_hold_is_kind_agnostic_per_author() {
+        use nostr_sdk::prelude::*;
+
+        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let writer = Keys::generate();
+        let author = writer.public_key().to_hex();
+
+        let wrap_of = |kind: u16| {
+            EventBuilder::new(Kind::Custom(kind), "opaque-ciphertext-stand-in")
+                .finalize(&writer)
+                .expect("sign")
+        };
+        let legacy = wrap_of(crate::private::KIND_WRAP);
+        let modern = wrap_of(crate::private::KIND_STREAM_WRAP);
+        assert_ne!(legacy.id, modern.id, "distinct wire kinds, distinct ids");
+
+        index.add_wrap(author.clone(), legacy.clone());
+        index.add_wrap(author.clone(), modern.clone());
+        assert!(index.contains(&legacy.id) && index.contains(&modern.id));
+
+        // A different author's registration releases neither.
+        let stranger = Keys::generate().public_key().to_hex();
+        assert!(index.take_for_authors(&[stranger]).is_empty());
+        assert!(index.contains(&legacy.id) && index.contains(&modern.id));
+
+        // The registering author's 30640 releases BOTH at once.
+        let taken = index.take_for_authors(&[author]);
+        assert_eq!(taken.len(), 2, "both wire kinds must release together");
+        let ids: HashSet<EventId> = taken.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&legacy.id) && ids.contains(&modern.id));
+        assert!(
+            !index.contains(&legacy.id) && !index.contains(&modern.id),
+            "the take must clear the skip-set entries"
+        );
+        assert!(index.all_event_ids().is_empty());
     }
 
     #[test]

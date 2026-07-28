@@ -765,10 +765,17 @@ impl WritePolicy for Nip34WritePolicy {
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
             // GRASP-P private-repo kinds. Only routed when the subsystem is
-            // enabled; otherwise all four kinds fall through to the existing
-            // dispatch below (zero behavior change with enable=false). Synced
-            // events (loopback:0) intentionally get identical handling — a
-            // synced 30640/30641/1059 must apply under the same rules.
+            // enabled; otherwise every private kind falls through to the
+            // existing dispatch below (zero behavior change with
+            // enable=false). Which stream-wrap kinds route here is decided
+            // in exactly one place (`accepts_*_stream_wrap_kind`), so the
+            // dual-accept window (3359 + legacy 1059) can never diverge
+            // from the sync filters or the NIP-11 advert; its complement
+            // (`rejects_retired_wrap_kind`) refuses the legacy kinds
+            // outright once the window closes, so they are never handed to
+            // the weaker public related-event path. Synced events
+            // (loopback:0) intentionally get identical handling — a synced
+            // 30640/30641/stream wrap must apply under the same rules.
             let private = self.private.get();
             let result = match event.kind {
                 k if private.is_some()
@@ -829,7 +836,7 @@ impl WritePolicy for Nip34WritePolicy {
                     }
                     result
                 }
-                k if private.is_some() && k.as_u16() == crate::private::KIND_WRAP => {
+                k if private.is_some_and(|svc| svc.accepts_stream_wrap_kind(k.as_u16())) => {
                     let svc = private.unwrap();
                     // Phase-4b A1: per-write-key token bucket (client
                     // submissions only — see the 30641 arm). Charged wraps
@@ -837,15 +844,15 @@ impl WritePolicy for Nip34WritePolicy {
                     // rate-limited wrap is rejected outright (no hold).
                     if !is_synced && !svc.client_write_allowed(&event.pubkey.to_hex()) {
                         crate::metrics::record_private_rate_limited("wrap");
-                        crate::metrics::record_private_event_rejected(crate::private::KIND_WRAP);
+                        crate::metrics::record_private_event_rejected(k.as_u16());
                         return reject_restricted("rate-limited; retry later");
                     }
                     match svc.try_handle_wrap(event, false).await {
                         Some(result) => result,
                         // Unregistered outer key: REJECT (never the public
                         // related-event path). §3.2 is normative here: a
-                        // GRASP-P node admits 1059s only for outer authors in
-                        // w∪s of a live registration — accepting referenced
+                        // GRASP-P node admits stream wraps only for outer
+                        // authors in w∪s of a live registration — accepting referenced
                         // wraps from unregistered keys made every deregistered
                         // rekey address permanently floodable (charged to
                         // nobody), defeating the client's epoch-scoped
@@ -859,18 +866,16 @@ impl WritePolicy for Nip34WritePolicy {
                         }
                     }
                 }
-                k if private.is_some()
-                    && k.as_u16() == crate::private::KIND_EPHEMERAL_WRAP =>
+                k if private
+                    .is_some_and(|svc| svc.accepts_ephemeral_stream_wrap_kind(k.as_u16())) =>
                 {
                     let svc = private.unwrap();
-                    // Phase-4b A1: 21059 wraps are never quota-charged, so
-                    // this bucket is their ONLY cost — client submissions
+                    // Phase-4b A1: ephemeral wraps are never quota-charged,
+                    // so this bucket is their ONLY cost — client submissions
                     // only (see the 30641 arm).
                     if !is_synced && !svc.client_write_allowed(&event.pubkey.to_hex()) {
                         crate::metrics::record_private_rate_limited("ewrap");
-                        crate::metrics::record_private_event_rejected(
-                            crate::private::KIND_EPHEMERAL_WRAP,
-                        );
+                        crate::metrics::record_private_event_rejected(k.as_u16());
                         return reject_restricted("rate-limited; retry later");
                     }
                     match svc.try_handle_wrap(event, true).await {
@@ -880,6 +885,29 @@ impl WritePolicy for Nip34WritePolicy {
                         // author must be registered).
                         None => reject_restricted("unregistered key"),
                     }
+                }
+                k if private.is_some_and(|svc| svc.rejects_retired_wrap_kind(k.as_u16())) => {
+                    // NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false RETIRES
+                    // 1059/21059 on a GRASP-P node: refuse them here rather
+                    // than let them fall through to `handle_related_event`.
+                    // Without this arm, closing the private arm RECLASSIFIES
+                    // a legacy wrap onto the public related-event policy,
+                    // which stores any `a`/`e`-tagged event referencing
+                    // accepted content — from any key, ungated by §3.2,
+                    // uncapped by private_max_event_bytes, uncharged to any
+                    // private quota, and never swept by the private GC. That
+                    // is MORE permissive than the default (legacy on, where
+                    // an unregistered 1059 is rejected outright), so the
+                    // "off" position of a migration knob would widen the
+                    // accepted set. Nothing legitimate is lost: with the knob
+                    // on, the private arm already claims every 1059 on this
+                    // node, so no client can be relying on the public path
+                    // for it, and genuine NIP-59 gift wraps go to inbox
+                    // relays, never a git node. Nodes with private repos
+                    // disabled never reach this arm (`private` is None) and
+                    // keep vanilla 1059 handling (phase0 G3).
+                    crate::metrics::record_private_event_rejected(k.as_u16());
+                    reject_restricted("legacy stream-wrap kind is not accepted on this node")
                 }
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
                 Kind::RepoState => self.handle_state(event, is_synced).await,

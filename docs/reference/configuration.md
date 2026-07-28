@@ -1329,7 +1329,7 @@ ledger. Every `NGIT_PRIVATE_*` knob is a no-op unless
 The admission-affecting knobs (mode, pow bits, whitelist, event/blob caps,
 the three quota scopes, alias/key limits, and the Phase-4b
 replacement-cadence pair) form the `policy_fingerprint` preimage
-(`grasp-p-policy-v2`): paired nodes MUST run identical values or
+(`grasp-p-policy-v3`): paired nodes MUST run identical values or
 registrations accepted on one node can be silently rejected on the other.
 Compare fingerprints via NIP-11 `private_repos.policy_fingerprint` or the
 startup log line.
@@ -1481,6 +1481,15 @@ startup log line.
 **Default:** `false`  
 **Required:** No
 
+#### `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND`
+
+**Description:** Also accept the **legacy** stream-wrap kinds `1059`/`21059` alongside the dedicated CORD stream-wrap kinds `3359`/`23359`. GRASP-P stream wraps were never NIP-59 gift wraps (no `p` tag, no kind-13 seal, symmetric AEAD, derived deterministic signer), so they moved to their own kind. The default `true` is the migration window: a node must accept `3359` **before** any client emits it, and wraps already published on `1059` (or held for out-of-order reprocess) must keep draining. Set `false` only once every client writing to this node has migrated — the legacy kinds are then **retired**: while private repos are enabled, a `1059`/`21059` is refused outright with `restricted: legacy stream-wrap kind is not accepted on this node`. It is deliberately **not** reclassified onto the public related-event path. That path stores any event carrying an `a`/`e` tag that references accepted content, from **any** key — no §3.2 registered-key gate, no `NGIT_PRIVATE_MAX_EVENT_BYTES` cap, no private quota charge, and never swept by the private GC — which would make the `false` position of this knob *wider* than the default (where an unregistered `1059` is rejected outright). Nodes with `NGIT_PRIVATE_REPOS_ENABLE=false` are unaffected: `1059` keeps its vanilla public related-event handling there. Genuine NIP-59 gift-wrapped invites are unaffected either way: they go to inbox relays, not the git node. This is a **cross-node acceptance** knob — it feeds the `policy_fingerprint` (`v3`), so both nodes of a pair must agree on it or wraps accepted on one are rejected on the other; flip it on both nodes in a single maintenance window (see the ops runbook §2).
+
+**Clients must emit exactly one wrap kind per logical wrap.** Dual-accept exists so a client can *switch* kinds, not *duplicate* them: the quota charge is keyed on `event.id` and the kind is part of the id preimage, so the same plaintext published as both `1059` and `3359` is two ids — charged twice and stored twice, with no credit path (wrap event bytes are released only when the registration dies).  
+**Type:** Boolean  
+**Default:** `true`  
+**Required:** No
+
 #### `NGIT_PRIVATE_PER_TENANT_METRICS`
 
 **Description:** Opt in to per-tenant metric labels. The default `false` exposes aggregate metrics only, keeping Prometheus label cardinality bounded regardless of tenant count.  
@@ -1507,7 +1516,7 @@ section above.)
 **Notes:**
 
 - **Default changed in WP-E (was `open` in Phase 1–4b).** The locked operator decision: launch posture is whitelist — in open mode every fresh key receives the full per-tenant blob quota, so ~50 pseudonymous tenants can lawfully exhaust the whole-subsystem storage budget (server issue !7). `open` is intended for staging/self-use only and must now be selected explicitly.
-- **`policy_fingerprint` change on upgrade.** The mode is part of the `grasp-p-policy-v2` fingerprint preimage. An operator who never set the mode explicitly will see their fingerprint change on upgrade (`open` → `whitelist`): paired nodes must upgrade together (or set the mode explicitly on both) to keep fingerprints — and therefore cross-node acceptance — in parity.
+- **`policy_fingerprint` change on upgrade.** The mode is part of the `grasp-p-policy-v3` fingerprint preimage. An operator who never set the mode explicitly will see their fingerprint change on upgrade (`open` → `whitelist`): paired nodes must upgrade together (or set the mode explicitly on both) to keep fingerprints — and therefore cross-node acceptance — in parity.
 - **Empty whitelist = accept-nothing (safe default).** `whitelist` mode with an empty `NGIT_PRIVATE_TENANT_WHITELIST` rejects every new registration; startup emits a loud `tracing::warn!` ("all new private-repo registrations will be rejected") so an operator who expected open mode sees it immediately.
 
 **Boot-time re-enforcement (exact behavior, pinned by the exit12 integration test):**
@@ -1581,7 +1590,7 @@ within seconds. These knobs bound the same-tenant replacement rate per
 `(tenant, alias)`. Unlike the write-rate bucket above, these knobs affect
 **cross-node acceptance** (a same-tenant newer edition can be accepted on
 one node and cadence-rejected on another), so they are part of the
-`policy_fingerprint` preimage (label `grasp-p-policy-v2`) — paired nodes
+`policy_fingerprint` preimage (label `grasp-p-policy-v3`) — paired nodes
 MUST run identical values.
 
 Rejected replacements are HELD by the relay and retried without any client

@@ -85,7 +85,21 @@ checks 4/5, never the run.
 1. **fingerprint-parity** — NIP-11 `private_repos.policy_fingerprint` must
    be present and equal on both nodes (a correctly paired setup hashes the
    same sorted `{own domain} ∪ {bootstrap peer}` set on both sides).
-   `registration_mode` is reported for each side.
+   `registration_mode` and `policy_version` are reported for each side. On a
+   mismatch the detail names which case it is: a **VERSION SKEW** (the
+   `grasp-p-policy-vN` labels differ — a label bump moves every node's
+   digest, so a rolling upgrade fails this check for the whole window) or a
+   **SAME-VERSION knob split** (a real acceptance divergence).
+1b. **kinds-parity** — NIP-11 `private_repos.kinds` must be the same SET on
+   both nodes; the line names the kinds only one side admits (`only-a=` /
+   `only-b=`). Its own check because the fingerprint digest folds a dozen
+   knobs into 16 opaque hex chars: a stream-wrap kind split (1059/21059 vs
+   3359/23359) means events one node stores are refused by the other and
+   never replicate. SKIP when neither node advertises `private_repos`
+   (private repos disabled — check 1 reports that).
+   **Scope:** this compares what the nodes SAY they accept. No check
+   compares stream-wrap SETS; wrap divergence is not covered by any
+   data-parity check here.
 2. **registration-parity** — per alias, the latest kind-30640 (highest
    `created_at`; ties broken by **lowest** event id, matching the relay's
    addressable tie-break) must be the same event id with the same
@@ -118,7 +132,8 @@ checks 4/5, never the run.
 Human mode prints one line per check to stdout:
 
 ```
-PASS fingerprint-parity fingerprint=f9d937ac1a5851d8 mode-a=open mode-b=open
+PASS fingerprint-parity fingerprint=f9d937ac1a5851d8 policy-a=grasp-p-policy-v3 policy-b=grasp-p-policy-v3 mode-a=open mode-b=open
+PASS kinds-parity kinds=1059,3359,21059,23359,30640,30641
 PASS registration-parity alias=0123… event=ab12cd34
 FAIL manifest-parity alias=0123… author=deadbeef reason=withheld-30641 -- kind-30641 present on A but absent on B; created_at=1785000000 age=912s exceeds --max-skew-secs=300
 FAIL blob-existence probe=head probed=3 failed=1 -- sha=d24eb189 A=404 B=200

@@ -5,8 +5,9 @@
 //! inspects wrap contents and never creates bare git repos for private repos.
 //!
 //! Everything here is inert unless `NGIT_PRIVATE_REPOS_ENABLE=true`: when the
-//! flag is off no [`PrivateService`] is constructed and all four private kinds
-//! (30640/30641/1059/21059) fall through to the existing admission handling.
+//! flag is off no [`PrivateService`] is constructed and every private kind
+//! (30640/30641 + the stream-wrap kinds 3359/23359 and, while legacy accept
+//! is on, 1059/21059) falls through to the existing admission handling.
 
 pub mod blob_store;
 pub mod blossom_auth;
@@ -41,10 +42,72 @@ pub use meta::{MetaEnv, RegistrationRecord};
 /// Private-repo event kinds.
 pub const KIND_REGISTRATION: u16 = 30640;
 pub const KIND_STATE_ROOT: u16 = 30641;
+/// LEGACY stream-wrap envelope: NIP-59's gift-wrap kind. GRASP-P stream
+/// wraps were never NIP-59 (no `p` tag, no kind-13 seal, symmetric AEAD, a
+/// derived deterministic signer), so riding 1059 bought nothing while
+/// forcing the spec to require relays to violate NIP-59's relay behaviours.
+/// Accepted only while `accept_legacy_wrap_kind` is on (default true) so
+/// wraps published by pre-migration clients keep flowing.
 pub const KIND_WRAP: u16 = 1059;
+/// LEGACY ephemeral stream-wrap envelope (see [`KIND_WRAP`]).
 pub const KIND_EPHEMERAL_WRAP: u16 = 21059;
+/// CORD stream wrap: the dedicated regular/stored envelope kind that
+/// replaces the stream-wrap use of 1059. Genuine NIP-59 gift-wrapped
+/// invites stay on 1059 and are not a git-node concern (they go to inbox
+/// relays).
+pub const KIND_STREAM_WRAP: u16 = 3359;
+/// Ephemeral analog of [`KIND_STREAM_WRAP`], replacing 21059. Never stored,
+/// never quota-charged; a server admission capability only (no client
+/// currently emits it).
+pub const KIND_EPHEMERAL_STREAM_WRAP: u16 = 23359;
 /// NIP-56 report (Phase-4b D3 intake: log + metric only).
 pub const KIND_REPORT: u16 = 1984;
+
+/// Is `kind` an admissible STORED stream-wrap envelope?
+///
+/// Single source of truth for stream-wrap kind membership: the admission
+/// arms, the sync filters/holds and the NIP-11 advert all route through
+/// this (or [`stream_wrap_kinds`]) so the accepted set can never drift
+/// between what we admit, what we ask peers for, and what we advertise.
+pub fn is_stream_wrap_kind(kind: u16, accept_legacy: bool) -> bool {
+    kind == KIND_STREAM_WRAP || (accept_legacy && kind == KIND_WRAP)
+}
+
+/// Is `kind` an admissible EPHEMERAL stream-wrap envelope?
+pub fn is_ephemeral_stream_wrap_kind(kind: u16, accept_legacy: bool) -> bool {
+    kind == KIND_EPHEMERAL_STREAM_WRAP || (accept_legacy && kind == KIND_EPHEMERAL_WRAP)
+}
+
+/// Is `kind` one of the LEGACY stream-wrap envelopes (stored or ephemeral)?
+///
+/// Kind membership only — [`is_stream_wrap_kind`] decides admission. This
+/// exists so a node with `accept_legacy_wrap_kind = false` can REFUSE these
+/// kinds outright instead of letting them fall through to the public
+/// related-event policy (see `PrivateService::rejects_retired_wrap_kind`).
+pub fn is_legacy_wrap_kind(kind: u16) -> bool {
+    kind == KIND_WRAP || kind == KIND_EPHEMERAL_WRAP
+}
+
+/// The admitted STORED stream-wrap kinds, newest first. Feeds the derived
+/// sync filter (one filter carrying every accepted kind, so held/in-flight
+/// legacy wraps still drain) and the NIP-11 `kinds` advert.
+pub fn stream_wrap_kinds(accept_legacy: bool) -> Vec<u16> {
+    let mut kinds = vec![KIND_STREAM_WRAP];
+    if accept_legacy {
+        kinds.push(KIND_WRAP);
+    }
+    kinds
+}
+
+/// The admitted EPHEMERAL stream-wrap kinds (NIP-11 advert only —
+/// ephemeral wraps are deliberately never synced).
+pub fn ephemeral_stream_wrap_kinds(accept_legacy: bool) -> Vec<u16> {
+    let mut kinds = vec![KIND_EPHEMERAL_STREAM_WRAP];
+    if accept_legacy {
+        kinds.push(KIND_EPHEMERAL_WRAP);
+    }
+    kinds
+}
 
 /// Hard cap on concurrent in-flight blob uploads. Together with the in-flight
 /// byte reservation this bounds transient `<blob_root>/tmp` disk usage, file
@@ -150,6 +213,11 @@ pub struct PrivateConfig {
     pub gc_interval_secs: u64,
     pub offboard_retention_secs: u64,
     pub accept_direct_invites: bool,
+    /// Dual-accept the LEGACY stream-wrap kinds (1059/21059) alongside the
+    /// dedicated 3359/23359. Default true: the server must accept 3359
+    /// BEFORE any client emits it, and legacy wraps already in flight (or
+    /// held for out-of-order reprocess) must keep draining.
+    pub accept_legacy_wrap_kind: bool,
     pub per_tenant_metrics: bool,
     // Phase 2 blob mirror knobs.
     pub mirror_enable: bool,
@@ -179,7 +247,7 @@ pub struct PrivateConfig {
     pub write_rate_refill_per_min: u32,
     /// Phase-4b A2: per-(tenant, alias) token bucket capacity for same-tenant
     /// kind-30640 REPLACEMENTS (0 = unlimited). Cross-node acceptance knob —
-    /// part of the `policy_fingerprint` preimage (v2): a same-tenant newer
+    /// part of the `policy_fingerprint` preimage (v3): a same-tenant newer
     /// 30640 accepted on one node may be cadence-rejected on another running
     /// different knobs, and the divergence heals only via refill + sync
     /// redelivery, so paired nodes must run identical values.
@@ -213,6 +281,7 @@ impl PrivateConfig {
             gc_interval_secs: config.private_gc_interval_secs,
             offboard_retention_secs: config.private_offboard_retention_secs,
             accept_direct_invites: config.private_accept_direct_invites,
+            accept_legacy_wrap_kind: config.private_accept_legacy_wrap_kind,
             per_tenant_metrics: config.private_per_tenant_metrics,
             mirror_enable: config.private_mirror_enable,
             mirror_peer_urls: config.private_mirror_peer_url_entries(),
@@ -243,6 +312,19 @@ impl PrivateConfig {
 /// set is `sorted({own domain} ∪ {bootstrap peer})` so a correctly-paired
 /// two-node setup (each bootstrapped to the other) hashes the same set on
 /// both sides.
+/// Label of the `policy_fingerprint` PREIMAGE FORMAT, bumped whenever a
+/// knob joins or leaves the preimage.
+///
+/// Advertised verbatim alongside the digest (NIP-11
+/// `private_repos.policy_version`) because the digest alone cannot
+/// distinguish the two very different reasons a pair's fingerprints
+/// differ: a version skew mid-rolling-upgrade (both nodes correctly
+/// configured, one not yet restarted — every node's digest moves on a label
+/// bump) versus a same-version knob split (a real, lasting divergence in
+/// what the two nodes accept). Operators who cannot tell those apart learn
+/// to ignore the one signal that reveals a genuine split view.
+pub const POLICY_VERSION: &str = "grasp-p-policy-v3";
+
 pub fn policy_fingerprint(config: &Config) -> String {
     use nostr::hashes::{sha256, Hash};
 
@@ -278,7 +360,16 @@ pub fn policy_fingerprint(config: &Config) -> String {
         // ABSENT: the denylist is node-local LEGAL config (per-jurisdiction
         // takedown lists legitimately differ across paired nodes) and its
         // enforcement (451s, purges) never changes event acceptance.
-        "grasp-p-policy-v2|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|domains={}",
+        //
+        // v2 -> v3 (wire-kind migration): `accept_legacy_wrap_kind` decides
+        // which stream-wrap KINDS this node admits, which is DIRECT
+        // acceptance behaviour — a paired node with legacy accept OFF would
+        // reject a 1059 stream wrap its peer accepted and stored, i.e.
+        // exactly the split-view divergence this fingerprint exists to
+        // detect. The label bumps with it so a v2/v3 mismatch is itself the
+        // signal an operator must see on a rolling upgrade.
+        "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|domains={}",
+        POLICY_VERSION,
         config.private_registration_mode,
         config.private_pow_bits,
         whitelist.join(","),
@@ -291,6 +382,7 @@ pub fn policy_fingerprint(config: &Config) -> String {
         config.private_max_write_keys_per_alias,
         config.private_registration_replace_capacity,
         config.private_registration_replace_refill_per_hour,
+        config.private_accept_legacy_wrap_kind,
         domains.join(","),
     );
     let digest = sha256::Hash::hash(preimage.as_bytes()).to_string();
@@ -647,15 +739,26 @@ impl PrivateService {
         result
     }
 
-    /// Kinds 1059 / 21059. Returns `None` for wraps from unregistered keys so
-    /// the caller can fall through to the existing related-event handling
-    /// (public path unchanged).
+    /// Stream wraps: kinds 3359 / 23359, plus the legacy 1059 / 21059 while
+    /// `accept_legacy_wrap_kind` is on. Both kind families are treated
+    /// IDENTICALLY here — same gating, same quota charging, same
+    /// hold/reprocess, same per-id wrap-charge idempotency; the only thing
+    /// the kind changes is the metric label.
+    ///
+    /// Returns `None` for wraps from unregistered keys. That is NOT a
+    /// fall-through to the public related-event path: per §3.2 the caller
+    /// REJECTS (see `builder.rs`, the wrap arms) — accepting referenced
+    /// wraps from unregistered keys made every deregistered rekey address
+    /// permanently floodable. The stored arm additionally holds the event
+    /// keyed by its outer author for out-of-order reprocess.
     pub async fn try_handle_wrap(
         &self,
         event: &Event,
         ephemeral: bool,
     ) -> Option<WritePolicyResult> {
-        let kind = if ephemeral { KIND_EPHEMERAL_WRAP } else { KIND_WRAP };
+        // Metrics keep the wire kind so the 1059 -> 3359 migration is
+        // observable per-kind on a live node.
+        let kind = event.kind.as_u16();
 
         let author_hex = event.pubkey.to_hex();
         let claim = match write_keys::find_claim(&self.meta, &author_hex) {
@@ -672,6 +775,11 @@ impl PrivateService {
 
         // From here on this subsystem owns the event.
         if let Some(rejection) = check_not_future_dated(event) {
+            // Metered like every other rejection arm: without this a
+            // future-dated wrap flood is invisible in
+            // ngit_private_events_rejected_total, which is exactly the
+            // series an operator watches for wrap abuse.
+            record_event_metric(kind, &rejection);
             return Some(rejection);
         }
         let event_json_len = event.as_json().len() as u64;
@@ -697,7 +805,8 @@ impl PrivateService {
             }
         }
 
-        // Quota: charge only stored wraps (1059), never ephemeral (21059).
+        // Quota: charge only stored wraps (3359/1059), never ephemeral
+        // (23359/21059).
         // §4b idempotency: admit_event runs BEFORE the library's save_event,
         // and duplicates/replays (client retries, P2 loopback:0 sync) still
         // reach this policy — charge only wraps the DB does not already hold,
@@ -1197,18 +1306,40 @@ impl PrivateService {
         out
     }
 
-    /// NIP-11 `private_repos` extension object.
-    pub fn nip11_extension(&self) -> serde_json::Value {
-        nip11_private_repos_value(
-            self.cfg.registration_mode,
-            self.cfg.pow_bits,
-            self.cfg.max_blob_bytes,
-            self.cfg.max_event_bytes,
-            self.cfg.quota_tenant_bytes,
-            self.cfg.quota_repo_bytes,
-            &self.cfg.domain,
-            &self.cfg.policy_fingerprint,
-        )
+    /// Does this node admit `kind` as a STORED stream wrap? The one gate
+    /// every caller (admission arm, sync skip-set, sync hold) asks.
+    pub fn accepts_stream_wrap_kind(&self, kind: u16) -> bool {
+        is_stream_wrap_kind(kind, self.cfg.accept_legacy_wrap_kind)
+    }
+
+    /// Does this node admit `kind` as an EPHEMERAL stream wrap?
+    pub fn accepts_ephemeral_stream_wrap_kind(&self, kind: u16) -> bool {
+        is_ephemeral_stream_wrap_kind(kind, self.cfg.accept_legacy_wrap_kind)
+    }
+
+    /// Does this node REFUSE `kind` outright as a RETIRED stream-wrap
+    /// envelope? True exactly for 1059/21059 once `accept_legacy_wrap_kind`
+    /// is off.
+    ///
+    /// Turning the knob off must NARROW what this node stores, and closing
+    /// the private arm alone does not do that: a 1059 that misses every
+    /// private arm lands on the PUBLIC related-event policy, which stores
+    /// any event carrying an `a`/`e` tag that references accepted content —
+    /// from ANY key, with no §3.2 registered-key gate, no
+    /// `private_max_event_bytes` cap, no private quota charge, and no
+    /// private GC. That is strictly MORE permissive than the default
+    /// (legacy on), where an unregistered 1059 is rejected outright
+    /// precisely because referenced wraps from unregistered keys made every
+    /// deregistered rekey address permanently floodable. A migration knob
+    /// that widens the accepted set when switched off is a footgun on an
+    /// operator-untrusted server, so the retired kinds are refused
+    /// explicitly.
+    ///
+    /// Scoped to nodes with private repos ENABLED (this method only exists
+    /// on a live `PrivateService`): where GRASP-P is off, 1059 keeps its
+    /// vanilla public related-event handling untouched.
+    pub fn rejects_retired_wrap_kind(&self, kind: u16) -> bool {
+        !self.cfg.accept_legacy_wrap_kind && is_legacy_wrap_kind(kind)
     }
 
     /// Spawn the background GC loop.
@@ -1439,9 +1570,15 @@ pub fn nip11_private_repos_value(
     quota_repo_bytes: u64,
     domain: &str,
     policy_fingerprint: &str,
+    accept_legacy_wrap_kind: bool,
 ) -> serde_json::Value {
+    // Kept in lockstep with the admission arms by construction: both read
+    // the accepted set from the same helpers.
+    let mut kinds = vec![KIND_REGISTRATION, KIND_STATE_ROOT];
+    kinds.extend(stream_wrap_kinds(accept_legacy_wrap_kind));
+    kinds.extend(ephemeral_stream_wrap_kinds(accept_legacy_wrap_kind));
     let mut object = serde_json::json!({
-        "kinds": [KIND_REGISTRATION, KIND_STATE_ROOT, KIND_WRAP, KIND_EPHEMERAL_WRAP],
+        "kinds": kinds,
         "registration_mode": mode.to_string(),
         "max_blob_bytes": max_blob_bytes,
         "max_event_bytes": max_event_bytes,
@@ -1452,6 +1589,11 @@ pub fn nip11_private_repos_value(
         // `doctor --two-node`) compare this across a node pair; a mismatch
         // means silent per-repo replication desync. Never the raw whitelist.
         "policy_fingerprint": policy_fingerprint,
+        // The preimage FORMAT label behind that digest. Published so a pair
+        // whose digests differ can be told apart at a glance: same version
+        // = a real knob split, different version = a rolling upgrade that
+        // has not finished. See POLICY_VERSION.
+        "policy_version": POLICY_VERSION,
     });
     if mode == RegistrationMode::Pow {
         object["pow_bits"] = serde_json::json!(pow_bits);
@@ -1459,7 +1601,12 @@ pub fn nip11_private_repos_value(
     object
 }
 
-/// NIP-11 helper for `http::nip11::RelayInformationDocument::from_config`.
+/// The ONE advert constructor, called from
+/// `http::nip11::RelayInformationDocument::from_config`. There is
+/// deliberately no `PrivateService`-bound twin: two constructors reading
+/// the same knob from two places (`self.cfg` vs `config`) is how "the
+/// advert tracks the accepted set exactly" breaks silently the next time
+/// the advert grows an argument.
 pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Value> {
     if !config.private_repos_enable {
         return None;
@@ -1473,6 +1620,7 @@ pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Va
         config.private_quota_repo_bytes,
         &config.domain,
         &policy_fingerprint(config),
+        config.private_accept_legacy_wrap_kind,
     ))
 }
 
@@ -1517,6 +1665,139 @@ mod tests {
             policy_fingerprint(&base),
             policy_fingerprint(&write_rate),
             "node-local write-rate knobs must NOT change the fingerprint"
+        );
+
+        // v3: stream-wrap kind acceptance is DIRECT acceptance behaviour —
+        // a peer with legacy accept OFF rejects a 1059 stream wrap this
+        // node accepted and stored (split view), so it must be visible in
+        // the fingerprint.
+        let mut legacy_off = Config::for_testing();
+        legacy_off.private_accept_legacy_wrap_kind = false;
+        assert_ne!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&legacy_off),
+            "wrap-kind acceptance must change the fingerprint"
+        );
+    }
+
+    /// The accepted-kind helpers are the single source of truth: dual
+    /// accept covers both families, legacy-off covers only 3359/23359, and
+    /// the stored/ephemeral sets never overlap.
+    #[test]
+    fn stream_wrap_kind_membership() {
+        for (kind, dual, strict) in [
+            (KIND_STREAM_WRAP, true, true),
+            (KIND_WRAP, true, false),
+            (KIND_EPHEMERAL_STREAM_WRAP, false, false),
+            (KIND_EPHEMERAL_WRAP, false, false),
+            (KIND_REGISTRATION, false, false),
+            (KIND_STATE_ROOT, false, false),
+        ] {
+            assert_eq!(is_stream_wrap_kind(kind, true), dual, "stored/dual {kind}");
+            assert_eq!(
+                is_stream_wrap_kind(kind, false),
+                strict,
+                "stored/legacy-off {kind}"
+            );
+        }
+        for (kind, dual, strict) in [
+            (KIND_EPHEMERAL_STREAM_WRAP, true, true),
+            (KIND_EPHEMERAL_WRAP, true, false),
+            (KIND_STREAM_WRAP, false, false),
+            (KIND_WRAP, false, false),
+        ] {
+            assert_eq!(
+                is_ephemeral_stream_wrap_kind(kind, true),
+                dual,
+                "ephemeral/dual {kind}"
+            );
+            assert_eq!(
+                is_ephemeral_stream_wrap_kind(kind, false),
+                strict,
+                "ephemeral/legacy-off {kind}"
+            );
+        }
+
+        // The retired-kind complement: exactly the legacy kinds, exactly
+        // when the window is closed. Closing the window must NARROW the
+        // accepted set — a legacy kind that merely stops matching the
+        // private arms would be picked up by the public related-event
+        // policy instead (wider than the default; see
+        // `PrivateService::rejects_retired_wrap_kind`).
+        for kind in [KIND_WRAP, KIND_EPHEMERAL_WRAP] {
+            assert!(is_legacy_wrap_kind(kind), "legacy membership {kind}");
+        }
+        for kind in [
+            KIND_STREAM_WRAP,
+            KIND_EPHEMERAL_STREAM_WRAP,
+            KIND_REGISTRATION,
+            KIND_STATE_ROOT,
+            KIND_REPORT,
+        ] {
+            assert!(
+                !is_legacy_wrap_kind(kind),
+                "only 1059/21059 may be retired: {kind}"
+            );
+        }
+        // No kind is ever both admitted and retired.
+        for kind in [
+            KIND_STREAM_WRAP,
+            KIND_WRAP,
+            KIND_EPHEMERAL_STREAM_WRAP,
+            KIND_EPHEMERAL_WRAP,
+        ] {
+            let admitted = is_stream_wrap_kind(kind, false) || is_ephemeral_stream_wrap_kind(kind, false);
+            assert!(
+                !(admitted && is_legacy_wrap_kind(kind)),
+                "legacy-off: {kind} cannot be both admitted and retired"
+            );
+        }
+
+        assert_eq!(stream_wrap_kinds(true), vec![KIND_STREAM_WRAP, KIND_WRAP]);
+        assert_eq!(stream_wrap_kinds(false), vec![KIND_STREAM_WRAP]);
+        assert_eq!(
+            ephemeral_stream_wrap_kinds(true),
+            vec![KIND_EPHEMERAL_STREAM_WRAP, KIND_EPHEMERAL_WRAP]
+        );
+        assert_eq!(
+            ephemeral_stream_wrap_kinds(false),
+            vec![KIND_EPHEMERAL_STREAM_WRAP]
+        );
+    }
+
+    /// The NIP-11 advert must mirror exactly what the admission arms
+    /// accept — a drifting advert is how a client learns to publish a kind
+    /// the node then rejects.
+    #[test]
+    fn nip11_kinds_track_the_accepted_set() {
+        let kinds_for = |accept_legacy: bool| -> Vec<u64> {
+            let value = nip11_private_repos_value(
+                RegistrationMode::Open,
+                20,
+                1,
+                1,
+                1,
+                1,
+                "example.com",
+                "deadbeefdeadbeef",
+                accept_legacy,
+            );
+            value["kinds"]
+                .as_array()
+                .expect("kinds array")
+                .iter()
+                .map(|k| k.as_u64().expect("kind number"))
+                .collect()
+        };
+        assert_eq!(
+            kinds_for(true),
+            vec![30640, 30641, 3359, 1059, 23359, 21059],
+            "dual accept must advertise both wrap families"
+        );
+        assert_eq!(
+            kinds_for(false),
+            vec![30640, 30641, 3359, 23359],
+            "legacy accept off must drop 1059/21059 from the advert"
         );
     }
 }
