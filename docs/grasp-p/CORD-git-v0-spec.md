@@ -1,121 +1,417 @@
-# CORD-git v0 — protocol convention for multi-tenant private git repos on public GRASP nodes
+# CORD-git v0.1 — protocol convention for multi-tenant private git repos on public GRASP nodes
 
-Status: **v0, written from the as-built** (Phases 0–4 of the GRASP-P/CORD-git plan). This is the
-protocol convention layer; `GRASP-P` is the server implementation (an ngit-grasp v1.2.0
-extension) and `cord-core`/`cord-git` is the reference client. Conformance markers: **[N]**
-normative, **[I]** informative, **[D]** deferred (named but not yet in v0).
+Status: **v0.1, written from the as-built** at server `master` **2e6e01a** (GRASP-P phases 0–4b)
+and client `main` **9562385** (cord-core/cord-git phase-4a + harness compat). This is the protocol
+convention layer; `GRASP-P` is the server implementation (an ngit-grasp v1.2.0 extension) and
+`cord-core`/`cord-git` is the reference client. Conformance markers: **[N]** normative, **[I]**
+informative, **[D]** deferred. "plan §3.2/§3.3" references the executing implementation plan, not
+sections of this document.
 
 ## 1. Model & trust
 
 CORD-git provides GitHub-style private repositories — per-repo contributor sets, read vs write
-roles, invite/revoke, (later) issues/PRs — where the **host is a public Nostr/GRASP relay whose
-operator is untrusted**. **[N]** The server stores only ciphertext and opaque public keys; it
+roles, invite/revoke/promote/demote, issues/PRs — where the **host is a public Nostr/GRASP relay
+whose operator is untrusted**. **[N]** The server stores only ciphertext and opaque public keys; it
 verifies outer signatures against a registered key set and moves bytes. Confidentiality never
-depends on server read-gating (the relay stays public-read; ciphertext harvest is a conceded,
-documented residual — store-now/decrypt-later). Membership, keys, invites, and revocation are
-tenant-side.
+depends on server read-gating (the relay stays public-read; ciphertext harvest is a conceded
+residual — store-now/decrypt-later). Membership, keys, invites, and revocation are tenant-side.
 
 **[N]** What "private" means: the server and world learn only
 `(hosting npub → random 32-hex alias → registered write/aux pubkeys → blob hashes/sizes/timing →
 epoch lineage across rotations)`. Never on the server in plaintext: repo names, refs, file
 contents, contributor identities.
 
+**[N]** Enumerability of that set is part of the concession, not merely its observability: `GET
+/list/<pubkey>` is unauthenticated (§2.4), so **any anonymous party can enumerate the full
+alias→blob-descriptor mapping of a hosting npub in a single request** — hashes, sizes, counts and
+therefore push cadence — rather than having to observe pushes as they happen. Blob *content* stays
+encrypted. An implementation that wants the weaker leak must gate or drop `/list`.
+
 ## 2. Server-visible wire kinds
 
 ### 2.1 kind 30640 — registration [N]
 Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by default).
 - `d` = **alias**: exactly 32 lowercase-hex chars, random (never the repo name).
-- `w` = `["w", <write-pubkey-hex>, <pop-sig-hex>]` ×N — registered write keys.
-- `aux` = `["aux", <pubkey-hex>, <pop-sig-hex>]` ×N — optional publish keys for read-only
-  members' events.
+- `w` = `["w", <write-pubkey-hex>, <pop-sig-hex>]` ×N, ≥1 required — registered write keys.
+- `aux` = `["aux", <pubkey-hex>, <pop-sig-hex>]` ×N — publish keys for read-only members' streams
+  and for rekey addresses. Aux keys can never publish 30641s or blobs.
 - **Proof-of-possession [N]**: every `w`/`aux` key that is not the event author carries, as the
   tag's third value, a 128-hex BIP-340 schnorr signature by that key over
-  `SHA256("grasp-p key-claim:" || <tenant-hex> || ":" || <alias>)`, where `<tenant-hex>` is the
-  hosting npub's x-only hex. Binds the claim to (tenant, alias); prevents key-namespace squatting.
-- `relays` and `server` tags: at least one of **each** must contain the serving node's domain.
-- First-registrant-wins on `w`/`aux` keys across tenants; alias owned by first tenant.
+  `SHA256("grasp-p key-claim:" || <tenant-hex> || ":" || <alias>)` (`<tenant-hex>` = the hosting
+  npub's x-only hex). Binds the claim to (tenant, alias); prevents key-namespace squatting. The
+  author key is exempt — the event signature is its proof.
+- `|w| + |aux| ≤ NGIT_PRIVATE_MAX_WRITE_KEYS_PER_ALIAS` (default 64); a key repeated across
+  `w ∪ aux` is rejected (it would corrupt claim-index diffing).
+- `relays` and `server` tags: ≥1 value of **each** must denote the serving node's domain by
+  **exact host match** (the pre-4b substring test admitted `wss://evil.com/x?example.com` and
+  `example.com.attacker.tld`).
+- **Deterministic cross-node conflict merge [N]** (plan §3.2): when an incoming 30640 claims an
+  alias held by a different tenant, or any `w`/`aux` key claimed by a different alias, the winner
+  is the one with the **lowest created_at**, ties to the **lowest event id** — compared against the
+  holder's **FIRST-edition anchor** (`first_created_at`/`first_event_id`), never the latest edition
+  and never node-local `registered_at`. Both operands are event-intrinsic, so partitioned nodes
+  converge on the same winner. Same-tenant replacement PRESERVES the anchor; authentic older
+  same-tenant evidence LOWERS it (late-witness self-heal). This comparator and same-tenant
+  replacement ordering (newest wins) are strict duals — pinned by test, never merged.
+- **Merge-winner exemptions [N]**: node-local state **that is not in the `policy_fingerprint`
+  preimage** must never gate a merge winner — a winner is exempt from the alias-count limit, the
+  quota *check* (never the charge), and the replacement-cadence bucket. Fresh non-conflict
+  registrations keep all three. Admission-mode gates (whitelist/pow) **do** apply to a conflict-merge
+  alias takeover (§5), because paired nodes are required to run identical, fingerprint-verified
+  admission config — so those gates cannot diverge the merge.
+- **Loser eviction [N]**: in the winner's meta txn the loser's record, key claims, alias slot,
+  blob-claim references, orphaned speculative charges, alias event-bytes column, and state-ring
+  editions are all freed; its relay-DB 30640 coordinate is pruned by the async caller. Both conflict
+  arms fire an operator alert, but only one is deduped: an **incoming** registration that loses
+  alerts at most once per loser event id (1 h TTL), so boot-reconcile and sync redelivery of an
+  already-resolved loser cannot re-alert forever; an **evicted stored** registration alerts
+  unconditionally on every eviction.
+- **Claim death [N]**: key claims are also freed by an author-valid NIP-09 kind-5 deletion of a
+  30640 (by `a` coordinate or `e` id) and by a NIP-62 vanish, both honoring a `created_at` cutoff —
+  an edition NEWER than the deletion keeps its claims, so a replayed stale deletion cannot wipe a
+  live edition; vanish freeing runs only when the request targets this relay. Without this, a
+  member could squat a future epoch's derivable rekey addresses, delete their own 30640, and wedge
+  every later rotation.
 
 ### 2.2 kind 30641 — state root [N]
-Addressable event signed by a **registered write key**.
-- `d` = alias; `a` = `30640:<tenant-hex>:<alias>` (must match the live registration).
-- `m` = `["m", <manifest-blob-sha256>, <bytes>]`; `pack` = `["pack", <sha256>, <bytes>]` ×N.
+Addressable event signed by a **registered write key** (aux keys refused).
+- `d` = alias; `a` = `30640:<tenant-hex>:<alias>`, must equal the live registration's coordinate
+  (first `d`/`a` tag wins, matching the addressable identifier).
+- `m` = `["m", <manifest-sha256>, <bytes>]`, exactly one; `pack` = `["pack", <sha256>, <bytes>]`
+  ×N. Total refs ≤ **256** per edition; each declared size ≤ the per-blob cap.
 - Plaintext hashes are what quota/mirror/GC consume; they reveal only pack count/sizes/timing.
-- Server retains the last N editions per (author, alias) in an edition ring (default 16).
+- Server retains the last N editions per **alias** in an edition ring (default 16), shared across
+  all of that alias's write keys — the ring key is `(alias, created_at, event id)` and the trim
+  scans by alias prefix; the author is not part of it. Relay-DB **addressable replacement** is
+  separately per `(author, alias)`, as NIP-01 requires. **[N]** Consequence for multi-writer
+  aliases (§2.1 permits `|w| + |aux| ≤ 64`): two active pushers share one 16-slot ring, so they
+  halve each other's retained history and can trim-supersede each other's blob claims — a trimmed
+  edition's referenced hashes lose this alias's claim, which releases the speculative charge *if
+  other aliases still reference it*, or starts the GC grace clock *if it was the last*.
+- **Speculative blob-claim charging [N]**: a referenced sha256 that is not yet stored and carries
+  no earlier speculative charge is charged NOW, at its DECLARED size, to the declaring
+  `(tenant, alias)` as a `stored=false` claim (`SpecCharge{tenant, alias, bytes}`); the quota
+  decision covers event bytes + all new speculative bytes in one check. Released **exactly once**,
+  against the recorded scope/bytes (never `claim.size`): (a) on upload — the upload txn releases
+  before it charges, so a same-scope declare-then-upload nets out; (b) when the CHARGING alias
+  stops referencing it while others remain (ring-trim supersede, registration death, Blossom
+  DELETE), the survivor re-charging on its next 30641 (a deliberate bounded unbilled window);
+  (c) on GC deletion after the claim loses its last alias and grace expires. `Option::take()`
+  makes double-release structurally impossible.
+- **In-transaction identity re-check [N]**: liveness is read outside the meta write txn, so the txn
+  re-verifies `(alias, tenant, latest event id)` before ANY mutation and rejects otherwise — a
+  footprint born after a death would have no cleanup trigger left.
 
-### 2.3 kind 1059 / 21059 — encrypted streams [N] / [D]
-1059 (stored) and 21059 (ephemeral) are admitted iff the outer signer ∈ any live registration's
-`w ∪ aux` set. Contents are never inspected. In v0 these carry **[D]** roster/collab rumors
-(Phase 4-full); the client MAY use them, the server only gates by outer key.
+### 2.3 kind 1059 / 21059 — encrypted streams [N]
+Admitted **only if** the outer signer is in the `w ∪ aux` set of a live registration, **and** it
+satisfies the size, skew, quota and rate gates below — membership is necessary, not sufficient.
+Contents are never inspected.
+- **[N]** An unregistered outer author is **rejected outright** — never routed to the public
+  related-event path. Accepting referenced wraps from unregistered keys made every deregistered
+  rekey address permanently floodable and charged to nobody, defeating the client's epoch-scoped
+  admission windows (plan §3.2). A rejected **1059** is held in the out-of-order index keyed by its
+  outer author, so a later 30640 registering that key reprocesses it; **21059** is never stored and
+  never held.
+- **[N]** 1059 bytes are quota-charged once per event id (idempotent inside the serialized meta
+  txn, so concurrent deliveries of one id cannot double-charge); 21059 is never charged — which is
+  why the per-write-key rate bucket is its only cost.
+- These carry the client's rekey (3303), guestbook (3314), and `#collab` (NIP-34/NIP-22) rumors.
+  The server gates only by outer key.
+
+**[D] Kind migration.** Stream wraps move to kind **3359** ("CORD stream wrap"), with ephemeral
+**23359** reserved. Kind 1059/21059 as described in this section is the **v0.1 wire reality**; after
+the migration, 1059 is retained only for genuine NIP-59 gift-wrapped invites (§4) — our stream wraps
+are tagless, author-addressed and carry a *signed* inner rumor, none of which is a NIP-59 gift wrap,
+so riding 1059 buys nothing and inherits NIP-59's relay AUTH-gating SHOULD (which would make
+p-tag-less wraps unservable). The NIP-11 `kinds` advert (§5) must change in lockstep with the
+constants.
 
 ### 2.4 Blossom-subset blobs [N]
 Content-addressed encrypted blobs over HTTP: `PUT /upload` (kind-24242 authorization),
-`GET /<sha256>` (public), `HEAD`, `DELETE`, `GET /list/<pubkey>`. Auth event (kind 24242):
-tags `t`∈{upload,delete}, `x`=<sha256>, `expiration`=<future>, `a`=`30640:<tenant>:<alias>`;
-signed by a `w`-set key (aux keys cannot write blobs). Header:
-`Authorization: Nostr <base64(event-json)>`. `blob sha256 = SHA256(exact PUT bytes)`.
+`GET /<sha256>` (**public/unauthenticated**), `HEAD`, `DELETE`, `GET /list/<pubkey>`
+(**public/unauthenticated** — the route takes no `Authorization` at all, see §1).
+Auth event (kind 24242): tags
+`t`∈{upload,delete}, `x`=<sha256>, `expiration`=<future>, `a`=`30640:<tenant>:<alias>`;
+`created_at` within ±24 h; id + signature verified by the route itself (no relay pipeline has seen
+it); signed by a `w`-set key. Header: `Authorization: Nostr <base64(event-json)>`.
+`blob sha256 = SHA256(exact PUT bytes)`. `/list` aggregates only that tenant's own aliases via the
+per-alias claim index (never a cross-tenant scan).
 
-Size limits **[N]**: event JSON ≤ 128 KiB; blob ≤ 256 MiB (configurable).
+Size limits **[N]**: event JSON ≤ 128 KiB; blob ≤ 256 MiB (both configurable). Concurrent uploads
+are capped (64) and reserved against the global byte budget BEFORE any body byte lands on disk.
 
 ## 3. Client cryptography [N]
 
 - **community_id** = `SHA256("cord-git/community/v1" || owner_xonly(32) || owner_salt(32))`
-  (self-certifying; d-convention for a future public flip is `cg-<community_id>`).
-- **Channel keys**: independent random 32-byte keys per plane — `#state` (manifests) and
-  `#collab` (issues/PRs, Phase 4).
+  (self-certifying). The `cg-<community_id>` d-convention is live as the `#collab` binding
+  coordinate `30617:<tenant>:cg-<community_id>`; **[D]** the public flip that would publish at it.
+- **Channel keys**: independent random 32-byte keys per plane — `#state` (manifests) and `#collab`
+  (issues/PRs/guestbook).
+- **HKDF shape [N]**: every derivation below is HKDF-SHA256 with **`L = 32`** and the stated
+  `salt`/`ikm`/`info`; where `info` is not stated it is the **empty string**, not the label. A
+  derivation whose output must be a secp256k1 scalar (the write and guestbook keypairs, and
+  `group_key` in §4.1) rerolls on the astronomically unlikely invalid-scalar case by **appending
+  one attempt byte (0x00, 0x01, …) to `info`** and re-expanding. Guessing `info = label` yields a
+  different key and fails silently.
 - **write_secret** → per-epoch write keypair:
-  `sk = HKDF-SHA256(salt="cord-git/write-auth/v1", ikm=write_secret, info=epoch_le32)`. Only
+  `sk = HKDF-SHA256(salt="cord-git/write-auth/v1", ikm=write_secret, info=epoch_le32, L=32)`. Only
   write-role members hold `write_secret`.
+- **Derived stream keys**: the `#collab` key derives the shared guestbook/stream keypair
+  (`salt="cord-git/guestbook-stream/v1"`, `ikm=#collab key`, `info=""`, `L=32`), registered in the
+  30640 `aux` set — it signs the outer 1059 of every guestbook Join and `#collab` message, so member
+  npubs never appear on the git node. Symmetric seal keys are separately domain-separated and share
+  that shape: `HKDF-SHA256(salt="cord-git/guestbook-seal/v1", ikm=#collab key, info="", L=32)` and
+  `HKDF-SHA256(salt="cord-git/collab-seal/v1", ikm=#collab key, info="", L=32)`.
 - **Blob encryption (keystone)**: every pack blob is ChaCha20-Poly1305 under a **fresh random
   32-byte key + fresh random 12-byte nonce**; wire = `nonce(12) || ct||tag`; `blob_id =
   SHA256(wire)`. No convergent encryption. The random key is recorded in the manifest.
 - **Manifest**: JSON `{v, community_id, epoch, refs{name→oid}, packs[{blob_id,key,nonce,size}],
-  manifest_prev, ts}`, encrypted under `HKDF(#state key, "cord-git/manifest/v1")` and stored as
-  the 30641 `m` blob. (v0 deviation from the plan's random-key-manifest-in-rumor: the
-  `#state`-derived key gives the same read-scope without a rumor fold; **[D]** the rumor path
-  returns for multi-writer roster/collab.)
-- **Integrity vs a malicious operator [N]**: on fetch, the client re-hashes every blob against
-  its addressed sha256 and AEAD-authenticates on decrypt; wrong bytes are detected, never
-  silently accepted.
-- **Authenticated state-root selection [N]**: a client must accept a 30641 only if it is (a)
-  signature-valid, (b) authored by a pubkey in the CURRENT live 30640's `w`-set (the 30640 itself
-  signature-verified against the tenant npub), and (c) not future-dated beyond clock skew
-  (≤15 min). This is what makes revocation effective: a removed member's planted or future-dated
-  state roots are never selected, and server-side admission also refuses future-dated private
-  events (≤15 min skew) so they cannot evict the real latest edition via addressable replacement.
+  manifest_prev, ts}`, encrypted under
+  `HKDF-SHA256(salt="cord-git/manifest/v1", ikm=#state key, info="", L=32)` and stored as the 30641
+  `m` blob.
+- **Fixed keys + random 96-bit nonces [N]**: fresh-key-per-message is the **blob** case only. The
+  manifest key, the guestbook and `#collab` seal keys, and the rekey envelope seal key (§4.1) are
+  **fixed for the lifetime of the channel key they derive from** — an entire epoch at minimum, and
+  spanning multiple epochs when a rotation rekeys only the `write` scope (a demote), since
+  `#state`/`#collab` are not rolled then. The rekey envelope seal key is strictly per-epoch. Each
+  message gets a fresh random **96-bit** nonce, prepended as
+  `nonce(12) || ct||tag`. Nonce-reuse safety is therefore a birthday bound in 2^96 — comfortable at
+  any realistic per-epoch message volume, but it is an assumption an implementation inherits, not a
+  property it can skip: nonces MUST come from a CSPRNG, and a 192-bit-nonce AEAD (XChaCha20-
+  Poly1305) would remove the analysis entirely. **[D]** the framing choice is not yet frozen.
+- **Integrity vs a malicious operator [N]**: on fetch, the client re-hashes every blob against its
+  addressed sha256 and AEAD-authenticates on decrypt; wrong bytes are detected, never silently
+  accepted.
+- **Authenticated state-root selection [N]**: accept a 30641 only if it is (a) signature-valid,
+  (b) authored by a pubkey in the CURRENT live 30640's `w`-set (that 30640 itself verified as
+  tenant-authored), and (c) not future-dated beyond `FUTURE_SLACK_SECS` = 900 s (matching the
+  server's `MAX_FUTURE_SKEW_SECS`); sort created_at desc, tie → lowest id. This is what makes
+  revocation effective: a removed member's planted or future-dated state roots are never selected,
+  and server-side admission also refuses future-dated private events so they cannot evict the real
+  latest edition via addressable replacement. The same 900 s bound guards the encrypted `#collab`
+  and guestbook inner rumors.
 - **Publish confirmation [N]**: relay OK=true is not a commit marker (addressable replacement may
-  silently discard a not-newest edition); a client must read back the authenticated latest after
-  publishing and confirm its own event id won before recording the new base.
+  silently discard a not-newest edition); read back the authenticated latest and confirm your own
+  event id won. Wrap read-backs are **id-pinned** — an author-scoped read at a stream address can
+  be buried by a flood of junk wraps.
 
 ## 4. Lifecycle
 
-- **create [N]**: generate hosting npub + salt + channel keys + write_secret + alias; publish
-  30640 (with PoP); first `push`.
-- **push [N]**: `git rev-list --objects --all | git pack-objects` → encrypt (random key) → PUT
-  → build+encrypt manifest → PUT → publish 30641. **Client-side CAS**: refuse if the remote
-  latest 30641 ≠ the local base (`manifest_prev`) unless `--force` (fork = fetch/merge first).
-- **clone [N]**: fetch latest 30641 → GET+verify+decrypt manifest (`#state` key) → GET+verify+
-  decrypt every pack (recorded keys) → `git unpack-objects` → set refs (validated: `refs/…`
-  prefix, hex oids — anti git-flag-injection) → checkout.
-- **revoke / rotate [N, partial]**: generate fresh `write_secret` + `#state` key, re-register
-  30640 with only the new write key (server frees the old key's claim), re-push under the new
-  secrets. A holder of old secrets can no longer push (write key deregistered) nor read new
-  content (rekeyed `#state`); their existing clone persists (forward-only, C7). **[D]** roster
-  removal, Concord refounding, and re-provisioning retained members via invite.
-- **invite / join [D]**: 3313 giftwrap (NIP-59) of the bundle (community_id, alias, node relays/
-  servers, channel keys, `write_secret` iff write role, role) to the invitee's own inbox relay —
-  never the git node.
-- **export / offboard [D]**: decrypted portable bundle; NIP-09 kind-5 tombstone; retention purge.
+- **create [N]**: generate hosting npub (or take a pre-admitted one from `CORD_GIT_HOSTING_NSEC`,
+  never argv) + salt + channel keys + write_secret + alias; publish 30640 (write key + derived
+  guestbook aux key, both with PoP); publish the genesis guestbook Join. `create` ends there — it
+  does **not** push; a fresh community has no 30641 until the first explicit `push`.
+- **push [N]**: `git pack-objects` → encrypt (fresh random key) → PUT → build+encrypt manifest →
+  PUT → publish 30641. **Client-side CAS**: refuse if the authenticated remote latest ≠ the local
+  base (`manifest_prev`) unless `--force`; then read back and confirm the new edition won.
+- **clone [N]**: fetch authenticated latest 30641 → GET+verify+decrypt manifest (`#state` key) →
+  GET+verify+decrypt every pack → `git unpack-objects` → set refs (validated: `refs/…` prefix,
+  conservative charset, no `..`, hex oids — anti git-flag-injection) → checkout. Refuses a
+  non-empty destination.
+- **invite / join [N]**: kind-3313 NIP-59 giftwrap of the bundle (community_id, alias, node
+  relays/servers, channel keys, `write_secret` iff write role, role) to the invitee's OWN inbox
+  relay — the client REFUSES to deliver to any configured git node. Join publishes a kind-3314
+  guestbook rumor, sealed under the guestbook seal key, wrapped by the derived guestbook key.
+  **[I]** `NGIT_PRIVATE_ACCEPT_DIRECT_INVITES` exists as a server knob but is not consulted by any
+  as-built admission path; the never-to-the-git-node rule is enforced client-side only.
+- **#collab issues/PRs [N]**: author-signed inner rumors (1621 issue, 1111 comment, 1617 patch,
+  1630/1631/1632/1633 status) carrying `a`/`channel`/`epoch` binding tags, sealed under the
+  `#collab` seal key and wrapped in a 1059 signed by the derived stream key with a past-tweaked
+  created_at (≤48 h). Any member (read or write) may post. **[I]** The Concord seal kind 20013 is
+  named in the client but no 20013 event is emitted — the seal is realized as the symmetric AEAD
+  layer inside the wrap content. History survives refoundings via the retained **prior `#collab`
+  key ring** (`epoch → {key, retired_at}`, capped, handed to retained members in the collab rekey
+  slot). A retired key is READ-ONLY history: a rumor under it is rejected when
+  `inner.created_at > retired_at + FUTURE_SLACK_SECS` — i.e. the admissible window is
+  `retired_at + 900 s`, not `retired_at` exactly, so an in-flight rumor at the moment of retirement
+  is not lost while a post-revocation injection by an old-key holder still is.
+- **rotate [N]**: single-relay revocation primitive — fresh `write_secret` + `#state` key,
+  re-register with only the new write key (server frees the old claim), re-push.
+- **revoke / demote [N]**: plan-§3.3 sequencing, epoch-atomic — see §4.1.
+- **promote [N]**: roster grant + `write_secret` whisper to the member's own inbox relay; no
+  rotation. The member trusts the delivered secret only after it derives a write key present in the
+  live 30640, verified against the tenant pubkey from the EXISTING keystore. The never-to-a-git-node
+  delivery rule is enforced here by its own guard, independently of the invite path's — promotion
+  carries `write_secret`, so it is the higher-value of the two leaks.
+- **export / offboard [D]**: decrypted portable bundle; kind-5 tombstone; retention purge.
+
+### 4.1 Rotation: pending-epoch lifecycle and §3.3 sequencing [N]
+
+- **Order (NORMATIVE)**: `30640′` widen (w = old ∪ new, aux = old ∪ new ∪ **this epoch's** rekey
+  addresses) → wait for confirmed acceptance on **every** configured relay → publish the 3303 rekey
+  wraps → `30640″` narrow (new-only sets), per relay → a **final sweep** re-narrowing any relay not
+  serving the narrow's key sets (per-relay created_at chains can tie cross-relay, and sync can
+  transiently serve a widen edition over the narrow) → adopt the refounded secrets into the
+  keystore → re-push the snapshot.
+- **[N] The sweep MUST precede the re-push, and this is not an optimisation target.** Until every
+  relay serves the narrow, a laggard may still serve a **widen** edition whose `w` set contains the
+  revoked member's OLD write key — under which their 30641 still satisfies the §3 authenticated
+  state-root rule and is selected as latest. Sweeping first closes that bypass window before any
+  new snapshot exists; deferring the sweep until after the push extends it by a full
+  pack→encrypt→upload→publish cycle, on exactly the relay least likely to have converged.
+- **No idle rekey-address admission [N]**: next-epoch rekey addresses are never precomputed or
+  pre-registered; an address is listed only between its widen and its narrow. Deregistration stops
+  only NEW admissions — already-stored wraps stay readable.
+- **Registrations are rebuildable TEMPLATES [N]**: the persisted widen/narrow are templates,
+  re-signed per relay per attempt with **`created_at = live.created_at + 1`**, where `live` is the
+  registration that relay is serving at that moment; where a relay serves **no** live registration
+  the fallback is **`created_at = now`**. Addressable
+  replacement resolves same-second ties by **lowest id**, so a registration built with
+  `Timestamp::now()` can lose FOREVER (reproduced: create→demote inside one second wedged a
+  rotation at publish). PoP signatures bind only (tenant, alias) and survive rebuilds; only the
+  secret-bearing rekey wraps must republish byte-identically.
+- **Pending-epoch file [N]**: the ENTIRE rotation — refounded secrets, roster/banlist snapshots,
+  built widen/rekeys/narrow — is persisted to `pending-epoch.json` (0600, tmp+rename) BEFORE
+  anything is published; a retry RESUMES from it and republishes the same rekey bytes (relays dedup
+  by id), so one epoch can never carry two genuine rekey sets. Secrets are adopted into the
+  keystore only after publication, so an aborted rotation leaves no half-applied state.
+- **Rival-resume guard [N]**: before publishing over a live registration matching none of this
+  rotation's own artifacts, its `created_at` is compared to the widen template's — anything newer
+  means a rival rotation landed elsewhere (two-device case), and the resume aborts loudly rather
+  than regressing to the stale epoch. The trigger is the **landed registration**, never a stray wrap.
+- **Fork prevention at mint [N]**: before building a NEW rotation the client checks the derived
+  addresses for genuine tenant-signed rekeys of that epoch and refuses to mint a rival set.
+- **Squat tolerance [N]**: any member can derive an epoch's rekey addresses and claim them under
+  their own alias, making the full widen fail with `write key already registered`. The client then
+  publishes a MINIMAL widen (all rekey addresses stripped — w/guestbook keys are random and can
+  never conflict) and re-adds individual addresses **on demand**, cumulatively, only when a rekey
+  publish is refused with a message containing `unregistered`. Any other rejection is fatal and
+  loud (a squatter saturating their own quota needs operator action, not a doomed retry).
+- **Tenant-signed `scopes` tag [N]**: every 3303 carries `scopes` = the epoch's FULL scope set
+  (`state,collab,write` for a revoke/refounding; `write` alone for a demote) in canonical order,
+  inside the tenant-signed inner rumor. "Canonical" is the **scope enum's declaration order —
+  `state`, `collab`, `write` — not lexicographic**; comma-joined, no spaces. No interop break
+  either way: the fold re-sorts by the same order before comparing two rekeys' sets, so a
+  lexicographic emitter still agrees — but the emitted bytes are `state,collab,write`. The fold
+  requires all genuine rekeys of an epoch to agree on it exactly and refuses to apply ANYTHING
+  until every listed scope is observed and verified — this is what distinguishes a write-only demote epoch (by design) from a partially
+  withheld refounding, and what makes the fold epoch-atomic.
+- **Fold rules [N]**: two genuine same-scope rekeys with different slots for this identity, or
+  disagreeing `scopes` sets, = forked epoch → loud fatal, never a silent side-pick. No write-scope
+  slot = demoted/never-had-push (keep reading); no state-scope slot = revoked. Rekeys are gathered
+  from ALL configured relays (a withholding relay must not hide a scope). After folding, the
+  post-fold keys are cross-checked against the live 30640 — a withheld rotation is a loud desync,
+  never "already up to date".
+- **Rekey wire [I]**: inner kind-3303 rumor **signed by the tenant** (authority is rejection — any
+  member can derive the outer address key, so only the tenant signature authenticates it), tags
+  `cgc`/`scope`/`epoch`/`scopes` (+ `prevcommit` for the write scope, over the PRIOR
+  `(write_secret, epoch)`); per-member slots = opaque hint + NIP-44 ciphertext from a fresh
+  ephemeral key. Outer 1059 signed by
+  `group_key("concord/rekey-pseudonym", prior_root, scope_id, epoch)`, content sealed under a
+  prior-root-derived key. The write scope uses a DEDICATED `scope_id` bound to the community id
+  (stable across refoundings), so "no slot" cannot be confused with removal.
+- **Rekey derivation family [N]** — wire-visible constants; an implementation that gets any label,
+  separator or integer encoding wrong computes different addresses and is invisible to every other
+  implementation. `‖` is byte concatenation, `epoch_le32` is the **u32 epoch, 4 bytes
+  little-endian**, `community_id_bytes` is the **raw 32 bytes** decoded from the 64-hex
+  `community_id`, and `member_xonly` is the member's **32-byte x-only** pubkey. Except where noted,
+  `epoch` is the **NEW** epoch being minted and `prior_root` is the **PRIOR** community root.
+
+  | Value | Derivation |
+  |---|---|
+  | `scope_id` | `SHA256(scope_label ‖ 0x00 ‖ community_id_bytes)` |
+  | scope labels | `cord-git/state-scope-id/v1`, `cord-git/collab-scope-id/v1`, `cord-git/write-scope-id/v1` |
+  | `group_key(label, root, scope_id, epoch)` | `sk = HKDF-SHA256(salt=label, ikm=root, info=scope_id ‖ epoch_le32, L=32)`, rerolled into the valid secp256k1 scalar range per §3 |
+  | rekey address | `group_key("concord/rekey-pseudonym", prior_root, scope_id, epoch)` — its x-only pubkey is the address: the `aux` entry, and the outer wrap's signer |
+  | `rekey_seal_key` | `HKDF-SHA256(salt="cord-git/rekey-seal/v1", ikm=prior_root, info=scope_id ‖ epoch_le32, L=32)` — symmetric; seals the outer content |
+  | `slot_hint` | `SHA256("cord-git/rekey-slot/v1" ‖ 0x00 ‖ prior_root ‖ scope_id ‖ epoch_le32 ‖ member_xonly)`, lowercase hex — **plain SHA-256, not HKDF** |
+  | `prevcommit` | `SHA256("cord-git/write-scope-prevcommit/v1" ‖ 0x00 ‖ write_secret ‖ epoch_le32)`, lowercase hex — over the **PRIOR** `(write_secret, epoch)` pair |
+
+  On the inner rumor the `scope` tag value is the **hex-encoded `scope_id`**, not the scope name;
+  `epoch` is the new epoch in decimal; `scopes` is per the bullet above. Anyone holding the prior
+  root can derive every address and seal key of the epoch — which is exactly why authority rests on
+  the inner tenant signature, and why an address is registered only between its widen and its
+  narrow.
 
 ## 5. Server extension (GRASP-P) [N]
 
-Additive to ngit-grasp v1.2.0, gated on `NGIT_PRIVATE_REPOS_ENABLE` (disabled = byte-identical to
-upstream). Registration policy (open/whitelist/pow; paid **[D]**), write-key index with PoP,
-per-tenant/per-repo/global quota ledger + in-flight reservation, Blossom-subset blob store
-(streamed PUT, sha-verified, GC), 30641 edition ring, aggregate metrics, NIP-11 `private_repos`
-advert + `policy_fingerprint`. Two-node replication: 30640 L1 sync filter → registration-driven
-30641 `#d` + 1059 `authors` derived filters; out-of-order reprocess; **pull-only blob mirror**
-over the peer's public GET (SSRF-guarded: private-IP block + no redirects + https-only by
-default). Denylist→451, kind-1984 intake, offboard kind-5: **[D]/stub**.
+Additive to ngit-grasp v1.2.0, gated on `NGIT_PRIVATE_REPOS_ENABLE` (disabled = **behaviourally**
+identical to upstream — the binary is not; all four kinds fall through to existing dispatch).
+Admission mode **defaults to `whitelist`** — the safe "accept nothing without an explicit tenant list" posture; `open` is
+staging/self-use only; `pow` (NIP-13, default 20 bits) is available; `paid` is **[D]** and rejected
+by config validation. Admission modes gate NEW aliases only (including conflict-merge takeovers and
+meta-index rebuilds); a boot reconcile of an already-admitted same-tenant edition skips them, and a
+rejected replay is non-destructive (no meta mutation, no pruning).
+
+Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
+Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
+aggregate metrics (per-tenant labels opt-in), NIP-11 `private_repos` advert (`kinds`,
+`registration_mode`, size caps, quotas, `blob_endpoints`, `policy_fingerprint`, plus `pow_bits`
+only in pow mode). The `kinds` array (today `30640, 30641, 1059, 21059`) is the discovery signal for
+"does this node speak the private extension", so **[D]** it must be updated in lockstep with the
+3359/23359 migration (§2.3), never after it.
+
+Two-node replication: 30640 L1 sync filter → registration-driven 30641 `#d` +
+1059 `authors` derived filters; out-of-order reprocess hold; hourly `since=None` full re-issue with
+a per-peer minimum interval; **pull-only blob mirror** over the peer's public GET with per-blob
+exponential backoff. **[N]** Outbound private-sync connections are *initiated* ONLY to the operator
+allowlist `NGIT_PRIVATE_SYNC_PEER_URLS` — tenant `relays` tags are advisory metadata and never
+trigger a connection (SSRF + membership-map-leak guard). **One exception, by design**: a configured
+`NGIT_SYNC_BOOTSTRAP_RELAY_URL` is connected unconditionally at startup and also carries the
+derived private filters, so it MUST be treated as a trusted private-sync peer — it learns the same
+registration-derived `#d`/`authors` filter set as an allowlisted peer, i.e. the tenant's alias and
+key map. Do not point it at a relay you would not put on the allowlist. Mirror SSRF guard:
+private-IP block, no redirect-following, https-only by default, sha+size-bounded.
+
+### 5.1 Abuse hardening (phase-4b) [N]
+
+- **Per-write-key token bucket** on CLIENT-submitted private writes (30641/1059/21059 + blob PUT):
+  default capacity 120, refill 60/min. Synced and reprocess traffic (loopback:0) bypasses it, so it
+  has no convergence impact — and is deliberately NOT in the policy fingerprint. Blob route answers
+  429 with `Retry-After`.
+- **30640 replacement-cadence limit**: per-`(tenant, alias)` bucket on same-tenant REPLACEMENTS,
+  default capacity 8, refill 4/hour; burst must stay ≥ 4 (a §3.3 rotation is widen→narrow = 2
+  replacements plus retries). **Hold semantics [N]**: a cadence-rejected replacement is both
+  rejected to the client AND held in the rejected index, then re-offered by the sync layer after
+  refill (hourly full re-issue as backstop) — convergence must not depend on the client retrying.
+  Applies to live admission from clients AND peers; boot-reconcile replays and merge winners are
+  exempt.
+- **`policy_fingerprint` v2**: `sha256(preimage)[..16]`, label `grasp-p-policy-v2`, over
+  `mode, pow_bits, whitelist, max_event_bytes, max_blob_bytes, quota_tenant, quota_repo,
+  global_budget, max_aliases, max_keys, replace_capacity, replace_refill_per_hour, domains`
+  (domains = sorted `{own domain} ∪ {bootstrap peer}`; the raw whitelist feeds the hash but is
+  never exposed). Everything not named in that preimage is excluded; among the excluded knobs are
+  client-write-rate, denylist, sync-re-issue and mirror-retry, per-tenant metrics, GC grace/interval,
+  offboard retention, the mirror knobs, and **`state_history_editions`** (the §2.2 ring depth) —
+  the rationale being that they are node-local and do not affect acceptance. **[N] That rationale
+  does not fully hold for `state_history_editions`**: ring depth decides which editions are trimmed,
+  trimming releases blob claims and their speculative charges, released charges change the quota
+  ledger, and quota decides acceptance. Two paired nodes on different ring depths can therefore
+  diverge on a `quota exceeded` verdict for the same 30641. Pair them on the same value, or add it
+  to a future preimage revision. Paired nodes must advertise the same fingerprint; a v1/v2 label
+  mismatch is itself the divergence signal.
+- **Denylist → 451**: node-local, multi-file, periodically reloaded (default 60 s), enforced on the
+  read path AND the upload preflight, with purge-on-add and a GC sweep that bypasses the grace
+  period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ.
+- **kind-1984 (NIP-56) intake**: observe-then-defer. Event id, reporter, and sha256-looking tag
+  values are logged (never the content) and metered; admission then runs the existing related-event
+  rules unchanged. No automatic action in v1.
+- **`ngit-private-watchdog` [I]**: a separate binary that anonymously probes TWO nodes and alerts
+  on split-view divergence (NIP-11 fingerprint, registrations, state roots, blob existence, `/list`
+  sets). Holds no keys, signs nothing, publishes nothing. Exit 0 = parity, 1 = divergence, 2 =
+  operational error; an unreachable node is never reported as divergence. Ops artifacts (runbook,
+  nginx zones, Prometheus alerts) live in `docs/grasp-p/ops/`.
+
+### 5.2 Rejection-string contract [N]
+
+| Condition | NIP-20 message | Class |
+|---|---|---|
+| 30641: no live registration for the alias | `unregistered alias` | genuine, **widenable** |
+| 1059/21059: outer key unclaimed, or alias not live | `unregistered key` | genuine, **widenable** |
+| 30641: registration identity changed inside the txn | `alias registration changed; retry` | **transient** |
+| 1059: registration identity changed inside the txn | `registration changed; retry` | **transient** |
+| 30640: same-tenant replacement over cadence | `replacement rate-limited; retry later` | **transient** (held + re-offered) |
+| client write bucket exhausted | `rate-limited; retry later` | **transient** |
+| 30640: lost an alias conflict | `alias already registered` | genuine |
+| 30640: lost a key conflict | `write key already registered` | genuine (drives the squat-tolerant widen) |
+| whitelist / pow / alias limit / quota | `tenant is not on the registration whitelist` / `registration requires N bits of NIP-13 proof of work` / `tenant has reached the alias limit` / `quota exceeded` | genuine |
+| any private kind, created_at > now + 900 s | `event created_at is too far in the future` | genuine |
+
+**[N]** The cord-git client treats any message containing the substring `unregistered` as its
+widenable case. The two transient identity-race strings are therefore deliberately worded to avoid
+that substring: an honest same-tenant rotation trips them, and a plain retry under the new record
+succeeds. **[I]** cord-git `push()` currently treats `unregistered alias` on a 30641 as fatal
+rather than re-registering and retrying once (client issue !34); widen is the wrong primitive there.
 
 ## 6. Threat model summary
 
@@ -123,20 +419,46 @@ default). Denylist→451, kind-1984 intake, offboard kind-5: **[D]/stub**.
 |---|---|
 | Operator / disk / coercion | Ciphertext-only; server verifies signatures against opaque keys |
 | Scraper / negentropy harvest | Same encryption; ciphertext harvest CONCEDED (not PQ) |
-| Non-member npub | No keys ⇒ cannot read; blob PUT gated by registered write key + PoP |
-| Malicious reader-member | Blobs content-addressed immutable; 30641 needs a write key; **[D]** roster authorship check |
+| Non-member npub | No keys ⇒ cannot read; blob PUT and 30641 gated by registered write key + PoP. **Not** gated: reads — `GET /<sha256>` and `GET /list/<pubkey>` are unauthenticated, so a non-member can enumerate and download every (encrypted) blob of any hosting npub (§1, §2.4) |
+| Malicious reader-member | Blobs content-addressed immutable; 30641 needs a `w` key; rekeys authenticated by the tenant signature, not by the derivable outer key |
 | Removed member | Forward-only: keeps old clone; post-rotation cannot push, learn new keys, or read new content |
-| Malicious tenant (abuse) | Quotas, global budget, admission modes, per-IP nginx, denylist **[D]** |
-| Mirror SSRF | Private-IP block, no redirect-follow, https-only default, sha+size-bounded |
+| Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat loses to the live+1 widen and is evicted); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
+| Cross-node split-brain | First-edition-anchored deterministic merge; node-local state never gates a winner; `policy_fingerprint` parity; watchdog |
+| Malicious tenant (abuse) | Quotas, speculative-claim charging, global budget, admission modes, per-write-key + cadence buckets, per-IP nginx zones, denylist/451, 1984 intake |
+| Mirror SSRF | Private-IP block, no redirect-follow, https-only default, sha+size-bounded, peer allowlist |
 
 ## 7. Conformance & residuals
 
 - **[D] Concord byte-conformance**: the membership/crypto layer is CORD-git-native behind a
   `KeyBackend` seam; a Concord backend (pinned commit 23dcea57) is future engineering, not a
   promise (R1). Marmot remains a risk-register fallback.
-- **Residuals**: ciphertext store-now/decrypt-later; removed-member re-fetch of old ciphertext;
-  epoch lineage visible to the operator (the price of quotas); mirror DNS-rebinding (mitigated
-  by an explicit peer-URL override); sizes/timing side channels (padding defaults **[D]**).
-- **[D] remaining**: #collab issues/PRs (NIP-34/22 rumors in `#state`/`#collab`), invite/join,
-  export/offboard, abuse hardening (denylist/451, 1984, per-IP zones, ops runbook), paid mode,
-  flip-public, Tier-H migration, 30643 snapshots, WASM viewer.
+- **Residuals [I]**: ciphertext store-now/decrypt-later; removed-member re-fetch of old ciphertext;
+  epoch lineage visible to the operator (the price of quotas); mirror DNS-rebinding (mitigated by
+  an explicit peer-URL override); sizes/timing side channels (padding defaults **[D]**); an
+  attacker backdating BELOW the true first edition wins the §3.2 merge (inherent to the created_at
+  anchor); if edition 1 is purged from every sync source, a late-joining node anchors on its
+  first-witnessed edition until the victim re-mints an earlier registration; ≥3-party conflict
+  chains converge only with sync redelivery (the earliest registrant always keeps its seat); spec
+  charges carried by a dead scope leave a bounded unbilled window until the survivor's next 30641;
+  `t:`/`g:` event-byte stranding on registration death; a live squatter saturating their own quota
+  blocks a rekey at their claimed address until operator action; byte quotas do not bound
+  claim/file COUNTS (server issue !25).
+- **[D] remaining**: the **1059→3359 / 21059→23359 stream-wrap migration** (§2.3, with the NIP-11
+  `kinds` advert in lockstep), paid mode, flip-public, export/offboard tombstone worker, 30643
+  snapshots, WASM viewer, Tier-H migration, Concord byte-conformance, padding defaults, AEAD nonce
+  width (§3), gated-GET / `/list` authorization, Cashu.
+
+## 8. Amendments since v0
+
+- §2.1 — §3.2 deterministic merge + FIRST-edition anchor + winner exemptions + loser eviction (v0: bare "first-registrant-wins").
+- §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
+- §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
+- §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.
+- §2.3 — unregistered 1059/21059 rejected outright (never the public path); 1059 held, 21059 not; **[D]** on collab rumors dropped.
+- §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
+- §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.
+- §4.1 (new) — pending-epoch lifecycle; templates at `created_at = live+1`; no idle rekey-address admission; rival-resume guard; mint-time fork prevention; squat-tolerant widen; tenant-signed `scopes` + epoch-atomic fold.
+- §5 — whitelist is the SHIPPED DEFAULT (v0 implied open); paid config-rejected; sync peers only from the operator allowlist.
+- §5.1 (new) — per-write-key bucket; cadence limit with hold semantics; fingerprint v2 + exclusions; denylist/1984 re-marked **[N]**; watchdog.
+- §5.2 (new) — exact transient-vs-genuine rejection strings and the `unregistered` substring contract.
+- §6/§7 — squatter + split-brain adversary rows; residuals expanded with the accepted anchor/merge/spec-charge findings; **[D]** narrowed.
