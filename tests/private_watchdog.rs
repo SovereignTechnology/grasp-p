@@ -430,6 +430,19 @@ async fn watchdog_e2e_happy_then_partitioned() {
         "{}",
         happy.stdout
     );
+    assert!(
+        happy.stdout.contains("PASS kinds-parity"),
+        "the advertised accepted-kind set is its own check line:\n{}",
+        happy.stdout
+    );
+    // The policy VERSION label prints next to the digest, so a version skew
+    // is distinguishable from a same-version knob split at a glance.
+    assert!(
+        happy.stdout.contains("policy-a=grasp-p-policy-v")
+            && happy.stdout.contains("policy-b=grasp-p-policy-v"),
+        "fingerprint-parity must report the policy_version of both nodes:\n{}",
+        happy.stdout
+    );
     assert!(!happy.stdout.contains("FAIL"), "{}", happy.stdout);
     assert!(happy.stderr.is_empty(), "{}", happy.stderr);
 
@@ -944,6 +957,97 @@ async fn watchdog_path_tie_bases_resolve_to_empty_path() {
     assert!(out.stdout.contains("PASS blob-existence"), "{}", out.stdout);
     assert!(!out.stdout.contains("ERROR"), "{}", out.stdout);
     assert!(out.stderr.is_empty(), "{}", out.stderr);
+
+    a.stop().await;
+    b.stop().await;
+}
+
+/// A mixed-version pair mid wire-kind migration (A dual-accepts the legacy
+/// stream-wrap kinds, B has retired them) must be reported as a KIND split
+/// on its own named check line.
+///
+/// Before this check, a wrap-kind split was only inferable from the opaque
+/// `policy_fingerprint` digest — which also moves for a dozen unrelated
+/// knobs, and moves on EVERY node when the preimage label bumps. An
+/// operator watching only `fingerprint-parity` cannot tell "rolling upgrade
+/// in progress" from "these two nodes permanently disagree about which
+/// wraps they store". Both distinctions are pinned here.
+#[tokio::test]
+async fn watchdog_reports_wrap_kind_split() {
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_a = format!("ws://127.0.0.1:{}", res_a.port());
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+    let tenant = Keys::generate();
+    let whitelist = tenant.public_key().to_bech32().expect("npub");
+
+    // The ONLY divergence is the legacy wrap-kind acceptance.
+    let a = TestRelay::start_private_pair_node(
+        res_a,
+        Some(url_b),
+        true,
+        None,
+        None,
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
+    )
+    .await;
+    let b = TestRelay::start_private_pair_node(
+        res_b,
+        Some(url_a),
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND", "false"),
+        ],
+    )
+    .await;
+
+    let out = run_watchdog(&[
+        "--relay-a".to_string(),
+        a.url().to_string(),
+        "--relay-b".to_string(),
+        b.url().to_string(),
+        "--timeout-secs".to_string(),
+        "10".to_string(),
+    ])
+    .await;
+
+    assert_eq!(
+        out.code, 1,
+        "a kind split is divergence, not an operational error:\n{}\n{}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("FAIL kinds-parity"),
+        "the split must be reported as a KIND split, not inferred from the \
+         fingerprint digest:\n{}",
+        out.stdout
+    );
+    // Named explicitly: exactly the legacy wrap kinds, only on A.
+    assert!(
+        out.stdout.contains("only-a=1059,21059") && out.stdout.contains("only-b=-"),
+        "the check must name which kinds diverge and on which side:\n{}",
+        out.stdout
+    );
+    // Same policy version on both -> a real knob split, NOT a version skew.
+    assert!(
+        out.stdout.contains("FAIL fingerprint-parity"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("SAME-VERSION knob split"),
+        "with both nodes on the same policy_version the operator must be told \
+         this is a real divergence, not a rolling upgrade in flight:\n{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("VERSION SKEW"),
+        "no label bump is in play here:\n{}",
+        out.stdout
+    );
 
     a.stop().await;
     b.stop().await;

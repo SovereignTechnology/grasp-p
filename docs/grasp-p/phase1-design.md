@@ -114,7 +114,6 @@ impl PrivateService {
     pub fn is_denylisted(&self, sha256: &str) -> bool;
     pub async fn blob_delete(&self, auth: &BlossomAuth, sha256: &str) -> Result<(), BlobError>;
     pub async fn blob_list(&self, tenant: &PublicKey) -> Vec<BlobDescriptor>;
-    pub fn nip11_extension(&self) -> serde_json::Value;
     pub fn spawn_gc(self: &Arc<Self>) -> JoinHandle<()>;
 }
 ```

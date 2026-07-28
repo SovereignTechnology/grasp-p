@@ -97,15 +97,23 @@ Any mode change moves the `policy_fingerprint` — coordinate both nodes (§2).
 ## 2. `policy_fingerprint` parity
 
 **What it is.** The first 16 hex chars of the SHA-256 over the
-`grasp-p-policy-v2` preimage (src/private/mod.rs:246–298):
+`grasp-p-policy-v3` preimage (src/private/mod.rs:246–298):
 
 ```
-grasp-p-policy-v2|mode=…|pow_bits=…|whitelist=…|max_event_bytes=…|max_blob_bytes=…|quota_tenant=…|quota_repo=…|global_budget=…|max_aliases=…|max_keys=…|replace_capacity=…|replace_refill_per_hour=…|domains=…
+grasp-p-policy-v3|mode=…|pow_bits=…|whitelist=…|max_event_bytes=…|max_blob_bytes=…|quota_tenant=…|quota_repo=…|global_budget=…|max_aliases=…|max_keys=…|replace_capacity=…|replace_refill_per_hour=…|accept_legacy_wrap_kind=…|domains=…
 ```
 
 `domains` is `sorted({own domain} ∪ {bootstrap peer})`, so a correctly
 paired two-node setup (each bootstrapped to the other) hashes the same set
 on both sides. The raw whitelist feeds the hash but is never exposed.
+
+`accept_legacy_wrap_kind` (`NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND`, default
+`true`) is in the preimage because it decides which stream-wrap KINDS the
+node admits: a peer with it off rejects a legacy kind-1059 stream wrap this
+node accepted and stored — a split view of the same repo. The label bumped
+`v2` → `v3` when the knob was introduced, so **every node's fingerprint
+changes on that upgrade**; that is expected, and a `v2`/`v3` mismatch during
+a rolling upgrade is exactly the signal to finish the roll.
 
 Deliberately ABSENT from the preimage (node-local knobs — src/private/mod.rs:270–281):
 
@@ -117,7 +125,9 @@ Deliberately ABSENT from the preimage (node-local knobs — src/private/mod.rs:2
 
 **Where to see it.**
 
-- NIP-11: `private_repos.policy_fingerprint` (src/private/mod.rs:1443)
+- NIP-11: `private_repos.policy_fingerprint`, with the preimage label
+  alongside it in `private_repos.policy_version` and the accepted set in
+  `private_repos.kinds`
 - boot log: the `GRASP-P private repositories enabled` line carries
   `mode` and `policy_fingerprint` fields (src/private/mod.rs:413–419)
 
@@ -133,14 +143,56 @@ mode explicitly on both beforehand.
 ```bash
 for d in git.sovit.xyz git.buildinelsalvador.com; do
   printf '%s  ' "$d"
-  curl -sH 'Accept: application/nostr+json' "https://$d/" | jq -r '.private_repos.policy_fingerprint'
+  curl -sH 'Accept: application/nostr+json' "https://$d/" \
+    | jq -r '.private_repos | "\(.policy_fingerprint)  \(.policy_version)  \(.kinds|join(","))"'
 done
 ```
 
-The two values must be identical (the watchdog's check 1,
-`fingerprint-parity`, does the same comparison — §7). A mismatch means
-registrations can be accepted on one node and silently rejected on the
-other: per-repo desync. Fix the config divergence, restart, re-verify.
+The two lines must be identical (the watchdog's check 1,
+`fingerprint-parity`, and check 1b, `kinds-parity`, do the same comparison —
+§7). A mismatch means registrations can be accepted on one node and silently
+rejected on the other: per-repo desync. Fix the config divergence, restart,
+re-verify.
+
+Read the digest WITH the version label:
+
+- **different `policy_version`** (e.g. `…-v2` vs `…-v3`) — a rolling upgrade
+  that has not finished. A label bump moves EVERY node's digest, so the pair
+  necessarily mismatches for the whole window. Finish the roll.
+- **same `policy_version`, different digest** — a real knob split: the two
+  nodes disagree about what they accept. Diff the preimage knobs above.
+
+The watchdog prints both labels on the `fingerprint-parity` line
+(`policy-a=` / `policy-b=`) and says which case it is — including the third
+one: a node that advertises NO label (`policy-a=unadvertised`) predates the
+`policy_version` field entirely, which is the same rolling-upgrade window
+seen from one side, so the watchdog calls it a version skew until both nodes
+are upgraded (src/bin/ngit-private-watchdog.rs:492–524).
+
+### Wire-kind migration (`NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND`)
+
+Stream wraps moved from kind 1059/21059 to 3359/23359. Rules:
+
+- **Flip the knob on BOTH nodes in ONE maintenance window.** While the pair
+  is split, wraps of a kind only one node admits are rejected on the other
+  and never replicate. Sync is pull-only, so a wrap authored during the
+  split never reaches the strict node — not late, *never*. There is no
+  backfill for it.
+- **Treat a `v2` → `v3` (or any label) upgrade the same way**: both sides in
+  one window, because every node's fingerprint moves on the bump.
+- **Stream-wrap divergence is NOT covered by the watchdog's data-parity
+  checks.** `fingerprint-parity`, `registration-parity`, `manifest-parity`,
+  `blob-existence` and `list-parity` compare registrations, 30641 editions
+  and blobs — never wrap sets. `kinds-parity` tells you the nodes *disagree
+  about which wrap kinds they admit*; nothing tells you which wraps actually
+  diverged. Wrap-set reconciliation is not implemented.
+- **Clients MUST emit exactly one wrap kind per logical wrap.** Server
+  dual-accept exists so a client can SWITCH kinds, never so it can emit both.
+  The quota charge is keyed on `event.id` and the kind is in the id preimage,
+  so the same plaintext published as 1059 and 3359 is two ids: charged twice,
+  stored twice — and wrap event bytes have no credit path (they are released
+  only when the registration dies), so a dual-emitting client permanently
+  doubles its `event_bytes` consumption.
 
 ---
 
@@ -439,6 +491,15 @@ blackbox/textfile patterns in prometheus-alerts.yaml:184–225.
   response — connectivity, never divergence.
 - Stale: the timer/cron died — restart it (watchdog.md §systemd).
 
+**Coverage limit — stream wraps.** The data-parity checks
+(`registration-parity`, `manifest-parity`, `blob-existence`, `list-parity`)
+compare kind-30640 registrations, kind-30641 editions and blobs. **No check
+compares stream-wrap sets**, so a wrap-set divergence is invisible as a data
+class. `kinds-parity` reports only that the two nodes disagree about which
+wrap KINDS they admit (§2) — a mismatch there means wraps have almost
+certainly diverged and there is no backfill for them; a match there does not
+prove the wrap sets agree.
+
 ---
 
 ## 4. Takedown workflow (NORMATIVE)
@@ -510,41 +571,57 @@ Procedure — verify-then-denylist:
 ## 5. Client-visible rejection strings (contract — do not change)
 
 cord-git pattern-matches on these strings (verified:
-cord-core/src/repo.rs:797 matches substring `unregistered` → widen;
-repo.rs:1059 matches `write key already registered` → squat-tolerant minimal
+cord-core/src/repo.rs:811 matches substring `unregistered` → widen;
+repo.rs:1073 matches `write key already registered` → squat-tolerant minimal
 widen; anything else is fatal with the server message). **Changing any of
 these strings breaks the client.** WS rejections are NIP-20 OK false
 rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 
 | wire message | path | class | client behavior |
 | --- | --- | --- | --- |
-| `restricted: unregistered key` | 1059/21059 outer author not in w∪s of a live registration (src/nostr/builder.rs:842, 865) | genuine | widens (adds the key to the 30640) and retries |
+| `restricted: unregistered key` | 3359/23359 (and 1059/21059 while dual-accept is on) outer author not in w∪s of a live registration (src/nostr/builder.rs:865, 886) | genuine | widens (adds the key to the 30640) and retries |
+| `restricted: legacy stream-wrap kind is not accepted on this node` | kind 1059/21059 submitted while `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false` on a node with private repos enabled (src/nostr/builder.rs:889–910) | genuine | migrate the client to 3359/23359 — retrying and widening are both useless; deliberately does NOT contain `unregistered` |
 | `restricted: unregistered alias` | 30641 for a dead/unknown alias (src/private/state_root.rs:143; renamed from `alias is not registered` in FS-7 — the cord-git widen trigger is the `unregistered` substring) | genuine | widens/re-registers and retries (recoverable; the old spelling was fatal client-side) |
-| `restricted: registration changed; retry` | 1059 charge-txn identity race (src/private/mod.rs:736–747) | transient | retry succeeds; deliberately does NOT contain `unregistered` |
-| `restricted: alias registration changed; retry` | 30641 txn identity race (src/private/state_root.rs:233–239) | transient | retry succeeds |
-| `restricted: rate-limited; retry later` | 30641/1059/21059 write bucket empty (src/nostr/builder.rs:792, 825, 858) | transient | back off, retry |
-| `restricted: replacement rate-limited; retry later` | same-tenant 30640 replacement cadence (src/private/registration.rs:572–579) | transient | retry later; the server ALSO holds the newest rejected edition and retries it after bucket refill (below), so the client may never need to |
-| `restricted: quota exceeded` | registration/wrap over quota (src/private/registration.rs:545, src/private/mod.rs:732) | genuine | free space or ask operator for quota |
-| `restricted: tenant is not on the registration whitelist` | whitelist mode (src/private/registration.rs:462–466) | genuine | ask operator to admit the npub |
-| `restricted: registration requires N bits of NIP-13 proof of work` | pow mode (src/private/registration.rs:468–474) | genuine | re-mine the 30640 |
-| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss (src/private/registration.rs:407, 441) | genuine | pick another alias / minimal widen without the squatted keys |
+| `restricted: registration changed; retry` | stream-wrap charge-txn identity race (src/private/mod.rs:856–867) | transient | retry succeeds; deliberately does NOT contain `unregistered` |
+| `restricted: alias registration changed; retry` | 30641 txn identity race (src/private/state_root.rs:238–244) | transient | retry succeeds |
+| `restricted: rate-limited; retry later` | 30641/wrap/ephemeral-wrap write bucket empty (src/nostr/builder.rs:815, 848, 879) | transient | back off, retry |
+| `restricted: replacement rate-limited; retry later` | same-tenant 30640 replacement cadence (src/private/registration.rs:591–598) | transient | retry later; the server ALSO holds the newest rejected edition and retries it after bucket refill (below), so the client may never need to |
+| `restricted: quota exceeded` | registration/wrap over quota (src/private/registration.rs:552, src/private/mod.rs:852) | genuine | free space or ask operator for quota |
+| `restricted: tenant is not on the registration whitelist` | whitelist mode (src/private/registration.rs:469–473) | genuine | ask operator to admit the npub |
+| `restricted: registration requires N bits of NIP-13 proof of work` | pow mode (src/private/registration.rs:476–481) | genuine | re-mine the 30640 |
+| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss (src/private/registration.rs:414, 448) | genuine | pick another alias / minimal widen without the squatted keys |
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
-| HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/private/mod.rs:112, 126) | takedown | none — operator action only |
-| HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/private/mod.rs:113, 127) | genuine | DELETE blobs or ask for quota |
+| HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/private/mod.rs:175, 189) | takedown | none — operator action only |
+| HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/private/mod.rs:176, 190) | genuine | DELETE blobs or ask for quota |
 
 A cadence-rejected replacement (`replacement rate-limited; retry later`)
 may be accepted LATER without the client republishing anything: the relay
 holds the newest rejected edition per `(tenant, alias)` and re-offers it
 after the cadence bucket refills (FS-2/R2-1, src/sync/private_index.rs,
-src/sync/mod.rs:2389–2443) — reject-then-silent-accept is NIP-20-normal
+src/sync/mod.rs:2388–2442) — reject-then-silent-accept is NIP-20-normal
 for this path, not a bug. The hourly full re-issue is only the backstop
 healer (hold expiry/overflow), not the convergence mechanism.
+
+The retirement rejection (`legacy stream-wrap kind is not accepted on this
+node`) is the opposite shape: GENUINE and permanent for as long as the knob
+is off. It fires on every kind-1059/21059 submission once
+`NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false` on a node with private repos
+enabled (src/nostr/builder.rs:889–910); nodes with private repos disabled
+never reach that arm and keep vanilla 1059 handling. Neither a retry nor a
+30640 widen changes the verdict — the ONLY resolution is a client that emits
+3359/23359 (§2 "Wire-kind migration"), so operator-side this string means
+"finish the client migration", never "server fault". It deliberately does
+NOT contain the substring `unregistered`: cord-git treats ANY message
+containing `unregistered` as its widenable case
+(cord-core/src/repo.rs:811), and widening a key cannot help against a
+retired KIND — the client would republish its 30640 and retry the same dead
+kind forever.
 
 Also stable: `restricted: event exceeds private repo size limit`,
 `restricted: tenant has reached the alias limit`,
 `invalid: event created_at is too far in the future`,
 HTTP 413 `blob exceeds the maximum blob size`, and the 400/401/403/404/411
-blossom shapes (src/private/mod.rs:80–132).
+blossom shapes (src/private/mod.rs:141–195).
 
 ---
 
@@ -571,7 +648,7 @@ sections):
   traffic bypasses it (node-local DoS knob, deliberately NOT in the
   fingerprint). The **replace bucket** gates client AND synced live
   admission — it is consensus-relevant: paired nodes MUST run identical
-  values (fingerprint v2, §2).
+  values (fingerprint v3, §2).
 - **Churn caveat (write bucket is per-KEY, not per-IP).** An attacker who
   cycles fresh keys gets a fresh bucket per key, so the write bucket does
   NOT bound a key-cycling flood — the effective per-IP bounds are the

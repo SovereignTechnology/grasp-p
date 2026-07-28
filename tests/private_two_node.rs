@@ -5,11 +5,12 @@
 //! (deterministic pairing — private repos have no announcement to discover
 //! peers from).
 //!
-//! 1. Replication E2E: 30640 + 2 blobs + 30641 + 1059 pushed to A are all
+//! 1. Replication E2E: 30640 + 2 blobs + 30641 + one stream wrap PER
+//!    accepted wire kind (legacy 1059 and CORD 3359) pushed to A are all
 //!    served by B (REQ + blob GET, byte-compared) within the bound.
-//! 2. Out-of-order: 30641 + 1059 published to B BEFORE the 30640 exists
-//!    anywhere; after the 30640 lands on A and syncs, B serves both
-//!    (private rejected-index reprocess hook).
+//! 2. Out-of-order: 30641 + both wrap kinds published to B BEFORE the 30640
+//!    exists anywhere; after the 30640 lands on A and syncs, B serves them
+//!    all (private rejected-index reprocess hook).
 //! 3. Kill-one-node backfill: stop B, push a fresh edition + blob to A,
 //!    restart B on the same LMDB paths; B backfills + mirrors.
 //! 4. Disabled no-op: with private repos disabled on both nodes, a normal
@@ -17,6 +18,9 @@
 //! 5. Mirror bounds: a 30641 referencing a blob absent on the peer is still
 //!    accepted + replicated, but the blob GET is 404 on B, the mirror
 //!    failure counter increments, and mirror lag stays > 0.
+//! 6. Mixed-version pair: A dual-accepting legacy wraps paired with a B that
+//!    has closed the window — 3359 crosses the split, 1059 does not, and the
+//!    policy fingerprints diverge.
 //!
 //! ```bash
 //! cargo test --test private_two_node -- --nocapture --test-threads=1
@@ -201,16 +205,57 @@ fn state_root_event(
         .expect("sign 30641")
 }
 
-/// Opaque wrap-shaped event (1059) signed by `signer`.
-fn wrap_event(signer: &Keys) -> Event {
+/// The stored stream-wrap wire kinds a node admits under the shipped
+/// `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=true` default: the dedicated CORD
+/// kind 3359 and, for the duration of the migration window, the legacy 1059.
+///
+/// Dual-accept means BOTH must replicate, so the pair scenarios below run
+/// once per kind rather than hardcoding one: the cross-node path matches on
+/// the wrap kind in several places (derived sync filters, the admission
+/// arms, the rejection hold keying) and a kind missing from any one of them
+/// is invisible to a single-node test.
+///
+/// Scope note: exit2 pins the CLIENT-submission hold
+/// (`nostr/builder.rs`, the wrap arm's `None` branch). Its twin in the sync
+/// ingest path (`sync/mod.rs`, the `accepts_stream_wrap_kind` arm of the
+/// rejection hold) is UNCOVERED and stays so: B only asks a peer for wraps
+/// by an author it has already accepted a 30640 for, so a synced wrap
+/// preceding its own registration is a race, not something the harness can
+/// order — deleting that arm leaves this suite green. What IS pinned is the
+/// contract it depends on: `PrivateRejectedIndex` holds both wire kinds
+/// under one author bucket and releases them together
+/// (`sync::private_index::tests::test_wrap_hold_is_kind_agnostic_per_author`).
+/// The dispatch arm itself is verified by inspection only.
+const STREAM_WRAP_KINDS: [u16; 2] = [1059, 3359];
+
+/// Opaque wrap-shaped event of the given wire `kind`, signed by `signer`.
+fn wrap_event(signer: &Keys, kind: u16) -> Event {
     let recipient = Keys::generate();
     EventBuilder::new(
-        Kind::Custom(1059),
+        Kind::Custom(kind),
         "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
     )
     .tags(vec![Tag::public_key(recipient.public_key())])
     .finalize(signer)
     .expect("sign wrap")
+}
+
+/// One wrap per accepted wire kind, all signed by the same write key.
+fn wrap_events(signer: &Keys) -> Vec<(u16, Event)> {
+    STREAM_WRAP_KINDS
+        .iter()
+        .map(|&kind| (kind, wrap_event(signer, kind)))
+        .collect()
+}
+
+/// Poll until `relay_url` serves the EXACT event `id`.
+///
+/// Deliberately id-scoped: a kind+author filter is satisfied by ANY event
+/// from that key, so once two wrap kinds are in flight from one write key a
+/// kind-less or id-less wait would pass vacuously (the same failure mode as
+/// the exit7 stale-edition wait).
+async fn wait_for_exact_event(relay_url: &str, id: EventId, bound: Duration) -> bool {
+    wait_for_event_on_relay(relay_url, Filter::new().id(id), bound).await
 }
 
 /// Signed kind-24242 Blossom auth event.
@@ -387,6 +432,27 @@ async fn start_pair_with_b_paths(
     extra_env: &[(&str, &str)],
     b_paths: Option<(PathBuf, PathBuf)>,
 ) -> (TestRelay, TestRelay) {
+    start_pair_inner(extra_env, extra_env, b_paths).await
+}
+
+/// Like [`start_pair`] but with a DIFFERENT env on each node — the
+/// mixed-version pair a rolling upgrade actually produces.
+///
+/// Callers must NOT assert policy-fingerprint parity here: any knob in the
+/// v3 preimage that differs between the two envs makes the fingerprints
+/// diverge by design (that divergence is the operator-visible signal).
+async fn start_pair_with_split_env(
+    a_env: &[(&str, &str)],
+    b_env: &[(&str, &str)],
+) -> (TestRelay, TestRelay) {
+    start_pair_inner(a_env, b_env, None).await
+}
+
+async fn start_pair_inner(
+    a_env: &[(&str, &str)],
+    b_env: &[(&str, &str)],
+    b_paths: Option<(PathBuf, PathBuf)>,
+) -> (TestRelay, TestRelay) {
     let res_a = reserve_port();
     let res_b = reserve_port();
     let url_a = format!("ws://127.0.0.1:{}", res_a.port());
@@ -395,11 +461,9 @@ async fn start_pair_with_b_paths(
         Some((git, relay)) => (Some(git), Some(relay)),
         None => (None, None),
     };
-    let a = TestRelay::start_private_pair_node(res_a, Some(url_b), true, None, None, extra_env)
-        .await;
+    let a = TestRelay::start_private_pair_node(res_a, Some(url_b), true, None, None, a_env).await;
     let b =
-        TestRelay::start_private_pair_node(res_b, Some(url_a), true, b_git, b_relay, extra_env)
-            .await;
+        TestRelay::start_private_pair_node(res_b, Some(url_a), true, b_git, b_relay, b_env).await;
     (a, b)
 }
 
@@ -489,9 +553,16 @@ async fn exit1_replication_e2e() {
     let replication_started = Instant::now();
     let (accepted, message) = publish_with_result(a.url(), &edition).await;
     assert!(accepted, "exit1: 30641 must be accepted on A; got {message:?}");
-    let wrap = wrap_event(&writer);
-    let (accepted, message) = publish_with_result(a.url(), &wrap).await;
-    assert!(accepted, "exit1: 1059 must be accepted on A; got {message:?}");
+    // One wrap per accepted wire kind — dual-accept is only real if BOTH
+    // cross the pair.
+    let wraps = wrap_events(&writer);
+    for (kind, wrap) in &wraps {
+        let (accepted, message) = publish_with_result(a.url(), wrap).await;
+        assert!(
+            accepted,
+            "exit1: wrap kind {kind} must be accepted on A; got {message:?}"
+        );
+    }
 
     // B serves the 30640 via REQ.
     assert!(
@@ -526,18 +597,28 @@ async fn exit1_replication_e2e() {
     assert_eq!(served[0].id, edition.id, "exit1: served 30641 id matches");
     assert_eq!(served[0].tags, edition.tags, "exit1: served tags intact");
 
-    // B serves the 1059 via REQ by (outer) author.
-    assert!(
-        wait_for_event_on_relay(
+    // B serves EVERY accepted wrap kind via REQ. Waited on by exact id: both
+    // wraps share the outer author, so a kind+author wait would let one kind
+    // satisfy the other's assertion.
+    for (kind, wrap) in &wraps {
+        assert!(
+            wait_for_exact_event(b.url(), wrap.id, REPLICATION_BOUND).await,
+            "exit1: wrap kind {kind} ({}) must replicate to B within {REPLICATION_BOUND:?}",
+            wrap.id
+        );
+        let served = fetch_from(
             b.url(),
             Filter::new()
-                .kind(Kind::Custom(1059))
+                .kind(Kind::Custom(*kind))
                 .author(writer.public_key()),
-            REPLICATION_BOUND,
         )
-        .await,
-        "exit1: 1059 must replicate to B within {REPLICATION_BOUND:?}"
-    );
+        .await;
+        assert!(
+            served.iter().any(|e| e.id == wrap.id),
+            "exit1: B must serve wrap {} under its own kind {kind}",
+            wrap.id
+        );
+    }
 
     // B serves BOTH blobs over its public GET route, sha-verified; the pack
     // is byte-compared against the original.
@@ -608,16 +689,21 @@ async fn exit2_out_of_order_reprocess() {
         !accepted,
         "exit2: 30641 published before its 30640 must be rejected initially"
     );
-    let wrap = wrap_event(&writer);
-    let (accepted, _) = publish_with_result(b.url(), &wrap).await;
-    assert!(
-        !accepted,
-        "exit2: 1059 published before its 30640 must be rejected initially"
-    );
+    // Both wrap kinds, from the SAME write key: the sync hold keys stream
+    // wraps by outer author and is deliberately kind-agnostic, so a 1059 and
+    // a 3359 land in one bucket and must be released together.
+    let wraps = wrap_events(&writer);
+    for (kind, wrap) in &wraps {
+        let (accepted, _) = publish_with_result(b.url(), wrap).await;
+        assert!(
+            !accepted,
+            "exit2: wrap kind {kind} published before its 30640 must be rejected initially"
+        );
+    }
 
     // ...then the 30640 goes to A and syncs over. B's reprocess hook must
-    // resurrect the held 30641 + 1059. (Whole sequence stays well under the
-    // 120s rejected-hold TTL.)
+    // resurrect the held 30641 + every held wrap kind. (Whole sequence stays
+    // well under the 120s rejected-hold TTL.)
     register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
 
     assert!(
@@ -641,17 +727,14 @@ async fn exit2_out_of_order_reprocess() {
         .await,
         "exit2: B must eventually accept + serve the held 30641 (reprocess hook)"
     );
-    assert!(
-        wait_for_event_on_relay(
-            b.url(),
-            Filter::new()
-                .kind(Kind::Custom(1059))
-                .author(writer.public_key()),
-            REPLICATION_BOUND,
-        )
-        .await,
-        "exit2: B must eventually accept + serve the held 1059 (reprocess hook)"
-    );
+    for (kind, wrap) in &wraps {
+        assert!(
+            wait_for_exact_event(b.url(), wrap.id, REPLICATION_BOUND).await,
+            "exit2: B must eventually accept + serve the held wrap kind {kind} ({}) \
+             (reprocess hook)",
+            wrap.id
+        );
+    }
 
     // The exact held events are served (not some other edition).
     let served = fetch_from(
@@ -2068,4 +2151,154 @@ async fn exit12_open_registrations_survive_whitelist_flip() {
     );
 
     node.stop().await;
+}
+
+// ============================================================================
+// Exit test 13 — mixed-version pair across the 1059 -> 3359 migration window
+// ============================================================================
+
+/// The deployment risk the wire-kind migration actually creates: a rolling
+/// upgrade transiently pairs a node still dual-accepting legacy wraps (A,
+/// the shipped default) with one that has already closed the window (B,
+/// `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false`).
+///
+/// Pinned contract for that window:
+///
+/// * the NEW kind crosses the split — this is what makes it safe to start
+///   emitting 3359 before every node has flipped;
+/// * the LEGACY kind does not — B never asks for 1059 in its derived filter
+///   (asking for a kind it would reject is a refetch loop), and one arriving
+///   by any other route is refused outright by the retired-kind arm (NOT
+///   handed to the public related-event path, which would store an
+///   `a`/`e`-tagged wrap from any key — see exit38). So a 1059 authored
+///   during the window lives only on the nodes that still accept it;
+/// * the policy fingerprints DIVERGE, which is precisely why v3 put
+///   `accept_legacy_wrap_kind` in the preimage — the operator sees the split
+///   view over NIP-11 instead of inferring it from missing events.
+///
+/// The absence assertion is ordered strictly behind a positive control: it
+/// runs only after the 3359 from the SAME write key has landed on B, so
+/// "did not replicate" can never be an unrun sync in disguise.
+#[tokio::test]
+async fn exit13_mixed_legacy_accept_pair() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    // Identical whitelist on both nodes; the ONLY divergence is the legacy
+    // wrap-kind acceptance, so the fingerprint difference below isolates it.
+    let (a, b) = start_pair_with_split_env(
+        &[("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str())],
+        &[
+            ("NGIT_PRIVATE_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND", "false"),
+        ],
+    )
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    // The split view is advertised, not silent.
+    let doc_a = nip11_doc(&a).await;
+    let doc_b = nip11_doc(&b).await;
+    let fp_a = doc_a["private_repos"]["policy_fingerprint"]
+        .as_str()
+        .expect("A must advertise private_repos.policy_fingerprint");
+    let fp_b = doc_b["private_repos"]["policy_fingerprint"]
+        .as_str()
+        .expect("B must advertise private_repos.policy_fingerprint");
+    assert_ne!(
+        fp_a, fp_b,
+        "exit13: differing legacy-wrap acceptance must change the policy \
+         fingerprint — that mismatch IS the operator's split-view signal"
+    );
+
+    let kinds_of = |doc: &serde_json::Value| -> Vec<u64> {
+        doc["private_repos"]["kinds"]
+            .as_array()
+            .expect("private_repos.kinds array")
+            .iter()
+            .filter_map(|k| k.as_u64())
+            .collect()
+    };
+    let kinds_a = kinds_of(&doc_a);
+    let kinds_b = kinds_of(&doc_b);
+    assert!(
+        kinds_a.contains(&1059) && kinds_a.contains(&3359),
+        "exit13: A must advertise both wrap kinds; got {kinds_a:?}"
+    );
+    assert!(
+        kinds_b.contains(&3359) && !kinds_b.contains(&1059),
+        "exit13: B must advertise 3359 only; got {kinds_b:?}"
+    );
+
+    // Register on A (listing both domains) and publish one wrap per kind.
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let reg = register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let legacy = wrap_event(&writer, 1059);
+    let (accepted, message) = publish_with_result(a.url(), &legacy).await;
+    assert!(
+        accepted,
+        "exit13: A still dual-accepts, so the 1059 must land there; got {message:?}"
+    );
+    let modern = wrap_event(&writer, 3359);
+    let (accepted, message) = publish_with_result(a.url(), &modern).await;
+    assert!(
+        accepted,
+        "exit13: the 3359 must be accepted on A; got {message:?}"
+    );
+
+    // B must first take the registration — until it does, its derived wrap
+    // filter has no authors and NOTHING would replicate, legacy or not.
+    assert!(
+        wait_for_exact_event(b.url(), reg.id, REPLICATION_BOUND).await,
+        "exit13: the 30640 {} must replicate A->B despite the fingerprint split",
+        reg.id
+    );
+
+    // Positive control: the new kind crosses the split.
+    assert!(
+        wait_for_exact_event(b.url(), modern.id, REPLICATION_BOUND).await,
+        "exit13: the 3359 {} must replicate to a peer with legacy accept off",
+        modern.id
+    );
+
+    // Only NOW is absence meaningful. Settle past one more sync tick so a
+    // late-arriving 1059 would still be caught.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let by_id = fetch_from(b.url(), Filter::new().id(legacy.id)).await;
+    assert!(
+        by_id.is_empty(),
+        "exit13: the legacy 1059 {} must NOT replicate to a node that has \
+         closed the migration window; B served {} event(s)",
+        legacy.id,
+        by_id.len()
+    );
+    let by_kind = fetch_from(
+        b.url(),
+        Filter::new()
+            .kind(Kind::Custom(1059))
+            .author(writer.public_key()),
+    )
+    .await;
+    assert!(
+        by_kind.is_empty(),
+        "exit13: B must hold no 1059 from the registered write key at all; got {} event(s)",
+        by_kind.len()
+    );
+
+    // A is unaffected by its peer's stricter policy: it still serves both.
+    let served_a = fetch_from(
+        a.url(),
+        Filter::new()
+            .kinds([Kind::Custom(1059), Kind::Custom(3359)])
+            .author(writer.public_key()),
+    )
+    .await;
+    assert!(
+        served_a.iter().any(|e| e.id == legacy.id) && served_a.iter().any(|e| e.id == modern.id),
+        "exit13: A must keep serving both wraps regardless of B's policy"
+    );
+
+    b.stop().await;
+    a.stop().await;
 }

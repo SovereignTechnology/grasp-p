@@ -483,6 +483,100 @@ fn fingerprint_parity(a: Option<&str>, b: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Fingerprint-mismatch detail with the version-skew vs knob-split
+/// distinction spelled out, so the operator is told which case they are
+/// looking at instead of inferring it from an opaque digest pair. A peer
+/// that advertises no `policy_version` at all is called out as its own
+/// (skew) case: it predates the field, which is exactly the rolling-upgrade
+/// window onto the first labelled build.
+fn fingerprint_detail(reason: String, a: &Option<String>, b: &Option<String>) -> String {
+    match (a, b) {
+        (Some(x), Some(y)) if x != y => format!(
+            "{reason}; policy_version differs ({x} vs {y}): this is a rolling-upgrade \
+             VERSION SKEW — every node's digest moves on a label bump. Finish the roll \
+             on both nodes in one maintenance window"
+        ),
+        (Some(x), Some(_)) => format!(
+            "{reason}; both nodes report policy_version={x}: this is a SAME-VERSION knob \
+             split — a real acceptance divergence. Compare the preimage knobs (runbook §2)"
+        ),
+        // Exactly one side advertises a label. That node is NOT on some
+        // other version — the peer PREDATES the policy_version field, which
+        // is precisely the shape of the first rolling upgrade onto a
+        // labelled build. Without this arm the operator sees neither verdict
+        // and a bare `policy-a=unadvertised` scope, i.e. no case at all for
+        // the most likely real-world mismatch.
+        (None, Some(y)) => format!(
+            "{reason}; node B reports policy_version={y} and node A advertises none: node A \
+             predates the policy_version field — treat this as a VERSION SKEW until both \
+             nodes are upgraded, then re-read this line"
+        ),
+        (Some(x), None) => format!(
+            "{reason}; node A reports policy_version={x} and node B advertises none: node B \
+             predates the policy_version field — treat this as a VERSION SKEW until both \
+             nodes are upgraded, then re-read this line"
+        ),
+        // Neither node labels its policy: both predate the field, so there
+        // is nothing to distinguish a skew from a knob split with. The bare
+        // reason (both digests) is all the evidence there is.
+        (None, None) => reason,
+    }
+}
+
+/// Verdict for the advertised accepted-kind set.
+#[derive(Debug, PartialEq, Eq)]
+enum KindsParity {
+    /// Identical sets (and non-empty).
+    Match,
+    /// Neither node advertises `private_repos.kinds` — nothing to compare
+    /// (private repos disabled, or a pre-advert build). The
+    /// fingerprint-parity check already reports that condition; repeating
+    /// it as a FAIL here would be noise.
+    Unavailable,
+    Mismatch {
+        only_a: Vec<u64>,
+        only_b: Vec<u64>,
+    },
+}
+
+/// Set parity of `private_repos.kinds` across the pair.
+///
+/// This exists as its OWN check because the `policy_fingerprint` digest
+/// folds a dozen knobs into 16 opaque hex chars: a wrap-kind split (one
+/// node still admits 1059, the other has retired it) is indistinguishable
+/// there from a quota or whitelist difference. A wrap-kind split means
+/// wraps accepted on one node are refused on the other and never
+/// replicate — a permanent, per-data-class divergence — so it is named
+/// explicitly.
+///
+/// NOTE (scope): this compares what the nodes SAY they accept. Stream
+/// wraps themselves are not compared by any watchdog data-parity check;
+/// see the runbook.
+fn kinds_parity(a: &BTreeSet<u64>, b: &BTreeSet<u64>) -> KindsParity {
+    if a.is_empty() && b.is_empty() {
+        return KindsParity::Unavailable;
+    }
+    if a == b {
+        return KindsParity::Match;
+    }
+    KindsParity::Mismatch {
+        only_a: a.difference(b).copied().collect(),
+        only_b: b.difference(a).copied().collect(),
+    }
+}
+
+/// Render a kind set for a check line: `1059,3359,23359,30640,30641`.
+fn kinds_display(kinds: &BTreeSet<u64>) -> String {
+    if kinds.is_empty() {
+        return "none".to_string();
+    }
+    kinds
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Symmetric difference of two /list sha256 sets: (only-in-a, only-in-b).
 fn list_diff<'a>(a: &'a BTreeSet<String>, b: &'a BTreeSet<String>) -> (Vec<&'a str>, Vec<&'a str>) {
     (
@@ -759,6 +853,8 @@ struct NodeConn {
 struct NodeSnapshot {
     fingerprint: Option<String>,
     registration_mode: Option<String>,
+    policy_version: Option<String>,
+    kinds: BTreeSet<u64>,
     registrations: Vec<RegistrationView>,
     state_roots: Vec<StateRootView>,
     malformed_registrations: usize,
@@ -895,7 +991,21 @@ async fn connect(side: &'static str, url: &str, timeout: Duration) -> Result<Nod
     })
 }
 
-async fn fetch_nip11(node: &NodeConn) -> Result<(Option<String>, Option<String>), OpError> {
+/// The `private_repos` advert fields the watchdog compares.
+#[derive(Debug, Default, Clone)]
+struct Nip11View {
+    fingerprint: Option<String>,
+    registration_mode: Option<String>,
+    /// Preimage-format label behind the digest (`grasp-p-policy-vN`).
+    /// Absent on nodes older than the field.
+    policy_version: Option<String>,
+    /// The advertised accepted-kind set. Compared as its own check: a
+    /// wrap-kind split must be reported as a kind split, not inferred from
+    /// an opaque digest that also moves for a dozen unrelated knobs.
+    kinds: BTreeSet<u64>,
+}
+
+async fn fetch_nip11(node: &NodeConn) -> Result<Nip11View, OpError> {
     let response = node
         .http
         .get(&node.nip11_url)
@@ -930,7 +1040,21 @@ async fn fetch_nip11(node: &NodeConn) -> Result<(Option<String>, Option<String>)
         .and_then(|p| p.get("registration_mode"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    Ok((fingerprint, mode))
+    let policy_version = private
+        .and_then(|p| p.get("policy_version"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let kinds = private
+        .and_then(|p| p.get("kinds"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|k| k.as_u64()).collect())
+        .unwrap_or_default();
+    Ok(Nip11View {
+        fingerprint,
+        registration_mode: mode,
+        policy_version,
+        kinds,
+    })
 }
 
 async fn fetch_events(
@@ -983,7 +1107,7 @@ async fn snapshot_node(
     w_keys: &BTreeMap<String, BTreeSet<PublicKey>>,
     timeout: Duration,
 ) -> Result<NodeSnapshot, OpError> {
-    let (fingerprint, registration_mode) = fetch_nip11(node).await?;
+    let nip11 = fetch_nip11(node).await?;
 
     // kind-30640: unfiltered (discovery) or one filter per explicit alias.
     let reg_filters = match aliases {
@@ -1029,8 +1153,10 @@ async fn snapshot_node(
     }
 
     Ok(NodeSnapshot {
-        fingerprint,
-        registration_mode,
+        fingerprint: nip11.fingerprint,
+        registration_mode: nip11.registration_mode,
+        policy_version: nip11.policy_version,
+        kinds: nip11.kinds,
         registrations,
         state_roots,
         malformed_registrations,
@@ -1280,6 +1406,17 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
     let mut lines: Vec<CheckLine> = Vec::new();
 
     // -- Check 1: fingerprint-parity ---------------------------------------
+    //
+    // The policy VERSION label is reported next to the digest: on a label
+    // bump (e.g. v2 -> v3) every node's digest moves, so a rolling upgrade
+    // fails this check for the whole window. Without the labels an operator
+    // cannot tell that expected, self-healing skew from a same-version knob
+    // split, and learns to ignore the check that would reveal a real one.
+    let policy_version_of = |snap: &NodeSnapshot| -> String {
+        snap.policy_version
+            .clone()
+            .unwrap_or_else(|| "unadvertised".into())
+    };
     match fingerprint_parity(snap_a.fingerprint.as_deref(), snap_b.fingerprint.as_deref()) {
         Ok(()) => lines.push(
             CheckLine::new("fingerprint-parity", Status::Pass)
@@ -1287,6 +1424,8 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
                     "fingerprint",
                     snap_a.fingerprint.clone().unwrap_or_default(),
                 )
+                .scope("policy-a", policy_version_of(&snap_a))
+                .scope("policy-b", policy_version_of(&snap_b))
                 .scope(
                     "mode-a",
                     snap_a
@@ -1312,6 +1451,8 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
                     "fingerprint-b",
                     snap_b.fingerprint.clone().unwrap_or_else(|| "none".into()),
                 )
+                .scope("policy-a", policy_version_of(&snap_a))
+                .scope("policy-b", policy_version_of(&snap_b))
                 .scope(
                     "mode-a",
                     snap_a
@@ -1326,8 +1467,49 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
                         .clone()
                         .unwrap_or_else(|| "?".into()),
                 )
-                .detail(reason),
+                .detail(fingerprint_detail(
+                    reason,
+                    &snap_a.policy_version,
+                    &snap_b.policy_version,
+                )),
         ),
+    }
+
+    // -- Check 1b: kinds-parity --------------------------------------------
+    match kinds_parity(&snap_a.kinds, &snap_b.kinds) {
+        KindsParity::Match => lines.push(
+            CheckLine::new("kinds-parity", Status::Pass)
+                .scope("kinds", kinds_display(&snap_a.kinds)),
+        ),
+        KindsParity::Unavailable => lines.push(
+            CheckLine::new("kinds-parity", Status::Skip).detail(
+                "neither node advertises private_repos.kinds (private repos disabled?); \
+                 see the fingerprint-parity line",
+            ),
+        ),
+        KindsParity::Mismatch { only_a, only_b } => {
+            let fmt = |v: &[u64]| {
+                if v.is_empty() {
+                    "-".to_string()
+                } else {
+                    v.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+                }
+            };
+            lines.push(
+                CheckLine::new("kinds-parity", Status::Fail)
+                    .scope("kinds-a", kinds_display(&snap_a.kinds))
+                    .scope("kinds-b", kinds_display(&snap_b.kinds))
+                    .scope("only-a", fmt(&only_a))
+                    .scope("only-b", fmt(&only_b))
+                    .detail(
+                        "the nodes accept different private-repo kinds: events of a kind \
+                         only one side admits are rejected on the other and never \
+                         replicate. For stream-wrap kinds (1059/21059 vs 3359/23359) flip \
+                         NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND on both nodes in ONE \
+                         maintenance window (runbook §2)",
+                    ),
+            );
+        }
     }
 
     if aliases.is_empty() {
@@ -2053,6 +2235,97 @@ mod tests {
         assert!(fingerprint_parity(None, None)
             .unwrap_err()
             .contains("neither"));
+    }
+
+    // -- kinds_parity -----------------------------------------------------------------
+
+    /// The accepted-kind set is compared as a SET, on its own check: a
+    /// wrap-kind split is a per-data-class divergence (wraps accepted on one
+    /// node are refused on the other and never replicate) and must be named,
+    /// not folded into the fingerprint digest.
+    #[test]
+    fn kinds_parity_is_a_set_comparison() {
+        let set = |v: &[u64]| -> BTreeSet<u64> { v.iter().copied().collect() };
+
+        // Order and duplicates in the advert cannot matter (BTreeSet).
+        assert_eq!(
+            kinds_parity(&set(&[30640, 3359, 23359]), &set(&[23359, 30640, 3359])),
+            KindsParity::Match
+        );
+
+        // The migration-window split: A still dual-accepts, B has retired.
+        let dual = set(&[1059, 3359, 21059, 23359, 30640, 30641]);
+        let strict = set(&[3359, 23359, 30640, 30641]);
+        assert_eq!(
+            kinds_parity(&dual, &strict),
+            KindsParity::Mismatch {
+                only_a: vec![1059, 21059],
+                only_b: vec![],
+            }
+        );
+        assert_eq!(
+            kinds_parity(&strict, &dual),
+            KindsParity::Mismatch {
+                only_a: vec![],
+                only_b: vec![1059, 21059],
+            }
+        );
+
+        // Neither side advertises: nothing to compare — fingerprint-parity
+        // already reports "private repos disabled?", so this must not
+        // duplicate it as a FAIL.
+        assert_eq!(
+            kinds_parity(&BTreeSet::new(), &BTreeSet::new()),
+            KindsParity::Unavailable
+        );
+        // One side advertising and the other not IS a divergence.
+        assert!(matches!(
+            kinds_parity(&strict, &BTreeSet::new()),
+            KindsParity::Mismatch { .. }
+        ));
+
+        assert_eq!(kinds_display(&set(&[3359, 30640])), "3359,30640");
+        assert_eq!(kinds_display(&BTreeSet::new()), "none");
+    }
+
+    /// A fingerprint mismatch has two very different causes and the operator
+    /// must be told which: a label bump moves EVERY node's digest for the
+    /// duration of a rolling upgrade (transient, self-healing), while a
+    /// same-version mismatch is a real acceptance divergence.
+    #[test]
+    fn fingerprint_detail_separates_version_skew_from_knob_split() {
+        let v2 = Some("grasp-p-policy-v2".to_string());
+        let v3 = Some("grasp-p-policy-v3".to_string());
+
+        let skew = fingerprint_detail("mismatch".into(), &v2, &v3);
+        assert!(skew.contains("VERSION SKEW"), "{skew}");
+        assert!(skew.contains("grasp-p-policy-v2") && skew.contains("grasp-p-policy-v3"));
+
+        let split = fingerprint_detail("mismatch".into(), &v3, &v3);
+        assert!(split.contains("SAME-VERSION knob split"), "{split}");
+        assert!(!split.contains("VERSION SKEW"), "{split}");
+
+        // Pre-advert node on ONE side is the rolling-upgrade window onto the
+        // first labelled build — the likeliest real mismatch there is. It
+        // must name the unlabelled node and land on the skew verdict, not
+        // fall through to a bare reason with an `unadvertised` scope.
+        let a_predates = fingerprint_detail("mismatch".into(), &None, &v3);
+        assert!(a_predates.contains("VERSION SKEW"), "{a_predates}");
+        assert!(
+            a_predates.contains("node A predates the policy_version field"),
+            "{a_predates}"
+        );
+        let b_predates = fingerprint_detail("mismatch".into(), &v3, &None);
+        assert!(b_predates.contains("VERSION SKEW"), "{b_predates}");
+        assert!(
+            b_predates.contains("node B predates the policy_version field"),
+            "{b_predates}"
+        );
+
+        // Neither side labels its policy: nothing to distinguish, so the
+        // reason is passed through untouched rather than guessed at.
+        let neither = fingerprint_detail("mismatch".into(), &None, &None);
+        assert_eq!(neither, "mismatch");
     }
 
     // -- list_diff --------------------------------------------------------------------

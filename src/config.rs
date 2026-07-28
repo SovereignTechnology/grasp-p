@@ -609,7 +609,9 @@ pub struct Config {
     // ------------------------------------------------------------------
     // GRASP-P private repositories (all no-ops unless enable=true)
     // ------------------------------------------------------------------
-    /// GRASP-P master switch: enable private repository hosting (30640/30641/1059/21059 + blob routes)
+    /// GRASP-P master switch: enable private repository hosting
+    /// (30640/30641 + stream wraps 3359/23359, and 1059/21059 while
+    /// NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND is on, + blob routes)
     #[arg(long, env = "NGIT_PRIVATE_REPOS_ENABLE", default_value_t = false)]
     pub private_repos_enable: bool,
 
@@ -631,7 +633,8 @@ pub struct Config {
     #[arg(long, env = "NGIT_PRIVATE_MAX_BLOB_BYTES", default_value_t = 268_435_456)]
     pub private_max_blob_bytes: u64,
 
-    /// Serialized-JSON size cap for private-repo events (30640/30641/1059/21059)
+    /// Serialized-JSON size cap for private-repo events (30640/30641 +
+    /// stream wraps 3359/23359 and legacy 1059/21059)
     #[arg(long, env = "NGIT_PRIVATE_MAX_EVENT_BYTES", default_value_t = 131_072)]
     pub private_max_event_bytes: u64,
 
@@ -740,16 +743,39 @@ pub struct Config {
     #[arg(long, env = "NGIT_PRIVATE_ACCEPT_DIRECT_INVITES", default_value_t = false)]
     pub private_accept_direct_invites: bool,
 
+    /// Also accept the LEGACY stream-wrap kinds 1059/21059 alongside the
+    /// dedicated CORD stream-wrap kinds 3359/23359. Default true: a node
+    /// must accept 3359 BEFORE any client emits it, and legacy wraps
+    /// already published (or held for out-of-order reprocess) must keep
+    /// draining. Set false only once every client on this node has
+    /// migrated — the legacy kinds are then RETIRED: while private repos
+    /// are enabled a 1059/21059 is refused outright ("restricted: legacy
+    /// stream-wrap kind is not accepted on this node"). It is deliberately
+    /// NOT reclassified onto the public related-event path: that path would
+    /// store an `a`/`e`-tagged 1059 from ANY key — no §3.2 registered-key
+    /// gate, no private_max_event_bytes cap, no private quota charge, never
+    /// swept by the private GC — i.e. WIDER than the default, which rejects
+    /// unregistered 1059s outright. Nodes with private repos disabled are
+    /// unaffected (1059 keeps its vanilla public handling).
+    /// Cross-node acceptance knob — part of the policy_fingerprint
+    /// preimage (v3).
+    #[arg(
+        long,
+        env = "NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND",
+        default_value_t = true
+    )]
+    pub private_accept_legacy_wrap_kind: bool,
+
     /// Opt in to per-tenant metric labels (default: aggregate metrics only)
     #[arg(long, env = "NGIT_PRIVATE_PER_TENANT_METRICS", default_value_t = false)]
     pub private_per_tenant_metrics: bool,
 
     /// Per-write-key token bucket capacity for CLIENT-submitted private
-    /// writes (kind 30641/1059/21059 events + blob PUTs). 0 = unlimited
+    /// writes (kind 30641 + stream-wrap events + blob PUTs). 0 = unlimited
     /// (limiter disabled). The default is deliberately generous: legitimate
     /// client flows — including cord-git widen→narrow key rotations — must
-    /// never trip it; only abuse floods (e.g. quota-uncharged 21059 spam)
-    /// get capped. Node-local DoS protection only: synced/replayed traffic
+    /// never trip it; only abuse floods (e.g. quota-uncharged ephemeral
+    /// stream-wrap spam) get capped. Node-local DoS protection only: synced/replayed traffic
     /// bypasses it, so it has no cross-node convergence impact.
     #[arg(long, env = "NGIT_PRIVATE_WRITE_RATE_CAPACITY", default_value_t = 120)]
     pub private_write_rate_capacity: u32,
@@ -767,7 +793,7 @@ pub struct Config {
     /// retries. A rejected replacement is HELD locally and retried after
     /// bucket refill (the hourly re-issue is the backstop healer).
     /// Cross-node acceptance knob — part of the policy_fingerprint
-    /// preimage (v2).
+    /// preimage (v3).
     #[arg(long, env = "NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY", default_value_t = 8)]
     pub private_registration_replace_capacity: u32,
 
@@ -1418,6 +1444,7 @@ impl Config {
             private_mirror_fetch_timeout_secs: 120,
             private_mirror_allow_private_ips: false,
             private_accept_direct_invites: false,
+            private_accept_legacy_wrap_kind: true,
             private_per_tenant_metrics: false,
             private_write_rate_capacity: 120,
             private_write_rate_refill_per_min: 60,
@@ -1445,6 +1472,43 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:7334");
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    /// Wire-kind migration: legacy stream-wrap acceptance defaults ON (a
+    /// node must accept 3359 before any client emits it, and in-flight
+    /// 1059s must keep draining), and the env var must be able to turn it
+    /// OFF — a default-true clap bool silently ignoring `=false` would
+    /// make the migration's final step a no-op.
+    #[test]
+    fn test_private_accept_legacy_wrap_kind_default_and_env_override() {
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND";
+        let original = std::env::var_os(VARIABLE);
+        std::env::remove_var(VARIABLE);
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default configuration should parse");
+        assert!(
+            config.private_accept_legacy_wrap_kind,
+            "legacy wrap-kind acceptance must default to true"
+        );
+        assert!(
+            Config::for_testing().private_accept_legacy_wrap_kind,
+            "for_testing() must match the shipped default"
+        );
+
+        std::env::set_var(VARIABLE, "false");
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("env-disabled configuration should parse");
+        assert!(
+            !config.private_accept_legacy_wrap_kind,
+            "NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false must turn legacy accept off"
+        );
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
     }
 
     #[test]
