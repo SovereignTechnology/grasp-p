@@ -88,7 +88,7 @@ SHOULD advertise a top-level `private_repos` object, which [NIP-11](https://nips
 
 ## Rejection Messages
 
-MUST use these [NIP-20](https://nips.nostr.com/20) `restricted: ` messages, which clients rely on to tell a re-registerable condition from a transient one.
+MUST use these [NIP-01](https://nips.nostr.com/1) `restricted: ` `OK` messages, which clients rely on to tell a re-registerable condition from a transient one.
 
 | Condition | Message |
 |---|---|
