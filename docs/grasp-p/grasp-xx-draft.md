@@ -66,7 +66,7 @@ MUST admit these kinds only when the signer is in the `w ∪ aux` set of a live 
 
 ### Why not kind `1059`
 
-These events are NIP-59-*shaped* but are not [NIP-59](https://nips.nostr.com/59) gift wraps: they carry no `p` tag, no kind `13` seal, their content is a symmetric AEAD envelope rather than [NIP-44](https://nips.nostr.com/44), and the signer is deterministically derived and shared by the group rather than a one-time random key. Their inner events are signed, where NIP-59 rumors are by definition unsigned — so conformance is not merely inconvenient here, it is unreachable. Reusing kind `1059` would oblige relays to apply NIP-59's relay behaviours to them — AUTH-gating, and serving only to the p-tagged recipient — under which a p-tag-less wrap is servable to nobody, and one conformant relay upgrade can black-hole a repository. It would also demand two contradictory treatments of one kind wherever GRASP-08 and GRASP-XX share a relay. Kinds `3359` and `23359` are unclaimed in the NIP corpus; assignment is requested.
+These events are NIP-59-*shaped* but are not [NIP-59](https://nips.nostr.com/59) gift wraps: they carry no `p` tag, no kind `13` seal, their content is a symmetric AEAD envelope rather than [NIP-44](https://nips.nostr.com/44), and the signer is deterministically derived and shared by the group rather than a one-time random key. Their inner events are signed, where NIP-59 rumors are by definition unsigned — so conformance is not merely inconvenient here, it is unreachable. Reusing kind `1059` would oblige relays to apply NIP-59's relay behaviours to them — AUTH-gating, and serving only to the p-tagged recipient — under which a p-tag-less wrap is servable to nobody, and one conformant relay upgrade can black-hole a repository. It would also demand two contradictory treatments of one kind wherever GRASP-08 and GRASP-XX share a relay. Kinds `3359` and `23359` are unclaimed in the NIP corpus; assignment is requested. (A service migrating clients off a prior `1059`-based deployment MAY dual-accept the old kinds behind a flag for a transitional window — the reference service does, defaulting on — but that window is a deployment concern, not part of this specification.)
 
 ## Blob Store
 
@@ -80,7 +80,7 @@ Authorization: Nostr <base64url-no-padding-event>
 
 > Implementation status: the reference service decodes standard base64 only, and does not yet enforce BUD-11's `server` tag or its human-readable `content` requirement; alignment is in progress.
 
-`GET /<sha256>` and `GET /list/<pubkey>` are UNAUTHENTICATED. Any anonymous party can therefore enumerate the complete alias-to-blob mapping of a hosting pubkey in one request — hashes, sizes, counts and by extension push cadence — rather than having to observe pushes as they happen. Blob content stays encrypted. An implementation wanting the weaker leak MUST gate or drop `/list`.
+`GET /<sha256>` and `GET /list/<pubkey>` are UNAUTHENTICATED. Any anonymous party can therefore enumerate the complete alias-to-blob mapping of a hosting pubkey in one request — hashes, sizes, counts and by extension push cadence — rather than having to observe pushes as they happen. Blob content stays encrypted. This is a trade, and an implementation is free to take the other side of it: one wanting the weaker leak MUST either require a `24242` authorization on `/list` or not serve the route at all. The reference service takes the leak.
 
 ## NIP-11
 
@@ -109,6 +109,8 @@ A client MUST treat any message containing the substring `unregistered` as re-re
 Clients SHOULD discover a user's private repositories through GRASP-08's encrypted kind `10318` private git relay list, used unchanged.
 
 A repository MAY additionally publish a kind `30617` announcement carrying GRASP-08's `["private", "true"]` tag, a `d` tag equal to the alias and a `nostr://` clone URL, and NO `name` or `description`, so that clients treat both trust models uniformly. This is opt-in per repository and MUST NOT be a default: it converts "an opaque alias exists" into "this coordinate exists, is private, and has these maintainers", and creates a stable public coordinate correlatable across relays and over time.
+
+> Implementation status: this section is specified but unbuilt — the reference client implements neither the kind `10318` list nor the `30617` announcement, so a repository hosted on it is today discoverable only out of band.
 
 ## Becoming Public
 

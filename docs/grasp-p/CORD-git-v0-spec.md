@@ -1,7 +1,8 @@
 # CORD-git v0.1 — protocol convention for multi-tenant private git repos on public GRASP nodes
 
-Status: **v0.1, written from the as-built** at server `master` **2e6e01a** (GRASP-P phases 0–4b)
-and client `main` **9562385** (cord-core/cord-git phase-4a + harness compat). This is the protocol
+Status: **v0.1, written from the as-built** at server `master` **c5301bb** (GRASP-P phases 0–4b plus
+the 3359 stream-wrap migration) and client `main` **eb1e5e2** (cord-core/cord-git phase-4a + harness
+compat plus the client half of that migration). This is the protocol
 convention layer; `GRASP-P` is the server implementation (an ngit-grasp v1.2.0 extension) and
 `cord-core`/`cord-git` is the reference client. Conformance markers: **[N]** normative, **[I]**
 informative, **[D]** deferred. "plan §3.2/§3.3" references the executing implementation plan, not
@@ -102,29 +103,47 @@ Addressable event signed by a **registered write key** (aux keys refused).
   re-verifies `(alias, tenant, latest event id)` before ANY mutation and rejects otherwise — a
   footprint born after a death would have no cleanup trigger left.
 
-### 2.3 kind 1059 / 21059 — encrypted streams [N]
-Admitted **only if** the outer signer is in the `w ∪ aux` set of a live registration, **and** it
-satisfies the size, skew, quota and rate gates below — membership is necessary, not sufficient.
-Contents are never inspected.
+### 2.3 kind 3359 / 23359 — encrypted streams [N]
+The wire kinds are **3359** ("CORD stream wrap", stored) and **23359** (its ephemeral analog)
+— `src/private/mod.rs:58,62`, client `cord-core/src/events.rs:41`. Admitted **only if** the outer
+signer is in the `w ∪ aux` set of a live registration, **and** it satisfies the size, skew, quota
+and rate gates below — membership is necessary, not sufficient. Contents are never inspected.
+- **[N] Why not 1059.** These wraps are NIP-59-*shaped* but are not gift wraps: tagless (no `p`),
+  author-addressed, symmetric AEAD rather than NIP-44, a derived signer shared by the group rather
+  than a one-time random one, and a *signed* inner rumor where NIP-59 rumors are definitionally
+  unsigned. Riding 1059 bought nothing and inherited NIP-59's relay AUTH-gating SHOULD, under which
+  a p-tag-less wrap is servable to nobody. Genuine NIP-59 gift-wrapped **invites and promotions
+  stay on 1059** and are delivered to the recipient's own inbox relay, never to a git node
+  (`cord-core/src/events.rs:55`) — that split is deliberate and load-bearing; re-collapsing the two
+  constants breaks either every invite or every stream read.
 - **[N]** An unregistered outer author is **rejected outright** — never routed to the public
   related-event path. Accepting referenced wraps from unregistered keys made every deregistered
   rekey address permanently floodable and charged to nobody, defeating the client's epoch-scoped
-  admission windows (plan §3.2). A rejected **1059** is held in the out-of-order index keyed by its
-  outer author, so a later 30640 registering that key reprocesses it; **21059** is never stored and
+  admission windows (plan §3.2). A rejected **3359** is held in the out-of-order index keyed by its
+  outer author, so a later 30640 registering that key reprocesses it; **23359** is never stored and
   never held.
-- **[N]** 1059 bytes are quota-charged once per event id (idempotent inside the serialized meta
-  txn, so concurrent deliveries of one id cannot double-charge); 21059 is never charged — which is
+- **[N]** 3359 bytes are quota-charged once per event id (idempotent inside the serialized meta
+  txn, so concurrent deliveries of one id cannot double-charge); 23359 is never charged — which is
   why the per-write-key rate bucket is its only cost.
 - These carry the client's rekey (3303), guestbook (3314), and `#collab` (NIP-34/NIP-22) rumors.
-  The server gates only by outer key.
+  The server gates only by outer key. The reference client emits no ephemeral wraps at all; 23359 is
+  a server admission capability.
+- **[N] Tagless admission is gated.** A shipped wrap carries no `p` and no `a` tag, so it is an
+  *orphan* to the public related-event policy and can only be admitted by the private arm. The full
+  contract — admitted from a registered outer key, quota-charged, stored, and served to a
+  never-AUTHed anonymous reader — is pinned on both wire kinds by `tests/private_repos.rs:4881`
+  (legacy) and `:4892` (3359).
 
-**[D] Kind migration.** Stream wraps move to kind **3359** ("CORD stream wrap"), with ephemeral
-**23359** reserved. Kind 1059/21059 as described in this section is the **v0.1 wire reality**; after
-the migration, 1059 is retained only for genuine NIP-59 gift-wrapped invites (§4) — our stream wraps
-are tagless, author-addressed and carry a *signed* inner rumor, none of which is a NIP-59 gift wrap,
-so riding 1059 buys nothing and inherits NIP-59's relay AUTH-gating SHOULD (which would make
-p-tag-less wraps unservable). The NIP-11 `kinds` advert (§5) must change in lockstep with the
-constants.
+**[I] Transitional legacy window.** The server ALSO accepts the pre-migration kinds **1059/21059**
+while `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` is true — its shipped default (`src/config.rs:746-767`,
+`src/private/mod.rs:72-80`) — so wraps published by pre-migration clients, and legacy wraps still
+held for out-of-order reprocess, keep draining. This is a migration window on *our* nodes, not a
+protocol element: a new implementation speaks 3359/23359 only. Ordering is what the window buys —
+a node must accept 3359 *before* any client emits it. Setting the flag false RETIRES the legacy
+kinds outright (§5.2); it deliberately does not reclassify them onto the public related-event path,
+which would be *wider* than the default. The reference client has completed its half: it emits and
+reads 3359 only, with **no dual-kind read window** (`cord-core/src/relay.rs:237`), so stream wraps
+stored at 1059 before the migration are invisible to it.
 
 ### 2.4 Blossom-subset blobs [N]
 Content-addressed encrypted blobs over HTTP: `PUT /upload` (kind-24242 authorization),
@@ -158,7 +177,7 @@ are capped (64) and reserved against the global byte budget BEFORE any body byte
   write-role members hold `write_secret`.
 - **Derived stream keys**: the `#collab` key derives the shared guestbook/stream keypair
   (`salt="cord-git/guestbook-stream/v1"`, `ikm=#collab key`, `info=""`, `L=32`), registered in the
-  30640 `aux` set — it signs the outer 1059 of every guestbook Join and `#collab` message, so member
+  30640 `aux` set — it signs the outer 3359 of every guestbook Join and `#collab` message, so member
   npubs never appear on the git node. Symmetric seal keys are separately domain-separated and share
   that shape: `HKDF-SHA256(salt="cord-git/guestbook-seal/v1", ikm=#collab key, info="", L=32)` and
   `HKDF-SHA256(salt="cord-git/collab-seal/v1", ikm=#collab key, info="", L=32)`.
@@ -216,7 +235,7 @@ are capped (64) and reserved against the global byte budget BEFORE any body byte
   as-built admission path; the never-to-the-git-node rule is enforced client-side only.
 - **#collab issues/PRs [N]**: author-signed inner rumors (1621 issue, 1111 comment, 1617 patch,
   1630/1631/1632/1633 status) carrying `a`/`channel`/`epoch` binding tags, sealed under the
-  `#collab` seal key and wrapped in a 1059 signed by the derived stream key with a past-tweaked
+  `#collab` seal key and wrapped in a 3359 signed by the derived stream key with a past-tweaked
   created_at (≤48 h). Any member (read or write) may post. **[I]** The Concord seal kind 20013 is
   named in the client but no 20013 event is emitted — the seal is realized as the symmetric AEAD
   layer inside the wrap content. History survives refoundings via the retained **prior `#collab`
@@ -296,7 +315,7 @@ are capped (64) and reserved against the global byte budget BEFORE any body byte
   member can derive the outer address key, so only the tenant signature authenticates it), tags
   `cgc`/`scope`/`epoch`/`scopes` (+ `prevcommit` for the write scope, over the PRIOR
   `(write_secret, epoch)`); per-member slots = opaque hint + NIP-44 ciphertext from a fresh
-  ephemeral key. Outer 1059 signed by
+  ephemeral key. Outer 3359 signed by
   `group_key("concord/rekey-pseudonym", prior_root, scope_id, epoch)`, content sealed under a
   prior-root-derived key. The write scope uses a DEDICATED `scope_id` bound to the community id
   (stable across refoundings), so "no slot" cannot be confused with removal.
@@ -336,13 +355,18 @@ rejected replay is non-destructive (no meta mutation, no pruning).
 Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
 Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
 aggregate metrics (per-tenant labels opt-in), NIP-11 `private_repos` advert (`kinds`,
-`registration_mode`, size caps, quotas, `blob_endpoints`, `policy_fingerprint`, plus `pow_bits`
-only in pow mode). The `kinds` array (today `30640, 30641, 1059, 21059`) is the discovery signal for
-"does this node speak the private extension", so **[D]** it must be updated in lockstep with the
-3359/23359 migration (§2.3), never after it.
+`registration_mode`, size caps, quotas, `blob_endpoints`, `policy_fingerprint`, `policy_version`,
+plus `pow_bits` only in pow mode) — `src/private/mod.rs:1564-1601`. `policy_version` is the
+`policy_fingerprint` PREIMAGE-FORMAT label published verbatim beside the digest, so a pair whose
+digests differ can tell a mid-rolling-upgrade version skew from a real same-version knob split
+(§5.1). The `kinds` array is the discovery signal for "does this node speak the private extension",
+and is built from the same helpers the admission arms use (`stream_wrap_kinds` /
+`ephemeral_stream_wrap_kinds`, `mod.rs:94-110`) so it cannot drift from the accepted set:
+`30640, 30641, 3359, 23359`, plus `1059, 21059` for as long as the legacy window (§2.3) is open.
 
 Two-node replication: 30640 L1 sync filter → registration-driven 30641 `#d` +
-1059 `authors` derived filters; out-of-order reprocess hold; hourly `since=None` full re-issue with
+3359 `authors` derived filters (plus 1059 while the legacy window is open — the same helper again,
+`src/sync/filters.rs:104`); out-of-order reprocess hold; hourly `since=None` full re-issue with
 a per-peer minimum interval; **pull-only blob mirror** over the peer's public GET with per-blob
 exponential backoff. **[N]** Outbound private-sync connections are *initiated* ONLY to the operator
 allowlist `NGIT_PRIVATE_SYNC_PEER_URLS` — tenant `relays` tags are advisory metadata and never
@@ -355,7 +379,7 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
 
 ### 5.1 Abuse hardening (phase-4b) [N]
 
-- **Per-write-key token bucket** on CLIENT-submitted private writes (30641/1059/21059 + blob PUT):
+- **Per-write-key token bucket** on CLIENT-submitted private writes (30641 / stream wraps / blob PUT):
   default capacity 120, refill 60/min. Synced and reprocess traffic (loopback:0) bypasses it, so it
   has no convergence impact — and is deliberately NOT in the policy fingerprint. Blob route answers
   429 with `Retry-After`.
@@ -366,9 +390,11 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   refill (hourly full re-issue as backstop) — convergence must not depend on the client retrying.
   Applies to live admission from clients AND peers; boot-reconcile replays and merge winners are
   exempt.
-- **`policy_fingerprint` v2**: `sha256(preimage)[..16]`, label `grasp-p-policy-v2`, over
+- **`policy_fingerprint` v3**: `sha256(preimage)[..16]`, label `grasp-p-policy-v3`
+  (`src/private/mod.rs:326`), over
   `mode, pow_bits, whitelist, max_event_bytes, max_blob_bytes, quota_tenant, quota_repo,
-  global_budget, max_aliases, max_keys, replace_capacity, replace_refill_per_hour, domains`
+  global_budget, max_aliases, max_keys, replace_capacity, replace_refill_per_hour,
+  accept_legacy_wrap_kind, domains`
   (domains = sorted `{own domain} ∪ {bootstrap peer}`; the raw whitelist feeds the hash but is
   never exposed). Everything not named in that preimage is excluded; among the excluded knobs are
   client-write-rate, denylist, sync-re-issue and mirror-retry, per-tenant metrics, GC grace/interval,
@@ -378,8 +404,12 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   trimming releases blob claims and their speculative charges, released charges change the quota
   ledger, and quota decides acceptance. Two paired nodes on different ring depths can therefore
   diverge on a `quota exceeded` verdict for the same 30641. Pair them on the same value, or add it
-  to a future preimage revision. Paired nodes must advertise the same fingerprint; a v1/v2 label
-  mismatch is itself the divergence signal.
+  to a future preimage revision. **`accept_legacy_wrap_kind` joined the preimage at v3** because it
+  decides which stream-wrap KINDS a node admits, which is direct acceptance behaviour: a peer with
+  the legacy window closed rejects a 1059 wrap its pair accepted and stored — exactly the split view
+  the fingerprint exists to detect. Paired nodes must advertise the same fingerprint; a label
+  mismatch (v2/v3) is itself the divergence signal, and is published as `policy_version` (§5) so an
+  operator can tell an unfinished rolling upgrade from a genuine knob split.
 - **Denylist → 451**: node-local, multi-file, periodically reloaded (default 60 s), enforced on the
   read path AND the upload preflight, with purge-on-add and a GC sweep that bypasses the grace
   period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ.
@@ -397,20 +427,26 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
 | Condition | NIP-20 message | Class |
 |---|---|---|
 | 30641: no live registration for the alias | `unregistered alias` | genuine, **widenable** |
-| 1059/21059: outer key unclaimed, or alias not live | `unregistered key` | genuine, **widenable** |
+| stream wrap: outer key unclaimed, or alias not live | `unregistered key` | genuine, **widenable** |
 | 30641: registration identity changed inside the txn | `alias registration changed; retry` | **transient** |
-| 1059: registration identity changed inside the txn | `registration changed; retry` | **transient** |
+| stream wrap: registration identity changed inside the txn | `registration changed; retry` | **transient** |
 | 30640: same-tenant replacement over cadence | `replacement rate-limited; retry later` | **transient** (held + re-offered) |
 | client write bucket exhausted | `rate-limited; retry later` | **transient** |
 | 30640: lost an alias conflict | `alias already registered` | genuine |
 | 30640: lost a key conflict | `write key already registered` | genuine (drives the squat-tolerant widen) |
 | whitelist / pow / alias limit / quota | `tenant is not on the registration whitelist` / `registration requires N bits of NIP-13 proof of work` / `tenant has reached the alias limit` / `quota exceeded` | genuine |
 | any private kind, created_at > now + 900 s | `event created_at is too far in the future` | genuine |
+| 1059/21059 while the legacy window is CLOSED | `legacy stream-wrap kind is not accepted on this node` | genuine, **not** widenable |
 
 **[N]** The cord-git client treats any message containing the substring `unregistered` as its
 widenable case. The two transient identity-race strings are therefore deliberately worded to avoid
 that substring: an honest same-tenant rotation trips them, and a plain retry under the new record
-succeeds. **[I]** cord-git `push()` currently treats `unregistered alias` on a 30641 as fatal
+succeeds. **The retired-legacy-kind string avoids it too, for the opposite reason**
+(`src/nostr/builder.rs:910`): it fires only when `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND=false`
+(§2.3), it is GENUINE rather than transient, and no amount of widening can help — the kind itself is
+retired on that node, so the only fix is for the client to emit 3359. A retired legacy wrap is
+refused here rather than falling through to the public related-event path, which would accept it
+from ANY key, uncapped, uncharged and never GC'd. **[I]** cord-git `push()` currently treats `unregistered alias` on a 30641 as fatal
 rather than re-registering and retrying once (client issue !34); widen is the wrong primitive there.
 
 ## 6. Threat model summary
@@ -443,8 +479,12 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
   `t:`/`g:` event-byte stranding on registration death; a live squatter saturating their own quota
   blocks a rekey at their claimed address until operator action; byte quotas do not bound
   claim/file COUNTS (server issue !25).
-- **[D] remaining**: the **1059→3359 / 21059→23359 stream-wrap migration** (§2.3, with the NIP-11
-  `kinds` advert in lockstep), paid mode, flip-public, export/offboard tombstone worker, 30643
+- **Landed since v0.1**: the **1059→3359 / 21059→23359 stream-wrap migration** (§2.3), on both the
+  server (`c5301bb`) and the client (`eb1e5e2`), with the NIP-11 `kinds` advert, the sync filters and
+  the `policy_fingerprint` moving in lockstep. What remains of it is not spec work but an operational
+  step: closing the legacy window per node once every client on it has migrated. Kind numbers 3359 /
+  23359 are still **unregistered** in the nips README table (see `nip-conformance.md` item 11).
+- **[D] remaining**: paid mode, flip-public, export/offboard tombstone worker, 30643
   snapshots, WASM viewer, Tier-H migration, Concord byte-conformance, padding defaults, AEAD nonce
   width (§3), gated-GET / `/list` authorization, Cashu.
 
@@ -454,7 +494,9 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
 - §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.
-- §2.3 — unregistered 1059/21059 rejected outright (never the public path); 1059 held, 21059 not; **[D]** on collab rumors dropped.
+- §2.3 — unregistered stream wraps rejected outright (never the public path); stored held, ephemeral not; **[D]** on collab rumors dropped.
+- §2.3 — **stream wraps moved to their own kinds 3359/23359** (server `c5301bb`, client `eb1e5e2`); 1059 retained ONLY for genuine NIP-59 invites/promotions; legacy 1059/21059 dual-accept as a transitional window, default on; retired-kind rejection string (§5.2); tagless-admission gate written (`tests/private_repos.rs:4881,4892`), closing the hole `nip-conformance.md` item 7b recorded.
+- §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.
 - §4.1 (new) — pending-epoch lifecycle; templates at `created_at = live+1`; no idle rekey-address admission; rival-resume guard; mint-time fork prevention; squat-tolerant widen; tenant-signed `scopes` + epoch-atomic fold.

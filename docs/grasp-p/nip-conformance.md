@@ -1,6 +1,10 @@
 # CORD-git / GRASP-P — NIP & BUD conformance inventory
 
-Audit date **2026-07-28**, against server `master` **2e6e01a** and client `main` **9562385**.
+Audit date **2026-07-28**, against server `master` **c5301bb** and client `main` **eb1e5e2**.
+The inventory was first taken at server `2e6e01a` / client `9562385`; items 3c, 4b, 5c, 7b, 10, 11
+and 12 were re-verified after the **1059 → 3359 stream-wrap migration landed on both sides** and now
+record shipped state rather than a decision. Migration hazards are kept as historical notes: they
+are what a future reader needs to understand why the code is split the way it is.
 Every claim about our code carries a `file:line`. Upstream claims are limited to what was verified
 against live sources on the audit date; anything not verified is marked as such rather than asserted.
 
@@ -15,11 +19,11 @@ that, the divergence is stated explicitly rather than papered over.
 
 **Verdict vocabulary.** `ADOPT` = change our code to match upstream. `KEEP-BESPOKE` = deliberate,
 documented divergence. `MIGRATE` = decided change of our own wire kind, away from a reused upstream
-number. `CONFORMANT` = we already consume the NIP correctly. `N-A` = the upstream spec does not apply
+number; `MIGRATED` = that change has SHIPPED. `CONFORMANT` = we already consume the NIP correctly. `N-A` = the upstream spec does not apply
 to this surface.
 
 **Phase column.** `now` = defect, fix in the current line; `v0.2` = next spec revision; `P3` = the
-GRASP-08-composition phase; `—` = no action.
+GRASP-08-composition phase; `landed` = shipped since the inventory was first taken; `—` = no action.
 
 ---
 
@@ -31,20 +35,20 @@ GRASP-08-composition phase; `—` = no action.
 | 2 | Blob / manifest encryption | NIP-44 v2 | bespoke ChaCha20-Poly1305 + HKDF | **KEEP-BESPOKE** | — |
 | 3a | Invite bundle (3313 rumor) | NIP-17 / NIP-59 | genuine NIP-59 gift wrap, custom rumor kind | **KEEP-BESPOKE** (kind sanctioned) | — |
 | 3b | Invite delivery discovery | NIP-17 kind 10050 | not implemented | **ADOPT** | P3 |
-| 3c | Guestbook Join (3314) | NIP-59 | 1059-**shaped**, not a gift wrap | **MIGRATE** → kind 3359 (item 12) | v0.2 |
+| 3c | Guestbook Join (3314) | NIP-59 | on kind **3359**; NIP-59-shaped, not a gift wrap | **MIGRATED** off 1059 (item 12) | landed |
 | 4 | Rekey slots (3303) | NIP-44 v2 | correct `nip44::encrypt` V2, fresh eph. key per slot | **CONFORMANT** | — |
-| 4b | Rekey outer wrap | NIP-59 | 1059-**shaped**, not a gift wrap | **MIGRATE** → kind 3359 (item 12) | v0.2 |
+| 4b | Rekey outer wrap | NIP-59 | on kind **3359**; NIP-59-shaped, not a gift wrap | **MIGRATED** off 1059 (item 12) | landed |
 | 5 | `#collab` issues/PRs | NIP-34 / NIP-22 | upstream kinds reused verbatim as rumors | **CONFORMANT-BY-REUSE** | — |
 | 5b | `KIND_SEAL = 20013` | NIP-59 kind 13 | **not a wire kind** — comment-only const | **N-A** | — |
-| 5c | `#collab` outer wrap | NIP-59 | 1059-**shaped**, not a gift wrap | **MIGRATE** → kind 3359 (item 12) | v0.2 |
+| 5c | `#collab` outer wrap | NIP-59 | on kind **3359**; NIP-59-shaped, not a gift wrap | **MIGRATED** off 1059 (item 12) | landed |
 | 6 | Private-repo discovery (10318, `["private","true"]` 30617) | GRASP-08 draft, NIP-51 | not implemented | **ADOPT** | P3 |
 | 7 | Client-side AUTH | NIP-42 | not implemented (client) | **ADOPT** | P3 |
-| 7b | Relay AUTH-gating of stored stream wraps | NIP-59 SHOULD | deliberately **not** gated; G3 covers the substrate only — **no gate covers our wrap shape yet** | **N-A after migration** (item 12) + write the missing gate | now |
+| 7b | Relay AUTH-gating of stored stream wraps | NIP-59 SHOULD | deliberately **not** gated; the missing tagless gate has been **written** (exit36/exit39) | **N-A** — the wraps left kind 1059 (item 12), so there is no NIP-59 rule to except | landed |
 | 8 | HTTP auth on the private surface | NIP-98 / NWT (PR #2187) | no NIP-98 surface anywhere | **N-A** | — |
 | 9 | Deletion / vanish claim freeing | NIP-09 / NIP-62 | implemented with cutoff + relay targeting | **CONFORMANT** | — |
 | 10 | NIP-11 `private_repos` advert | NIP-11 | custom top-level object, no `limitation` | **CONFORMANT-BY-EXTENSION** + **ADOPT** companions | P3 |
-| 11 | Kind-number registration | nips `README.md` kind table | all 7 unregistered | **ADOPT** (open a README-table PR) | v0.2 |
-| 12 | kind-1059 semantic overload | NIP-59 | 3 of our 4 1059 uses are shaped-not-conformant | **MIGRATE** to 3359 / 23359 — **DECIDED** | v0.2 |
+| 11 | Kind-number registration | nips `README.md` kind table | all 7 unregistered — 3359/23359 now in use but still unminted | **ADOPT** (open a README-table PR) | v0.2 |
+| 12 | kind-1059 semantic overload | NIP-59 | resolved — the 3 shaped-not-conformant uses are on 3359; 1059 keeps only the genuine gift wraps | **MIGRATED** to 3359 / 23359 — **SHIPPED both sides** | landed |
 
 ---
 
@@ -158,22 +162,24 @@ in `crates/inbox-relay/Cargo.toml:8`. Today the inviter must be told the invitee
 out-of-band. **ADOPT** — this is pure gain, costs the server nothing, and is what makes invites work
 without a side channel.
 
-**3c — the guestbook Join is *not* a gift wrap.** `build_join` (`invite.rs:352-372`) builds a
-kind-1059 event directly via `EventBuilder`, with:
+**3c — the guestbook Join is *not* a gift wrap.** `build_join` (`invite.rs:355-375`) builds a
+kind-**3359** event directly via `EventBuilder` (`invite.rs:371`, `KIND_STREAM_WRAP` =
+`cord-core/src/events.rs:41`), with:
 - content = base64 of a **symmetric** ChaCha20-Poly1305 envelope under a `#collab`-derived seal key
-  (`invite.rs:361-363`), not a NIP-44 ciphertext;
+  (`invite.rs:364-366`), not a NIP-44 ciphertext;
 - **no `p` tag** — there is no recipient pubkey; the addressing is by *author*;
 - a signer that is **deterministically derived and shared by every member**
   (`crypto::derive_guestbook_keys`, `crypto.rs:79-92`), not the one-time random key NIP-59 requires;
 - no kind-13 seal layer.
 
 It does keep NIP-59's past-tweaked timestamp discipline (`Timestamp::tweaked(0..172_800)`,
-`invite.rs:369`). This was a reuse of the 1059 *number* to ride the server's existing admission path
-for opaque encrypted streams — the server admits 1059 without inspecting it — but it is a semantic
-overload of a NIP-59 kind, and it reads to a reviewer as squatting the number.
+`invite.rs:372`).
 
-**MIGRATE to kind 3359.** Decided; rationale and the full argument in item 12. The wire shape is
-unchanged apart from the number: kind + past-tweaked `created_at` + base64 AEAD content, no tags.
+**MIGRATED to kind 3359 — shipped** (client `eb1e5e2`, server `c5301bb`); rationale and the full
+argument in item 12. *Historically*, this rode the 1059 *number* to reach the server's existing
+admission path for opaque encrypted streams — a semantic overload of a NIP-59 kind that read to a
+reviewer as squatting it. The wire shape is unchanged apart from the number: kind + past-tweaked
+`created_at` + base64 AEAD content, no tags. The join READ moved with the emit (`invite.rs:422`).
 
 **Security note (not a NIP question).** The invite bundle carries **no inviter authentication**: the
 rumor is authored by the throwaway ephemeral key (`invite.rs:237-238`), so `unwrap_invite` proves
@@ -182,7 +188,7 @@ community-id check (`invite.rs:158-161`) binds `(tenant_pub, owner_salt) → com
 forger can pick their own tenant. Client backlog issue !17. Flagged here because a standards reader
 will ask.
 
-## 4. Rekey wraps — inner 3303, per-member NIP-44 slots, outer 1059
+## 4. Rekey wraps — inner 3303, per-member NIP-44 slots, outer 3359
 
 `cord-core/src/rekey.rs`. **NIP-44 usage is correct and idiomatic:** each slot encrypts with a
 **freshly generated ephemeral key** to the member's own npub via
@@ -194,17 +200,18 @@ and decrypts with `nip44::decrypt_to_bytes(member_keys.secret_key(), &eph_pub, &
 (`rekey.rs:646`). **CONFORMANT.**
 
 Timestamp discipline: the outer wrap is past-tweaked, `Timestamp::tweaked(0..172_800)`
-(`rekey.rs:369`), matching NIP-59's SHOULD.
+(`rekey.rs:368`), matching NIP-59's SHOULD.
 
-**4b — the outer wrap has the same overload as 3c.** `rekey.rs:363-371`: content is base64 of a
-symmetric envelope under `rekey_seal_key` (`rekey.rs:208-216`), signed by the derived
+**4b — the outer wrap had the same overload as 3c, and moved with it.** `rekey.rs:367-369`: kind
+**3359**, content base64 of a symmetric envelope under `rekey_seal_key` (`rekey.rs:207-215`), signed by the derived
 rekey-pseudonym address key (`rekey.rs:183-191`), **no `p` tag, no kind-13 seal, not NIP-44**. The
 authenticity root is the *inner* 3303's tenant signature (`rekey.rs:355-360`, enforced at
 `rekey.rs:430-432`) precisely because every member can derive the outer key. Correct design for the
 threat model, but again: not a NIP-59 gift wrap.
 
-**MIGRATE to kind 3359** alongside 3c and 5c — item 12. Note that this signed inner rumor is exactly
-why full NIP-59 conformance is *impossible* here, not merely inconvenient (item 12).
+**MIGRATED to kind 3359** alongside 3c and 5c — item 12; read side at `rekey.rs:411`. Note that this
+signed inner rumor is exactly why full NIP-59 conformance was *impossible* here, not merely
+inconvenient (item 12) — which is what made a fresh kind the only coherent outcome.
 
 ## 5. `#collab` (issues / PRs) vs NIP-34 / NIP-22
 
@@ -229,10 +236,11 @@ AEAD envelope inside the outer wrap's content (`collab.rs:164-167`). **It theref
 registration and there is nothing to reconcile against NIP-59's kind 13.** Stated explicitly because
 a reviewer scanning for kind constants will otherwise flag it. Consider deleting the const.
 
-**5c — the outer wrap is the third 1059 overload.** `collab.rs:164-176` builds the same shape as 3c
-and 4b: kind-1059, base64 symmetric AEAD under `collab_seal_key`, no `p` tag, no kind-13 seal, signed
-by the derived `#collab` stream key. **MIGRATE to kind 3359** — item 12. The inner rumors keep their
-upstream NIP-34/NIP-22 kinds; only the outer number changes.
+**5c — the outer wrap was the third 1059 overload, and moved with the other two.**
+`collab.rs:164-176` builds the same shape as 3c and 4b: kind-**3359** (`collab.rs:171`), base64
+symmetric AEAD under `collab_seal_key`, no `p` tag, no kind-13 seal, signed by the derived `#collab`
+stream key. **MIGRATED to kind 3359** — item 12; read side at `collab.rs:315`. The inner rumors kept
+their upstream NIP-34/NIP-22 kinds; only the outer number changed.
 
 ## 6. Discovery — kind 10318 and the opt-in `["private","true"]` 30617
 
@@ -270,9 +278,9 @@ Needed for two reasons: GRASP-08 composition (an 08 deployment may gate reads), 
 that relays serve 1059 only to the p-tagged recipient — which is how the *invitee's own inbox relay*
 is expected to behave when we fetch invites (`relay.rs:171-174`).
 
-**7b — server side: we deliberately do NOT AUTH-gate stored stream wraps. N-A after the item-12
-migration.** This is a deliberate property, not an oversight — but be precise about what is
-*tested*. **G3 pins the substrate property that ngit-grasp's read path applies no NIP-42/p-tag guard
+**7b — server side: we deliberately do NOT AUTH-gate stored stream wraps. N-A: the item-12 migration
+has landed, so no NIP-59 relay rule reaches our wraps at all.** This is a deliberate property, not an
+oversight — but be precise about what is *tested*. **G3 pins the substrate property that ngit-grasp's read path applies no NIP-42/p-tag guard
 to stored kind-1059 events**: `tests/phase0_gates.rs:11` names it "no hidden read guard on stored
 kind-1059 gift wraps", and `:452-512` asserts an anonymous client that never AUTHs **must** be served
 a stored wrap, both via `kinds=[1059]` and via a bare `ids=[…]` filter.
@@ -287,10 +295,16 @@ which does **not** set `NGIT_PRIVATE_REPOS_ENABLE` (default `false`, `src/config
 `start_with_private_repos` / `start_private_pair_node` set it). The private wrap admission arm
 (`src/nostr/builder.rs:832-861`) therefore never runs, and the assertion at `:463` is that the relay
 accepts the **a-ref'd** wrap. Real GRASP-P stream wraps are **tagless** (item 12) and admitted only
-by outer-author key claim. **A gate covering GRASP-P stream wraps as shipped DOES NOT YET EXIST and
-must be written — private repos enabled, a registered outer author, no `p` and no `a` tag — before,
-not after, the 3359 migration.** This section is where we ask to be excused from a NIP-59 SHOULD, so
-it will be scrutinised hardest; it must not overstate its evidence.
+by outer-author key claim. **That gate has since been written, as the migration required
+(`tests/private_repos.rs:4822` `assert_tagless_wrap_admitted`)**: private repos enabled, a registered
+outer author, an assertion that the fixture carries NO tags at all, then the full contract —
+admitted, quota-charged exactly its event bytes, stored, and served to a never-AUTHed anonymous
+reader. It runs on **both** wire kinds: `exit36_tagless_stream_wrap_legacy_kind` (`:4881`, kind 1059
+under the dual-accept default) and `exit39_tagless_stream_wrap_new_kind` (`:4892`, kind 3359).
+`exit37` (`:4900`) additionally pins §3.2 gating and non-storage on 3359/23359, and `exit38`
+(`:4996`) pins that the legacy kinds can be retired. This section is where we ask to be excused from
+a NIP-59 SHOULD, so it will be scrutinised hardest; the paragraphs below record what the *older*
+gates do and do not cover, because a reviewer who finds G3 first will otherwise over-read it.
 
 **The nearest neighbour is `exit3_wrap_admission` (`tests/private_repos.rs:633`) — name it, because
 a hostile reviewer will find it.** Unlike G3 it *does* run the private arm: private repos are
@@ -299,9 +313,9 @@ enabled (`:636`, `start_with_private_repos`), the wrap is signed by the **regist
 (`connect_anonymous_client`, no AUTH) — which is exactly the anonymous-read property 7b claims, on
 the private admission path. What it does **not** cover is the shipped wire shape: its fixture
 `wrap_event` (`:218-227`) attaches `Tag::public_key(recipient)`, so the event is **p-tagged**, not
-tagless. So exit3 closes the "private arm + anonymous read" half and leaves the "tagless" half
-open. The missing gate is still missing; it is narrower than it first appears — a tagless variant of
-the exit3 fixture — but it must still be written.
+tagless. So exit3 closes the "private arm + anonymous read" half and leaves the "tagless" half open.
+That remaining half is what exit36/exit39 now close — they are, as predicted, tagless variants of
+the exit3 fixture.
 
 Rationale for the divergence itself: GRASP-P's stream wraps are addressed by *author* (derived
 stream/rekey keys), not by `p` tag, so the p-tag serving rule has no target to filter on; and
@@ -309,15 +323,18 @@ content-blind replication (negentropy sync between nodes, `phase0_gates.rs:379,4
 being anonymously readable. Confidentiality never rests on read-gating — that is stated normatively
 in `CORD-git-v0-spec.md:14-18`.
 
-**The migration retires this divergence rather than declaring it.** NIP-59's relay SHOULD binds kind
-1059; once the three stream wraps are kind 3359 (item 12), no NIP-59 relay rule applies to them and
-there is nothing to except ourselves from. The only 1059s we then touch are genuine gift-wrapped
-invites, which live on the *invitee's inbox relay* and where AUTH-gating is the expected, desired
-behaviour — that is precisely what item 7 (client AUTH) exists to satisfy. **Implementation
-follow-up:** G3's fixture builds a p-tagged, a-tagged `Kind::GiftWrap` (`phase0_gates.rs:461`).
-Retiring 1059 does not make that fixture cover 3359 — the missing gate above has to be *written*,
-not re-pointed, and G3 itself should stay on 1059 as what it actually is: a characterization of the
-upstream read path.
+**The migration retired this divergence rather than declaring it.** NIP-59's relay SHOULD binds kind
+1059; now that the three stream wraps are kind 3359 (item 12), no NIP-59 relay rule applies to them
+and there is nothing to except ourselves from. The only 1059s we still touch are genuine
+gift-wrapped invites and promotions, which live on the *invitee's inbox relay* and where AUTH-gating
+is the expected, desired behaviour — that is precisely what item 7 (client AUTH) exists to satisfy.
+One residual survives the migration: while `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` is true (the
+shipped default, `src/config.rs:767`) the node still admits and anonymously serves 1059 stream
+wraps, so the exemption argument still has to be made for the length of the legacy window — it is
+the window, not the design, that keeps it alive. **Historical note on G3, still accurate:** its
+fixture builds a p-tagged, a-tagged `Kind::GiftWrap` (`phase0_gates.rs:461`). Retiring 1059 did not
+make that fixture cover 3359 — the new gate had to be *written*, not re-pointed, and G3 stays on
+1059 as what it actually is: a characterization of the upstream public read path.
 
 The server does implement NIP-42 as a *client* when syncing outbound
 (`src/sync/relay_connection.rs:371`).
@@ -362,16 +379,26 @@ persist across restarts (`builder.rs:749-758,970`).
 
 `RelayInformationDocument.private_repos: Option<serde_json::Value>` (`src/http/nip11.rs:58-59`),
 populated from config at `nip11.rs:147` via `private::nip11_private_repos_from_config`
-(`src/private/mod.rs:1463-1477`), which emits `kinds` (30640, 30641, 1059, 21059),
-`registration_mode`, `max_blob_bytes`, `max_event_bytes`, `quota_tenant_bytes`, `quota_repo_bytes`,
-`blob_endpoints`, `policy_fingerprint`, and `pow_bits` when in PoW mode
-(`mod.rs:1433-1459`). Absent entirely when private repos are disabled (`mod.rs:1464-1466`).
+(`src/private/mod.rs:1610-1622`), which emits `kinds`, `registration_mode`, `max_blob_bytes`,
+`max_event_bytes`, `quota_tenant_bytes`, `quota_repo_bytes`, `blob_endpoints`, `policy_fingerprint`,
+`policy_version`, and `pow_bits` when in PoW mode (`mod.rs:1564-1601`). Absent entirely when private
+repos are disabled (`mod.rs:1611-1613`).
 
-**The advertised `kinds` array changes with item 12.** `mod.rs:1444` emits
-`[KIND_REGISTRATION, KIND_STATE_ROOT, KIND_WRAP, KIND_EPHEMERAL_WRAP]`; post-migration that becomes
-30640, 30641, 1059, 3359, 23359 — 1059 stays only if the node is also an invite inbox. This array is
-the natural discovery signal for "does this node speak GRASP-XX", so it must be updated in lockstep
-with the kind constants, not after.
+**`policy_version` (`mod.rs:1596`, value `grasp-p-policy-v3` from `mod.rs:326`) is new since the
+first revision of this inventory.** It publishes the `policy_fingerprint` PREIMAGE-FORMAT label
+verbatim beside the digest, because the digest alone cannot distinguish the two very different
+reasons a pair's fingerprints differ: a version skew mid-rolling-upgrade (every node's digest moves
+on a label bump) versus a same-version knob split, which is a real and lasting divergence in what
+the two nodes accept. Not a NIP question — NIP-11 permits the field — but it is part of the advert a
+standards reader will enumerate.
+
+**The advertised `kinds` array moved with item 12, and now cannot drift.** `mod.rs:1577-1579` builds
+it from the *same* helpers the admission arms and sync filters use
+(`stream_wrap_kinds`/`ephemeral_stream_wrap_kinds`, `mod.rs:94-110`), so "what we advertise", "what
+we admit" and "what we ask peers for" are one definition. Today that yields 30640, 30641, 3359,
+23359, plus 1059 and 21059 for as long as `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` (the transitional
+window, on by default) is set. This array is the natural discovery signal for "does this node speak
+GRASP-XX".
 
 NIP-11 registers no extension convention beyond "clients MUST ignore fields they do not understand",
 so a custom top-level object is legal. The comment at `nip11.rs:55-57` correctly keeps the Blossom
@@ -402,13 +429,13 @@ method is a full-corpus grep.
 
 | Kind | Use | Defined at | Corpus status |
 |------|-----|------------|---------------|
-| 30640 | registration | `src/private/mod.rs:42`, `cord-core/src/events.rs:98` | free — 0 occurrences |
-| 30641 | state root | `src/private/mod.rs:43`, `cord-core/src/events.rs:128` | free — 0 occurrences |
-| 3313 | invite + promotion rumor | `cord-core/src/invite.rs:34` | free — 0 occurrences |
-| 3314 | guestbook Join rumor | `cord-core/src/invite.rs:38` | free — 0 occurrences |
-| 3303 | rekey rumor | `cord-core/src/rekey.rs:44` | free — 0 occurrences |
-| **3359** | **CORD stream wrap** (item 12) | to be minted; replaces 1059 at `invite.rs:368`, `collab.rs:171`, `rekey.rs:368` (emit) and `invite.rs:419`, `collab.rs:314`, `rekey.rs:411` (read) — see the const-split hazard below | free — 0 occurrences |
-| **23359** | **ephemeral stream wrap**, reserved | to be minted; replaces `KIND_EPHEMERAL_WRAP` (`src/private/mod.rs:45`) | free — 0 occurrences |
+| 30640 | registration | `src/private/mod.rs:43`, `cord-core/src/events.rs:152` | free — 0 occurrences |
+| 30641 | state root | `src/private/mod.rs:44`, `cord-core/src/events.rs:182` | free — 0 occurrences |
+| 3313 | invite + promotion rumor | `cord-core/src/invite.rs:39` | free — 0 occurrences |
+| 3314 | guestbook Join rumor | `cord-core/src/invite.rs:41` | free — 0 occurrences |
+| 3303 | rekey rumor | `cord-core/src/rekey.rs:45` | free — 0 occurrences |
+| **3359** | **CORD stream wrap** — **now in use** (item 12) | `src/private/mod.rs:58`, `cord-core/src/events.rs:41`; emitted at `invite.rs:371`, `collab.rs:171`, `rekey.rs:367` and read at `invite.rs:423`, `collab.rs:315`, `rekey.rs:411` — see the const-split hazard below, which is now the *shipped* shape | free — 0 occurrences; **still unminted** |
+| **23359** | **ephemeral stream wrap**, reserved | `src/private/mod.rs:62`; server admission capability only, no client emits it | free — 0 occurrences; **still unminted** |
 
 Numbers confirmed **taken** in the same sweep, for contrast: `1059` (`59.md`, Gift Wrap — also
 `17.md`, `45.md`, README), `21059` (`59.md:77`), `10317` (`34.md:243`), `24242`
@@ -419,8 +446,9 @@ numbers we must avoid do not appear in nips at all: Marmot's `30443`/`444`/`445`
 lives at `github.com/marmot-protocol/marmot`, and `27519` (Nostr Web Token), still an unmerged nips
 PR #2187 (item 8). Check external specs and open PRs before treating a free number as mintable.
 
-Not requiring registration: 1059 (NIP-59, retained only for genuine gift-wrapped invites after item
-12), 24242 (Blossom BUD-11), 1621 / 1111 / 1617 / 1630-1633 (NIP-34 / NIP-22, reused verbatim), 1984
+Not requiring registration: 1059 (NIP-59 — since item 12 landed it is retained only for genuine
+gift-wrapped invites and promotions, plus the transitional legacy stream-wrap window on the server),
+24242 (Blossom BUD-11), 1621 / 1111 / 1617 / 1630-1633 (NIP-34 / NIP-22, reused verbatim), 1984
 (NIP-56 reports, `src/private/mod.rs:47`), and **20013** (item 5b — never constructed).
 
 **Why the rumor kinds are on this list.** 3313 / 3314 / 3303 are sealed inside an AEAD or NIP-59
@@ -439,15 +467,32 @@ Marmot. Our 3313/3314/3303/3359 cluster sits in a sparse but unreserved band.
 **ADOPT: open a PR against nostr-protocol/nips adding rows to the kind table in `README.md`** for all
 seven (30640, 30641, 3313, 3314, 3303, 3359, 23359) before publishing the proposal. Re-run the
 full-corpus grep at filing time — the table above is a 2026-07-28 snapshot, and the README table's
-own lag means a row's absence there proves nothing.
+own lag means a row's absence there proves nothing. **This is now the only unfinished half of item
+12:** 3359/23359 are on the wire in both implementations while still unminted upstream, so the
+window in which someone else could claim the numbers is open and running. Filing is no longer
+optional tidying.
 
-## 12. DECIDED — the kind-1059 overload: migrate stream wraps to kind 3359
+## 12. SHIPPED — the kind-1059 overload: stream wraps migrated to kind 3359
 
-**Verdict: MIGRATE.** The three non-NIP-59 stream wraps — guestbook Join (`invite.rs:352-372`),
-`#collab` (`collab.rs:164-176`), rekey (`rekey.rs:360-372`) — move off kind 1059 onto a single new
-**regular** kind **3359**, "CORD stream wrap", with **23359** reserved as its ephemeral analog.
-Genuine NIP-59 wraps stay on 1059: `wrap_invite` (`invite.rs:233`, kind-3313 rumor) and promotions
-(`invite.rs:314-335`) really are `GiftWrapBuilder` output and are unaffected.
+**Verdict: MIGRATED — landed on both sides** (server `c5301bb`, client `eb1e5e2`). The three
+non-NIP-59 stream wraps — guestbook Join (`invite.rs:355-375`), `#collab` (`collab.rs:164-176`),
+rekey (`rekey.rs:367-369`) — moved off kind 1059 onto a single new **regular** kind **3359**, "CORD
+stream wrap", with **23359** as its ephemeral analog. Genuine NIP-59 wraps stayed on 1059:
+`wrap_invite` (`invite.rs:236-245`, kind-3313 rumor) and promotions (`invite.rs:334`) really are
+`GiftWrapBuilder` output and were unaffected.
+
+**Transitional window on the server, not in the protocol.** `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND`
+(`src/config.rs:746-767`, default **true**) keeps 1059/21059 admissible alongside 3359/23359 so a
+node accepts the new kind before any client emits it and pre-migration wraps keep draining; it is in
+the `policy_fingerprint` preimage (v3) because it is direct acceptance behaviour. Setting it false
+retires the legacy kinds with `restricted: legacy stream-wrap kind is not accepted on this node`
+(`src/nostr/builder.rs:889-910`) rather than letting them fall through to the public related-event
+path, which would be *wider* than the default. The client took **no** dual-kind read window
+(`relay.rs:216-236` documents why: no production repo predated the migration), so pre-migration
+stream wraps are simply unreadable — a deliberate, operator-confirmed data loss of nothing.
+
+The hazard notes below are kept as **history**: they describe what the migration had to get right,
+and they are the explanation for why the code is shaped the way it is now.
 
 **One kind, not three, and no discriminating tag.** The server dispatches wraps purely by outer-author
 key claim (`find_claim`, `src/private/mod.rs:661`) and never by stream type — it deliberately cannot
@@ -458,16 +503,21 @@ tag would be a **privacy regression**: it would let an observer cheaply label wh
 and which are collab traffic, which the current tagless shape denies them. **Wire shape is unchanged
 apart from the number:** kind + past-tweaked `created_at` + base64 AEAD content, no tags.
 
-**Migration hazard — `KIND_WRAP` is three constants, and one of them is dual-purpose. It must be
-SPLIT, not retargeted.** The client declares `KIND_WRAP = 1059` three times: `invite.rs:36`,
+**Migration hazard (HISTORICAL, and it is why the code looks the way it does) — `KIND_WRAP` was
+three constants, one of them dual-purpose. It had to be SPLIT, not retargeted.** The client declared
+`KIND_WRAP = 1059` three times: `invite.rs:36`,
 `collab.rs:63`, `rekey.rs:46`. The latter two are stream-wrap-only and can be retargeted wholesale.
 **`invite.rs:36` cannot**: the same const gates the *genuine* NIP-59 path — `unwrap_3313`'s outer
 kind check at `invite.rs:250`, which serves both invites (`wrap_invite`, `:233`) and promotions
 (`:314-335`) — **and** the guestbook join, which emits at `:368` and reads at `:419`. Flipping that
 one number to 3359 would silently make every real gift-wrapped invite fail to unwrap ("not a gift
 wrap"), with no test in the migration's own path to catch it. Invite/promotion keep 1059; the join
-moves to 3359, which means `invite.rs` needs **two** constants and the join READ at `:419` must move
-with the emit at `:368`.
+moves to 3359, which means `invite.rs` needs **two** constants and the join READ must move with the
+emit. **How it was resolved:** the three per-module constants were replaced by exactly two, hoisted
+into one module — `KIND_STREAM_WRAP = 3359` (`cord-core/src/events.rs:41`) and
+`KIND_NIP59_GIFT_WRAP = 1059` (`:55`) — each carrying a doc comment stating why it is not the other,
+and `events.rs:55-56` explicitly forbids re-merging them. `invite.rs:35` now imports both: the
+gift-wrap check stays on 1059 (`:253`) while the join emits (`:371`) and reads (`:423`) on 3359.
 
 Migration is also not confined to construction sites: the REQ filters that name the kind move too —
 `repo.rs:1404`, `repo.rs:2086` and `crates/cord-git/src/main.rs:793` all build `kinds:
@@ -475,7 +525,8 @@ Migration is also not confined to construction sites: the REQ filters that name 
 loudly nowhere. Test fixtures asserting the outer kind (`invite.rs:534,623,634,692`;
 `collab.rs:686,769`) must be split the same way, or they will keep passing against the wrong number.
 
-**The two stream READ paths are invisible to a `KIND_WRAP` grep — they use a bare integer literal.**
+**Second hazard (HISTORICAL) — the two stream READ paths were invisible to a `KIND_WRAP` grep,
+because they used a bare integer literal.**
 Those three filter sites are all the *rekey* read path. The reads that actually serve the migrating
 streams (items 3c and 5c) live in `crates/cord-core/src/relay.rs:190`, where `wraps_by_authors`
 builds `{"kinds": [1059], "authors": …}` as a **literal `1059`**, not `KIND_WRAP` — so any grep
@@ -492,22 +543,33 @@ above.
 the mirror image of the `invite.rs:36` const-split hazard: **within one file, one literal moves
 (`:190`) and one must not (`:172`)**, and here neither is behind a named constant to make the split
 reviewable. Retargeting both would break every real invite; retargeting neither would break roster
-and collab reads.
+and collab reads. **How it was resolved:** both literals are gone. `giftwrap_filter`
+(`relay.rs:183`) names `KIND_NIP59_GIFT_WRAP` and `stream_wrap_filter` (`relay.rs:237`) names
+`KIND_STREAM_WRAP`, each split out as its own function so an emit-site test can assert the kind, and
+each carrying prose stating which plane it belongs to and what breaks if it is changed
+(`relay.rs:168-176`, `:186-236`). Every stream-wrap REQ is now required to build its filter through
+`stream_wrap_filter`, including the multi-relay fetches in `repo::fold` and
+`repo::ensure_no_existing_rekeys` that do not go via `wraps_by_authors`.
 
-Cosmetic follow-up (no behaviour, but the docs go stale at migration): the error strings `"not a
-1059 wrap"` at `collab.rs:315`, `invite.rs:420` and `rekey.rs:412`, plus ~12 prose doc-comments
-naming 1059 (e.g. `relay.rs:176-180`, `collab.rs:6,13,124,169`, `rekey.rs:28,286`,
-`invite.rs:1,10,349`, `crypto.rs:21`, `repo.rs:189,221`), should be updated in the same commit.
+Cosmetic follow-up (no behaviour, but the docs would have gone stale at migration): the error
+strings `"not a 1059 wrap"` and ~12 prose doc-comments naming 1059. **Done in the same commit**, and
+better than asked: the three parsers now share one message builder,
+`events::unexpected_stream_wrap_kind` (`events.rs:66-75`), called at `collab.rs:315`,
+`invite.rs:423` and `rekey.rs:411`. It special-cases a 1059 outer with "legacy kind-1059 stream wrap
+from before the 3359 migration; this client no longer reads it" — because the person most likely to
+hit it is not an attacker but a member holding pre-migration history, whom a bare "wrong kind" tells
+nothing.
 
-**Ephemeral.** The client never emits 21059 at all — zero references anywhere in `cord-git` (verified
-by grep). It exists only as a server admission arm (`src/private/mod.rs:45`,
-`src/nostr/builder.rs:862-883`). Renumber that arm to 23359 and declare 23359 in the spec as
-**reserved, unused by the reference client**. Do not ship a spec that reserves 21059. Note 21059 is
-not confined to that arm: it is also advertised in the NIP-11 `kinds` array (`mod.rs:1444`, item 10),
-which must move in the same commit.
+**Ephemeral.** The client emits no ephemeral wrap at all — it has no constant for one. The kind
+exists only as a server admission capability (`src/private/mod.rs:62`,
+`src/nostr/builder.rs:889`), now numbered **23359**, with 21059 accepted only inside the legacy
+window. The NIP-11 `kinds` array moved in the same commit (item 10) and can no longer drift from the
+admission arms: both read the set from `ephemeral_stream_wrap_kinds` (`mod.rs:104-110`). The spec
+declares 23359 **reserved, unused by the reference client** (`CORD-git-v0-spec.md` §2.3).
 
-**Why riding 1059 is not defensible.** This is the decisive argument, and it is worth stating in the
-GRASP-XX text: riding 1059 buys us nothing we actually have.
+**Why riding 1059 was not defensible.** This is the decisive argument, and it is now stated in the
+GRASP-XX text (`grasp-xx-draft.md`, "Why not kind `1059`"): riding 1059 bought nothing we actually
+had.
 
 - Our stream wraps are **tagless**, and vanilla ngit-grasp's related-event policy rejects tagless
   1059s as orphans (`src/nostr/builder.rs:701-717`); our own nodes reject 1059s from unregistered
@@ -518,9 +580,10 @@ GRASP-XX text: riding 1059 buys us nothing we actually have.
   which a tagless wrap never matches.
 - The cost is real and asymmetric: a relay that implements NIP-59's AUTH-gating SHOULD makes
   p-tag-less wraps **silently unservable to everyone**, because no recipient exists to AUTH as. Our
-  design requires the exact opposite — characterized (for the upstream read path, not for our own
-  wrap shape) by gate G3, `tests/phase0_gates.rs:452-512`; see item 7b for what G3 does and does not
-  cover. Sitting on 1059 means one conformant upstream relay upgrade can black-hole a repo.
+  design requires the exact opposite — characterized for the upstream read path by gate G3
+  (`tests/phase0_gates.rs:452-512`) and, for our own tagless wrap shape, by exit36/exit39
+  (`tests/private_repos.rs:4881,4892`); see item 7b. Sitting on 1059 would have meant one conformant
+  upstream relay upgrade could black-hole a repo.
 - Coexistence breaks: if GRASP-08 and GRASP-XX ever share a relay, kind 1059 would need two
   contradictory relay treatments at once — AUTH-gated for 08's p-tagged wraps, anonymously readable
   for ours. (This assumes 08 wraps with genuine NIP-59; **not verified against the 08 draft** — open
@@ -602,10 +665,13 @@ Not NIP questions, but a standards reader will surface them.
 
 ## Open questions
 
-> **Resolved since the last revision.** "1059 overload: keep or mint our own kind?" is **decided —
-> MIGRATE to 3359/23359** (item 12). "Is the NIP-59 relay SHOULD applicable to author-addressed
-> wraps?" is moot as a consequence: the migration takes our stream wraps out of kind 1059 entirely,
-> so no NIP-59 relay rule applies to them and we no longer need an exemption (item 7b).
+> **Resolved since the last revision.** "1059 overload: keep or mint our own kind?" is **shipped —
+> MIGRATED to 3359/23359** on both sides (item 12). "Is the NIP-59 relay SHOULD applicable to
+> author-addressed wraps?" is moot as a consequence: the migration took our stream wraps out of kind
+> 1059 entirely, so no NIP-59 relay rule applies to them and no exemption is needed (item 7b) — with
+> the one caveat that the transitional legacy window keeps 1059 admissible on our nodes until an
+> operator closes it. The missing tagless admission gate that item 7b demanded has been written
+> (`tests/private_repos.rs:4881,4892`). What remains open is upstream kind registration (item 11).
 
 1. **Does GRASP-08 wrap with genuine NIP-59?** Assumed but **not verified against the 08 draft**.
    It is the sole support for item 12's coexistence argument, and it also determines whether an
