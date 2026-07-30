@@ -640,15 +640,19 @@ impl Purgatory {
         }
     }
 
-    /// Remove older states on coordinates promoted in this pass when their Git
-    /// objects are still unavailable. Reconstructable predecessors and states
-    /// from other authors remain available as rollback candidates.
+    /// Remove non-preferred states on coordinates promoted in this pass when
+    /// their Git objects are still unavailable. Reconstructable predecessors
+    /// and states from other authors remain available as rollback candidates.
     pub(crate) fn remove_unreconstructable_state_replacements(
         &self,
         identifier: &str,
         promoted: &[Event],
         source_repo_path: &Path,
     ) -> usize {
+        if promoted.is_empty() {
+            return 0;
+        }
+
         let is_preferred = |candidate: &Event, current: &Event| {
             candidate.created_at > current.created_at
                 || (candidate.created_at == current.created_at && candidate.id < current.id)

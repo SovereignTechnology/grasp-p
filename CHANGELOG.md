@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Removed superseded same-author repository states from purgatory after their
-  replacement is promoted when the pushed Git data cannot reconstruct them.
-  Reconstructable rollback states and other maintainers' states are retained.
+  replacement is promoted when the locally available Git data cannot
+  reconstruct them. Reconstructable rollback states and other maintainers'
+  states are retained.
 
 ## [2.0.0] - 2026-07-27
 
