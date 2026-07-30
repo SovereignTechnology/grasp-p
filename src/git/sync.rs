@@ -1060,6 +1060,7 @@ async fn process_purgatory_state_events(
     promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
+    let mut promoted_states = Vec::new();
 
     // Find state events in purgatory for this identifier
     let mut purgatory_states = purgatory.find_state(identifier);
@@ -1235,6 +1236,7 @@ async fn process_purgatory_state_events(
                     // Remove from purgatory
                     purgatory.remove_state_event(identifier, &entry.event.id);
                     result.states_released += 1;
+                    promoted_states.push(entry.event.clone());
 
                     // Add the newly saved state to db_repo_data so subsequent iterations
                     // can correctly determine if they're the latest
@@ -1329,6 +1331,20 @@ async fn process_purgatory_state_events(
                 }
             }
         }
+    }
+
+    let removed = purgatory.remove_unreconstructable_state_replacements(
+        identifier,
+        &promoted_states,
+        source_repo_path,
+    );
+    result.states_released += removed;
+    if removed > 0 {
+        info!(
+            identifier = %identifier,
+            removed,
+            "Removed unreconstructable superseded state events from purgatory"
+        );
     }
 
     result
