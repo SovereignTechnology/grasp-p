@@ -440,6 +440,13 @@ sequenceDiagram
     end
 ```
 
+State promotion remains oldest-first so reconstructable predecessors reach
+relay history before a newer replacement. After a promotion pass, purgatory
+removes only non-preferred events on the promoted event's exact coordinate
+(same author and `d` tag) when their Git objects are still unavailable.
+Reconstructable predecessors and other maintainers' states remain as rollback
+candidates.
+
 ### PR Event Arrival (Kind 1617/1618)
 
 ```mermaid

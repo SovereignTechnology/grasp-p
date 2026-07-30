@@ -35,7 +35,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
-use nostr_sdk::prelude::Event;
+use nostr_sdk::prelude::{Event, SaveEventStatus};
 
 use crate::git::authorization::{
     collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
@@ -863,7 +863,7 @@ async fn save_promoted_event(
     event: &Event,
     context: PurgatorySaveContext,
     promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SaveEventStatus> {
     if let Some(hooks) = promotion_hooks {
         hooks.before_event_saved(event, context).await;
     }
@@ -871,7 +871,6 @@ async fn save_promoted_event(
     database
         .save_event(event)
         .await
-        .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to save promoted event {}: {e}", event.id))
 }
 
@@ -1060,6 +1059,7 @@ async fn process_purgatory_state_events(
     promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
 ) -> ProcessResult {
     let mut result = ProcessResult::default();
+    let mut promoted_states = Vec::new();
 
     // Find state events in purgatory for this identifier
     let mut purgatory_states = purgatory.find_state(identifier);
@@ -1209,7 +1209,7 @@ async fn process_purgatory_state_events(
             )
             .await
             {
-                Ok(_) => {
+                Ok(save_status) => {
                     info!(
                         identifier = %identifier,
                         event_id = %entry.event.id,
@@ -1235,6 +1235,9 @@ async fn process_purgatory_state_events(
                     // Remove from purgatory
                     purgatory.remove_state_event(identifier, &entry.event.id);
                     result.states_released += 1;
+                    if save_status.is_success() {
+                        promoted_states.push(entry.event.clone());
+                    }
 
                     // Add the newly saved state to db_repo_data so subsequent iterations
                     // can correctly determine if they're the latest
@@ -1329,6 +1332,20 @@ async fn process_purgatory_state_events(
                 }
             }
         }
+    }
+
+    let removed = purgatory.remove_unreconstructable_state_replacements(
+        identifier,
+        &promoted_states,
+        source_repo_path,
+    );
+    result.states_released += removed;
+    if removed > 0 {
+        info!(
+            identifier = %identifier,
+            removed,
+            "Removed unreconstructable superseded state events from purgatory"
+        );
     }
 
     result

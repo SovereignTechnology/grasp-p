@@ -640,6 +640,62 @@ impl Purgatory {
         }
     }
 
+    /// Remove non-preferred states on coordinates promoted in this pass when
+    /// their Git objects are still unavailable. Reconstructable predecessors
+    /// and states from other authors remain available as rollback candidates.
+    pub(crate) fn remove_unreconstructable_state_replacements(
+        &self,
+        identifier: &str,
+        promoted: &[Event],
+        source_repo_path: &Path,
+    ) -> usize {
+        if promoted.is_empty() {
+            return 0;
+        }
+
+        let is_preferred = |candidate: &Event, current: &Event| {
+            candidate.created_at > current.created_at
+                || (candidate.created_at == current.created_at && candidate.id < current.id)
+        };
+        let mut winners = HashMap::<PublicKey, &Event>::new();
+        for event in promoted {
+            winners
+                .entry(event.pubkey)
+                .and_modify(|current| {
+                    if is_preferred(event, current) {
+                        *current = event;
+                    }
+                })
+                .or_insert(event);
+        }
+
+        let removable: HashSet<EventId> = self
+            .find_state(identifier)
+            .into_iter()
+            .filter(|entry| {
+                winners.get(&entry.event.pubkey).is_some_and(|winner| {
+                    is_preferred(winner, &entry.event)
+                        && !can_apply_state(&entry.event, source_repo_path)
+                })
+            })
+            .map(|entry| entry.event.id)
+            .collect();
+        if removable.is_empty() {
+            return 0;
+        }
+
+        let Some(mut entries) = self.state_events.get_mut(identifier) else {
+            return 0;
+        };
+        let before = entries.len();
+        entries.retain(|entry| !removable.contains(&entry.event.id));
+        let removed = before - entries.len();
+        drop(entries);
+        self.state_events
+            .remove_if(identifier, |_, entries| entries.is_empty());
+        removed
+    }
+
     /// Find state events that could be satisfied by ref updates.
     ///
     /// Returns state events waiting for this identifier where applying the
@@ -2797,6 +2853,58 @@ async fn test_multiple_state_events_same_identifier() {
     assert!(authors.contains(&keys1.public_key()));
     assert!(authors.contains(&keys2.public_key()));
     assert!(authors.contains(&keys3.public_key()));
+}
+
+#[test]
+fn cleanup_keeps_reconstructable_and_independent_state_fallbacks() {
+    let purgatory = Purgatory::new(PathBuf::new());
+    let author = Keys::generate();
+    let other_author = Keys::generate();
+    let identifier = "state-cleanup";
+    let state = |keys: &Keys, created_at: u64, oid: Option<&str>| {
+        let mut tags = vec![Tag::identifier(identifier)];
+        if let Some(oid) = oid {
+            tags.push(Tag::custom("refs/heads/main", [oid.to_string()]));
+        }
+        EventBuilder::new(Kind::RepoState, "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(created_at))
+            .finalize(keys)
+            .unwrap()
+    };
+
+    let missing_oid = "a".repeat(40);
+    let missing_older = state(&author, 100, Some(&missing_oid));
+    let reconstructable_older = state(&author, 101, None);
+    let promoted = state(&author, 200, None);
+    let missing_newer = state(&author, 300, Some(&missing_oid));
+    let other_coordinate = state(&other_author, 100, Some(&missing_oid));
+
+    for event in [
+        &missing_older,
+        &reconstructable_older,
+        &missing_newer,
+        &other_coordinate,
+    ] {
+        purgatory.add_state(event.clone(), identifier.to_string(), event.pubkey, false);
+    }
+
+    let removed = purgatory.remove_unreconstructable_state_replacements(
+        identifier,
+        &[promoted],
+        Path::new("/not/a/git/repository"),
+    );
+
+    assert_eq!(removed, 1);
+    let remaining: HashSet<EventId> = purgatory
+        .find_state(identifier)
+        .into_iter()
+        .map(|entry| entry.event.id)
+        .collect();
+    assert!(!remaining.contains(&missing_older.id));
+    assert!(remaining.contains(&reconstructable_older.id));
+    assert!(remaining.contains(&missing_newer.id));
+    assert!(remaining.contains(&other_coordinate.id));
 }
 
 #[tokio::test]
