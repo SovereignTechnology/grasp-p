@@ -11,6 +11,26 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
+      # The suite must be hermetic with respect to ambient git configuration,
+      # so CI always runs it under a deliberately hostile global config: a
+      # failing pre-commit hook delivered via both core.hooksPath and
+      # init.templateDir, plus the settings that have bitten before. The
+      # settings target test-side git only: the relay never runs `git commit`,
+      # so its server-side operations are unaffected except for
+      # init.defaultBranch, which is exactly the regression being guarded.
+      # (The hermetic helpers make the tests themselves config-blind, so this
+      # single run also covers hosts where these settings are unset.)
+      - name: Install hostile git configuration
+        run: |
+          mkdir -p /tmp/hostile-git/hooks /tmp/hostile-git/template/hooks
+          printf '#!/bin/sh\necho "hostile hook: ambient git config leaked into a test" >&2\nexit 1\n' \
+            | tee /tmp/hostile-git/hooks/pre-commit > /tmp/hostile-git/template/hooks/pre-commit
+          chmod +x /tmp/hostile-git/hooks/pre-commit /tmp/hostile-git/template/hooks/pre-commit
+          git config --global init.defaultBranch main
+          git config --global core.hooksPath /tmp/hostile-git/hooks
+          git config --global init.templateDir /tmp/hostile-git/template
+          git config --global commit.gpgsign true
+          git config --global core.autocrlf true
       - run: nix develop --command cargo fmt --all -- --check
       - run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
       - run: nix develop --command cargo test --locked
