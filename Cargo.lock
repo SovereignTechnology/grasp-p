@@ -114,9 +114,9 @@ dependencies = [
 
 [[package]]
 name = "async-wsocket"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c69f24cf7a798027c6b0801de5bfd05d01fe343e87a8329f7c8b46a6d3bc4a79"
+checksum = "efa9ef232c1731ddbe4a306b5b5dcf9e50a924d6bd086d4784939d14f8e78daa"
 dependencies = [
  "futures",
  "futures-util",
@@ -133,12 +133,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomic-destructor"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef49f5882e4b6afaac09ad239a4f8c70a24b8f2b0897edb1f706008efd109cf4"
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -152,9 +146,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bech32"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
 
 [[package]]
 name = "bip39"
@@ -1210,9 +1204,9 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
 
 [[package]]
 name = "matchers"
@@ -1280,6 +1274,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bitcoin_hashes",
  "clap",
  "dashmap",
  "dotenvy",
@@ -1295,7 +1290,6 @@ dependencies = [
  "nostr",
  "nostr-lmdb",
  "nostr-memory",
- "nostr-relay-builder",
  "nostr-sdk",
  "prometheus",
  "rand 0.10.1",
@@ -1311,9 +1305,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a901cdb1982b9bf73a8d8a7270978345aabd0c62544f6a9a5c35a13d0a7f5824"
+checksum = "0334ad7a19f229983c808840f65d813d09c7fc030775db5d325abffa1295fe6c"
 dependencies = [
  "base64",
  "bech32",
@@ -1335,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-database"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc883371f13c7c6ab53e9a541fd76955d5fafe8418ccae1439fc64ff0c6bb2f"
+checksum = "82e3827aa36205889d9950bb07e9ab9380f7881ab3b059956f2d87651fa64281"
 dependencies = [
  "btreecap",
  "flatbuffers",
@@ -1347,9 +1341,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-gossip"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c719c20a592b898e636f85a030fdba3689c7a07cc8707c9c2b34f1fb72a3db70"
+checksum = "a4696e01b02eb84daa6d8419f529c6e6f3063b742a54925dc0300a3230871477"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1357,9 +1351,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-lmdb"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "352aa0d58315128c581c3046f91bbb9b39b482d5ff3300ceea748726b889d4fc"
+checksum = "2832ab8243313733630c90208f36b9859dd939b13c745c977f2a0c465b5ec117"
 dependencies = [
  "async-utility",
  "flume",
@@ -1372,9 +1366,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-memory"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96fce3c7c698afe88d9ac28f78e8dd68de6ecd3accfa99f2b7b76791e0ac24c2"
+checksum = "1688a4bfea60f72ca212c55f23cc9f068bfb5e787829d85fc7f689c3df9de842"
 dependencies = [
  "btreecap",
  "nostr",
@@ -1383,30 +1377,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr-relay-builder"
-version = "0.45.0-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d6f997d7bdbd18ab6fd5bf7d402c80dd1d313599461723a111a3ace10b2440"
-dependencies = [
- "async-utility",
- "async-wsocket",
- "atomic-destructor",
- "faster-hex",
- "negentropy",
- "nostr",
- "nostr-database",
- "nostr-memory",
- "nostr-sdk",
- "opaquerr",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "nostr-sdk"
-version = "0.45.0-alpha.3"
+version = "0.45.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efa5827340f0296084ead006938172fa946531185741af15c8bf4e60b6f3ad7f"
+checksum = "c2ffff8a1d69b9828574ead3b34d615bffe4c75ff3e3335a28f111867c7f7cdd"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -1417,7 +1391,9 @@ dependencies = [
  "nostr",
  "nostr-database",
  "nostr-gossip",
+ "nostr-memory",
  "opaquerr",
+ "rand 0.10.1",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -1703,6 +1679,8 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
+ "libc",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
 
@@ -1712,7 +1690,7 @@ version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha",
+ "rand_chacha 0.9.0",
  "rand_core 0.9.5",
 ]
 
@@ -1725,6 +1703,16 @@ dependencies = [
  "chacha20 0.10.0",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1742,6 +1730,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"
@@ -1924,12 +1915,13 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "secp256k1"
-version = "0.29.1"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
+checksum = "b50c5943d326858130af85e049f2661ba3c78b26589b8ab98e65e80ae44a1252"
 dependencies = [
+ "bitcoin_hashes",
+ "rand 0.8.6",
  "secp256k1-sys",
- "serde",
 ]
 
 [[package]]

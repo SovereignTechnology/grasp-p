@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nostr_relay_builder::prelude::{Event, WritePolicy, WritePolicyResult};
-use nostr_relay_builder::LocalRelay;
+use nostr_sdk::local_relay::LocalRelay;
 use nostr_sdk::prelude::PublicKey;
+use nostr_sdk::prelude::{Event, WritePolicy, WritePolicyResult};
 use tracing::{debug, info, warn};
 
 use crate::git::sync::{PurgatoryPromotionHooks, PurgatorySaveContext};

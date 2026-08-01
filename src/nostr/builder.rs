@@ -4,16 +4,18 @@
 /// Deletion behaviour is owned by the `nostr::lifecycle` subsystem;
 /// this module keeps top-level `admit_event`
 /// dispatch and non-deletion admission/router policy logic.
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use nostr::nips::nip19::ToBech32;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
-use nostr_relay_builder::prelude::*;
+use nostr_sdk::prelude::*;
 
 use crate::config::{Config, DatabaseBackend};
 use crate::nostr::events::RepositoryAnnouncement;
@@ -143,7 +145,7 @@ impl Nip34WritePolicy {
     ///
     /// This must be called after the relay is created since the relay depends
     /// on this policy, but purgatory sync needs the relay to notify subscribers.
-    pub fn set_local_relay(&self, relay: nostr_relay_builder::LocalRelay) {
+    pub fn set_local_relay(&self, relay: nostr_sdk::local_relay::LocalRelay) {
         self.ctx.set_local_relay(relay);
     }
 
@@ -163,7 +165,7 @@ impl Nip34WritePolicy {
             .clone()
     }
 
-    pub(crate) fn local_relay(&self) -> Option<nostr_relay_builder::LocalRelay> {
+    pub(crate) fn local_relay(&self) -> Option<nostr_sdk::local_relay::LocalRelay> {
         self.ctx.get_local_relay()
     }
 
@@ -793,9 +795,9 @@ impl Nip34WritePolicy {
 impl WritePolicy for Nip34WritePolicy {
     fn admit_event<'a>(
         &'a self,
-        event: &'a nostr_relay_builder::prelude::Event,
+        event: &'a nostr_sdk::prelude::Event,
         addr: &'a SocketAddr,
-    ) -> BoxedFuture<'a, WritePolicyResult> {
+    ) -> Pin<Box<dyn Future<Output = WritePolicyResult> + Send + 'a>> {
         Box::pin(async move {
             // Check event blacklist FIRST - it overrides everything
             if let Some(reason) = self.check_event_blacklist(event) {

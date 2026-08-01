@@ -2,7 +2,7 @@ use nostr::nips::nip19::ToBech32;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use nostr_relay_builder::prelude::{Event, Filter, Kind, PublicKey, Timestamp};
+use nostr_sdk::prelude::{Event, Filter, Kind, PublicKey, Timestamp};
 
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::lifecycle::{DeletionSource, RequestClassification};
@@ -704,7 +704,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use nostr_relay_builder::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     use super::super::DeletionContext;
     use super::*;

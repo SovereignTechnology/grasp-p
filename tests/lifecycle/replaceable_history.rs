@@ -357,7 +357,7 @@ async fn newer_30617_supersedes_older_and_preserves_old_in_history() {
 
 #[tokio::test]
 async fn sync_style_admit_then_save_captures_superseded_history_once() {
-    use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};
+    use nostr_sdk::prelude::{WritePolicy, WritePolicyResult};
 
     let git_dir = tempfile::tempdir().expect("git tempdir");
     let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());

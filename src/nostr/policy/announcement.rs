@@ -2,7 +2,7 @@
 ///
 /// Handles validation of NIP-34 repository announcements (kind 30617)
 /// according to GRASP-01 specification.
-use nostr_relay_builder::prelude::{Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag};
+use nostr_sdk::prelude::{Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag};
 use std::collections::HashSet;
 use std::time::Duration;
 

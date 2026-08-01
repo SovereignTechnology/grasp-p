@@ -33,7 +33,7 @@
 use std::collections::HashSet;
 
 use nostr::nips::nip19::ToBech32;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
     WritePolicyResult,
 };
@@ -414,7 +414,7 @@ mod tests {
     use crate::nostr::lifecycle::RequestLifecycleRecord;
     use crate::nostr::lifecycle::Tombstones;
     use crate::purgatory::Purgatory;
-    use nostr_relay_builder::prelude::*;
+    use nostr_sdk::prelude::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -804,10 +804,10 @@ mod tests {
         let attacker_keys = Keys::generate();
         let victim_keys = Keys::generate();
 
-        let foreign_target = EventBuilder::text_note("real event from victim")
+        let foreign_target = EventBuilder::new(Kind::TextNote, "real event from victim")
             .finalize(&victim_keys)
             .unwrap();
-        let valid_target = EventBuilder::text_note("real event from deleter")
+        let valid_target = EventBuilder::new(Kind::TextNote, "real event from deleter")
             .finalize(&attacker_keys)
             .unwrap();
         let deletion = EventBuilder::new(Kind::EventDeletion, "")

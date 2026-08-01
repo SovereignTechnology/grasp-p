@@ -22,7 +22,7 @@ use ngit_grasp::nostr::lifecycle::{
 use ngit_grasp::nostr::SharedDatabase;
 use ngit_grasp::purgatory::Purgatory;
 use ngit_grasp::sync::rejected_index::RejectedEventsIndex;
-use nostr_relay_builder::prelude::LocalRelayBuilder;
+use nostr_sdk::prelude::LocalRelayBuilder;
 use nostr_sdk::prelude::*;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;

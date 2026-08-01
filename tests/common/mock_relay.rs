@@ -43,7 +43,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use nostr_relay_builder::prelude::*;
+use nostr_sdk::prelude::*;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -267,8 +267,8 @@ async fn handle_request(
 
 /// Derive the Sec-WebSocket-Accept key from the request key.
 fn derive_accept_key(request_key: &[u8]) -> String {
-    use nostr::hashes::sha1::Hash as Sha1Hash;
-    use nostr::hashes::{Hash, HashEngine};
+    use bitcoin_hashes::sha1::Hash as Sha1Hash;
+    use bitcoin_hashes::{Hash, HashEngine};
 
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -307,6 +307,9 @@ async fn wait_for_server_ready(port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Disambiguate from `nostr_sdk::local_relay::MockRelay`, which the SDK
+    // prelude also exports since the relay builder was merged into nostr-sdk.
+    use super::MockRelay;
     use nostr_sdk::prelude::*;
     use std::time::Duration;
 
@@ -339,7 +342,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Create and send a simple event
-        let event = EventBuilder::text_note("Test note from MockRelay test")
+        let event = EventBuilder::new(Kind::TextNote, "Test note from MockRelay test")
             .finalize(&keys)
             .expect("Failed to sign event");
 

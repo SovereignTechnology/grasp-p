@@ -40,7 +40,9 @@ use std::time::Duration;
 
 /// Helper to create a test event
 async fn create_test_event(keys: &Keys, content: &str) -> Event {
-    EventBuilder::text_note(content).finalize(keys).unwrap()
+    EventBuilder::new(Kind::TextNote, content)
+        .finalize(keys)
+        .unwrap()
 }
 
 /// Helper to create a state event with specific refs

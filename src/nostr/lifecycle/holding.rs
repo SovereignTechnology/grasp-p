@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, io::ErrorKind};
 
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };

@@ -3,7 +3,7 @@
 /// Handles validation of NIP-34 PR events (kind 1618) and PR Update events (kind 1619)
 /// according to GRASP-01 specification.
 use anyhow::{bail, Result};
-use nostr_relay_builder::prelude::Event;
+use nostr_sdk::prelude::Event;
 
 use super::PolicyContext;
 use crate::git;

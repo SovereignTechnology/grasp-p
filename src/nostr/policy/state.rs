@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use nostr_relay_builder::builder::WritePolicyResult;
+use nostr_sdk::local_relay::WritePolicyResult;
 /// State Policy - State event validation + ref alignment
 ///
 /// Handles validation of NIP-34 repository state events (kind 30618)
 /// and aligns git refs with authorized state according to GRASP-01.
-use nostr_relay_builder::prelude::Event;
+use nostr_sdk::prelude::Event;
 
 use super::{accepted_purgatory, duplicate, reject_invalid, reject_restricted, PolicyContext};
 use crate::git;

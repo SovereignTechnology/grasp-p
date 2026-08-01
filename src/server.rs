@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nostr_relay_builder::LocalRelay;
+use nostr_sdk::local_relay::LocalRelay;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};

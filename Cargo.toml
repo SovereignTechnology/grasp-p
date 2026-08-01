@@ -16,16 +16,27 @@ hyper = { version = "1.4", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"] }
 http-body-util = "0.1"
 
-# Nostr relay
-nostr-relay-builder = "0.45.0-alpha.3"
-
 # Nostr
-nostr = "0.45.0-alpha.3"
-nostr-sdk = "0.45.0-alpha.3"
-nostr-lmdb = "0.45.0-alpha.3"
-nostr-memory = "0.45.0-alpha.3"
+#
+# These are prerelease (alpha) requirements and are pinned exactly with `=`.
+# Cargo treats `"0.45.0-alpha.8"` as `^0.45.0-alpha.8`, which accepts *any*
+# later prerelease of 0.45.0 even though alphas carry no compatibility
+# guarantee (alpha.4 deleted the `nostr-relay-builder` crate outright). Exact
+# pins keep lockfile-less builds - `cargo install`, downstream consumers of the
+# `ngit_grasp` library - on the version this tree is tested against.
+# Relax to caret requirements once 0.45.0 is released.
+nostr = "=0.45.0-alpha.8"
+# `local-relay` carries the embedded relay implementation, previously the
+# separate `nostr-relay-builder` crate.
+nostr-sdk = { version = "=0.45.0-alpha.8", features = ["local-relay"] }
+nostr-lmdb = "=0.45.0-alpha.8"
+nostr-memory = "=0.45.0-alpha.8"
 
 # Utilities
+# SHA-1 for the `Sec-WebSocket-Accept` handshake. `nostr` uses this same crate
+# internally but stopped re-exporting it as `nostr::hashes` in 0.45.0-alpha.8,
+# so depend on it directly rather than pulling in a second hash implementation.
+bitcoin_hashes = "0.14"
 futures-util = "0.3"
 base64 = "0.22"
 flate2 = "1.0"

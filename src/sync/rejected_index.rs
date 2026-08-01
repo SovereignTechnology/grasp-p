@@ -1036,11 +1036,11 @@ impl RejectedEventsIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::prelude::{EventBuilder, FinalizeUnsignedEvent, Keys, SignEvent};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeUnsignedEvent, Keys, Kind, SignEvent};
 
     async fn create_test_event() -> Event {
         let keys = Keys::generate();
-        let unsigned = nostr_sdk::prelude::EventBuilder::text_note("test")
+        let unsigned = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "test")
             .finalize_unsigned(keys.public_key());
         keys.sign_event(unsigned).unwrap()
     }
@@ -1290,10 +1290,15 @@ mod tests {
             RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_secs(604800));
         let keys = Keys::generate();
         let dependency_event = keys
-            .sign_event(EventBuilder::text_note("dependency").finalize_unsigned(keys.public_key()))
+            .sign_event(
+                EventBuilder::new(Kind::TextNote, "dependency")
+                    .finalize_unsigned(keys.public_key()),
+            )
             .unwrap();
         let permanent_event = keys
-            .sign_event(EventBuilder::text_note("permanent").finalize_unsigned(keys.public_key()))
+            .sign_event(
+                EventBuilder::new(Kind::TextNote, "permanent").finalize_unsigned(keys.public_key()),
+            )
             .unwrap();
         let pubkey = keys.public_key();
         let identifier = "test-repo".to_string();
@@ -1329,11 +1334,11 @@ mod tests {
         let keys1 = Keys::generate();
         let keys2 = Keys::generate();
 
-        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("test1")
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "test1")
             .finalize_unsigned(keys1.public_key());
         let event1 = keys1.sign_event(unsigned1).unwrap();
 
-        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("test2")
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "test2")
             .finalize_unsigned(keys2.public_key());
         let event2 = keys2.sign_event(unsigned2).unwrap();
 
@@ -1374,12 +1379,12 @@ mod tests {
         let keys = Keys::generate();
 
         // Create an announcement event
-        let unsigned_ann = nostr_sdk::prelude::EventBuilder::text_note("announcement")
+        let unsigned_ann = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "announcement")
             .finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).unwrap();
 
         // Create a state event
-        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state")
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "state")
             .finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).unwrap();
 
@@ -1434,12 +1439,12 @@ mod tests {
         let keys = Keys::generate();
 
         // Create an announcement event
-        let unsigned_ann = nostr_sdk::prelude::EventBuilder::text_note("announcement")
+        let unsigned_ann = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "announcement")
             .finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).unwrap();
 
         // Create a state event
-        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state")
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "state")
             .finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).unwrap();
 
@@ -1581,11 +1586,11 @@ mod tests {
         let keys = Keys::generate();
 
         // Create two events
-        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("event1")
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "event1")
             .finalize_unsigned(keys.public_key());
         let event1 = keys.sign_event(unsigned1).unwrap();
 
-        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("event2")
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "event2")
             .finalize_unsigned(keys.public_key());
         let event2 = keys.sign_event(unsigned2).unwrap();
 
@@ -1794,12 +1799,12 @@ mod tests {
         let keys = Keys::generate();
 
         // Create announcement event
-        let unsigned_ann = nostr_sdk::prelude::EventBuilder::text_note("announcement")
+        let unsigned_ann = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "announcement")
             .finalize_unsigned(keys.public_key());
         let event_ann = keys.sign_event(unsigned_ann).unwrap();
 
         // Create state event
-        let unsigned_state = nostr_sdk::prelude::EventBuilder::text_note("state")
+        let unsigned_state = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "state")
             .finalize_unsigned(keys.public_key());
         let event_state = keys.sign_event(unsigned_state).unwrap();
 
@@ -1849,15 +1854,15 @@ mod tests {
         let keys = Keys::generate();
 
         // Create events with different rejection reasons
-        let unsigned1 = nostr_sdk::prelude::EventBuilder::text_note("event1")
+        let unsigned1 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "event1")
             .finalize_unsigned(keys.public_key());
         let event1 = keys.sign_event(unsigned1).unwrap();
 
-        let unsigned2 = nostr_sdk::prelude::EventBuilder::text_note("event2")
+        let unsigned2 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "event2")
             .finalize_unsigned(keys.public_key());
         let event2 = keys.sign_event(unsigned2).unwrap();
 
-        let unsigned3 = nostr_sdk::prelude::EventBuilder::text_note("event3")
+        let unsigned3 = nostr_sdk::prelude::EventBuilder::new(Kind::TextNote, "event3")
             .finalize_unsigned(keys.public_key());
         let event3 = keys.sign_event(unsigned3).unwrap();
 

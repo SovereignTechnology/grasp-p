@@ -13,7 +13,8 @@ path = "src/bin/grasp-audit.rs"
 
 [dependencies]
 # Nostr
-nostr-sdk = "0.45.0-alpha.3"
+# Pinned exactly: see the rationale in the workspace root Cargo.toml.
+nostr-sdk = "=0.45.0-alpha.8"
 
 # Async
 tokio = { version = "1", features = ["full"] }

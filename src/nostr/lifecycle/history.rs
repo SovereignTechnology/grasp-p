@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };

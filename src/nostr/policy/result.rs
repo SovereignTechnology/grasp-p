@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use nostr::message::relay::SingleWord;
-use nostr_relay_builder::prelude::{MachineReadablePrefix, WritePolicyResult};
+use nostr_sdk::prelude::{MachineReadablePrefix, WritePolicyResult};
 
 /// The `purgatory:` machine-readable prefix.
 ///

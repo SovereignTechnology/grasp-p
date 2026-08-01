@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::process::Command;
 
-use nostr_relay_builder::prelude::{Event, Kind, Timestamp};
+use nostr_sdk::prelude::{Event, Kind, Timestamp};
 
 use super::{policy::DeletionPolicy, DeletionOutcome};
 use crate::nostr::events::RepositoryAnnouncement;
@@ -181,10 +181,10 @@ impl DeletionPolicy {
     /// Only removes entries whose author matches `author`.
     fn remove_by_event_id(
         &self,
-        author: &nostr_relay_builder::prelude::PublicKey,
+        author: &nostr_sdk::prelude::PublicKey,
         target_id_hex: &str,
         _deletion_created_at: u64,
-        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+        removed_ids: &mut HashSet<nostr_sdk::prelude::EventId>,
     ) -> DeletionOutcome {
         // --- Check PR events (kind 1617/1618) first — O(1) direct lookup ---
         // PR purgatory is keyed by event ID hex, so this is the cheapest check.
@@ -273,10 +273,10 @@ impl DeletionPolicy {
     /// Per NIP-09, all versions up to `deletion_created_at` are considered deleted.
     fn remove_by_coordinate(
         &self,
-        author: &nostr_relay_builder::prelude::PublicKey,
+        author: &nostr_sdk::prelude::PublicKey,
         coordinate: &str,
         deletion_created_at: u64,
-        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+        removed_ids: &mut HashSet<nostr_sdk::prelude::EventId>,
     ) -> DeletionOutcome {
         let mut outcome = DeletionOutcome::default();
         // Parse coordinate: `<kind>:<pubkey>:<d-identifier>`
@@ -356,9 +356,9 @@ impl DeletionPolicy {
     /// Remove a purgatory announcement and delete its bare repository from disk.
     fn evict_purgatory_entry(
         &self,
-        author: &nostr_relay_builder::prelude::PublicKey,
+        author: &nostr_sdk::prelude::PublicKey,
         identifier: &str,
-        removed_ids: &mut HashSet<nostr_relay_builder::prelude::EventId>,
+        removed_ids: &mut HashSet<nostr_sdk::prelude::EventId>,
     ) -> DeletionOutcome {
         let mut outcome = DeletionOutcome::default();
         // Get repo path before removing

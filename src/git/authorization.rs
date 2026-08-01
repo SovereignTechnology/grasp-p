@@ -29,7 +29,7 @@
 
 use anyhow::{anyhow, Result};
 use hyper::body::Bytes;
-use nostr_relay_builder::prelude::*;
+use nostr_sdk::prelude::*;
 use nostr_sdk::prelude::{EventId, ToBech32};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

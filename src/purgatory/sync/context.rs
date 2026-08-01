@@ -189,7 +189,7 @@ pub trait SyncContext: Send + Sync {
 // Real Implementation
 // =============================================================================
 
-use nostr_relay_builder::LocalRelay;
+use nostr_sdk::local_relay::LocalRelay;
 use std::process::Command;
 use std::sync::Arc;
 use tracing::debug;

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
 };
 

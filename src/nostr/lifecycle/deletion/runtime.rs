@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Args;
-use nostr_relay_builder::prelude::{PublicKey, Timestamp};
+use nostr_sdk::prelude::{PublicKey, Timestamp};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -263,7 +263,7 @@ mod tests {
     use std::sync::Arc;
 
     use nostr_memory::MemoryDatabase;
-    use nostr_relay_builder::prelude::{
+    use nostr_sdk::prelude::{
         EventBuilder, EventId, FinalizeEvent, Keys, Kind, NostrDatabase, Tag,
     };
 

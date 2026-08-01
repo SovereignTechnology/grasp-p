@@ -64,7 +64,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use hyper::body::{Bytes, Frame};
 use hyper::Response;
-use nostr_relay_builder::LocalRelay;
+use nostr_sdk::local_relay::LocalRelay;
 use nostr_sdk::prelude::*;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;

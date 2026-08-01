@@ -50,7 +50,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     PublicKey, SingleLetterTag, Tag, Timestamp,
 };

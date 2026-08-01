@@ -5,7 +5,7 @@
 //! module provides the direct accepted-event save facade for paths outside the
 //! relay builder.
 
-use nostr_relay_builder::prelude::Event;
+use nostr_sdk::prelude::Event;
 
 use crate::nostr::SharedDatabase;
 

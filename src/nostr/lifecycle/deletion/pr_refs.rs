@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use nostr_relay_builder::prelude::{Event, Kind};
+use nostr_sdk::prelude::{Event, Kind};
 
 use super::policy::{owner_directory_component, DeletionPolicy};
 use crate::git;

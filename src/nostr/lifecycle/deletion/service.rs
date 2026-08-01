@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     nip62, Alphabet, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Timestamp,
     WritePolicyResult,
 };
@@ -876,7 +876,7 @@ mod tests {
             self.lifecycle_for_request_result(request_id).await.unwrap()
         }
     }
-    use nostr_relay_builder::prelude::{EventBuilder, EventId, FinalizeEvent, Keys, Tag};
+    use nostr_sdk::prelude::{EventBuilder, EventId, FinalizeEvent, Keys, Tag};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -904,7 +904,7 @@ mod tests {
 
     fn vanish(keys: &Keys, content: &str) -> Event {
         EventBuilder::new(Kind::RequestToVanish, content)
-            .tags(vec![nostr_relay_builder::prelude::Tag::custom(
+            .tags(vec![nostr_sdk::prelude::Tag::custom(
                 "relay",
                 vec!["ALL_RELAYS".to_string()],
             )])
@@ -914,7 +914,7 @@ mod tests {
 
     fn non_targeting_vanish(keys: &Keys) -> Event {
         EventBuilder::new(Kind::RequestToVanish, "non-targeting")
-            .tags(vec![nostr_relay_builder::prelude::Tag::custom(
+            .tags(vec![nostr_sdk::prelude::Tag::custom(
                 "relay",
                 vec!["wss://other.example".to_string()],
             )])
@@ -1230,9 +1230,7 @@ mod tests {
         let service = DeletionService::new(ctx.clone());
         let keys = Keys::generate();
         let state = EventBuilder::new(Kind::RepoState, "")
-            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
-                "purgatory-only",
-            )])
+            .tags(vec![nostr_sdk::prelude::Tag::identifier("purgatory-only")])
             .finalize(&keys)
             .unwrap();
         ctx.purgatory.add_state(
@@ -1330,7 +1328,7 @@ mod tests {
             .unwrap();
         ctx.database.save_event(&target).await.unwrap();
         let state = EventBuilder::new(Kind::RepoState, "")
-            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
+            .tags(vec![nostr_sdk::prelude::Tag::identifier(
                 "preserve-purgatory",
             )])
             .finalize(&keys)
@@ -1376,7 +1374,7 @@ mod tests {
         let service = DeletionService::new(ctx.clone());
         let keys = Keys::generate();
         let state = EventBuilder::new(Kind::RepoState, "")
-            .tags(vec![nostr_relay_builder::prelude::Tag::identifier(
+            .tags(vec![nostr_sdk::prelude::Tag::identifier(
                 "disrespector-purgatory",
             )])
             .finalize(&keys)

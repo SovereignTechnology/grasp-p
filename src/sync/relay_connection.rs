@@ -735,7 +735,7 @@ impl RelayConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_relay_builder::prelude::LocalRelayBuilder;
+    use nostr_sdk::prelude::LocalRelayBuilder;
     use std::future::pending;
 
     #[tokio::test]
@@ -804,7 +804,7 @@ mod tests {
         let other = LocalRelayBuilder::default().build();
         other.run().await.expect("start other relay");
 
-        let expected = EventBuilder::text_note("only on the other relay")
+        let expected = EventBuilder::new(Kind::TextNote, "only on the other relay")
             .finalize(&Keys::generate())
             .expect("build event");
         other

@@ -3,9 +3,7 @@
 /// Handles validation of events that reference accepted repositories or events
 /// (backward references) and events that are referenced by accepted events
 /// (forward references).
-use nostr_relay_builder::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag,
-};
+use nostr_sdk::prelude::{Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag};
 
 use super::PolicyContext;
 

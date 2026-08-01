@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use nostr_relay_builder::prelude::{
+use nostr_sdk::prelude::{
     Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
 };
 use tar::Builder as TarBuilder;
@@ -255,7 +255,7 @@ impl DeletionPolicy {
         &self,
         author: &PublicKey,
         coordinate: &str,
-        deletion_created_at: nostr_relay_builder::prelude::Timestamp,
+        deletion_created_at: nostr_sdk::prelude::Timestamp,
         moved_ids: &mut HashSet<EventId>,
         source: DeletionSource,
     ) -> DeletionOutcome {

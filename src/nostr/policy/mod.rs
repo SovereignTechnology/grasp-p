@@ -26,7 +26,7 @@ pub use crate::git::sync::AlignmentResult;
 
 use super::SharedDatabase;
 use crate::purgatory::Purgatory;
-use nostr_relay_builder::LocalRelay;
+use nostr_sdk::local_relay::LocalRelay;
 use std::sync::Arc;
 
 /// Shared context for all sub-policies

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use flate2::read::GzDecoder;
-use nostr_relay_builder::prelude::{Event, Kind, PublicKey, Timestamp};
+use nostr_sdk::prelude::{Event, Kind, PublicKey, Timestamp};
 use tar::Archive as TarArchive;
 
 use super::DeletionService;

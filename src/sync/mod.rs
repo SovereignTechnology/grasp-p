@@ -52,7 +52,7 @@ use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
-use nostr_relay_builder::prelude::LocalRelay;
+use nostr_sdk::prelude::LocalRelay;
 
 const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
 const MAX_PURGATORY_FILTER_ACTIONS_PER_TICK: usize = 1;
@@ -3699,7 +3699,7 @@ impl SyncManager {
         rejected_events_index: &Arc<RejectedEventsIndex>,
         save_context: crate::nostr::persistence::SaveContext,
     ) -> ProcessResult {
-        use nostr_relay_builder::prelude::{WritePolicy, WritePolicyResult};
+        use nostr_sdk::prelude::{WritePolicy, WritePolicyResult};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         // Check if event already exists
         match database.event_by_id(&event.id).await {
@@ -5076,7 +5076,7 @@ mod tests {
                 .expect("build metadata event");
             pagination.record_event(&event);
         }
-        let note = EventBuilder::text_note("one note")
+        let note = EventBuilder::new(Kind::TextNote, "one note")
             .custom_created_at(Timestamp::from_secs(100))
             .finalize(&keys)
             .expect("build text note");

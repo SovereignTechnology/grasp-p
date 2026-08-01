@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nostr_relay_builder::prelude::{Filter, Kind, Timestamp};
+use nostr_sdk::prelude::{Filter, Kind, Timestamp};
 
 use crate::nostr::lifecycle::RequestLifecycleRecord;
 
@@ -129,7 +129,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use nostr_relay_builder::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Tag};
+    use nostr_sdk::prelude::{Event, EventBuilder, EventId, FinalizeEvent, Keys, Tag};
 
     use super::*;
     use crate::grasp06::receive::new_repo_init_locks;

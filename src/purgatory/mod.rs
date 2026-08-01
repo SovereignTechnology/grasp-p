@@ -1843,7 +1843,9 @@ mod tests {
 
         // Add some test data
         let keys = Keys::generate();
-        let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&keys)
+            .unwrap();
 
         purgatory.add_state(
             event.clone(),
@@ -1905,7 +1907,9 @@ mod tests {
         assert!(!purgatory.has_pending_events("test-repo"));
 
         // Add a state event
-        let event = EventBuilder::text_note("state").finalize(&keys).unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "state")
+            .finalize(&keys)
+            .unwrap();
         purgatory.add_state(event, "test-repo".to_string(), keys.public_key(), false);
 
         // Now should have pending events
@@ -1997,7 +2001,9 @@ mod tests {
 fn test_pr_event_vs_placeholder() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
-    let event = EventBuilder::text_note("test PR").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test PR")
+        .finalize(&keys)
+        .unwrap();
 
     // Add a PR event with actual event
     purgatory.add_pr(
@@ -2049,10 +2055,12 @@ fn test_cleanup_removes_expired_entries() {
     let keys = Keys::generate();
 
     // Create events
-    let state_event = EventBuilder::text_note("state event")
+    let state_event = EventBuilder::new(Kind::TextNote, "state event")
         .finalize(&keys)
         .unwrap();
-    let pr_event = EventBuilder::text_note("pr event").finalize(&keys).unwrap();
+    let pr_event = EventBuilder::new(Kind::TextNote, "pr event")
+        .finalize(&keys)
+        .unwrap();
 
     // Add entries to purgatory
     purgatory.add_state(
@@ -2105,10 +2113,12 @@ fn test_cleanup_preserves_non_expired_entries() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let state_event = EventBuilder::text_note("state event")
+    let state_event = EventBuilder::new(Kind::TextNote, "state event")
         .finalize(&keys)
         .unwrap();
-    let pr_event = EventBuilder::text_note("pr event").finalize(&keys).unwrap();
+    let pr_event = EventBuilder::new(Kind::TextNote, "pr event")
+        .finalize(&keys)
+        .unwrap();
 
     // Add fresh entries
     purgatory.add_state(
@@ -2145,8 +2155,12 @@ fn test_cleanup_mixed_expired_and_fresh() {
     let keys = Keys::generate();
 
     // Add multiple state events for same repo
-    let event1 = EventBuilder::text_note("event1").finalize(&keys).unwrap();
-    let event2 = EventBuilder::text_note("event2").finalize(&keys).unwrap();
+    let event1 = EventBuilder::new(Kind::TextNote, "event1")
+        .finalize(&keys)
+        .unwrap();
+    let event2 = EventBuilder::new(Kind::TextNote, "event2")
+        .finalize(&keys)
+        .unwrap();
 
     purgatory.add_state(event1, "test-repo".to_string(), keys.public_key(), false);
     purgatory.add_state(event2, "test-repo".to_string(), keys.public_key(), false);
@@ -2159,8 +2173,12 @@ fn test_cleanup_mixed_expired_and_fresh() {
     }
 
     // Add PR events
-    let pr1 = EventBuilder::text_note("pr1").finalize(&keys).unwrap();
-    let pr2 = EventBuilder::text_note("pr2").finalize(&keys).unwrap();
+    let pr1 = EventBuilder::new(Kind::TextNote, "pr1")
+        .finalize(&keys)
+        .unwrap();
+    let pr2 = EventBuilder::new(Kind::TextNote, "pr2")
+        .finalize(&keys)
+        .unwrap();
 
     purgatory.add_pr(pr1, "pr-1".to_string(), "commit-1".to_string(), false);
     purgatory.add_pr(pr2, "pr-2".to_string(), "commit-2".to_string(), false);
@@ -2190,8 +2208,12 @@ fn test_remove_expired_legacy_method() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let state_event = EventBuilder::text_note("state").finalize(&keys).unwrap();
-    let pr_event = EventBuilder::text_note("pr").finalize(&keys).unwrap();
+    let state_event = EventBuilder::new(Kind::TextNote, "state")
+        .finalize(&keys)
+        .unwrap();
+    let pr_event = EventBuilder::new(Kind::TextNote, "pr")
+        .finalize(&keys)
+        .unwrap();
 
     purgatory.add_state(state_event, "repo".to_string(), keys.public_key(), false);
     purgatory.add_pr(pr_event, "pr-id".to_string(), "commit".to_string(), false);
@@ -2219,8 +2241,12 @@ fn test_expired_event_tracking() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let state_event = EventBuilder::text_note("state").finalize(&keys).unwrap();
-    let pr_event = EventBuilder::text_note("pr").finalize(&keys).unwrap();
+    let state_event = EventBuilder::new(Kind::TextNote, "state")
+        .finalize(&keys)
+        .unwrap();
+    let pr_event = EventBuilder::new(Kind::TextNote, "pr")
+        .finalize(&keys)
+        .unwrap();
 
     let state_event_id = state_event.id;
     let pr_event_id = pr_event.id;
@@ -2268,8 +2294,12 @@ fn test_cleanup_expired_events() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let event1 = EventBuilder::text_note("event1").finalize(&keys).unwrap();
-    let event2 = EventBuilder::text_note("event2").finalize(&keys).unwrap();
+    let event1 = EventBuilder::new(Kind::TextNote, "event1")
+        .finalize(&keys)
+        .unwrap();
+    let event2 = EventBuilder::new(Kind::TextNote, "event2")
+        .finalize(&keys)
+        .unwrap();
 
     let event1_id = event1.id;
     let event2_id = event2.id;
@@ -2320,7 +2350,9 @@ fn test_expired_events_prevent_readdition() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
     let event_id = event.id;
 
     // Add event to purgatory
@@ -2381,7 +2413,9 @@ fn test_user_can_resubmit_expired_event() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
     let event_id = event.id;
 
     // Add event to purgatory
@@ -2424,10 +2458,10 @@ async fn test_save_and_restore_state_events() {
     let keys = Keys::generate();
 
     // Add multiple state events for the same identifier
-    let event1 = EventBuilder::text_note("state event 1")
+    let event1 = EventBuilder::new(Kind::TextNote, "state event 1")
         .finalize(&keys)
         .unwrap();
-    let event2 = EventBuilder::text_note("state event 2")
+    let event2 = EventBuilder::new(Kind::TextNote, "state event 2")
         .finalize(&keys)
         .unwrap();
 
@@ -2568,7 +2602,9 @@ async fn test_save_and_restore_expired_events() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
     let event_id = event.id;
 
     // Add and expire event
@@ -2707,7 +2743,9 @@ async fn test_downtime_calculation() {
     let keys = Keys::generate();
 
     // Add state event
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
 
     purgatory.add_state(event.clone(), "repo".to_string(), keys.public_key(), false);
 
@@ -2761,7 +2799,9 @@ async fn test_expiry_times_preserved() {
     let keys = Keys::generate();
 
     // Add state event
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
 
     purgatory.add_state(event.clone(), "repo".to_string(), keys.public_key(), false);
 
@@ -2808,13 +2848,13 @@ async fn test_multiple_state_events_same_identifier() {
     let keys3 = Keys::generate();
 
     // Add multiple state events for the same identifier from different authors
-    let event1 = EventBuilder::text_note("maintainer 1")
+    let event1 = EventBuilder::new(Kind::TextNote, "maintainer 1")
         .finalize(&keys1)
         .unwrap();
-    let event2 = EventBuilder::text_note("maintainer 2")
+    let event2 = EventBuilder::new(Kind::TextNote, "maintainer 2")
         .finalize(&keys2)
         .unwrap();
-    let event3 = EventBuilder::text_note("maintainer 3")
+    let event3 = EventBuilder::new(Kind::TextNote, "maintainer 3")
         .finalize(&keys3)
         .unwrap();
 
@@ -2973,7 +3013,9 @@ async fn test_file_cleanup_after_successful_restore() {
     let keys = Keys::generate();
 
     // Add some data
-    let event = EventBuilder::text_note("test").finalize(&keys).unwrap();
+    let event = EventBuilder::new(Kind::TextNote, "test")
+        .finalize(&keys)
+        .unwrap();
     purgatory.add_state(event, "repo".to_string(), keys.public_key(), false);
 
     // Save to disk
@@ -3002,7 +3044,7 @@ async fn test_save_and_restore_announcement_events() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let ann_event = EventBuilder::text_note("announcement event")
+    let ann_event = EventBuilder::new(Kind::TextNote, "announcement event")
         .finalize(&keys)
         .unwrap();
     let ann_event_id = ann_event.id;
@@ -3057,7 +3099,7 @@ async fn test_soft_expired_announcements_not_persisted() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let ann_event = EventBuilder::text_note("announcement event")
+    let ann_event = EventBuilder::new(Kind::TextNote, "announcement event")
         .finalize(&keys)
         .unwrap();
 
@@ -3100,7 +3142,7 @@ async fn test_announcement_with_missing_repo_skipped_on_restore() {
     let purgatory = Purgatory::new(PathBuf::new());
     let keys = Keys::generate();
 
-    let ann_event = EventBuilder::text_note("announcement event")
+    let ann_event = EventBuilder::new(Kind::TextNote, "announcement event")
         .finalize(&keys)
         .unwrap();
 
@@ -3140,7 +3182,7 @@ async fn test_comprehensive_roundtrip() {
     let keys2 = Keys::generate();
 
     // Add announcement
-    let ann_event = EventBuilder::text_note("announcement")
+    let ann_event = EventBuilder::new(Kind::TextNote, "announcement")
         .finalize(&keys1)
         .unwrap();
     let ann_event_id = ann_event.id;
@@ -3153,8 +3195,12 @@ async fn test_comprehensive_roundtrip() {
     );
 
     // Add multiple state events
-    let state1 = EventBuilder::text_note("state 1").finalize(&keys1).unwrap();
-    let state2 = EventBuilder::text_note("state 2").finalize(&keys2).unwrap();
+    let state1 = EventBuilder::new(Kind::TextNote, "state 1")
+        .finalize(&keys1)
+        .unwrap();
+    let state2 = EventBuilder::new(Kind::TextNote, "state 2")
+        .finalize(&keys2)
+        .unwrap();
 
     purgatory.add_state(
         state1.clone(),
@@ -3186,7 +3232,9 @@ async fn test_comprehensive_roundtrip() {
     purgatory.add_pr_placeholder("pr-2".to_string(), "commit-2".to_string());
 
     // Add and expire an event
-    let expired_event = EventBuilder::text_note("expired").finalize(&keys1).unwrap();
+    let expired_event = EventBuilder::new(Kind::TextNote, "expired")
+        .finalize(&keys1)
+        .unwrap();
     let expired_id = expired_event.id;
     purgatory.add_state(
         expired_event,

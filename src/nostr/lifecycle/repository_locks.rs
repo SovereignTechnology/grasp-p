@@ -217,7 +217,7 @@ impl RepositoryLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_relay_builder::prelude::Keys;
+    use nostr_sdk::prelude::Keys;
 
     #[tokio::test]
     async fn lifecycle_read_locks_can_be_held_concurrently() {
