@@ -1314,7 +1314,7 @@ impl<'a> TestContext<'a> {
 
         // -B creates or resets main at HEAD, tolerating a pre-existing local
         // main (e.g. when the host sets init.defaultBranch=main)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
             .output();
@@ -1416,7 +1416,7 @@ impl<'a> TestContext<'a> {
         // Create or reset main at our deterministic commit and check it out.
         // -B tolerates a pre-existing local main (e.g. when the host sets
         // init.defaultBranch=main)
-        let checkout_output = Command::new("git")
+        let checkout_output = git_command()
             .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
             .output();
@@ -1553,13 +1553,13 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["checkout", "--orphan", "main-new"])
             .current_dir(&clone_path)
             .output();
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["rm", "-rf", "--cached", "."])
             .current_dir(&clone_path)
             .output();
@@ -1577,12 +1577,12 @@ impl<'a> TestContext<'a> {
         };
 
         // Step 4: Replace main branch with our new orphan branch
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["branch", "-D", "main"])
             .current_dir(&clone_path)
             .output();
 
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["branch", "-m", "main"])
             .current_dir(&clone_path)
             .output();
@@ -1730,13 +1730,13 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["checkout", "--orphan", "main-new"])
             .current_dir(&clone_path)
             .output();
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["rm", "-rf", "--cached", "."])
             .current_dir(&clone_path)
             .output();
@@ -1757,12 +1757,12 @@ impl<'a> TestContext<'a> {
         };
 
         // Step 4: Replace main branch with our new orphan branch
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["branch", "-D", "main"])
             .current_dir(&clone_path)
             .output();
 
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["branch", "-m", "main"])
             .current_dir(&clone_path)
             .output();
@@ -1937,12 +1937,12 @@ impl<'a> TestContext<'a> {
         }
 
         // Create master branch if needed and push to refs/nostr/<pr-event-id>
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["branch", "-M", "master"])
             .current_dir(&clone_path)
             .output();
 
-        let push_output = Command::new("git")
+        let push_output = git_command()
             .args([
                 "push",
                 "origin",
@@ -2070,13 +2070,13 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["checkout", "--orphan", "pr-branch"])
             .current_dir(&clone_path)
             .output();
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["rm", "-rf", "--cached", "."])
             .current_dir(&clone_path)
             .output();
@@ -2112,7 +2112,7 @@ impl<'a> TestContext<'a> {
             ));
         }
 
-        let push_output = Command::new("git")
+        let push_output = git_command()
             .args([
                 "push",
                 "origin",
@@ -2335,9 +2335,9 @@ pub async fn send_and_verify_rejected(
 // Git Operation Helpers
 // ============================================================
 
+use crate::git_command;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 /// Clone a repository from the relay and return the path
@@ -2368,9 +2368,8 @@ pub fn clone_repo(relay_domain: &str, npub: &str, repo_id: &str) -> Result<PathB
     let _ = fs::remove_dir_all(&clone_path);
 
     let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
-    let output = Command::new("git")
+    let output = git_command()
         .args(["clone", &clone_url, clone_path.to_str().unwrap()])
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("Failed to execute git clone: {}", e))?;
 
@@ -2380,11 +2379,11 @@ pub fn clone_repo(relay_domain: &str, npub: &str, repo_id: &str) -> Result<PathB
     }
 
     // Configure git user
-    let _ = Command::new("git")
+    let _ = git_command()
         .args(["config", "user.email", "test@grasp-audit.local"])
         .current_dir(&clone_path)
         .output();
-    let _ = Command::new("git")
+    let _ = git_command()
         .args(["config", "user.name", "GRASP Audit Test"])
         .current_dir(&clone_path)
         .output();
@@ -2417,7 +2416,7 @@ pub fn create_commit(clone_path: &Path, message: &str) -> Result<String, String>
     fs::write(&test_file, message).map_err(|e| format!("Failed to write file: {}", e))?;
 
     let filename = test_file.file_name().unwrap().to_str().unwrap();
-    let output = Command::new("git")
+    let output = git_command()
         .args(["add", filename])
         .current_dir(clone_path)
         .output()
@@ -2427,7 +2426,7 @@ pub fn create_commit(clone_path: &Path, message: &str) -> Result<String, String>
         return Err("Git add failed".to_string());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-c", "commit.gpgsign=false", "commit", "-m", message])
         .current_dir(clone_path)
         .output()
@@ -2437,7 +2436,7 @@ pub fn create_commit(clone_path: &Path, message: &str) -> Result<String, String>
         return Err("Git commit failed".to_string());
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(clone_path)
         .output()
@@ -2514,7 +2513,7 @@ pub fn create_deterministic_commit_with_variant(
 
     fs::write(&test_file, content).map_err(|e| format!("Failed to write file: {}", e))?;
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["add", "test.txt"])
         .current_dir(clone_path)
         .output()
@@ -2525,7 +2524,7 @@ pub fn create_deterministic_commit_with_variant(
     }
 
     // Create deterministic commit with fixed dates and GPG disabled
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-c", "commit.gpgsign=false", "commit", "-m", message])
         .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
         .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00Z")
@@ -2538,7 +2537,7 @@ pub fn create_deterministic_commit_with_variant(
         return Err(format!("Git commit failed: {}", stderr));
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(clone_path)
         .output()
@@ -2594,10 +2593,9 @@ pub fn create_deterministic_commit(clone_path: &Path, _message: &str) -> Result<
 /// # }
 /// ```
 pub fn try_push(clone_path: &Path) -> Result<bool, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["push", "origin", "main", "--force"])
         .current_dir(clone_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("Failed to execute git push: {}", e))?;
 
@@ -2632,10 +2630,9 @@ pub fn try_push(clone_path: &Path) -> Result<bool, String> {
 /// # }
 /// ```
 pub fn try_push_to_ref(clone_path: &Path, ref_name: &str) -> Result<bool, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["push", "origin", &format!("HEAD:{}", ref_name)])
         .current_dir(clone_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("Failed to execute git push: {}", e))?;
 
@@ -2653,7 +2650,7 @@ pub fn try_push_to_ref(clone_path: &Path, ref_name: &str) -> Result<bool, String
 /// * `remote_url` - The remote URL to add as `origin`
 pub fn init_local_repo(path: &Path, remote_url: &str) -> Result<(), String> {
     // Step 1: git init <path>
-    let output = Command::new("git")
+    let output = git_command()
         .args(["init", path.to_str().unwrap_or(".")])
         .output()
         .map_err(|e| format!("Failed to execute git init: {}", e))?;
@@ -2664,7 +2661,7 @@ pub fn init_local_repo(path: &Path, remote_url: &str) -> Result<(), String> {
     }
 
     // Step 2: git config user.email
-    let output = Command::new("git")
+    let output = git_command()
         .args(["config", "user.email", "probe@grasp-audit.local"])
         .current_dir(path)
         .output()
@@ -2676,7 +2673,7 @@ pub fn init_local_repo(path: &Path, remote_url: &str) -> Result<(), String> {
     }
 
     // Step 3: git config user.name
-    let output = Command::new("git")
+    let output = git_command()
         .args(["config", "user.name", "GRASP Probe"])
         .current_dir(path)
         .output()
@@ -2688,7 +2685,7 @@ pub fn init_local_repo(path: &Path, remote_url: &str) -> Result<(), String> {
     }
 
     // Step 4: git symbolic-ref HEAD refs/heads/main (sets default branch to main)
-    let output = Command::new("git")
+    let output = git_command()
         .args(["symbolic-ref", "HEAD", "refs/heads/main"])
         .current_dir(path)
         .output()
@@ -2700,7 +2697,7 @@ pub fn init_local_repo(path: &Path, remote_url: &str) -> Result<(), String> {
     }
 
     // Step 5: git remote add origin <remote_url>
-    let output = Command::new("git")
+    let output = git_command()
         .args(["remote", "add", "origin", remote_url])
         .current_dir(path)
         .output()

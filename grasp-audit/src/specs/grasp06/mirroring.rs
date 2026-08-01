@@ -48,6 +48,7 @@
 //! sleep before the ref-mirror probe — keeps the total wait close to
 //! the original 2 s while making the two failure modes attributable.
 
+use crate::git_command;
 use crate::specs::grasp06::SpecRef;
 use crate::{
     create_commit, init_local_repo, try_push_to_ref, AuditClient, FixtureKind, TestContext,
@@ -56,7 +57,6 @@ use crate::{
 use nostr_sdk::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 pub struct MirroringTests;
@@ -619,9 +619,8 @@ impl MirroringTests {
             //    had ample time to run. A negative result here is a real
             //    "didn't happen, won't happen" signal.
             let refname = format!("refs/nostr/{}", pr_event_id);
-            let out = Command::new("git")
+            let out = git_command()
                 .args(["ls-remote", &prs_url, &refname])
-                .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .map_err(|e| format!("Failed to execute git ls-remote {}: {}", prs_url, e))?;
 
@@ -707,9 +706,5 @@ impl Drop for TempPath {
 /// Run a `git` command in `cwd` and return the [`std::process::Output`]
 /// unchanged. The caller decides whether non-zero exit is failure.
 fn run_git(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+    git_command().args(args).current_dir(cwd).output()
 }

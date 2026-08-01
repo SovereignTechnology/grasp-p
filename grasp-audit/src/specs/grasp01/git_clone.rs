@@ -15,11 +15,11 @@
 //! cd grasp-audit && nix develop -c bash test-ngit-relay.sh --mode test
 //! ```
 
+use crate::git_command;
 use crate::specs::grasp01::SpecRef;
 use crate::{AuditClient, FixtureKind, TestContext, TestResult};
 use nostr_sdk::prelude::*;
 use std::fs;
-use std::process::Command;
 
 /// Test suite for Git clone operations
 pub struct GitCloneTests;
@@ -106,7 +106,7 @@ impl GitCloneTests {
         let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
         // Attempt to clone the repository
-        let output = Command::new("git")
+        let output = git_command()
             .args(["clone", &clone_url, clone_path.to_str().unwrap()])
             .env("GIT_TERMINAL_PROMPT", "0") // Disable password prompts
             .output();
@@ -229,9 +229,8 @@ impl GitCloneTests {
 
         let invalid_url = format!("http://{}/invalid/path", relay_domain);
 
-        let output = Command::new("git")
+        let output = git_command()
             .args(["clone", &invalid_url, clone_path.to_str().unwrap()])
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
 

@@ -31,6 +31,7 @@
 pub mod audit;
 pub mod client;
 pub mod fixtures;
+pub mod git;
 pub mod isolation;
 pub mod probe;
 pub mod result;
@@ -62,6 +63,7 @@ pub use fixtures::{
     PR_TEST_COMMIT_HASH,
     RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH,
 };
+pub use git::git_command;
 pub use probe::{run_probe, ProbeCheck, ProbeReport};
 pub use result::{AuditResult, TestResult};
 

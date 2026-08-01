@@ -22,11 +22,11 @@
 //! cd grasp-audit && nix develop -c bash test-ngit-relay.sh --mode test
 //! ```
 
+use crate::git_command;
 use crate::specs::grasp01::SpecRef;
 use crate::{AuditClient, FixtureKind, TestContext, TestResult};
 use nostr_sdk::prelude::*;
 use std::fs;
-use std::process::Command;
 
 /// Test suite for Git filter capability operations
 pub struct GitFilterTests;
@@ -223,14 +223,13 @@ impl GitFilterTests {
         let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
         // Attempt filtered clone with blob:none
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "clone",
                 "--filter=blob:none",
                 &clone_url,
                 clone_path.to_str().unwrap(),
             ])
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
 
         // Clean up
@@ -334,14 +333,13 @@ impl GitFilterTests {
         let clone_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
         // First do a shallow clone to have a repository to fetch into
-        let clone_output = Command::new("git")
+        let clone_output = git_command()
             .args([
                 "clone",
                 "--depth=1",
                 &clone_url,
                 clone_path.to_str().unwrap(),
             ])
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
 
         // Clean up
@@ -360,10 +358,9 @@ impl GitFilterTests {
         }
 
         // Now attempt a filtered fetch
-        let output = Command::new("git")
+        let output = git_command()
             .args(["fetch", "--filter=tree:0", "origin"])
             .current_dir(&clone_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output();
 
         let output = match output {

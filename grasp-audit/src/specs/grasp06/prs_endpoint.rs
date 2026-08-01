@@ -5,6 +5,7 @@
 //! Each test here maps 1:1 to a MUST in the spec, or to an audit-derived
 //! invariant that follows directly from NIP-11 discovery semantics.
 
+use crate::git_command;
 use crate::specs::grasp06::fixtures::advertises_grasp;
 use crate::specs::grasp06::SpecRef;
 use crate::{
@@ -13,7 +14,6 @@ use crate::{
 use nostr_sdk::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 pub struct PrsEndpointTests;
@@ -164,9 +164,8 @@ impl PrsEndpointTests {
                 let _ = fs::remove_dir_all(&clone_path);
             };
 
-            let clone_output = Command::new("git")
+            let clone_output = git_command()
                 .args(["clone", &clone_url, clone_path.to_str().unwrap()])
-                .env("GIT_TERMINAL_PROMPT", "0")
                 .output();
 
             let clone_output = match clone_output {
@@ -186,7 +185,7 @@ impl PrsEndpointTests {
             // 4. Verify the cloned repo has zero refs. `for-each-ref` lists
             //    every ref one-per-line; empty stdout means no refs at all,
             //    which is the spec's "empty bare repository" invariant.
-            let refs_output = Command::new("git")
+            let refs_output = git_command()
                 .args(["-C", clone_path.to_str().unwrap(), "for-each-ref"])
                 .output();
 
@@ -520,9 +519,8 @@ impl PushValidationTests {
             //    empty stdout means the ref was deleted (or never written).
             //    A failed ls-remote (404 / connection error) is a setup
             //    failure — the /prs/ endpoint must be reachable.
-            let ls_out = Command::new("git")
+            let ls_out = git_command()
                 .args(["ls-remote", &prs_url, &refname])
-                .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .map_err(|e| format!("Failed to execute git ls-remote {}: {}", prs_url, e))?;
 
@@ -670,10 +668,9 @@ impl Drop for LocalWorkspace2 {
 /// Run a `git` command in `cwd` and require success. Returns the stderr text
 /// on failure so the caller's error message contains the actual git output.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("Failed to execute git {:?}: {}", args, e))?;
     if !output.status.success() {
@@ -687,10 +684,9 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
 /// about the exit code — the caller decides whether success or failure is
 /// the spec-correct outcome.
 fn git_push(cwd: &Path, url: &str, refname: &str) -> std::io::Result<std::process::Output> {
-    Command::new("git")
+    git_command()
         .args(["push", url, &format!("HEAD:{}", refname)])
         .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
 }
 

@@ -31,6 +31,7 @@
 #[allow(dead_code)]
 const PR_TEST_COMMIT_HASH: &str = "5a51b30e4615b572dcd5b9e487861b58605a5c21";
 
+use crate::git_command;
 use crate::specs::grasp01::SpecRef;
 use crate::{
     clone_repo, create_commit, create_deterministic_commit_with_variant, try_push, try_push_to_ref,
@@ -40,7 +41,6 @@ use crate::{
 use nostr_sdk::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 // ============================================================
@@ -66,13 +66,13 @@ use std::time::Duration;
 fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
     // Step 1: Clean up any tracked files in the working directory
     // This ensures we start with a clean slate
-    let _ = Command::new("git")
+    let _ = git_command()
         .args(["clean", "-fd"])
         .current_dir(clone_path)
         .output();
 
     // Step 2: Create orphan branch (removes all history)
-    let output = Command::new("git")
+    let output = git_command()
         .args(["checkout", "--orphan", "pr-test-branch"])
         .current_dir(clone_path)
         .output()
@@ -86,7 +86,7 @@ fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
     }
 
     // Step 3: Remove ALL files from the index (staging area)
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rm", "-rf", "--cached", "."])
         .current_dir(clone_path)
         .output()
@@ -123,7 +123,7 @@ fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
         create_deterministic_commit_with_variant(clone_path, CommitVariant::PRTestCommit)?;
 
     // Step 6: Verify this is actually a root commit (no parent)
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-list", "--max-parents=0", "HEAD"])
         .current_dir(clone_path)
         .output()
@@ -139,12 +139,12 @@ fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
     }
 
     // Step 7: Replace main branch with our new orphan branch
-    let _ = Command::new("git")
+    let _ = git_command()
         .args(["branch", "-D", "main"])
         .current_dir(clone_path)
         .output();
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["branch", "-m", "main"])
         .current_dir(clone_path)
         .output()
@@ -160,7 +160,7 @@ fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
     // Step 8: Verify commit hash matches expected
     if commit_hash != PR_TEST_COMMIT_HASH {
         // Debug: Show what's in the commit
-        let tree_output = Command::new("git")
+        let tree_output = git_command()
             .args(["ls-tree", "-r", "HEAD"])
             .current_dir(clone_path)
             .output();
@@ -168,7 +168,7 @@ fn create_pr_test_commit(clone_path: &Path) -> Result<String, String> {
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|_| "Failed to get tree".to_string());
 
-        let cat_output = Command::new("git")
+        let cat_output = git_command()
             .args(["cat-file", "-p", "HEAD"])
             .current_dir(clone_path)
             .output();
@@ -254,7 +254,7 @@ fn reset_to_correct_pr_commit(clone_path: &Path) -> Result<String, String> {
 /// Returns Ok(true) if push succeeded, Ok(false) if rejected, Err on git error.
 #[allow(dead_code)]
 fn push_to_pr_ref(clone_path: &Path, pr_event_id: &str) -> Result<bool, String> {
-    let push_output = Command::new("git")
+    let push_output = git_command()
         .args([
             "push",
             "--force",
@@ -332,7 +332,7 @@ async fn get_default_branch_from_info_refs(
 /// Checks if a ref exists on the remote.
 #[allow(dead_code)]
 fn ref_exists_on_remote(clone_path: &Path, ref_name: &str) -> Result<bool, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["ls-remote", "origin", ref_name])
         .current_dir(clone_path)
         .output()
@@ -541,8 +541,6 @@ impl PushAuthorizationTests {
         client: &AuditClient,
         relay_domain: &str,
     ) -> TestResult {
-        use std::process::Command;
-
         let test_name = "test_push_rejected_wrong_commit";
 
         // ============================================================
@@ -617,7 +615,7 @@ impl PushAuthorizationTests {
         };
 
         // Create/checkout main branch
-        let branch_output = Command::new("git")
+        let branch_output = git_command()
             .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
             .output();
@@ -1568,7 +1566,7 @@ impl PushAuthorizationTests {
         // ============================================================
         // Step 4: Create and checkout develop1 branch, then create unique commit
         // ============================================================
-        let output = Command::new("git")
+        let output = git_command()
             .args(["checkout", "-b", "develop1"])
             .current_dir(&clone_path)
             .output();
@@ -1683,14 +1681,13 @@ mod tests {
     #[test]
     fn test_pr_test_commit_hash_discovery() {
         use std::fs;
-        use std::process::Command;
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let path = temp_dir.path();
 
         // Initialize git repo
-        let output = Command::new("git")
+        let output = git_command()
             .args(["init"])
             .current_dir(path)
             .output()
@@ -1702,14 +1699,14 @@ mod tests {
         );
 
         // Configure git user - use same identity as clone_repo in fixtures.rs
-        let output = Command::new("git")
+        let output = git_command()
             .args(["config", "user.email", "test@grasp-audit.local"])
             .current_dir(path)
             .output()
             .expect("git config email failed");
         assert!(output.status.success(), "git config email failed");
 
-        let output = Command::new("git")
+        let output = git_command()
             .args(["config", "user.name", "GRASP Audit Test"])
             .current_dir(path)
             .output()
@@ -1721,7 +1718,7 @@ mod tests {
         fs::write(&test_file, "PR test deterministic commit\n").expect("Failed to write test file");
 
         // Add the file
-        let output = Command::new("git")
+        let output = git_command()
             .args(["add", "test.txt"])
             .current_dir(path)
             .output()
@@ -1733,7 +1730,7 @@ mod tests {
         );
 
         // Create deterministic commit with fixed dates and GPG disabled
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "-c",
                 "commit.gpgsign=false",
@@ -1753,7 +1750,7 @@ mod tests {
         );
 
         // Get the commit hash
-        let output = Command::new("git")
+        let output = git_command()
             .args(["rev-parse", "HEAD"])
             .current_dir(path)
             .output()
