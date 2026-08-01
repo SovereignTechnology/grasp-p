@@ -1312,18 +1312,10 @@ impl<'a> TestContext<'a> {
             ));
         }
 
-        let branch_out = Command::new("git")
-            .args(["branch", "main"])
-            .current_dir(&clone_path)
-            .output();
-        if let Ok(o) = &branch_out {
-            if !o.status.success() {
-                // branch may already exist (detached HEAD clone) — ignore
-            }
-        }
-
+        // -B creates or resets main at HEAD, tolerating a pre-existing local
+        // main (e.g. when the host sets init.defaultBranch=main)
         let _ = Command::new("git")
-            .args(["checkout", "main"])
+            .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
             .output();
 
@@ -1421,42 +1413,26 @@ impl<'a> TestContext<'a> {
             ));
         }
 
-        // Create main branch pointing to our deterministic commit
-        let branch_output = Command::new("git")
-            .args(["branch", "main"])
-            .current_dir(&clone_path)
-            .output();
-
-        match branch_output {
-            Err(e) => {
-                cleanup(&clone_path);
-                return Err(anyhow::anyhow!("Failed to create main branch: {}", e));
-            }
-            Ok(output) if !output.status.success() => {
-                cleanup(&clone_path);
-                return Err(anyhow::anyhow!(
-                    "Failed to create main branch: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            _ => {}
-        }
-
-        // Checkout main branch
+        // Create or reset main at our deterministic commit and check it out.
+        // -B tolerates a pre-existing local main (e.g. when the host sets
+        // init.defaultBranch=main)
         let checkout_output = Command::new("git")
-            .args(["checkout", "main"])
+            .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
             .output();
 
         match checkout_output {
             Err(e) => {
                 cleanup(&clone_path);
-                return Err(anyhow::anyhow!("Failed to checkout main branch: {}", e));
+                return Err(anyhow::anyhow!(
+                    "Failed to create/checkout main branch: {}",
+                    e
+                ));
             }
             Ok(output) if !output.status.success() => {
                 cleanup(&clone_path);
                 return Err(anyhow::anyhow!(
-                    "Failed to checkout main branch: {}",
+                    "Failed to create/checkout main branch: {}",
                     String::from_utf8_lossy(&output.stderr)
                 ));
             }
