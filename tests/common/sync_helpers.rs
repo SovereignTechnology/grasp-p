@@ -1274,6 +1274,11 @@ pub async fn push_unique_git_data_to_relay(
             .current_dir(path)
             .output()
             .expect("git rev-parse");
+        assert!(
+            out.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 

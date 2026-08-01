@@ -1313,11 +1313,11 @@ impl<'a> TestContext<'a> {
         }
 
         // -B creates or resets main at HEAD, tolerating a pre-existing local
-        // main (e.g. when the host sets init.defaultBranch=main)
-        let _ = git_command()
-            .args(["checkout", "-B", "main"])
-            .current_dir(&clone_path)
-            .output();
+        // main (the clone's initial branch follows the server's advertised HEAD)
+        if let Err(e) = run_fixture_git(&clone_path, &["checkout", "-B", "main"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to create/checkout main: {}", e));
+        }
 
         let push_result = try_push(&clone_path);
         cleanup(&clone_path);
@@ -1414,8 +1414,8 @@ impl<'a> TestContext<'a> {
         }
 
         // Create or reset main at our deterministic commit and check it out.
-        // -B tolerates a pre-existing local main (e.g. when the host sets
-        // init.defaultBranch=main)
+        // -B tolerates a pre-existing local main (the clone's initial branch
+        // follows the server's advertised HEAD)
         let checkout_output = git_command()
             .args(["checkout", "-B", "main"])
             .current_dir(&clone_path)
@@ -1553,16 +1553,16 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = git_command()
-            .args(["checkout", "--orphan", "main-new"])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["checkout", "--orphan", "main-new"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to create orphan branch: {}", e));
+        }
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = git_command()
-            .args(["rm", "-rf", "--cached", "."])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["rm", "-rf", "--cached", "."]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to clear staged files: {}", e));
+        }
 
         // Step 3: Create deterministic commit using maintainer variant
         let commit_hash = match create_deterministic_commit_with_variant(
@@ -1576,16 +1576,21 @@ impl<'a> TestContext<'a> {
             }
         };
 
-        // Step 4: Replace main branch with our new orphan branch
+        // Step 4: Replace main branch with our new orphan branch. Deleting the
+        // old main is best-effort (the clone may not have had one); the rename
+        // must succeed for the push below to target refs/heads/main.
         let _ = git_command()
             .args(["branch", "-D", "main"])
             .current_dir(&clone_path)
             .output();
 
-        let _ = git_command()
-            .args(["branch", "-m", "main"])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["branch", "-m", "main"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!(
+                "Failed to rename orphan branch to main: {}",
+                e
+            ));
+        }
 
         // Verify commit hash matches expected
         if commit_hash != MAINTAINER_DETERMINISTIC_COMMIT_HASH {
@@ -1730,16 +1735,16 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = git_command()
-            .args(["checkout", "--orphan", "main-new"])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["checkout", "--orphan", "main-new"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to create orphan branch: {}", e));
+        }
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = git_command()
-            .args(["rm", "-rf", "--cached", "."])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["rm", "-rf", "--cached", "."]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to clear staged files: {}", e));
+        }
 
         // Step 3: Create deterministic commit using recursive maintainer variant
         let commit_hash = match create_deterministic_commit_with_variant(
@@ -1756,16 +1761,21 @@ impl<'a> TestContext<'a> {
             }
         };
 
-        // Step 4: Replace main branch with our new orphan branch
+        // Step 4: Replace main branch with our new orphan branch. Deleting the
+        // old main is best-effort (the clone may not have had one); the rename
+        // must succeed for the push below to target refs/heads/main.
         let _ = git_command()
             .args(["branch", "-D", "main"])
             .current_dir(&clone_path)
             .output();
 
-        let _ = git_command()
-            .args(["branch", "-m", "main"])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["branch", "-m", "main"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!(
+                "Failed to rename orphan branch to main: {}",
+                e
+            ));
+        }
 
         // Verify commit hash matches expected
         if commit_hash != RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH {
@@ -1936,11 +1946,11 @@ impl<'a> TestContext<'a> {
             ));
         }
 
-        // Create master branch if needed and push to refs/nostr/<pr-event-id>
-        let _ = git_command()
-            .args(["branch", "-M", "master"])
-            .current_dir(&clone_path)
-            .output();
+        // Force-rename the current branch to master; the push below targets it.
+        if let Err(e) = run_fixture_git(&clone_path, &["branch", "-M", "master"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to create master branch: {}", e));
+        }
 
         let push_output = git_command()
             .args([
@@ -2070,16 +2080,16 @@ impl<'a> TestContext<'a> {
 
         // Reset to orphan state and create deterministic root commit
         // Step 1: Create orphan branch (removes all history)
-        let _ = git_command()
-            .args(["checkout", "--orphan", "pr-branch"])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["checkout", "--orphan", "pr-branch"]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to create orphan branch: {}", e));
+        }
 
         // Step 2: Clear staged files (orphan keeps files staged from previous branch)
-        let _ = git_command()
-            .args(["rm", "-rf", "--cached", "."])
-            .current_dir(&clone_path)
-            .output();
+        if let Err(e) = run_fixture_git(&clone_path, &["rm", "-rf", "--cached", "."]) {
+            cleanup(&clone_path);
+            return Err(anyhow::anyhow!("Failed to clear staged files: {}", e));
+        }
 
         // Step 3: Remove all working directory files for clean state (except .git)
         for entry in fs::read_dir(&clone_path)
@@ -2340,6 +2350,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Run a git command in `repo_path` and fail on a non-zero exit.
+///
+/// Fixture steps whose success later pushes and hash assertions depend on
+/// must not fail silently.
+fn run_fixture_git(repo_path: &Path, args: &[&str]) -> Result<(), String> {
+    let output = git_command()
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("git {} failed to spawn: {}", args.join(" "), e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// Clone a repository from the relay and return the path
 ///
 /// # Arguments
@@ -2378,15 +2408,12 @@ pub fn clone_repo(relay_domain: &str, npub: &str, repo_id: &str) -> Result<PathB
         return Err(format!("Git clone failed: {}", stderr));
     }
 
-    // Configure git user
-    let _ = git_command()
-        .args(["config", "user.email", "test@grasp-audit.local"])
-        .current_dir(&clone_path)
-        .output();
-    let _ = git_command()
-        .args(["config", "user.name", "GRASP Audit Test"])
-        .current_dir(&clone_path)
-        .output();
+    // Configure the committer identity the deterministic hashes are pinned to.
+    run_fixture_git(
+        &clone_path,
+        &["config", "user.email", "test@grasp-audit.local"],
+    )?;
+    run_fixture_git(&clone_path, &["config", "user.name", "GRASP Audit Test"])?;
 
     Ok(clone_path)
 }

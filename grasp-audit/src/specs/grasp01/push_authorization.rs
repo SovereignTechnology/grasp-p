@@ -338,6 +338,13 @@ fn ref_exists_on_remote(clone_path: &Path, ref_name: &str) -> Result<bool, Strin
         .output()
         .map_err(|e| format!("Failed to execute git ls-remote: {}", e))?;
 
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(!stdout.trim().is_empty())
 }
@@ -1571,10 +1578,22 @@ impl PushAuthorizationTests {
             .current_dir(&clone_path)
             .output();
 
-        if let Err(e) = output {
-            let _ = fs::remove_dir_all(&clone_path);
-            return TestResult::new(test_name, SpecRef::GitSetHeadOnReceive, desc)
-                .fail(format!("Failed to create develop1 branch: {}", e));
+        match output {
+            Err(e) => {
+                let _ = fs::remove_dir_all(&clone_path);
+                return TestResult::new(test_name, SpecRef::GitSetHeadOnReceive, desc)
+                    .fail(format!("Failed to create develop1 branch: {}", e));
+            }
+            Ok(out) if !out.status.success() => {
+                let _ = fs::remove_dir_all(&clone_path);
+                return TestResult::new(test_name, SpecRef::GitSetHeadOnReceive, desc).fail(
+                    format!(
+                        "Failed to create develop1 branch: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                );
+            }
+            Ok(_) => {}
         }
 
         // Create a unique commit on develop1

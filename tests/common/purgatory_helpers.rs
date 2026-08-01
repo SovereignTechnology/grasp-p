@@ -658,16 +658,10 @@ pub fn push_ref_to_relay(
 
     if check_output.status.success() {
         // Remote exists, update it
-        let _ = git_command()
-            .args(["remote", "set-url", "origin", &remote_url])
-            .current_dir(local_path)
-            .output();
+        run_git(local_path, &["remote", "set-url", "origin", &remote_url])?;
     } else {
         // Add new remote
-        let _ = git_command()
-            .args(["remote", "add", "origin", &remote_url])
-            .current_dir(local_path)
-            .output();
+        run_git(local_path, &["remote", "add", "origin", &remote_url])?;
     }
 
     // Push specific commit to specific ref

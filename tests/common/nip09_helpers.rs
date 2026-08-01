@@ -106,14 +106,21 @@ pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Even
         "deterministic commit hash mismatch"
     );
 
-    let _ = grasp_audit::git_command()
-        .args(["branch", "main"])
+    // Create or reset `main` at the deterministic commit and check it out.
+    // `-B` tolerates a pre-existing local `main` (the clone's initial branch
+    // follows the branch the server advertises as HEAD).
+    let checkout = grasp_audit::git_command()
+        .args(["checkout", "-B", "main"])
         .current_dir(&clone_path)
-        .output();
-    let _ = grasp_audit::git_command()
-        .args(["checkout", "main"])
-        .current_dir(&clone_path)
-        .output();
+        .output()
+        .expect("spawn git checkout -B main");
+    if !checkout.status.success() {
+        cleanup(&clone_path);
+        panic!(
+            "failed to create/checkout main before push: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
 
     let pushed = try_push(&clone_path);
     cleanup(&clone_path);
@@ -222,14 +229,21 @@ pub async fn publish_served_repo_with_maintainers(
         "deterministic commit hash mismatch"
     );
 
-    let _ = grasp_audit::git_command()
-        .args(["branch", "main"])
+    // Create or reset `main` at the deterministic commit and check it out.
+    // `-B` tolerates a pre-existing local `main` (the clone's initial branch
+    // follows the branch the server advertises as HEAD).
+    let checkout = grasp_audit::git_command()
+        .args(["checkout", "-B", "main"])
         .current_dir(&clone_path)
-        .output();
-    let _ = grasp_audit::git_command()
-        .args(["checkout", "main"])
-        .current_dir(&clone_path)
-        .output();
+        .output()
+        .expect("spawn git checkout -B main");
+    if !checkout.status.success() {
+        cleanup(&clone_path);
+        panic!(
+            "failed to create/checkout main before push: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
 
     let pushed = try_push(&clone_path);
     cleanup(&clone_path);
@@ -498,14 +512,21 @@ pub async fn publish_served_announcement_for_identifier(
         "deterministic commit hash mismatch"
     );
 
-    let _ = grasp_audit::git_command()
-        .args(["branch", "main"])
+    // Create or reset `main` at the deterministic commit and check it out.
+    // `-B` tolerates a pre-existing local `main` (the clone's initial branch
+    // follows the branch the server advertises as HEAD).
+    let checkout = grasp_audit::git_command()
+        .args(["checkout", "-B", "main"])
         .current_dir(&clone_path)
-        .output();
-    let _ = grasp_audit::git_command()
-        .args(["checkout", "main"])
-        .current_dir(&clone_path)
-        .output();
+        .output()
+        .expect("spawn git checkout -B main");
+    if !checkout.status.success() {
+        cleanup(&clone_path);
+        panic!(
+            "failed to create/checkout main before push: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
 
     let pushed = try_push(&clone_path);
     cleanup(&clone_path);
@@ -611,14 +632,21 @@ pub async fn publish_served_announcement_with_state_for_identifier(
         "deterministic commit hash mismatch"
     );
 
-    let _ = grasp_audit::git_command()
-        .args(["branch", "main"])
+    // Create or reset `main` at the deterministic commit and check it out.
+    // `-B` tolerates a pre-existing local `main` (the clone's initial branch
+    // follows the branch the server advertises as HEAD).
+    let checkout = grasp_audit::git_command()
+        .args(["checkout", "-B", "main"])
         .current_dir(&clone_path)
-        .output();
-    let _ = grasp_audit::git_command()
-        .args(["checkout", "main"])
-        .current_dir(&clone_path)
-        .output();
+        .output()
+        .expect("spawn git checkout -B main");
+    if !checkout.status.success() {
+        cleanup(&clone_path);
+        panic!(
+            "failed to create/checkout main before push: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
 
     let pushed = try_push(&clone_path);
     cleanup(&clone_path);
