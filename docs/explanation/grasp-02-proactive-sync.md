@@ -1006,7 +1006,9 @@ Degraded -> Dead: 24h+ of continuous failures
 Degraded -> Disconnected: Recovery (enters 5min stability period)
 Disconnected -> Healthy: Stable for 5 minutes after recovery
 Any -> RateLimited: NOTICE message from relay indicating rate limiting
-RateLimited -> previous state: After 65-second cooldown expires
+RateLimited -> Probing: After 65-second cooldown expires
+Probing -> previous state: Recovery REQs succeed
+Probing -> RateLimited: Recovery REQ is rate limited again
 ```
 
 ### Backoff Configuration
@@ -1016,7 +1018,9 @@ RateLimited -> previous state: After 65-second cooldown expires
 - **Default max**: 1 hour (configurable via `sync_max_backoff_secs`)
 - **Dead threshold**: 24 hours of continuous failures
 - **Dead retry interval**: Once per 24 hours
-- **Rate limit cooldown**: Fixed 65 seconds (60s typical limit + 5s buffer)
+- **Rate limit cooldown**: Fixed 65 seconds (60s typical limit + 5s buffer);
+  repeated notices during the same cooldown do not extend its deadline, while
+  a rejection after that deadline starts a new cooldown
 - **Stability period**: 5 minutes after recovery before marking as Healthy
 
 ### Special Behaviors
@@ -1025,7 +1029,8 @@ RateLimited -> previous state: After 65-second cooldown expires
 - **Desired GRASP-02 sources**: Remain registered and retryable before their
   first successful historic batch; an initially empty or unavailable source
   cannot make a purgatory invitation permanently lose its sync path
-- **Rate limiting**: Distinct from connection failures - triggered by relay NOTICE messages
+- **Rate limiting**: Distinct from connection failures and therefore not cleared
+  by a successful WebSocket connection; it is triggered by relay NOTICE messages
 - **Connection timeout**: Set to `base_backoff_secs` to ensure retry timing works correctly
 - **Connection concurrency**: At most eight DNS/websocket attempts run at once;
   queued attempts do not start health backoff until a worker slot is available

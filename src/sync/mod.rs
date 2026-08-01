@@ -4313,7 +4313,7 @@ impl SyncManager {
 
     /// Check for rate-limited relays that have exceeded cooldown
     ///
-    /// This method is called periodically by run_rate_limit_checker (every 1 second).
+    /// This method is called by the health and metrics checker every 2 seconds.
     /// For each relay in RateLimited state that has exceeded the 65-second cooldown:
     /// 1. Clears the rate limit state (sets to Healthy)
     /// 2. Recomputes required actions for that relay

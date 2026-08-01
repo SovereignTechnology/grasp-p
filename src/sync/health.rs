@@ -105,7 +105,7 @@ impl RelayHealth {
     ///
     /// ## State Logic
     ///
-    /// 1. **RateLimited**: If rate_limited flag is set and cooldown hasn't expired
+    /// 1. **RateLimited**: If the rate-limit cooldown hasn't expired
     /// 2. **Dead**: 24+ hours of continuous failures
     /// 3. **Degraded**: Active connection failures OR in stability period after recovery
     /// 4. **Disconnected**: Not connected, but no recent failures or issues
@@ -274,29 +274,41 @@ impl RelayHealthTracker {
 
     /// Record a successful connection to a relay
     ///
-    /// Clears failure counters and rate limiting. Sets connected = true.
+    /// Clears connection failure counters. Sets connected = true.
+    ///
+    /// A successful WebSocket connection does not prove that the relay will
+    /// accept a new REQ, so it deliberately leaves any active rate-limit
+    /// cooldown unchanged.
     pub fn record_success(&self, relay_url: &str) {
         let now = Instant::now();
         let mut entry = self.health.entry(relay_url.to_string()).or_default();
         let health = entry.value_mut();
 
         let old_state = health.state();
+        let active_rate_limit = health
+            .rate_limited
+            .then_some(health.next_retry_at)
+            .flatten()
+            .filter(|deadline| *deadline > now);
 
-        // Reset to healthy state
+        // Reset connection health. A live rate-limit cooldown is independent
+        // of whether the WebSocket handshake succeeded.
         health.connected = true;
-        health.rate_limited = false;
+        health.rate_limited = active_rate_limit.is_some();
         health.consecutive_failures = 0;
         health.first_failure_time = None;
         health.last_failure_time = None;
         health.last_success_time = Some(now);
         health.last_attempt_time = Some(now);
-        health.next_retry_at = None;
+        health.next_retry_at = active_rate_limit;
 
-        if old_state != HealthState::Healthy {
+        let new_state = health.state();
+        if old_state != new_state {
             tracing::info!(
-                "Relay {} recovered to healthy (was {:?})",
+                "Relay {} connection recovered ({:?} -> {:?})",
                 relay_url,
-                old_state
+                old_state,
+                new_state
             );
         }
     }
@@ -382,6 +394,13 @@ impl RelayHealthTracker {
         let mut entry = self.health.entry(relay_url.to_string()).or_default();
         let health = entry.value_mut();
 
+        // A relay may repeat the same NOTICE throughout a cooldown. Ignore
+        // reminders for that episode, but treat a rejection after the deadline
+        // as a failed recovery probe and begin a new cooldown.
+        if health.rate_limited && health.next_retry_at.is_some_and(|deadline| now < deadline) {
+            return;
+        }
+
         health.rate_limited = true;
         health.next_retry_at = Some(now + Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
 
@@ -394,15 +413,14 @@ impl RelayHealthTracker {
 
     /// Clear rate limiting state for a specific relay
     ///
-    /// This only clears the rate_limited flag, without affecting connection status
-    /// or failure counters. Use this when rate limit cooldown has expired and we
-    /// want to allow new subscriptions.
-    ///
-    /// This is different from `record_success()` which resets all health state.
+    /// This clears the rate-limit episode without affecting connection status
+    /// or failure counters. Use this when the cooldown has expired and new
+    /// subscriptions may probe the relay again.
     pub fn clear_rate_limit(&self, relay_url: &str) {
         if let Some(mut entry) = self.health.get_mut(relay_url) {
             let health = entry.value_mut();
             health.rate_limited = false;
+            health.next_retry_at = None;
         }
     }
 
@@ -414,7 +432,7 @@ impl RelayHealthTracker {
     pub fn is_rate_limited(&self, relay_url: &str) -> bool {
         if let Some(entry) = self.health.get(relay_url) {
             let health = entry.value();
-            health.rate_limited
+            health.is_rate_limited_now()
         } else {
             false
         }
@@ -437,8 +455,8 @@ impl RelayHealthTracker {
 
             // Check if rate limited and cooldown has expired
             if health.rate_limited {
-                if let Some(next_retry) = health.next_retry_at {
-                    if now > next_retry {
+                if let Some(deadline) = health.next_retry_at {
+                    if now >= deadline {
                         // Cooldown expired - clear rate limiting
                         health.rate_limited = false;
                         health.next_retry_at = None;
@@ -748,5 +766,49 @@ mod tests {
         let tracker = RelayHealthTracker::with_defaults();
         let health = tracker.get_health("wss://nonexistent.example.com");
         assert!(health.is_none());
+    }
+
+    #[test]
+    fn repeated_rate_limit_notice_does_not_extend_cooldown() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://limited.example";
+
+        tracker.record_rate_limit(relay);
+        let first_deadline = tracker.get_health(relay).unwrap().next_retry_at;
+        tracker.record_rate_limit(relay);
+
+        assert_eq!(
+            tracker.get_health(relay).unwrap().next_retry_at,
+            first_deadline
+        );
+    }
+
+    #[test]
+    fn rate_limit_notice_after_deadline_starts_new_cooldown() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://limited.example";
+
+        tracker.record_rate_limit(relay);
+        tracker.health.get_mut(relay).unwrap().next_retry_at =
+            Some(Instant::now() - Duration::from_millis(1));
+
+        tracker.record_rate_limit(relay);
+
+        assert!(tracker.get_health(relay).unwrap().is_rate_limited_now());
+    }
+
+    #[test]
+    fn connection_success_does_not_clear_rate_limit_cooldown() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://limited.example";
+
+        tracker.record_rate_limit(relay);
+        let deadline = tracker.get_health(relay).unwrap().next_retry_at;
+        tracker.record_success(relay);
+
+        let health = tracker.get_health(relay).unwrap();
+        assert!(health.is_rate_limited_now());
+        assert_eq!(health.next_retry_at, deadline);
+        assert!(health.connected);
     }
 }
