@@ -22,7 +22,89 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
-use crate::common::{sync_helpers::*, TestRelay};
+use crate::common::{sync_helpers::*, MockRelay, TestRelay};
+
+/// A source relay's active-REQ cap must not silently remove one of the
+/// repository filter variants.
+///
+/// The generic announcement subscription occupies one active REQ. A single
+/// repository then needs state, a, A, and q filters. Installing each filter as
+/// a separate live subscription exceeds this source's four-REQ limit, leaving
+/// q-tagged collaboration events permanently uncovered.
+#[tokio::test]
+async fn test_live_sync_batches_repo_filters_below_source_req_limit() {
+    let source = MockRelay::start_with_max_reqs(4).await;
+    let syncing = TestRelay::start_with_sync(None).await;
+    let keys = Keys::generate();
+    let repo_id = "test-repo-bounded-reqs";
+    let domains = [source.domain(), syncing.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(String::as_str).collect();
+
+    let (announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+
+    let source_client = TestClient::new(source.url(), keys.clone())
+        .await
+        .expect("connect to constrained source relay");
+    source_client
+        .send_event(&announcement)
+        .await
+        .expect("publish announcement to constrained source relay");
+
+    wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(5))
+        .await
+        .expect("syncing relay should connect to constrained source");
+
+    // Observe one q-tagged event completing the round trip before testing a
+    // second live event. This proves the relevant subscription is installed
+    // without relying on an arbitrary scheduling delay.
+    let readiness_issue = build_layer2_issue_with_q_tag(
+        &keys,
+        &repo_coord(&keys, repo_id),
+        "Subscription readiness probe",
+    )
+    .expect("build q-tagged readiness issue");
+    source_client
+        .send_event(&readiness_issue)
+        .await
+        .expect("publish q-tagged readiness issue");
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(readiness_issue.id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "q-tagged readiness issue should sync before testing live delivery"
+    );
+
+    let issue = build_layer2_issue_with_q_tag(
+        &keys,
+        &repo_coord(&keys, repo_id),
+        "Issue behind the final repository filter",
+    )
+    .expect("build q-tagged issue");
+    source_client
+        .send_event(&issue)
+        .await
+        .expect("publish q-tagged issue");
+
+    let synced = wait_for_event_on_relay(
+        syncing.url(),
+        Filter::new().id(issue.id),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    source_client.disconnect().await;
+    syncing.stop().await;
+    source.stop().await;
+
+    assert!(
+        synced,
+        "q-tagged issue should sync even when the source permits only four active REQs"
+    );
+}
 
 /// Test 5: Live sync Layer 2 events
 ///

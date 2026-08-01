@@ -371,13 +371,68 @@ pub struct ReprocessingStats {
 
 /// Pagination state for a subscription in non-Negentropy historic sync
 #[derive(Debug, Clone)]
-pub struct PaginationState {
-    /// Number of events received for this subscription
+pub struct FilterPaginationState {
+    /// Number of events received for this filter
     pub event_count: usize,
-    /// Smallest created_at timestamp seen (for pagination with `until`)
+    /// Smallest created_at timestamp seen for this filter
     pub min_created_at: Option<Timestamp>,
     /// Original filter to reconstruct for next page
     pub original_filter: Filter,
+}
+
+/// Pagination state for every OR filter carried by one subscription.
+#[derive(Debug, Clone)]
+pub struct PaginationState {
+    pub filters: Vec<FilterPaginationState>,
+}
+
+impl PaginationState {
+    fn new(filters: Vec<Filter>) -> Self {
+        Self {
+            filters: filters
+                .into_iter()
+                .map(|original_filter| FilterPaginationState {
+                    event_count: 0,
+                    min_created_at: None,
+                    original_filter,
+                })
+                .collect(),
+        }
+    }
+
+    fn record_event(&mut self, event: &Event) {
+        for state in &mut self.filters {
+            if state
+                .original_filter
+                .match_event(event, MatchEventOptions::new())
+            {
+                state.event_count += 1;
+                match state.min_created_at {
+                    None => state.min_created_at = Some(event.created_at),
+                    Some(min) if event.created_at < min => {
+                        state.min_created_at = Some(event.created_at);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn next_page_filters(self) -> Vec<Filter> {
+        self.filters
+            .into_iter()
+            .filter_map(|state| {
+                (state.event_count >= PAGINATION_THRESHOLD)
+                    .then_some(state.min_created_at)
+                    .flatten()
+                    .map(|min_created_at| {
+                        state
+                            .original_filter
+                            .until(Timestamp::from(min_created_at.as_secs()))
+                    })
+            })
+            .collect()
+    }
 }
 
 /// A batch of items pending confirmation
@@ -503,9 +558,21 @@ const CONSOLIDATION_THRESHOLD: usize = 70;
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
-/// Page size threshold for historic sync pagination (non-negentropy)
-/// If a subscription receives >= 75 events, we fetch the next page
+/// Per-filter threshold for historic REQ+EOSE pagination.
+///
+/// Grouped pagination assumes that relays apply result limits independently to
+/// each filter, return at least this many events for a non-exhausted filter,
+/// and do not impose an additional total-result cap across the whole REQ. This
+/// matches NIP-01's per-filter `limit` model and ngit-grasp's relay behavior.
+/// Relays that violate these assumptions can make one filter appear exhausted
+/// after another filter consumes the combined result allowance.
 const PAGINATION_THRESHOLD: usize = 75;
+
+/// Conservative number of OR filters carried by one NIP-01 REQ.
+///
+/// This keeps active subscription counts low without producing unusually
+/// large REQ messages for relays that enforce their own per-REQ filter limits.
+const MAX_FILTERS_PER_REQ: usize = 10;
 
 fn reserve_connect_attempt(
     in_flight: &mut HashMap<String, ConnectAttemptToken>,
@@ -558,6 +625,10 @@ fn consolidation_fragmentation(
 fn should_consolidate(current_count: usize, new_count: usize, desired_baseline: usize) -> bool {
     consolidation_fragmentation(current_count, new_count, desired_baseline)
         > CONSOLIDATION_THRESHOLD
+}
+
+fn grouped_subscription_count(filter_count: usize) -> usize {
+    filter_count.div_ceil(MAX_FILTERS_PER_REQ)
 }
 
 #[derive(Debug, Default)]
@@ -1113,130 +1184,103 @@ impl SyncManager {
 
         // Check for pagination: if this subscription hit the threshold, fetch next page
         if let Some(pagination_state) = batch.pagination_state.remove(&sub_id) {
-            if pagination_state.event_count >= PAGINATION_THRESHOLD {
-                if let Some(min_created_at) = pagination_state.min_created_at {
-                    tracing::info!(
-                        relay = %relay_url,
-                        sub_id = %sub_id,
-                        batch_id = batch.batch_id,
-                        event_count = pagination_state.event_count,
-                        min_created_at = %min_created_at,
-                        "Subscription hit pagination threshold, fetching next page"
+            let next_filters = pagination_state.next_page_filters();
+            if !next_filters.is_empty() {
+                let relay_url_for_pagination = relay_url.to_string();
+                let batch_id = batch.batch_id;
+                tracing::info!(
+                    relay = %relay_url,
+                    sub_id = %sub_id,
+                    batch_id,
+                    filter_count = next_filters.len(),
+                    "Grouped subscription hit pagination threshold, fetching next page"
+                );
+
+                // A NOTICE can arrive immediately before this page's EOSE.
+                // Keep a sentinel in the batch and let a detached worker
+                // resume the exact grouped page after the cooldown.
+                if self.health_tracker.is_rate_limited(relay_url) {
+                    let deferred_sub_id = mark_deferred_pagination(batch, &sub_id);
+                    drop(pending);
+
+                    let Some(connection) = self.connections.get(&relay_url_for_pagination).cloned()
+                    else {
+                        tracing::error!(
+                            relay = %relay_url_for_pagination,
+                            batch_id,
+                            "Cannot defer rate-limited pagination without a relay connection"
+                        );
+                        return;
+                    };
+                    Self::spawn_deferred_pagination(
+                        connection,
+                        self.health_tracker.clone(),
+                        self.pending_sync_index.clone(),
+                        relay_url_for_pagination,
+                        batch_id,
+                        deferred_sub_id,
+                        next_filters,
                     );
+                    return;
+                }
 
-                    // Create next page filter: same as original but with .until(min_created_at)
-                    // dont subtract 1 second to avoid duplicate events at the boundary
-                    // as this would lead to missed events with the same created_at timestamp
-                    let until_timestamp = Timestamp::from(min_created_at.as_secs());
-                    let mut next_filter = pagination_state.original_filter.clone();
-                    next_filter = next_filter.until(until_timestamp);
+                drop(pending);
 
-                    // Store relay_url for spawning the subscription after releasing the lock
-                    let relay_url_for_pagination = relay_url.to_string();
-                    let batch_id = batch.batch_id;
-
-                    // A NOTICE can arrive immediately before this page's EOSE.
-                    // Never wait for the cooldown here: the caller owns the
-                    // global SyncManager mutex, while the health checker that
-                    // clears the cooldown needs that same mutex. Keep a
-                    // sentinel in the batch and resume this exact page from a
-                    // detached worker so generic history is not lost or
-                    // restarted from page one.
-                    if self.health_tracker.is_rate_limited(relay_url) {
-                        let deferred_sub_id = mark_deferred_pagination(batch, &sub_id);
-                        drop(pending);
-
-                        let Some(connection) =
-                            self.connections.get(&relay_url_for_pagination).cloned()
-                        else {
+                let mut next_page_started = false;
+                if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
+                    match conn.subscribe_filters(next_filters.clone(), true).await {
+                        Ok(new_sub_id) => {
+                            let mut pending = self.pending_sync_index.write().await;
+                            if let Some(batches) = pending.get_mut(&relay_url_for_pagination) {
+                                if let Some(batch) =
+                                    batches.iter_mut().find(|b| b.batch_id == batch_id)
+                                {
+                                    batch.outstanding_subs.insert(new_sub_id.clone());
+                                    next_page_started = true;
+                                    batch.pagination_state.insert(
+                                        new_sub_id.clone(),
+                                        PaginationState::new(next_filters),
+                                    );
+                                    tracing::info!(
+                                        relay = %relay_url_for_pagination,
+                                        new_sub_id = %new_sub_id,
+                                        batch_id,
+                                        "Next grouped page subscription created"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
                             tracing::error!(
                                 relay = %relay_url_for_pagination,
                                 batch_id,
-                                "Cannot defer rate-limited pagination without a relay connection"
+                                error = %error,
+                                "Failed to create grouped pagination subscription"
                             );
-                            return;
-                        };
-                        Self::spawn_deferred_pagination(
-                            connection,
-                            self.health_tracker.clone(),
-                            self.pending_sync_index.clone(),
-                            relay_url_for_pagination,
-                            batch_id,
-                            deferred_sub_id,
-                            next_filter,
-                            until_timestamp,
-                        );
-                        return;
-                    }
-
-                    // Drop the lock before async operations
-                    drop(pending);
-
-                    // Subscribe to next page and add to outstanding_subs
-                    let mut next_page_started = false;
-                    if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
-                        match conn.subscribe_filter(next_filter.clone(), true).await {
-                            Ok(new_sub_id) => {
-                                // Re-acquire lock to update the batch
-                                let mut pending = self.pending_sync_index.write().await;
-                                if let Some(batches) = pending.get_mut(&relay_url_for_pagination) {
-                                    if let Some(batch) =
-                                        batches.iter_mut().find(|b| b.batch_id == batch_id)
-                                    {
-                                        batch.outstanding_subs.insert(new_sub_id.clone());
-                                        next_page_started = true;
-                                        // Initialize pagination state for new subscription
-                                        batch.pagination_state.insert(
-                                            new_sub_id.clone(),
-                                            PaginationState {
-                                                event_count: 0,
-                                                min_created_at: None,
-                                                original_filter: next_filter,
-                                            },
-                                        );
-                                        tracing::info!(
-                                            relay = %relay_url_for_pagination,
-                                            new_sub_id = %new_sub_id,
-                                            batch_id = batch_id,
-                                            until = %until_timestamp,
-                                            "Next page subscription created"
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    relay = %relay_url_for_pagination,
-                                    batch_id = batch_id,
-                                    error = %e,
-                                    "Failed to create pagination subscription, continuing without next page"
-                                );
-                            }
                         }
                     }
-
-                    if !next_page_started {
-                        let completed_batch = {
-                            let mut pending = self.pending_sync_index.write().await;
-                            take_drained_batch_as_failed(
-                                &mut pending,
-                                &relay_url_for_pagination,
-                                batch_id,
-                            )
-                        };
-                        if let Some(batch) = completed_batch {
-                            tracing::warn!(
-                                relay = %relay_url_for_pagination,
-                                batch_id,
-                                "Pagination could not continue; completing drained batch as failed"
-                            );
-                            self.confirm_batch(&relay_url_for_pagination, batch).await;
-                        }
-                    }
-
-                    // Early return since we've released and re-acquired locks
-                    return;
                 }
+
+                if !next_page_started {
+                    let completed_batch = {
+                        let mut pending = self.pending_sync_index.write().await;
+                        take_drained_batch_as_failed(
+                            &mut pending,
+                            &relay_url_for_pagination,
+                            batch_id,
+                        )
+                    };
+                    if let Some(batch) = completed_batch {
+                        tracing::warn!(
+                            relay = %relay_url_for_pagination,
+                            batch_id,
+                            "Pagination could not continue; completing drained batch as failed"
+                        );
+                        self.confirm_batch(&relay_url_for_pagination, batch).await;
+                    }
+                }
+
+                return;
             }
         }
 
@@ -1323,8 +1367,8 @@ impl SyncManager {
 
                         let mut new_sub_ids = HashSet::new();
                         if let Some(conn) = self.connections.get(&relay_url_for_fallback) {
-                            for filter in fallback_filters {
-                                match conn.subscribe_filter(filter, true).await {
+                            for filter_group in fallback_filters.chunks(MAX_FILTERS_PER_REQ) {
+                                match conn.subscribe_filters(filter_group.to_vec(), true).await {
                                     Ok(sub_id) => {
                                         new_sub_ids.insert(sub_id);
                                     }
@@ -1521,14 +1565,13 @@ impl SyncManager {
         relay_url: String,
         batch_id: u64,
         deferred_sub_id: SubscriptionId,
-        next_filter: Filter,
-        until_timestamp: Timestamp,
+        next_filters: Vec<Filter>,
     ) {
         tokio::spawn(async move {
             tracing::info!(
                 relay = %relay_url,
                 batch_id,
-                until = %until_timestamp,
+                filter_count = next_filters.len(),
                 "Rate limited during historic pagination; deferring the exact next page without blocking the sync actor"
             );
 
@@ -1557,23 +1600,20 @@ impl SyncManager {
                     return;
                 }
 
-                match connection.subscribe_filter(next_filter.clone(), true).await {
+                match connection
+                    .subscribe_filters(next_filters.clone(), true)
+                    .await
+                {
                     Ok(new_sub_id) => {
                         batch.outstanding_subs.remove(&deferred_sub_id);
                         batch.outstanding_subs.insert(new_sub_id.clone());
-                        batch.pagination_state.insert(
-                            new_sub_id.clone(),
-                            PaginationState {
-                                event_count: 0,
-                                min_created_at: None,
-                                original_filter: next_filter,
-                            },
-                        );
+                        batch
+                            .pagination_state
+                            .insert(new_sub_id.clone(), PaginationState::new(next_filters));
                         tracing::info!(
                             relay = %relay_url,
                             new_sub_id = %new_sub_id,
                             batch_id,
-                            until = %until_timestamp,
                             "Deferred pagination resumed after rate-limit cooldown"
                         );
                         return;
@@ -2125,8 +2165,11 @@ impl SyncManager {
         }
 
         // Step 3: Check if consolidation is needed BEFORE adding new filters
-        self.maybe_consolidate(&action.relay_url, action.filters.len())
-            .await;
+        self.maybe_consolidate(
+            &action.relay_url,
+            grouped_subscription_count(action.filters.len()),
+        )
+        .await;
 
         // Subscribe to each filter and collect subscription IDs
         tracing::info!(
@@ -2293,15 +2336,7 @@ impl SyncManager {
                                     if let Some(state) =
                                         batch.pagination_state.get_mut(&subscription_id)
                                     {
-                                        state.event_count += 1;
-                                        // Track minimum created_at timestamp
-                                        match state.min_created_at {
-                                            None => state.min_created_at = Some(event.created_at),
-                                            Some(min) if event.created_at < min => {
-                                                state.min_created_at = Some(event.created_at);
-                                            }
-                                            _ => {}
-                                        }
+                                        state.record_event(&event);
                                     }
 
                                     // Track received event IDs (negentropy path)
@@ -3989,7 +4024,7 @@ impl SyncManager {
 
         // Every connected relay carries one consolidated generic announcement
         // subscription in addition to its repository-specific desired filters.
-        1 + desired_repo_filters
+        1 + grouped_subscription_count(desired_repo_filters)
     }
 
     /// Check if incremental fragmentation exceeds the consolidation threshold.
@@ -4278,7 +4313,7 @@ impl SyncManager {
 
     /// Check for rate-limited relays that have exceeded cooldown
     ///
-    /// This method is called periodically by run_rate_limit_checker (every 1 second).
+    /// This method is called by the health and metrics checker every 2 seconds.
     /// For each relay in RateLimited state that has exceeded the 65-second cooldown:
     /// 1. Clears the rate limit state (sets to Healthy)
     /// 2. Recomputes required actions for that relay
@@ -4372,15 +4407,17 @@ impl SyncManager {
 
         let mut sub_ids = Vec::new();
 
-        for filter in filters.iter() {
+        for filter_group in filters.chunks(MAX_FILTERS_PER_REQ) {
             // Live subscriptions MUST use limit(0) to receive ONLY new events
             // This prevents fetching historic events that would be miscounted as "live" in metrics
             // The caller passes the same filters to both sync_live() and historic_sync()
             // Live subscriptions do NOT auto-close - we want them to stay open for new events
-            match connection
-                .subscribe_filter(filter.clone().limit(0), false)
-                .await
-            {
+            let grouped_filters = filter_group
+                .iter()
+                .cloned()
+                .map(|filter| filter.limit(0))
+                .collect();
+            match connection.subscribe_filters(grouped_filters, false).await {
                 Ok(sub_id) => {
                     sub_ids.push(sub_id);
                 }
@@ -4696,29 +4733,23 @@ impl SyncManager {
             let mut subscription_ids = HashSet::new();
             let mut pagination_state = HashMap::new();
 
-            // DEBUG TRACING: Log each filter in REQ+EOSE path
-            for (idx, filter) in filters_with_since.iter().enumerate() {
+            // Keep several OR filters under each relay-visible subscription.
+            for (idx, filter_group) in filters_with_since.chunks(MAX_FILTERS_PER_REQ).enumerate() {
                 tracing::debug!(
                     relay = %relay_url,
                     batch_id = batch_id,
-                    filter_idx = idx,
-                    filter = ?filter,
-                    "Subscribing to filter in REQ+EOSE path"
+                    group_idx = idx,
+                    filter_count = filter_group.len(),
+                    filters = ?filter_group,
+                    "Subscribing to grouped filters in REQ+EOSE path"
                 );
 
                 if let Some(conn) = self.connections.get(relay_url) {
-                    match conn.subscribe_filter(filter.clone(), true).await {
+                    let grouped_filters = filter_group.to_vec();
+                    match conn.subscribe_filters(grouped_filters.clone(), true).await {
                         Ok(sub_id) => {
                             subscription_ids.insert(sub_id.clone());
-                            // Initialize pagination state for this subscription
-                            pagination_state.insert(
-                                sub_id,
-                                PaginationState {
-                                    event_count: 0,
-                                    min_created_at: None,
-                                    original_filter: filter.clone(),
-                                },
-                            );
+                            pagination_state.insert(sub_id, PaginationState::new(grouped_filters));
                         }
                         Err(e) => {
                             tracing::error!(
@@ -5028,6 +5059,48 @@ mod tests {
             1,
             desired_baseline,
         ));
+    }
+
+    #[test]
+    fn grouped_pagination_advances_only_filters_that_fill_a_page() {
+        let keys = Keys::generate();
+        let metadata_filter = Filter::new().kind(Kind::Metadata);
+        let note_filter = Filter::new().kind(Kind::TextNote);
+        let mut pagination =
+            PaginationState::new(vec![metadata_filter.clone(), note_filter.clone()]);
+
+        for created_at in 1..=PAGINATION_THRESHOLD {
+            let event = EventBuilder::new(Kind::Metadata, created_at.to_string())
+                .custom_created_at(Timestamp::from_secs(created_at as u64))
+                .finalize(&keys)
+                .expect("build metadata event");
+            pagination.record_event(&event);
+        }
+        let note = EventBuilder::text_note("one note")
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&keys)
+            .expect("build text note");
+        pagination.record_event(&note);
+
+        let next_filters = pagination.next_page_filters();
+        assert_eq!(next_filters.len(), 1);
+        assert_eq!(next_filters[0].until, Some(Timestamp::from_secs(1)));
+        assert!(
+            next_filters[0]
+                .kinds
+                .as_ref()
+                .unwrap()
+                .contains(&Kind::Metadata),
+            "the full metadata filter should advance"
+        );
+        assert!(
+            !next_filters[0]
+                .kinds
+                .as_ref()
+                .unwrap()
+                .contains(&Kind::TextNote),
+            "the partial text-note filter should not advance"
+        );
     }
 
     #[test]

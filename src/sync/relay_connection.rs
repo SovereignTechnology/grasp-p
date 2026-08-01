@@ -423,30 +423,57 @@ impl RelayConnection {
         filter: Filter,
         auto_close: bool,
     ) -> Result<SubscriptionId, String> {
-        // DEBUG TRACING: Log the filter being subscribed to
+        self.subscribe_filters(vec![filter], auto_close).await
+    }
+
+    /// Subscribe to several OR filters under one NIP-01 subscription ID.
+    ///
+    /// Relays apply active-REQ limits to subscription IDs, not to the filters
+    /// inside a REQ. Grouping related filters preserves NIP-01 semantics while
+    /// avoiding one persistent subscription per GRASP tag variant.
+    pub async fn subscribe_filters(
+        &self,
+        filters: Vec<Filter>,
+        auto_close: bool,
+    ) -> Result<SubscriptionId, String> {
+        if filters.is_empty() {
+            return Err("Cannot subscribe with an empty filter set".to_string());
+        }
+
         tracing::debug!(
             relay = %self.url,
-            filter = ?filter,
+            filter_count = filters.len(),
+            filters = ?filters,
             auto_close = auto_close,
-            "subscribe_filter called with filter"
+            "subscribe_filters called"
         );
 
         let output = if auto_close {
             self.client
-                .subscribe(filter)
+                .subscribe(filters)
                 .close_on(
                     SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE),
                 )
                 .await
         } else {
-            self.client.subscribe(filter).await
+            self.client.subscribe(filters).await
         }
         .map_err(|e| format!("Failed to subscribe on {}: {}", self.url, e))?;
+
+        if !output.failed.is_empty() {
+            let failures = output
+                .failed
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("Failed to subscribe on {}: {}", self.url, failures));
+        }
 
         tracing::debug!(
             relay = %self.url,
             subscription_id = %output.value,
-            "subscribe_filter succeeded"
+            "subscribe_filters succeeded"
         );
 
         Ok(output.value)
