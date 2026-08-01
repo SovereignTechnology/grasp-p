@@ -133,29 +133,24 @@ impl RepositoryAnnouncement {
         })
     }
 
-    /// Normalize a URL by removing trailing slashes for consistent comparison
-    ///
-    /// See test_validate_announcement_with_trailing_slash_in_relay for why we need this
-    fn normalize_url_for_comparison(url: &str) -> &str {
-        url.trim_end_matches('/')
-    }
-
     /// Check if this announcement lists the given domain in clone URLs
+    ///
+    /// Compares parsed host and port semantics, not substrings, so a URL such
+    /// as `https://gitnostr.com.attacker.example/` cannot satisfy a check for
+    /// `gitnostr.com`.
     pub fn has_clone_url(&self, domain: &str) -> bool {
-        let normalized_domain = Self::normalize_url_for_comparison(domain);
-        self.clone_urls.iter().any(|url| {
-            let normalized_url = Self::normalize_url_for_comparison(url);
-            normalized_url.contains(normalized_domain)
-        })
+        self.clone_urls
+            .iter()
+            .any(|url| crate::outbound::url_matches_service_domain(url, domain))
     }
 
     /// Check if this announcement lists the given relay
+    ///
+    /// Uses the same exact host and port comparison as [`Self::has_clone_url`].
     pub fn has_relay(&self, relay: &str) -> bool {
-        let normalized_relay = Self::normalize_url_for_comparison(relay);
-        self.relays.iter().any(|r| {
-            let normalized_r = Self::normalize_url_for_comparison(r);
-            normalized_r.contains(normalized_relay)
-        })
+        self.relays
+            .iter()
+            .any(|r| crate::outbound::url_matches_service_domain(r, relay))
     }
 
     /// Check if this announcement lists the service (both clone and relay)

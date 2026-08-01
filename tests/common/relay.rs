@@ -81,6 +81,10 @@ struct RelayOptions {
     relay_data_path: Option<PathBuf>,
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
     rejected_hot_cache_duration_secs: Option<u64>,
+    /// Run with the production outbound target policy (reject non-global
+    /// event-directed sync targets). The fixture default is permissive
+    /// because the entire test infrastructure lives on loopback.
+    enforce_outbound_target_policy: bool,
 }
 
 /// Focused configuration for short-lived deletion-request lifecycle tests.
@@ -139,6 +143,27 @@ impl TestRelay {
             port::reserve_port(),
             RelayOptions {
                 bootstrap_relay_url,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a syncing relay with the production outbound target policy.
+    ///
+    /// Unlike every other constructor, this does NOT set
+    /// `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`, so event-directed sync
+    /// targets on loopback/private addresses are rejected exactly as they
+    /// would be in production. The operator-configured bootstrap relay is
+    /// still allowed even when it is local.
+    pub async fn start_with_sync_enforced_outbound_policy(
+        bootstrap_relay_url: Option<String>,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                enforce_outbound_target_policy: true,
                 ..RelayOptions::default()
             },
         )
@@ -512,6 +537,14 @@ impl TestRelay {
         // Add bootstrap relay URL if provided
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
             cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url);
+        }
+
+        // The test infrastructure runs entirely on loopback, which the
+        // production outbound target policy rejects for event-directed sync.
+        // Default to the permissive test policy; policy regression tests opt
+        // back into production behavior via enforce_outbound_target_policy.
+        if !options.enforce_outbound_target_policy {
+            cmd.env("NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS", "true");
         }
 
         if let Some(duration_secs) = options.rejected_hot_cache_duration_secs {

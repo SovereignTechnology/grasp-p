@@ -317,6 +317,45 @@ NGIT_SYNC_BOOTSTRAP_RELAY_URL=ws://127.0.0.1:8081
 - Even without a bootstrap relay, sync will discover relays from stored announcements
 - Synced events go through the same validation as directly-submitted events
 - Use WebSocket protocol (`ws://` or `wss://`) or defaults to wss://
+- The bootstrap relay is operator-configured and therefore exempt from the
+  outbound target policy (see `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), so a
+  local bootstrap relay keeps working even with the policy enforced
+
+---
+
+#### `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`
+
+**Description:** Allow event-directed sync targets that are not globally reachable
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+**Examples:**
+
+```bash
+# Production (default): reject non-global event-directed targets
+NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=false
+
+# Integration tests / closed development networks only
+NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true
+```
+
+**Notes:**
+
+- Repository announcements and PR events are untrusted; their `relays` and
+  `clone` URLs feed outbound WebSocket connections and `git fetch` calls
+- With the default (`false`), event-directed targets are rejected when they
+  use loopback, private, link-local, CGNAT, or other special-purpose
+  addresses, local hostnames (`localhost`, single-label names, `.local`,
+  `.internal`, `.home.arpa`, `.onion`, ...), embedded credentials, or
+  hostnames that resolve to non-globally-reachable addresses (SSRF protection)
+- Scheme and credential checks still apply when set to `true`
+- The operator-configured `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is always allowed,
+  even when local; event-provided URLs never inherit that exception
+- Leave `false` in production; `true` is intended for tests and closed
+  development networks
+- See `docs/explanation/defensive-measures.md` for the full outbound target
+  policy, including the remaining DNS-rebinding caveat for relay connections
 
 ---
 

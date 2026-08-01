@@ -52,6 +52,7 @@ use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
+use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 use nostr_sdk::prelude::LocalRelay;
 
 const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
@@ -948,6 +949,13 @@ pub struct SyncManager {
     rejected_events_index: Arc<RejectedEventsIndex>,
     /// Active relay connections - keyed by relay URL
     connections: HashMap<String, RelayConnection>,
+    /// Event-directed relay targets rejected by the outbound target policy.
+    ///
+    /// Rejected URLs stay in `repo_sync_index` (they come from stored events),
+    /// so without this memo every sync pass would re-derive, re-reject, and
+    /// re-log the same forbidden target. Bounded by the set of distinct relay
+    /// URLs in stored/purgatory events, which the indexes already carry.
+    rejected_relay_targets: HashSet<String>,
     /// Last exact-ID dependency recovery attempt, used to bound retries.
     dependency_refetch_attempts: Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
     /// Last dependency pass for each purgatory announcement.
@@ -1049,6 +1057,7 @@ impl SyncManager {
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
             connections: HashMap::new(),
+            rejected_relay_targets: HashSet::new(),
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             purgatory_dependency_attempts: HashMap::new(),
             dependency_relay_deadlines: HashMap::new(),
@@ -1977,8 +1986,9 @@ impl SyncManager {
         if let Some(ref bootstrap_url) = self.bootstrap_relay_url.clone() {
             match canonical_relay_key(bootstrap_url) {
                 Ok(relay_url) => {
-                    self.register_relay(relay_url.clone(), true).await;
-                    self.schedule_connect_relay(&relay_url).await;
+                    if self.register_relay(relay_url.clone(), true).await {
+                        self.schedule_connect_relay(&relay_url).await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -2112,6 +2122,17 @@ impl SyncManager {
             }
         };
 
+        // Targets already rejected by the outbound policy stay in the sync
+        // indexes (they come from stored events); skip them quietly instead
+        // of re-rejecting on every recomputation.
+        if self.rejected_relay_targets.contains(&action.relay_url) {
+            tracing::debug!(
+                relay = %action.relay_url,
+                "Skipping relay target rejected by outbound policy"
+            );
+            return;
+        }
+
         // Step 1: Check if relay exists in relay_sync_index
         let connection_status = {
             let index = self.relay_sync_index.read().await;
@@ -2129,8 +2150,9 @@ impl SyncManager {
                 );
 
                 // Register relay (creates RelayConnection, initializes RelayState, updates metrics)
-                self.register_relay(action.relay_url.clone(), false).await;
-                self.schedule_connect_relay(&action.relay_url).await;
+                if self.register_relay(action.relay_url.clone(), false).await {
+                    self.schedule_connect_relay(&action.relay_url).await;
+                }
                 // Connection will trigger handle_connect_or_reconnect which will process items
                 return;
             }
@@ -2656,7 +2678,15 @@ impl SyncManager {
     /// Also initializes RelayState if it doesn't exist.
     /// Does NOT connect - connection happens via the bounded scheduler.
     /// The RelayConnection persists forever and is reused on reconnects.
-    async fn register_relay(&mut self, relay_url: String, is_bootstrap: bool) {
+    ///
+    /// Returns `false` when the target was rejected and no connection exists,
+    /// so callers must not schedule a connection attempt. Event-directed URLs
+    /// are vetted by the outbound target policy; the operator-configured
+    /// bootstrap relay is exempt. An event URL identical to an already
+    /// registered connection (e.g. the bootstrap relay itself) reuses that
+    /// connection rather than being re-authorized, which keeps the configured
+    /// exception exact: only URLs that canonicalize to the same key share it.
+    async fn register_relay(&mut self, relay_url: String, is_bootstrap: bool) -> bool {
         let relay_url = match canonical_relay_key(&relay_url) {
             Ok(relay_url) => relay_url,
             Err(error) => {
@@ -2665,12 +2695,37 @@ impl SyncManager {
                     error = %error,
                     "Rejecting invalid relay registration"
                 );
-                return;
+                return false;
             }
         };
 
         // Create RelayConnection if not exists
         if !self.connections.contains_key(&relay_url) {
+            let policy = self.outbound_target_policy();
+            let source = if is_bootstrap {
+                RelayTargetSource::OperatorConfigured
+            } else {
+                RelayTargetSource::EventDirected
+            };
+
+            // Refuse to even register unauthorized event-directed targets so
+            // they never enter the reconnect lifecycle. The connection worker
+            // re-checks (with DNS vetting) immediately before every dial.
+            if source == RelayTargetSource::EventDirected {
+                if let Err(reason) = policy.authorize(OutboundTargetKind::EventRelay, &relay_url) {
+                    // Warn once per target; sync passes keep re-deriving the
+                    // same URLs from stored events.
+                    if self.rejected_relay_targets.insert(relay_url.clone()) {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            reason = %reason,
+                            "Rejecting event-directed sync relay target"
+                        );
+                    }
+                    return false;
+                }
+            }
+
             // Get relay owner keys for NIP-42 authentication
             let keys = self
                 .config
@@ -2681,6 +2736,8 @@ impl SyncManager {
                 relay_url.clone(),
                 Arc::clone(&self.database),
                 keys,
+                source,
+                policy,
             );
             self.connections.insert(relay_url.clone(), connection);
             tracing::debug!(relay = %relay_url, "Registered new relay connection");
@@ -2724,6 +2781,15 @@ impl SyncManager {
                 metrics.set_relay_connected(&relay_url, false);
             }
             tracing::info!(relay = %relay_url, "Registered new relay for tracking");
+        }
+
+        true
+    }
+
+    /// Outbound target policy derived from operator configuration.
+    fn outbound_target_policy(&self) -> OutboundTargetPolicy {
+        OutboundTargetPolicy {
+            allow_non_global: self.config.sync_allow_non_global_targets,
         }
     }
 
@@ -3048,6 +3114,14 @@ impl SyncManager {
             let relay_index = self.relay_sync_index.read().await;
             compute_actions(&all_targets, &pending_index, &relay_index)
         };
+        // Policy-rejected targets must not consume the bounded per-tick
+        // budget, or a stored event listing forbidden relays could starve
+        // legitimate ones. Compare canonical keys: the rejected set stores
+        // them, while actions still carry raw event-supplied URLs.
+        actions.retain(|action| match canonical_relay_key(&action.relay_url) {
+            Ok(key) => !self.rejected_relay_targets.contains(&key),
+            Err(_) => false,
+        });
         actions.sort_by_key(|action| {
             !self
                 .dependency_relay_deadlines
@@ -3238,7 +3312,9 @@ impl SyncManager {
                     Instant::now() + dependency_relay_retention(),
                 );
                 if !self.connections.contains_key(&relay_url) {
-                    self.register_relay(relay_url.clone(), false).await;
+                    if !self.register_relay(relay_url.clone(), false).await {
+                        continue;
+                    }
                     self.schedule_connect_relay(&relay_url).await;
                 }
                 canonical_dependency_relays.push(relay_url);

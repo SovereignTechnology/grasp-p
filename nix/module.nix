@@ -167,6 +167,18 @@ let
         description = "Disable NIP-77 negentropy sync (use REQ+EOSE instead)";
       };
 
+      syncAllowNonGlobalTargets = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Allow event-directed sync targets that are not globally reachable
+          (loopback, private, link-local addresses and local hostnames).
+          Disables the SSRF protection for untrusted announcement/PR URLs;
+          intended only for tests and closed development networks. The
+          operator-configured bootstrap relay is always allowed regardless.
+        '';
+      };
+
       rejectedHotCacheDurationSecs = mkOption {
         type = types.int;
         default = 120;
@@ -490,6 +502,8 @@ let
         NGIT_SYNC_BOOTSTRAP_RELAY_URL = cfg.syncBootstrapRelayUrl;
       } // optionalAttrs cfg.syncDisableNegentropy {
         NGIT_SYNC_DISABLE_NEGENTROPY = "true";
+      } // optionalAttrs cfg.syncAllowNonGlobalTargets {
+        NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS = "true";
       } // optionalAttrs
       (cfg.relayOwnerNsec != null && cfg.relayOwnerNsecFile == null) {
         # Only set inline nsec if file is not specified

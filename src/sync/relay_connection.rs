@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::nostr::SharedDatabase;
+use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 
 /// Maximum wall-clock time for one dry-run NIP-77 reconciliation.
 ///
@@ -105,6 +106,10 @@ pub struct NegentropySyncResult {
 pub struct RelayConnection {
     /// The relay URL this connection is for
     url: String,
+    /// Whether the URL came from operator configuration or an untrusted event
+    source: RelayTargetSource,
+    /// Outbound target policy applied before every event-directed dial
+    policy: OutboundTargetPolicy,
     /// The underlying nostr-sdk client
     client: Client,
     /// Local database for negentropy comparison (used for NIP-77 sync)
@@ -144,13 +149,22 @@ impl RelayConnection {
     /// # Arguments
     /// * `url` - The relay URL to connect to (with or without scheme, e.g., "relay.example.com" or "wss://relay.example.com")
     /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
-    pub fn new(url: String, keys: Keys) -> Self {
+    /// * `source` - Whether the URL is operator-configured or event-directed
+    /// * `policy` - Outbound target policy enforced before event-directed dials
+    pub fn new(
+        url: String,
+        keys: Keys,
+        source: RelayTargetSource,
+        policy: OutboundTargetPolicy,
+    ) -> Self {
         let normalized_url = Self::normalize_url(&url);
         let client = Client::builder()
             .authenticator(SignerAuthenticator::new(keys))
             .build();
         Self {
             url: normalized_url,
+            source,
+            policy,
             client,
             database: None,
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -164,13 +178,23 @@ impl RelayConnection {
     /// * `url` - The relay URL to connect to (with or without scheme, e.g., "relay.example.com" or "wss://relay.example.com")
     /// * `database` - Shared database for local event comparison during negentropy sync
     /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
-    pub fn new_with_database(url: String, database: SharedDatabase, keys: Keys) -> Self {
+    /// * `source` - Whether the URL is operator-configured or event-directed
+    /// * `policy` - Outbound target policy enforced before event-directed dials
+    pub fn new_with_database(
+        url: String,
+        database: SharedDatabase,
+        keys: Keys,
+        source: RelayTargetSource,
+        policy: OutboundTargetPolicy,
+    ) -> Self {
         let normalized_url = Self::normalize_url(&url);
         let client = Client::builder()
             .authenticator(SignerAuthenticator::new(keys))
             .build();
         Self {
             url: normalized_url,
+            source,
+            policy,
             client,
             database: Some(database),
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -196,6 +220,27 @@ impl RelayConnection {
     /// * `Ok(())` - Connection established successfully
     /// * `Err(String)` with error description on failure
     pub async fn connect(&self, connection_timeout_secs: u64) -> Result<(), String> {
+        // Final authorization for event-directed targets, immediately before
+        // the outbound dial so no registration path can bypass it. Runs on
+        // every attempt (including reconnects) so DNS answers are re-vetted.
+        if self.source == RelayTargetSource::EventDirected {
+            if let Err(reason) = self
+                .policy
+                .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
+                .await
+            {
+                tracing::warn!(
+                    url = %self.url,
+                    reason = %reason,
+                    "Rejecting event-directed relay target"
+                );
+                return Err(format!(
+                    "Outbound target policy rejected relay {}: {}",
+                    self.url, reason
+                ));
+            }
+        }
+
         let connection_timeout = Duration::from_secs(connection_timeout_secs);
         let connection_deadline = tokio::time::Instant::now() + connection_timeout;
         let timeout_error = || {
@@ -735,6 +780,19 @@ impl RelayConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Event-directed connection with the permissive policy used by tests
+    /// that dial loopback fixtures.
+    fn permissive_connection(url: &str, keys: Keys) -> RelayConnection {
+        RelayConnection::new(
+            url.to_string(),
+            keys,
+            RelayTargetSource::EventDirected,
+            OutboundTargetPolicy {
+                allow_non_global: true,
+            },
+        )
+    }
     use nostr_sdk::prelude::LocalRelayBuilder;
     use std::future::pending;
 
@@ -778,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn hung_negentropy_diff_times_out_and_disables_future_attempts() {
-        let connection = RelayConnection::new("ws://127.0.0.1:1".to_string(), Keys::generate());
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
         assert!(connection.supports_negentropy().await);
 
         let result = connection
@@ -812,7 +870,14 @@ mod tests {
             .await
             .expect("seed other relay");
 
-        let connection = RelayConnection::new(configured.url().await.to_string(), Keys::generate());
+        // Operator-configured source: loopback fixtures stay dialable under
+        // the strict default policy, mirroring the bootstrap-relay exception.
+        let connection = RelayConnection::new(
+            configured.url().await.to_string(),
+            Keys::generate(),
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
         connection
             .connect(3)
             .await
@@ -845,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_events_reports_an_unregistered_exact_relay() {
-        let connection = RelayConnection::new("ws://127.0.0.1:1".to_string(), Keys::generate());
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
 
         let error = connection
             .fetch_events(
@@ -909,22 +974,19 @@ mod tests {
 
     #[test]
     fn test_new_normalizes_url() {
-        let keys = Keys::generate();
-        let conn = RelayConnection::new("relay.example.com".to_string(), keys);
+        let conn = permissive_connection("relay.example.com", Keys::generate());
         assert_eq!(conn.url(), "wss://relay.example.com");
     }
 
     #[test]
     fn test_new_preserves_wss_scheme() {
-        let keys = Keys::generate();
-        let conn = RelayConnection::new("wss://relay.example.com".to_string(), keys);
+        let conn = permissive_connection("wss://relay.example.com", Keys::generate());
         assert_eq!(conn.url(), "wss://relay.example.com");
     }
 
     #[test]
     fn test_new_preserves_ws_scheme() {
-        let keys = Keys::generate();
-        let conn = RelayConnection::new("ws://relay.example.com".to_string(), keys);
+        let conn = permissive_connection("ws://relay.example.com", Keys::generate());
         assert_eq!(conn.url(), "ws://relay.example.com");
     }
 
@@ -932,9 +994,24 @@ mod tests {
     fn test_new_with_database_normalizes_url() {
         // This test just verifies the URL normalization works
         // We can't easily test with_database without a real database
-        let keys = Keys::generate();
-        let conn = RelayConnection::new("git.shakespeare.diy".to_string(), keys);
+        let conn = permissive_connection("git.shakespeare.diy", Keys::generate());
         assert_eq!(conn.url(), "wss://git.shakespeare.diy");
+    }
+
+    #[tokio::test]
+    async fn event_directed_connect_rejects_loopback_before_dialling() {
+        let connection = RelayConnection::new(
+            "ws://127.0.0.1:1".to_string(),
+            Keys::generate(),
+            RelayTargetSource::EventDirected,
+            OutboundTargetPolicy::default(),
+        );
+
+        let error = connection
+            .connect(3)
+            .await
+            .expect_err("strict policy must reject an event-directed loopback dial");
+        assert!(error.contains("Outbound target policy"), "{error}");
     }
 
     #[test]

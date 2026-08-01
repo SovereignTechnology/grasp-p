@@ -197,6 +197,7 @@ use tracing::debug;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::SharedDatabase;
+use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, ResolvedTarget};
 use crate::purgatory::Purgatory;
 use crate::sync::naughty_list::NaughtyListTracker;
 
@@ -230,6 +231,9 @@ pub struct RealSyncContext {
 
     /// Naughty list tracker for git remote domains with persistent errors
     git_naughty_list: Arc<NaughtyListTracker>,
+
+    /// Outbound target policy applied before every event-directed git fetch
+    outbound_policy: OutboundTargetPolicy,
 }
 
 impl RealSyncContext {
@@ -243,6 +247,8 @@ impl RealSyncContext {
     /// * `local_relay` - Local relay for WebSocket notifications
     /// * `write_policy` - Write policy for promotion-time recovery hooks
     /// * `git_naughty_list` - Naughty list tracker for git remote domains
+    /// * `outbound_policy` - Policy vetting event-directed git fetch targets
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         purgatory: Arc<Purgatory>,
         database: SharedDatabase,
@@ -251,6 +257,7 @@ impl RealSyncContext {
         local_relay: Option<LocalRelay>,
         write_policy: Option<Nip34WritePolicy>,
         git_naughty_list: Arc<NaughtyListTracker>,
+        outbound_policy: OutboundTargetPolicy,
     ) -> Self {
         Self {
             purgatory,
@@ -260,6 +267,7 @@ impl RealSyncContext {
             local_relay,
             write_policy,
             git_naughty_list,
+            outbound_policy,
         }
     }
 
@@ -267,6 +275,72 @@ impl RealSyncContext {
     pub fn git_naughty_list(&self) -> &Arc<NaughtyListTracker> {
         &self.git_naughty_list
     }
+}
+
+/// `http.curloptResolve` entry pinning the vetted DNS answers, when any.
+///
+/// Format is curl's `HOST:PORT:ADDRESS[,ADDRESS]`. Empty when the policy is
+/// permissive and no vetting occurred (nothing to pin).
+fn resolve_pin_entry(resolved: &ResolvedTarget) -> Option<String> {
+    if resolved.addresses.is_empty() {
+        return None;
+    }
+    let addresses = resolved
+        .addresses
+        .iter()
+        .map(|address| match address {
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "{}:{}:{}",
+        resolved.target.host, resolved.target.port, addresses
+    ))
+}
+
+/// Build a `git fetch` command that cannot escape the outbound target policy.
+///
+/// The URL was authorized immediately before this call; these controls keep
+/// the subprocess pointed at the vetted target:
+/// - `GIT_ALLOW_PROTOCOL` confines git to smart HTTP, so no server-suggested
+///   alternate transport (ssh, file, ext) can run;
+/// - `http.followRedirects=false` stops HTTP redirects re-targeting the fetch;
+/// - proxy configuration and environment are cleared so the connection goes to
+///   the host that was vetted rather than through an ambient proxy;
+/// - `credential.helper=` keeps any operator credentials on this machine out
+///   of requests to event-directed servers;
+/// - `http.curloptResolve` pins the vetted DNS answers so the fetch cannot be
+///   re-bound to a different address between authorization and connection.
+fn hardened_git_fetch_command(
+    repo_path: &Path,
+    resolve_pin: Option<&str>,
+    args: &[String],
+) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg("http.followRedirects=false")
+        .arg("-c")
+        .arg("http.proxy=")
+        .arg("-c")
+        .arg("credential.helper=");
+    if let Some(pin) = resolve_pin {
+        command.arg("-c").arg(format!("http.curloptResolve={pin}"));
+    }
+    command
+        .args(args)
+        .env("GIT_ALLOW_PROTOCOL", "http:https")
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("GIT_PROXY_COMMAND")
+        .current_dir(repo_path);
+    command
 }
 
 #[async_trait]
@@ -383,6 +457,31 @@ impl SyncContext for RealSyncContext {
             "Fetching OIDs from remote server"
         );
 
+        // Final authorization immediately before the outbound fetch. Clone
+        // URLs come from untrusted announcement and PR events, so this is the
+        // gate that keeps them off loopback/private/local targets. DNS is
+        // vetted here and the answers pinned onto the git subprocess below.
+        let resolved = match self
+            .outbound_policy
+            .authorize_resolved(OutboundTargetKind::EventGit, url)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                tracing::warn!(
+                    url = %url,
+                    reason = %reason,
+                    "Rejecting event-directed git fetch target"
+                );
+                return Err(anyhow::anyhow!(
+                    "outbound target policy rejected git fetch target {}: {}",
+                    url,
+                    reason
+                ));
+            }
+        };
+        let resolve_pin = resolve_pin_entry(&resolved);
+
         // Use tokio::task::spawn_blocking for the git fetch since it's blocking
         let repo_path = repo_path.to_path_buf();
         let url = url.to_string();
@@ -409,10 +508,8 @@ impl SyncContext for RealSyncContext {
                 let mut args = vec!["fetch".to_string(), url.clone()];
                 args.extend(remaining_oids.iter().cloned());
 
-                let output = Command::new("git")
-                    .args(&args)
-                    .current_dir(&repo_path)
-                    .output();
+                let output =
+                    hardened_git_fetch_command(&repo_path, resolve_pin.as_deref(), &args).output();
 
                 match output {
                     Ok(result) if result.status.success() => {

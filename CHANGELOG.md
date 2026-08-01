@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Restricted event-directed sync targets to globally reachable endpoints.
+  Relay and clone URLs from untrusted repository announcements and PR events
+  reached the proactive WebSocket and `git fetch` sinks after syntax-only
+  checks; production logs showed sync dialling `ws://localhost:3334`,
+  `ws://127.0.0.1:7334`, and a CGNAT address, so a crafted event could point
+  a public relay at loopback or internal infrastructure (SSRF). A fail-closed
+  outbound target policy now runs immediately before every event-directed
+  connection and git fetch: per-sink scheme allowlists, no credentials, no
+  local hostnames, and only globally reachable addresses for IP literals and
+  all DNS answers. Git fetches additionally pin the vetted DNS answers and
+  disable redirects, proxies, credential helpers, and alternate protocols.
+  Service admission and self-fetch filtering now compare parsed host and port
+  instead of substrings, so `gitnostr.com.attacker.example` no longer
+  satisfies a check for `gitnostr.com`. The operator-configured bootstrap
+  relay remains usable even when local; event URLs never inherit that
+  exception. The new `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` flag (default
+  `false`) disables the reachability checks for tests and closed development
+  networks. Known limitation: relay-connection DNS is re-validated before
+  every dial but cannot be pinned through nostr-sdk's connector, leaving a
+  narrow DNS-rebinding window that needs upstream connector support.
+
 ### Fixed
 
 - Fixed malformed client messages tearing down the whole WebSocket connection.

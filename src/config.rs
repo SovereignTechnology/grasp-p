@@ -413,6 +413,25 @@ pub struct Config {
     #[arg(long, env = "NGIT_SYNC_DISABLE_NEGENTROPY", default_value_t = false)]
     pub sync_disable_negentropy: bool,
 
+    /// Allow event-directed sync targets that are not globally reachable (default: false)
+    ///
+    /// Repository announcements and PR events are untrusted; by default their
+    /// relay and clone URLs may only point at globally reachable hosts.
+    /// Loopback, private, link-local and other special-purpose addresses,
+    /// local hostnames, and hosts resolving to such addresses are rejected
+    /// before any outbound connection or git fetch (SSRF protection).
+    ///
+    /// Setting this to true disables the reachability checks. Intended only
+    /// for integration tests and closed development networks; production
+    /// relays must leave it false. The operator-configured bootstrap relay is
+    /// always allowed regardless of this setting.
+    #[arg(
+        long,
+        env = "NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS",
+        default_value_t = false
+    )]
+    pub sync_allow_non_global_targets: bool,
+
     /// Hot cache duration in seconds for rejected announcements (default: 120 = 2 minutes)
     /// Stores full event objects for immediate re-processing when dependencies resolve.
     /// Too short (<30s): Miss events from slow relays
@@ -1031,6 +1050,7 @@ impl Config {
             sync_disconnect_check_interval_secs: 60,
             sync_base_backoff_secs: 5,
             sync_disable_negentropy: false,
+            sync_allow_non_global_targets: false,
             rejected_hot_cache_duration_secs: 120,
             rejected_cold_index_expiry_secs: 604800,
             naughty_list_expiration_hours: 12,

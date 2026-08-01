@@ -101,6 +101,68 @@ These limits prevent individual connections from overwhelming the relay.
 - Max 30 requests per minute per domain
 - Respectful rate limiting when fetching missing git data
 
+### Outbound Target Policy (SSRF Protection)
+
+**Source:** Custom ngit-grasp implementation  
+**Location:** `src/outbound.rs`
+
+Repository announcements, state events, and PR events are untrusted input,
+but their `relays` and `clone` tags direct proactive sync's outbound
+WebSocket connections and purgatory git fetches. Production logs showed
+event-directed sync dialling `ws://localhost:3334`, `ws://127.0.0.1:7334`,
+and `ws://100.125.184.46:7334` (CGNAT); a crafted event could use this to
+probe or attack the relay host's local network.
+
+One fail-closed policy is applied immediately before every event-directed
+outbound sink:
+
+- **Relay connections** (`RelayConnection::connect`): re-checked before every
+  dial, including reconnects, plus a registration-time gate so forbidden
+  targets never enter the reconnect lifecycle.
+- **Git fetches** (`RealSyncContext::fetch_oids`): checked immediately before
+  spawning `git fetch`.
+
+The policy enforces:
+
+- **Scheme allowlist per sink** - `ws`/`wss` for relays, `http`/`https` for
+  git; no `file:`, `ssh:`, `git:`, or other protocol escapes.
+- **No credentials** in URLs.
+- **No local hostnames** - `localhost`, single-label names, and IANA
+  special-use suffixes (`.local`, `.internal`, `.home.arpa`, `.onion`,
+  `.test`, `.invalid`, `.localdomain`).
+- **Globally reachable addresses only** - loopback, private (RFC 1918),
+  CGNAT (RFC 6598), link-local, unspecified, multicast, broadcast,
+  documentation, benchmarking, reserved, and unique-local ranges are all
+  rejected, for IP literals and for every DNS answer (resolution failure
+  fails closed).
+- **Exact service matching** - GRASP-01 admission (`lists_service`) and the
+  don't-fetch-from-ourselves filter compare parsed host and port, so
+  `gitnostr.com.attacker.example` or `https://evil.example/gitnostr.com/`
+  cannot satisfy a check for `gitnostr.com`.
+
+The **operator-configured bootstrap relay** (`NGIT_SYNC_BOOTSTRAP_RELAY_URL`)
+is trusted and exempt, so a local bootstrap relay keeps working. Trust is
+carried by the source of the URL, never by URL comparison: an event-provided
+URL that merely resembles the bootstrap relay is still rejected.
+
+Git subprocesses are additionally confined so an authorized URL cannot escape
+the decision: `GIT_ALLOW_PROTOCOL=http:https`, `http.followRedirects=false`,
+proxies disabled (config and environment), `credential.helper=` cleared, and
+the vetted DNS answers pinned via `http.curloptResolve`.
+
+**Known limitation (DNS rebinding, relay connections only):** the vetted DNS
+answers cannot be pinned onto nostr-sdk's connector because its connect API
+accepts a URL, not a pre-resolved socket address. Relay DNS is therefore
+re-validated immediately before every connection attempt but re-resolved by
+the SDK during the dial, leaving a narrow time-of-check/time-of-use window.
+Closing it needs upstream connector support for pre-resolved addresses
+(rust-nostr). Git fetches do not share this window because their DNS answers
+are pinned.
+
+The escape hatch `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true` disables the
+reachability checks (scheme and credential checks remain) for integration
+tests and closed development networks. Production relays must leave it unset.
+
 ## What's NOT Implemented
 
 ### Per-IP Rate Limiting
@@ -152,6 +214,7 @@ Per-IP connection and event rate limiting were considered but deferred until abu
 | Naughty list | ✅ Active | Yes | Yes (12h default) |
 | Rate limit detection | ✅ Active | Yes | Automatic |
 | Domain throttling | ✅ Active | Yes | Hardcoded (5/30) |
+| Outbound target policy (SSRF) | ✅ Active | Yes | Yes (`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`) |
 | **Not Implemented** |
 | Per-IP connection limit | ⚠️ Deferred | No | - |
 | Per-IP rate limiting | ⚠️ Deferred | No | - |

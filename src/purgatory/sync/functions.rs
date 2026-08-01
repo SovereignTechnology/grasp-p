@@ -129,10 +129,12 @@ pub async fn sync_identifier_next_url<C: SyncContext + ?Sized>(
     // Get clone URLs from PR events in purgatory
     let pr_urls = ctx.collect_pr_clone_urls(identifier);
 
-    // Merge and filter out our domain
+    // Merge and filter out our domain (exact host:port match, not substring)
     let all_urls: HashSet<String> = announcement_urls
         .union(&pr_urls)
-        .filter(|url| our_domain.is_none_or(|d| !url.contains(d)))
+        .filter(|url| {
+            our_domain.is_none_or(|d| !crate::outbound::url_matches_service_domain(url, d))
+        })
         .cloned()
         .collect();
 
@@ -245,10 +247,12 @@ pub async fn get_throttled_domains_with_untried_urls<C: SyncContext + ?Sized>(
     // Get clone URLs from PR events in purgatory
     let pr_urls = ctx.collect_pr_clone_urls(identifier);
 
-    // Merge and filter out our domain
+    // Merge and filter out our domain (exact host:port match, not substring)
     let all_urls: HashSet<String> = announcement_urls
         .union(&pr_urls)
-        .filter(|url| our_domain.is_none_or(|d| !url.contains(d)))
+        .filter(|url| {
+            our_domain.is_none_or(|d| !crate::outbound::url_matches_service_domain(url, d))
+        })
         .cloned()
         .collect();
 

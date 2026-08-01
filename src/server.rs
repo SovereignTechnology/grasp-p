@@ -29,6 +29,7 @@ use crate::{
     git, grasp06, http,
     metrics::Metrics,
     nostr::{self, builder::Nip34WritePolicy, lifecycle::RepositoryLifecycle, SharedDatabase},
+    outbound::OutboundTargetPolicy,
     purgatory::{sync::RealSyncContext, sync::ThrottleManager, Purgatory},
     sync::{naughty_list::NaughtyListTracker, rejected_index::RejectedEventsIndex, SyncManager},
 };
@@ -309,6 +310,9 @@ impl RelayServer {
             Some(relay_runtime.relay.clone()),
             Some(relay_runtime.write_policy.clone()),
             git_naughty_list.clone(),
+            OutboundTargetPolicy {
+                allow_non_global: config.sync_allow_non_global_targets,
+            },
         ));
 
         // Create throttle manager for rate limiting remote git servers
