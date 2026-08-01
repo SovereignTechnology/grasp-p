@@ -2238,7 +2238,7 @@ impl<'a> TestContext<'a> {
 /// # Example
 /// ```no_run
 /// # use grasp_audit::*;
-/// # async fn example(client: &AuditClient, event: nostr_sdk::Event) -> Result<(), String> {
+/// # async fn example(client: &AuditClient, event: nostr_sdk::prelude::Event) -> Result<(), String> {
 /// send_and_verify_accepted(client, event, "issue referencing repo via 'a' tag").await?;
 /// # Ok(())
 /// # }
@@ -2292,7 +2292,7 @@ pub async fn send_and_verify_accepted(
 /// # Example
 /// ```no_run
 /// # use grasp_audit::*;
-/// # async fn example(client: &AuditClient, event: nostr_sdk::Event) -> Result<(), String> {
+/// # async fn example(client: &AuditClient, event: nostr_sdk::prelude::Event) -> Result<(), String> {
 /// send_and_verify_rejected(client, event, "orphan issue with no repo connection").await?;
 /// # Ok(())
 /// # }
