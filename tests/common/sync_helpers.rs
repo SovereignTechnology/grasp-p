@@ -1234,7 +1234,7 @@ pub async fn push_unique_git_data_to_relay(
     let path = git_temp_dir.path();
 
     fn git(path: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = grasp_audit::git_command()
             .args(args)
             .current_dir(path)
             .env("GIT_AUTHOR_NAME", "Test User")
@@ -1269,7 +1269,7 @@ pub async fn push_unique_git_data_to_relay(
     git(path, &["commit", "-m", "State test commit"]);
 
     let commit_hash = {
-        let out = std::process::Command::new("git")
+        let out = grasp_audit::git_command()
             .args(["rev-parse", "HEAD"])
             .current_dir(path)
             .output()

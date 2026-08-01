@@ -13,11 +13,11 @@ use common::{
     publish_served_repo_with_state_event_and_maintainers, push_to_relay, CommitVariant, TestRelay,
 };
 
+use grasp_audit::git_command;
 use grasp_audit::{AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
 use ngit_grasp::nostr::lifecycle::HoldingStore;
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
-use std::process::Command;
 use std::time::Duration;
 
 fn build_state_with_branches(
@@ -53,7 +53,7 @@ fn repo_path(relay: &TestRelay, client: &AuditClient, repo_id: &str) -> std::pat
 }
 
 fn list_repo_refs(repo_path: &std::path::Path) -> HashSet<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args([
             "--git-dir",
             repo_path.to_str().expect("repo path"),
@@ -80,7 +80,7 @@ fn assert_valid_empty_bare_repo(repo_path: &std::path::Path) {
         repo_path.display()
     );
 
-    let bare = Command::new("git")
+    let bare = git_command()
         .args([
             "--git-dir",
             repo_path.to_str().expect("repo path"),
@@ -100,7 +100,7 @@ fn assert_valid_empty_bare_repo(repo_path: &std::path::Path) {
         "replacement repo must report itself as bare"
     );
 
-    let refs = Command::new("git")
+    let refs = git_command()
         .args([
             "--git-dir",
             repo_path.to_str().expect("repo path"),

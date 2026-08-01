@@ -572,7 +572,7 @@ async fn test_archive_read_only_creates_bare_repo() {
         .await
         .expect("Failed to write new file");
 
-    let output = tokio::process::Command::new("git")
+    let output = tokio::process::Command::from(grasp_audit::git_command())
         .args(["add", "."])
         .current_dir(temp_dir.path())
         .output()
@@ -580,7 +580,7 @@ async fn test_archive_read_only_creates_bare_repo() {
         .expect("Failed to git add");
     assert!(output.status.success());
 
-    let output = tokio::process::Command::new("git")
+    let output = tokio::process::Command::from(grasp_audit::git_command())
         .args(["commit", "-m", "New commit for push test"])
         .current_dir(temp_dir.path())
         .output()
@@ -590,7 +590,7 @@ async fn test_archive_read_only_creates_bare_repo() {
 
     // Try to push to archive relay (should fail in read-only mode)
     let push_url = format!("http://{}/{}/{}.git", archive_domain, npub, identifier);
-    let output = tokio::process::Command::new("git")
+    let output = tokio::process::Command::from(grasp_audit::git_command())
         .args(["push", &push_url, "main"])
         .current_dir(temp_dir.path())
         .output()

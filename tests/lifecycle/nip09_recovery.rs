@@ -9,13 +9,13 @@ use common::{
     publish_served_repo_with_maintainers, publish_served_repo_with_state_event, push_to_relay,
     CommitVariant, TestRelay,
 };
+use grasp_audit::git_command;
 use grasp_audit::{AuditClient, AuditConfig};
 use ngit_grasp::nostr::lifecycle::{
     HoldingStore, DEFAULT_RETENTION, HOLDING_ARCHIVE_PATH_TAG, HOLDING_METADATA_KIND,
 };
 use nostr_sdk::prelude::*;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 async fn open_holding(relay: &TestRelay) -> HoldingStore {
@@ -230,7 +230,7 @@ async fn wait_for_event_presence(
 }
 
 fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
+    git_command()
         .args(args)
         .current_dir(repo_path)
         .output()
@@ -238,7 +238,7 @@ fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn run_git_bare(repo_path: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
+    git_command()
         .args(["--git-dir", repo_path.to_str().expect("repo path utf8")])
         .args(args)
         .output()
@@ -992,7 +992,7 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
         .expect("query restored state"));
     assert!(repo_path.is_dir(), "git repo must be restored");
 
-    let show_ref = Command::new("git")
+    let show_ref = git_command()
         .args(["--git-dir", repo_path.to_str().unwrap(), "show-ref"])
         .output()
         .expect("run git show-ref on restored repo");

@@ -11,9 +11,9 @@
 //! - Use `Tag::custom("name", vec![...])` syntax
 //! - Use `EventBuilder::new(kind, content).tags(tags)` syntax
 
+use grasp_audit::git_command;
 use nostr_sdk::prelude::*;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 // NOTE: Using rust-nostr Kind variants:
@@ -131,7 +131,7 @@ pub fn create_branch(
 
 /// Get the HEAD commit hash.
 fn get_head_commit(path: &Path) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(path)
         .output()
@@ -149,7 +149,7 @@ fn get_head_commit(path: &Path) -> Result<String, String> {
 
 /// Run a git command in the specified directory.
 fn run_git(path: &Path, args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(path)
         .output()
@@ -543,7 +543,7 @@ pub async fn check_ref_at_commit(
 ) -> Result<bool, String> {
     let remote_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
-    let output = Command::new("git")
+    let output = git_command()
         .args(["ls-remote", &remote_url, ref_name])
         .output()
         .map_err(|e| format!("Failed to run git ls-remote: {}", e))?;
@@ -591,7 +591,7 @@ pub fn push_to_relay(
     let remote_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
     // Check if origin already exists
-    let check_output = Command::new("git")
+    let check_output = git_command()
         .args(["remote", "get-url", "origin"])
         .current_dir(local_path)
         .output()
@@ -606,7 +606,7 @@ pub fn push_to_relay(
     }
 
     // Push all refs
-    let output = Command::new("git")
+    let output = git_command()
         .args(["push", "-u", "origin", "--all"])
         .current_dir(local_path)
         .output()
@@ -650,7 +650,7 @@ pub fn push_ref_to_relay(
     let remote_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
     // Check if origin already exists
-    let check_output = Command::new("git")
+    let check_output = git_command()
         .args(["remote", "get-url", "origin"])
         .current_dir(local_path)
         .output()
@@ -658,13 +658,13 @@ pub fn push_ref_to_relay(
 
     if check_output.status.success() {
         // Remote exists, update it
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["remote", "set-url", "origin", &remote_url])
             .current_dir(local_path)
             .output();
     } else {
         // Add new remote
-        let _ = Command::new("git")
+        let _ = git_command()
             .args(["remote", "add", "origin", &remote_url])
             .current_dir(local_path)
             .output();
@@ -673,7 +673,7 @@ pub fn push_ref_to_relay(
     // Push specific commit to specific ref
     // Format: git push origin <commit>:<ref>
     let refspec = format!("{}:{}", commit_hash, ref_name);
-    let output = Command::new("git")
+    let output = git_command()
         .args(["push", "origin", &refspec])
         .current_dir(local_path)
         .output()
@@ -823,7 +823,7 @@ mod tests {
         create_branch(temp_dir.path(), "feature", None).expect("Failed to create branch");
 
         // Verify branch exists
-        let output = Command::new("git")
+        let output = git_command()
             .args(["rev-parse", "feature"])
             .current_dir(temp_dir.path())
             .output()

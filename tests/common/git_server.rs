@@ -27,7 +27,7 @@
 //!     let server = SmartGitServer::start(temp_dir.path()).await;
 //!     
 //!     // Git operations work against server.url()
-//!     let output = Command::new("git")
+//!     let output = git_command()
 //!         .args(["clone", "--depth=1", server.url(), "/tmp/clone"])
 //!         .output()
 //!         .unwrap();
@@ -46,9 +46,9 @@
 //! The purgatory sync system uses `git fetch --depth=1`, so tests involving purgatory
 //! sync should use `SmartGitServer`.
 
+use grasp_audit::git_command;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use http_body_util::Full;
@@ -100,7 +100,7 @@ impl SimpleGitServer {
         let bare_repo_path = temp_dir.path().join("repo.git");
 
         // 2. Create bare clone
-        let output = Command::new("git")
+        let output = git_command()
             .args(["clone", "--bare"])
             .arg(source_repo)
             .arg(&bare_repo_path)
@@ -115,7 +115,7 @@ impl SimpleGitServer {
         }
 
         // 3. Run git update-server-info to generate info/refs and objects/info/packs
-        let output = Command::new("git")
+        let output = git_command()
             .args(["update-server-info"])
             .current_dir(&bare_repo_path)
             .output()
@@ -395,7 +395,7 @@ mod tests {
         let server = SimpleGitServer::start(temp_dir.path()).await;
 
         // Run git ls-remote against the server (using tokio::process::Command)
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["ls-remote", server.url()])
             .output()
             .await
@@ -439,7 +439,7 @@ mod tests {
         let dest_dir = tempfile::tempdir().expect("Failed to create dest dir");
 
         // Initialize empty repo (using tokio::process::Command)
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["init"])
             .current_dir(dest_dir.path())
             .output()
@@ -448,7 +448,7 @@ mod tests {
         assert!(output.status.success());
 
         // Add the server as a remote
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["remote", "add", "origin", server.url()])
             .current_dir(dest_dir.path())
             .output()
@@ -457,7 +457,7 @@ mod tests {
         assert!(output.status.success());
 
         // Fetch from the server
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["fetch", "origin"])
             .current_dir(dest_dir.path())
             .output()
@@ -471,7 +471,7 @@ mod tests {
         );
 
         // Verify the commit was fetched
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["rev-parse", "origin/main"])
             .current_dir(dest_dir.path())
             .output()
@@ -561,7 +561,7 @@ impl SmartGitServer {
         let bare_repo_path = temp_dir.path().join("repo.git");
 
         // 2. Create bare clone
-        let output = Command::new("git")
+        let output = git_command()
             .args(["clone", "--bare"])
             .arg(source_repo)
             .arg(&bare_repo_path)
@@ -759,7 +759,7 @@ async fn handle_info_refs_upload_pack(
     use tokio::process::Command as TokioCommand;
 
     // Spawn git upload-pack --advertise-refs
-    let mut cmd = TokioCommand::new("git");
+    let mut cmd = TokioCommand::from(grasp_audit::git_command());
     cmd.arg("-c")
         .arg("uploadpack.allowReachableSHA1InWant=true")
         .arg("-c")
@@ -851,7 +851,7 @@ async fn handle_upload_pack(
     let body_bytes = req.collect().await?.to_bytes();
 
     // Spawn git upload-pack
-    let mut cmd = TokioCommand::new("git");
+    let mut cmd = TokioCommand::from(grasp_audit::git_command());
     cmd.arg("-c")
         .arg("uploadpack.allowReachableSHA1InWant=true")
         .arg("-c")
@@ -1004,7 +1004,7 @@ mod smart_git_server_tests {
         let server = SmartGitServer::start(temp_dir.path()).await;
 
         // Run git ls-remote against the server (using tokio::process::Command)
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["ls-remote", server.url()])
             .output()
             .await
@@ -1048,7 +1048,7 @@ mod smart_git_server_tests {
         let dest_dir = tempfile::tempdir().expect("Failed to create dest dir");
 
         // Initialize empty repo
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["init"])
             .current_dir(dest_dir.path())
             .output()
@@ -1057,7 +1057,7 @@ mod smart_git_server_tests {
         assert!(output.status.success());
 
         // Add the server as a remote
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["remote", "add", "origin", server.url()])
             .current_dir(dest_dir.path())
             .output()
@@ -1066,7 +1066,7 @@ mod smart_git_server_tests {
         assert!(output.status.success());
 
         // Fetch from the server
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["fetch", "origin"])
             .current_dir(dest_dir.path())
             .output()
@@ -1080,7 +1080,7 @@ mod smart_git_server_tests {
         );
 
         // Verify the commit was fetched
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["rev-parse", "origin/main"])
             .current_dir(dest_dir.path())
             .output()
@@ -1113,7 +1113,7 @@ mod smart_git_server_tests {
         let dest_dir = tempfile::tempdir().expect("Failed to create dest dir");
 
         // Initialize empty repo
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["init"])
             .current_dir(dest_dir.path())
             .output()
@@ -1122,7 +1122,7 @@ mod smart_git_server_tests {
         assert!(output.status.success());
 
         // Add the server as a remote
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["remote", "add", "origin", server.url()])
             .current_dir(dest_dir.path())
             .output()
@@ -1131,7 +1131,7 @@ mod smart_git_server_tests {
         assert!(output.status.success());
 
         // Shallow fetch from the server - THIS IS WHAT PURGATORY SYNC USES
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["fetch", "--depth=1", "origin", &commit_hash])
             .current_dir(dest_dir.path())
             .output()
@@ -1145,7 +1145,7 @@ mod smart_git_server_tests {
         );
 
         // Verify the commit was fetched
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::from(grasp_audit::git_command())
             .args(["cat-file", "-t", &commit_hash])
             .current_dir(dest_dir.path())
             .output()

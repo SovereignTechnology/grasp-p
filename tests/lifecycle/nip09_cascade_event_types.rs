@@ -12,15 +12,15 @@ use common::{
     publish_served_repo, push_ref_to_relay, TestRelay,
 };
 
+use grasp_audit::git_command;
 use grasp_audit::{clone_repo, AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
 use nostr_sdk::prelude::*;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 fn repo_has_ref(repo_path: &Path, ref_name: &str) -> bool {
-    let output = Command::new("git")
+    let output = git_command()
         .args([
             "--git-dir",
             repo_path.to_str().expect("repo path utf8"),

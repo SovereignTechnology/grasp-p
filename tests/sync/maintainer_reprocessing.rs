@@ -29,9 +29,9 @@
 //! announcements are in relay_a's DB), wait briefly for the sync round-trip, then
 //! send the owner announcement + git push.
 
+use grasp_audit::git_command;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -146,7 +146,7 @@ async fn push_counts(relay: &TestRelay) -> (u64, u64) {
 }
 
 fn list_remote_refs(clone_url: &str) -> Result<BTreeMap<String, String>, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["ls-remote", "--refs", clone_url])
         .output()
         .map_err(|error| format!("Failed to list refs from {clone_url}: {error}"))?;
@@ -203,7 +203,7 @@ async fn assert_remote_refs(
 }
 
 fn rename_default_branch(repository: &Path, branch: &str) {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["branch", "-m", branch])
         .current_dir(repository)
         .output()
@@ -216,7 +216,7 @@ fn rename_default_branch(repository: &Path, branch: &str) {
 }
 
 fn remote_default_branch(clone_url: &str) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["ls-remote", "--symref", clone_url, "HEAD"])
         .output()
         .map_err(|error| format!("Failed to inspect HEAD from {clone_url}: {error}"))?;
@@ -1080,7 +1080,7 @@ async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
         &[&source_relay.domain()],
     )
     .await;
-    let commit_output = Command::new("git")
+    let commit_output = git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(maintainer_git.path())
         .output()

@@ -106,11 +106,11 @@ pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Even
         "deterministic commit hash mismatch"
     );
 
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["branch", "main"])
         .current_dir(&clone_path)
         .output();
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["checkout", "main"])
         .current_dir(&clone_path)
         .output();
@@ -222,11 +222,11 @@ pub async fn publish_served_repo_with_maintainers(
         "deterministic commit hash mismatch"
     );
 
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["branch", "main"])
         .current_dir(&clone_path)
         .output();
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["checkout", "main"])
         .current_dir(&clone_path)
         .output();
@@ -498,11 +498,11 @@ pub async fn publish_served_announcement_for_identifier(
         "deterministic commit hash mismatch"
     );
 
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["branch", "main"])
         .current_dir(&clone_path)
         .output();
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["checkout", "main"])
         .current_dir(&clone_path)
         .output();
@@ -611,11 +611,11 @@ pub async fn publish_served_announcement_with_state_for_identifier(
         "deterministic commit hash mismatch"
     );
 
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["branch", "main"])
         .current_dir(&clone_path)
         .output();
-    let _ = std::process::Command::new("git")
+    let _ = grasp_audit::git_command()
         .args(["checkout", "main"])
         .current_dir(&clone_path)
         .output();

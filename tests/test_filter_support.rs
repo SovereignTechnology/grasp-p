@@ -19,7 +19,7 @@ async fn test_filter_capability_advertised() {
     let server = SmartGitServer::start(temp_dir.path()).await;
 
     // Run git ls-remote to see advertised capabilities
-    let output = Command::new("git")
+    let output = Command::from(grasp_audit::git_command())
         .env("GIT_TRACE_PACKET", "1")
         .args(["ls-remote", server.url()])
         .output()
@@ -63,7 +63,7 @@ async fn test_filtered_clone_succeeds() {
     let clone_path = clone_dir.path().join("cloned-repo");
 
     // Attempt a filtered clone
-    let output = Command::new("git")
+    let output = Command::from(grasp_audit::git_command())
         .args([
             "clone",
             "--filter=blob:none",
@@ -90,7 +90,7 @@ async fn test_filtered_clone_succeeds() {
     );
 
     // In a filtered clone, we should be able to list files
-    let ls_output = Command::new("git")
+    let ls_output = Command::from(grasp_audit::git_command())
         .current_dir(&clone_path)
         .args(["ls-files"])
         .output()
@@ -126,7 +126,7 @@ async fn test_filtered_fetch_succeeds() {
     let clone_dir = TempDir::new().expect("Failed to create clone dir");
     let clone_path = clone_dir.path().join("repo");
 
-    let clone_output = Command::new("git")
+    let clone_output = Command::from(grasp_audit::git_command())
         .args(["clone", server.url(), clone_path.to_str().unwrap()])
         .output()
         .await
@@ -139,7 +139,7 @@ async fn test_filtered_fetch_succeeds() {
     );
 
     // Now try a filtered fetch
-    let fetch_output = Command::new("git")
+    let fetch_output = Command::from(grasp_audit::git_command())
         .current_dir(&clone_path)
         .args(["fetch", "--filter=blob:none", "origin"])
         .output()
