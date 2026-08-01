@@ -24,6 +24,8 @@ Key Architectural Points:
 - **Clear separation** between Live sync (using `limit:0`) and Historic Sync (handled via negentropy falling back to REQ+EOSE with 'until' based pagination support)
 - **Discovery management**: The nature of discovery inherently leads to a drip feed of root_events (e.g., Repo Announcements, Issues, Patches and PRs) that require additional subscriptions. Without careful management this can lead to large numbers of subscriptions and potentially rate limiting. Mitigation strategies:
   - Self-subscriber waits for 5s to batch updates before creating new filters / subscriptions, allowing time for most events to be received from outstanding subscriptions from connected relays
+  - Up to ten compatible OR filters share each NIP-01 REQ, bounding
+    relay-visible active subscriptions without broadening any filter
   - PendingBatch tracks each new set of filters that may require pagination until they are complete
   - Websocket handshakes run in at most eight bounded workers outside the sync
     actor; only the actor applies their results, and subscriptions start only
@@ -168,15 +170,18 @@ pub enum SyncMethod {
 /// Key: relay URL
 pub type PendingSyncIndex = Arc<RwLock<HashMap<String, Vec<PendingBatch>>>>;
 
-/// Pagination state for a subscription in non-Negentropy historic sync
+/// Pagination state for one filter inside a grouped subscription
+#[derive(Debug, Clone)]
+pub struct FilterPaginationState {
+    pub event_count: usize,
+    pub min_created_at: Option<Timestamp>,
+    pub original_filter: Filter,
+}
+
+/// Per-filter progress for every OR filter carried by one subscription
 #[derive(Debug, Clone)]
 pub struct PaginationState {
-    /// Number of events received for this subscription
-    pub event_count: usize,
-    /// Smallest created_at timestamp seen (for pagination with `until`)
-    pub min_created_at: Option<Timestamp>,
-    /// Original filter to reconstruct for next page
-    pub original_filter: Filter,
+    pub filters: Vec<FilterPaginationState>,
 }
 
 pub struct PendingBatch {
@@ -205,12 +210,18 @@ pub struct PendingItems {
 
 When a relay doesn't support NIP-77 Negentropy, historic sync falls back to traditional REQ+EOSE. To handle large result sets efficiently:
 
-- **`PaginationState`** tracks per-subscription pagination progress
+- **`PaginationState`** tracks pagination separately for each OR filter in a
+  grouped subscription
   - `event_count`: Number of events received so far
   - `min_created_at`: Smallest timestamp seen, used to set `until` for next page
   - `original_filter`: Base filter to reconstruct with updated `until` parameter
-- **Automatic pagination**: When EOSE is received, if enough events were received to suggest more may exist, the system automatically issues a follow-up request with `until` set to `min_created_at`
+- **Automatic pagination**: When EOSE is received, each filter that may have
+  more results is reconstructed with its own `until` timestamp; those next-page
+  filters remain grouped in one follow-up REQ
 - **Completion**: Pagination continues until an EOSE is received with fewer events than expected, indicating the end of results
+- **Compatibility assumptions**: Relay result limits apply independently to
+  each filter, the effective per-filter limit is at least 75, and there is no
+  additional total-result cap across the grouped REQ
 
 ---
 
@@ -707,8 +718,10 @@ fn compute_actions(
 
 ### Sync Primitives
 
-- **`sync_live()`**: Creates subscriptions with `limit: 0` for ongoing event stream (not tracked in PendingSyncIndex)
-- **`historic_sync()`**: Dispatches to negentropy or REQ+EOSE based on relay capability, creates PendingBatch, returns batch_id
+- **`sync_live()`**: Groups compatible filters into bounded subscriptions with
+  `limit: 0` for the ongoing event stream (not tracked in PendingSyncIndex)
+- **`historic_sync()`**: Dispatches to negentropy or grouped REQ+EOSE based on
+  relay capability, creates PendingBatch, and returns a batch ID
 
 ### Filter Processing
 
@@ -843,8 +856,10 @@ When a relay doesn't support NIP-77 Negentropy, historic sync uses traditional R
 
 ### How Pagination Works
 
-1. **Initial Request**: Send REQ with filters (may include `since` parameter)
-2. **Track Events**: As events arrive, [`PaginationState`](src/sync/mod.rs:165) tracks:
+1. **Initial Request**: Send bounded groups of OR filters in each REQ (filters
+   may include a `since` parameter)
+2. **Track Events**: As events arrive, `PaginationState` tracks each matching
+   filter independently:
    - `event_count`: Number of events received
    - `min_created_at`: Smallest timestamp seen (oldest event)
    - `original_filter`: Base filter for reconstruction
@@ -852,8 +867,25 @@ When a relay doesn't support NIP-77 Negentropy, historic sync uses traditional R
 4. **Next Page**: If enough events were received (suggesting more exist):
    - Create new filter with `until: min_created_at`
    - Issue another REQ for events older than the oldest seen
-   - Reuse same subscription ID
+   - Group the next-page filters in a new subscription
 5. **Completion**: Repeat until EOSE arrives with fewer events, indicating end of results
+
+### Relay Compatibility Assumptions
+
+Per-filter completion is inferred from the number of returned events because
+NIP-01 does not provide a pagination cursor or an explicit "filter exhausted"
+signal. Grouped historic sync therefore assumes that a relay:
+
+- applies its result limit independently to every filter in the REQ;
+- returns at least 75 events for a non-exhausted filter; and
+- does not impose an additional total-result cap across the whole REQ that can
+  allow one filter to starve another.
+
+ngit-grasp's relay implementation has these semantics: it queries each filter
+with its own limit before merging and deduplicating the results. Relays with a
+smaller hidden per-filter cap or a shared total-result cap can cause historic
+sync to conclude prematurely, so compatibility with those implementations is
+not currently guaranteed.
 
 ### Pagination State Lifecycle
 
@@ -861,14 +893,14 @@ When a relay doesn't support NIP-77 Negentropy, historic sync uses traditional R
 flowchart TB
     REQ[Send REQ with filters] --> TRACK[Initialize PaginationState]
     TRACK --> EVENT[Receive EVENT]
-    EVENT --> UPDATE[Update event_count and min_created_at]
+    EVENT --> UPDATE[Update each matching filter's count and oldest timestamp]
     UPDATE --> MORE{More events?}
     MORE --> |yes| EVENT
     MORE --> |no| EOSE[Receive EOSE]
     EOSE --> CHECK{event_count suggests more pages?}
-    CHECK --> |yes| NEXT[Create filter with until=min_created_at]
-    NEXT --> REQ2[Send next page REQ]
-    REQ2 --> RESET[Reset event_count, keep min_created_at]
+    CHECK --> |yes| NEXT[Create next filters with their own until timestamps]
+    NEXT --> REQ2[Send grouped next page REQ]
+    REQ2 --> RESET[Reset per-filter counters]
     RESET --> EVENT
     CHECK --> |no| DONE[Batch complete, confirm items]
 ```
@@ -880,7 +912,7 @@ flowchart TB
 | **Efficiency**      | High (set reconciliation)    | Lower (sequential pages)                                  |
 | **Bandwidth**       | Minimal (only missing items) | Higher (all matching events transferred)                  |
 | **Relay support**   | Requires NIP-77              | Universal (standard Nostr)                                |
-| **State tracking**  | None needed                  | [`PaginationState`](src/sync/mod.rs:165) per subscription |
+| **State tracking**  | None needed                  | Per-filter state within each grouped subscription         |
 | **Completion time** | Typically faster             | Slower for large sets                                     |
 | **Use cases**       | Full sync, large event sets  | Fallback, small gaps with `since`                         |
 

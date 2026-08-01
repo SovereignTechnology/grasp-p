@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed proactive sync losing repository events when public relays cap active
+  subscriptions. Compatible GRASP filters now share bounded NIP-01 REQs while
+  retaining per-filter history pagination.
 - Removed superseded same-author repository states from purgatory after their
   replacement is promoted when the locally available Git data cannot
   reconstruct them. Reconstructable rollback states and other maintainers'

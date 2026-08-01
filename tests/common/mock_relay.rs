@@ -72,6 +72,19 @@ impl MockRelay {
     /// The relay accepts all events without validation and stores them
     /// in an in-memory database.
     pub async fn start() -> Self {
+        Self::start_with_rate_limit(RateLimit::default()).await
+    }
+
+    /// Start a mock relay with a custom per-connection active REQ limit.
+    pub async fn start_with_max_reqs(max_reqs: usize) -> Self {
+        Self::start_with_rate_limit(RateLimit {
+            max_reqs,
+            ..RateLimit::default()
+        })
+        .await
+    }
+
+    async fn start_with_rate_limit(rate_limit: RateLimit) -> Self {
         // Create and bind listener (eliminates port race condition)
         let std_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
@@ -87,7 +100,7 @@ impl MockRelay {
         let listener =
             TcpListener::from_std(std_listener).expect("Failed to convert to tokio listener");
 
-        Self::start_with_listener(listener, port).await
+        Self::start_with_listener(listener, port, rate_limit).await
     }
 
     /// Start a mock relay on a specific port.
@@ -96,13 +109,13 @@ impl MockRelay {
         let listener = TcpListener::bind(addr)
             .await
             .expect("Failed to bind to address");
-        Self::start_with_listener(listener, port).await
+        Self::start_with_listener(listener, port, RateLimit::default()).await
     }
 
     /// Internal method to start the relay with an existing listener.
-    async fn start_with_listener(listener: TcpListener, port: u16) -> Self {
+    async fn start_with_listener(listener: TcpListener, port: u16, rate_limit: RateLimit) -> Self {
         // Create a simple relay with no write policy (accepts all events)
-        let relay = LocalRelayBuilder::default().build();
+        let relay = LocalRelayBuilder::default().rate_limit(rate_limit).build();
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -167,6 +180,11 @@ impl MockRelay {
     /// Get the relay WebSocket URL.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Get the relay domain as a host and port.
+    pub fn domain(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     /// Stop the mock relay.
