@@ -2,6 +2,7 @@
 #![allow(dead_code)] // Test helpers may not be used in all test configurations
 #![allow(unused_imports)] // Re-exports may not be used in all test configurations
 
+pub mod censoring_proxy;
 pub mod git_server;
 pub mod mock_relay;
 pub mod nip09_helpers;

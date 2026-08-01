@@ -128,6 +128,7 @@
 //! - `fetch_metrics()` - Prometheus metrics fetching
 
 // Test modules
+pub mod historic_recovery;
 pub mod historic_sync;
 pub mod catchup;
 pub mod discovery;

@@ -292,7 +292,7 @@ Each layer creates one or more `PendingBatch` entries tracked in `PendingSyncInd
 
 **Why the double-check?** There's an async gap between receiving EOSE and the self-subscriber processing events to create Layer 2/3 filters. The 6-second wait (5s batch window + 1s buffer) ensures we don't prematurely mark sync complete while Layer 2/3 batches are being created.
 
-**Batch Failure Tracking**: When negentropy retry protection triggers (relay returns zero requested events on retry), the batch is marked as `failed = true`. This causes the relay to transition to `ConnectedHistoricSyncFailures` instead of `Connected`, signaling that live sync is active but historic sync is incomplete.
+**Batch Failure Tracking**: When negentropy retry protection triggers (relay returns zero requested events on retry) and no fallback subscriptions can be created, the batch is marked as `failed = true`. This causes the relay to transition to `ConnectedHistoricSyncFailures` instead of `Connected`, signaling that live sync is active but historic sync is incomplete. The event IDs the relay failed to deliver are not dropped with the batch: they are registered for bounded background recovery (see "Missing-Event Recovery for Incomplete Batches" below), and a relay whose pending IDs are all eventually recovered — with no unrelated batch failures — is promoted back to `Connected`.
 
 **Metrics tracking**: The `ngit_sync_relay_connected` metric shows:
 - `0` = Disconnected
@@ -390,6 +390,8 @@ The sync system uses three background tasks that run continuously:
 3. When an announcement is promoted (git data arrives), the SelfSubscriber sees the newly accepted event and upgrades the entry to `SyncLevel::Full`
 
 **Why a separate timer?** Purgatory announcements are never saved to the database, so the SelfSubscriber never sees them. The timer bridges this gap, ensuring state events are synced for repos that may still receive git data.
+
+The same tick also drives missing-event recovery for incomplete historic sync batches (see "Missing-Event Recovery for Incomplete Batches"). Recovery attempts are backed off per relay, so the tick stays cheap when nothing is due.
 
 ---
 
@@ -799,6 +801,43 @@ Each dry-run diff also has a 15-second total wall-clock deadline. This is
 separate from the SDK's initial-response and idle timers: a relay that keeps an
 exchange active without completing it cannot hold the sync actor indefinitely.
 Reaching the deadline uses the same unsupported-relay fallback path.
+
+### Missing-Event Recovery for Incomplete Batches
+
+Negentropy reconciliation can identify event IDs a relay holds, only for the
+relay's exact-ID REQ response to return a subset of them (result limits,
+truncation) or nothing at all. The batch flow retries once with an ID-based
+subscription and then falls back to semantic REQ+EOSE filters built from the
+batch's repos/root events. The generic Layer 1 announcements batch carries no
+such metadata, so no semantic fallback exists for it: in production this
+finalized the batch with partial results and silently dropped the missing IDs
+until the next daily sync (23-25h later).
+
+Missing IDs from a batch that finalizes incomplete are instead registered in a
+per-relay recovery index (`sync::missing_events`) and retried by the sync
+maintenance timer:
+
+- **Non-blocking**: the batch still finalizes (as failed) and the relay keeps
+  serving traffic; recovery runs in the background over the existing relay
+  connection, outside the sync actor lock.
+- **Bounded and backed off**: attempts are per relay with exponential backoff
+  (30s base doubling up to 15min; sub-second in `NGIT_TEST`), one in-flight
+  attempt per relay, at most 300 IDs per fetch. One persistently incomplete
+  relay cannot starve other relays or later batches.
+- **Progress-aware**: a successful attempt clears only the IDs actually
+  recovered and resets the backoff; duplicate incomplete responses merge into
+  the existing pending set. IDs that arrive by other means (live sync, user
+  submission) are cleared on the next tick without consuming attempt budget.
+- **Explicit expiry**: after 12 consecutive zero-progress attempts the relay's
+  pending IDs are dropped with a warning, and the relay stays in
+  `ConnectedHistoricSyncFailures` until the daily sync re-discovers the gap.
+  Attempts against a disconnected relay are deferred, not counted, so an
+  unavailable relay neither expires its pending work nor loops tightly.
+- **Honest status**: full recovery promotes the relay from
+  `ConnectedHistoricSyncFailures` back to `Connected` — but only when no
+  unrelated batch failure was observed for that relay. Nothing is persisted
+  across restarts; a restart re-runs historic sync, which re-detects any
+  still-missing events.
 
 ### Integration with Rejected Events Index
 

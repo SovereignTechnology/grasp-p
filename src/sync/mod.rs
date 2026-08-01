@@ -16,6 +16,7 @@ pub mod algorithms;
 pub mod filters;
 pub mod health;
 pub mod metrics;
+pub mod missing_events;
 pub mod naughty_list;
 pub mod rejected_index;
 pub mod relay_connection;
@@ -752,6 +753,11 @@ async fn run_daily_timer(
 /// - Sync-path announcements: registered here within one interval of arriving.
 /// - User-submitted purgatory announcements: the SelfSubscriber never sees them
 ///   (they're rejected from DB), so this timer is the only registration path.
+///
+/// The same tick also drives bounded recovery of events that relays reported
+/// during negentropy reconciliation but failed to deliver on exact-ID fetches
+/// (see [`missing_events`]). Recovery attempts are backed off per relay, so
+/// the tick itself stays cheap when nothing is due.
 async fn run_purgatory_announcement_sync(
     sync_manager: Arc<Mutex<SyncManager>>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -766,6 +772,7 @@ async fn run_purgatory_announcement_sync(
             _ = tokio::time::sleep(interval) => {
                 let mut manager = sync_manager.lock().await;
                 manager.sync_purgatory_announcements_to_index().await;
+                manager.tick_missing_event_recovery().await;
             }
             _ = shutdown_rx.recv() => {
                 tracing::debug!("Purgatory announcement sync timer received shutdown signal");
@@ -958,6 +965,10 @@ pub struct SyncManager {
     rejected_relay_targets: HashSet<String>,
     /// Last exact-ID dependency recovery attempt, used to bound retries.
     dependency_refetch_attempts: Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
+    /// Events relays reported during negentropy reconciliation but failed to
+    /// deliver on exact-ID fetches. Retried with bounded backoff by the sync
+    /// maintenance timer instead of being dropped with their failed batch.
+    missing_event_recovery: Arc<std::sync::Mutex<missing_events::MissingEventRecoveryIndex>>,
     /// Last dependency pass for each purgatory announcement.
     purgatory_dependency_attempts: HashMap<EventId, Instant>,
     /// Temporary source relays retained while rejected dependencies are recovered.
@@ -1059,6 +1070,9 @@ impl SyncManager {
             connections: HashMap::new(),
             rejected_relay_targets: HashSet::new(),
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            missing_event_recovery: Arc::new(std::sync::Mutex::new(
+                missing_events::MissingEventRecoveryIndex::default(),
+            )),
             purgatory_dependency_attempts: HashMap::new(),
             dependency_relay_deadlines: HashMap::new(),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
@@ -1327,7 +1341,7 @@ impl SyncManager {
                             retry_count = retry_count,
                             requested_count = requested_count,
                             missing_count = missing.len(),
-                            missing_ids = ?missing.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                            missing_ids_sample = ?missing.iter().take(5).map(|id| id.to_hex()).collect::<Vec<_>>(),
                             "Negentropy retry made no progress - relay returned zero requested events. \
                              Marking relay as not supporting negentropy and falling back to REQ+EOSE."
                         );
@@ -1422,12 +1436,33 @@ impl SyncManager {
                             // Early return - batch not complete yet, waiting for REQ+EOSE EOSE
                             return;
                         } else {
-                            // Failed to create any fallback subscriptions, mark as failed
+                            // No fallback subscriptions could be created (for
+                            // announcement batches there is no semantic metadata
+                            // at all). Finalize the batch as failed but keep the
+                            // missing IDs represented so the maintenance timer
+                            // retries them with bounded backoff instead of
+                            // forgetting them until the next daily sync.
+                            let relay_already_degraded = {
+                                let index = self.relay_sync_index.read().await;
+                                index
+                                    .get(&relay_url_for_fallback)
+                                    .map(|state| state.historic_sync_had_failures)
+                                    .unwrap_or(false)
+                            };
+                            let register_outcome =
+                                self.missing_event_recovery.lock().unwrap().register(
+                                    &relay_url_for_fallback,
+                                    batch_id,
+                                    missing.iter().copied(),
+                                    relay_already_degraded,
+                                    Instant::now(),
+                                );
                             tracing::error!(
                                 relay = %relay_url_for_fallback,
                                 batch_id = batch_id,
                                 missing_count = missing_count,
-                                "Failed to create REQ+EOSE fallback subscriptions - completing batch with partial results"
+                                pending_recovery = register_outcome.pending_total,
+                                "Failed to create REQ+EOSE fallback subscriptions - completing batch with partial results; bounded missing-event recovery scheduled"
                             );
 
                             // Re-acquire lock to extract the batch
@@ -1457,7 +1492,7 @@ impl SyncManager {
                         requested_count = requested_count,
                         received_count = received_count,
                         missing_count = missing.len(),
-                        missing_ids = ?missing.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                        missing_ids_sample = ?missing.iter().take(5).map(|id| id.to_hex()).collect::<Vec<_>>(),
                         "Negentropy sync incomplete - relay returned fewer events than requested. \
                          This may indicate a relay limit on ID-based queries. \
                          Retrying missing events."
@@ -1523,20 +1558,39 @@ impl SyncManager {
                         // Early return - batch not complete yet, waiting for retry EOSE
                         return;
                     } else {
-                        // Failed to create retry subscriptions, log and continue to confirm
-                        // with partial results
+                        // Failed to create retry subscriptions. Finalize the
+                        // batch as failed (an incomplete batch must not be
+                        // reported as successfully complete) and keep the
+                        // missing IDs represented for bounded recovery.
+                        let relay_already_degraded = {
+                            let index = self.relay_sync_index.read().await;
+                            index
+                                .get(&relay_url_for_retry)
+                                .map(|state| state.historic_sync_had_failures)
+                                .unwrap_or(false)
+                        };
+                        let register_outcome =
+                            self.missing_event_recovery.lock().unwrap().register(
+                                &relay_url_for_retry,
+                                batch_id,
+                                missing.iter().copied(),
+                                relay_already_degraded,
+                                Instant::now(),
+                            );
                         tracing::error!(
                             relay = %relay_url_for_retry,
                             batch_id = batch_id,
                             missing_count = missing.len(),
-                            "Failed to retry missing events - confirming batch with partial results"
+                            pending_recovery = register_outcome.pending_total,
+                            "Failed to retry missing events - confirming batch with partial results; bounded missing-event recovery scheduled"
                         );
 
                         // Re-acquire lock to extract the batch
                         let mut pending = self.pending_sync_index.write().await;
                         if let Some(batches) = pending.get_mut(&relay_url_for_retry) {
                             if let Some(idx) = batches.iter().position(|b| b.batch_id == batch_id) {
-                                let completed_batch = batches.remove(idx);
+                                let mut completed_batch = batches.remove(idx);
+                                completed_batch.failed = true;
                                 if batches.is_empty() {
                                     pending.remove(&relay_url_for_retry);
                                 }
@@ -1642,6 +1696,288 @@ impl SyncManager {
         });
     }
 
+    /// Drive bounded recovery of events relays reported during negentropy
+    /// reconciliation but failed to deliver on exact-ID fetches.
+    ///
+    /// Runs on the sync maintenance timer. For each relay with pending IDs:
+    /// 1. IDs already present locally (live sync, user submission) are
+    ///    cleared promptly without consuming attempt budget.
+    /// 2. When the relay's backoff deadline has passed and it has a live
+    ///    connection, one bounded exact-ID fetch is spawned. Network I/O runs
+    ///    outside the sync actor lock, and per-relay single-flight keeps one
+    ///    persistently incomplete relay from starving other relays or later
+    ///    batches.
+    async fn tick_missing_event_recovery(&mut self) {
+        let idle_relays = self.missing_event_recovery.lock().unwrap().idle_relays();
+        if idle_relays.is_empty() {
+            return;
+        }
+
+        for relay_url in idle_relays {
+            let Some(pending) = self
+                .missing_event_recovery
+                .lock()
+                .unwrap()
+                .pending_ids(&relay_url)
+            else {
+                continue;
+            };
+
+            // 1. Clear IDs satisfied by other means.
+            let satisfied: Vec<EventId> = match self
+                .database
+                .query(Filter::new().ids(pending.iter().copied()))
+                .await
+            {
+                Ok(events) => events.into_iter().map(|event| event.id).collect(),
+                Err(_) => Vec::new(),
+            };
+            if !satisfied.is_empty() {
+                let outcome = self
+                    .missing_event_recovery
+                    .lock()
+                    .unwrap()
+                    .clear_satisfied(&relay_url, &satisfied);
+                tracing::info!(
+                    relay = %relay_url,
+                    satisfied = satisfied.len(),
+                    "Pending missing events satisfied by local arrivals"
+                );
+                if let Some(outcome) = outcome {
+                    Self::apply_recovery_outcome(
+                        &relay_url,
+                        outcome,
+                        &self.relay_sync_index,
+                        self.metrics.as_ref(),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+
+            // 2. Issue a due attempt over a live connection only.
+            let connection_ready = {
+                let index = self.relay_sync_index.read().await;
+                index
+                    .get(&relay_url)
+                    .map(|state| {
+                        matches!(
+                            state.connection_status,
+                            ConnectionStatus::Syncing
+                                | ConnectionStatus::Connected
+                                | ConnectionStatus::ConnectedHistoricSyncFailures
+                        )
+                    })
+                    .unwrap_or(false)
+            };
+            let connection = self.connections.get(&relay_url).cloned();
+            let (Some(connection), true) = (connection, connection_ready) else {
+                // No usable connection: postpone without consuming the
+                // zero-progress budget so an unavailable relay can neither
+                // expire its pending IDs nor spin in a tight loop.
+                self.missing_event_recovery
+                    .lock()
+                    .unwrap()
+                    .defer_attempt(&relay_url, Instant::now());
+                continue;
+            };
+
+            let Some(attempt) = self
+                .missing_event_recovery
+                .lock()
+                .unwrap()
+                .begin_attempt(&relay_url, Instant::now())
+            else {
+                continue;
+            };
+
+            tokio::spawn(Self::run_missing_event_recovery_attempt(
+                relay_url,
+                connection,
+                attempt,
+                Arc::clone(&self.database),
+                self.write_policy.clone(),
+                self.local_relay.clone(),
+                Arc::clone(&self.rejected_events_index),
+                Arc::clone(&self.missing_event_recovery),
+                self.relay_sync_index.clone(),
+                self.metrics.clone(),
+            ));
+        }
+    }
+
+    /// One bounded exact-ID recovery fetch against a single relay.
+    ///
+    /// Runs outside the sync actor lock. Every event the relay returns is
+    /// passed through the normal write policy; an ID counts as recovered once
+    /// the relay has delivered the event, regardless of the policy verdict
+    /// (rejected events have their own re-processing machinery).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_missing_event_recovery_attempt(
+        relay_url: String,
+        connection: RelayConnection,
+        attempt: missing_events::RecoveryAttempt,
+        database: SharedDatabase,
+        write_policy: Nip34WritePolicy,
+        local_relay: LocalRelay,
+        rejected_events_index: Arc<RejectedEventsIndex>,
+        missing_event_recovery: Arc<std::sync::Mutex<missing_events::MissingEventRecoveryIndex>>,
+        relay_index: RelaySyncIndex,
+        metrics: Option<SyncMetrics>,
+    ) {
+        let requested: HashSet<EventId> = attempt.ids.iter().copied().collect();
+        tracing::info!(
+            relay = %relay_url,
+            attempt = attempt.attempt_number,
+            requested = requested.len(),
+            "Retrying events missing from an incomplete historic sync batch"
+        );
+
+        let events = match connection
+            .fetch_events(
+                Filter::new().ids(attempt.ids.iter().copied()),
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(
+                    relay = %relay_url,
+                    attempt = attempt.attempt_number,
+                    requested = requested.len(),
+                    error = %error,
+                    "Missing-event recovery fetch failed"
+                );
+                Vec::new()
+            }
+        };
+
+        let mut recovered = HashSet::new();
+        for event in events {
+            if !requested.contains(&event.id) {
+                continue;
+            }
+            let result = Self::process_event_static(
+                &event,
+                &relay_url,
+                &database,
+                &write_policy,
+                &local_relay,
+                &rejected_events_index,
+                crate::nostr::persistence::SaveContext::RelaySync,
+            )
+            .await;
+            if result == ProcessResult::Rejected {
+                tracing::debug!(
+                    relay = %relay_url,
+                    event_id = %event.id,
+                    "Recovered missing event was rejected by the write policy"
+                );
+            }
+            recovered.insert(event.id);
+        }
+
+        let outcome = missing_event_recovery.lock().unwrap().complete_attempt(
+            &relay_url,
+            &recovered,
+            Instant::now(),
+        );
+        let Some(outcome) = outcome else {
+            tracing::debug!(
+                relay = %relay_url,
+                "Recovery attempt finished after the relay's pending work was reset"
+            );
+            return;
+        };
+        Self::apply_recovery_outcome(&relay_url, outcome, &relay_index, metrics.as_ref()).await;
+    }
+
+    /// Log a recovery outcome and, on full recovery, restore relay health.
+    ///
+    /// A relay is only promoted from `ConnectedHistoricSyncFailures` back to
+    /// `Connected` when every registered missing ID was recovered and no
+    /// unrelated batch failure was observed for the relay.
+    async fn apply_recovery_outcome(
+        relay_url: &str,
+        outcome: missing_events::AttemptOutcome,
+        relay_index: &RelaySyncIndex,
+        metrics: Option<&SyncMetrics>,
+    ) {
+        use missing_events::AttemptOutcome;
+
+        match outcome {
+            AttemptOutcome::FullyRecovered {
+                recovered,
+                total_recovered,
+                can_restore_health,
+            } => {
+                tracing::info!(
+                    relay = %relay_url,
+                    recovered,
+                    total_recovered,
+                    can_restore_health,
+                    "All events missing from historic sync fully recovered"
+                );
+                if !can_restore_health {
+                    return;
+                }
+                let mut index = relay_index.write().await;
+                if let Some(state) = index.get_mut(relay_url) {
+                    state.historic_sync_had_failures = false;
+                    if state.connection_status == ConnectionStatus::ConnectedHistoricSyncFailures {
+                        state.connection_status = ConnectionStatus::Connected;
+                        tracing::info!(
+                            relay = %relay_url,
+                            "Historic sync failures resolved - relay promoted to Connected"
+                        );
+                        if let Some(metrics) = metrics {
+                            metrics
+                                .record_connection_status(relay_url, ConnectionStatus::Connected);
+                        }
+                    }
+                }
+            }
+            AttemptOutcome::PartiallyRecovered {
+                recovered,
+                remaining,
+                next_attempt_in,
+            } => {
+                tracing::info!(
+                    relay = %relay_url,
+                    recovered,
+                    remaining,
+                    next_attempt_in_secs = next_attempt_in.as_secs_f64(),
+                    "Partially recovered events missing from historic sync - retry scheduled"
+                );
+            }
+            AttemptOutcome::RetryScheduled {
+                attempt,
+                remaining,
+                next_attempt_in,
+            } => {
+                tracing::info!(
+                    relay = %relay_url,
+                    attempt,
+                    remaining,
+                    next_attempt_in_secs = next_attempt_in.as_secs_f64(),
+                    "No missing events recovered - retry scheduled with backoff"
+                );
+            }
+            AttemptOutcome::Expired {
+                remaining,
+                attempts,
+            } => {
+                tracing::warn!(
+                    relay = %relay_url,
+                    remaining,
+                    attempts,
+                    "Missing-event recovery expired by policy after repeated zero-progress attempts - relay remains ConnectedHistoricSyncFailures until daily sync"
+                );
+            }
+        }
+    }
+
     /// Confirm a completed batch by moving items to RelayState
     ///
     /// This method is used by both sync paths (REQ+EOSE and Negentropy) to
@@ -1716,6 +2052,12 @@ impl SyncManager {
             // Track if this batch failed (for ConnectedDegraded transition)
             if batch.failed {
                 state.historic_sync_had_failures = true;
+                // Failures unrelated to a relay's pending missing-event
+                // recovery mean full recovery must not restore its health.
+                self.missing_event_recovery
+                    .lock()
+                    .unwrap()
+                    .note_failed_batch(relay_url, batch_id);
                 tracing::warn!(
                     relay = %relay_url,
                     batch_id = batch_id,
@@ -1892,6 +2234,21 @@ impl SyncManager {
 
         // Unsubscribe all current subscriptions
         connection.unsubscribe_all().await;
+
+        // Daily sync re-discovers everything from scratch, superseding any
+        // pending missing-event recovery for this relay.
+        let dropped_recovery_ids = self
+            .missing_event_recovery
+            .lock()
+            .unwrap()
+            .clear_relay(relay_url);
+        if dropped_recovery_ids > 0 {
+            tracing::info!(
+                relay = %relay_url,
+                dropped_missing_ids = dropped_recovery_ids,
+                "Daily sync reset pending missing-event recovery"
+            );
+        }
 
         // Clear pending batches for this relay
         {
@@ -3561,6 +3918,12 @@ impl SyncManager {
                     "Removed connection from connections map"
                 );
             }
+
+            // Drop pending missing-event recovery along with the relay.
+            self.missing_event_recovery
+                .lock()
+                .unwrap()
+                .clear_relay(relay_url);
 
             // Update metrics - decrement connected count
             if let Some(ref metrics) = self.metrics {

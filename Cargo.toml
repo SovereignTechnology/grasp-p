@@ -83,6 +83,7 @@ tempfile = "3"
 grasp-audit = { path = "grasp-audit", version = "0.2.0" }
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+tokio-tungstenite = "0.28.0"
 
 [lib]
 name = "ngit_grasp"

@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed historic sync silently abandoning events a relay identified but failed
+  to deliver. Negentropy reconciliation finds event IDs missing locally, but a
+  relay's exact-ID response can return only a subset; for batches without
+  repository/root-event metadata (the Layer 1 announcements batch) no semantic
+  REQ+EOSE fallback exists, and production logs showed such batches completing
+  "with partial results" — dropping the missing IDs until the next daily sync
+  up to 25 hours later. The still-missing IDs are now kept in a per-relay
+  recovery index and refetched over the existing connection with bounded
+  exponential backoff (30s doubling to 15min, one in-flight attempt per relay,
+  300 IDs per fetch). Progress clears only the recovered IDs and resets the
+  backoff; duplicate incomplete responses merge without duplicating work; IDs
+  satisfied by live sync are cleared without consuming attempts; 12
+  consecutive zero-progress attempts expire the pending IDs explicitly, and
+  the relay stays observably degraded (`ConnectedHistoricSyncFailures`) until
+  the daily sync. Startup remains non-blocking throughout, and a relay whose
+  missing events are all recovered — with no unrelated batch failures — is now
+  promoted back to `Connected` instead of reporting failures forever. Also
+  fixed the retry-subscription-failure path confirming an incomplete batch as
+  successful, and bounded the previously unbounded `missing_ids` log arrays to
+  a five-ID sample.
 - Fixed malformed client messages tearing down the whole WebSocket connection.
   A single unparseable message - in production, requests carrying invalid event
   IDs that fail with `Invalid input length 64` - closed the session, forcing

@@ -33,6 +33,7 @@ mod common;
 mod sync {
     pub mod catchup;
     pub mod discovery;
+    pub mod historic_recovery;
     pub mod historic_sync;
     pub mod live_sync;
     pub mod maintainer_reprocessing;
