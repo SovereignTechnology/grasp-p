@@ -2,7 +2,7 @@
 
 Status: DRAFT - expect breaking changes.
 
-Purpose: to host many independent private repositories on a public service that stores only ciphertext and opaque public keys, and that can later become public. The operator is trusted with no plaintext. This is an optional extension to GRASP-01. [GRASP-08](https://github.com/DanConwayDev/grasp) also addresses private repositories, under a trusted-operator model; the two are independent.
+Purpose: to host many independent private repositories on a public service that stores only ciphertext and opaque public keys, and that can later become public. The operator is trusted with no plaintext. This is an optional extension to GRASP-01. GRASP-08 also addresses private repositories, under a trusted-operator model; the two are independent.
 
 Client key derivation, encryption, membership, invites and key rotation are out of scope: the service cannot observe them. They are described informatively in the companion CORD-git specification. Discovery is also out of scope — a repository is addressed by its hosting pubkey and alias, the `nostr://<hosting-npub>/<alias>` coordinate, obtained out of band. Kinds `30640`, `30641`, `3359` and `23359` are as specified here; all four are unclaimed in the [NIPs](https://github.com/nostr-protocol/nips) corpus as of 2026-07-28, and adding them to the NIP kind index is a separate submission.
 
