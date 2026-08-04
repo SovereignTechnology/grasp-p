@@ -835,11 +835,13 @@ async fn run_rejected_index_cleanup(
                 // Clean up cold index for both event types (single index handles both)
                 let (_, ann_cold_expired) = manager.rejected_events_index.cleanup_expired_for_type("announcement");
                 let (_, state_cold_expired) = manager.rejected_events_index.cleanup_expired_for_type("state");
+                let unrecoverable_expired = manager.rejected_events_index.cleanup_expired_unrecoverable();
 
-                if ann_cold_expired + state_cold_expired > 0 {
+                if ann_cold_expired + state_cold_expired + unrecoverable_expired > 0 {
                     tracing::info!(
                         announcements = ann_cold_expired,
                         states = state_cold_expired,
+                        unrecoverable = unrecoverable_expired,
                         "Cleaned up expired entries from rejected events cold index"
                     );
                 }
@@ -4420,10 +4422,19 @@ impl SyncManager {
                                 );
                             }
                         } else {
+                            // No 'd' tag: structurally malformed, permanently
+                            // invalid, and without a pubkey+identifier key for
+                            // the two-tier index. Remember the exact ID so
+                            // historic sync stops re-downloading and
+                            // revalidating it. Direct live submissions never
+                            // reach this sync-only path; their rejections are
+                            // logged by the write policy.
+                            rejected_events_index.add_unrecoverable(event.id, event.kind.as_u16());
                             tracing::warn!(
                                 event_id = %event.id,
                                 kind = %event.kind.as_u16(),
-                                "Event missing 'd' tag, cannot track in rejected index"
+                                relay = %relay_url,
+                                "Synced event missing 'd' tag, tracked as unrecoverable by ID"
                             );
                         }
                     }
@@ -5796,6 +5807,32 @@ mod tests {
         assert!(!filtered_ids.contains(&rejected_id));
         assert!(filtered_ids.contains(&valid_id));
         assert_eq!(filtered_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_missing_d_tag_event_excluded_from_refetch_after_rejection() {
+        let purgatory_ids: HashSet<EventId> = HashSet::new();
+        let rejected_index =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+
+        // Announcement without a 'd' tag: structurally malformed, no
+        // repository identifier exists to key the two-tier index with
+        let keys = Keys::generate();
+        let malformed = EventBuilder::new(Kind::GitRepoAnnouncement, "no d tag")
+            .finalize(&keys)
+            .unwrap();
+        assert!(!malformed.tags.iter().any(|t| t.kind() == "d"));
+
+        // Rejection path tracks it by exact ID
+        rejected_index.add_unrecoverable(malformed.id, malformed.kind.as_u16());
+
+        // Live/REQ path consults contains() before processing
+        assert!(rejected_index.contains(&malformed.id));
+
+        // Historic negentropy path excludes it from re-download
+        let rejected_ids = rejected_index.get_all_event_ids();
+        let excluded_ids: HashSet<EventId> = purgatory_ids.union(&rejected_ids).cloned().collect();
+        assert!(excluded_ids.contains(&malformed.id));
     }
 
     #[test]
