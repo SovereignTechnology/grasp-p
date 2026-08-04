@@ -1860,6 +1860,18 @@ impl SyncManager {
             if !requested.contains(&event.id) {
                 continue;
             }
+            // Events already tracked as rejected count as recovered without
+            // re-processing: re-validation is owned by the rejected-index
+            // re-processing machinery, and unrecoverable IDs never revalidate.
+            if rejected_events_index.contains(&event.id) {
+                tracing::debug!(
+                    relay = %relay_url,
+                    event_id = %event.id,
+                    "Recovered missing event already tracked as rejected, skipping re-processing"
+                );
+                recovered.insert(event.id);
+                continue;
+            }
             let result = Self::process_event_static(
                 &event,
                 &relay_url,
