@@ -10,7 +10,7 @@
 //! - `RelaySyncIndex` - What we have CONFIRMED syncing + connection state
 //! - `PendingSyncIndex` - In-flight batches awaiting EOSE confirmation
 //!
-//! See `docs/explanation/grasp-02-proactive-sync-v4.md` for full design details.
+//! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 pub mod algorithms;
 pub mod filters;

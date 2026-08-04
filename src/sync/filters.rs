@@ -7,7 +7,7 @@
 //! - Layer 2: Events tagging our repos (a/A/q tags)
 //! - Layer 3: Events tagging our root events (e/E/q tags)
 //!
-//! See `docs/explanation/grasp-02-proactive-sync-v4.md` for full design details.
+//! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 use std::collections::HashSet;
 

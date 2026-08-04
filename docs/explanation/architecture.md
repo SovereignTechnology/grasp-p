@@ -558,7 +558,7 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 
 **Source Code:** [`src/sync/`](../../src/sync/)
 
-For full design details, see [grasp-02-proactive-sync-v4.md](grasp-02-proactive-sync-v4.md).
+For full design details, see [grasp-02-proactive-sync.md](grasp-02-proactive-sync.md).
 
 ### Rejected Events Index
 
@@ -697,6 +697,6 @@ ngit-grasp uses inline authorization at the HTTP handler level, giving full cont
 ## Related Documentation
 
 - [Inline Authorization Explanation](inline-authorization.md) - Why we chose this approach
-- [GRASP-02 Proactive Sync v4 Design](grasp-02-proactive-sync-v4.md) - Current production sync implementation
+- [GRASP-02 Proactive Sync Design](grasp-02-proactive-sync.md) - Current production sync implementation
 - [Test Strategy](../reference/test-strategy.md) - Comprehensive testing documentation
 - [GRASP-01 Implementation Learnings](../learnings/grasp-01-implementation.md) - Patterns and lessons learned
