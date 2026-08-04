@@ -30,6 +30,43 @@ use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSourc
 /// exchange alive indefinitely by continuing to send reconciliation messages.
 const NEGENTROPY_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Cooldown schedule for transient negentropy failures.
+///
+/// Indexed by the number of consecutive failed attempts (capped at the last
+/// entry). Transient failures pause NIP-77 for this relay temporarily instead
+/// of disabling it for the connection lifetime: a client-side channel overflow
+/// or a relay rate limit says nothing about whether the relay speaks NIP-77.
+const NEGENTROPY_TRANSIENT_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(1800),
+    Duration::from_secs(7200),
+];
+
+/// How a failed negentropy diff should affect future NIP-77 attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegentropyFailure {
+    /// The relay explicitly reported that it cannot speak NIP-77.
+    Unsupported,
+    /// Timeouts, rate limits, client-side channel overflow and other errors
+    /// that carry no information about NIP-77 support.
+    Transient,
+}
+
+/// Classify a negentropy diff error string.
+///
+/// Only explicit "not supported" signals from the relay justify permanently
+/// disabling NIP-77. Everything else is treated as transient; the relay stays
+/// eligible for negentropy after a bounded cooldown.
+fn classify_negentropy_failure(error: &str) -> NegentropyFailure {
+    let lower = error.to_lowercase();
+    if lower.contains("not support") || lower.contains("unsupported") {
+        NegentropyFailure::Unsupported
+    } else {
+        NegentropyFailure::Transient
+    }
+}
+
 /// Interval between relay-status checks while a connection attempt is in flight.
 ///
 /// nostr-sdk may return from `try_connect_relay` while another task still has
@@ -116,8 +153,12 @@ pub struct RelayConnection {
     database: Option<SharedDatabase>,
     /// Whether we've logged NIP-77 not supported for this relay (log once)
     nip77_warning_logged: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether this relay supports NIP-77 negentropy (None = unknown, Some(false) = confirmed not supported)
+    /// Whether this relay supports NIP-77 negentropy (0 = unknown, 2 = confirmed not supported)
     nip77_supported: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Consecutive transient negentropy failures (drives the cooldown schedule)
+    nip77_transient_failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Deadline before which negentropy is not attempted (transient-failure cooldown)
+    nip77_cooldown_until: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl RelayConnection {
@@ -169,6 +210,8 @@ impl RelayConnection {
             database: None,
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -199,6 +242,8 @@ impl RelayConnection {
             database: Some(database),
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -614,7 +659,8 @@ impl RelayConnection {
     /// - The nostr-sdk 0.44 API for relay document access varies
     ///
     /// # Returns
-    /// * `false` if we've confirmed this relay doesn't support NIP-77
+    /// * `false` if we've confirmed this relay doesn't support NIP-77, or a
+    ///   transient-failure cooldown is active
     /// * `true` if unknown or supported (will attempt and handle failure)
     pub async fn supports_negentropy(&self) -> bool {
         // 0 = unknown (try it), 1 = supported, 2 = confirmed not supported
@@ -628,21 +674,69 @@ impl RelayConnection {
             return false;
         }
 
+        // Transient-failure cooldown: pause negentropy without ruling it out
+        let cooldown_until = *self
+            .nip77_cooldown_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(cooldown_until, Some(until) if tokio::time::Instant::now() < until) {
+            tracing::trace!(relay = %self.url, "Skipping negentropy - transient-failure cooldown active");
+            return false;
+        }
+
         // Unknown or supported - try it
         true
     }
 
     /// Mark this relay as not supporting NIP-77 negentropy
     ///
-    /// Called when we detect negentropy isn't working for this relay:
-    /// - NOTICE message contains negentropy-related error
-    /// - negentropy_sync_diff() fails
-    /// - Negentropy retry returns zero events
+    /// Called only when the relay explicitly signals it cannot speak NIP-77
+    /// (see [`classify_negentropy_failure`]), or when a negentropy retry
+    /// returns zero events (see zero-progress handling in `sync::mod`).
+    /// Transient failures use a bounded cooldown instead.
     ///
     /// Future batches will skip negentropy and use REQ+EOSE directly.
     pub fn mark_negentropy_unsupported(&self) {
         self.nip77_supported
             .store(2, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a transient negentropy failure and start (or keep) a cooldown.
+    ///
+    /// Failures that arrive while a cooldown is already active come from
+    /// diffs that were in flight when the cooldown started (e.g. a burst of
+    /// concurrent per-filter syncs sharing one root cause); they do not
+    /// escalate the backoff.
+    ///
+    /// # Returns
+    /// The newly applied cooldown, or `None` if an existing cooldown
+    /// absorbed the failure.
+    fn record_negentropy_transient_failure(&self) -> Option<Duration> {
+        let mut cooldown_until = self
+            .nip77_cooldown_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = tokio::time::Instant::now();
+        if matches!(*cooldown_until, Some(until) if now < until) {
+            return None;
+        }
+        let failures = self
+            .nip77_transient_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = (failures as usize).min(NEGENTROPY_TRANSIENT_BACKOFF.len() - 1);
+        let cooldown = NEGENTROPY_TRANSIENT_BACKOFF[index];
+        *cooldown_until = Some(now + cooldown);
+        Some(cooldown)
+    }
+
+    /// Record a successful negentropy diff: clear the transient-failure state.
+    fn record_negentropy_success(&self) {
+        self.nip77_transient_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .nip77_cooldown_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Perform a negentropy sync diff (dry run) to identify missing events
@@ -713,9 +807,9 @@ impl RelayConnection {
             loop {
                 let status = nip77_status.load(std::sync::atomic::Ordering::Relaxed);
                 if status == 2 {
-                    // Relay confirmed not to support NIP-77 (via NOTICE or other means)
+                    // A concurrent sync received an explicit unsupported signal
                     return Err(format!(
-                        "Relay {} does not support NIP-77 (detected via NOTICE)",
+                        "Relay {} was marked as not supporting NIP-77 by a concurrent sync",
                         url
                     ));
                 }
@@ -744,6 +838,7 @@ impl RelayConnection {
 
         match result {
             Ok(reconciliation) => {
+                self.record_negentropy_success();
                 tracing::debug!(
                     relay = %self.url,
                     local_count = reconciliation.local.len(),
@@ -753,18 +848,40 @@ impl RelayConnection {
                 Ok(reconciliation)
             }
             Err(e) => {
-                self.mark_negentropy_unsupported();
+                match classify_negentropy_failure(&e) {
+                    NegentropyFailure::Unsupported => {
+                        self.mark_negentropy_unsupported();
 
-                // Log warning only once per relay to avoid spam
-                if !self
-                    .nip77_warning_logged
-                    .swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    tracing::warn!(
-                        relay = %self.url,
-                        error = %e,
-                        "Negentropy diff failed, will fall back to REQ+EOSE"
-                    );
+                        // Log warning only once per relay to avoid spam
+                        if !self
+                            .nip77_warning_logged
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            tracing::warn!(
+                                relay = %self.url,
+                                error = %e,
+                                "Relay does not support NIP-77, will fall back to REQ+EOSE"
+                            );
+                        }
+                    }
+                    NegentropyFailure::Transient => {
+                        // One warning per cooldown; in-flight failures sharing
+                        // the same root cause are logged at debug level
+                        if let Some(cooldown) = self.record_negentropy_transient_failure() {
+                            tracing::warn!(
+                                relay = %self.url,
+                                error = %e,
+                                cooldown_secs = cooldown.as_secs(),
+                                "Transient negentropy failure, pausing NIP-77 and falling back to REQ+EOSE"
+                            );
+                        } else {
+                            tracing::debug!(
+                                relay = %self.url,
+                                error = %e,
+                                "Negentropy diff failed during existing cooldown"
+                            );
+                        }
+                    }
                 }
                 Err(e)
             }
@@ -834,8 +951,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hung_negentropy_diff_times_out_and_disables_future_attempts() {
+    #[tokio::test(start_paused = true)]
+    async fn hung_negentropy_diff_times_out_and_pauses_attempts_until_cooldown() {
         let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
         assert!(connection.supports_negentropy().await);
 
@@ -851,7 +968,167 @@ mod tests {
             .contains("timed out"));
         assert!(
             !connection.supports_negentropy().await,
-            "a timed-out relay must use REQ+EOSE for future historic batches"
+            "a timed-out relay must use REQ+EOSE while the cooldown is active"
+        );
+
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(
+            connection.supports_negentropy().await,
+            "a timeout must not disable NIP-77 permanently"
+        );
+    }
+
+    /// Run a diff seeded with a fixed error and assert it surfaces as a failure.
+    async fn failing_diff(connection: &RelayConnection, error: &str) {
+        let error = error.to_string();
+        connection
+            .run_negentropy_diff_with_timeout(async move { Err(error) }, Duration::from_secs(5))
+            .await
+            .expect_err("diff seeded with an error must fail");
+    }
+
+    #[test]
+    fn production_failure_strings_classify_as_transient_or_unsupported() {
+        // Transient errors carry no information about NIP-77 support
+        // (all observed on gitnostr.com, 2026-08-04)
+        for error in [
+            r#"Negentropy diff had failures: {RelayUrl("wss://relay.ngit.dev"): "channel lagged by 3"}"#,
+            r#"Negentropy diff had failures: {RelayUrl("wss://nos.lol"): "timeout"}"#,
+            r#"Negentropy diff had failures: {RelayUrl("wss://relay.cyberguy.fyi"): "blocked: too many subscriptions"}"#,
+            "Negentropy diff timed out after 15.000s",
+        ] {
+            assert_eq!(
+                classify_negentropy_failure(error),
+                NegentropyFailure::Transient,
+                "{error}"
+            );
+        }
+
+        // Explicit unsupported signals from the relay
+        for error in [
+            r#"Negentropy diff had failures: {RelayUrl("wss://example.com"): "negentropy not supported"}"#,
+            r#"Negentropy diff had failures: {RelayUrl("wss://example.com"): "server does not support our negentropy protocol version"}"#,
+        ] {
+            assert_eq!(
+                classify_negentropy_failure(error),
+                NegentropyFailure::Unsupported,
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_diff_failure_pauses_negentropy_only_until_cooldown_elapses() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+
+        failing_diff(
+            &connection,
+            r#"Negentropy diff had failures: {RelayUrl("wss://relay.example.com"): "channel lagged by 3"}"#,
+        )
+        .await;
+
+        assert!(
+            !connection.supports_negentropy().await,
+            "a transient failure must pause NIP-77 while the cooldown is active"
+        );
+
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(
+            connection.supports_negentropy().await,
+            "a transient failure must not disable NIP-77 permanently"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_burst_of_transient_failures_does_not_escalate_backoff() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+
+        for _ in 0..40 {
+            failing_diff(
+                &connection,
+                r#"Negentropy diff had failures: {RelayUrl("wss://relay.example.com"): "timeout"}"#,
+            )
+            .await;
+        }
+
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(
+            connection.supports_negentropy().await,
+            "in-flight failures sharing one root cause must not escalate the cooldown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_transient_failures_escalate_and_success_resets_backoff() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        let transient =
+            r#"Negentropy diff had failures: {RelayUrl("wss://relay.example.com"): "timeout"}"#;
+
+        // First failed attempt starts the first cooldown
+        failing_diff(&connection, transient).await;
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(connection.supports_negentropy().await);
+
+        // Second consecutive failed attempt backs off longer
+        failing_diff(&connection, transient).await;
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(
+            !connection.supports_negentropy().await,
+            "consecutive failed attempts must back off longer"
+        );
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[1]).await;
+        assert!(connection.supports_negentropy().await);
+
+        // A successful diff resets the schedule to the first cooldown
+        connection
+            .run_negentropy_diff_with_timeout(
+                async { Ok(nostr_sdk::client::SyncSummary::default()) },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("successful diff");
+        failing_diff(&connection, transient).await;
+        tokio::time::advance(NEGENTROPY_TRANSIENT_BACKOFF[0] + Duration::from_secs(1)).await;
+        assert!(
+            connection.supports_negentropy().await,
+            "a successful diff must reset the backoff schedule"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_unsupported_signal_disables_negentropy_for_the_connection() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+
+        failing_diff(
+            &connection,
+            r#"Negentropy diff had failures: {RelayUrl("wss://relay.example.com"): "negentropy not supported"}"#,
+        )
+        .await;
+
+        assert!(!connection.supports_negentropy().await);
+        tokio::time::advance(Duration::from_secs(48 * 3600)).await;
+        assert!(
+            !connection.supports_negentropy().await,
+            "an explicit unsupported signal is permanent for the connection lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_unsupported_marking_aborts_diff_without_claiming_a_notice() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.mark_negentropy_unsupported();
+
+        let error = connection
+            .run_negentropy_diff_with_timeout(
+                pending::<Result<nostr_sdk::client::SyncSummary, String>>(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a relay marked unsupported must abort in-flight diffs");
+
+        assert!(
+            !error.contains("NOTICE"),
+            "abort reason must not fabricate a NOTICE-based detection: {error}"
         );
     }
 

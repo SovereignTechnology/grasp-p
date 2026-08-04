@@ -82,6 +82,7 @@ tempfile = "3"
 # Testing
 grasp-audit = { path = "grasp-audit", version = "0.2.0" }
 tempfile = "3"
+tokio = { version = "1.35", features = ["full", "test-util"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 tokio-tungstenite = "0.28.0"
 
