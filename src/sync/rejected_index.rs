@@ -205,6 +205,32 @@ struct SerializableColdIndex {
     entries: HashMap<EventId, SerializableColdIndexEntry>,
 }
 
+/// Entry in the unrecoverable index (metadata only)
+///
+/// Note: event_id is stored as the HashMap key, not in this struct
+#[derive(Debug, Clone)]
+struct UnrecoverableEntry {
+    kind: u16,
+    rejected_at: Instant,
+}
+
+/// Serializable version of UnrecoverableEntry for persistence
+///
+/// Converts Instant to Duration offset from saved_at time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableUnrecoverableEntry {
+    kind: u16,
+    /// Duration since saved_at when this entry was rejected
+    rejected_at_offset_secs: u64,
+}
+
+/// Serializable state for the unrecoverable index
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SerializableUnrecoverableIndex {
+    expiry_duration_secs: u64,
+    entries: HashMap<EventId, SerializableUnrecoverableEntry>,
+}
+
 /// Complete rejected cache state for persistence
 ///
 /// Stores both hot cache and cold index with version and timestamp information.
@@ -219,6 +245,11 @@ struct RejectedCacheState {
     hot_cache: SerializableHotCache,
     /// Cold index entries with metadata only
     cold_index: SerializableColdIndex,
+    /// ID-keyed entries for structurally unrecoverable events
+    ///
+    /// Defaults to empty when restoring caches saved before this index existed.
+    #[serde(default)]
+    unrecoverable: SerializableUnrecoverableIndex,
 }
 
 /// Hot cache: Stores full events for immediate re-processing
@@ -531,14 +562,80 @@ impl ColdIndex {
     }
 }
 
+/// Unrecoverable index: ID-keyed store for structurally malformed events
+///
+/// Some rejected events (e.g. announcements without a 'd' tag) cannot be
+/// tracked in the pubkey+identifier tiers and can never become valid, so no
+/// dependency recovery applies to them. Remembering their exact IDs stops
+/// historic sync from re-downloading and revalidating them on every pass.
+/// Entries share the cold index expiry bound.
+#[derive(Debug, Clone)]
+struct UnrecoverableIndex {
+    /// Map of event_id -> metadata entry
+    entries: Arc<RwLock<HashMap<EventId, UnrecoverableEntry>>>,
+    /// Duration before entries expire
+    expiry_duration: Duration,
+}
+
+impl UnrecoverableIndex {
+    fn new(expiry_duration: Duration) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            expiry_duration,
+        }
+    }
+
+    /// Add an event ID, preserving the original rejection time on re-add
+    fn add(&self, event_id: EventId, kind: u16) {
+        self.entries
+            .write()
+            .unwrap()
+            .entry(event_id)
+            .or_insert_with(|| UnrecoverableEntry {
+                kind,
+                rejected_at: Instant::now(),
+            });
+    }
+
+    /// Check if event is in the unrecoverable index
+    fn contains(&self, event_id: &EventId) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .get(event_id)
+            .is_some_and(|entry| {
+                Instant::now().duration_since(entry.rejected_at) < self.expiry_duration
+            })
+    }
+
+    /// Remove expired entries from the unrecoverable index
+    fn cleanup_expired(&self) -> usize {
+        let mut entries = self.entries.write().unwrap();
+        let now = Instant::now();
+        let initial_count = entries.len();
+
+        entries.retain(|_, entry| now.duration_since(entry.rejected_at) < self.expiry_duration);
+
+        initial_count - entries.len()
+    }
+
+    /// Get current number of entries in the unrecoverable index
+    fn len(&self) -> usize {
+        self.entries.read().unwrap().len()
+    }
+}
+
 /// Two-tier rejected events index
 ///
 /// Combines hot cache (full events, short duration) with cold index
 /// (metadata only, long duration) for efficient re-processing and deduplication.
+/// A third, ID-keyed unrecoverable store covers structurally malformed events
+/// that have no pubkey+identifier key.
 #[derive(Clone)]
 pub struct RejectedEventsIndex {
     hot_cache: HotCache,
     cold_index: ColdIndex,
+    unrecoverable: UnrecoverableIndex,
     metrics: Option<super::metrics::SyncMetrics>,
 }
 
@@ -548,6 +645,7 @@ impl std::fmt::Debug for RejectedEventsIndex {
         f.debug_struct("RejectedEventsIndex")
             .field("hot_cache", &self.hot_cache)
             .field("cold_index", &self.cold_index)
+            .field("unrecoverable", &self.unrecoverable)
             .field("metrics", &self.metrics.is_some())
             .finish()
     }
@@ -564,6 +662,7 @@ impl RejectedEventsIndex {
         Self {
             hot_cache: HotCache::new(hot_cache_duration),
             cold_index: ColdIndex::new(cold_index_duration),
+            unrecoverable: UnrecoverableIndex::new(cold_index_duration),
             metrics: None,
         }
     }
@@ -583,6 +682,7 @@ impl RejectedEventsIndex {
         let index = Self {
             hot_cache: HotCache::new(hot_cache_duration),
             cold_index: ColdIndex::new(cold_index_duration),
+            unrecoverable: UnrecoverableIndex::new(cold_index_duration),
             metrics: Some(metrics),
         };
 
@@ -708,9 +808,22 @@ impl RejectedEventsIndex {
         self.update_metrics_for_type("state");
     }
 
-    /// Check if event is already rejected (in either tier)
+    /// Check if event is already rejected (in any tier)
     pub fn contains(&self, event_id: &EventId) -> bool {
-        self.hot_cache.contains(event_id) || self.cold_index.contains(event_id)
+        self.hot_cache.contains(event_id)
+            || self.cold_index.contains(event_id)
+            || self.unrecoverable.contains(event_id)
+    }
+
+    /// Track a structurally unrecoverable event by ID alone.
+    ///
+    /// Used for rejected events that cannot be keyed by pubkey+identifier
+    /// (e.g. a repository announcement without a 'd' tag) and can therefore
+    /// never be resolved by dependency recovery. The ID is remembered for the
+    /// cold index expiry duration so the event is not re-downloaded and
+    /// revalidated on every historic pass.
+    pub fn add_unrecoverable(&self, event_id: EventId, kind: u16) {
+        self.unrecoverable.add(event_id, kind);
     }
 
     /// Invalidate events and get them for immediate re-processing (unified method)
@@ -843,9 +956,23 @@ impl RejectedEventsIndex {
         self.hot_cache.len()
     }
 
+    /// Clean up expired entries from the unrecoverable index
+    ///
+    /// # Returns
+    ///
+    /// Number of expired entries removed
+    pub fn cleanup_expired_unrecoverable(&self) -> usize {
+        self.unrecoverable.cleanup_expired()
+    }
+
     /// Get current number of entries in cold index
     pub fn cold_index_len(&self) -> usize {
         self.cold_index.len()
+    }
+
+    /// Get current number of entries in the unrecoverable index
+    pub fn unrecoverable_len(&self) -> usize {
+        self.unrecoverable.len()
     }
 
     /// Get all rejected event IDs (from both hot cache and cold index)
@@ -862,6 +989,10 @@ impl RejectedEventsIndex {
         // Add from cold index
         let cold_entries = self.cold_index.entries.read().unwrap();
         ids.extend(cold_entries.keys().cloned());
+
+        // Add from unrecoverable index
+        let unrecoverable_entries = self.unrecoverable.entries.read().unwrap();
+        ids.extend(unrecoverable_entries.keys().cloned());
 
         ids
     }
@@ -883,9 +1014,10 @@ impl RejectedEventsIndex {
         let saved_at = SystemTime::now();
         let now = Instant::now();
 
-        // Lock both caches for consistent snapshot
+        // Lock all caches for consistent snapshot
         let hot_entries = self.hot_cache.entries.read().unwrap();
         let cold_entries = self.cold_index.entries.read().unwrap();
+        let unrecoverable_entries = self.unrecoverable.entries.read().unwrap();
 
         // Convert hot cache entries to serializable format
         let serializable_hot_entries: HashMap<EventId, SerializableHotCacheEntry> = hot_entries
@@ -926,6 +1058,22 @@ impl RejectedEventsIndex {
             })
             .collect();
 
+        // Convert unrecoverable entries to serializable format
+        let serializable_unrecoverable_entries: HashMap<EventId, SerializableUnrecoverableEntry> =
+            unrecoverable_entries
+                .iter()
+                .map(|(event_id, entry)| {
+                    let rejected_at_offset_secs = now.duration_since(entry.rejected_at).as_secs();
+
+                    let serializable_entry = SerializableUnrecoverableEntry {
+                        kind: entry.kind,
+                        rejected_at_offset_secs,
+                    };
+
+                    (*event_id, serializable_entry)
+                })
+                .collect();
+
         // Create complete state
         let state = RejectedCacheState {
             version: 1,
@@ -937,6 +1085,10 @@ impl RejectedEventsIndex {
             cold_index: SerializableColdIndex {
                 expiry_duration_secs: self.cold_index.expiry_duration.as_secs(),
                 entries: serializable_cold_entries,
+            },
+            unrecoverable: SerializableUnrecoverableIndex {
+                expiry_duration_secs: self.unrecoverable.expiry_duration.as_secs(),
+                entries: serializable_unrecoverable_entries,
             },
         };
 
@@ -973,9 +1125,10 @@ impl RejectedEventsIndex {
 
         let now_instant = Instant::now();
 
-        // Lock both caches for restoration
+        // Lock all caches for restoration
         let mut hot_entries = self.hot_cache.entries.write().unwrap();
         let mut cold_entries = self.cold_index.entries.write().unwrap();
+        let mut unrecoverable_entries = self.unrecoverable.entries.write().unwrap();
 
         // Restore hot cache entries
         for (event_id, serializable_entry) in state.hot_cache.entries {
@@ -1022,9 +1175,27 @@ impl RejectedEventsIndex {
             cold_entries.insert(event_id, entry);
         }
 
+        // Restore unrecoverable index entries
+        for (event_id, serializable_entry) in state.unrecoverable.entries {
+            // Reconstruct rejected_at by extending the offset by downtime
+            let original_offset = Duration::from_secs(serializable_entry.rejected_at_offset_secs);
+            let total_offset = original_offset + downtime;
+
+            // rejected_at = now - total_offset
+            let rejected_at = now_instant - total_offset;
+
+            let entry = UnrecoverableEntry {
+                kind: serializable_entry.kind,
+                rejected_at,
+            };
+
+            unrecoverable_entries.insert(event_id, entry);
+        }
+
         // Release locks before deleting file
         drop(hot_entries);
         drop(cold_entries);
+        drop(unrecoverable_entries);
 
         // Delete the state file after successful restore
         std::fs::remove_file(path)?;
@@ -1201,6 +1372,91 @@ mod tests {
         assert!(index.contains(&event.id));
         assert_eq!(index.hot_cache_len(), 1);
         assert_eq!(index.cold_index_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unrecoverable_id_tracked_without_identifier() {
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let event = create_test_event().await;
+
+        index.add_unrecoverable(event.id, 30617);
+
+        // Consulted by both skip paths: exact-ID contains and refetch exclusion
+        assert!(index.contains(&event.id));
+        assert!(index.get_all_event_ids().contains(&event.id));
+        assert_eq!(index.unrecoverable_len(), 1);
+
+        // No identifier was invented: the two-tier stores stay untouched
+        assert_eq!(index.hot_cache_len(), 0);
+        assert_eq!(index.cold_index_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unrecoverable_ids_expire_with_cold_bound() {
+        let index = RejectedEventsIndex::new(Duration::from_millis(10), Duration::from_millis(50));
+        let event = create_test_event().await;
+
+        index.add_unrecoverable(event.id, 30617);
+        assert!(index.contains(&event.id));
+
+        // Passage of time is the behaviour under test (bounded expiry)
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(!index.contains(&event.id));
+        assert_eq!(index.cleanup_expired_unrecoverable(), 1);
+        assert_eq!(index.unrecoverable_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unrecoverable_ids_survive_save_restore_roundtrip() {
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let event = create_test_event().await;
+        index.add_unrecoverable(event.id, 30617);
+
+        let directory = tempfile::tempdir().expect("Failed to create cache directory");
+        let path = directory.path().join("rejected-events-cache.json");
+        index.save_to_disk(&path).expect("Failed to save cache");
+
+        let restored =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        restored
+            .restore_from_disk(&path)
+            .expect("Failed to restore cache");
+
+        assert!(restored.contains(&event.id));
+        assert!(restored.get_all_event_ids().contains(&event.id));
+        assert_eq!(restored.unrecoverable_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_restore_accepts_cache_without_unrecoverable_section() {
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let event = create_test_event().await;
+        index.add_announcement(
+            event.clone(),
+            event.pubkey,
+            "test-repo".to_string(),
+            RejectionReason::DoesNotListService,
+        );
+
+        let directory = tempfile::tempdir().expect("Failed to create cache directory");
+        let path = directory.path().join("rejected-events-cache.json");
+        index.save_to_disk(&path).expect("Failed to save cache");
+
+        // Simulate a cache file written before the unrecoverable index existed
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("unrecoverable");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let restored =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        restored
+            .restore_from_disk(&path)
+            .expect("Failed to restore pre-unrecoverable cache");
+
+        assert!(restored.contains(&event.id));
+        assert_eq!(restored.unrecoverable_len(), 0);
     }
 
     #[tokio::test]
