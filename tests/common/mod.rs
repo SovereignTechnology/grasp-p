@@ -5,6 +5,7 @@
 pub mod censoring_proxy;
 pub mod git_server;
 pub mod mock_relay;
+pub mod neg_limiting_proxy;
 pub mod nip09_helpers;
 pub mod port;
 pub mod purgatory_helpers;

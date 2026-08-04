@@ -43,6 +43,19 @@ const NEGENTROPY_TRANSIENT_BACKOFF: [Duration; 4] = [
     Duration::from_secs(7200),
 ];
 
+/// Maximum concurrent negentropy diff rounds per relay connection.
+///
+/// Relays bound concurrent subscriptions per connection, and on
+/// strfry-family relays negentropy views count against that same budget
+/// (`maxSubsPerConnection`; nos.lol and relay.primal.net advertise 20,
+/// shared with live subscriptions). Historic sync opens one diff per
+/// filter, so an unbounded batch (146 filters observed in production)
+/// bursts far past the tightest common budget and draws
+/// "too many concurrent NEG requests" rejections. Four concurrent rounds
+/// leaves the shared budget mostly available for live subscriptions; see
+/// docs/explanation/sync-scaling-constraints.md.
+const MAX_CONCURRENT_NEG_DIFFS: usize = 4;
+
 /// How a failed negentropy diff should affect future NIP-77 attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NegentropyFailure {
@@ -159,6 +172,9 @@ pub struct RelayConnection {
     nip77_transient_failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Deadline before which negentropy is not attempted (transient-failure cooldown)
     nip77_cooldown_until: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    /// Bounds concurrent negentropy diff rounds on this connection
+    /// (shared across clones; see [`MAX_CONCURRENT_NEG_DIFFS`])
+    neg_diff_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl RelayConnection {
@@ -212,6 +228,9 @@ impl RelayConnection {
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_NEG_DIFFS,
+            )),
         }
     }
 
@@ -244,6 +263,9 @@ impl RelayConnection {
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_NEG_DIFFS,
+            )),
         }
     }
 
@@ -770,6 +792,28 @@ impl RelayConnection {
         &self,
         filter: Filter,
     ) -> Result<nostr_sdk::client::SyncSummary, String> {
+        // Bound concurrent rounds: historic sync opens one diff per filter,
+        // and relays count each open round against a per-connection budget
+        // shared with live subscriptions (see MAX_CONCURRENT_NEG_DIFFS).
+        // The permit is held for the whole round, including the timeout.
+        let _permit = self
+            .neg_diff_permits
+            .acquire()
+            .await
+            .map_err(|_| format!("Negentropy permits closed for {}", self.url))?;
+
+        // While this round was queued, an earlier round may have started a
+        // transient-failure cooldown or received an explicit unsupported
+        // signal. Bail out to the per-batch REQ+EOSE fallback instead of
+        // opening another round against a relay that just failed. This does
+        // not record a failure, so it cannot escalate the cooldown.
+        if !self.supports_negentropy().await {
+            return Err(format!(
+                "Negentropy skipped for {}: cooldown active or relay marked unsupported",
+                self.url
+            ));
+        }
+
         // Use dry_run to only identify differences without downloading events
         let sync_opts = SyncOptions::default().dry_run();
         let client = self.client.clone();
