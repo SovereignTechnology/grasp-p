@@ -576,6 +576,43 @@ const PAGINATION_THRESHOLD: usize = 75;
 /// large REQ messages for relays that enforce their own per-REQ filter limits.
 const MAX_FILTERS_PER_REQ: usize = 10;
 
+/// Serialized byte budget for the filters carried by one NIP-01 REQ.
+///
+/// The whole REQ message must fit relay maximum message sizes (128 KB floor
+/// observed via NIP-11). 48 KB of filters leaves margin for the envelope and
+/// holds three full byte-budgeted filter chunks (see
+/// [`filters::FILTER_VALUE_BYTE_BUDGET`]), so grouped REQs also stay within
+/// strfry's optional strict `filterValidation` limit of three filters per
+/// REQ when chunks are full. See
+/// docs/explanation/sync-scaling-constraints.md.
+const REQ_MESSAGE_BYTE_BUDGET: usize = 48 * 1024;
+
+/// Pack filters into REQ-sized groups.
+///
+/// Groups are cut when adding the next filter would exceed either the
+/// serialized byte budget or the filter-count cap. A single oversized filter
+/// still gets its own group, so progress is always made.
+fn group_filters_for_req(filters: &[Filter]) -> Vec<Vec<Filter>> {
+    let mut groups: Vec<Vec<Filter>> = Vec::new();
+    let mut current: Vec<Filter> = Vec::new();
+    let mut bytes = 0usize;
+    for filter in filters {
+        let cost = filter.as_json().len();
+        if !current.is_empty()
+            && (current.len() >= MAX_FILTERS_PER_REQ || bytes + cost > REQ_MESSAGE_BYTE_BUDGET)
+        {
+            groups.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        current.push(filter.clone());
+        bytes += cost;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 fn reserve_connect_attempt(
     in_flight: &mut HashMap<String, ConnectAttemptToken>,
     next_token: &mut u64,
@@ -629,8 +666,8 @@ fn should_consolidate(current_count: usize, new_count: usize, desired_baseline: 
         > CONSOLIDATION_THRESHOLD
 }
 
-fn grouped_subscription_count(filter_count: usize) -> usize {
-    filter_count.div_ceil(MAX_FILTERS_PER_REQ)
+fn grouped_subscription_count(filters: &[Filter]) -> usize {
+    group_filters_for_req(filters).len()
 }
 
 #[derive(Debug, Default)]
@@ -1392,8 +1429,8 @@ impl SyncManager {
 
                         let mut new_sub_ids = HashSet::new();
                         if let Some(conn) = self.connections.get(&relay_url_for_fallback) {
-                            for filter_group in fallback_filters.chunks(MAX_FILTERS_PER_REQ) {
-                                match conn.subscribe_filters(filter_group.to_vec(), true).await {
+                            for filter_group in group_filters_for_req(&fallback_filters) {
+                                match conn.subscribe_filters(filter_group, true).await {
                                     Ok(sub_id) => {
                                         new_sub_ids.insert(sub_id);
                                     }
@@ -2560,7 +2597,7 @@ impl SyncManager {
         // Step 3: Check if consolidation is needed BEFORE adding new filters
         self.maybe_consolidate(
             &action.relay_url,
-            grouped_subscription_count(action.filters.len()),
+            grouped_subscription_count(&action.filters),
         )
         .await;
 
@@ -4474,19 +4511,18 @@ impl SyncManager {
             let repo_index = self.repo_sync_index.read().await;
             algorithms::derive_relay_targets(&repo_index).remove(relay_url)
         };
-        let desired_repo_filters = target.map_or(0, |target| {
+        let desired_repo_filters = target.map_or_else(Vec::new, |target| {
             filters::build_sync_level_aware_filters(
                 &target.repos,
                 &target.state_only_repos,
                 &target.root_events,
                 None,
             )
-            .len()
         });
 
         // Every connected relay carries one consolidated generic announcement
         // subscription in addition to its repository-specific desired filters.
-        1 + grouped_subscription_count(desired_repo_filters)
+        1 + grouped_subscription_count(&desired_repo_filters)
     }
 
     /// Check if incremental fragmentation exceeds the consolidation threshold.
@@ -4869,14 +4905,13 @@ impl SyncManager {
 
         let mut sub_ids = Vec::new();
 
-        for filter_group in filters.chunks(MAX_FILTERS_PER_REQ) {
+        for filter_group in group_filters_for_req(&filters) {
             // Live subscriptions MUST use limit(0) to receive ONLY new events
             // This prevents fetching historic events that would be miscounted as "live" in metrics
             // The caller passes the same filters to both sync_live() and historic_sync()
             // Live subscriptions do NOT auto-close - we want them to stay open for new events
             let grouped_filters = filter_group
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(|filter| filter.limit(0))
                 .collect();
             match connection.subscribe_filters(grouped_filters, false).await {
@@ -5196,7 +5231,10 @@ impl SyncManager {
             let mut pagination_state = HashMap::new();
 
             // Keep several OR filters under each relay-visible subscription.
-            for (idx, filter_group) in filters_with_since.chunks(MAX_FILTERS_PER_REQ).enumerate() {
+            for (idx, filter_group) in group_filters_for_req(&filters_with_since)
+                .into_iter()
+                .enumerate()
+            {
                 tracing::debug!(
                     relay = %relay_url,
                     batch_id = batch_id,
@@ -5207,7 +5245,7 @@ impl SyncManager {
                 );
 
                 if let Some(conn) = self.connections.get(relay_url) {
-                    let grouped_filters = filter_group.to_vec();
+                    let grouped_filters = filter_group;
                     match conn.subscribe_filters(grouped_filters.clone(), true).await {
                         Ok(sub_id) => {
                             subscription_ids.insert(sub_id.clone());
@@ -5313,6 +5351,47 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_filters_for_req_respects_count_and_byte_budgets() {
+        // Many small filters group by the count cap.
+        let small: Vec<Filter> = (0..25)
+            .map(|i| Filter::new().id(EventId::all_zeros()).limit(i))
+            .collect();
+        let groups = group_filters_for_req(&small);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![MAX_FILTERS_PER_REQ, MAX_FILTERS_PER_REQ, 5]
+        );
+
+        // Large filters group by the byte budget instead: every group stays
+        // within it (single oversized filters excepted) and below the cap.
+        let ids: Vec<EventId> = (0..600u32)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&i.to_be_bytes());
+                EventId::from_byte_array(bytes)
+            })
+            .collect();
+        let root_events: std::collections::HashSet<EventId> = ids.into_iter().collect();
+        let large = filters::tagged_one_of_our_root_event_filters(&root_events, None);
+        assert!(large.len() > 3, "600 IDs should span multiple chunks");
+
+        let groups = group_filters_for_req(&large);
+        assert!(groups.len() > 1);
+        for group in &groups {
+            assert!(group.len() <= MAX_FILTERS_PER_REQ);
+            let bytes: usize = group.iter().map(|f| f.as_json().len()).sum();
+            assert!(
+                group.len() == 1 || bytes <= REQ_MESSAGE_BYTE_BUDGET,
+                "group of {} filters serializes to {} bytes",
+                group.len(),
+                bytes
+            );
+        }
+        // Grouping preserves every filter exactly once.
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), large.len());
+    }
 
     #[test]
     fn purgatory_dependency_budget_prioritizes_a_fresh_announcement() {

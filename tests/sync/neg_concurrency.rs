@@ -14,8 +14,8 @@
 //! source relay (real NIP-77) sits behind a proxy that mimics the strfry
 //! limit, rejecting NEG-OPEN frames beyond 4 concurrent rounds. The watched
 //! set is sized so that one historic batch needs more negentropy rounds than
-//! the limit (150 root events → two 100-ID chunks × three tag variants = six
-//! filters). Unbounded concurrency draws rejections; the bounded client must
+//! the limit (260 root events → two byte-budgeted chunks × three tag variants
+//! = six filters). Unbounded concurrency draws rejections; the bounded client must
 //! draw none while still overlapping rounds and completing the sync.
 //!
 //! See docs/explanation/sync-scaling-constraints.md for the budget model.
@@ -40,10 +40,12 @@ use crate::common::{port, TestRelay};
 /// exactly that bound must never reject a round.
 const PROXY_NEG_LIMIT: usize = 4;
 
-/// Root events to seed. Two 100-ID chunks × three tag variants (e/E/q) give
-/// six negentropy filters in a single historic batch — more rounds than the
-/// bound, so bounded scheduling is required to avoid rejections.
-const ISSUE_COUNT: usize = 150;
+/// Root events to seed. Byte-budgeted chunking fits ~244 hex event IDs per
+/// filter (16 KB of serialized tag values), so 260 IDs split into two chunks;
+/// two chunks × three tag variants (e/E/q) give six negentropy filters in a
+/// single historic batch — more rounds than the bound, so bounded scheduling
+/// is required to avoid rejections.
+const ISSUE_COUNT: usize = 260;
 
 /// Wait until the proxy has seen at least `min_total` NEG rounds
 /// (opened + rejected) and the count has been stable for `stable_for`.
@@ -77,11 +79,11 @@ async fn wait_for_neg_quiescence(
 
 /// Scenario:
 /// 1. Source relay hosts one repository (announcement + state + git data) and
-///    150 historic issues, each a root event of that repository.
+///    260 historic issues, each a root event of that repository.
 /// 2. A proxy in front of the source enforces the strfry-style limit of 4
 ///    concurrent NEG rounds and records peak concurrency and rejections.
 /// 3. The syncing relay bootstraps through the proxy. Syncing the issues
-///    registers 150 root events, whose next historic batch needs six
+///    registers 260 root events, whose next historic batch needs six
 ///    negentropy rounds — more than the limit.
 /// 4. The syncing relay must complete historic sync without a single
 ///    rejection while still running rounds concurrently.
@@ -173,7 +175,7 @@ async fn startup_historic_sync_stays_within_relay_neg_concurrency_limit() {
     .await;
 
     // 6. The issues must arrive via the bounded historic sync (sampled ends
-    //    of the range cover both 100-ID chunks).
+    //    of the range cover both byte-budgeted chunks).
     for issue_id in [issue_ids[0], issue_ids[ISSUE_COUNT / 2], issue_ids[ISSUE_COUNT - 1]] {
         assert!(
             wait_for_event_on_relay(

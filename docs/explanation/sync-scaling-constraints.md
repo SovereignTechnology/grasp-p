@@ -89,9 +89,10 @@ Derived from the tightest commonly observed values; all sizing below assumes:
   shared between live REQs, NEG rounds, and fallback REQs.
 - **Message budget M = 128 KB** (nos.lol); we target ≤ 48 KB of filter payload
   per message to leave margin for envelope and future growth.
-- **Per-filter value budget 32 KB** (half of strfry's 65535-byte set cap).
+- **Per-filter value budget 16 KB** (a quarter of strfry's 65535-byte set
+  cap), chosen so three full chunks fit one 48 KB REQ message — see lever 2.
 - A serialized 64-char hex ID costs ~67 bytes (`"…",`), so:
-  ~480 hex IDs per filter, ~700 hex IDs per message. Variable-length values
+  ~240 hex IDs per filter, ~730 hex IDs per message. Variable-length values
   (`#d` identifiers, repo references) must be budgeted by bytes, not count.
 
 ---
@@ -117,12 +118,21 @@ The levers, in the order we reach for them:
 ### Lever 1: Maximise items per filter (byte-budgeted chunking)
 
 Replace the fixed 100-items-per-chunk rule with byte budgets: a filter chunk
-is full when it reaches ~32 KB of serialized tag values (~480 hex IDs), and a
+is full when it reaches 16 KB of serialized tag values (~240 hex IDs), and a
 message is full at ~48 KB. The 100-item chunk was a guess made when we
 believed relays capped item counts; the verified constraints are byte caps
 (strfry 65535 per filter set, message size per NIP-11), so counting items
-wastes ~5× capacity for hex IDs while being *unsafe* for unbounded-length
+wastes ~2.4× capacity for hex IDs while being *unsafe* for unbounded-length
 `#d` identifiers.
+
+The chunk budget is deliberately *not* maximal: 16 KB rather than the ~32 KB
+a lone filter could safely use. Bigger chunks reduce transient negentropy
+rounds but force one-filter-per-REQ grouping under the message budget,
+inflating the *persistent* subscription count — and subscriptions are the
+scarcer resource (B = 20 floor, shared with negentropy). 16 KB minimises
+subscriptions first and still cuts negentropy rounds ~2.4×; three full
+chunks per 48 KB REQ also matches strfry's strict `filterValidation` limit
+of three filters per REQ.
 
 Because the limits are not discoverable (NIP-11 gap), the budget is static
 and conservative rather than probed; the existing transient-failure cooldown
@@ -137,7 +147,7 @@ use one tag field each, so this is not a binding constraint.
 ### Lever 2: Pack filters per REQ — coupled to lever 1 by message size
 
 Live subscriptions send all their filters in one REQ message, so the message
-budget M caps **items per subscription** (~700 hex IDs at M = 128 KB) no
+budget M caps **items per subscription** (~730 hex IDs at M = 128 KB) no
 matter how items are split into filters. Bigger chunks (lever 1) therefore
 mean *fewer filters per REQ*, not more items per subscription: 10 × 500-ID
 filters in one REQ would be ~330 KB — over nos.lol's cap. The current
@@ -268,7 +278,7 @@ with the heuristics demoted to backstop.
 | Lever | Status |
 | --- | --- |
 | 3 — bounded NEG concurrency | Stabilisation cycle 3 (in flight) |
-| 1 + 2 — byte-budgeted chunking and REQ packing | Proposed as cycle 4 |
+| 1 + 2 — byte-budgeted chunking and REQ packing | Landed with cycle 3 (same PR) |
 | Ledger unification (live + historic + fallback against one budget, NIP-11-aware B/M) | Design accepted here; implement after cycles 3–4 |
 | 4 — multi-connection sharding | Deferred until a relay's target set approaches the single-connection ceiling |
 | Serving-side limits + NIP-11 advertisement | Follow-up work item |
