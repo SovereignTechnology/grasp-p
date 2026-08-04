@@ -736,6 +736,12 @@ fn compute_actions(
 
 ## Filter Building (Three-Layer Strategy)
 
+Chunk sizes, filters-per-REQ packing, and sync concurrency are bounded by
+relay-imposed limits (subscription budgets, message sizes, filter byte caps).
+The verified constraints and the budget model that justifies these numbers
+live in
+[Sync Scaling Constraints and Budgets](sync-scaling-constraints.md).
+
 ### Layer 1: Announcements
 
 - **Kinds**: 30617 (Repository Announcements), 30618 (Maintainer Lists)

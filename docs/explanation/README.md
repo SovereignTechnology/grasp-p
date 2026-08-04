@@ -108,6 +108,20 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
+### [Sync Scaling Constraints and Budgets](sync-scaling-constraints.md)
+**Relay-imposed limits and how sync spends them at scale**
+
+**Topics:**
+- Verified relay limits (strfry, live NIP-11, our embedded relay)
+- Per-connection budget ledger (live vs historic vs fallback)
+- Byte-budgeted filter chunking and REQ packing
+- Bounded negentropy concurrency
+- Multi-connection escalation and serving-side obligations
+
+**Read when:** You're changing filter construction, subscription management, or sync concurrency, and need the constraint justification
+
+---
+
 ### [GRASP-02 Purgatory Git Data Fetching](grasp-02-proactive-sync-purgatory-git-data.md)
 **Proactive git data fetching from remote servers**
 
