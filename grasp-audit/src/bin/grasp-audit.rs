@@ -1,13 +1,13 @@
 //! GRASP Audit CLI Tool
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use grasp_audit::*;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "grasp-audit")]
+#[command(name = "grasp-audit", version)]
 #[command(about = "GRASP audit and compliance testing tool", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -24,6 +24,30 @@ struct KeyArgs {
     /// Read a secret key in nsec or hex format from this file.
     #[arg(long, value_name = "PATH", conflicts_with = "nsec")]
     nsec_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuditSelection {
+    Nip01Smoke,
+    Nip11,
+    EventAcceptance,
+    Cors,
+    GitClone,
+    GitFilter,
+    PushAuth,
+    RepoCreation,
+    Purgatory,
+    Grasp06,
+    All,
+}
+
+impl std::fmt::Display for AuditSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self
+            .to_possible_value()
+            .expect("audit selection variants have possible values");
+        formatter.write_str(value.get_name())
+    }
 }
 
 #[derive(Subcommand)]
@@ -67,19 +91,20 @@ enum Commands {
         relay: String,
 
         /// Fixture mode: shared (default) or isolated
-        ///
-        /// - shared: Fixtures are cached and reused across tests (efficient for sequential test runs)
-        /// - isolated: Each test creates fresh fixtures (for parallel tests like cargo test)
         #[arg(short, long, default_value = "shared")]
         mode: String,
 
-        /// Spec to test (nip01-smoke, nip11, event-acceptance, cors, git-clone, git-filter, push-auth, repo-creation, purgatory, grasp06, all)
-        #[arg(short, long, default_value = "all")]
-        spec: String,
+        /// Audit specification or suite to run.
+        #[arg(short, long, value_enum, default_value_t = AuditSelection::All)]
+        spec: AuditSelection,
 
         /// Git data directory (required for cors, git-clone, push-auth, repo-creation specs)
         #[arg(short, long)]
         git_data_dir: Option<PathBuf>,
+
+        /// Output one stable machine-readable JSON document.
+        #[arg(long, default_value_t = false)]
+        json: bool,
 
         #[command(flatten)]
         keys: KeyArgs,
@@ -88,13 +113,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Probe output is self-contained — library chatter (nostr_relay_pool etc.)
-    // adds no value and clutters both human and JSON output.  Skip the tracing
-    // subscriber entirely for the probe subcommand; initialise it normally for
-    // audit subcommands where verbose output is expected.
-    let is_probe = std::env::args().nth(1).as_deref() == Some("probe");
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let is_probe = args.get(1).is_some_and(|arg| arg == "probe");
     if !is_probe {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
                     .add_directive(tracing::Level::INFO.into()),
@@ -102,7 +125,33 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let cli = Cli::parse();
+    let audit_json = audit_json_requested(&args);
+    let parse_started_at = unix_timestamp();
+    let parse_started = Instant::now();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.print()?;
+            return Ok(());
+        }
+        Err(error) if audit_json => {
+            let report = AuditReport::error(
+                requested_relay(&args),
+                "",
+                parse_started_at,
+                parse_started.elapsed(),
+                format!("invalid command line ({:?})", error.kind()),
+            );
+            println!("{}", serde_json::to_string(&report)?);
+            std::process::exit(2);
+        }
+        Err(error) => error.exit(),
+    };
 
     match cli.command {
         Commands::Probe {
@@ -115,36 +164,26 @@ async fn main() -> Result<()> {
             harden_network,
         } => {
             let relay = match relay {
-                Some(r) => r,
+                Some(relay) => relay,
                 None => {
-                    // Print probe-specific help and exit cleanly
-                    let mut cmd = Cli::command();
-                    let _ = cmd.find_subcommand_mut("probe").unwrap().print_help();
+                    let mut command = Cli::command();
+                    let _ = command.find_subcommand_mut("probe").unwrap().print_help();
                     println!();
                     return Ok(());
                 }
             };
-
             let keys = load_keys(&keys)?;
-
-            // read_only is the default; --create-repo opts into the write path
             let read_only = !create_repo;
-
-            // Overall probe timeout: min(20s, watch_interval) to prevent
-            // overlapping runs under --watch or cron scheduling.
-            let overall_secs = match watch {
-                Some(interval) => interval.min(20),
-                None => 20,
-            };
+            let overall_secs = watch.map_or(20, |interval| interval.min(20));
             let options = ProbeOptions { harden_network };
 
             if let Some(interval) = watch {
-                let mut run = 1u64;
+                let mut run = 1_u64;
                 loop {
                     if !json {
-                        println!("\n[Run {}]", run);
+                        println!("\n[Run {run}]");
                     }
-                    let report = grasp_audit::probe::run_probe_with_options(
+                    let report = run_probe_with_options(
                         &relay,
                         keys.clone(),
                         read_only,
@@ -162,15 +201,9 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(interval)).await;
                 }
             } else {
-                let report = grasp_audit::probe::run_probe_with_options(
-                    &relay,
-                    keys,
-                    read_only,
-                    timeout,
-                    overall_secs,
-                    options,
-                )
-                .await;
+                let report =
+                    run_probe_with_options(&relay, keys, read_only, timeout, overall_secs, options)
+                        .await;
                 if json {
                     report.print_json();
                 } else {
@@ -181,211 +214,259 @@ async fn main() -> Result<()> {
                 }
             }
         }
-
         Commands::Audit {
             relay,
             mode,
             spec,
             git_data_dir,
+            json,
             keys,
-        } => {
-            let keys = load_keys(&keys)?;
-            let mut config = match mode.as_str() {
-                "shared" => AuditConfig::shared(),
-                "isolated" => AuditConfig::isolated(),
-                // Backwards compatibility aliases
-                "ci" => AuditConfig::isolated(),
-                "production" => AuditConfig::shared(),
-                _ => {
-                    return Err(anyhow!(
-                        "Invalid mode: {}. Use 'shared' or 'isolated'",
-                        mode
-                    ))
-                }
-            };
-
-            // Audit needs to create events to test the relay, so disable read-only mode
-            config.read_only = false;
-
-            // Derive relay_domain from relay URL (e.g., "ws://localhost:8081" -> "localhost:8081")
-            let relay_domain = relay
-                .replace("ws://", "")
-                .replace("wss://", "")
-                .trim_end_matches('/')
-                .to_string();
-
-            println!("🔍 GRASP Audit Tool");
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            println!("Relay:   {}", relay);
-            println!("Mode:    {}", mode);
-            println!("Spec:    {}", spec);
-            println!("Run ID:  {}", config.run_id);
-            if let Some(ref dir) = git_data_dir {
-                println!("Git Dir: {}", dir.display());
-            }
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            println!();
-
-            println!("Connecting to relay...");
-            let client = match keys {
-                Some(keys) => AuditClient::new_with_keys(&relay, config, keys).await,
-                None => AuditClient::new(&relay, config).await,
-            }
-            .map_err(|e| anyhow!("Failed to connect to relay: {}", e))?;
-
-            if !client.is_connected().await {
-                return Err(anyhow!("Could not establish connection to relay"));
-            }
-
-            println!("✓ Connected\n");
-
-            let results = match spec.as_str() {
-                "nip01-smoke" => {
-                    println!("Running NIP-01 smoke tests...\n");
-                    specs::Nip01SmokeTests::run_all(&client).await
-                }
-                "nip11" => {
-                    println!("Running NIP-11 document tests...\n");
-                    specs::Nip11DocumentTests::run_all(&client).await
-                }
-                "event-acceptance" => {
-                    println!("Running event acceptance policy tests...\n");
-                    specs::EventAcceptancePolicyTests::run_all(&client).await
-                }
-                "cors" => {
-                    println!("Running CORS tests...\n");
-                    specs::CorsTests::run_all(&client, &relay_domain).await
-                }
-                "git-clone" => {
-                    println!("Running Git clone tests...\n");
-                    specs::GitCloneTests::run_all(&client, &relay_domain).await
-                }
-                "git-filter" => {
-                    println!("Running Git filter capability tests...\n");
-                    specs::GitFilterTests::run_all(&client, &relay_domain).await
-                }
-                "push-auth" => {
-                    println!("Running push authorization tests...\n");
-                    specs::PushAuthorizationTests::run_all(&client, &relay_domain).await
-                }
-                "repo-creation" => {
-                    println!("Running repository creation tests...\n");
-                    specs::RepositoryCreationTests::run_all(&client, &relay_domain).await
-                }
-                "purgatory" => {
-                    println!("Running purgatory tests...\n");
-                    specs::PurgatoryTests::run_all(&client).await
-                }
-                "grasp06" => {
-                    println!("Running GRASP-06 tests...\n");
-                    // GRASP-06 has its own report renderer (sections differ
-                    // from GRASP-01). Print it directly and short-circuit the
-                    // shared print_report path below.
-                    let grasp06_results = specs::Grasp06Tests::run_all(&client).await;
-                    specs::Grasp06Tests::print_report(&grasp06_results);
-                    if !grasp06_results.all_passed() {
-                        println!("❌ Some tests failed");
-                        std::process::exit(1);
-                    } else {
-                        println!("✅ All tests passed!");
-                    }
-                    return Ok(());
-                }
-                "all" => {
-                    println!("Running all tests...\n");
-                    let mut all_results = AuditResult::new("All GRASP-01 Tests");
-
-                    // NIP-01 smoke tests (stateless - no shared fixture dependencies)
-                    println!("  → NIP-01 smoke tests...");
-                    let nip01_results = specs::Nip01SmokeTests::run_all(&client).await;
-                    all_results.merge(nip01_results);
-
-                    // NIP-11 document tests (stateless)
-                    println!("  → NIP-11 document tests...");
-                    let nip11_results = specs::Nip11DocumentTests::run_all(&client).await;
-                    all_results.merge(nip11_results);
-
-                    // CORS tests (stateless HTTP checks)
-                    println!("  → CORS tests...");
-                    let cors_results = specs::CorsTests::run_all(&client, &relay_domain).await;
-                    all_results.merge(cors_results);
-
-                    // Repository creation tests (uses ValidRepoSent only - no state events)
-                    println!("  → Repository creation tests...");
-                    let repo_results = specs::RepositoryCreationTests::run_all(&client, &relay_domain).await;
-                    all_results.merge(repo_results);
-
-                    // Git clone tests (uses ValidRepoSent only - no state events)
-                    println!("  → Git clone tests...");
-                    let clone_results = specs::GitCloneTests::run_all(&client, &relay_domain).await;
-                    all_results.merge(clone_results);
-
-                    // Git filter capability tests (uses ValidRepoSent only - no state events)
-                    println!("  → Git filter capability tests...");
-                    let filter_results = specs::GitFilterTests::run_all(&client, &relay_domain).await;
-                    all_results.merge(filter_results);
-
-                    // Event acceptance policy tests (uses ValidRepoServed - no extra state events)
-                    println!("  → Event acceptance policy tests...");
-                    let event_results = specs::EventAcceptancePolicyTests::run_all(&client).await;
-                    all_results.merge(event_results);
-
-                    // Purgatory tests MUST run before push-auth.
-                    // Push-auth sends new replaceable state events (kind 30618) for the same
-                    // repo_id as OwnerStateDataPushed (e.g. test_head_set_after_git_push_with_required_oids
-                    // sends a develop1 state event that displaces the original). If purgatory ran
-                    // after push-auth, is_event_on_relay(original_id) would return false because
-                    // the original state event has been replaced on the relay.
-                    println!("  → Purgatory tests...");
-                    let purgatory_results = specs::PurgatoryTests::run_all(&client).await;
-                    all_results.merge(purgatory_results);
-
-                    // Push authorization tests (mutates shared state - must run last among git specs)
-                    println!("  → Push authorization tests...");
-                    let push_results = specs::PushAuthorizationTests::run_all(&client, &relay_domain).await;
-                    all_results.merge(push_results);
-
-                    // GRASP-06 tests live in their own spec family with their
-                    // own report renderer. Print the GRASP-01 block first
-                    // (via the default `print_report` below), then the
-                    // GRASP-06 block separately.
-                    println!("  → GRASP-06 tests...");
-                    let grasp06_results = specs::Grasp06Tests::run_all(&client).await;
-
-                    println!();
-                    all_results.print_report();
-                    specs::Grasp06Tests::print_report(&grasp06_results);
-
-                    let combined_ok =
-                        all_results.all_passed() && grasp06_results.all_passed();
-                    if !combined_ok {
-                        println!("❌ Some tests failed");
-                        std::process::exit(1);
-                    } else {
-                        println!("✅ All tests passed!");
-                    }
-                    return Ok(());
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unknown spec: {}. Use 'nip01-smoke', 'nip11', 'event-acceptance', 'cors', 'git-clone', 'git-filter', 'push-auth', 'repo-creation', 'purgatory', 'grasp06', or 'all'",
-                        spec
-                    ))
-                }
-            };
-
-            results.print_report();
-
-            if !results.all_passed() {
-                println!("❌ Some tests failed");
-                std::process::exit(1);
-            } else {
-                println!("✅ All tests passed!");
-            }
-        }
+        } => run_audit(relay, mode, spec, git_data_dir, json, keys).await?,
     }
 
     Ok(())
+}
+
+fn audit_json_requested(args: &[OsString]) -> bool {
+    args.get(1).is_some_and(|arg| arg == "audit") && args.iter().skip(2).any(|arg| arg == "--json")
+}
+
+fn requested_relay(args: &[OsString]) -> String {
+    for (index, arg) in args.iter().enumerate().skip(2) {
+        if arg == "--relay" || arg == "-r" {
+            return args
+                .get(index + 1)
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--relay=")) {
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
+async fn run_audit(
+    relay: String,
+    mode: String,
+    spec: AuditSelection,
+    git_data_dir: Option<PathBuf>,
+    json: bool,
+    key_args: KeyArgs,
+) -> Result<()> {
+    let started_at = unix_timestamp();
+    let started = Instant::now();
+    let mut config = match mode.as_str() {
+        "shared" | "production" => AuditConfig::shared(),
+        "isolated" | "ci" => AuditConfig::isolated(),
+        _ => audit_runtime_error(
+            json,
+            &relay,
+            "",
+            started_at,
+            started,
+            anyhow!("Invalid mode: {mode}. Use 'shared' or 'isolated'"),
+        ),
+    };
+    config.read_only = false;
+    let run_id = config.run_id.clone();
+
+    let keys = match load_keys(&key_args) {
+        Ok(keys) => keys,
+        Err(error) => audit_runtime_error(json, &relay, &run_id, started_at, started, error),
+    };
+    let relay_domain = relay
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_end_matches('/')
+        .to_string();
+
+    if !json {
+        println!("🔍 GRASP Audit Tool");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Relay:   {relay}");
+        println!("Mode:    {mode}");
+        println!("Spec:    {spec}");
+        println!("Run ID:  {run_id}");
+        if let Some(ref dir) = git_data_dir {
+            println!("Git Dir: {}", dir.display());
+        }
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        println!("Connecting to relay...");
+    }
+
+    let client_result = match keys {
+        Some(keys) => AuditClient::new_with_keys(&relay, config, keys).await,
+        None => AuditClient::new(&relay, config).await,
+    };
+    let client = match client_result {
+        Ok(client) => client,
+        Err(error) => audit_runtime_error(
+            json,
+            &relay,
+            &run_id,
+            started_at,
+            started,
+            anyhow!("Failed to connect to relay: {error}"),
+        ),
+    };
+    if !client.is_connected().await {
+        audit_runtime_error(
+            json,
+            &relay,
+            &run_id,
+            started_at,
+            started,
+            anyhow!("Could not establish connection to relay"),
+        );
+    }
+    if !json {
+        println!("✓ Connected\n");
+    }
+
+    let mut results = Vec::new();
+    match spec {
+        AuditSelection::Nip01Smoke => {
+            status(json, "Running NIP-01 smoke tests...");
+            results.push((
+                AuditSuite::Nip01Smoke,
+                specs::Nip01SmokeTests::run_all(&client).await,
+            ));
+        }
+        AuditSelection::Nip11 => {
+            status(json, "Running NIP-11 document tests...");
+            results.push((
+                AuditSuite::Nip11Document,
+                specs::Nip11DocumentTests::run_all(&client).await,
+            ));
+        }
+        AuditSelection::EventAcceptance => {
+            status(json, "Running event acceptance policy tests...");
+            results.push((
+                AuditSuite::EventAcceptance,
+                specs::EventAcceptancePolicyTests::run_all(&client).await,
+            ));
+        }
+        AuditSelection::Cors => {
+            status(json, "Running CORS tests...");
+            results.push((
+                AuditSuite::Cors,
+                specs::CorsTests::run_all(&client, &relay_domain).await,
+            ));
+        }
+        AuditSelection::GitClone => {
+            status(json, "Running Git clone tests...");
+            results.push((
+                AuditSuite::GitClone,
+                specs::GitCloneTests::run_all(&client, &relay_domain).await,
+            ));
+        }
+        AuditSelection::GitFilter => {
+            status(json, "Running Git filter capability tests...");
+            results.push((
+                AuditSuite::GitFilter,
+                specs::GitFilterTests::run_all(&client, &relay_domain).await,
+            ));
+        }
+        AuditSelection::PushAuth => {
+            status(json, "Running push authorization tests...");
+            results.push((
+                AuditSuite::PushAuthorization,
+                specs::PushAuthorizationTests::run_all(&client, &relay_domain).await,
+            ));
+        }
+        AuditSelection::RepoCreation => {
+            status(json, "Running repository creation tests...");
+            results.push((
+                AuditSuite::RepositoryCreation,
+                specs::RepositoryCreationTests::run_all(&client, &relay_domain).await,
+            ));
+        }
+        AuditSelection::Purgatory => {
+            status(json, "Running purgatory tests...");
+            results.push((
+                AuditSuite::Purgatory,
+                specs::PurgatoryTests::run_all(&client).await,
+            ));
+        }
+        AuditSelection::Grasp06 => {
+            status(json, "Running GRASP-06 tests...");
+            results.push((
+                AuditSuite::Grasp06All,
+                specs::Grasp06Tests::run_all(&client).await,
+            ));
+        }
+        AuditSelection::All => {
+            status(json, "Running all tests...");
+            let mut grasp01 = AuditResult::new("All GRASP-01 Tests");
+            progress(json, "  → NIP-01 smoke tests...");
+            grasp01.merge(specs::Nip01SmokeTests::run_all(&client).await);
+            progress(json, "  → NIP-11 document tests...");
+            grasp01.merge(specs::Nip11DocumentTests::run_all(&client).await);
+            progress(json, "  → CORS tests...");
+            grasp01.merge(specs::CorsTests::run_all(&client, &relay_domain).await);
+            progress(json, "  → Repository creation tests...");
+            grasp01.merge(specs::RepositoryCreationTests::run_all(&client, &relay_domain).await);
+            progress(json, "  → Git clone tests...");
+            grasp01.merge(specs::GitCloneTests::run_all(&client, &relay_domain).await);
+            progress(json, "  → Git filter capability tests...");
+            grasp01.merge(specs::GitFilterTests::run_all(&client, &relay_domain).await);
+            progress(json, "  → Event acceptance policy tests...");
+            grasp01.merge(specs::EventAcceptancePolicyTests::run_all(&client).await);
+            // Purgatory must run before push authorization because the latter
+            // replaces shared state events used by the purgatory assertions.
+            progress(json, "  → Purgatory tests...");
+            grasp01.merge(specs::PurgatoryTests::run_all(&client).await);
+            progress(json, "  → Push authorization tests...");
+            grasp01.merge(specs::PushAuthorizationTests::run_all(&client, &relay_domain).await);
+            results.push((AuditSuite::Grasp01All, grasp01));
+            progress(json, "  → GRASP-06 tests...");
+            results.push((
+                AuditSuite::Grasp06All,
+                specs::Grasp06Tests::run_all(&client).await,
+            ));
+        }
+    }
+
+    let all_passed = results.iter().all(|(_, result)| result.all_passed());
+    if json {
+        let specs = results
+            .iter()
+            .map(|(suite, result)| SpecReport::from_result(*suite, result))
+            .collect();
+        let report = AuditReport::completed(&relay, &run_id, started_at, started.elapsed(), specs);
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        for (suite, result) in &results {
+            if *suite == AuditSuite::Grasp06All {
+                specs::Grasp06Tests::print_report(result);
+            } else {
+                result.print_report();
+            }
+        }
+        if all_passed {
+            println!("✅ All tests passed!");
+        } else {
+            println!("❌ Some tests failed");
+        }
+    }
+
+    if !all_passed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn status(json: bool, message: &str) {
+    if !json {
+        println!("{message}\n");
+    }
+}
+
+fn progress(json: bool, message: &str) {
+    if !json {
+        println!("{message}");
+    }
 }
 
 fn load_keys(args: &KeyArgs) -> Result<Option<Keys>> {
@@ -423,6 +504,32 @@ fn load_keys_with_env(args: &KeyArgs, env_value: Option<OsString>) -> Result<Opt
     Keys::parse(value)
         .map(Some)
         .map_err(|error| anyhow!("Invalid secret key from {source}: {error}"))
+}
+
+fn audit_runtime_error(
+    json: bool,
+    relay: &str,
+    run_id: &str,
+    started_at: u64,
+    started: Instant,
+    error: anyhow::Error,
+) -> ! {
+    if json {
+        let report = AuditReport::error(
+            relay,
+            run_id,
+            started_at,
+            started.elapsed(),
+            error.to_string(),
+        );
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("audit error report is serializable")
+        );
+    } else {
+        eprintln!("{error:#}");
+    }
+    std::process::exit(2);
 }
 
 #[cfg(test)]
@@ -539,5 +646,35 @@ mod tests {
                 "{subcommand} accepted conflicting key sources"
             );
         }
+    }
+
+    #[test]
+    fn audit_selection_is_validated_by_clap() {
+        let parsed = Cli::try_parse_from([
+            "grasp-audit",
+            "audit",
+            "--relay",
+            "wss://example.com",
+            "--spec",
+            "not-an-audit",
+        ]);
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn json_parse_error_helpers_detect_audit_and_relay() {
+        let args: Vec<OsString> = [
+            "grasp-audit",
+            "audit",
+            "--json",
+            "--relay=wss://relay.example",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+
+        assert!(audit_json_requested(&args));
+        assert_eq!(requested_relay(&args), "wss://relay.example");
     }
 }
