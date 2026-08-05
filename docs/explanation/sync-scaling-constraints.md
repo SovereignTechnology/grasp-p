@@ -171,6 +171,13 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
 - Rounds queue behind a per-connection semaphore; each completion releases
   the next. No timed batches or sleeps — throughput degrades smoothly instead
   of bursting into rejections.
+- Transient REQ+EOSE subscriptions — historic sync groups, fallback
+  filters, exact-ID fetches, retries, and pagination pages — queue behind
+  their own per-connection semaphore (5 permits): a permit is acquired when
+  the auto-close REQ is sent and released when its EOSE or CLOSED arrives
+  (with a 30 s watchdog against relays that never answer). Live
+  subscriptions are not gated. 4 NEG + 5 REQ + 2 margin leaves at least
+  nine slots of the B = 20 floor for live subscriptions.
 - Permit acquisition checks relay health first: while a rate-limit or
   transient-failure cooldown is active, queued rounds take the REQ+EOSE
   fallback path (which is itself budget-accounted) instead of firing into a
@@ -282,6 +289,7 @@ with the heuristics demoted to backstop.
 | Lever | Status |
 | --- | --- |
 | 3 — bounded NEG concurrency | Stabilisation cycle 3 (in flight) |
+| 3 — bounded transient REQ+EOSE concurrency | Landed with cycle 3 (same PR) |
 | 1 + 2 — byte-budgeted chunking and REQ packing | Landed with cycle 3 (same PR) |
 | Ledger unification (live + historic + fallback against one budget, NIP-11-aware B/M) | Design accepted here; implement after cycles 3–4 |
 | 4 — multi-connection sharding | Deferred until a relay's target set approaches the single-connection ceiling |

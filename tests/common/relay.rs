@@ -62,6 +62,9 @@ pub struct TestRelay {
     _relay_data_dir: Option<tempfile::TempDir>,
     /// Path to relay data directory (for test assertions)
     relay_data_path: PathBuf,
+    /// Options used at start, retained so [`Self::restart`] can respawn
+    /// an identical relay on the same port.
+    options: RelayOptions,
 }
 
 /// Options that the various `start*` constructors fan out into a single
@@ -384,6 +387,30 @@ impl TestRelay {
         .await
     }
 
+    /// Start a syncing relay on a caller-reserved port with persistent
+    /// LMDB storage in explicit directories, so [`Self::restart`] can
+    /// resume from the same data on the same port.
+    pub async fn start_on_reservation_persistent_sync(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        disable_negentropy: bool,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy,
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -621,6 +648,7 @@ impl TestRelay {
             git_data_path,
             _relay_data_dir: relay_data_dir,
             relay_data_path,
+            options: options.clone(),
         };
 
         match relay.wait_for_ready_or_early_exit().await {
@@ -648,6 +676,46 @@ impl TestRelay {
     /// Get the subprocess log captured by the test harness.
     pub fn log_path(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/relay-{}.log", self.port))
+    }
+
+    /// Stop the relay process and start a fresh one on the same port with
+    /// the same options and data directories.
+    ///
+    /// Only meaningful for relays started with persistent (caller-owned)
+    /// data directories: an in-memory or tempdir-backed relay would
+    /// restart empty. The same port is re-reserved so addresses embedded
+    /// in already-published events stay valid.
+    pub async fn restart(mut self) -> Self {
+        let port = self.port;
+        let options = self.options.clone();
+
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        drop(self);
+
+        // The kernel frees the port once the child is fully gone; retry
+        // the specific-port reservation within a bounded deadline.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reservation = loop {
+            match port::reserve_specific(port) {
+                Ok(reservation) => break reservation,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "port {port} not released by stopped relay within deadline: {error}"
+                    );
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        match Self::try_start_once(reservation, &options).await {
+            StartOutcome::Ready(relay) => relay,
+            StartOutcome::EarlyExit { status } => panic!(
+                "restarted ngit-grasp subprocess exited early (status: {status:?}); \
+                 check /tmp/relay-{port}.log"
+            ),
+        }
     }
 
     /// Get the git data directory path
