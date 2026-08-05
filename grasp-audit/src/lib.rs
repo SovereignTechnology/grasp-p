@@ -33,6 +33,7 @@ pub mod client;
 pub mod fixtures;
 pub mod git;
 pub mod isolation;
+mod pinned_proxy;
 pub mod probe;
 pub mod report;
 pub mod result;
@@ -65,7 +66,9 @@ pub use fixtures::{
     RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH,
 };
 pub use git::{git_command, GRASP_AUDIT_NSEC_ENV};
-pub use probe::{run_probe, ProbeCheck, ProbeCheckName, ProbeReport};
+pub use probe::{
+    run_probe, run_probe_with_options, ProbeCheck, ProbeCheckName, ProbeOptions, ProbeReport,
+};
 pub use report::{
     AuditOutcome, AuditSpec, AuditSuite, ResultCounts, SpecReport, TestOutcome, TestReport,
 };

@@ -43,11 +43,21 @@ grasp-audit probe --relay wss://relay.ngit.dev --watch 10
 # Pipe JSON output to a log file
 grasp-audit probe --relay wss://relay.ngit.dev --json --watch 10 >> probe.log
 
+# Harden a scheduled read-only probe against untrusted network targets
+grasp-audit probe --relay wss://relay.ngit.dev --json --harden-network
+
 # Full write-path check: publish events, git push, verify refs match state
 # (requires write access; use --nsec for whitelisted relays)
 grasp-audit probe --relay wss://relay.ngit.dev --create-repo
 grasp-audit probe --relay wss://relay.ngit.dev --create-repo --nsec nsec1...
 ```
+
+`--harden-network` is opt-in so `ws://localhost` remains available for local
+development. Scheduled probes of discovered servers should enable it. Hardened
+probes require `wss://`, pin validated public addresses for WebSocket and HTTP
+connections, refuse redirects and cross-origin clone URLs, and bound response
+bodies. They are deliberately read-only and cannot be combined with
+`--create-repo`.
 
 **Probe checks (read-only):**
 
