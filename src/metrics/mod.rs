@@ -176,6 +176,64 @@ lazy_static! {
             .expect("register manual ejection deleted metric");
         metric
     };
+    static ref PURGATORY_GIT_FETCH_PASSES_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_purgatory_git_fetch_passes_total",
+            "Outbound purgatory git fetch passes (one ls-remote comparison plus fetches per pass)",
+        ))
+        .expect("build purgatory git fetch passes metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register purgatory git fetch passes metric");
+        metric
+    };
+    static ref PURGATORY_GIT_FETCH_OIDS_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_purgatory_git_fetch_oids_total",
+                "Purgatory git fetch OID outcomes by kind \
+                 (advertised_tip, residual_attempted, residual_missing, residual_skipped, fetched)",
+            ),
+            &["kind"],
+        )
+        .expect("build purgatory git fetch oids metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register purgatory git fetch oids metric");
+        metric
+    };
+}
+
+/// Record one completed outbound purgatory git fetch pass.
+///
+/// Together with the per-pass summary log line this gives production the
+/// client-side view of purgatory git fetching: how many needed OIDs were
+/// advertised by the remote (batch-fetched), how many residual OIDs were
+/// attempted individually, how many the remote did not have, and how many
+/// unchanged-advertisement misses were skipped, and how many OIDs actually arrived.
+pub fn record_purgatory_git_fetch_pass(
+    advertised_tips: usize,
+    residual_attempted: usize,
+    residual_missing: usize,
+    residual_skipped: usize,
+    fetched: usize,
+) {
+    PURGATORY_GIT_FETCH_PASSES_TOTAL.inc();
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["advertised_tip"])
+        .inc_by(advertised_tips as f64);
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["residual_attempted"])
+        .inc_by(residual_attempted as f64);
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["residual_missing"])
+        .inc_by(residual_missing as f64);
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["residual_skipped"])
+        .inc_by(residual_skipped as f64);
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["fetched"])
+        .inc_by(fetched as f64);
 }
 
 pub fn record_blacklist_deletion_attempt(phase: &str) {

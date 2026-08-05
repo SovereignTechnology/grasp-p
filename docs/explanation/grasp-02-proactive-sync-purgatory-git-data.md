@@ -400,6 +400,47 @@ Soft expiry is the solution: the bare repo is deleted at 30 minutes (respecting 
 
 ---
 
+## Fetch Strategy: Advertised Tips First
+
+A sync pass for one URL (`RealSyncContext::fetch_oids`) runs three phases,
+all through the same hardened/pinned git subprocess machinery:
+
+1. **Compare** — `git ls-remote` lists the remote's advertised refs. Most
+   needed OIDs are ref tips declared by state events, and PR tips appear
+   under `refs/nostr/<event-id>`, so the advertisement reveals up front
+   which needed OIDs the remote can serve.
+2. **Batch-fetch advertised tips** — one `git fetch <url> <oid>…` for the
+   needed OIDs the remote advertises. Advertised OIDs are always valid
+   wants, so `not our ref` cannot occur and an OID the remote never had
+   cannot fail the batch.
+3. **Residual OIDs one at a time** — needed OIDs that were neither
+   advertised nor discovered as ancestors of the fetched tips are
+   requested individually. Some servers refuse arbitrary-SHA1 wants, so a
+   per-OID failure costs exactly one small round trip and never aborts the
+   rest of the pass.
+
+Missing residual OIDs are memoized per clone URL against a fingerprint of
+the sorted advertised OID set. Later passes skip those OIDs while the
+advertisement is unchanged; any ref-tip change clears that URL's memo and
+allows them to be retried. Entries expire lazily after 30 minutes and the
+memo is capped at 1,024 URLs, evicting the oldest entry when full.
+
+**Why not just list every OID as a want?** An earlier implementation did
+exactly that and dropped one OID from the batch on each `not our ref`
+error. Against a state event declaring hundreds of tips that exist on no
+reachable server (observed in production with the `market` repository),
+that degenerated into a sorted oid-by-oid crawl: one failed upload-pack
+round trip per missing tip, O(N²) want retransmission, an upload-pack
+subprocess spawned and aborted per attempt, and nothing fetched until the
+crawl finished.
+
+Each pass emits one `Purgatory git fetch pass complete` INFO line
+(needed / advertised tips / residual attempted / residual missing /
+residual skipped / fetched) and increments `ngit_purgatory_git_fetch_passes_total` and
+`ngit_purgatory_git_fetch_oids_total{kind}`.
+
+---
+
 ## Testability: Mock-Based Architecture
 
 A key design goal was **100% unit test coverage** without requiring real git servers or databases.
@@ -584,13 +625,20 @@ Sync incomplete - applying backoff (identifier=test-repo, attempt_count=2, next_
 Failed to fetch OIDs (url=https://server.com/repo.git, error=connection timeout)
 ```
 
-### Metrics (Future)
+### Metrics
 
-Planned Prometheus metrics for observability:
+Implemented:
+
+- `ngit_purgatory_git_fetch_passes_total` - Outbound git fetch passes
+  (one ls-remote comparison plus fetches per pass)
+- `ngit_purgatory_git_fetch_oids_total{kind}` - Per-pass OID outcomes
+  (`advertised_tip`, `residual_attempted`, `residual_missing`,
+  `residual_skipped`, `fetched`)
+
+Planned:
 
 - `purgatory_sync_queue_size` - Number of identifiers pending sync
 - `purgatory_sync_attempts_total{identifier}` - Total sync attempts per identifier
-- `purgatory_sync_oids_fetched_total{identifier}` - OIDs successfully fetched
 - `purgatory_domain_in_flight{domain}` - Current in-flight requests per domain
 - `purgatory_domain_requests_total{domain}` - Total requests per domain
 
@@ -670,8 +718,9 @@ End-to-end tests verify sync behavior with real relay instances:
 
 ### 3. Prometheus Metrics
 
-**Current**: Structured logging only  
-**Future**: Export metrics for monitoring dashboards
+**Current**: Structured logging plus per-pass fetch metrics
+(`ngit_purgatory_git_fetch_*`, see [Observability](#observability))
+**Future**: Queue-depth and per-domain throttle metrics
 
 **Use case**: Operators want visibility into sync performance, throttle effectiveness, success rates.
 

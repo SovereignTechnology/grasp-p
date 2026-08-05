@@ -12,8 +12,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::git::authorization::RepositoryData;
 use crate::git::sync::PurgatoryPromotionHooks;
@@ -191,7 +193,7 @@ pub trait SyncContext: Send + Sync {
 
 use nostr_sdk::local_relay::LocalRelay;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use crate::nostr::builder::Nip34WritePolicy;
@@ -232,6 +234,10 @@ pub struct RealSyncContext {
     /// Naughty list tracker for git remote domains with persistent errors
     git_naughty_list: Arc<NaughtyListTracker>,
 
+    /// OIDs each URL has already reported missing, scoped to its current
+    /// advertised ref tips.
+    miss_memo: Arc<Mutex<HashMap<String, RemoteMissMemo>>>,
+
     /// Outbound target policy applied before every event-directed git fetch
     outbound_policy: OutboundTargetPolicy,
 }
@@ -267,6 +273,7 @@ impl RealSyncContext {
             local_relay,
             write_policy,
             git_naughty_list,
+            miss_memo: Arc::new(Mutex::new(HashMap::new())),
             outbound_policy,
         }
     }
@@ -275,6 +282,62 @@ impl RealSyncContext {
     pub fn git_naughty_list(&self) -> &Arc<NaughtyListTracker> {
         &self.git_naughty_list
     }
+}
+
+const MISS_MEMO_TTL: Duration = Duration::from_secs(30 * 60);
+const MISS_MEMO_MAX_URLS: usize = 1024;
+
+#[derive(Debug)]
+struct RemoteMissMemo {
+    advert_fingerprint: u64,
+    missing: HashSet<String>,
+    last_touched: Instant,
+}
+
+fn advertised_oids_fingerprint(advertised: &HashSet<String>) -> u64 {
+    let mut sorted: Vec<&str> = advertised.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn memoized_missing_for_url(
+    memo: &mut HashMap<String, RemoteMissMemo>,
+    url: &str,
+    advert_fingerprint: u64,
+    now: Instant,
+) -> HashSet<String> {
+    memo.retain(|_, entry| now.duration_since(entry.last_touched) < MISS_MEMO_TTL);
+
+    if let Some(entry) = memo.get_mut(url) {
+        entry.last_touched = now;
+        if entry.advert_fingerprint == advert_fingerprint {
+            return entry.missing.clone();
+        }
+        entry.advert_fingerprint = advert_fingerprint;
+        entry.missing.clear();
+        return HashSet::new();
+    }
+
+    if memo.len() >= MISS_MEMO_MAX_URLS {
+        if let Some(oldest_url) = memo
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_touched)
+            .map(|(url, _)| url.clone())
+        {
+            memo.remove(&oldest_url);
+        }
+    }
+    memo.insert(
+        url.to_string(),
+        RemoteMissMemo {
+            advert_fingerprint,
+            missing: HashSet::new(),
+            last_touched: now,
+        },
+    );
+    HashSet::new()
 }
 
 /// `http.curloptResolve` entry pinning the vetted DNS answers, when any.
@@ -300,7 +363,8 @@ fn resolve_pin_entry(resolved: &ResolvedTarget) -> Option<String> {
     ))
 }
 
-/// Build a `git fetch` command that cannot escape the outbound target policy.
+/// Build a git command (fetch / ls-remote) that cannot escape the outbound
+/// target policy.
 ///
 /// The URL was authorized immediately before this call; these controls keep
 /// the subprocess pointed at the vetted target:
@@ -313,11 +377,7 @@ fn resolve_pin_entry(resolved: &ResolvedTarget) -> Option<String> {
 ///   of requests to event-directed servers;
 /// - `http.curloptResolve` pins the vetted DNS answers so the fetch cannot be
 ///   re-bound to a different address between authorization and connection.
-fn hardened_git_fetch_command(
-    repo_path: &Path,
-    resolve_pin: Option<&str>,
-    args: &[String],
-) -> Command {
+fn hardened_git_command(repo_path: &Path, resolve_pin: Option<&str>, args: &[String]) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -341,6 +401,66 @@ fn hardened_git_fetch_command(
         .env_remove("GIT_PROXY_COMMAND")
         .current_dir(repo_path);
     command
+}
+
+/// Parse `git ls-remote` output into the set of advertised object ids.
+///
+/// Each line has the form `<oid>\t<refname>`; peeled tag lines
+/// (`refs/tags/x^{}`) are included since their OIDs are fetchable too.
+fn parse_advertised_oids(stdout: &str) -> HashSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|oid| oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|oid| oid.to_string())
+        .collect()
+}
+
+/// Whether a git fetch failure means the remote simply does not have (or
+/// will not serve) the requested object — an expected per-OID outcome, not
+/// a remote malfunction.
+fn is_object_missing_error(stderr: &str) -> bool {
+    // Server-side rejection of an unknown want, relayed by the client as
+    // "fatal: remote error: upload-pack: not our ref <oid>".
+    stderr.contains("not our ref")
+        // Client-side refusal when the server does not advertise the
+        // object and does not allow unadvertised wants (protocol v0).
+        || stderr.contains("Server does not allow request for unadvertised object")
+}
+
+/// Record a remote failure with the naughty list tracker (only error
+/// categories the tracker classifies as persistent are recorded).
+fn record_remote_failure(
+    naughty_list: &NaughtyListTracker,
+    url: &str,
+    stderr: &str,
+    operation: &str,
+) {
+    let Some(domain) = extract_domain(url) else {
+        return;
+    };
+    let Some(category) = NaughtyListTracker::classify_error(stderr) else {
+        return;
+    };
+    let is_new = naughty_list.record(&domain, category, stderr.to_string());
+
+    if is_new {
+        tracing::warn!(
+            domain = %domain,
+            category = %category,
+            operation = %operation,
+            error = %stderr,
+            "Git remote domain added to naughty list"
+        );
+    } else {
+        debug!(
+            domain = %domain,
+            category = %category,
+            operation = %operation,
+            error = %stderr,
+            "Git remote operation failed (domain on naughty list)"
+        );
+    }
 }
 
 #[async_trait]
@@ -487,112 +607,83 @@ impl SyncContext for RealSyncContext {
         let url = url.to_string();
         let missing_oids: Vec<String> = missing.into_iter().cloned().collect();
         let naughty_list = self.git_naughty_list.clone();
+        let miss_memo = self.miss_memo.clone();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let mut remaining_oids = missing_oids.clone();
-            let mut missing_from_remote: Vec<String> = Vec::new();
-
-            // Retry loop: keep fetching until success or no OIDs left
-            loop {
-                if remaining_oids.is_empty() {
-                    // All OIDs were missing from remote
-                    debug!(
-                        url = %url,
-                        missing_count = missing_from_remote.len(),
-                        "All requested OIDs missing from remote"
-                    );
-                    return Ok(vec![]);
-                }
-
-                // git fetch <remote> <sha1> <sha2> ... - fetch all OIDs with full history
-                let mut args = vec!["fetch".to_string(), url.clone()];
-                args.extend(remaining_oids.iter().cloned());
-
-                let output =
-                    hardened_git_fetch_command(&repo_path, resolve_pin.as_deref(), &args).output();
-
-                match output {
+            // Phase 1: compare the remote's advertised refs against our
+            // needs. Most needed OIDs are ref tips declared by state events
+            // (PR tips appear under `refs/nostr/<event-id>`), so the
+            // advertisement tells us up front which OIDs the remote can
+            // serve — instead of discovering each missing one through a
+            // failed "not our ref" upload-pack round trip.
+            let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
+            let advertised =
+                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &ls_remote_args)
+                    .output()
+                {
                     Ok(result) if result.status.success() => {
-                        // Fetch succeeded - count how many OIDs we now have
-                        let fetched: Vec<String> = missing_oids
-                            .iter()
-                            .filter(|oid| crate::git::oid_exists(&repo_path, oid))
-                            .cloned()
-                            .collect();
-
-                        if !missing_from_remote.is_empty() {
-                            debug!(
-                                url = %url,
-                                fetched_count = fetched.len(),
-                                missing_count = missing_from_remote.len(),
-                                missing_oids = ?missing_from_remote,
-                                "Fetch completed after retries - some OIDs were missing from remote"
-                            );
-                        } else {
-                            debug!(url = %url, fetched_count = fetched.len(), "Successfully fetched OIDs");
-                        }
-
-                        return Ok(fetched);
+                        parse_advertised_oids(&String::from_utf8_lossy(&result.stdout))
                     }
                     Ok(result) => {
                         let stderr = String::from_utf8_lossy(&result.stderr);
+                        record_remote_failure(&naughty_list, &url, &stderr, "ls-remote");
+                        return Err(anyhow::anyhow!(
+                            "git ls-remote failed for {}: {}",
+                            url,
+                            stderr
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "git ls-remote command error for {}: {}",
+                            url,
+                            e
+                        ))
+                    }
+                };
+            let advert_fingerprint = advertised_oids_fingerprint(&advertised);
+            let memoized_missing = {
+                let mut memo = miss_memo
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                memoized_missing_for_url(&mut memo, &url, advert_fingerprint, Instant::now())
+            };
 
-                        // Check for "not our ref" error - this is retryable
-                        if stderr.contains("upload-pack: not our ref") {
-                            // Parse out the missing OID from stderr
-                            let missing_oid = stderr.lines().find_map(|line| {
-                                if line.contains("not our ref") {
-                                    // Extract the OID from lines like:
-                                    // "fatal: remote error: upload-pack: not our ref <oid>"
-                                    line.split("not our ref")
-                                        .nth(1)
-                                        .map(|s| s.trim().to_string())
-                                } else {
-                                    None
-                                }
-                            });
+            // Phase 2: batch-fetch the needed OIDs the remote actually
+            // advertises. Advertised OIDs are always valid wants, so
+            // "not our ref" cannot occur here and one batch cannot be
+            // failed by an OID the remote never had.
+            let advertised_tips: Vec<String> = missing_oids
+                .iter()
+                .filter(|oid| advertised.contains(*oid))
+                .cloned()
+                .collect();
+            if !advertised_tips.is_empty() {
+                let mut args = vec!["fetch".to_string(), url.clone()];
+                args.extend(advertised_tips.iter().cloned());
 
-                            if let Some(ref oid) = missing_oid {
-                                // Remove the missing OID and retry with remaining
-                                remaining_oids.retain(|o| o != oid);
-                                missing_from_remote.push(oid.clone());
-
-                                debug!(
-                                    url = %url,
-                                    missing_oid = %oid,
-                                    remaining_count = remaining_oids.len(),
-                                    "OID not found on remote, retrying with remaining OIDs"
-                                );
-
-                                continue; // Retry with remaining OIDs
-                            }
+                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
+                    Ok(result) if result.status.success() => {}
+                    Ok(result) => {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        if is_object_missing_error(&stderr) {
+                            // The remote's refs changed between ls-remote and
+                            // fetch. Fall through: every still-missing OID is
+                            // retried individually below.
+                            debug!(
+                                url = %url,
+                                error = %stderr,
+                                "Advertised tip vanished between ls-remote and \
+                                 fetch - falling back to per-OID fetches"
+                            );
+                        } else {
+                            record_remote_failure(&naughty_list, &url, &stderr, "fetch");
+                            return Err(anyhow::anyhow!(
+                                "git fetch failed for {}: {}",
+                                url,
+                                stderr
+                            ));
                         }
-
-                        // Non-retryable error - record to naughty list and return error
-                        if let Some(domain) = extract_domain(&url) {
-                            if let Some(category) = NaughtyListTracker::classify_error(&stderr) {
-                                let is_new =
-                                    naughty_list.record(&domain, category, stderr.to_string());
-
-                                if is_new {
-                                    tracing::warn!(
-                                        domain = %domain,
-                                        category = %category,
-                                        error = %stderr,
-                                        "Git remote domain added to naughty list"
-                                    );
-                                } else {
-                                    debug!(
-                                        domain = %domain,
-                                        category = %category,
-                                        error = %stderr,
-                                        "Git fetch failed (domain on naughty list)"
-                                    );
-                                }
-                            }
-                        }
-
-                        return Err(anyhow::anyhow!("git fetch failed for {}: {}", url, stderr));
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!(
@@ -603,6 +694,90 @@ impl SyncContext for RealSyncContext {
                     }
                 }
             }
+
+            // Phase 3: request residual OIDs that were not advertised and
+            // did not arrive as ancestors of the fetched tips, one at a
+            // time. Arbitrary-SHA1 wants may still be refused by some
+            // servers, so a per-OID failure must cost exactly one small
+            // round trip and must not abort the rest.
+            let mut residual_attempted = 0usize;
+            let mut residual_missing = 0usize;
+            let mut residual_skipped = 0usize;
+            for oid in &missing_oids {
+                if crate::git::oid_exists(&repo_path, oid) {
+                    continue;
+                }
+                if memoized_missing.contains(oid) {
+                    residual_skipped += 1;
+                    continue;
+                }
+                residual_attempted += 1;
+
+                let args = vec!["fetch".to_string(), url.clone(), oid.clone()];
+                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
+                    Ok(result) if result.status.success() => {}
+                    Ok(result) => {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        if is_object_missing_error(&stderr) {
+                            residual_missing += 1;
+                            let mut memo = miss_memo
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(entry) = memo.get_mut(&url) {
+                                if entry.advert_fingerprint == advert_fingerprint {
+                                    entry.missing.insert(oid.clone());
+                                    entry.last_touched = Instant::now();
+                                }
+                            }
+                            debug!(
+                                url = %url,
+                                oid = %oid,
+                                "OID not available on remote"
+                            );
+                        } else {
+                            // A genuine remote failure: record it and stop
+                            // hammering the server, but keep what the batch
+                            // already fetched.
+                            record_remote_failure(&naughty_list, &url, &stderr, "fetch");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(url = %url, oid = %oid, error = %e, "git fetch command error");
+                        break;
+                    }
+                }
+            }
+
+            let fetched: Vec<String> = missing_oids
+                .iter()
+                .filter(|oid| crate::git::oid_exists(&repo_path, oid))
+                .cloned()
+                .collect();
+
+            // One summary line per outbound fetch pass: this is the
+            // client-side visibility the drop-one-and-retry loop lacked
+            // (it logged only at debug level, so a relay crawling a remote
+            // was invisible in its own production logs).
+            tracing::info!(
+                url = %url,
+                needed = missing_oids.len(),
+                advertised_tips = advertised_tips.len(),
+                residual_attempted = residual_attempted,
+                residual_missing = residual_missing,
+                residual_skipped = residual_skipped,
+                fetched = fetched.len(),
+                "Purgatory git fetch pass complete"
+            );
+            crate::metrics::record_purgatory_git_fetch_pass(
+                advertised_tips.len(),
+                residual_attempted,
+                residual_missing,
+                residual_skipped,
+                fetched.len(),
+            );
+
+            Ok(fetched)
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {}", e))?
@@ -671,6 +846,88 @@ impl SyncContext for RealSyncContext {
 
     fn our_domain(&self) -> Option<&str> {
         self.our_domain_value.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod fetch_helper_tests {
+    use super::*;
+
+    #[test]
+    fn parse_advertised_oids_collects_ref_tips_and_peeled_tags() {
+        let stdout = "6451bf9d83e64647ba714740e9a15e5327d28be1\tHEAD\n\
+             6451bf9d83e64647ba714740e9a15e5327d28be1\trefs/heads/main\n\
+             ace0a97f55e3b5343f312b1340717d34e2b4d2c6\trefs/tags/v1.0\n\
+             beef000000000000000000000000000000000001\trefs/tags/v1.0^{}\n";
+        let advertised = parse_advertised_oids(stdout);
+        assert_eq!(advertised.len(), 3);
+        assert!(advertised.contains("6451bf9d83e64647ba714740e9a15e5327d28be1"));
+        assert!(advertised.contains("ace0a97f55e3b5343f312b1340717d34e2b4d2c6"));
+        assert!(advertised.contains("beef000000000000000000000000000000000001"));
+    }
+
+    #[test]
+    fn parse_advertised_oids_ignores_malformed_lines() {
+        let stdout = "warning: something\nnot-an-oid\trefs/heads/x\n\n";
+        assert!(parse_advertised_oids(stdout).is_empty());
+    }
+
+    #[test]
+    fn object_missing_errors_are_recognised() {
+        assert!(is_object_missing_error(
+            "fatal: remote error: upload-pack: not our ref beef0000"
+        ));
+        assert!(is_object_missing_error(
+            "error: Server does not allow request for unadvertised object beef0000"
+        ));
+        assert!(!is_object_missing_error(
+            "fatal: unable to access 'https://x/': SSL certificate problem"
+        ));
+    }
+
+    #[test]
+    fn miss_memo_is_stable_order_independent_invalidated_and_bounded() {
+        let first = HashSet::from(["b".to_string(), "a".to_string()]);
+        let reordered = HashSet::from(["a".to_string(), "b".to_string()]);
+        let changed = HashSet::from(["a".to_string(), "c".to_string()]);
+        let first_fingerprint = advertised_oids_fingerprint(&first);
+        assert_eq!(first_fingerprint, advertised_oids_fingerprint(&reordered));
+        assert_ne!(first_fingerprint, advertised_oids_fingerprint(&changed));
+
+        let now = Instant::now();
+        let mut memo = HashMap::new();
+        assert!(
+            memoized_missing_for_url(&mut memo, "https://one", first_fingerprint, now).is_empty()
+        );
+        memo.get_mut("https://one")
+            .unwrap()
+            .missing
+            .insert("missing".to_string());
+        assert!(
+            memoized_missing_for_url(&mut memo, "https://one", first_fingerprint, now)
+                .contains("missing")
+        );
+        assert!(memoized_missing_for_url(
+            &mut memo,
+            "https://one",
+            advertised_oids_fingerprint(&changed),
+            now,
+        )
+        .is_empty());
+
+        memo.get_mut("https://one").unwrap().last_touched = now - MISS_MEMO_TTL;
+        memoized_missing_for_url(&mut memo, "https://two", first_fingerprint, now);
+        assert!(!memo.contains_key("https://one"));
+
+        for index in 0..=MISS_MEMO_MAX_URLS {
+            memoized_missing_for_url(
+                &mut memo,
+                &format!("https://remote-{index}"),
+                first_fingerprint,
+                now,
+            );
+        }
+        assert_eq!(memo.len(), MISS_MEMO_MAX_URLS);
     }
 }
 

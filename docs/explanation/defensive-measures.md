@@ -120,7 +120,8 @@ outbound sink:
   dial, including reconnects, plus a registration-time gate so forbidden
   targets never enter the reconnect lifecycle.
 - **Git fetches** (`RealSyncContext::fetch_oids`): checked immediately before
-  spawning `git fetch`.
+  spawning the pass's git subprocesses (`git ls-remote` and `git fetch`),
+  with the vetted DNS answers pinned onto each of them.
 
 The policy enforces:
 
