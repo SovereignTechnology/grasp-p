@@ -122,6 +122,18 @@ async fn incomplete_exact_id_fetch_recovers_after_event_becomes_available() {
         "proxy should have censored the initial fetch and at least one retry, dropped: {}",
         proxy.dropped_count()
     );
+    let syncing_log = std::fs::read_to_string(syncing.log_path())
+        .expect("read syncing relay log after historic batch completion");
+    assert!(
+        syncing_log.contains(
+            "Negentropy residual retry made no progress; retaining NIP-77 and scheduling bounded missing-event recovery"
+        ),
+        "a small residual must retain NIP-77 and enter bounded recovery"
+    );
+    assert!(
+        !syncing_log.contains("Marking relay as incompatible with negentropy hydration"),
+        "a one-event residual must not trigger semantic fallback"
+    );
     assert!(
         !wait_for_event_on_relay(
             syncing.url(),

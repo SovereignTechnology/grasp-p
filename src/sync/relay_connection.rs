@@ -857,9 +857,9 @@ impl RelayConnection {
     /// Mark this relay as not supporting NIP-77 negentropy
     ///
     /// Called only when the relay explicitly signals it cannot speak NIP-77
-    /// (see [`classify_negentropy_failure`]), or when a negentropy retry
-    /// returns zero events (see zero-progress handling in `sync::mod`).
-    /// Transient failures use a bounded cooldown instead.
+    /// (see [`classify_negentropy_failure`]), or when a material first-pass
+    /// exact-ID hydration failure shows its advertised inventory is not usable.
+    /// Small residuals and transient failures retain NIP-77.
     ///
     /// Future batches will skip negentropy and use REQ+EOSE directly.
     pub fn mark_negentropy_unsupported(&self) {
