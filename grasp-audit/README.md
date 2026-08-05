@@ -82,6 +82,26 @@ grasp-audit audit --relay ws://localhost:7334 --spec nip01-smoke
 grasp-audit audit --relay ws://localhost:7334 --mode isolated --spec push-auth
 ```
 
+### Audit identity
+
+Probe write checks and full audits can use an explicit identity. Key sources
+are checked in this order:
+
+1. `--nsec <nsec-or-hex>`
+2. `--nsec-file <path>`
+3. `GRASP_AUDIT_NSEC`
+
+`--nsec` is convenient for disposable keys, but command arguments may be
+visible to other local users. Prefer `--nsec-file` or `GRASP_AUDIT_NSEC` for
+scheduled jobs. The two command-line options cannot be used together. If no
+source is supplied, the tool generates a fresh key as before.
+
+```bash
+grasp-audit probe --relay wss://relay.ngit.dev --create-repo --nsec nsec1...
+grasp-audit audit --relay wss://relay.ngit.dev --nsec-file /run/credentials/audit_nsec
+GRASP_AUDIT_NSEC=nsec1... grasp-audit audit --relay wss://relay.ngit.dev
+```
+
 ### As a Library (Audit)
 
 ```rust

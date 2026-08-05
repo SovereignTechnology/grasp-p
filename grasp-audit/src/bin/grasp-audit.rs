@@ -1,7 +1,8 @@
 //! GRASP Audit CLI Tool
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use grasp_audit::*;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,6 +12,18 @@ use std::time::Duration;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Clone, Args)]
+struct KeyArgs {
+    /// Secret key in nsec or hex format. Convenient for disposable keys, but
+    /// visible in the process argument list; prefer --nsec-file or GRASP_AUDIT_NSEC.
+    #[arg(long, conflicts_with = "nsec_file")]
+    nsec: Option<String>,
+
+    /// Read a secret key in nsec or hex format from this file.
+    #[arg(long, value_name = "PATH", conflicts_with = "nsec")]
+    nsec_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -33,9 +46,8 @@ enum Commands {
         #[arg(long)]
         watch: Option<u64>,
 
-        /// Secret key in nsec bech32 format (for whitelisted relays)
-        #[arg(long)]
-        nsec: Option<String>,
+        #[command(flatten)]
+        keys: KeyArgs,
 
         /// Create a test repo on the relay to verify the full write path
         /// (publish events, git push, verify refs match state).
@@ -64,6 +76,9 @@ enum Commands {
         /// Git data directory (required for cors, git-clone, push-auth, repo-creation specs)
         #[arg(short, long)]
         git_data_dir: Option<PathBuf>,
+
+        #[command(flatten)]
+        keys: KeyArgs,
     },
 }
 
@@ -91,7 +106,7 @@ async fn main() -> Result<()> {
             json,
             timeout,
             watch,
-            nsec,
+            keys,
             create_repo,
         } => {
             let relay = match relay {
@@ -105,15 +120,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Parse nsec if provided
-            let keys = if let Some(nsec_str) = nsec {
-                use nostr_sdk::prelude::SecretKey;
-                let sk = SecretKey::from_bech32(&nsec_str)
-                    .map_err(|e| anyhow!("Invalid nsec: {}", e))?;
-                Some(Keys::new(sk))
-            } else {
-                None
-            };
+            let keys = load_keys(&keys)?;
 
             // read_only is the default; --create-repo opts into the write path
             let read_only = !create_repo;
@@ -167,7 +174,9 @@ async fn main() -> Result<()> {
             mode,
             spec,
             git_data_dir,
+            keys,
         } => {
+            let keys = load_keys(&keys)?;
             let mut config = match mode.as_str() {
                 "shared" => AuditConfig::shared(),
                 "isolated" => AuditConfig::isolated(),
@@ -205,9 +214,11 @@ async fn main() -> Result<()> {
             println!();
 
             println!("Connecting to relay...");
-            let client = AuditClient::new(&relay, config)
-                .await
-                .map_err(|e| anyhow!("Failed to connect to relay: {}", e))?;
+            let client = match keys {
+                Some(keys) => AuditClient::new_with_keys(&relay, config, keys).await,
+                None => AuditClient::new(&relay, config).await,
+            }
+            .map_err(|e| anyhow!("Failed to connect to relay: {}", e))?;
 
             if !client.is_connected().await {
                 return Err(anyhow!("Could not establish connection to relay"));
@@ -362,4 +373,158 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_keys(args: &KeyArgs) -> Result<Option<Keys>> {
+    load_keys_with_env(args, std::env::var_os(GRASP_AUDIT_NSEC_ENV))
+}
+
+fn load_keys_with_env(args: &KeyArgs, env_value: Option<OsString>) -> Result<Option<Keys>> {
+    let value = if let Some(value) = &args.nsec {
+        Some((value.clone(), "--nsec".to_string()))
+    } else if let Some(path) = &args.nsec_file {
+        Some((
+            std::fs::read_to_string(path)
+                .map_err(|error| anyhow!("Failed to read {}: {error}", path.display()))?,
+            format!("--nsec-file {}", path.display()),
+        ))
+    } else if let Some(value) = env_value {
+        Some((
+            value.into_string().map_err(|_| {
+                anyhow!("Secret key from {GRASP_AUDIT_NSEC_ENV} is not valid UTF-8")
+            })?,
+            GRASP_AUDIT_NSEC_ENV.to_string(),
+        ))
+    } else {
+        None
+    };
+
+    let Some((value, source)) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("Secret key source {source} is empty"));
+    }
+
+    Keys::parse(value)
+        .map(Some)
+        .map_err(|error| anyhow!("Invalid secret key from {source}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_args(nsec: Option<String>, nsec_file: Option<PathBuf>) -> KeyArgs {
+        KeyArgs { nsec, nsec_file }
+    }
+
+    fn nsec(keys: &Keys) -> String {
+        keys.secret_key().to_bech32().unwrap()
+    }
+
+    #[test]
+    fn inline_key_takes_precedence_over_environment() {
+        let inline = Keys::generate();
+        let environment = Keys::generate();
+        let loaded = load_keys_with_env(
+            &key_args(Some(format!("  {}\n", nsec(&inline))), None),
+            Some(nsec(&environment).into()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.public_key(), inline.public_key());
+    }
+
+    #[test]
+    fn file_key_takes_precedence_over_environment_and_is_trimmed() {
+        let file_keys = Keys::generate();
+        let environment = Keys::generate();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("\n {} \n", nsec(&file_keys))).unwrap();
+
+        let loaded = load_keys_with_env(
+            &key_args(None, Some(file.path().to_path_buf())),
+            Some(nsec(&environment).into()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.public_key(), file_keys.public_key());
+    }
+
+    #[test]
+    fn environment_key_is_used_and_trimmed() {
+        let environment = Keys::generate();
+        let loaded = load_keys_with_env(
+            &key_args(None, None),
+            Some(format!("\t{}\n", nsec(&environment)).into()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(loaded.public_key(), environment.public_key());
+    }
+
+    #[test]
+    fn hex_keys_are_supported() {
+        let expected = Keys::generate();
+        let hex = expected.secret_key().to_secret_hex();
+        let loaded = load_keys_with_env(&key_args(Some(hex), None), None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.public_key(), expected.public_key());
+    }
+
+    #[test]
+    fn no_key_source_preserves_generated_key_behavior() {
+        assert!(load_keys_with_env(&key_args(None, None), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn empty_and_invalid_key_sources_are_rejected() {
+        let empty = load_keys_with_env(&key_args(Some(" \n".to_string()), None), None).unwrap_err();
+        assert!(empty.to_string().contains("--nsec is empty"));
+
+        let invalid =
+            load_keys_with_env(&key_args(None, None), Some("not-a-key".into())).unwrap_err();
+        assert!(invalid
+            .to_string()
+            .contains("Invalid secret key from GRASP_AUDIT_NSEC"));
+    }
+
+    #[test]
+    fn empty_key_file_is_rejected_with_its_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error =
+            load_keys_with_env(&key_args(None, Some(file.path().to_path_buf())), None).unwrap_err();
+
+        assert!(error.to_string().contains("--nsec-file"));
+        assert!(error.to_string().contains("is empty"));
+    }
+
+    #[test]
+    fn both_subcommands_expose_key_options_and_reject_cli_conflicts() {
+        for subcommand in ["probe", "audit"] {
+            let parsed = Cli::try_parse_from([
+                "grasp-audit",
+                subcommand,
+                "--relay",
+                "wss://example.com",
+                "--nsec",
+                "secret",
+                "--nsec-file",
+                "/tmp/secret",
+            ]);
+            assert!(
+                parsed.is_err(),
+                "{subcommand} accepted conflicting key sources"
+            );
+        }
+    }
 }

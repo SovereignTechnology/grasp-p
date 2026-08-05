@@ -63,7 +63,7 @@ pub use fixtures::{
     PR_TEST_COMMIT_HASH,
     RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH,
 };
-pub use git::git_command;
+pub use git::{git_command, GRASP_AUDIT_NSEC_ENV};
 pub use probe::{run_probe, ProbeCheck, ProbeReport};
 pub use result::{AuditResult, TestResult};
 
