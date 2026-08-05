@@ -3299,6 +3299,17 @@ impl SyncManager {
                 return;
             }
         };
+        if self
+            .health_tracker
+            .naughty_list()
+            .is_some_and(|naughty_list| naughty_list.is_naughty(&relay_url))
+        {
+            tracing::debug!(
+                relay = %relay_url,
+                "Suppressing connection attempt for naughty relay"
+            );
+            return;
+        }
         let Some(result_tx) = self.connect_attempt_result_tx.clone() else {
             tracing::error!(relay = %relay_url, "Connection scheduler is not running");
             return;
