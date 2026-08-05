@@ -10,7 +10,7 @@ use std::sync::Arc;
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_sdk::prelude::{
-    Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
+    Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };
 
@@ -145,10 +145,7 @@ impl ReplaceableHistoryStore {
     ) -> Vec<SupersededRecord> {
         let filter = Filter::new()
             .kind(Kind::from(HISTORY_METADATA_KIND))
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::A),
-                coordinate.to_string(),
-            );
+            .custom_tag(SingleLetterTag::LOWERCASE_A, coordinate.to_string());
 
         let events = match self.db.query(filter).await {
             Ok(events) => events,

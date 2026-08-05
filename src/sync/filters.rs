@@ -120,8 +120,7 @@ pub fn state_event_filters_for_our_repos(
 
         // Add #d tags for all identifiers in this chunk
         for identifier in chunk {
-            filter =
-                filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier.as_str());
+            filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, identifier.as_str());
         }
 
         if let Some(ts) = since {
@@ -160,19 +159,19 @@ pub fn tagged_one_of_our_repo_event_filters(
         // Lowercase 'a' tag - standard addressable reference
         let mut f1 = Filter::new();
         for repo in chunk {
-            f1 = f1.custom_tag(SingleLetterTag::lowercase(Alphabet::A), repo.as_str());
+            f1 = f1.custom_tag(SingleLetterTag::LOWERCASE_A, repo.as_str());
         }
 
         // Uppercase 'A' tag - some clients use this
         let mut f2 = Filter::new();
         for repo in chunk {
-            f2 = f2.custom_tag(SingleLetterTag::uppercase(Alphabet::A), repo.as_str());
+            f2 = f2.custom_tag(SingleLetterTag::UPPERCASE_A, repo.as_str());
         }
 
         // Quote 'q' tag - NIP-10 quote references to addressable events
         let mut f3 = Filter::new();
         for repo in chunk {
-            f3 = f3.custom_tag(SingleLetterTag::lowercase(Alphabet::Q), repo.as_str());
+            f3 = f3.custom_tag(SingleLetterTag::LOWERCASE_Q, repo.as_str());
         }
 
         if let Some(ts) = since {
@@ -223,19 +222,19 @@ pub fn tagged_one_of_our_root_event_filters(
         // Lowercase 'e' tag - standard event reference
         let mut f1 = Filter::new();
         for event_id in chunk {
-            f1 = f1.custom_tag(SingleLetterTag::lowercase(Alphabet::E), event_id.as_str());
+            f1 = f1.custom_tag(SingleLetterTag::LOWERCASE_E, event_id.as_str());
         }
 
         // Uppercase 'E' tag - some clients use this
         let mut f2 = Filter::new();
         for event_id in chunk {
-            f2 = f2.custom_tag(SingleLetterTag::uppercase(Alphabet::E), event_id.as_str());
+            f2 = f2.custom_tag(SingleLetterTag::UPPERCASE_E, event_id.as_str());
         }
 
         // Quote 'q' tag - NIP-10 quote references to events
         let mut f3 = Filter::new();
         for event_id in chunk {
-            f3 = f3.custom_tag(SingleLetterTag::lowercase(Alphabet::Q), event_id.as_str());
+            f3 = f3.custom_tag(SingleLetterTag::LOWERCASE_Q, event_id.as_str());
         }
 
         if let Some(ts) = since {
@@ -439,7 +438,7 @@ mod tests {
     fn test_root_event_filters_single_event() {
         let mut root_events = HashSet::new();
         // Create a valid event ID (all zeros for testing)
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         let filters = tagged_one_of_our_root_event_filters(&root_events, None);
 
@@ -450,11 +449,11 @@ mod tests {
     #[test]
     fn test_root_event_filters_batching() {
         let mut root_events = HashSet::new();
-        // EventId::all_zeros() will deduplicate, so we need unique IDs
+        // EventId::from_byte_array([0; 32]) will deduplicate, so we need unique IDs
         // For testing purposes, we'll just verify with one ID since HashSet
         // deduplicates all_zeros(). In real usage these would be unique.
         for _ in 0..250 {
-            root_events.insert(EventId::all_zeros());
+            root_events.insert(EventId::from_byte_array([0; 32]));
         }
 
         let filters = tagged_one_of_our_root_event_filters(&root_events, None);
@@ -467,7 +466,7 @@ mod tests {
     #[test]
     fn test_root_event_filters_with_since() {
         let mut root_events = HashSet::new();
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         let since = Timestamp::from(1700000000);
         let filters = tagged_one_of_our_root_event_filters(&root_events, Some(since));
@@ -491,7 +490,7 @@ mod tests {
         repos.insert("30617:abc123:repo1".to_string());
 
         let mut root_events = HashSet::new();
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         let filters = build_layer2_and_layer3_filters(&repos, &root_events, None);
 
@@ -517,7 +516,7 @@ mod tests {
         let repos: HashSet<String> = HashSet::new();
 
         let mut root_events = HashSet::new();
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         let filters = build_layer2_and_layer3_filters(&repos, &root_events, None);
 
@@ -531,7 +530,7 @@ mod tests {
         repos.insert("30617:abc123:repo1".to_string());
 
         let mut root_events = HashSet::new();
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         let since = Timestamp::from(1700000000);
         let filters = build_layer2_and_layer3_filters(&repos, &root_events, Some(since));

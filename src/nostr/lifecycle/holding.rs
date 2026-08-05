@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, io::ErrorKind};
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_sdk::prelude::{
-    Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
+    Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
     SingleLetterTag, Tag, Timestamp,
 };
 
@@ -220,7 +220,7 @@ impl HoldingStore {
     pub async fn metadata_for_event(&self, id: &EventId) -> Vec<Event> {
         let filter = Filter::new()
             .kind(Kind::from(HOLDING_METADATA_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), id.to_hex());
+            .custom_tag(SingleLetterTag::LOWERCASE_E, id.to_hex());
 
         match self.db.query(filter).await {
             Ok(events) => events.into_iter().collect(),
@@ -922,7 +922,7 @@ mod tests {
         let store = HoldingStore::in_memory();
         let metadata = EventBuilder::new(Kind::from(HOLDING_METADATA_KIND), "")
             .tags(vec![
-                Tag::custom("e", vec![EventId::all_zeros().to_hex()]),
+                Tag::custom("e", vec![EventId::from_byte_array([0; 32]).to_hex()]),
                 Tag::custom("holding-deleted-at", vec!["not-a-number".to_string()]),
             ])
             .finalize(&Keys::generate())

@@ -242,7 +242,7 @@ mod tests {
         relays.insert("wss://relay1.com".to_string());
 
         let mut root_events = HashSet::new();
-        root_events.insert(EventId::all_zeros());
+        root_events.insert(EventId::from_byte_array([0; 32]));
 
         repo_index.insert(
             "repo1".to_string(),
@@ -359,7 +359,7 @@ mod tests {
         let mut relays1 = HashSet::new();
         relays1.insert("wss://relay1.com".to_string());
         let mut root_events1 = HashSet::new();
-        root_events1.insert(EventId::all_zeros());
+        root_events1.insert(EventId::from_byte_array([0; 32]));
 
         repo_index.insert(
             "repo1".to_string(),
@@ -374,7 +374,7 @@ mod tests {
         let mut relays2 = HashSet::new();
         relays2.insert("wss://relay1.com".to_string());
         let mut root_events2 = HashSet::new();
-        root_events2.insert(EventId::all_zeros()); // Same event
+        root_events2.insert(EventId::from_byte_array([0; 32])); // Same event
 
         repo_index.insert(
             "repo2".to_string(),
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_compute_actions_with_root_events() {
-        let event_id = EventId::all_zeros();
+        let event_id = EventId::from_byte_array([0; 32]);
 
         let mut targets = HashMap::new();
         targets.insert(

@@ -261,7 +261,7 @@ impl Nip01SmokeTests {
 
             // Create event JSON with corrupted ID
             let invalid_event_json = serde_json::json!({
-                "id": EventId::all_zeros().to_hex(), // Wrong ID!
+                "id": EventId::from_byte_array([0; 32]).to_hex(), // Wrong ID!
                 "pubkey": event.pubkey.to_hex(),
                 "created_at": event.created_at.as_secs(),
                 "kind": event.kind.as_u16(),

@@ -305,7 +305,7 @@ mod tests {
             Duration::from_secs(60),
         );
         let request = EventBuilder::new(Kind::EventDeletion, "")
-            .tags(vec![Tag::event(EventId::all_zeros())])
+            .tags(vec![Tag::event(EventId::from_byte_array([0; 32]))])
             .finalize(&Keys::generate())
             .expect("deletion request should sign");
 

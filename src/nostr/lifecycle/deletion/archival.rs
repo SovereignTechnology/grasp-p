@@ -4,9 +4,7 @@ use std::path::PathBuf;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use nostr_sdk::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
-};
+use nostr_sdk::prelude::{Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp};
 use tar::Builder as TarBuilder;
 
 use super::{
@@ -278,10 +276,7 @@ impl DeletionPolicy {
         let kind = Kind::from(kind_num);
         let mut filter = Filter::new().kind(kind).author(*author);
         if kind.is_addressable() {
-            filter = filter.custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                identifier.to_string(),
-            );
+            filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
         }
         // Per NIP-09, only versions up to the deletion's created_at are deleted.
         filter = filter.until(deletion_created_at);
@@ -478,10 +473,7 @@ impl DeletionPolicy {
         let remaining_filter = Filter::new()
             .kind(Kind::GitRepoAnnouncement)
             .author(scope.owner)
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                scope.identifier.clone(),
-            );
+            .custom_tag(SingleLetterTag::LOWERCASE_D, scope.identifier.clone());
 
         match self.ctx.database.query(remaining_filter).await {
             Ok(remaining) if !remaining.is_empty() => {

@@ -5488,7 +5488,7 @@ mod tests {
     fn group_filters_for_req_respects_count_and_byte_budgets() {
         // Many small filters group by the count cap.
         let small: Vec<Filter> = (0..25)
-            .map(|i| Filter::new().id(EventId::all_zeros()).limit(i))
+            .map(|i| Filter::new().id(EventId::from_byte_array([0; 32])).limit(i))
             .collect();
         let groups = group_filters_for_req(&small);
         assert_eq!(

@@ -165,7 +165,7 @@ mod tests {
 
     fn deletion() -> Event {
         EventBuilder::new(Kind::EventDeletion, "")
-            .tags(vec![Tag::event(EventId::all_zeros())])
+            .tags(vec![Tag::event(EventId::from_byte_array([0; 32]))])
             .finalize(&Keys::generate())
             .unwrap()
     }
@@ -236,7 +236,7 @@ mod tests {
             service
                 .ctx
                 .tombstones()
-                .event_deletion_candidates(&EventId::all_zeros(), &request.pubkey)
+                .event_deletion_candidates(&EventId::from_byte_array([0; 32]), &request.pubkey)
                 .await
                 .unwrap()
                 .len(),

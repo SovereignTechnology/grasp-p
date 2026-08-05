@@ -1,8 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 
-use nostr_sdk::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
-};
+use nostr_sdk::prelude::{Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp};
 
 use super::policy::{identifier_from_event, DeletionPolicy};
 use crate::git;
@@ -161,10 +159,7 @@ impl DeletionPolicy {
     ) -> Option<Event> {
         let mut filter = Filter::new().kind(kind).author(*author);
         if kind.is_addressable() {
-            filter = filter.custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                identifier.to_string(),
-            );
+            filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
         }
         if let Some(cutoff) = until {
             filter = filter.until(cutoff);

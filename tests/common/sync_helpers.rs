@@ -972,7 +972,7 @@ mod tests {
     #[test]
     fn test_build_layer3_comment_kind_1111() {
         let keys = Keys::generate();
-        let parent_id = EventId::all_zeros();
+        let parent_id = EventId::from_byte_array([0; 32]);
 
         let event = build_layer3_comment_event(&keys, &parent_id, "Test comment", Kind::Comment)
             .expect("Should create event");
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn test_build_layer3_comment_kind_1() {
         let keys = Keys::generate();
-        let parent_id = EventId::all_zeros();
+        let parent_id = EventId::from_byte_array([0; 32]);
 
         let event = build_layer3_comment_event(&keys, &parent_id, "Test reply", Kind::Custom(1))
             .expect("Should create event");
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn test_build_layer3_reply_with_e_tag() {
         let keys = Keys::generate();
-        let parent_id = EventId::all_zeros();
+        let parent_id = EventId::from_byte_array([0; 32]);
 
         let event = build_layer3_reply_with_e_tag(&keys, &parent_id, "Reply content")
             .expect("Should create event");
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn test_build_layer3_comment_with_uppercase_e() {
         let keys = Keys::generate();
-        let parent_id = EventId::all_zeros();
+        let parent_id = EventId::from_byte_array([0; 32]);
 
         let event = build_layer3_comment_with_uppercase_e_tag(&keys, &parent_id, "Comment content")
             .expect("Should create event");
@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn test_build_layer3_quote_with_q() {
         let keys = Keys::generate();
-        let parent_id = EventId::all_zeros();
+        let parent_id = EventId::from_byte_array([0; 32]);
 
         let event = build_layer3_quote_with_q_tag(&keys, &parent_id, "Quote content")
             .expect("Should create event");
@@ -1578,7 +1578,7 @@ mod sync_helper_tests {
         let coord = repo_coord(&keys, "test");
         let historic =
             build_layer2_issue_event(&keys, &coord, "Historic").expect("Should create event");
-        let live = build_layer3_reply_with_e_tag(&keys, &EventId::all_zeros(), "Live")
+        let live = build_layer3_reply_with_e_tag(&keys, &EventId::from_byte_array([0; 32]), "Live")
             .expect("Should create event");
 
         // Should panic - both slices provided

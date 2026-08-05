@@ -691,10 +691,9 @@ impl Nip34WritePolicy {
     /// chain apply its preferred state before considering older candidates,
     /// without requiring an invitee-authored state event or push.
     async fn reconcile_stored_state_events_for_identifier(&self, identifier: &str) {
-        let filter = Filter::new().kind(Kind::RepoState).custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            identifier.to_string(),
-        );
+        let filter = Filter::new()
+            .kind(Kind::RepoState)
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
         let mut states: Vec<Event> = match self.ctx.database.query(filter).await {
             Ok(events) => events.into_iter().collect(),
             Err(error) => {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the rust-nostr crates from `0.45.0-alpha.8` to the stable `0.45.0`
+  release, including the upstream NEG-OPEN handling fix.
+
 ### Security
 
 - Restricted event-directed sync targets to globally reachable endpoints.
@@ -57,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   IDs that fail with `Invalid input length 64` - closed the session, forcing
   clients to reconnect and re-subscribe. Invalid messages are now answered with
   a `NOTICE` and the connection stays open. Fixed upstream in rust-nostr and
-  picked up by upgrading to `0.45.0-alpha.8`.
+  picked up by upgrading to the stable `0.45.0` release.
 - Fixed proactive sync losing repository events when public relays cap active
   subscriptions. Compatible GRASP filters now share bounded NIP-01 REQs while
   retaining per-filter history pagination.

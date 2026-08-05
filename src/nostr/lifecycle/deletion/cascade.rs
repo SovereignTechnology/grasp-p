@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use nostr_sdk::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
-};
+use nostr_sdk::prelude::{Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp};
 
 use super::policy::{
     announcement_address_of, identifier_from_event, owner_directory_component, DeletionPolicy,
@@ -344,10 +342,9 @@ impl DeletionPolicy {
         moved_ids: &mut HashSet<EventId>,
         source: DeletionSource,
     ) -> DeletionOutcome {
-        let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement).custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            identifier.to_string(),
-        );
+        let announcement_filter = Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
 
         let remaining_announcements = match self.ctx.database.query(announcement_filter).await {
             Ok(events) => events,
@@ -368,10 +365,9 @@ impl DeletionPolicy {
             return DeletionOutcome::default();
         }
 
-        let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            identifier.to_string(),
-        );
+        let state_filter = Filter::new()
+            .kind(Kind::RepoState)
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
 
         let metadata = HoldingMetadata {
             deleted_at: deletion_created_at,
@@ -616,7 +612,7 @@ async fn query_address_events_with_until(
 
     let mut filter = Filter::new().kind(parsed.kind).author(parsed.pubkey);
     if let Some(identifier) = parsed.identifier {
-        filter = filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier);
+        filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, identifier);
     }
     if let Some(until) = until {
         filter = filter.until(until);
@@ -666,9 +662,9 @@ async fn query_incoming_event_refs(
     query_tag_variants(
         database,
         &[
-            SingleLetterTag::lowercase(Alphabet::E),
-            SingleLetterTag::uppercase(Alphabet::E),
-            SingleLetterTag::lowercase(Alphabet::Q),
+            SingleLetterTag::LOWERCASE_E,
+            SingleLetterTag::UPPERCASE_E,
+            SingleLetterTag::LOWERCASE_Q,
         ],
         &hex,
     )
@@ -682,9 +678,9 @@ async fn query_incoming_address_refs(
     query_tag_variants(
         database,
         &[
-            SingleLetterTag::lowercase(Alphabet::A),
-            SingleLetterTag::uppercase(Alphabet::A),
-            SingleLetterTag::lowercase(Alphabet::Q),
+            SingleLetterTag::LOWERCASE_A,
+            SingleLetterTag::UPPERCASE_A,
+            SingleLetterTag::LOWERCASE_Q,
         ],
         address,
     )

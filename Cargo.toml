@@ -18,23 +18,18 @@ http-body-util = "0.1"
 
 # Nostr
 #
-# These are prerelease (alpha) requirements and are pinned exactly with `=`.
-# Cargo treats `"0.45.0-alpha.8"` as `^0.45.0-alpha.8`, which accepts *any*
-# later prerelease of 0.45.0 even though alphas carry no compatibility
-# guarantee (alpha.4 deleted the `nostr-relay-builder` crate outright). Exact
-# pins keep lockfile-less builds - `cargo install`, downstream consumers of the
-# `ngit_grasp` library - on the version this tree is tested against.
-# Relax to caret requirements once 0.45.0 is released.
-nostr = "=0.45.0-alpha.8"
+# The stable 0.45 series contains the upstream NEG-OPEN handling fix used by
+# the embedded relay. Caret requirements accept compatible patch releases.
+nostr = "0.45.0"
 # `local-relay` carries the embedded relay implementation, previously the
 # separate `nostr-relay-builder` crate.
-nostr-sdk = { version = "=0.45.0-alpha.8", features = ["local-relay"] }
-nostr-lmdb = "=0.45.0-alpha.8"
-nostr-memory = "=0.45.0-alpha.8"
+nostr-sdk = { version = "0.45.0", features = ["local-relay"] }
+nostr-lmdb = "0.45.0"
+nostr-memory = "0.45.0"
 
 # Utilities
 # SHA-1 for the `Sec-WebSocket-Accept` handshake. `nostr` uses this same crate
-# internally but stopped re-exporting it as `nostr::hashes` in 0.45.0-alpha.8,
+# internally but stopped re-exporting it as `nostr::hashes` in 0.45,
 # so depend on it directly rather than pulling in a second hash implementation.
 bitcoin_hashes = "0.14"
 futures-util = "0.3"

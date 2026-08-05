@@ -3,7 +3,7 @@
 /// Handles validation of events that reference accepted repositories or events
 /// (backward references) and events that are referenced by accepted events
 /// (forward references).
-use nostr_sdk::prelude::{Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag};
+use nostr_sdk::prelude::{Event, EventId, Filter, Kind, PublicKey, SingleLetterTag};
 
 use super::PolicyContext;
 
@@ -230,9 +230,9 @@ impl RelatedEventPolicy {
 
             // Check addressable reference tags: a, A, q (with address format)
             let addressable_tags = [
-                SingleLetterTag::lowercase(Alphabet::A), // 'a' - addressable event reference
-                SingleLetterTag::uppercase(Alphabet::A), // 'A' - uppercase addressable reference
-                SingleLetterTag::lowercase(Alphabet::Q), // 'q' - quote (can be address or ID)
+                SingleLetterTag::LOWERCASE_A, // 'a' - addressable event reference
+                SingleLetterTag::UPPERCASE_A, // 'A' - uppercase addressable reference
+                SingleLetterTag::LOWERCASE_Q, // 'q' - quote (can be address or ID)
             ];
 
             for tag_type in &addressable_tags {
@@ -252,9 +252,9 @@ impl RelatedEventPolicy {
             let event_id_hex = event.id.to_hex();
 
             let event_id_tags = [
-                SingleLetterTag::lowercase(Alphabet::E), // 'e' - standard event reference
-                SingleLetterTag::uppercase(Alphabet::E), // 'E' - NIP-22 root event reference
-                SingleLetterTag::lowercase(Alphabet::Q), // 'q' - quote reference
+                SingleLetterTag::LOWERCASE_E, // 'e' - standard event reference
+                SingleLetterTag::UPPERCASE_E, // 'E' - NIP-22 root event reference
+                SingleLetterTag::LOWERCASE_Q, // 'q' - quote reference
             ];
 
             for tag_type in &event_id_tags {

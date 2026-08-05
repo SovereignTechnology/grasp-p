@@ -2,7 +2,7 @@
 ///
 /// Handles validation of NIP-34 repository announcements (kind 30617)
 /// according to GRASP-01 specification.
-use nostr_sdk::prelude::{Alphabet, Event, Filter, Kind, PublicKey, SingleLetterTag};
+use nostr_sdk::prelude::{Event, Filter, Kind, PublicKey, SingleLetterTag};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -316,10 +316,7 @@ impl AnnouncementPolicy {
         let filter = Filter::new()
             .kind(Kind::GitRepoAnnouncement)
             .author(*pubkey)
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                identifier.to_string(),
-            );
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
 
         let events: Vec<Event> = match self.ctx.database.query(filter).await {
             Ok(events) => events.into_iter().collect(),
@@ -434,10 +431,9 @@ impl AnnouncementPolicy {
         author: &PublicKey,
     ) -> Result<bool, String> {
         // Query all announcements with this identifier that are already in the database
-        let filter = Filter::new().kind(Kind::GitRepoAnnouncement).custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            identifier.to_string(),
-        );
+        let filter = Filter::new()
+            .kind(Kind::GitRepoAnnouncement)
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
 
         let db_announcements: Vec<Event> = match self.ctx.database.query(filter).await {
             Ok(events) => events.into_iter().collect(),

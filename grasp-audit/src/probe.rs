@@ -913,7 +913,7 @@ pub async fn run_probe_with_options(
                 let r2 = if r1.is_ok() {
                     client.send_event(state.clone()).await
                 } else {
-                    r1.map(|_| EventId::all_zeros())
+                    r1.map(|_| EventId::from_byte_array([0; 32]))
                 };
                 r2
             }
@@ -1482,9 +1482,7 @@ pub async fn run_probe_with_options(
                         // The relay only serves authorized state events (owner + full
                         // recursive maintainer chain already resolved by the relay).
                         let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
-                            nostr_sdk::prelude::SingleLetterTag::lowercase(
-                                nostr_sdk::prelude::Alphabet::D,
-                            ),
+                            nostr_sdk::prelude::SingleLetterTag::LOWERCASE_D,
                             ann_id.clone(),
                         );
                         let state_events = client

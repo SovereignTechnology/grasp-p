@@ -34,8 +34,7 @@ use std::collections::HashSet;
 
 use nostr::nips::nip19::ToBech32;
 use nostr_sdk::prelude::{
-    Alphabet, Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp,
-    WritePolicyResult,
+    Event, EventId, Filter, Kind, PublicKey, SingleLetterTag, Timestamp, WritePolicyResult,
 };
 
 use super::service::{request_is_served_with_config, UNSERVED_REPLAY_MESSAGE};
@@ -275,8 +274,7 @@ impl DeletionPolicy {
                 .author(owner)
                 .until(event.created_at);
             if kind.is_addressable() {
-                filter =
-                    filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), identifier.clone());
+                filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, identifier.clone());
             }
             if !self.ctx.database.query(filter).await?.is_empty() {
                 return Ok(true);
@@ -551,7 +549,7 @@ mod tests {
     async fn distinct_overlapping_deletion_requests_are_independently_accepted() {
         let ctx = make_context();
         let keys = Keys::generate();
-        let target = EventId::all_zeros();
+        let target = EventId::from_byte_array([0; 32]);
 
         let first = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![Tag::event(target)])
@@ -622,7 +620,7 @@ mod tests {
         let ctx = make_context();
         let keys = Keys::generate();
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
-            .tags(vec![Tag::event(EventId::all_zeros())])
+            .tags(vec![Tag::event(EventId::from_byte_array([0; 32]))])
             .finalize(&keys)
             .unwrap();
 
@@ -1005,7 +1003,7 @@ mod tests {
     async fn disrespector_records_unused_lifecycle_without_enforcing_a_gate() {
         let ctx = make_disrespector_context();
         let keys = Keys::generate();
-        let target = EventId::all_zeros();
+        let target = EventId::from_byte_array([0; 32]);
 
         let deletion = EventBuilder::new(Kind::EventDeletion, "")
             .tags(vec![Tag::event(target)])

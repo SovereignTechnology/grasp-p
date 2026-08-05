@@ -434,12 +434,12 @@ impl AuditClient {
 
     /// Query events, optionally filtered to this audit run
     pub async fn query(&self, mut filter: Filter) -> Result<Vec<Event>> {
-        use nostr_sdk::prelude::{Alphabet, SingleLetterTag};
+        use nostr_sdk::prelude::SingleLetterTag;
 
         if self.config.mode == AuditMode::Isolated {
             // In Isolated mode, only see our own audit events
             // Filter by "t" tags (hashtags)
-            let t_tag = SingleLetterTag::lowercase(Alphabet::T);
+            let t_tag = SingleLetterTag::LOWERCASE_T;
             filter = filter
                 .custom_tag(t_tag, "grasp-audit-test-event")
                 .custom_tag(t_tag, format!("audit-{}", self.config.run_id));

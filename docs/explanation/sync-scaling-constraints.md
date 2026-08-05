@@ -71,7 +71,7 @@ advertised, and many relays omit `limitation` entirely. Consequence: filter
 sizing cannot be negotiated per relay — it must be statically conservative,
 with reactive fallback as the backstop.
 
-### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0-alpha.8)
+### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0)
 
 - `max_reqs` = 500, enforced for REQ only (`src/nostr/builder.rs`).
 - Negentropy: **no concurrency limit at all** (upstream `TODO`), 60000-byte

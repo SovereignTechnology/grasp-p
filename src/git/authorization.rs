@@ -214,10 +214,7 @@ pub async fn fetch_repository_data_excluding_purgatory(
 ) -> Result<RepositoryData> {
     let filter = Filter::new()
         .kinds([Kind::GitRepoAnnouncement, Kind::RepoState])
-        .custom_tag(
-            SingleLetterTag::lowercase(Alphabet::D),
-            identifier.to_string(),
-        );
+        .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string());
 
     let events: Vec<Event> = database
         .query(filter)
@@ -770,10 +767,7 @@ impl AuthorizationContext {
     pub fn create_filter(identifier: &str) -> Filter {
         Filter::new()
             .kinds([Kind::GitRepoAnnouncement, Kind::RepoState])
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                identifier.to_string(),
-            )
+            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string())
     }
 
     /// Get the latest authorized state for a repository

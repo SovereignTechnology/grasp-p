@@ -51,8 +51,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use nostr_lmdb::NostrLmdb;
 use nostr_memory::MemoryDatabase;
 use nostr_sdk::prelude::{
-    Alphabet, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase,
-    PublicKey, SingleLetterTag, Tag, Timestamp,
+    Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, NostrDatabase, PublicKey,
+    SingleLetterTag, Tag, Timestamp,
 };
 
 /// Directory name (under `relay_data_path`) for the LMDB tombstone database.
@@ -765,7 +765,7 @@ impl Tombstones {
     ) -> anyhow::Result<Vec<Event>> {
         let filter = Filter::new()
             .kind(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), request_id.to_hex());
+            .custom_tag(SingleLetterTag::LOWERCASE_E, request_id.to_hex());
         self.db
             .query(filter)
             .await
@@ -868,7 +868,7 @@ impl Tombstones {
         let filter = Filter::new()
             .kind(Kind::EventDeletion)
             .author(*author)
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::E), id.to_hex());
+            .custom_tag(SingleLetterTag::LOWERCASE_E, id.to_hex());
         self.lifecycle_candidates(filter, |request| {
             request.kind == Kind::EventDeletion
                 && request.pubkey == *author
@@ -892,10 +892,9 @@ impl Tombstones {
         // it. Extract it so we can require the kind-5 author to match.
         let coord_owner_hex = coordinate.split(':').nth(1);
 
-        let filter = Filter::new().kind(Kind::EventDeletion).custom_tag(
-            SingleLetterTag::lowercase(Alphabet::A),
-            coordinate.to_string(),
-        );
+        let filter = Filter::new()
+            .kind(Kind::EventDeletion)
+            .custom_tag(SingleLetterTag::LOWERCASE_A, coordinate.to_string());
         self.lifecycle_candidates(filter, |request| {
             request.kind == Kind::EventDeletion
                 && request.created_at >= event_created_at
@@ -980,7 +979,7 @@ mod tests {
     async fn lifecycle_round_trip_for_kind_five_preserves_relay_first_seen_at() {
         let store = Tombstones::in_memory();
         let keys = Keys::generate();
-        let request = deletion_by_event(&keys, EventId::all_zeros());
+        let request = deletion_by_event(&keys, EventId::from_byte_array([0; 32]));
         let first_seen_at = Timestamp::from_secs(1234);
 
         store
@@ -1036,7 +1035,7 @@ mod tests {
     #[tokio::test]
     async fn exact_replay_does_not_reset_first_seen_at() {
         let store = Tombstones::in_memory();
-        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        let request = deletion_by_event(&Keys::generate(), EventId::from_byte_array([0; 32]));
         store
             .record_request(
                 &request,
@@ -1070,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn marking_request_used_advances_without_resetting_first_seen_at() {
         let store = Tombstones::in_memory();
-        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        let request = deletion_by_event(&Keys::generate(), EventId::from_byte_array([0; 32]));
         store
             .record_request(
                 &request,
@@ -1107,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_metadata_selection_is_deterministic_and_compacted_on_update() {
         let store = Tombstones::in_memory();
-        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        let request = deletion_by_event(&Keys::generate(), EventId::from_byte_array([0; 32]));
         store
             .record_request(
                 &request,
@@ -1154,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_and_orphan_metadata_are_ignored_safely() {
         let store = Tombstones::in_memory();
-        let request = deletion_by_event(&Keys::generate(), EventId::all_zeros());
+        let request = deletion_by_event(&Keys::generate(), EventId::from_byte_array([0; 32]));
         let malformed = EventBuilder::new(Kind::from(TOMBSTONE_REQUEST_METADATA_KIND), "")
             .tags(vec![Tag::event(request.id)])
             .finalize(&store.metadata_signer)
@@ -1166,7 +1165,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let orphan_id = EventId::all_zeros();
+        let orphan_id = EventId::from_byte_array([0; 32]);
         let orphan = store
             .build_metadata(
                 orphan_id,
@@ -1187,7 +1186,7 @@ mod tests {
     async fn metadata_events_do_not_affect_deletion_or_vanish_queries() {
         let store = Tombstones::in_memory();
         let keys = Keys::generate();
-        let target = EventId::all_zeros();
+        let target = EventId::from_byte_array([0; 32]);
         let metadata = store
             .build_metadata(
                 target,
@@ -1215,7 +1214,7 @@ mod tests {
         let store = Tombstones::in_memory();
         let owner = Keys::generate();
         let other = Keys::generate();
-        let target = EventId::all_zeros();
+        let target = EventId::from_byte_array([0; 32]);
         let request = deletion_by_event(&owner, target);
         store
             .record_request(
@@ -1243,7 +1242,7 @@ mod tests {
     async fn event_deletion_candidates_resolve_duplicate_requests_together() {
         let store = Tombstones::in_memory();
         let owner = Keys::generate();
-        let target = EventId::all_zeros();
+        let target = EventId::from_byte_array([0; 32]);
         let mut actionable_ids = Vec::new();
 
         // A single event may have many valid deletion requests. Save their
@@ -1383,7 +1382,7 @@ mod tests {
     async fn lifecycle_metadata_survives_lmdb_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let keys = Keys::generate();
-        let request = deletion_by_event(&keys, EventId::all_zeros());
+        let request = deletion_by_event(&keys, EventId::from_byte_array([0; 32]));
         let store = Tombstones::open_lmdb(directory.path()).await.unwrap();
         store
             .record_request(

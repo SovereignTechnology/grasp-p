@@ -1,7 +1,6 @@
 use anyhow::Result;
 use nostr_sdk::prelude::{
-    nip62, Alphabet, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Timestamp,
-    WritePolicyResult,
+    nip62, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Timestamp, WritePolicyResult,
 };
 
 use crate::nostr::events::RepositoryAnnouncement;
@@ -523,7 +522,7 @@ impl DeletionService {
             .kind(Kind::GitRepoAnnouncement)
             .author(incoming.pubkey)
             .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
+                SingleLetterTag::LOWERCASE_D,
                 incoming_announcement.identifier.clone(),
             );
 
@@ -948,9 +947,9 @@ mod tests {
             deletion_request_retention_used_unserved_gating_additional_secs: 3,
             ..crate::config::Config::for_testing()
         }));
-        let request = deletion(&Keys::generate(), EventId::all_zeros());
+        let request = deletion(&Keys::generate(), EventId::from_byte_array([0; 32]));
         let unused = RequestLifecycleRecord {
-            metadata_event_id: EventId::all_zeros(),
+            metadata_event_id: EventId::from_byte_array([0; 32]),
             request: request.clone(),
             first_seen_at: Timestamp::from_secs(10),
             last_used_at: None,
@@ -978,16 +977,16 @@ mod tests {
     fn winner_order_prefers_used_then_first_seen_then_event_id() {
         let keys = Keys::generate();
         let first_request = EventBuilder::new(Kind::EventDeletion, "first")
-            .tags(vec![Tag::event(EventId::all_zeros())])
+            .tags(vec![Tag::event(EventId::from_byte_array([0; 32]))])
             .finalize(&keys)
             .unwrap();
         let second_request = EventBuilder::new(Kind::EventDeletion, "second")
-            .tags(vec![Tag::event(EventId::all_zeros())])
+            .tags(vec![Tag::event(EventId::from_byte_array([0; 32]))])
             .finalize(&keys)
             .unwrap();
         let record = |request: Event, first_seen_at: u64, last_used_at: Option<u64>| {
             RequestLifecycleRecord {
-                metadata_event_id: EventId::all_zeros(),
+                metadata_event_id: EventId::from_byte_array([0; 32]),
                 request,
                 first_seen_at: Timestamp::from_secs(first_seen_at),
                 last_used_at: last_used_at.map(Timestamp::from_secs),
