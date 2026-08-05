@@ -52,6 +52,27 @@ use crate::{AuditClient, AuditResult, TestContext, TestResult};
 use spec_requirements::{get_sections, GRASP_06_REQUIREMENTS};
 use std::collections::BTreeMap;
 
+/// Stable GRASP-06 test identifiers shared by executable tests and the
+/// placeholders emitted when the capability is not advertised.
+pub(crate) mod test_ids {
+    pub const NAMESPACE_404_WHEN_NOT_ADVERTISED: &str =
+        "prs_namespace_404_when_grasp06_not_advertised";
+    pub const NIP11_ADVERTISED_WHEN_ENABLED: &str = "nip11_advertises_grasp_06_when_enabled";
+    pub const FETCH_UNKNOWN_PATH: &str = "prs_fetch_unknown_path_serves_empty_repo";
+    pub const PUSH_NOSTR_REF: &str = "prs_push_refs_nostr_event_id_accepted";
+    pub const REJECT_OTHER_REFS: &str = "prs_push_other_refs_rejected";
+    pub const ACCEPT_EVENT_FOR_PRS_ENDPOINT: &str =
+        "pr_event_accepted_when_clone_tag_names_prs_endpoint";
+    pub const HOLD_RELAXED_EVENT_IN_PURGATORY: &str =
+        "pr_event_accepted_via_relaxation_is_held_in_purgatory";
+    pub const REJECT_EVENT_FOR_OTHER_ENDPOINT: &str =
+        "pr_event_rejected_when_clone_tag_does_not_name_prs_endpoint";
+    pub const MIRROR_PRS_PUSH: &str = "prs_push_mirrors_to_announced_repo";
+    pub const PROMOTE_AND_MIRROR_GIT_FIRST: &str = "prs_push_then_pr_event_promotes_and_mirrors";
+    pub const NO_REVERSE_MIRROR: &str = "standard_push_does_not_mirror_to_prs";
+    pub const DELETE_COMMIT_MISMATCH: &str = "commit_mismatch_deletes_ref_and_blocks_promotion";
+}
+
 // ANSI colour codes — duplicated locally (same constants as result.rs) rather
 // than re-exported, to keep the renderer self-contained.
 const GREEN: &str = "\x1b[1;92m";
@@ -138,7 +159,7 @@ impl Grasp06Tests {
             let reason = "GRASP-06 not advertised in NIP-11";
             results.add(
                 TestResult::new(
-                    "nip11_advertises_grasp_06_when_enabled",
+                    test_ids::NIP11_ADVERTISED_WHEN_ENABLED,
                     SpecRef::Grasp06AdvertisedWhenEnabled,
                     "NIP-11 supported_grasps MUST include 'GRASP-06' when feature is enabled",
                 )
@@ -146,7 +167,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "prs_fetch_unknown_path_serves_empty_repo",
+                    test_ids::FETCH_UNKNOWN_PATH,
                     SpecRef::Grasp06FetchEmptyRepo,
                     "MUST serve empty bare repo on fetch for any well-formed /prs/ path \
                      until refs/nostr/<event-id> has been accepted",
@@ -155,7 +176,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "prs_push_refs_nostr_event_id_accepted",
+                    test_ids::PUSH_NOSTR_REF,
                     SpecRef::Grasp06AcceptRefsNostrPush,
                     "MUST accept pushes to refs/nostr/<event-id> on /prs/<npub>/<id>.git",
                 )
@@ -163,7 +184,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "prs_push_other_refs_rejected",
+                    test_ids::REJECT_OTHER_REFS,
                     SpecRef::Grasp06RejectNonNostrRefs,
                     "MUST reject pushes to anything other than refs/nostr/<64-hex-event-id> \
                      on /prs/<npub>/<id>.git",
@@ -180,7 +201,7 @@ impl Grasp06Tests {
             // and isn't being verified.
             results.add(
                 TestResult::new(
-                    "pr_event_accepted_when_clone_tag_names_prs_endpoint",
+                    test_ids::ACCEPT_EVENT_FOR_PRS_ENDPOINT,
                     SpecRef::Grasp06RelaxAcceptPrEvent,
                     "MUST accept PR event for un-announced coord when its clone tag names \
                      this relay's /prs/<signer-npub>/<identifier>.git endpoint",
@@ -189,7 +210,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "pr_event_accepted_via_relaxation_is_held_in_purgatory",
+                    test_ids::HOLD_RELAXED_EVENT_IN_PURGATORY,
                     SpecRef::Grasp06RelaxAcceptPrEvent,
                     "PR event accepted under the GRASP-06 relaxation MUST be held in purgatory \
                      until matching git data arrives",
@@ -198,7 +219,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "pr_event_rejected_when_clone_tag_does_not_name_prs_endpoint",
+                    test_ids::REJECT_EVENT_FOR_OTHER_ENDPOINT,
                     SpecRef::Grasp06RelaxRequiresCloneTag,
                     "MUST NOT relax PR acceptance when the event's clone tag does not name \
                      this relay's /prs/<signer-npub>/<identifier>.git endpoint",
@@ -214,7 +235,7 @@ impl Grasp06Tests {
             // /prs/ exists. Skipping keeps the report honest.
             results.add(
                 TestResult::new(
-                    "prs_push_mirrors_to_announced_repo",
+                    test_ids::MIRROR_PRS_PUSH,
                     SpecRef::Grasp06MirrorToAnnouncedRepo,
                     "refs accepted via /prs/ MUST be mirrored into any matching \
                      accepted-announcement repos on this relay",
@@ -223,7 +244,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "prs_push_then_pr_event_promotes_and_mirrors",
+                    test_ids::PROMOTE_AND_MIRROR_GIT_FIRST,
                     SpecRef::Grasp06MirrorToAnnouncedRepo,
                     "git-first ordering: when a /prs/ push arrives before the PR event, the \
                      event MUST still be promoted out of purgatory on arrival and the mirror \
@@ -233,7 +254,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "standard_push_does_not_mirror_to_prs",
+                    test_ids::NO_REVERSE_MIRROR,
                     SpecRef::Grasp06NoReverseMirror,
                     "the reverse direction MUST NOT mirror: a push to /<npub>/<id>.git must \
                      not appear under /prs/",
@@ -242,7 +263,7 @@ impl Grasp06Tests {
             );
             results.add(
                 TestResult::new(
-                    "commit_mismatch_deletes_ref_and_blocks_promotion",
+                    test_ids::DELETE_COMMIT_MISMATCH,
                     SpecRef::Grasp06CommitMismatchDeletesRef,
                     "when the pushed commit does not match the PR event's `c` tag, the ref \
                      MUST be deleted and the event MUST NOT be promoted out of purgatory",
