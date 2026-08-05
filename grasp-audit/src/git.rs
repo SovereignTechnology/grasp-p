@@ -8,10 +8,13 @@
 
 use std::process::Command;
 
+/// Environment variable used to supply an audit signing key.
+pub const GRASP_AUDIT_NSEC_ENV: &str = "GRASP_AUDIT_NSEC";
+
 /// Signing secrets that audit processes may legitimately hold but git never
 /// needs. Removing them here also removes them from hooks, credential helpers,
 /// remote helpers, and any other process git starts.
-const SIGNING_SECRET_ENV_VARS: [&str; 2] = ["GRASP_AUDIT_NSEC", "NGIT_RELAY_OWNER_NSEC"];
+const SIGNING_SECRET_ENV_VARS: [&str; 2] = [GRASP_AUDIT_NSEC_ENV, "NGIT_RELAY_OWNER_NSEC"];
 
 /// Build a `git` [`Command`] that is hermetic with respect to ambient git
 /// configuration.
