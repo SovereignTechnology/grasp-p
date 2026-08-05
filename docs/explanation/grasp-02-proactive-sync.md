@@ -752,14 +752,14 @@ live in
 ### Layer 2: Events Tagging Our Repos
 
 - **Tags**: lowercase `a`, uppercase `A`, and `q` tags for comprehensive coverage
-- **Batching**: Byte-budgeted (16 KB of serialized tag values per filter; see [Sync Scaling Constraints](sync-scaling-constraints.md))
+- **Batching**: Byte-budgeted (32 KB of serialized tag values per filter; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_repo_tag_filters(repos, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 
 ### Layer 3: Events Tagging Our Root Events
 
 - **Tags**: lowercase `e`, uppercase `E`, and `q` tags for comprehensive coverage
-- **Batching**: Byte-budgeted (16 KB of serialized tag values per filter, ~240 hex IDs; see [Sync Scaling Constraints](sync-scaling-constraints.md))
+- **Batching**: Byte-budgeted (32 KB of serialized tag values per filter, ~489 hex IDs; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 

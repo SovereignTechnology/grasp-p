@@ -18,15 +18,17 @@ use nostr_sdk::prelude::*;
 /// Relay filter limits are byte caps, not item counts: strfry bounds the
 /// concatenated tag values of a filter set at 65535 bytes, and the whole
 /// message must fit relay maximum message sizes (128 KB floor observed via
-/// NIP-11, which cannot advertise per-filter limits at all). 16 KB per
-/// filter keeps a healthy margin under both, and three full chunks grouped
-/// into one REQ stay within the 48 KB message budget — which also matches
-/// strfry's optional strict `filterValidation` limit of three filters per
-/// REQ. Fewer, larger chunks would shrink negentropy round counts further
-/// but force one-filter-per-REQ grouping, inflating the persistent
-/// subscription count relays actually ration. See
+/// NIP-11, which cannot advertise per-filter limits at all). 32 KB per
+/// filter is half strfry's per-filter cap, and a full chunk's ~33 KB
+/// NEG-OPEN message keeps ~1.8× margin under the 60 KB negentropy frame
+/// limit our own embedded relay (nostr-sdk local relay) enforces. Three
+/// full chunks grouped into one REQ fit the 96 KB message budget — which
+/// also matches strfry's optional strict `filterValidation` limit of three
+/// filters per REQ. Persistent subscription count scales with how full
+/// each REQ is packed and negentropy round count scales with chunk size,
+/// so maximising both budgets together minimises both costs. See
 /// docs/explanation/sync-scaling-constraints.md.
-pub const FILTER_VALUE_BYTE_BUDGET: usize = 16 * 1024;
+pub const FILTER_VALUE_BYTE_BUDGET: usize = 32 * 1024;
 
 /// Split `values` into contiguous chunks whose serialized tag-value bytes
 /// stay within [`FILTER_VALUE_BYTE_BUDGET`].
@@ -363,9 +365,11 @@ mod tests {
     #[test]
     fn test_repo_filters_batching() {
         // Each ref serializes to exactly 1024 bytes (1021 + quoting overhead),
-        // so a 16 KB chunk holds exactly 16 refs: 40 refs = 16 + 16 + 8.
+        // so a chunk holds exactly FILTER_VALUE_BYTE_BUDGET / 1024 refs;
+        // build two full chunks plus a partial third.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
         let mut repos = HashSet::new();
-        for i in 0..40 {
+        for i in 0..(2 * per_chunk + per_chunk / 2) {
             let identifier = format!("{i:0>4}{}", "x".repeat(1021 - 4 - "30617:pubkey:".len()));
             repos.insert(format!("30617:pubkey:{identifier}"));
         }
@@ -403,11 +407,12 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
 
-        // Exact fit: values costing 1024 bytes each, 16 per 16 KB chunk.
-        let values: Vec<String> = (0..17).map(|i| format!("{i:0>1021}")).collect();
+        // Exact fit: values costing 1024 bytes each fill a chunk exactly.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
+        let values: Vec<String> = (0..per_chunk + 1).map(|i| format!("{i:0>1021}")).collect();
         let chunks = chunk_values_by_bytes(&values);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 16);
+        assert_eq!(chunks[0].len(), per_chunk);
         assert_eq!(chunks[1].len(), 1);
     }
 
@@ -556,10 +561,12 @@ mod tests {
 
     #[test]
     fn test_state_event_filters_batching() {
-        // Each identifier costs exactly 1024 serialized bytes, so a 16 KB
-        // chunk holds exactly 16 identifiers: 40 identifiers = 16 + 16 + 8.
+        // Each identifier costs exactly 1024 serialized bytes, so a chunk
+        // holds exactly FILTER_VALUE_BYTE_BUDGET / 1024 identifiers; build
+        // two full chunks plus a partial third.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
         let mut repos = HashSet::new();
-        for i in 0..40 {
+        for i in 0..(2 * per_chunk + per_chunk / 2) {
             let identifier = format!("{i:0>4}{}", "x".repeat(1021 - 4));
             repos.insert(format!("30617:pubkey{i}:{identifier}"));
         }

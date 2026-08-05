@@ -87,12 +87,14 @@ Derived from the tightest commonly observed values; all sizing below assumes:
 
 - **Subscription budget B = 20** per connection (nos.lol, relay.primal.net),
   shared between live REQs, NEG rounds, and fallback REQs.
-- **Message budget M = 128 KB** (nos.lol); we target ≤ 48 KB of filter payload
-  per message to leave margin for envelope and future growth.
-- **Per-filter value budget 16 KB** (a quarter of strfry's 65535-byte set
-  cap), chosen so three full chunks fit one 48 KB REQ message — see lever 2.
+- **Message budget M = 128 KB** (nos.lol); we target ≤ 96 KB of filter payload
+  per message, a 1.3× margin for the envelope.
+- **Per-filter value budget 32 KB** (half of strfry's 65535-byte set cap;
+  a full-chunk NEG-OPEN is ~33 KB, ~1.8× under the 60 KB negentropy frame
+  limit our own embedded relay enforces), chosen so three full chunks fit one
+  96 KB REQ message — see lever 2.
 - A serialized 64-char hex ID costs ~67 bytes (`"…",`), so:
-  ~240 hex IDs per filter, ~730 hex IDs per message. Variable-length values
+  ~489 hex IDs per filter, ~1460 hex IDs per message. Variable-length values
   (`#d` identifiers, repo references) must be budgeted by bytes, not count.
 
 ---
@@ -118,21 +120,24 @@ The levers, in the order we reach for them:
 ### Lever 1: Maximise items per filter (byte-budgeted chunking)
 
 Replace the fixed 100-items-per-chunk rule with byte budgets: a filter chunk
-is full when it reaches 16 KB of serialized tag values (~240 hex IDs), and a
-message is full at ~48 KB. The 100-item chunk was a guess made when we
+is full when it reaches 32 KB of serialized tag values (~489 hex IDs), and a
+message is full at ~96 KB. The 100-item chunk was a guess made when we
 believed relays capped item counts; the verified constraints are byte caps
 (strfry 65535 per filter set, message size per NIP-11), so counting items
-wastes ~2.4× capacity for hex IDs while being *unsafe* for unbounded-length
+wastes ~4.9× capacity for hex IDs while being *unsafe* for unbounded-length
 `#d` identifiers.
 
-The chunk budget is deliberately *not* maximal: 16 KB rather than the ~32 KB
-a lone filter could safely use. Bigger chunks reduce transient negentropy
-rounds but force one-filter-per-REQ grouping under the message budget,
-inflating the *persistent* subscription count — and subscriptions are the
-scarcer resource (B = 20 floor, shared with negentropy). 16 KB minimises
-subscriptions first and still cuts negentropy rounds ~2.4×; three full
-chunks per 48 KB REQ also matches strfry's strict `filterValidation` limit
-of three filters per REQ.
+Chunk and REQ budgets are maximised *together* because they bound different
+costs: for a total serialized payload T, persistent subscription count
+scales with how full each REQ is packed (T / 96 KB), while negentropy round
+count scales with chunk size (T / 32 KB — one round per filter). Bigger
+chunks do not inflate subscription counts as long as full chunks still pack
+three to a REQ, so 32 KB chunks in 96 KB REQs minimise both at once — and
+three full chunks per REQ matches strfry's strict `filterValidation` limit
+of three filters per REQ. What eventually bounds filter size is none of the
+byte caps but per-query result limits (e.g. damus "blocked: too many query
+results" against filters that match too much at once); accounting for those
+belongs to the budget-ledger work.
 
 Because the limits are not discoverable (NIP-11 gap), the budget is static
 and conservative rather than probed; the existing transient-failure cooldown
@@ -147,14 +152,13 @@ use one tag field each, so this is not a binding constraint.
 ### Lever 2: Pack filters per REQ — coupled to lever 1 by message size
 
 Live subscriptions send all their filters in one REQ message, so the message
-budget M caps **items per subscription** (~730 hex IDs at M = 128 KB) no
-matter how items are split into filters. Bigger chunks (lever 1) therefore
-mean *fewer filters per REQ*, not more items per subscription: 10 × 500-ID
-filters in one REQ would be ~330 KB — over nos.lol's cap. The current
-`MAX_FILTERS_PER_REQ = 10` with 100-item chunks (~67 KB messages) sits near
-the limit already; the correct rule is a byte budget per REQ message, with
-filter count as a secondary bound (strfry accepts 200 filters per REQ, but
-its optional strict `filterValidation` mode accepts only 3).
+budget M caps **items per subscription** (~1460 hex IDs at the 96 KB payload
+budget) no matter how items are split into filters. Packing more filters
+into fewer REQs is what actually shrinks the persistent subscription count,
+so the rule is a byte budget per REQ message, with filter count as a
+secondary bound (strfry accepts 200 filters per REQ, but its optional
+strict `filterValidation` mode accepts only 3 — matched by three full 32 KB
+chunks per 96 KB REQ).
 
 ### Lever 3: Bound and schedule concurrency (coordination with live sync)
 
@@ -197,7 +201,7 @@ Costs and risks, which is why it is last:
 
 Budget pressure is worst where the watched set is largest — today that is our
 own bootstrap relay (869 repos / 3632 roots ≈ 1 MB of serialized tag values,
-i.e. ~21 messages minimum even optimally packed). Public relays typically
+i.e. ~11 messages minimum even optimally packed). Public relays typically
 carry small per-relay target sets but tight budgets (B = 20). Two
 consequences:
 
@@ -205,7 +209,7 @@ consequences:
   server-side limits rather than spending client-side levers.
 - For public relays, levers 1–3 keep us comfortably inside B = 20 at current
   scale; lever 4 exists for the point where a single public relay's target
-  set outgrows ~`(B − margin) × 700` hex-ID-equivalents (~12–13 k items).
+  set outgrows ~`(B − margin) × 1460` hex-ID-equivalents (~26 k items).
 
 ---
 

@@ -14,7 +14,7 @@
 //! source relay (real NIP-77) sits behind a proxy that mimics the strfry
 //! limit, rejecting NEG-OPEN frames beyond 4 concurrent rounds. The watched
 //! set is sized so that one historic batch needs more negentropy rounds than
-//! the limit (260 root events → two byte-budgeted chunks × three tag variants
+//! the limit (520 root events → two byte-budgeted chunks × three tag variants
 //! = six filters). Unbounded concurrency draws rejections; the bounded client must
 //! draw none while still overlapping rounds and completing the sync.
 //!
@@ -40,12 +40,12 @@ use crate::common::{port, TestRelay};
 /// exactly that bound must never reject a round.
 const PROXY_NEG_LIMIT: usize = 4;
 
-/// Root events to seed. Byte-budgeted chunking fits ~244 hex event IDs per
-/// filter (16 KB of serialized tag values), so 260 IDs split into two chunks;
+/// Root events to seed. Byte-budgeted chunking fits ~489 hex event IDs per
+/// filter (32 KB of serialized tag values), so 520 IDs split into two chunks;
 /// two chunks × three tag variants (e/E/q) give six negentropy filters in a
 /// single historic batch — more rounds than the bound, so bounded scheduling
 /// is required to avoid rejections.
-const ISSUE_COUNT: usize = 260;
+const ISSUE_COUNT: usize = 520;
 
 /// Wait until the proxy has seen at least `min_total` NEG rounds
 /// (opened + rejected) and the count has been stable for `stable_for`.

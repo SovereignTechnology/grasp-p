@@ -579,13 +579,13 @@ const MAX_FILTERS_PER_REQ: usize = 10;
 /// Serialized byte budget for the filters carried by one NIP-01 REQ.
 ///
 /// The whole REQ message must fit relay maximum message sizes (128 KB floor
-/// observed via NIP-11). 48 KB of filters leaves margin for the envelope and
-/// holds three full byte-budgeted filter chunks (see
+/// observed via NIP-11). 96 KB of filters leaves 1.3× margin for the
+/// envelope and holds three full byte-budgeted filter chunks (see
 /// [`filters::FILTER_VALUE_BYTE_BUDGET`]), so grouped REQs also stay within
 /// strfry's optional strict `filterValidation` limit of three filters per
 /// REQ when chunks are full. See
 /// docs/explanation/sync-scaling-constraints.md.
-const REQ_MESSAGE_BYTE_BUDGET: usize = 48 * 1024;
+const REQ_MESSAGE_BYTE_BUDGET: usize = 96 * 1024;
 
 /// Pack filters into REQ-sized groups.
 ///
