@@ -12,8 +12,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::git::authorization::RepositoryData;
 use crate::git::sync::PurgatoryPromotionHooks;
@@ -191,7 +193,7 @@ pub trait SyncContext: Send + Sync {
 
 use nostr_sdk::local_relay::LocalRelay;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use crate::nostr::builder::Nip34WritePolicy;
@@ -232,6 +234,10 @@ pub struct RealSyncContext {
     /// Naughty list tracker for git remote domains with persistent errors
     git_naughty_list: Arc<NaughtyListTracker>,
 
+    /// OIDs each URL has already reported missing, scoped to its current
+    /// advertised ref tips.
+    miss_memo: Arc<Mutex<HashMap<String, RemoteMissMemo>>>,
+
     /// Outbound target policy applied before every event-directed git fetch
     outbound_policy: OutboundTargetPolicy,
 }
@@ -267,6 +273,7 @@ impl RealSyncContext {
             local_relay,
             write_policy,
             git_naughty_list,
+            miss_memo: Arc::new(Mutex::new(HashMap::new())),
             outbound_policy,
         }
     }
@@ -275,6 +282,62 @@ impl RealSyncContext {
     pub fn git_naughty_list(&self) -> &Arc<NaughtyListTracker> {
         &self.git_naughty_list
     }
+}
+
+const MISS_MEMO_TTL: Duration = Duration::from_secs(30 * 60);
+const MISS_MEMO_MAX_URLS: usize = 1024;
+
+#[derive(Debug)]
+struct RemoteMissMemo {
+    advert_fingerprint: u64,
+    missing: HashSet<String>,
+    last_touched: Instant,
+}
+
+fn advertised_oids_fingerprint(advertised: &HashSet<String>) -> u64 {
+    let mut sorted: Vec<&str> = advertised.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn memoized_missing_for_url(
+    memo: &mut HashMap<String, RemoteMissMemo>,
+    url: &str,
+    advert_fingerprint: u64,
+    now: Instant,
+) -> HashSet<String> {
+    memo.retain(|_, entry| now.duration_since(entry.last_touched) < MISS_MEMO_TTL);
+
+    if let Some(entry) = memo.get_mut(url) {
+        entry.last_touched = now;
+        if entry.advert_fingerprint == advert_fingerprint {
+            return entry.missing.clone();
+        }
+        entry.advert_fingerprint = advert_fingerprint;
+        entry.missing.clear();
+        return HashSet::new();
+    }
+
+    if memo.len() >= MISS_MEMO_MAX_URLS {
+        if let Some(oldest_url) = memo
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_touched)
+            .map(|(url, _)| url.clone())
+        {
+            memo.remove(&oldest_url);
+        }
+    }
+    memo.insert(
+        url.to_string(),
+        RemoteMissMemo {
+            advert_fingerprint,
+            missing: HashSet::new(),
+            last_touched: now,
+        },
+    );
+    HashSet::new()
 }
 
 /// `http.curloptResolve` entry pinning the vetted DNS answers, when any.
@@ -544,6 +607,7 @@ impl SyncContext for RealSyncContext {
         let url = url.to_string();
         let missing_oids: Vec<String> = missing.into_iter().cloned().collect();
         let naughty_list = self.git_naughty_list.clone();
+        let miss_memo = self.miss_memo.clone();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             // Phase 1: compare the remote's advertised refs against our
@@ -553,32 +617,36 @@ impl SyncContext for RealSyncContext {
             // serve — instead of discovering each missing one through a
             // failed "not our ref" upload-pack round trip.
             let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
-            let advertised = match hardened_git_command(
-                &repo_path,
-                resolve_pin.as_deref(),
-                &ls_remote_args,
-            )
-            .output()
-            {
-                Ok(result) if result.status.success() => {
-                    parse_advertised_oids(&String::from_utf8_lossy(&result.stdout))
-                }
-                Ok(result) => {
-                    let stderr = String::from_utf8_lossy(&result.stderr);
-                    record_remote_failure(&naughty_list, &url, &stderr, "ls-remote");
-                    return Err(anyhow::anyhow!(
-                        "git ls-remote failed for {}: {}",
-                        url,
-                        stderr
-                    ));
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "git ls-remote command error for {}: {}",
-                        url,
-                        e
-                    ))
-                }
+            let advertised =
+                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &ls_remote_args)
+                    .output()
+                {
+                    Ok(result) if result.status.success() => {
+                        parse_advertised_oids(&String::from_utf8_lossy(&result.stdout))
+                    }
+                    Ok(result) => {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        record_remote_failure(&naughty_list, &url, &stderr, "ls-remote");
+                        return Err(anyhow::anyhow!(
+                            "git ls-remote failed for {}: {}",
+                            url,
+                            stderr
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "git ls-remote command error for {}: {}",
+                            url,
+                            e
+                        ))
+                    }
+                };
+            let advert_fingerprint = advertised_oids_fingerprint(&advertised);
+            let memoized_missing = {
+                let mut memo = miss_memo
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                memoized_missing_for_url(&mut memo, &url, advert_fingerprint, Instant::now())
             };
 
             // Phase 2: batch-fetch the needed OIDs the remote actually
@@ -634,8 +702,13 @@ impl SyncContext for RealSyncContext {
             // round trip and must not abort the rest.
             let mut residual_attempted = 0usize;
             let mut residual_missing = 0usize;
+            let mut residual_skipped = 0usize;
             for oid in &missing_oids {
                 if crate::git::oid_exists(&repo_path, oid) {
+                    continue;
+                }
+                if memoized_missing.contains(oid) {
+                    residual_skipped += 1;
                     continue;
                 }
                 residual_attempted += 1;
@@ -647,6 +720,15 @@ impl SyncContext for RealSyncContext {
                         let stderr = String::from_utf8_lossy(&result.stderr);
                         if is_object_missing_error(&stderr) {
                             residual_missing += 1;
+                            let mut memo = miss_memo
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(entry) = memo.get_mut(&url) {
+                                if entry.advert_fingerprint == advert_fingerprint {
+                                    entry.missing.insert(oid.clone());
+                                    entry.last_touched = Instant::now();
+                                }
+                            }
                             debug!(
                                 url = %url,
                                 oid = %oid,
@@ -683,6 +765,7 @@ impl SyncContext for RealSyncContext {
                 advertised_tips = advertised_tips.len(),
                 residual_attempted = residual_attempted,
                 residual_missing = residual_missing,
+                residual_skipped = residual_skipped,
                 fetched = fetched.len(),
                 "Purgatory git fetch pass complete"
             );
@@ -690,6 +773,7 @@ impl SyncContext for RealSyncContext {
                 advertised_tips.len(),
                 residual_attempted,
                 residual_missing,
+                residual_skipped,
                 fetched.len(),
             );
 
@@ -799,6 +883,51 @@ mod fetch_helper_tests {
         assert!(!is_object_missing_error(
             "fatal: unable to access 'https://x/': SSL certificate problem"
         ));
+    }
+
+    #[test]
+    fn miss_memo_is_stable_order_independent_invalidated_and_bounded() {
+        let first = HashSet::from(["b".to_string(), "a".to_string()]);
+        let reordered = HashSet::from(["a".to_string(), "b".to_string()]);
+        let changed = HashSet::from(["a".to_string(), "c".to_string()]);
+        let first_fingerprint = advertised_oids_fingerprint(&first);
+        assert_eq!(first_fingerprint, advertised_oids_fingerprint(&reordered));
+        assert_ne!(first_fingerprint, advertised_oids_fingerprint(&changed));
+
+        let now = Instant::now();
+        let mut memo = HashMap::new();
+        assert!(
+            memoized_missing_for_url(&mut memo, "https://one", first_fingerprint, now).is_empty()
+        );
+        memo.get_mut("https://one")
+            .unwrap()
+            .missing
+            .insert("missing".to_string());
+        assert!(
+            memoized_missing_for_url(&mut memo, "https://one", first_fingerprint, now)
+                .contains("missing")
+        );
+        assert!(memoized_missing_for_url(
+            &mut memo,
+            "https://one",
+            advertised_oids_fingerprint(&changed),
+            now,
+        )
+        .is_empty());
+
+        memo.get_mut("https://one").unwrap().last_touched = now - MISS_MEMO_TTL;
+        memoized_missing_for_url(&mut memo, "https://two", first_fingerprint, now);
+        assert!(!memo.contains_key("https://one"));
+
+        for index in 0..=MISS_MEMO_MAX_URLS {
+            memoized_missing_for_url(
+                &mut memo,
+                &format!("https://remote-{index}"),
+                first_fingerprint,
+                now,
+            );
+        }
+        assert_eq!(memo.len(), MISS_MEMO_MAX_URLS);
     }
 }
 

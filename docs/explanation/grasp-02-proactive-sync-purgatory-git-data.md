@@ -419,18 +419,24 @@ all through the same hardened/pinned git subprocess machinery:
    per-OID failure costs exactly one small round trip and never aborts the
    rest of the pass.
 
+Missing residual OIDs are memoized per clone URL against a fingerprint of
+the sorted advertised OID set. Later passes skip those OIDs while the
+advertisement is unchanged; any ref-tip change clears that URL's memo and
+allows them to be retried. Entries expire lazily after 30 minutes and the
+memo is capped at 1,024 URLs, evicting the oldest entry when full.
+
 **Why not just list every OID as a want?** An earlier implementation did
 exactly that and dropped one OID from the batch on each `not our ref`
 error. Against a state event declaring hundreds of tips that exist on no
 reachable server (observed in production with the `market` repository),
 that degenerated into a sorted oid-by-oid crawl: one failed upload-pack
-round trip per missing tip, O(N²) want retransmission, pack data streamed
-and discarded on every failure, and nothing fetched until the crawl
-finished.
+round trip per missing tip, O(N²) want retransmission, an upload-pack
+subprocess spawned and aborted per attempt, and nothing fetched until the
+crawl finished.
 
 Each pass emits one `Purgatory git fetch pass complete` INFO line
 (needed / advertised tips / residual attempted / residual missing /
-fetched) and increments `ngit_purgatory_git_fetch_passes_total` and
+residual skipped / fetched) and increments `ngit_purgatory_git_fetch_passes_total` and
 `ngit_purgatory_git_fetch_oids_total{kind}`.
 
 ---
@@ -626,7 +632,8 @@ Implemented:
 - `ngit_purgatory_git_fetch_passes_total` - Outbound git fetch passes
   (one ls-remote comparison plus fetches per pass)
 - `ngit_purgatory_git_fetch_oids_total{kind}` - Per-pass OID outcomes
-  (`advertised_tip`, `residual_attempted`, `residual_missing`, `fetched`)
+  (`advertised_tip`, `residual_attempted`, `residual_missing`,
+  `residual_skipped`, `fetched`)
 
 Planned:
 
@@ -712,7 +719,7 @@ End-to-end tests verify sync behavior with real relay instances:
 ### 3. Prometheus Metrics
 
 **Current**: Structured logging plus per-pass fetch metrics
-(`ngit_purgatory_git_fetch_*`, see [Observability](#observability))  
+(`ngit_purgatory_git_fetch_*`, see [Observability](#observability))
 **Future**: Queue-depth and per-domain throttle metrics
 
 **Use case**: Operators want visibility into sync performance, throttle effectiveness, success rates.

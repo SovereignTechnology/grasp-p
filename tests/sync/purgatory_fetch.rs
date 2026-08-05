@@ -275,13 +275,8 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
 
     // 6. Let the sync pass finish so requests aimed at the missing tips
     //    (however the client shapes them) are all recorded.
-    wait_for_upload_pack_quiescence(
-        &proxy,
-        1,
-        Duration::from_secs(3),
-        Duration::from_secs(60),
-    )
-    .await;
+    wait_for_upload_pack_quiescence(&proxy, 1, Duration::from_secs(3), Duration::from_secs(60))
+        .await;
 
     // 7. Regression assertions on the outbound request shape.
     let exchanges = proxy.exchanges();
@@ -329,6 +324,53 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
     verify_event_not_served(syncing.url(), &syncing_state.id, Duration::from_secs(1))
         .await
         .expect("state event with unfetchable tips must stay in purgatory");
+
+    // 9. A fresh replaceable state event resets the queue backoff and
+    //    deterministically triggers another pass. With an unchanged remote
+    //    advertisement, the miss memo must suppress every failed fetch.
+    let failed_after_first_pass = proxy
+        .exchanges()
+        .iter()
+        .filter(|exchange| !exchange.ok)
+        .count();
+    let info_refs_before_second_pass = proxy.info_refs_count();
+    let syncing_state_v2 = EventBuilder::new(Kind::RepoState, "")
+        .tags(syncing_state.tags.clone())
+        .custom_created_at(Timestamp::from_secs(syncing_state.created_at.as_secs() + 1))
+        .finalize(&keys)
+        .expect("create fresh syncing state event");
+    mock_client
+        .send_event(&syncing_state_v2)
+        .await
+        .expect("send fresh state event to mock relay");
+
+    let second_pass_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while proxy.info_refs_count() <= info_refs_before_second_pass {
+        assert!(
+            tokio::time::Instant::now() < second_pass_deadline,
+            "fresh state event should trigger a second ls-remote"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        wait_for_upload_pack_quiescence(
+            &proxy,
+            proxy.exchanges().len(),
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+        )
+        .await,
+        "second fetch pass should become quiescent"
+    );
+    let failed_after_second_pass = proxy
+        .exchanges()
+        .iter()
+        .filter(|exchange| !exchange.ok)
+        .count();
+    assert_eq!(
+        failed_after_second_pass, failed_after_first_pass,
+        "unchanged advertisement must produce no new failed upload-pack exchanges"
+    );
 
     source_client.disconnect().await;
     mock_client.disconnect().await;

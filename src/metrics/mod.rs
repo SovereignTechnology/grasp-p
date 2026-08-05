@@ -192,7 +192,7 @@ lazy_static! {
             Opts::new(
                 "ngit_purgatory_git_fetch_oids_total",
                 "Purgatory git fetch OID outcomes by kind \
-                 (advertised_tip, residual_attempted, residual_missing, fetched)",
+                 (advertised_tip, residual_attempted, residual_missing, residual_skipped, fetched)",
             ),
             &["kind"],
         )
@@ -210,11 +210,12 @@ lazy_static! {
 /// client-side view of purgatory git fetching: how many needed OIDs were
 /// advertised by the remote (batch-fetched), how many residual OIDs were
 /// attempted individually, how many the remote did not have, and how many
-/// OIDs actually arrived.
+/// unchanged-advertisement misses were skipped, and how many OIDs actually arrived.
 pub fn record_purgatory_git_fetch_pass(
     advertised_tips: usize,
     residual_attempted: usize,
     residual_missing: usize,
+    residual_skipped: usize,
     fetched: usize,
 ) {
     PURGATORY_GIT_FETCH_PASSES_TOTAL.inc();
@@ -227,6 +228,9 @@ pub fn record_purgatory_git_fetch_pass(
     PURGATORY_GIT_FETCH_OIDS_TOTAL
         .with_label_values(&["residual_missing"])
         .inc_by(residual_missing as f64);
+    PURGATORY_GIT_FETCH_OIDS_TOTAL
+        .with_label_values(&["residual_skipped"])
+        .inc_by(residual_skipped as f64);
     PURGATORY_GIT_FETCH_OIDS_TOTAL
         .with_label_values(&["fetched"])
         .inc_by(fetched as f64);
