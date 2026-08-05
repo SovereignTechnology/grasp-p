@@ -70,7 +70,8 @@ pub use probe::{
     run_probe, run_probe_with_options, ProbeCheck, ProbeCheckName, ProbeOptions, ProbeReport,
 };
 pub use report::{
-    AuditOutcome, AuditSpec, AuditSuite, ResultCounts, SpecReport, TestOutcome, TestReport,
+    unix_timestamp, AuditOutcome, AuditReport, AuditRunOutcome, AuditSpec, AuditSuite,
+    ResultCounts, SpecReport, TestOutcome, TestReport, ToolInfo, AUDIT_REPORT_SCHEMA_VERSION,
 };
 pub use result::{AuditResult, TestResult};
 

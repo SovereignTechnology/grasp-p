@@ -90,7 +90,17 @@ grasp-audit audit --relay ws://localhost:7334 --spec nip01-smoke
 
 # Run with isolated fixtures (for testing/debugging)
 grasp-audit audit --relay ws://localhost:7334 --mode isolated --spec push-auth
+
+# Emit one stable JSON document for a scheduled full audit
+grasp-audit audit --relay wss://relay.ngit.dev --spec all --json
 ```
+
+`audit --json` writes one schema-versioned document to stdout and suppresses
+the human progress/report output. Completed runs include tool and run metadata,
+pinned GRASP revisions, aggregate counts, and per-test outcomes. Invalid
+arguments and setup/runtime errors use the same envelope with an `error`
+outcome. Exit status is `0` for a passing audit, `1` for completed test
+failures, and `2` for invocation or runtime errors.
 
 ### Audit identity
 

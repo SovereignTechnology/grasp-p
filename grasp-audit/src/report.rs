@@ -1,15 +1,17 @@
 //! Stable, serializable results for compliance audit consumers.
 //!
-//! These types describe completed spec and test results. They deliberately do
-//! not include invocation details such as the relay URL, run timestamps, or a
-//! top-level schema version; a CLI machine-output contract can wrap them later
-//! without changing the audit domain model.
+//! [`SpecReport`] and [`TestReport`] describe completed audit results, while
+//! [`AuditReport`] adds the versioned run metadata used by the CLI's machine
+//! output contract.
 
 use crate::result::{AuditResult, TestResult};
 use crate::specs::grasp01::GRASP_COMMIT_ID;
 use crate::specs::grasp06::GRASP_06_COMMIT_ID;
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Version of the full-audit JSON document emitted by the CLI.
+pub const AUDIT_REPORT_SCHEMA_VERSION: u16 = 1;
 
 /// Maximum UTF-8 byte length retained for failures and skip reasons.
 pub const MAX_RESULT_MESSAGE_BYTES: usize = 4096;
@@ -91,6 +93,22 @@ pub enum AuditOutcome {
     Fail,
 }
 
+/// Outcome of a full audit invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRunOutcome {
+    Pass,
+    Fail,
+    Error,
+}
+
+/// Identity of the tool that produced a full audit report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+}
+
 /// Outcome of a single audit test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +151,74 @@ pub struct SpecReport {
     pub outcome: AuditOutcome,
     pub counts: ResultCounts,
     pub tests: Vec<TestReport>,
+}
+
+/// Stable machine-readable envelope for one full audit CLI invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditReport {
+    pub schema_version: u16,
+    pub tool: ToolInfo,
+    pub relay_url: String,
+    pub run_id: String,
+    pub started_at: u64,
+    pub finished_at: u64,
+    pub duration_ms: u64,
+    pub outcome: AuditRunOutcome,
+    pub specs: Vec<SpecReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl AuditReport {
+    /// Build a report for an audit that reached test execution.
+    pub fn completed(
+        relay_url: impl Into<String>,
+        run_id: impl Into<String>,
+        started_at: u64,
+        duration: Duration,
+        specs: Vec<SpecReport>,
+    ) -> Self {
+        let outcome = if specs.iter().all(|spec| spec.outcome == AuditOutcome::Pass) {
+            AuditRunOutcome::Pass
+        } else {
+            AuditRunOutcome::Fail
+        };
+
+        Self {
+            schema_version: AUDIT_REPORT_SCHEMA_VERSION,
+            tool: tool_info(),
+            relay_url: relay_url.into(),
+            run_id: run_id.into(),
+            started_at,
+            finished_at: unix_timestamp(),
+            duration_ms: duration_ms(duration),
+            outcome,
+            specs,
+            error: None,
+        }
+    }
+
+    /// Build a report for a parse, setup, or runtime error.
+    pub fn error(
+        relay_url: impl Into<String>,
+        run_id: impl Into<String>,
+        started_at: u64,
+        duration: Duration,
+        error: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            schema_version: AUDIT_REPORT_SCHEMA_VERSION,
+            tool: tool_info(),
+            relay_url: relay_url.into(),
+            run_id: run_id.into(),
+            started_at,
+            finished_at: unix_timestamp(),
+            duration_ms: duration_ms(duration),
+            outcome: AuditRunOutcome::Error,
+            specs: Vec::new(),
+            error: Some(bounded_message(error.as_ref())),
+        }
+    }
 }
 
 impl SpecReport {
@@ -184,6 +270,21 @@ impl From<&TestResult> for TestReport {
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+/// Current Unix timestamp in seconds.
+pub fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn tool_info() -> ToolInfo {
+    ToolInfo {
+        name: "grasp-audit",
+        version: env!("CARGO_PKG_VERSION"),
+    }
 }
 
 fn bounded_message(value: &str) -> String {
@@ -257,5 +358,52 @@ mod tests {
         result.duration = Duration::from_micros(42_900);
 
         assert_eq!(TestReport::from(&result).duration_ms, 42);
+    }
+
+    #[test]
+    fn audit_report_wraps_stable_spec_reports() {
+        let mut passing = AuditResult::new("passing");
+        passing.add(TestResult::new("passes", SpecRef::NostrRelayNip01Compliant, "passes").pass());
+        let mut failing = AuditResult::new("failing");
+        failing.add(
+            TestResult::new("fails", SpecRef::NostrRelayNip01Compliant, "fails").fail("broken"),
+        );
+
+        let report = AuditReport::completed(
+            "wss://relay.example",
+            "audit-1",
+            1,
+            Duration::from_millis(42),
+            vec![
+                SpecReport::from_result(AuditSuite::Grasp01All, &passing),
+                SpecReport::from_result(AuditSuite::Grasp06All, &failing),
+            ],
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["schema_version"], AUDIT_REPORT_SCHEMA_VERSION);
+        assert_eq!(json["tool"]["name"], "grasp-audit");
+        assert_eq!(json["relay_url"], "wss://relay.example");
+        assert_eq!(json["run_id"], "audit-1");
+        assert_eq!(json["duration_ms"], 42);
+        assert_eq!(json["outcome"], "fail");
+        assert_eq!(json["specs"][0]["suite"], "grasp01-all");
+        assert_eq!(json["specs"][1]["suite"], "grasp06-all");
+        assert!(json.get("error").is_none());
+    }
+
+    #[test]
+    fn audit_error_reports_are_bounded_and_have_no_specs() {
+        let report = AuditReport::error(
+            "wss://relay.example",
+            "audit-1",
+            1,
+            Duration::ZERO,
+            "é".repeat(MAX_RESULT_MESSAGE_BYTES),
+        );
+
+        assert_eq!(report.outcome, AuditRunOutcome::Error);
+        assert!(report.specs.is_empty());
+        assert!(report.error.unwrap().len() <= MAX_RESULT_MESSAGE_BYTES);
     }
 }
