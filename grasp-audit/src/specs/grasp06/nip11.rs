@@ -34,7 +34,7 @@ impl Nip11Tests {
     /// fail (TDD red); once Phase 9 lands it becomes the regression guard.
     pub async fn test_nip11_advertises_grasp_06_when_enabled(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "nip11_advertises_grasp_06_when_enabled",
+            super::test_ids::NIP11_ADVERTISED_WHEN_ENABLED,
             SpecRef::Grasp06AdvertisedWhenEnabled,
             "NIP-11 supported_grasps MUST include 'GRASP-06' when feature is enabled",
         )

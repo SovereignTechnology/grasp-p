@@ -10,6 +10,70 @@ use crate::fixtures::{create_commit, init_local_repo, try_push};
 use nostr_sdk::prelude::*;
 use std::time::{Duration, Instant};
 
+/// Stable identifiers for probe checks, in execution order.
+///
+/// The enum is the only catalog of check names. Probe JSON retains its
+/// existing string-valued `name` field for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeCheckName {
+    Prepare,
+    ConnectWebsocket,
+    Nip11Fetch,
+    PublishEvents,
+    GitRepoInitialised,
+    GitPush,
+    ServesLatestAnnouncement,
+    GitFetchRefs,
+    GitRefsMatchState,
+}
+
+impl ProbeCheckName {
+    /// Checks that make up an operational probe, excluding offline setup.
+    pub fn operational() -> impl Iterator<Item = Self> {
+        std::iter::successors(Some(Self::ConnectWebsocket), |name| name.next())
+    }
+
+    fn after_connection_failure() -> impl Iterator<Item = Self> {
+        [
+            Self::Nip11Fetch,
+            Self::PublishEvents,
+            Self::GitRepoInitialised,
+            Self::GitPush,
+            Self::GitFetchRefs,
+        ]
+        .into_iter()
+    }
+
+    const fn next(self) -> Option<Self> {
+        match self {
+            Self::Prepare => Some(Self::ConnectWebsocket),
+            Self::ConnectWebsocket => Some(Self::Nip11Fetch),
+            Self::Nip11Fetch => Some(Self::PublishEvents),
+            Self::PublishEvents => Some(Self::GitRepoInitialised),
+            Self::GitRepoInitialised => Some(Self::GitPush),
+            Self::GitPush => Some(Self::ServesLatestAnnouncement),
+            Self::ServesLatestAnnouncement => Some(Self::GitFetchRefs),
+            Self::GitFetchRefs => Some(Self::GitRefsMatchState),
+            Self::GitRefsMatchState => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::ConnectWebsocket => "connect_websocket",
+            Self::Nip11Fetch => "nip11_fetch",
+            Self::PublishEvents => "publish_events",
+            Self::GitRepoInitialised => "git_repo_initialised",
+            Self::GitPush => "git_push",
+            Self::ServesLatestAnnouncement => "serves_latest_announcement",
+            Self::GitFetchRefs => "git_fetch_refs",
+            Self::GitRefsMatchState => "git_refs_match_state",
+        }
+    }
+}
+
 // ============================================================
 // Result types
 // ============================================================
@@ -129,9 +193,9 @@ impl ProbeReport {
 // ============================================================
 
 /// Build a skipped ProbeCheck
-fn skipped(name: &'static str, reason: &str) -> ProbeCheck {
+fn skipped(name: ProbeCheckName, reason: &str) -> ProbeCheck {
     ProbeCheck {
-        name,
+        name: name.as_str(),
         passed: false,
         skipped: true,
         duration_ms: 0,
@@ -174,19 +238,6 @@ fn now_iso8601() -> String {
 // Main probe function
 // ============================================================
 
-/// All check names in the order they may appear, used to fill skipped entries
-/// when the overall deadline fires.
-const ALL_CHECK_NAMES: &[&str] = &[
-    "connect_websocket",
-    "nip11_fetch",
-    "publish_events",
-    "git_repo_initialised",
-    "git_push",
-    "serves_latest_announcement",
-    "git_fetch_refs",
-    "git_refs_match_state",
-];
-
 /// Run a probe against a GRASP relay and return a full report.
 ///
 /// # Arguments
@@ -216,6 +267,7 @@ pub async fn run_probe(
     /// the relay was generally slow across multiple steps.
     macro_rules! deadline_return {
         ($relay_url:expr, $timestamp:expr, $total_start:expr, $overall_secs:expr, $checks:expr, $timed_out_name:expr) => {{
+            let timed_out_name = $timed_out_name;
             let total_ms = $total_start.elapsed().as_millis() as u64;
             let budget_ms = ($overall_secs as u64) * 1000;
 
@@ -235,7 +287,7 @@ pub async fn run_probe(
 
             // The step that couldn't start due to the deadline
             $checks.push(ProbeCheck {
-                name: $timed_out_name,
+                name: timed_out_name.as_str(),
                 passed: false,
                 skipped: false,
                 duration_ms: 0,
@@ -244,8 +296,8 @@ pub async fn run_probe(
             });
             // Skip all subsequent checks
             let already: std::collections::HashSet<&str> = $checks.iter().map(|c| c.name).collect();
-            for name in ALL_CHECK_NAMES {
-                if !already.contains(name) {
+            for name in ProbeCheckName::operational() {
+                if !already.contains(name.as_str()) {
                     $checks.push(skipped(name, "overall timeout"));
                 }
             }
@@ -274,7 +326,7 @@ pub async fn run_probe(
                 all_passed: false,
                 total_duration_ms: total_start.elapsed().as_millis() as u64,
                 checks: vec![ProbeCheck {
-                    name: "prepare",
+                    name: ProbeCheckName::Prepare.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: 0,
@@ -358,7 +410,7 @@ pub async fn run_probe(
             total_start,
             overall_secs,
             checks,
-            "connect_websocket"
+            ProbeCheckName::ConnectWebsocket
         );
     }
     let step1_start = Instant::now();
@@ -373,7 +425,7 @@ pub async fn run_probe(
     let client = match client_result {
         Ok(c) => {
             checks.push(ProbeCheck {
-                name: "connect_websocket",
+                name: ProbeCheckName::ConnectWebsocket.as_str(),
                 passed: true,
                 skipped: false,
                 duration_ms: step1_ms,
@@ -384,7 +436,7 @@ pub async fn run_probe(
         }
         Err(e) => {
             checks.push(ProbeCheck {
-                name: "connect_websocket",
+                name: ProbeCheckName::ConnectWebsocket.as_str(),
                 passed: false,
                 skipped: false,
                 duration_ms: step1_ms,
@@ -392,13 +444,7 @@ pub async fn run_probe(
                 error: Some(e.to_string()),
             });
             // Skip all remaining steps
-            for name in &[
-                "nip11_fetch",
-                "publish_events",
-                "git_repo_initialised",
-                "git_push",
-                "git_fetch_refs",
-            ] {
+            for name in ProbeCheckName::after_connection_failure() {
                 checks.push(skipped(name, "connect_websocket failed"));
             }
             let _ = std::fs::remove_dir_all(&local_repo_path);
@@ -423,7 +469,7 @@ pub async fn run_probe(
                 total_start,
                 overall_secs,
                 checks,
-                "nip11_fetch"
+                ProbeCheckName::Nip11Fetch
             );
         }
         let step2_start = Instant::now();
@@ -458,7 +504,7 @@ pub async fn run_probe(
                     format!("{} ({} v{})", name, software, version)
                 });
                 checks.push(ProbeCheck {
-                    name: "nip11_fetch",
+                    name: ProbeCheckName::Nip11Fetch.as_str(),
                     passed: true,
                     skipped: false,
                     duration_ms: step2_ms,
@@ -468,7 +514,7 @@ pub async fn run_probe(
             }
             Ok(Ok(resp)) => {
                 checks.push(ProbeCheck {
-                    name: "nip11_fetch",
+                    name: ProbeCheckName::Nip11Fetch.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step2_ms,
@@ -478,7 +524,7 @@ pub async fn run_probe(
             }
             Ok(Err(e)) => {
                 checks.push(ProbeCheck {
-                    name: "nip11_fetch",
+                    name: ProbeCheckName::Nip11Fetch.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step2_ms,
@@ -488,7 +534,7 @@ pub async fn run_probe(
             }
             Err(_) => {
                 checks.push(ProbeCheck {
-                    name: "nip11_fetch",
+                    name: ProbeCheckName::Nip11Fetch.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step2_ms,
@@ -511,14 +557,17 @@ pub async fn run_probe(
             total_start,
             overall_secs,
             checks,
-            "publish_events"
+            ProbeCheckName::PublishEvents
         );
     }
 
     if read_only {
-        checks.push(skipped("publish_events", "read-only mode"));
-        checks.push(skipped("git_repo_initialised", "read-only mode"));
-        checks.push(skipped("git_push", "read-only mode"));
+        checks.push(skipped(ProbeCheckName::PublishEvents, "read-only mode"));
+        checks.push(skipped(
+            ProbeCheckName::GitRepoInitialised,
+            "read-only mode",
+        ));
+        checks.push(skipped(ProbeCheckName::GitPush, "read-only mode"));
     } else {
         let step3_start = Instant::now();
 
@@ -542,7 +591,7 @@ pub async fn run_probe(
         match send_result {
             Ok(_) => {
                 checks.push(ProbeCheck {
-                    name: "publish_events",
+                    name: ProbeCheckName::PublishEvents.as_str(),
                     passed: true,
                     skipped: false,
                     duration_ms: step3_ms,
@@ -553,7 +602,7 @@ pub async fn run_probe(
             }
             Err(e) => {
                 checks.push(ProbeCheck {
-                    name: "publish_events",
+                    name: ProbeCheckName::PublishEvents.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step3_ms,
@@ -561,8 +610,11 @@ pub async fn run_probe(
                     error: Some(e.to_string()),
                 });
                 // Skip steps 4 and 5; step 6 will use fallback
-                checks.push(skipped("git_repo_initialised", "publish_events failed"));
-                checks.push(skipped("git_push", "publish_events failed"));
+                checks.push(skipped(
+                    ProbeCheckName::GitRepoInitialised,
+                    "publish_events failed",
+                ));
+                checks.push(skipped(ProbeCheckName::GitPush, "publish_events failed"));
             }
         }
 
@@ -577,7 +629,7 @@ pub async fn run_probe(
                     total_start,
                     overall_secs,
                     checks,
-                    "git_repo_initialised"
+                    ProbeCheckName::GitRepoInitialised
                 );
             }
             let step4_start = Instant::now();
@@ -605,7 +657,7 @@ pub async fn run_probe(
 
             if repo_ready {
                 checks.push(ProbeCheck {
-                    name: "git_repo_initialised",
+                    name: ProbeCheckName::GitRepoInitialised.as_str(),
                     passed: true,
                     skipped: false,
                     duration_ms: step4_ms,
@@ -614,7 +666,7 @@ pub async fn run_probe(
                 });
             } else {
                 checks.push(ProbeCheck {
-                    name: "git_repo_initialised",
+                    name: ProbeCheckName::GitRepoInitialised.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step4_ms,
@@ -622,7 +674,10 @@ pub async fn run_probe(
                     error: Some("timeout waiting for repo to be initialised (15s)".to_string()),
                 });
                 write_succeeded = false;
-                checks.push(skipped("git_push", "git_repo_initialised timed out"));
+                checks.push(skipped(
+                    ProbeCheckName::GitPush,
+                    "git_repo_initialised timed out",
+                ));
             }
         }
 
@@ -637,7 +692,7 @@ pub async fn run_probe(
                     total_start,
                     overall_secs,
                     checks,
-                    "git_push"
+                    ProbeCheckName::GitPush
                 );
             }
             let step5_start = Instant::now();
@@ -647,7 +702,7 @@ pub async fn run_probe(
             match push_result {
                 Ok(true) => {
                     checks.push(ProbeCheck {
-                        name: "git_push",
+                        name: ProbeCheckName::GitPush.as_str(),
                         passed: true,
                         skipped: false,
                         duration_ms: step5_ms,
@@ -657,7 +712,7 @@ pub async fn run_probe(
                 }
                 Ok(false) => {
                     checks.push(ProbeCheck {
-                        name: "git_push",
+                        name: ProbeCheckName::GitPush.as_str(),
                         passed: false,
                         skipped: false,
                         duration_ms: step5_ms,
@@ -668,7 +723,7 @@ pub async fn run_probe(
                 }
                 Err(e) => {
                     checks.push(ProbeCheck {
-                        name: "git_push",
+                        name: ProbeCheckName::GitPush.as_str(),
                         passed: false,
                         skipped: false,
                         duration_ms: step5_ms,
@@ -731,7 +786,7 @@ pub async fn run_probe(
                 total_start,
                 overall_secs,
                 checks,
-                "git_fetch_refs"
+                ProbeCheckName::GitFetchRefs
             );
         }
         let refs_url = format!("{}/info/refs?service=git-upload-pack", clone_url);
@@ -752,7 +807,7 @@ pub async fn run_probe(
             Ok(Ok(resp)) if resp.status().is_success() => {
                 let body = resp.text().await.unwrap_or_default();
                 checks.push(ProbeCheck {
-                    name: "git_fetch_refs",
+                    name: ProbeCheckName::GitFetchRefs.as_str(),
                     passed: true,
                     skipped: false,
                     duration_ms: step6_ms,
@@ -763,7 +818,7 @@ pub async fn run_probe(
             }
             Ok(Ok(resp)) => {
                 checks.push(ProbeCheck {
-                    name: "git_fetch_refs",
+                    name: ProbeCheckName::GitFetchRefs.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step6_ms,
@@ -774,7 +829,7 @@ pub async fn run_probe(
             }
             Ok(Err(e)) => {
                 checks.push(ProbeCheck {
-                    name: "git_fetch_refs",
+                    name: ProbeCheckName::GitFetchRefs.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step6_ms,
@@ -785,7 +840,7 @@ pub async fn run_probe(
             }
             Err(_) => {
                 checks.push(ProbeCheck {
-                    name: "git_fetch_refs",
+                    name: ProbeCheckName::GitFetchRefs.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: step6_ms,
@@ -799,7 +854,10 @@ pub async fn run_probe(
         // Step 6b: git_refs_match_state — compare fetched refs against our state event
         match refs_body {
             None => {
-                checks.push(skipped("git_refs_match_state", "git_fetch_refs failed"));
+                checks.push(skipped(
+                    ProbeCheckName::GitRefsMatchState,
+                    "git_fetch_refs failed",
+                ));
             }
             Some(body) => {
                 let fetched_refs = parse_refs(&body);
@@ -841,7 +899,7 @@ pub async fn run_probe(
                 }
 
                 checks.push(ProbeCheck {
-                    name: "git_refs_match_state",
+                    name: ProbeCheckName::GitRefsMatchState.as_str(),
                     passed: mismatches.is_empty(),
                     skipped: false,
                     duration_ms: 0, // no extra network call; cost already in git_fetch_refs
@@ -865,7 +923,7 @@ pub async fn run_probe(
                 total_start,
                 overall_secs,
                 checks,
-                "serves_latest_announcement"
+                ProbeCheckName::ServesLatestAnnouncement
             );
         }
         let filter = Filter::new().kind(Kind::GitRepoAnnouncement).limit(1);
@@ -895,7 +953,7 @@ pub async fn run_probe(
                         .unwrap_or("unknown")
                         .to_string();
                     checks.push(ProbeCheck {
-                        name: "serves_latest_announcement",
+                        name: ProbeCheckName::ServesLatestAnnouncement.as_str(),
                         passed: true,
                         skipped: false,
                         duration_ms: 0,
@@ -905,7 +963,7 @@ pub async fn run_probe(
                 }
                 None => {
                     checks.push(ProbeCheck {
-                        name: "serves_latest_announcement",
+                        name: ProbeCheckName::ServesLatestAnnouncement.as_str(),
                         passed: false,
                         skipped: false,
                         duration_ms: 0,
@@ -953,7 +1011,7 @@ pub async fn run_probe(
                         total_start,
                         overall_secs,
                         checks,
-                        "git_fetch_refs"
+                        ProbeCheckName::GitFetchRefs
                     );
                 }
                 let step6_start = Instant::now();
@@ -973,7 +1031,7 @@ pub async fn run_probe(
                     Ok(Ok(resp)) if resp.status().is_success() => {
                         let body = resp.text().await.unwrap_or_default();
                         checks.push(ProbeCheck {
-                            name: "git_fetch_refs",
+                            name: ProbeCheckName::GitFetchRefs.as_str(),
                             passed: true,
                             skipped: false,
                             duration_ms: step6_ms,
@@ -984,7 +1042,7 @@ pub async fn run_probe(
                     }
                     Ok(Ok(resp)) => {
                         checks.push(ProbeCheck {
-                            name: "git_fetch_refs",
+                            name: ProbeCheckName::GitFetchRefs.as_str(),
                             passed: false,
                             skipped: false,
                             duration_ms: step6_ms,
@@ -995,7 +1053,7 @@ pub async fn run_probe(
                     }
                     Ok(Err(e)) => {
                         checks.push(ProbeCheck {
-                            name: "git_fetch_refs",
+                            name: ProbeCheckName::GitFetchRefs.as_str(),
                             passed: false,
                             skipped: false,
                             duration_ms: step6_ms,
@@ -1006,7 +1064,7 @@ pub async fn run_probe(
                     }
                     Err(_) => {
                         checks.push(ProbeCheck {
-                            name: "git_fetch_refs",
+                            name: ProbeCheckName::GitFetchRefs.as_str(),
                             passed: false,
                             skipped: false,
                             duration_ms: step6_ms,
@@ -1023,7 +1081,10 @@ pub async fn run_probe(
                 // including recursive maintainer chains), then compare against git refs.
                 match refs_body_fallback {
                     None => {
-                        checks.push(skipped("git_refs_match_state", "git_fetch_refs failed"));
+                        checks.push(skipped(
+                            ProbeCheckName::GitRefsMatchState,
+                            "git_fetch_refs failed",
+                        ));
                     }
                     Some(body) => {
                         let fetched_refs = parse_refs(&body);
@@ -1050,7 +1111,7 @@ pub async fn run_probe(
 
                         if state_events.is_empty() {
                             checks.push(ProbeCheck {
-                                name: "git_refs_match_state",
+                                name: ProbeCheckName::GitRefsMatchState.as_str(),
                                 passed: false,
                                 skipped: false,
                                 duration_ms: 0,
@@ -1115,7 +1176,7 @@ pub async fn run_probe(
                             }
 
                             checks.push(ProbeCheck {
-                                name: "git_refs_match_state",
+                                name: ProbeCheckName::GitRefsMatchState.as_str(),
                                 passed: mismatches.is_empty(),
                                 skipped: false,
                                 duration_ms: 0,
@@ -1133,14 +1194,17 @@ pub async fn run_probe(
             None => {
                 // Not read-only (already handled above) but no repo found
                 checks.push(ProbeCheck {
-                    name: "git_fetch_refs",
+                    name: ProbeCheckName::GitFetchRefs.as_str(),
                     passed: false,
                     skipped: false,
                     duration_ms: 0,
                     detail: None,
                     error: Some("no repositories found on relay".to_string()),
                 });
-                checks.push(skipped("git_refs_match_state", "no announcement found"));
+                checks.push(skipped(
+                    ProbeCheckName::GitRefsMatchState,
+                    "no announcement found",
+                ));
             }
         }
     }
@@ -1157,5 +1221,35 @@ pub async fn run_probe(
         all_passed,
         total_duration_ms: total_start.elapsed().as_millis() as u64,
         checks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProbeCheckName;
+
+    #[test]
+    fn probe_check_catalog_preserves_public_names_and_order() {
+        let names: Vec<_> = ProbeCheckName::operational()
+            .map(ProbeCheckName::as_str)
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "connect_websocket",
+                "nip11_fetch",
+                "publish_events",
+                "git_repo_initialised",
+                "git_push",
+                "serves_latest_announcement",
+                "git_fetch_refs",
+                "git_refs_match_state",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&ProbeCheckName::GitRepoInitialised).unwrap(),
+            "\"git_repo_initialised\""
+        );
     }
 }

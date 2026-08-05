@@ -34,6 +34,7 @@ pub mod fixtures;
 pub mod git;
 pub mod isolation;
 pub mod probe;
+pub mod report;
 pub mod result;
 pub mod specs;
 
@@ -64,7 +65,10 @@ pub use fixtures::{
     RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH,
 };
 pub use git::{git_command, GRASP_AUDIT_NSEC_ENV};
-pub use probe::{run_probe, ProbeCheck, ProbeReport};
+pub use probe::{run_probe, ProbeCheck, ProbeCheckName, ProbeReport};
+pub use report::{
+    AuditOutcome, AuditSpec, AuditSuite, ResultCounts, SpecReport, TestOutcome, TestReport,
+};
 pub use result::{AuditResult, TestResult};
 
 // Re-export commonly used types

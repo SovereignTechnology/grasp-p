@@ -54,7 +54,7 @@ impl EventAcceptanceTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "pr_event_accepted_when_clone_tag_names_prs_endpoint",
+            super::test_ids::ACCEPT_EVENT_FOR_PRS_ENDPOINT,
             SpecRef::Grasp06RelaxAcceptPrEvent,
             "MUST accept PR event for un-announced coord when its clone tag names this \
              relay's /prs/<signer-npub>/<identifier>.git endpoint",
@@ -170,7 +170,7 @@ impl EventAcceptanceTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "pr_event_accepted_via_relaxation_is_held_in_purgatory",
+            super::test_ids::HOLD_RELAXED_EVENT_IN_PURGATORY,
             SpecRef::Grasp06RelaxAcceptPrEvent,
             "PR event accepted under the GRASP-06 relaxation MUST be held in purgatory \
              until matching git data arrives",
@@ -279,7 +279,7 @@ impl EventAcceptanceTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "pr_event_rejected_when_clone_tag_does_not_name_prs_endpoint",
+            super::test_ids::REJECT_EVENT_FOR_OTHER_ENDPOINT,
             SpecRef::Grasp06RelaxRequiresCloneTag,
             "MUST NOT relax PR acceptance when the event's clone tag does not name this \
              relay's /prs/<signer-npub>/<identifier>.git endpoint",

@@ -108,7 +108,7 @@ impl MirroringTests {
     /// land, the test turns green.
     pub async fn test_prs_push_mirrors_to_announced_repo(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "prs_push_mirrors_to_announced_repo",
+            super::test_ids::MIRROR_PRS_PUSH,
             SpecRef::Grasp06MirrorToAnnouncedRepo,
             "refs accepted via /prs/ MUST be mirrored into any matching accepted-announcement \
              repos on this relay",
@@ -343,7 +343,7 @@ impl MirroringTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "prs_push_then_pr_event_promotes_and_mirrors",
+            super::test_ids::PROMOTE_AND_MIRROR_GIT_FIRST,
             SpecRef::Grasp06MirrorToAnnouncedRepo,
             "git-first ordering: when a /prs/ push arrives before the PR event, the event MUST \
              still be promoted out of purgatory on arrival and the mirror MUST still fire",
@@ -571,7 +571,7 @@ impl MirroringTests {
     /// green as long as the relay never adds a reverse-mirror branch.
     pub async fn test_standard_push_does_not_mirror_to_prs(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "standard_push_does_not_mirror_to_prs",
+            super::test_ids::NO_REVERSE_MIRROR,
             SpecRef::Grasp06NoReverseMirror,
             "the reverse direction MUST NOT mirror: a push to /<npub>/<id>.git must not appear \
              under /prs/",

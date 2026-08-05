@@ -34,7 +34,7 @@ impl PrsEndpointTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "prs_namespace_404_when_grasp06_not_advertised",
+            super::test_ids::NAMESPACE_404_WHEN_NOT_ADVERTISED,
             SpecRef::Grasp06NotAdvertised404,
             "MUST return 404 on /prs/ when GRASP-06 is not advertised in NIP-11",
         )
@@ -122,7 +122,7 @@ impl PrsEndpointTests {
     /// "off" case.
     pub async fn test_prs_fetch_unknown_path_serves_empty_repo(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "prs_fetch_unknown_path_serves_empty_repo",
+            super::test_ids::FETCH_UNKNOWN_PATH,
             SpecRef::Grasp06FetchEmptyRepo,
             "MUST serve empty bare repo on fetch for any well-formed /prs/ path \
              until refs/nostr/<event-id> has been accepted",
@@ -241,7 +241,7 @@ impl PrsEndpointTests {
     /// handler with the ref-name validator), this turns green.
     pub async fn test_prs_push_refs_nostr_event_id_accepted(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "prs_push_refs_nostr_event_id_accepted",
+            super::test_ids::PUSH_NOSTR_REF,
             SpecRef::Grasp06AcceptRefsNostrPush,
             "MUST accept pushes to refs/nostr/<event-id> on /prs/<npub>/<id>.git",
         )
@@ -323,7 +323,7 @@ impl PrsEndpointTests {
     ///   validator, which is what the spec requires.
     pub async fn test_prs_push_other_refs_rejected(client: &AuditClient) -> TestResult {
         TestResult::new(
-            "prs_push_other_refs_rejected",
+            super::test_ids::REJECT_OTHER_REFS,
             SpecRef::Grasp06RejectNonNostrRefs,
             "MUST reject pushes to anything other than refs/nostr/<64-hex-event-id> \
              on /prs/<npub>/<id>.git",
@@ -417,7 +417,7 @@ impl PushValidationTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "commit_mismatch_deletes_ref_and_blocks_promotion",
+            super::test_ids::DELETE_COMMIT_MISMATCH,
             SpecRef::Grasp06CommitMismatchDeletesRef,
             "when the pushed commit does not match the PR event's `c` tag, the ref MUST be \
              deleted and the event MUST NOT be promoted out of purgatory",
