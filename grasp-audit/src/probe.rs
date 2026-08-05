@@ -7,8 +7,13 @@
 use crate::audit::AuditConfig;
 use crate::client::AuditClient;
 use crate::fixtures::{create_commit, init_local_repo, try_push};
+use crate::pinned_proxy::PinnedSocksProxy;
 use nostr_sdk::prelude::*;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
+
+const MAX_NIP11_BODY_BYTES: usize = 256 * 1024;
+const MAX_GIT_ADVERTISEMENT_BYTES: usize = 1024 * 1024;
 
 /// Stable identifiers for probe checks, in execution order.
 ///
@@ -234,6 +239,189 @@ fn now_iso8601() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", yr, mo, d, h, m, s)
 }
 
+/// Optional network policy for probes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeOptions {
+    /// Reject non-public targets, cross-origin clone URLs, redirects, and
+    /// oversized HTTP bodies. Disabled by default so local development
+    /// targets remain usable.
+    pub harden_network: bool,
+}
+
+async fn validate_public_url(url: &reqwest::Url, deadline: Instant) -> Result<(), String> {
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("URL query strings and fragments are not allowed".to_string());
+    }
+    resolve_public_url(url, deadline).await.map(|_| ())
+}
+
+async fn resolve_public_url(
+    url: &reqwest::Url,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    if !matches!(url.scheme(), "wss" | "https") {
+        return Err("network hardening requires wss/https".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL credentials are not allowed".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no usable port".to_string())?;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_public_ip(ip) {
+            return Err(format!("non-public target address is not allowed: {ip}"));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("overall timeout before resolving {host}"));
+    }
+    let timeout = remaining.min(Duration::from_secs(5));
+    let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| {
+            if Instant::now() >= deadline {
+                format!("overall timeout while resolving {host}")
+            } else {
+                format!("timed out resolving {host}")
+            }
+        })?
+        .map_err(|error| format!("failed to resolve {host}: {error}"))?;
+    let addresses: Vec<_> = resolved.collect();
+    if addresses.is_empty() {
+        return Err(format!("{host} resolved to no addresses"));
+    }
+    if let Some(address) = addresses.iter().find(|address| !is_public_ip(address.ip())) {
+        return Err(format!(
+            "{host} resolved to prohibited address {}",
+            address.ip()
+        ));
+    }
+    Ok(addresses)
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_ipv4(v4);
+    }
+
+    // Public relay targets must be in the currently allocated global-unicast
+    // space (2000::/3) and outside every special-purpose range within it.
+    // This intentionally fails closed for future allocations. Keep this list
+    // aligned with the IANA IPv6 Special-Purpose Address Registry.
+    const SPECIAL_PURPOSE: &[(u128, u8)] = &[
+        (0x2001_0000_0000_0000_0000_0000_0000_0000, 23), // IETF protocols
+        (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32), // documentation
+        (0x2002_0000_0000_0000_0000_0000_0000_0000, 16), // 6to4
+        (0x2620_004f_8000_0000_0000_0000_0000_0000, 48), // AS112
+        (0x3fff_0000_0000_0000_0000_0000_0000_0000, 20), // documentation
+    ];
+
+    ipv6_has_prefix(ip, 0x2000_0000_0000_0000_0000_0000_0000_0000, 3)
+        && !SPECIAL_PURPOSE
+            .iter()
+            .any(|(network, prefix)| ipv6_has_prefix(ip, *network, *prefix))
+}
+
+fn ipv6_has_prefix(ip: Ipv6Addr, network: u128, prefix_len: u8) -> bool {
+    let shift = 128 - u32::from(prefix_len);
+    (u128::from(ip) >> shift) == (network >> shift)
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+async fn probe_http_client(
+    url: &reqwest::Url,
+    harden_network: bool,
+    deadline: Instant,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder();
+    if harden_network {
+        let addresses = resolve_public_url(url, deadline).await?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?;
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("response exceeds {max_bytes} byte limit"));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("response exceeds {max_bytes} byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_probe_body(
+    response: reqwest::Response,
+    max_bytes: Option<usize>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(timeout, async {
+        match max_bytes {
+            Some(max_bytes) => read_limited_body(response, max_bytes).await,
+            None => response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|_| "timeout reading response body".to_string())?
+}
+
 // ============================================================
 // Main probe function
 // ============================================================
@@ -254,10 +442,107 @@ pub async fn run_probe(
     timeout_secs: u64,
     overall_secs: u64,
 ) -> ProbeReport {
+    run_probe_with_options(
+        relay_url,
+        keys,
+        read_only,
+        timeout_secs,
+        overall_secs,
+        ProbeOptions::default(),
+    )
+    .await
+}
+
+/// Run a probe with an explicit network policy.
+pub async fn run_probe_with_options(
+    relay_url: &str,
+    keys: Option<Keys>,
+    read_only: bool,
+    timeout_secs: u64,
+    overall_secs: u64,
+    options: ProbeOptions,
+) -> ProbeReport {
     let total_start = Instant::now();
     let deadline = total_start + Duration::from_secs(overall_secs);
     let timestamp = now_iso8601();
     let mut checks: Vec<ProbeCheck> = Vec::new();
+
+    if options.harden_network && !read_only {
+        return ProbeReport {
+            relay_url: relay_url.to_string(),
+            timestamp,
+            all_passed: false,
+            total_duration_ms: total_start.elapsed().as_millis() as u64,
+            checks: vec![ProbeCheck {
+                name: ProbeCheckName::Prepare.as_str(),
+                passed: false,
+                skipped: false,
+                duration_ms: 0,
+                detail: None,
+                error: Some("--harden-network cannot be combined with --create-repo".to_string()),
+            }],
+        };
+    }
+
+    let pinned_proxy = if options.harden_network {
+        match reqwest::Url::parse(relay_url) {
+            Ok(url) => {
+                let result = async {
+                    if url.query().is_some() || url.fragment().is_some() {
+                        return Err("URL query strings and fragments are not allowed".to_string());
+                    }
+                    let addresses = resolve_public_url(&url, deadline).await?;
+                    let host = url
+                        .host_str()
+                        .ok_or_else(|| "URL has no host".to_string())?;
+                    let port = url
+                        .port_or_known_default()
+                        .ok_or_else(|| "URL has no usable port".to_string())?;
+                    PinnedSocksProxy::start(host.to_string(), port, addresses)
+                        .await
+                        .map_err(|error| format!("failed to start hardened connection: {error}"))
+                }
+                .await;
+                match result {
+                    Ok(proxy) => Some(proxy),
+                    Err(error) => {
+                        return ProbeReport {
+                            relay_url: relay_url.to_string(),
+                            timestamp,
+                            all_passed: false,
+                            total_duration_ms: total_start.elapsed().as_millis() as u64,
+                            checks: vec![ProbeCheck {
+                                name: ProbeCheckName::Prepare.as_str(),
+                                passed: false,
+                                skipped: false,
+                                duration_ms: 0,
+                                detail: None,
+                                error: Some(error),
+                            }],
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                return ProbeReport {
+                    relay_url: relay_url.to_string(),
+                    timestamp,
+                    all_passed: false,
+                    total_duration_ms: total_start.elapsed().as_millis() as u64,
+                    checks: vec![ProbeCheck {
+                        name: ProbeCheckName::Prepare.as_str(),
+                        passed: false,
+                        skipped: false,
+                        duration_ms: 0,
+                        detail: None,
+                        error: Some(format!("invalid relay URL: {error}")),
+                    }],
+                };
+            }
+        }
+    } else {
+        None
+    };
 
     /// Fill all check names not yet present in `checks` as skipped with the
     /// given reason, then return a finished ProbeReport.
@@ -414,12 +699,24 @@ pub async fn run_probe(
         );
     }
     let step1_start = Instant::now();
-    let client_result = tokio::time::timeout(
-        deadline.saturating_duration_since(Instant::now()),
-        AuditClient::new_with_keys(relay_url, config.clone(), keys.clone()),
-    )
-    .await
-    .unwrap_or_else(|_| Err(anyhow::anyhow!("overall timeout")));
+    let connect = async {
+        match pinned_proxy.as_ref() {
+            Some(proxy) => {
+                AuditClient::new_with_keys_and_proxy(
+                    relay_url,
+                    config.clone(),
+                    keys.clone(),
+                    Proxy::all(proxy.address()),
+                )
+                .await
+            }
+            None => AuditClient::new_with_keys(relay_url, config.clone(), keys.clone()).await,
+        }
+    };
+    let client_result =
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), connect)
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("overall timeout")));
     let step1_ms = step1_start.elapsed().as_millis() as u64;
 
     let client = match client_result {
@@ -473,15 +770,23 @@ pub async fn run_probe(
             );
         }
         let step2_start = Instant::now();
-        let http_client = reqwest::Client::new();
+        let http_url = reqwest::Url::parse(&http_base);
+        let http_client = match http_url {
+            Ok(ref url) => probe_http_client(url, options.harden_network, deadline).await,
+            Err(error) => Err(format!("invalid NIP-11 URL: {error}")),
+        };
         let nip11_result = tokio::time::timeout(
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(timeout_secs)),
-            http_client
-                .get(&http_base)
-                .header("Accept", "application/nostr+json")
-                .send(),
+            async {
+                http_client?
+                    .get(&http_base)
+                    .header("Accept", "application/nostr+json")
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
         )
         .await;
 
@@ -489,28 +794,59 @@ pub async fn run_probe(
 
         match nip11_result {
             Ok(Ok(resp)) if resp.status().is_success() => {
-                let detail = resp.json::<serde_json::Value>().await.ok().map(|v| {
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                    // software is typically a repo URL; take the last path segment
-                    let software = v
-                        .get("software")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.trim_end_matches('/').rsplit('/').next().unwrap_or(s))
-                        .unwrap_or("unknown");
-                    let version = v
-                        .get("version")
-                        .and_then(|ver| ver.as_str())
-                        .unwrap_or("unknown");
-                    format!("{} ({} v{})", name, software, version)
-                });
-                checks.push(ProbeCheck {
-                    name: ProbeCheckName::Nip11Fetch.as_str(),
-                    passed: true,
-                    skipped: false,
-                    duration_ms: step2_ms,
-                    detail,
-                    error: None,
-                });
+                let body = read_probe_body(
+                    resp,
+                    options.harden_network.then_some(MAX_NIP11_BODY_BYTES),
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(timeout_secs)),
+                )
+                .await;
+                match body {
+                    Ok(body) => {
+                        let detail =
+                            serde_json::from_slice::<serde_json::Value>(&body)
+                                .ok()
+                                .map(|value| {
+                                    let name = value
+                                        .get("name")
+                                        .and_then(|name| name.as_str())
+                                        .unwrap_or("unknown");
+                                    let software = value
+                                        .get("software")
+                                        .and_then(|software| software.as_str())
+                                        .map(|software| {
+                                            software
+                                                .trim_end_matches('/')
+                                                .rsplit('/')
+                                                .next()
+                                                .unwrap_or(software)
+                                        })
+                                        .unwrap_or("unknown");
+                                    let version = value
+                                        .get("version")
+                                        .and_then(|version| version.as_str())
+                                        .unwrap_or("unknown");
+                                    format!("{name} ({software} v{version})")
+                                });
+                        checks.push(ProbeCheck {
+                            name: ProbeCheckName::Nip11Fetch.as_str(),
+                            passed: true,
+                            skipped: false,
+                            duration_ms: step2_ms,
+                            detail,
+                            error: None,
+                        });
+                    }
+                    Err(error) => checks.push(ProbeCheck {
+                        name: ProbeCheckName::Nip11Fetch.as_str(),
+                        passed: false,
+                        skipped: false,
+                        duration_ms: step2_ms,
+                        detail: None,
+                        error: Some(error),
+                    }),
+                }
             }
             Ok(Ok(resp)) => {
                 checks.push(ProbeCheck {
@@ -1016,12 +1352,40 @@ pub async fn run_probe(
                 }
                 let step6_start = Instant::now();
                 let refs_url = format!("{}/info/refs?service=git-upload-pack", fetch_url);
-                let http_client = reqwest::Client::new();
+                let fetch_url_parsed = reqwest::Url::parse(&fetch_url);
+                let refs_url_parsed = reqwest::Url::parse(&refs_url);
+                let http_base_parsed = reqwest::Url::parse(&http_base);
+                let http_client = match (&fetch_url_parsed, &refs_url_parsed, &http_base_parsed) {
+                    (Ok(fetch), Ok(url), Ok(base))
+                        if !options.harden_network || same_origin(fetch, base) =>
+                    {
+                        if options.harden_network {
+                            match validate_public_url(fetch, deadline).await {
+                                Ok(()) => probe_http_client(url, true, deadline).await,
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            probe_http_client(url, false, deadline).await
+                        }
+                    }
+                    (Ok(_), Ok(_), Ok(_)) => {
+                        Err("announcement clone URL leaves audited service origin".to_string())
+                    }
+                    (Err(error), _, _) => Err(format!("invalid clone URL: {error}")),
+                    (_, Err(error), _) => Err(format!("invalid Git URL: {error}")),
+                    (_, _, Err(error)) => Err(format!("invalid service URL: {error}")),
+                };
                 let refs_result = tokio::time::timeout(
                     deadline
                         .saturating_duration_since(Instant::now())
                         .min(Duration::from_secs(timeout_secs)),
-                    http_client.get(&refs_url).send(),
+                    async {
+                        http_client?
+                            .get(&refs_url)
+                            .send()
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
                 )
                 .await;
                 let step6_ms = step6_start.elapsed().as_millis() as u64;
@@ -1029,16 +1393,41 @@ pub async fn run_probe(
                 // Capture body for git_refs_match_state if fetch succeeds
                 let refs_body_fallback: Option<String> = match refs_result {
                     Ok(Ok(resp)) if resp.status().is_success() => {
-                        let body = resp.text().await.unwrap_or_default();
-                        checks.push(ProbeCheck {
-                            name: ProbeCheckName::GitFetchRefs.as_str(),
-                            passed: true,
-                            skipped: false,
-                            duration_ms: step6_ms,
-                            detail: None,
-                            error: None,
-                        });
-                        Some(body)
+                        let body = read_probe_body(
+                            resp,
+                            options
+                                .harden_network
+                                .then_some(MAX_GIT_ADVERTISEMENT_BYTES),
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_secs(timeout_secs)),
+                        )
+                        .await
+                        .map(|body| String::from_utf8_lossy(&body).into_owned());
+                        match body {
+                            Ok(body) => {
+                                checks.push(ProbeCheck {
+                                    name: ProbeCheckName::GitFetchRefs.as_str(),
+                                    passed: true,
+                                    skipped: false,
+                                    duration_ms: step6_ms,
+                                    detail: None,
+                                    error: None,
+                                });
+                                Some(body)
+                            }
+                            Err(error) => {
+                                checks.push(ProbeCheck {
+                                    name: ProbeCheckName::GitFetchRefs.as_str(),
+                                    passed: false,
+                                    skipped: false,
+                                    duration_ms: step6_ms,
+                                    detail: None,
+                                    error: Some(error),
+                                });
+                                None
+                            }
+                        }
                     }
                     Ok(Ok(resp)) => {
                         checks.push(ProbeCheck {
@@ -1226,7 +1615,7 @@ pub async fn run_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::ProbeCheckName;
+    use super::*;
 
     #[test]
     fn probe_check_catalog_preserves_public_names_and_order() {
@@ -1251,5 +1640,110 @@ mod tests {
             serde_json::to_string(&ProbeCheckName::GitRepoInitialised).unwrap(),
             "\"git_repo_initialised\""
         );
+    }
+
+    #[test]
+    fn hardening_rejects_private_and_special_addresses() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.1.1",
+            "192.0.2.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "2001:db8::1",
+            "64:ff9b::8.8.8.8",
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001::1",
+            "2002:0808:0808::1",
+            "2620:4f:8000::1",
+            "3fff::1",
+            "5f00::1",
+            "4000::1",
+            "::8.8.8.8",
+        ] {
+            assert!(
+                !is_public_ip(address.parse().unwrap()),
+                "{address} must be rejected"
+            );
+        }
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn hardened_urls_reject_queries_and_fragments() {
+        for url in ["wss://8.8.8.8/?query=true", "wss://8.8.8.8/#fragment"] {
+            assert!(validate_public_url(
+                &reqwest::Url::parse(url).unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn hardened_http_requests_allow_generated_git_query() {
+        let url = reqwest::Url::parse("https://8.8.8.8/info/refs?service=git-upload-pack").unwrap();
+        assert!(
+            probe_http_client(&url, true, Instant::now() + Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn hardened_resolution_honours_an_expired_overall_deadline() {
+        let url = reqwest::Url::parse("https://example.com").unwrap();
+        let error = resolve_public_url(&url, Instant::now()).await.unwrap_err();
+
+        assert!(error.contains("overall timeout"));
+    }
+
+    #[tokio::test]
+    async fn hardening_rejects_write_probes_before_connecting() {
+        let report = run_probe_with_options(
+            "wss://example.com",
+            None,
+            false,
+            30,
+            60,
+            ProbeOptions {
+                harden_network: true,
+            },
+        )
+        .await;
+
+        assert!(!report.all_passed);
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.checks[0].name, ProbeCheckName::Prepare.as_str());
+        assert_eq!(
+            report.checks[0].error.as_deref(),
+            Some("--harden-network cannot be combined with --create-repo")
+        );
+    }
+
+    #[test]
+    fn origin_comparison_includes_scheme_host_and_port() {
+        let base = reqwest::Url::parse("https://example.com/repo").unwrap();
+        assert!(same_origin(
+            &base,
+            &reqwest::Url::parse("https://example.com/other").unwrap()
+        ));
+        assert!(!same_origin(
+            &base,
+            &reqwest::Url::parse("https://example.net/repo").unwrap()
+        ));
+        assert!(!same_origin(
+            &base,
+            &reqwest::Url::parse("https://example.com:8443/repo").unwrap()
+        ));
     }
 }

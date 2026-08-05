@@ -54,6 +54,10 @@ enum Commands {
         /// Requires write access; use --nsec for whitelisted relays.
         #[arg(long, default_value_t = false)]
         create_repo: bool,
+
+        /// Restrict read-only probes to pinned public wss/https targets.
+        #[arg(long, default_value_t = false)]
+        harden_network: bool,
     },
 
     /// Run audit tests against a server
@@ -108,6 +112,7 @@ async fn main() -> Result<()> {
             watch,
             keys,
             create_repo,
+            harden_network,
         } => {
             let relay = match relay {
                 Some(r) => r,
@@ -131,6 +136,7 @@ async fn main() -> Result<()> {
                 Some(interval) => interval.min(20),
                 None => 20,
             };
+            let options = ProbeOptions { harden_network };
 
             if let Some(interval) = watch {
                 let mut run = 1u64;
@@ -138,12 +144,13 @@ async fn main() -> Result<()> {
                     if !json {
                         println!("\n[Run {}]", run);
                     }
-                    let report = grasp_audit::probe::run_probe(
+                    let report = grasp_audit::probe::run_probe_with_options(
                         &relay,
                         keys.clone(),
                         read_only,
                         timeout,
                         overall_secs,
+                        options,
                     )
                     .await;
                     if json {
@@ -155,9 +162,15 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(interval)).await;
                 }
             } else {
-                let report =
-                    grasp_audit::probe::run_probe(&relay, keys, read_only, timeout, overall_secs)
-                        .await;
+                let report = grasp_audit::probe::run_probe_with_options(
+                    &relay,
+                    keys,
+                    read_only,
+                    timeout,
+                    overall_secs,
+                    options,
+                )
+                .await;
                 if json {
                     report.print_json();
                 } else {

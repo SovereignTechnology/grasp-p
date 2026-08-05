@@ -197,6 +197,57 @@ impl AuditClient {
         })
     }
 
+    /// Create a keyed audit client whose relay connection is routed through a
+    /// caller-supplied proxy.
+    pub(crate) async fn new_with_keys_and_proxy(
+        relay_url: &str,
+        config: AuditConfig,
+        keys: Keys,
+        proxy: Proxy,
+    ) -> Result<Self> {
+        let maintainer_keys = Keys::generate();
+        let recursive_maintainer_keys = Keys::generate();
+        let pr_author_keys = Keys::generate();
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .proxy(proxy)
+            .build();
+
+        client.add_relay(relay_url).await?;
+        client.connect().await;
+
+        let mut attempts = 0;
+        let mut connected = false;
+        while attempts < 50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let relays = client.relays().await;
+            connected = relays.values().any(|relay| relay.status().is_connected());
+            if connected {
+                break;
+            }
+
+            attempts += 1;
+        }
+
+        if !connected {
+            return Err(anyhow!("Failed to connect to relay at '{}'", relay_url));
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        Ok(Self {
+            client,
+            config,
+            keys,
+            maintainer_keys,
+            recursive_maintainer_keys,
+            pr_author_keys,
+            fixture_cache: Arc::new(Mutex::new(HashMap::new())),
+            typed_fixture_cache: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
     /// Get the fixture cache for TestContext usage
     ///
     /// This cache is shared across all TestContext instances created from this client.
