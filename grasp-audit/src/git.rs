@@ -8,6 +8,11 @@
 
 use std::process::Command;
 
+/// Signing secrets that audit processes may legitimately hold but git never
+/// needs. Removing them here also removes them from hooks, credential helpers,
+/// remote helpers, and any other process git starts.
+const SIGNING_SECRET_ENV_VARS: [&str; 2] = ["GRASP_AUDIT_NSEC", "NGIT_RELAY_OWNER_NSEC"];
+
 /// Build a `git` [`Command`] that is hermetic with respect to ambient git
 /// configuration.
 ///
@@ -44,6 +49,9 @@ pub fn git_command() -> Command {
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
     cmd.env_remove("GIT_INDEX_FILE");
+    for name in SIGNING_SECRET_ENV_VARS {
+        cmd.env_remove(name);
+    }
     cmd
 }
 
@@ -56,6 +64,20 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn git_commands_do_not_inherit_signing_secrets() {
+        let command = git_command();
+
+        for secret_name in SIGNING_SECRET_ENV_VARS {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == secret_name && value.is_none()),
+                "{secret_name} must be removed from git's environment"
+            );
+        }
+    }
 
     /// Write a global gitconfig whose settings demonstrably break the fixture
     /// recipe when they leak in: `core.hooksPath` and `init.templateDir` both
