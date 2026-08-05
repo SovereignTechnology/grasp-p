@@ -58,6 +58,14 @@ use nostr_sdk::prelude::LocalRelay;
 
 const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
 const MAX_PURGATORY_FILTER_ACTIONS_PER_TICK: usize = 1;
+const SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS: usize = 20;
+const SEMANTIC_FALLBACK_MAX_DELIVERED_PERCENT: usize = 10;
+
+fn should_use_semantic_fallback(requested_count: usize, received_count: usize) -> bool {
+    requested_count >= SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS
+        && received_count.saturating_mul(100)
+            <= requested_count.saturating_mul(SEMANTIC_FALLBACK_MAX_DELIVERED_PERCENT)
+}
 
 fn purgatory_dependency_retry_after() -> Duration {
     if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
@@ -458,6 +466,8 @@ pub struct PendingBatch {
     /// Event IDs actually received for this batch (None for REQ+EOSE)
     /// Compared against requested_event_ids to detect missing events
     pub received_event_ids: Option<HashSet<EventId>>,
+    /// First-pass advertised and delivered counts, retained while retrying a residual.
+    pub initial_hydration_counts: Option<(usize, usize)>,
     /// Number of retry attempts for missing events (Negentropy only)
     /// Used to prevent infinite retry loops when relay consistently fails
     pub retry_count: usize,
@@ -1363,26 +1373,35 @@ impl SyncManager {
                     let requested_count = requested.len();
                     let received_count = received.len();
                     let retry_count = batch.retry_count;
+                    let initial_hydration_counts = batch
+                        .initial_hydration_counts
+                        .unwrap_or((requested_count, received_count));
+                    if retry_count == 0 {
+                        batch.initial_hydration_counts = Some(initial_hydration_counts);
+                    }
 
-                    // Check if we made any progress (received ANY events we requested)
-                    // If received_count is 0, relay returned nothing useful - abort retry
-                    //
-                    // NOTE: Some relays (e.g., azzamo.net, snort.social) have been observed
-                    // returning zero events during negentropy retry even though manual queries
-                    // (REQ by ID) show they DO have these events. This appears to be relay-
-                    // specific behavior where the relay refuses to serve events via negentropy
-                    // retry for unknown reasons (rate limiting, negentropy implementation bugs,
-                    // or other internal logic). When retry returns zero, fall back to REQ+EOSE.
-                    if retry_count > 0 && received_count == 0 {
+                    // A semantic fallback is reserved for relays whose first exact-ID fetch is
+                    // materially incompatible with their advertised inventory. Small residuals
+                    // can be caused by indexing lag, expiry, or concurrent deletion and must not
+                    // disable NIP-77 for an otherwise healthy relay.
+                    if retry_count > 0
+                        && received_count == 0
+                        && should_use_semantic_fallback(
+                            initial_hydration_counts.0,
+                            initial_hydration_counts.1,
+                        )
+                    {
                         tracing::info!(
                             relay = %relay_url,
                             batch_id = batch.batch_id,
                             retry_count = retry_count,
                             requested_count = requested_count,
                             missing_count = missing.len(),
+                            initial_requested_count = initial_hydration_counts.0,
+                            initial_received_count = initial_hydration_counts.1,
                             missing_ids_sample = ?missing.iter().take(5).map(|id| id.to_hex()).collect::<Vec<_>>(),
-                            "Negentropy retry made no progress - relay returned zero requested events. \
-                             Marking relay as not supporting negentropy and falling back to REQ+EOSE."
+                            "Negentropy exact-ID hydration delivered at most 10% of a material batch. \
+                             Marking relay as incompatible with negentropy hydration and falling back to REQ+EOSE."
                         );
 
                         // Mark relay as not supporting negentropy so future batches skip it
@@ -1522,6 +1541,53 @@ impl SyncManager {
                             }
                             return;
                         }
+                    }
+
+                    if retry_count > 0 && received_count == 0 {
+                        let relay_url_for_recovery = relay_url.to_string();
+                        let batch_id = batch.batch_id;
+                        let missing_count = missing.len();
+
+                        drop(pending);
+
+                        let relay_already_degraded = {
+                            let index = self.relay_sync_index.read().await;
+                            index
+                                .get(&relay_url_for_recovery)
+                                .map(|state| state.historic_sync_had_failures)
+                                .unwrap_or(false)
+                        };
+                        let register_outcome =
+                            self.missing_event_recovery.lock().unwrap().register(
+                                &relay_url_for_recovery,
+                                batch_id,
+                                missing.iter().copied(),
+                                relay_already_degraded,
+                                Instant::now(),
+                            );
+                        tracing::warn!(
+                            relay = %relay_url_for_recovery,
+                            batch_id = batch_id,
+                            retry_count = retry_count,
+                            missing_count = missing_count,
+                            pending_recovery = register_outcome.pending_total,
+                            "Negentropy residual retry made no progress; retaining NIP-77 and scheduling bounded missing-event recovery"
+                        );
+
+                        let mut pending = self.pending_sync_index.write().await;
+                        if let Some(batches) = pending.get_mut(&relay_url_for_recovery) {
+                            if let Some(idx) = batches.iter().position(|b| b.batch_id == batch_id) {
+                                let mut completed_batch = batches.remove(idx);
+                                completed_batch.failed = true;
+                                if batches.is_empty() {
+                                    pending.remove(&relay_url_for_recovery);
+                                }
+                                drop(pending);
+                                self.confirm_batch(&relay_url_for_recovery, completed_batch)
+                                    .await;
+                            }
+                        }
+                        return;
                     }
 
                     tracing::warn!(
@@ -5022,6 +5088,7 @@ impl SyncManager {
                 pagination_state: HashMap::new(), // Negentropy doesn't use pagination
                 requested_event_ids: None,        // Will be set after negentropy diff
                 received_event_ids: None,         // Will be set after negentropy diff
+                initial_hydration_counts: None,
                 retry_count: 0,
                 failed: false,
             };
@@ -5279,6 +5346,7 @@ impl SyncManager {
                 pagination_state,
                 requested_event_ids: None, // Not used for REQ+EOSE
                 received_event_ids: None,  // Not used for REQ+EOSE
+                initial_hydration_counts: None,
                 retry_count: 0,            // Not used for REQ+EOSE
                 failed: false,
             };
@@ -5351,6 +5419,21 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_fallback_requires_material_first_pass_incompatibility() {
+        for (requested, received) in [(118, 115), (203, 197), (380, 301), (1818, 1420)] {
+            assert!(
+                !should_use_semantic_fallback(requested, received),
+                "{received}/{requested} is a residual, not a hydration incompatibility"
+            );
+        }
+
+        assert!(should_use_semantic_fallback(20, 0));
+        assert!(should_use_semantic_fallback(20, 2));
+        assert!(!should_use_semantic_fallback(20, 3));
+        assert!(!should_use_semantic_fallback(19, 0));
+    }
 
     #[test]
     fn group_filters_for_req_respects_count_and_byte_budgets() {
@@ -5711,6 +5794,7 @@ mod tests {
             pagination_state: HashMap::new(),
             requested_event_ids: None,
             received_event_ids: None,
+            initial_hydration_counts: None,
             retry_count: 0,
             failed: false,
         };
@@ -5742,6 +5826,7 @@ mod tests {
             pagination_state: HashMap::new(),
             requested_event_ids: None,
             received_event_ids: None,
+            initial_hydration_counts: None,
             retry_count: 0,
             failed: false,
         };
@@ -5990,6 +6075,7 @@ mod tests {
             pagination_state: HashMap::new(),
             requested_event_ids: Some(HashSet::new()),
             received_event_ids: Some(HashSet::new()),
+            initial_hydration_counts: None,
             retry_count: 0,
             failed: false,
         };
@@ -6012,6 +6098,7 @@ mod tests {
             pagination_state: HashMap::new(),
             requested_event_ids: None,
             received_event_ids: None,
+            initial_hydration_counts: None,
             retry_count: 0,
             failed: false,
         };
