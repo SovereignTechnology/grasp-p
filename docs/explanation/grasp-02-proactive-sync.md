@@ -727,7 +727,7 @@ fn compute_actions(
 
 ### Filter Processing
 
-- **`handle_new_sync_filters()`**: Single entry point for AddFilters from both paths (self-subscriber OR recompute), orchestrates live+historic sync
+- **`handle_new_sync_filters()`**: Single entry point for AddFilters from both paths (self-subscriber OR recompute); rejects the service's own relay target, then orchestrates live+historic sync
 - **`recompute_new_sync_filters_for_relay()`**: Calls derive_relay_targets → compute_actions → handle_new_sync_filters for each resulting action
 
 ---

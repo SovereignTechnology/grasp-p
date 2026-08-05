@@ -53,7 +53,9 @@ use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
-use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
+use crate::outbound::{
+    url_matches_service_domain, OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource,
+};
 use nostr_sdk::prelude::LocalRelay;
 
 const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
@@ -141,6 +143,10 @@ pub(crate) fn canonical_relay_key(relay_url: &str) -> Result<String, String> {
         canonical.pop();
     }
     Ok(canonical)
+}
+
+fn is_own_sync_target(relay_url: &str, service_domain: &str) -> bool {
+    url_matches_service_domain(relay_url, service_domain)
 }
 
 fn connections_for_relay_urls<T: Clone>(
@@ -2595,6 +2601,19 @@ impl SyncManager {
                 return;
             }
         };
+
+        // The local self-subscriber already observes everything served here.
+        // Enforce this at the shared AddFilters boundary too, because
+        // purgatory recomputation creates actions without passing through the
+        // self-subscriber's own-relay exclusion.
+        if is_own_sync_target(&action.relay_url, &self.service_domain) {
+            tracing::debug!(
+                relay = %action.relay_url,
+                service_domain = %self.service_domain,
+                "Skipping sync action targeting this relay"
+            );
+            return;
+        }
 
         // Targets already rejected by the outbound policy stay in the sync
         // indexes (they come from stored events); skip them quietly instead
@@ -5419,6 +5438,25 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_relay_targets_are_excluded_from_sync_actions() {
+        assert!(is_own_sync_target("wss://gitnostr.com", "gitnostr.com"));
+        assert!(is_own_sync_target("ws://gitnostr.com", "gitnostr.com"));
+        assert!(is_own_sync_target(
+            "ws://127.0.0.1:7334",
+            "127.0.0.1:7334"
+        ));
+
+        assert!(!is_own_sync_target(
+            "wss://gitnostr.com.attacker.example",
+            "gitnostr.com"
+        ));
+        assert!(!is_own_sync_target(
+            "ws://127.0.0.1:7335",
+            "127.0.0.1:7334"
+        ));
+    }
 
     #[test]
     fn semantic_fallback_requires_material_first_pass_incompatibility() {
