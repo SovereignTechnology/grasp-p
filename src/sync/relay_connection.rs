@@ -43,6 +43,52 @@ const NEGENTROPY_TRANSIENT_BACKOFF: [Duration; 4] = [
     Duration::from_secs(7200),
 ];
 
+/// Maximum concurrent negentropy diff rounds per relay connection.
+///
+/// Relays bound concurrent subscriptions per connection, and on
+/// strfry-family relays negentropy views count against that same budget
+/// (`maxSubsPerConnection`; nos.lol and relay.primal.net advertise 20,
+/// shared with live subscriptions). Historic sync opens one diff per
+/// filter, so an unbounded batch (146 filters observed in production)
+/// bursts far past the tightest common budget and draws
+/// "too many concurrent NEG requests" rejections. Four concurrent rounds
+/// leaves the shared budget mostly available for live subscriptions; see
+/// docs/explanation/sync-scaling-constraints.md.
+const MAX_CONCURRENT_NEG_DIFFS: usize = 4;
+
+/// Maximum concurrent transient (auto-close) REQ subscriptions per relay
+/// connection.
+///
+/// Historic REQ+EOSE sync, negentropy ID fetches, missing-event retries,
+/// fallback subscriptions and pagination pages each open an auto-close REQ
+/// that stays open until EOSE. Relays bound concurrent subscriptions per
+/// connection (`maxSubsPerConnection` on strfry-family relays; nos.lol
+/// advertises 20, shared between live subscriptions, negentropy views and
+/// REQs), so an unbounded startup batch bursts past the tightest common
+/// budget — observed in production as "ERROR: too many concurrent REQs"
+/// NOTICEs from nos.lol. Five permits alongside the four negentropy
+/// permits and a two-slot margin leaves at least nine slots of that
+/// budget for live subscriptions; see
+/// docs/explanation/sync-scaling-constraints.md.
+const MAX_CONCURRENT_TRANSIENT_REQS: usize = 5;
+
+/// Upper bound on how long a transient-REQ permit may be held.
+///
+/// Permits are normally released when the subscription's EOSE (or CLOSED)
+/// arrives. A relay that never answers would otherwise pin its permits
+/// forever and starve every later transient subscription on the
+/// connection, so a watchdog reclaims the permit after this deadline
+/// (twice the negentropy round timeout, generous for large REQ pages).
+const TRANSIENT_REQ_PERMIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Permits held by in-flight transient REQ subscriptions, keyed by
+/// subscription id and shared across connection clones.
+type TransientReqPermitMap = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<SubscriptionId, tokio::sync::OwnedSemaphorePermit>,
+    >,
+>;
+
 /// How a failed negentropy diff should affect future NIP-77 attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NegentropyFailure {
@@ -159,6 +205,16 @@ pub struct RelayConnection {
     nip77_transient_failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Deadline before which negentropy is not attempted (transient-failure cooldown)
     nip77_cooldown_until: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    /// Bounds concurrent negentropy diff rounds on this connection
+    /// (shared across clones; see [`MAX_CONCURRENT_NEG_DIFFS`])
+    neg_diff_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent transient (auto-close) REQ subscriptions on this
+    /// connection (shared across clones; see
+    /// [`MAX_CONCURRENT_TRANSIENT_REQS`])
+    transient_req_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Permits held by open transient subscriptions, keyed by subscription
+    /// id; released on EOSE/CLOSED, connection teardown, or the watchdog
+    transient_req_permits_held: TransientReqPermitMap,
 }
 
 impl RelayConnection {
@@ -212,6 +268,15 @@ impl RelayConnection {
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_NEG_DIFFS,
+            )),
+            transient_req_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRANSIENT_REQS,
+            )),
+            transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -244,6 +309,15 @@ impl RelayConnection {
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_NEG_DIFFS,
+            )),
+            transient_req_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRANSIENT_REQS,
+            )),
+            transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -414,6 +488,12 @@ impl RelayConnection {
                         tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
                         // Convert Cow<SubscriptionId> to owned SubscriptionId
                         let owned_sub_id = sub_id.into_owned();
+                        // Release the transient permit BEFORE forwarding:
+                        // the forward can block on channel backpressure and
+                        // permit release must never depend on downstream
+                        // consumers (the SyncManager actor may itself be
+                        // waiting on a permit).
+                        self.release_transient_req_permit(&owned_sub_id);
                         if event_sender
                             .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
                             .await
@@ -447,7 +527,13 @@ impl RelayConnection {
                         let _ = event_sender.send(RelayEvent::Notice(msg.to_string())).await;
                         // Don't break - continue processing events
                     }
-                    RelayMessage::Closed { message: msg, .. } => {
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message: msg,
+                    } => {
+                        // A CLOSED subscription can no longer produce EOSE;
+                        // free its transient permit if one is held.
+                        self.release_transient_req_permit(subscription_id.as_ref());
                         tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
                         let _ = event_sender.send(RelayEvent::Closed(msg.to_string())).await;
                         // Don't break - CLOSED is subscription-specific, not connection-specific
@@ -491,6 +577,10 @@ impl RelayConnection {
                 }
             }
         }
+
+        // The connection is going away; every outstanding transient
+        // subscription dies with it, so free their permits.
+        self.clear_transient_req_permits();
 
         tracing::debug!(relay = %url, "Notification stream ended, event loop terminated");
     }
@@ -538,6 +628,25 @@ impl RelayConnection {
             "subscribe_filters called"
         );
 
+        // Transient (auto-close) subscriptions share a bounded number of
+        // per-connection slots so historic bursts queue instead of
+        // exceeding relay subscription budgets. The permit is registered
+        // against the subscription id on success and released when the
+        // subscription's EOSE or CLOSED arrives (see run_event_loop).
+        let permit = if auto_close {
+            match self.transient_req_permits.clone().acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Err(format!(
+                        "Failed to subscribe on {}: transient permit semaphore closed",
+                        self.url
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let output = if auto_close {
             self.client
                 .subscribe(filters)
@@ -558,6 +667,10 @@ impl RelayConnection {
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(format!("Failed to subscribe on {}: {}", self.url, failures));
+        }
+
+        if let Some(permit) = permit {
+            self.hold_transient_req_permit(output.value.clone(), permit);
         }
 
         tracing::debug!(
@@ -626,6 +739,7 @@ impl RelayConnection {
 
     /// Disconnect from the relay
     pub async fn disconnect(&self) {
+        self.clear_transient_req_permits();
         self.client.disconnect().await;
         tracing::debug!(relay = %self.url, "Disconnected from relay");
     }
@@ -636,10 +750,62 @@ impl RelayConnection {
     /// with consolidated filters. This sends CLOSE messages for all active
     /// subscriptions on the relay.
     pub async fn unsubscribe_all(&self) {
+        self.clear_transient_req_permits();
         if let Err(e) = self.client.unsubscribe_all().await {
             tracing::debug!(relay = %self.url, error = %e, "Failed to unsubscribe from all subscriptions");
         }
         tracing::debug!(relay = %self.url, "Unsubscribed from all subscriptions");
+    }
+
+    /// Register a held transient-REQ permit for `sub_id` and start its
+    /// watchdog.
+    fn hold_transient_req_permit(
+        &self,
+        sub_id: SubscriptionId,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        self.transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .insert(sub_id.clone(), permit);
+
+        // Watchdog: a relay that never sends EOSE (or CLOSED) must not pin
+        // its permits forever. Dropping the permit only frees our own
+        // slot; the subscription itself remains subject to the normal
+        // batch and disconnect cleanup paths.
+        let held = std::sync::Arc::clone(&self.transient_req_permits_held);
+        let relay_url = self.url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TRANSIENT_REQ_PERMIT_TIMEOUT).await;
+            let reclaimed = held
+                .lock()
+                .expect("transient permit map poisoned")
+                .remove(&sub_id)
+                .is_some();
+            if reclaimed {
+                tracing::debug!(
+                    relay = %relay_url,
+                    sub_id = %sub_id,
+                    "Transient REQ permit reclaimed by watchdog (no EOSE within deadline)"
+                );
+            }
+        });
+    }
+
+    /// Release the transient-REQ permit held for `sub_id`, if any.
+    fn release_transient_req_permit(&self, sub_id: &SubscriptionId) {
+        self.transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .remove(sub_id);
+    }
+
+    /// Release every held transient-REQ permit (connection teardown).
+    fn clear_transient_req_permits(&self) {
+        self.transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .clear();
     }
 
     // =========================================================================
@@ -770,6 +936,28 @@ impl RelayConnection {
         &self,
         filter: Filter,
     ) -> Result<nostr_sdk::client::SyncSummary, String> {
+        // Bound concurrent rounds: historic sync opens one diff per filter,
+        // and relays count each open round against a per-connection budget
+        // shared with live subscriptions (see MAX_CONCURRENT_NEG_DIFFS).
+        // The permit is held for the whole round, including the timeout.
+        let _permit = self
+            .neg_diff_permits
+            .acquire()
+            .await
+            .map_err(|_| format!("Negentropy permits closed for {}", self.url))?;
+
+        // While this round was queued, an earlier round may have started a
+        // transient-failure cooldown or received an explicit unsupported
+        // signal. Bail out to the per-batch REQ+EOSE fallback instead of
+        // opening another round against a relay that just failed. This does
+        // not record a failure, so it cannot escalate the cooldown.
+        if !self.supports_negentropy().await {
+            return Err(format!(
+                "Negentropy skipped for {}: cooldown active or relay marked unsupported",
+                self.url
+            ));
+        }
+
         // Use dry_run to only identify differences without downloading events
         let sync_opts = SyncOptions::default().dry_run();
         let client = self.client.clone();

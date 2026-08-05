@@ -6,7 +6,7 @@
 //! This module subscribes to relevant event kinds on our own relay and
 //! batches updates before sending them to the SyncManager.
 //!
-//! See `docs/explanation/grasp-02-proactive-sync-v4.md` for full design details.
+//! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

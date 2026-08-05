@@ -69,6 +69,20 @@ pub struct PortReservation {
     _listener: TcpListener,
 }
 
+/// Reserve a specific loopback port.
+///
+/// Used by restart flows that must reuse an address already embedded in
+/// published events (e.g. a repository announcement naming the relay's
+/// domain). Fails while the port is still bound — callers should wait
+/// for the previous holder to exit and retry within a bounded deadline.
+pub fn reserve_specific(port: u16) -> std::io::Result<PortReservation> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    Ok(PortReservation {
+        port,
+        _listener: listener,
+    })
+}
+
 impl PortReservation {
     /// The kernel-assigned loopback port number held by this reservation.
     pub fn port(&self) -> u16 {

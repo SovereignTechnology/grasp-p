@@ -7,11 +7,56 @@
 //! - Layer 2: Events tagging our repos (a/A/q tags)
 //! - Layer 3: Events tagging our root events (e/E/q tags)
 //!
-//! See `docs/explanation/grasp-02-proactive-sync-v4.md` for full design details.
+//! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
+
+/// Serialized byte budget of tag values per filter chunk.
+///
+/// Relay filter limits are byte caps, not item counts: strfry bounds the
+/// concatenated tag values of a filter set at 65535 bytes, and the whole
+/// message must fit relay maximum message sizes (128 KB floor observed via
+/// NIP-11, which cannot advertise per-filter limits at all). 32 KB per
+/// filter is half strfry's per-filter cap, and a full chunk's ~33 KB
+/// NEG-OPEN message keeps ~1.8× margin under the 60 KB negentropy frame
+/// limit our own embedded relay (nostr-sdk local relay) enforces. Three
+/// full chunks grouped into one REQ fit the 96 KB message budget — which
+/// also matches strfry's optional strict `filterValidation` limit of three
+/// filters per REQ. Persistent subscription count scales with how full
+/// each REQ is packed and negentropy round count scales with chunk size,
+/// so maximising both budgets together minimises both costs. See
+/// docs/explanation/sync-scaling-constraints.md.
+pub const FILTER_VALUE_BYTE_BUDGET: usize = 32 * 1024;
+
+/// Split `values` into contiguous chunks whose serialized tag-value bytes
+/// stay within [`FILTER_VALUE_BYTE_BUDGET`].
+///
+/// Each value costs its UTF-8 length plus JSON quoting and separator
+/// overhead. A single value larger than the budget still gets its own
+/// chunk, so progress is always made.
+fn chunk_values_by_bytes<T: AsRef<str>>(values: &[T]) -> Vec<&[T]> {
+    // Two quotes and a separator per value in the serialized JSON array.
+    const VALUE_OVERHEAD: usize = 3;
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (idx, value) in values.iter().enumerate() {
+        let cost = value.as_ref().len() + VALUE_OVERHEAD;
+        if idx > start && bytes + cost > FILTER_VALUE_BYTE_BUDGET {
+            chunks.push(&values[start..idx]);
+            start = idx;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < values.len() {
+        chunks.push(&values[start..]);
+    }
+    chunks
+}
 
 /// Layer 1: Announcements filter (kinds 30617 + 10317)
 ///
@@ -36,7 +81,7 @@ pub fn build_announcement_filter(since: Option<Timestamp>) -> Filter {
 /// Subscribes to kind 30618 state events using #d (identifier) tags.
 /// This is more efficient than Layer 1 broadcast subscription because:
 /// - Only receives state events for repos we actually host
-/// - One filter can include multiple identifiers (batched per 100)
+/// - One filter can include multiple identifiers (byte-budgeted batches)
 /// - Avoids 1000+ rejections for repos we don't care about
 ///
 /// # Arguments
@@ -44,7 +89,7 @@ pub fn build_announcement_filter(since: Option<Timestamp>) -> Filter {
 /// * `since` - Optional timestamp for incremental sync
 ///
 /// # Returns
-/// Vec of filters, one filter per 100-identifier chunk
+/// Vec of filters, one filter per byte-budgeted identifier chunk
 pub fn state_event_filters_for_our_repos(
     repos: &HashSet<String>,
     since: Option<Timestamp>,
@@ -69,8 +114,8 @@ pub fn state_event_filters_for_our_repos(
     let mut filters = Vec::new();
     let identifier_vec: Vec<_> = identifiers.iter().collect();
 
-    // Batch by 100 identifiers per filter
-    for chunk in identifier_vec.chunks(100) {
+    // Batch identifiers per filter within the serialized byte budget
+    for chunk in chunk_values_by_bytes(&identifier_vec) {
         let mut filter = Filter::new().kind(Kind::RepoState); // kind 30618
 
         // Add #d tags for all identifiers in this chunk
@@ -92,14 +137,14 @@ pub fn state_event_filters_for_our_repos(
 /// Layer 2: Events tagging one of our repos
 ///
 /// Uses lowercase a, uppercase A, and q tags for comprehensive coverage.
-/// Batched per 100 repo refs.
+/// Batched by serialized byte budget.
 ///
 /// # Arguments
 /// * `repos` - Set of repo addressable refs (format: 30617:pubkey:identifier)
 /// * `since` - Optional timestamp for incremental sync
 ///
 /// # Returns
-/// Vec of filters, one set of 3 filters (a/A/q) per 100-repo chunk
+/// Vec of filters, one set of 3 filters (a/A/q) per byte-budgeted chunk
 pub fn tagged_one_of_our_repo_event_filters(
     repos: &HashSet<String>,
     since: Option<Timestamp>,
@@ -111,7 +156,7 @@ pub fn tagged_one_of_our_repo_event_filters(
     let mut filters = Vec::new();
     let repo_refs: Vec<_> = repos.iter().collect();
 
-    for chunk in repo_refs.chunks(100) {
+    for chunk in chunk_values_by_bytes(&repo_refs) {
         // Lowercase 'a' tag - standard addressable reference
         let mut f1 = Filter::new();
         for repo in chunk {
@@ -147,14 +192,14 @@ pub fn tagged_one_of_our_repo_event_filters(
 /// Layer 3: Events tagging one of our root events
 ///
 /// Uses lowercase e, uppercase E, and q tags for comprehensive coverage.
-/// Batched per 100 event IDs.
+/// Batched by serialized byte budget.
 ///
 /// # Arguments
 /// * `root_events` - Set of event IDs (1617/1618/1621 root events)
 /// * `since` - Optional timestamp for incremental sync
 ///
 /// # Returns
-/// Vec of filters, one set of 3 filters (e/E/q) per 100-event chunk
+/// Vec of filters, one set of 3 filters (e/E/q) per byte-budgeted chunk
 pub fn tagged_one_of_our_root_event_filters(
     root_events: &HashSet<EventId>,
     since: Option<Timestamp>,
@@ -174,7 +219,7 @@ pub fn tagged_one_of_our_root_event_filters(
     let mut filters = Vec::new();
     let event_ids: Vec<String> = root_events.iter().map(|id| id.to_hex()).collect();
 
-    for (chunk_idx, chunk) in event_ids.chunks(100).enumerate() {
+    for (chunk_idx, chunk) in chunk_values_by_bytes(&event_ids).into_iter().enumerate() {
         // Lowercase 'e' tag - standard event reference
         let mut f1 = Filter::new();
         for event_id in chunk {
@@ -319,6 +364,26 @@ mod tests {
 
     #[test]
     fn test_repo_filters_batching() {
+        // Each ref serializes to exactly 1024 bytes (1021 + quoting overhead),
+        // so a chunk holds exactly FILTER_VALUE_BYTE_BUDGET / 1024 refs;
+        // build two full chunks plus a partial third.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
+        let mut repos = HashSet::new();
+        for i in 0..(2 * per_chunk + per_chunk / 2) {
+            let identifier = format!("{i:0>4}{}", "x".repeat(1021 - 4 - "30617:pubkey:".len()));
+            repos.insert(format!("30617:pubkey:{identifier}"));
+        }
+
+        let filters = tagged_one_of_our_repo_event_filters(&repos, None);
+
+        // Should create 9 filters (3 byte-budgeted chunks * 3 tag types)
+        assert_eq!(filters.len(), 9);
+    }
+
+    #[test]
+    fn test_repo_filters_small_refs_consolidate_into_one_chunk() {
+        // 250 short refs fit one byte-budgeted chunk (previously 3 chunks
+        // under the fixed 100-item rule).
         let mut repos = HashSet::new();
         for i in 0..250 {
             repos.insert(format!("30617:pubkey{}:repo{}", i, i));
@@ -326,9 +391,29 @@ mod tests {
 
         let filters = tagged_one_of_our_repo_event_filters(&repos, None);
 
-        // Should create 9 filters (3 chunks * 3 tag types)
-        // 250 repos = 100 + 100 + 50 = 3 chunks
-        assert_eq!(filters.len(), 9);
+        // One chunk * 3 tag types
+        assert_eq!(filters.len(), 3);
+    }
+
+    #[test]
+    fn test_chunk_values_by_bytes_edge_cases() {
+        // Empty input -> no chunks.
+        let empty: Vec<String> = vec![];
+        assert!(chunk_values_by_bytes(&empty).is_empty());
+
+        // A single value larger than the whole budget still gets a chunk.
+        let oversized = vec!["x".repeat(FILTER_VALUE_BYTE_BUDGET * 2)];
+        let chunks = chunk_values_by_bytes(&oversized);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+
+        // Exact fit: values costing 1024 bytes each fill a chunk exactly.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
+        let values: Vec<String> = (0..per_chunk + 1).map(|i| format!("{i:0>1021}")).collect();
+        let chunks = chunk_values_by_bytes(&values);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), per_chunk);
+        assert_eq!(chunks[1].len(), 1);
     }
 
     #[test]
@@ -476,14 +561,19 @@ mod tests {
 
     #[test]
     fn test_state_event_filters_batching() {
+        // Each identifier costs exactly 1024 serialized bytes, so a chunk
+        // holds exactly FILTER_VALUE_BYTE_BUDGET / 1024 identifiers; build
+        // two full chunks plus a partial third.
+        let per_chunk = FILTER_VALUE_BYTE_BUDGET / 1024;
         let mut repos = HashSet::new();
-        for i in 0..250 {
-            repos.insert(format!("30617:pubkey{}:repo{}", i, i));
+        for i in 0..(2 * per_chunk + per_chunk / 2) {
+            let identifier = format!("{i:0>4}{}", "x".repeat(1021 - 4));
+            repos.insert(format!("30617:pubkey{i}:{identifier}"));
         }
 
         let filters = state_event_filters_for_our_repos(&repos, None);
 
-        // Should create 3 filters (250 identifiers = 100 + 100 + 50 = 3 chunks)
+        // Should create 3 byte-budgeted filters
         assert_eq!(filters.len(), 3);
     }
 

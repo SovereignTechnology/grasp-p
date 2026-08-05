@@ -736,6 +736,12 @@ fn compute_actions(
 
 ## Filter Building (Three-Layer Strategy)
 
+Chunk sizes, filters-per-REQ packing, and sync concurrency are bounded by
+relay-imposed limits (subscription budgets, message sizes, filter byte caps).
+The verified constraints and the budget model that justifies these numbers
+live in
+[Sync Scaling Constraints and Budgets](sync-scaling-constraints.md).
+
 ### Layer 1: Announcements
 
 - **Kinds**: 30617 (Repository Announcements), 30618 (Maintainer Lists)
@@ -746,14 +752,14 @@ fn compute_actions(
 ### Layer 2: Events Tagging Our Repos
 
 - **Tags**: lowercase `a`, uppercase `A`, and `q` tags for comprehensive coverage
-- **Batching**: Per 100 repo refs
+- **Batching**: Byte-budgeted (32 KB of serialized tag values per filter; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_repo_tag_filters(repos, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 
 ### Layer 3: Events Tagging Our Root Events
 
 - **Tags**: lowercase `e`, uppercase `E`, and `q` tags for comprehensive coverage
-- **Batching**: Per 100 event IDs
+- **Batching**: Byte-budgeted (32 KB of serialized tag values per filter, ~489 hex IDs; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 

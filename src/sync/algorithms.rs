@@ -5,7 +5,7 @@
 //! - `derive_relay_targets()` - Inverts RepoSyncIndex to per-relay view
 //! - `compute_actions()` - Three-way diff to determine new sync actions
 //!
-//! See `docs/explanation/grasp-02-proactive-sync-v4.md` for full design details.
+//! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 use std::collections::{HashMap, HashSet};
 

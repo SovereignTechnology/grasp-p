@@ -135,4 +135,6 @@ pub mod discovery;
 pub mod live_sync;
 pub mod maintainer_reprocessing;
 pub mod metrics;
+pub mod neg_concurrency;
+pub mod req_concurrency;
 pub mod tag_variations;
