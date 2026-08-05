@@ -89,7 +89,7 @@ These limits prevent individual connections from overwhelming the relay.
 - Tracks relays with persistent infrastructure issues (DNS, TLS, protocol errors)
 - Separate from normal connection failures
 - 12-hour expiration (configurable)
-- Reduces retry frequency for broken relays
+- Suppresses connection attempts until the entry expires
 
 **Rate Limit Detection:**
 - Detects when remote relay rate limits us

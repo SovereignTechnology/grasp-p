@@ -481,6 +481,14 @@ impl RelayHealthTracker {
     /// - The relay is healthy
     /// - The backoff period has elapsed
     pub fn should_attempt_connection(&self, relay_url: &str) -> bool {
+        if self
+            .naughty_list
+            .as_ref()
+            .is_some_and(|naughty_list| naughty_list.is_naughty(relay_url))
+        {
+            return false;
+        }
+
         let entry = self.health.get(relay_url);
 
         match entry {

@@ -276,7 +276,7 @@ ngit-grasp implements multiple layers of defense against abuse, spam, and denial
 
 **Relay Sync Protection (GRASP-02):**
 - **Exponential backoff** - Failed connections: 5s → 10s → 20s → ... → 1 hour max
-- **Naughty list** - Track relays with infrastructure issues separately (12h expiry)
+- **Naughty list** - Suppress relays with infrastructure issues until expiry (12h default)
 - **Rate limit detection** - Auto 65s cooldown when remote relays rate limit us
 - **Domain throttling** - Max 5 concurrent, 30/min per domain for git data fetching
 
