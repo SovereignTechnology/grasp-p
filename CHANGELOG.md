@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Kept proactive sync within each relay connection's active-subscription
+  allowance. Live subscriptions, negentropy rounds, historic and fallback
+  queries, pagination verification, and purgatory dependency polling now share
+  one per-session budget derived from NIP-11 with a conservative fallback.
+  Live coverage is consolidated first, capacity is reserved for control work,
+  and timed-out queries are closed relay-side before their slots are reused.
 - Fixed historic sync silently abandoning events a relay identified but failed
   to deliver. Negentropy reconciliation finds event IDs missing locally, but a
   relay's exact-ID response can return only a subset; for batches without
