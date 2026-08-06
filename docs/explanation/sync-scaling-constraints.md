@@ -296,13 +296,12 @@ set fails at runtime. Multi-connection sharding remains the later lever.
 
 A transient slot is released only after EOSE has caused CLOSE to be enqueued,
 after relay CLOSED, or after connection teardown. Because NIP-01 provides no
-CLOSE acknowledgement, the 120-second recovery path sends CLOSE and then tears
-down the connection; valid production startup pages exceeded 30 seconds, while
-two minutes remains a bounded escape from a stuck subscription. The first
-expired watchdog atomically retires the session ledger before awaiting
-disconnect; concurrent watchdogs take no further action. Completed teardown
-definitively closes the relay-side session before its slots return, and the
-manager reconnects normally. Exact-ID
+CLOSE acknowledgement, the 120-second recovery path sends CLOSE for only the
+timed-out subscription and releases only that subscription's generation-scoped
+slot after the SDK accepts the message; valid production startup pages exceeded
+30 seconds, while two minutes remains a bounded escape from a stuck
+subscription. If CLOSE cannot be enqueued, the slot remains held until ordinary
+connection teardown so local accounting cannot run ahead of the relay. Exact-ID
 purgatory polling uses the same transient class bound and shared ledger as
 historic pagination. Unexpected CLOSED for a persistent live subscription is
 reported to the manager, which recomputes and transactionally reopens complete
@@ -371,8 +370,8 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   filters, exact-ID fetches, retries, and pagination pages — retain a
   five-request class cap inside the shared ledger: a slot is acquired when
   the auto-close REQ is sent and released when its EOSE or CLOSED arrives
-  (with a 120 s watchdog that sends CLOSE and tears down an unresponsive
-  session before releasing). Live subscriptions are ledgered first, so NEG,
+  (with a 120 s watchdog that sends CLOSE for only the unresponsive
+  subscription before releasing its slot). Live subscriptions are ledgered first, so NEG,
   transient REQ,
   and purgatory exact-ID polling share only the remaining capacity.
 - Permit acquisition checks relay health first: while a rate-limit or
