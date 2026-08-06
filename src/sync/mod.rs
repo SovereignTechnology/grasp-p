@@ -4945,6 +4945,10 @@ impl SyncManager {
             "Pending batches drained; running deferred consolidation"
         );
         let _ = self.consolidate(relay_url).await;
+        // The AddFilters action that requested this consolidation was
+        // intentionally not admitted. Re-derive it now that the deferral has
+        // cleared so a quiet relay does not wait for an unrelated dirty signal.
+        self.recompute_new_sync_filters_for_relay(relay_url).await;
     }
 
     fn cancel_deferred_consolidation(&mut self, relay_url: &str, reason: &'static str) {
