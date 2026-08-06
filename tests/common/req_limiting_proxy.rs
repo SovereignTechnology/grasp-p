@@ -11,9 +11,9 @@
 //! The proxy models *awaiting-EOSE* occupancy — the quantity the client-side
 //! transient-REQ bound controls: a REQ joins the active set when it is
 //! opened and leaves it when the client sends CLOSE or the backend answers
-//! EOSE, whichever comes first. Live subscriptions (every filter carrying
-//! `limit: 0`) are exempt; they are persistent by design and budgeted
-//! separately.
+//! EOSE/CLOSED, whichever comes first. Live subscriptions (every filter
+//! carrying `limit: 0`) are exempt; they are persistent by design and
+//! budgeted separately.
 //!
 //! The proxy additionally:
 //! - records the peak number of concurrently open transient REQs, so tests
@@ -247,11 +247,13 @@ async fn proxy_connection(
                 let Some(message) = message else { break };
                 let message = message.map_err(|e| format!("backend read: {e}"))?;
                 if let Message::Text(text) = &message {
-                    if let Some(subid) = parse_backend_eose(text.as_str()) {
+                    if let Some((subid, is_eose)) = parse_backend_subscription_end(text.as_str()) {
                         if active.remove(&subid) {
-                            // Hold EOSE frames briefly so simultaneously
-                            // opened REQs provably overlap at the proxy.
-                            tokio::time::sleep(REQ_RESPONSE_DELAY).await;
+                            if is_eose {
+                                // Hold EOSE frames briefly so simultaneously
+                                // opened REQs provably overlap at the proxy.
+                                tokio::time::sleep(REQ_RESPONSE_DELAY).await;
+                            }
                         }
                     }
                 }
@@ -310,15 +312,32 @@ fn parse_client_frame(text: &str) -> Option<ClientFrame> {
     }
 }
 
-/// Extract the subscription id from a backend `["EOSE", <subid>]` frame.
-fn parse_backend_eose(text: &str) -> Option<String> {
-    if !text.starts_with("[\"EOSE") {
+/// Extract the subscription id from a definitive backend EOSE/CLOSED frame.
+fn parse_backend_subscription_end(text: &str) -> Option<(String, bool)> {
+    if !(text.starts_with("[\"EOSE") || text.starts_with("[\"CLOSED")) {
         return None;
     }
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let array = value.as_array()?;
-    if array.first()?.as_str()? != "EOSE" {
-        return None;
+    let kind = array.first()?.as_str()?;
+    Some((array.get(1)?.as_str()?.to_string(), kind == "EOSE"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_backend_subscription_end;
+
+    #[test]
+    fn backend_closed_definitively_releases_proxy_occupancy() {
+        assert_eq!(
+            parse_backend_subscription_end(
+                r#"["CLOSED","historic-id","rate-limited: too many queries"]"#
+            ),
+            Some(("historic-id".to_string(), false))
+        );
+        assert_eq!(
+            parse_backend_subscription_end(r#"["EOSE","historic-id"]"#),
+            Some(("historic-id".to_string(), true))
+        );
     }
-    Some(array.get(1)?.as_str()?.to_string())
 }
