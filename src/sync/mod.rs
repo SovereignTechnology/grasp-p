@@ -596,7 +596,12 @@ const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 /// full page for an exhausted filter. 200 keeps a 50-event margin under the
 /// tightest audited default while sparing filters with fewer than 200
 /// results the redundant final page. A relay capped below this threshold
-/// silently truncates history; no such deployment is known.
+/// silently truncates history. Known live exception (2026-08-06): Ditto
+/// Relay applies a 100-event default to filters that omit `limit` — which
+/// ours currently do — while accepting explicit limits up to its
+/// advertised NIP-11 `max_limit`; sending explicit limits on historic
+/// filters is the planned mitigation. See
+/// docs/explanation/sync-scaling-constraints.md.
 const PAGINATION_THRESHOLD: usize = 200;
 
 /// Conservative number of OR filters carried by one NIP-01 REQ.

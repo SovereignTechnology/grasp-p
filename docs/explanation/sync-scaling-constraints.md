@@ -163,20 +163,19 @@ explicit request where they differ. This matters for pagination: nostream and
 Ditto normally return 500 and 100 respectively when `limit` is omitted even
 though they advertise the larger accepted `max_limit`.
 
-#### Admission and rate limits
+#### Admission and rate limits (condensed)
 
-| Implementation | Default rate/admission rules | State decay or expiry |
-| --- | --- | --- |
-| nostr-sdk `LocalRelay` 0.45.0 | Per connection: 120 query messages/min, 30 AUTH events/min, 300 text messages/min; event writes 60/min | Minute-window limiters; configuration is per connection (published crate `local_relay/builder.rs:27-46,277-284`) |
-| strfry 1.1.1 | No native connection/IP/message/event rate limiter | None; deployment proxy or write-policy plugin may add one ([`TODO:13-15`](https://github.com/hoytech/strfry/blob/1.1.1/TODO#L13-L15)) |
-| nostr-rs-relay 0.10.0 | Disabled by default; optional global event-write rate and per-client subscription-creation rate | Governor token buckets averaged over one minute; tokens refill continuously ([`config.rs:64-79,311-324`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/config.rs#L64-L79), [`server.rs:1107-1117`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/server.rs#L1107-L1117)) |
-| khatru v0.19.1 | None unless policies are installed. Optional `ApplySaneDefaults`: per IP, 10-event burst draining 2 every 3 min; 100-filter burst draining 20/min; 100 connection attempts draining 1 every 5 min | Discrete leaky counters; idle keys disappear after about 15 min, 5 min, and 500 min respectively ([`sane_defaults.go:9-22`](https://github.com/fiatjaf/khatru/blob/v0.19.1/policies/sane_defaults.go#L9-L22), [`helpers.go:10-41`](https://github.com/fiatjaf/khatru/blob/v0.19.1/policies/helpers.go#L10-L41)) |
-| relayer v2.2.14 | Disabled by default; optional per-connection message limiter with configurable requests/second and burst | Standard Go token bucket with continuous refill; no fixed expiry ([`start.go:201-216`](https://github.com/fiatjaf/relayer/blob/v2.2.14/start.go#L201-L216)) |
-| nostream v3.0.0 | Per IP: 12 connection attempts/s and 48/min; 240 raw messages/min. Event rules are kind-specific (6–60/min) plus 720/hour overall | Default EWMA: each configured period is the half-life, so pressure decays rather than expiring at a boundary; optional sliding-window mode ([`default-settings.yaml:92-125,161-227`](https://github.com/Cameri/nostream/blob/v3.0.0/resources/default-settings.yaml#L92-L125), [`CONFIGURATION.md:154-167`](https://github.com/Cameri/nostream/blob/v3.0.0/CONFIGURATION.md#L154-L167)) |
-| rnostr v0.4.9 | Disabled by default; optional per-IP, optionally kind-scoped event quotas | Governor token bucket: burst equals the configured limit and refills continuously across its period; stale keys are swept every 60 s by default ([`rnostr.example.toml:105-136`](https://github.com/rnostr/rnostr/blob/v0.4.9/rnostr.example.toml#L105-L136), [`rate_limiter.rs:113-122,183-191`](https://github.com/rnostr/rnostr/blob/v0.4.9/extensions/src/rate_limiter.rs#L113-L122)) |
-| chorus v2.0.2 | Per connection, both directions: 16 MiB byte burst refilled at 1 MiB/s; closes on exhaustion. Five simultaneous connections/IP. At least 1 s reconnect ban after disconnect | Token bucket fully recovers from empty in 16 s; connection count releases on disconnect; reconnect ban has a configured/adaptive duration ([`chorus.toml:285-330`](https://github.com/mikedilger/chorus/blob/v2.0.2/contrib/chorus.toml#L285-L330)) |
-| haven v1.2.2 | Per-IP event and connection-attempt leaky counters, separately configurable for private/chat/inbox/outbox endpoints; e.g. each connection bucket bursts to 9 and drains 3 every 1–5 min | Same discrete khatru leaky-counter model; a full connection bucket clears in 3–15 min depending on endpoint ([`limits.go:59-102`](https://github.com/bitvora/haven/blob/v1.2.2/limits.go#L59-L102), [`init.go:126-138`](https://github.com/bitvora/haven/blob/v1.2.2/init.go#L126-L138)) |
-| Ditto Relay 0.1.0 (`cf34437`) | No native connection/IP/message/event rate limiter found; hard caps above still apply | None in the relay; deployment infrastructure may add limits |
+Native rate limiting varies wildly and is invisible to clients. Our own
+embedded relay enforces per-connection per-minute quotas (120 queries, 300
+text messages, 60 event writes); nostream ships per-IP connection-attempt
+and kind-specific event quotas with EWMA decay; khatru and haven offer
+discrete leaky counters that drain over minutes; nostr-rs-relay, relayer,
+and rnostr have token-bucket limiters that are disabled by default; chorus
+budgets raw bytes per connection (16 MiB burst, 1 MiB/s refill), caps
+five simultaneous connections per IP, and bans immediate reconnects;
+strfry and Ditto have no native limiter at all, deferring to deployment
+infrastructure. The full survey with citations is preserved in this
+file's history (commit `9723ff4`).
 
 NIP-11 describes hard relay limitations, not rate-limit algorithms. The
 standard fields relevant here are `max_limit`, `max_filters`, and
@@ -202,23 +201,41 @@ Consequences:
   for an exhausted filter.
 - A relay capping a filter below 200, or enforcing an aggregate per-REQ
   cap, silently truncates history. No audited implementation has an
-  aggregate cap; the remaining risk is a deliberately restrictive,
-  non-default strfry or rnostr configuration.
+  aggregate cap. **Known live exception (2026-08-06): Ditto Relay applies
+  a 100-event default to filters that omit `limit`** — which ours
+  currently do — while accepting explicit limits up to its advertised
+  `max_limit` (1000). Against a Ditto relay, filters with more than 100
+  results are silently truncated until historic filters carry an explicit
+  `limit`. Note that NIP-11 `max_limit` cannot reveal this: it advertises
+  the largest *accepted* request, not the default applied when `limit` is
+  omitted. Beyond Ditto, the remaining risk is a deliberately
+  restrictive, non-default strfry or rnostr configuration.
 - The price of the floor is one redundant page for any filter whose result
   count lands between 200 and the relay's actual cap. The threshold was
   raised from its original ultra-conservative 75 once the audit
   established the real floor; filters with 75–199 results no longer pay
   the extra page.
-- Future lever (not implemented): where NIP-11 advertises `max_limit`
-  (strfry, nostream, rnostr do), use it as a per-relay threshold, with
-  observed page sizes as fallback evidence and 200 as the static floor.
+- Planned lever (not implemented): send an explicit `limit` on historic
+  filters — `min(page size, advertised max_limit)` where NIP-11 provides
+  one (strfry, nostream, rnostr, Ditto do) — so implicit defaults like
+  Ditto's 100 never apply, and use the advertised value as a per-relay
+  threshold with 200 as the static floor. Caveat: nostream *rejects* a
+  REQ whose requested limit exceeds its configured `maxLimit` rather than
+  clamping it, so explicit limits must respect advertised values where
+  present and stay modest otherwise.
 
 ### Working floors
 
 Derived from the tightest commonly observed values; all sizing below assumes:
 
-- **Subscription budget B = 20** per connection (nos.lol, relay.primal.net),
-  shared between live REQs, NEG rounds, and fallback REQs.
+- **Subscription budget B = 20** per connection (nos.lol, relay.primal.net,
+  Ditto Relay default), shared between live REQs, NEG rounds, and fallback
+  REQs. Caveat found by the 2026-08-06 limit matrix: nostream defaults to
+  **10** subscriptions per connection and 10 filters per REQ (both
+  advertised in NIP-11), below this floor — the fixed 4 NEG + 5 REQ + 2
+  margin pattern alone would overdraw a default nostream before any live
+  subscriptions. Honouring advertised `max_subscriptions`/`max_filters`
+  is therefore required ledger work, not just an optimisation.
 - **Message budget M = 128 KB** (nos.lol); we target ≤ 96 KB of filter payload
   per message, a 1.3× margin for the envelope.
 - **Per-filter value budget 32 KB** (half of strfry's 65535-byte set cap;
@@ -328,8 +345,11 @@ escalation path when a relay's watched set can no longer fit:
 Costs and risks, which is why it is last:
 
 - Per-IP connection caps exist but are not advertised anywhere; exceeding
-  them looks like abuse and risks bans. Bound connections per relay (≤ 4) and
-  scale in with hysteresis.
+  them looks like abuse and risks bans. The tightest native cap found by
+  the 2026-08-06 limit matrix is chorus at five simultaneous connections
+  per IP (with a reconnect ban of at least one second), so the ≤ 4 bound
+  now has source evidence rather than being pure caution. Bound
+  connections per relay (≤ 4) and scale in with hysteresis.
 - Each connection re-authenticates (NIP-42) and carries its own health state,
   file descriptor, and TLS/session overhead.
 - Filter-to-connection assignment must be deterministic (stable sharding of
