@@ -30,6 +30,9 @@ use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSourc
 /// exchange alive indefinitely by continuing to send reconciliation messages.
 const NEGENTROPY_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// NIP-11 is advisory and must not hold up a connected relay indefinitely.
+const NIP11_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Cooldown schedule for transient negentropy failures.
 ///
 /// Indexed by the number of consecutive failed attempts (capped at the last
@@ -409,6 +412,57 @@ impl RelayConnection {
 
         tracing::info!(url = %self.url, "Connected to relay");
         Ok(())
+    }
+
+    /// Fetch the omitted-limit page-size hint advertised by this connection's relay.
+    ///
+    /// This is deliberately fetched for every WebSocket session rather than cached on the
+    /// long-lived `RelayConnection`: operators can change their cap between reconnects. Only
+    /// NIP-11 `default_limit` is returned. `max_limit` describes explicit `limit` values and is
+    /// not applicable to the historic filters we intentionally send without one.
+    pub async fn fetch_default_limit(&self) -> Option<usize> {
+        let mut document_url = reqwest::Url::parse(&self.url).ok()?;
+        let http_scheme = match document_url.scheme() {
+            "ws" => "http",
+            "wss" => "https",
+            _ => return None,
+        };
+        document_url.set_scheme(http_scheme).ok()?;
+
+        let fetch = async {
+            let response = reqwest::Client::new()
+                .get(document_url)
+                .header(reqwest::header::ACCEPT, "application/nostr+json")
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                tracing::debug!(
+                    relay = %self.url,
+                    status = %response.status(),
+                    "NIP-11 fetch returned a non-success status"
+                );
+                return Ok(None);
+            }
+            response.text().await.map(Some)
+        };
+        let body = match tokio::time::timeout(NIP11_FETCH_TIMEOUT, fetch).await {
+            Ok(Ok(Some(body))) => body,
+            Ok(Ok(None)) => return None,
+            Ok(Err(error)) => {
+                tracing::debug!(relay = %self.url, error = %error, "NIP-11 fetch failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!(relay = %self.url, "NIP-11 fetch timed out");
+                return None;
+            }
+        };
+        let document = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok()?;
+        document
+            .limitation
+            .and_then(|limitation| limitation.default_limit)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
     }
 
     /// Run the event loop, sending events through the provided channel

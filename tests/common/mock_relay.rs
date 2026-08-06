@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
-use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
+use hyper::header::{ACCEPT, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -66,25 +66,55 @@ pub struct MockRelay {
     relay: LocalRelay,
 }
 
+#[derive(Clone, Copy)]
+struct PaginationConfig {
+    page_size: usize,
+    advertised_default_limit: Option<usize>,
+    advertised_max_limit: Option<usize>,
+}
+
 impl MockRelay {
     /// Start a mock relay on a random free port.
     ///
     /// The relay accepts all events without validation and stores them
     /// in an in-memory database.
     pub async fn start() -> Self {
-        Self::start_with_rate_limit(RateLimit::default()).await
+        Self::start_with_rate_limit(RateLimit::default(), None).await
     }
 
     /// Start a mock relay with a custom per-connection active REQ limit.
     pub async fn start_with_max_reqs(max_reqs: usize) -> Self {
-        Self::start_with_rate_limit(RateLimit {
-            max_reqs,
-            ..RateLimit::default()
-        })
+        Self::start_with_rate_limit(
+            RateLimit {
+                max_reqs,
+                ..RateLimit::default()
+            },
+            None,
+        )
         .await
     }
 
-    async fn start_with_rate_limit(rate_limit: RateLimit) -> Self {
+    /// Start a relay whose omitted-limit pages and NIP-11 hints can be varied independently.
+    pub async fn start_with_pagination(
+        page_size: usize,
+        advertised_default_limit: Option<usize>,
+        advertised_max_limit: Option<usize>,
+    ) -> Self {
+        Self::start_with_rate_limit(
+            RateLimit::default(),
+            Some(PaginationConfig {
+                page_size,
+                advertised_default_limit,
+                advertised_max_limit,
+            }),
+        )
+        .await
+    }
+
+    async fn start_with_rate_limit(
+        rate_limit: RateLimit,
+        pagination: Option<PaginationConfig>,
+    ) -> Self {
         // Create and bind listener (eliminates port race condition)
         let std_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
@@ -100,7 +130,7 @@ impl MockRelay {
         let listener =
             TcpListener::from_std(std_listener).expect("Failed to convert to tokio listener");
 
-        Self::start_with_listener(listener, port, rate_limit).await
+        Self::start_with_listener(listener, port, rate_limit, pagination).await
     }
 
     /// Start a mock relay on a specific port.
@@ -109,13 +139,25 @@ impl MockRelay {
         let listener = TcpListener::bind(addr)
             .await
             .expect("Failed to bind to address");
-        Self::start_with_listener(listener, port, RateLimit::default()).await
+        Self::start_with_listener(listener, port, RateLimit::default(), None).await
     }
 
     /// Internal method to start the relay with an existing listener.
-    async fn start_with_listener(listener: TcpListener, port: u16, rate_limit: RateLimit) -> Self {
+    async fn start_with_listener(
+        listener: TcpListener,
+        port: u16,
+        rate_limit: RateLimit,
+        pagination: Option<PaginationConfig>,
+    ) -> Self {
         // Create a simple relay with no write policy (accepts all events)
-        let relay = LocalRelayBuilder::default().rate_limit(rate_limit).build();
+        let mut builder = LocalRelayBuilder::default().rate_limit(rate_limit);
+        if let Some(config) = pagination {
+            builder = builder
+                .default_filter_limit(config.page_size)
+                .max_filter_limit(config.page_size.max(1000))
+                .max_query_results(config.page_size.max(1000));
+        }
+        let relay = builder.build();
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -130,12 +172,15 @@ impl MockRelay {
                         match accept_result {
                             Ok((stream, remote_addr)) => {
                                 let relay = server_relay.clone();
+                                let pagination = pagination;
                                 let io = TokioIo::new(stream);
 
                                 tokio::spawn(async move {
                                     let service = service_fn(move |req| {
                                         let relay = relay.clone();
-                                        async move { handle_request(req, relay, remote_addr).await }
+                                        async move {
+                                            handle_request(req, relay, remote_addr, pagination).await
+                                        }
                                     });
 
                                     if let Err(e) = http1::Builder::new()
@@ -215,6 +260,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     relay: LocalRelay,
     addr: SocketAddr,
+    pagination: Option<PaginationConfig>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check for WebSocket upgrade request
     let is_websocket = req
@@ -255,6 +301,30 @@ async fn handle_request(
                 .body(Full::new(Bytes::new()))
                 .unwrap());
         }
+    }
+
+    if req
+        .headers()
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/nostr+json"))
+    {
+        let limitation = pagination.map(|config| {
+            serde_json::json!({
+                "default_limit": config.advertised_default_limit,
+                "max_limit": config.advertised_max_limit,
+            })
+        });
+        let document = serde_json::json!({
+            "name": "pagination test relay",
+            "supported_nips": [1, 11],
+            "limitation": limitation,
+        });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/nostr+json")
+            .body(Full::new(Bytes::from(document.to_string())))
+            .unwrap());
     }
 
     // Non-WebSocket request - return simple response

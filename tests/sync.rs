@@ -31,6 +31,7 @@ mod common;
 
 // Include sync test submodules (located in tests/sync/)
 mod sync {
+    pub mod adaptive_pagination;
     pub mod catchup;
     pub mod discovery;
     pub mod historic_recovery;
