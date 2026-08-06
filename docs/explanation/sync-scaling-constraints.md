@@ -71,12 +71,16 @@ The five reachable relays advertise their result cap as
 ### Discoverability gap (NIP-11)
 
 NIP-11 `limitation` has **no field for tag values per filter**. It does define
-`max_filters` (filters per subscription) and `max_limit` (query results), in
-addition to `max_subscriptions` and `max_message_length`, but implementations
-and operators advertise these unevenly. `max_limit` also cannot express
-whether the allowance is per filter or aggregate across a multi-filter REQ.
-Consequently neither filter sizing nor the pagination model can be negotiated
-reliably; both need conservative defaults and reactive fallback.
+`max_filters` (filters per subscription), `max_limit` (clamp applied to a
+filter's explicit `limit`), and `default_limit` (maximum returned events when
+`limit` is omitted — the field pagination actually needs), in addition to
+`max_subscriptions` and `max_message_length`, but implementations and
+operators advertise these unevenly: `default_limit` in particular is rarely
+present (neither nos.lol nor relay.ditto.pub advertises it, checked live
+2026-08-06). `max_limit` also cannot express whether the allowance is per
+filter or aggregate across a multi-filter REQ. Consequently neither filter
+sizing nor the pagination model can be negotiated reliably; both need
+conservative defaults, observation, and reactive fallback.
 
 ### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0)
 
@@ -215,14 +219,38 @@ Consequences:
   raised from its original ultra-conservative 75 once the audit
   established the real floor; filters with 75–199 results no longer pay
   the extra page.
-- Planned lever (not implemented): send an explicit `limit` on historic
-  filters — `min(page size, advertised max_limit)` where NIP-11 provides
-  one (strfry, nostream, rnostr, Ditto do) — so implicit defaults like
-  Ditto's 100 never apply, and use the advertised value as a per-relay
-  threshold with 200 as the static floor. Caveat: nostream *rejects* a
-  REQ whose requested limit exceeds its configured `maxLimit` rather than
-  clamping it, so explicit limits must respect advertised values where
-  present and stay modest otherwise.
+- Planned design (accepted 2026-08-06, not implemented): keep omitting
+  `limit` — an explicit limit would cap the relays that serve unbounded
+  pages — fix the counting, and adapt the threshold per relay:
+  1. **Count raw delivered events.** Today only events processed as
+     Saved or Duplicate count toward the threshold and the `until`
+     cursor, so purgatory-routed and rejected events consume relay
+     allowance invisibly; this is the sole reason thresholds need
+     margin. Counting every delivered event that matches the filter
+     (and cursoring on them) makes a truncated page count exactly the
+     relay's page size.
+  2. **Adaptive per-relay threshold:**
+     `estimated_cap = max(largest observed page, advertised
+     default_limit if present)`;
+     `threshold = max(90, floor(0.9 × estimated_cap))`. Observed pages
+     are ground truth (always ≤ the true cap, so never unsafe, and
+     converging upward to eliminate redundant pages); the 0.9 slack
+     absorbs relay-side shrinkage such as expired-event skipping; the
+     floor of 90 stays below Ditto's 100, the smallest default found.
+     Learned state is per connection session and NIP-11 is refetched on
+     reconnect, so an operator lowering their cap cannot strand a stale
+     threshold.
+  3. **NIP-11 fields:** `default_limit` ("maximum returned events if
+     you send a filter without a limit") is the standard field for
+     exactly this and is used as a hint when advertised — though
+     rarely: neither nos.lol nor relay.ditto.pub advertises it (checked
+     live 2026-08-06). Being self-reported, a wrong-high value is
+     unsafe, so the first page that the hint would declare exhausted
+     triggers one verification page; if it yields new events the hint
+     is discarded in favour of learned-only. `max_limit` must never
+     raise the threshold while requests omit `limit`: it bounds
+     accepted explicit requests, not the omitted-limit page size
+     (Ditto: 1000 advertised vs 100 served; nostream: 5000 vs 500).
 
 ### Working floors
 

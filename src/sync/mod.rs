@@ -598,10 +598,12 @@ const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 /// results the redundant final page. A relay capped below this threshold
 /// silently truncates history. Known live exception (2026-08-06): Ditto
 /// Relay applies a 100-event default to filters that omit `limit` — which
-/// ours currently do — while accepting explicit limits up to its
-/// advertised NIP-11 `max_limit`; sending explicit limits on historic
-/// filters is the planned mitigation. See
-/// docs/explanation/sync-scaling-constraints.md.
+/// ours do — while advertising only its larger explicit-request cap in
+/// NIP-11. The accepted mitigation (not yet implemented) is to count raw
+/// delivered events instead of only Saved/Duplicate ones and adapt the
+/// threshold per relay from observed page sizes and advertised
+/// `default_limit`, with a floor of 90. See "Per-query result limits and
+/// the pagination model" in docs/explanation/sync-scaling-constraints.md.
 const PAGINATION_THRESHOLD: usize = 200;
 
 /// Conservative number of OR filters carried by one NIP-01 REQ.
