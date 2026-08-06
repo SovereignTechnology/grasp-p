@@ -77,9 +77,61 @@ with reactive fallback as the backstop.
 - Negentropy: **no concurrency limit at all** (upstream `TODO`), 60000-byte
   frame limit per NEG message.
 - No limits on filters per REQ or tag values per filter.
+- Query result limits (verified 2026-08-06 against the published
+  `nostr-sdk-0.45.0` crate source, `src/local_relay/local/inner.rs`):
+  enforced **per filter, not per REQ**. A filter without a `limit` is given
+  `default_filter_limit` (500); the effective limit is then clamped to
+  `min(limit, max_filter_limit, max_query_results)` (defaults: no
+  `max_filter_limit`, `max_query_results` = 500). Each filter is queried
+  independently and the merged, deduplicated results are sent **without
+  aggregate truncation** — a source comment suggests the merged set is also
+  capped, but the implementation does not do this.
+- Behaviour change from 0.45.0-alpha.8 and earlier: a filter without an
+  explicit `limit` previously returned *every* match; stable 0.45.0 returns
+  at most the newest 500 per filter, so large backlogs arrive via
+  pagination instead of one unbounded response.
 
 khatru (used by the ngit-relay reference implementation) and nostr-rs-relay
 similarly enforce no filter-size limits by default.
+
+### Per-query result limits and the pagination model
+
+NIP-01 defines `limit` per filter, for the initial query only, and lets
+relays return fewer events than requested. It neither guarantees that each
+filter in a multi-filter REQ receives an independent result allowance nor
+forbids an aggregate cap across the whole REQ. Which model a relay
+implements is an empirical question, and it decides whether grouped
+REQ+EOSE pagination (per-filter `until` cursors inside one grouped
+subscription) is safe.
+
+Evidence so far:
+
+- **nostr-sdk `LocalRelay` 0.45.0 — verified per-filter** (see above).
+  During the 0.45.0 upgrade an aggregate merged-result cap was suspected;
+  inspection of the published crate source ruled it out.
+- **strfry, khatru, nostr-rs-relay, others — assumed per-filter,
+  unaudited.** Per-filter clamping is the natural implementation shape, but
+  we have not verified it against sources. An implementation audit is
+  pending; record findings here with version and file:line citations.
+
+The client encodes this model in `PAGINATION_THRESHOLD` (75,
+`src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 75 events is
+treated as possibly-truncated and fetched again with `until` set to its
+oldest seen `created_at`; below 75 it is treated as exhausted.
+Consequences:
+
+- Correct against any relay whose effective per-filter cap is ≥ 75. The
+  value sits deliberately far below every known default (500) so that no
+  plausible operator configuration falls under it.
+- A relay capping a filter below 75, or enforcing an aggregate per-REQ
+  cap, would silently truncate history. No such implementation is
+  currently known; the audit exists to keep that claim evidence-based
+  rather than assumed.
+- The price of the conservative floor is one redundant page for any filter
+  whose result count lands between 75 and the relay's actual cap. Future
+  lever (not implemented): learn each relay's effective cap from the
+  largest pages it returns and raise the assumed limit toward it, shrinking
+  the redundant-page window while keeping 75 as the safe floor.
 
 ### Working floors
 
