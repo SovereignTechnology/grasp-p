@@ -101,11 +101,10 @@ const MAX_CONCURRENT_TRANSIENT_REQS: usize = 5;
 /// Permits are normally released when the subscription's EOSE (or CLOSED)
 /// arrives. A relay that never answers would otherwise pin its permits
 /// forever and starve every later transient subscription on the
-/// connection, so a watchdog requests CLOSE after this deadline (twice the
-/// negentropy round timeout, generous for large REQ pages). Because NIP-01
-/// has no CLOSE acknowledgement, the watchdog tears down the connection after
-/// requesting CLOSE; teardown is the only definitive acknowledgement that the
-/// relay released every subscription in the session.
+/// connection, so a watchdog sends CLOSE after this deadline (twice the
+/// negentropy round timeout, generous for large REQ pages). The slot is
+/// returned only after CLOSE is successfully enqueued; a send failure retains
+/// it until ordinary connection teardown.
 // Production startup pages on relay.ngit.dev legitimately exceeded 30 seconds;
 // allow two minutes before treating a missing EOSE/CLOSED as a stuck session.
 const TRANSIENT_REQ_PERMIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -275,8 +274,6 @@ pub struct RelayConnection {
     /// One ledger shared by every relay-side subscription consumer. The
     /// semaphore contains B minus the reserved margin for this session.
     subscription_budget: std::sync::Arc<std::sync::Mutex<SubscriptionLedgerSession>>,
-    /// Generation whose watchdog owns session teardown, or u64::MAX when none.
-    watchdog_teardown_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Usable capacity configured for the current session.
     subscription_usable_slots: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Bounds concurrent transient (auto-close) REQ subscriptions on this
@@ -352,9 +349,6 @@ impl RelayConnection {
                     )),
                 },
             )),
-            watchdog_teardown_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                u64::MAX,
-            )),
             subscription_usable_slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
             )),
@@ -409,9 +403,6 @@ impl RelayConnection {
                         FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
                     )),
                 },
-            )),
-            watchdog_teardown_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                u64::MAX,
             )),
             subscription_usable_slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
@@ -604,8 +595,6 @@ impl RelayConnection {
             generation: session.generation.wrapping_add(1),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(usable)),
         };
-        self.watchdog_teardown_generation
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
         tracing::info!(
             relay = %self.url,
             subscription_budget = budget,
@@ -685,41 +674,6 @@ impl RelayConnection {
             .lock()
             .expect("subscription ledger poisoned")
             .generation
-    }
-
-    /// Atomically claim teardown for one session and retire its ledger before
-    /// any asynchronous disconnect work. Only the first watchdog for the
-    /// current generation can succeed.
-    fn begin_watchdog_teardown(&self, generation: u64) -> bool {
-        if self
-            .watchdog_teardown_generation
-            .compare_exchange(
-                u64::MAX,
-                generation,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-
-        let mut session = self
-            .subscription_budget
-            .lock()
-            .expect("subscription ledger poisoned");
-        if session.generation != generation {
-            let _ = self.watchdog_teardown_generation.compare_exchange(
-                generation,
-                u64::MAX,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            );
-            return false;
-        }
-        session.semaphore.close();
-        session.generation = session.generation.wrapping_add(1);
-        true
     }
 
     pub fn live_filter_groups(&self) -> Vec<Vec<Filter>> {
@@ -1338,13 +1292,13 @@ impl RelayConnection {
             .expect("transient permit map poisoned")
             .insert(sub_id.clone(), permit);
 
-        // Watchdog: request relay-side closure for a REQ that never sends
-        // EOSE or CLOSED. NIP-01 CLOSE has no acknowledgement, so force a
-        // session teardown after CLOSE; only completed disconnect makes it
-        // safe to return the local slot and let the manager reconnect.
+        // A timed-out REQ is closed individually. NIP-01 defines CLOSE as the
+        // client-side end of a subscription, so a successfully enqueued CLOSE
+        // is the accounting boundary after which this one slot can be reused.
+        // If CLOSE cannot be sent, retain the permit until ordinary connection
+        // teardown clears it; local capacity must not run ahead of the relay.
         let held = std::sync::Arc::clone(&self.transient_req_permits_held);
         let client = self.client.clone();
-        let teardown = self.clone();
         let url = self.url.clone();
         let relay_url = self.url.clone();
         tokio::spawn(async move {
@@ -1354,17 +1308,29 @@ impl RelayConnection {
                 .expect("transient permit map poisoned")
                 .get(&sub_id)
                 .map(|permits| permits.generation);
-            if generation.is_some_and(|generation| teardown.begin_watchdog_teardown(generation)) {
-                if let Ok(Some(relay)) = client.relay(&url).await {
-                    let _ = relay.send_msg(ClientMessage::close(sub_id.clone())).await;
+            if let (Some(generation), Ok(Some(relay))) = (generation, client.relay(&url).await) {
+                if relay
+                    .send_msg(ClientMessage::close(sub_id.clone()))
+                    .await
+                    .is_ok()
+                {
+                    Self::release_transient_req_permit_for_generation(
+                        &held,
+                        &sub_id,
+                        generation,
+                    );
+                    tracing::warn!(
+                        relay = %relay_url,
+                        sub_id = %sub_id,
+                        "Transient REQ watchdog sent CLOSE after missing EOSE/CLOSED"
+                    );
+                } else {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        sub_id = %sub_id,
+                        "Transient REQ watchdog could not send CLOSE; retaining subscription slot"
+                    );
                 }
-                client.disconnect().await;
-                held.lock().expect("transient permit map poisoned").clear();
-                tracing::warn!(
-                    relay = %relay_url,
-                    sub_id = %sub_id,
-                    "Transient REQ watchdog forced session teardown after missing EOSE/CLOSED"
-                );
             }
         });
     }
@@ -1375,6 +1341,23 @@ impl RelayConnection {
             .lock()
             .expect("transient permit map poisoned")
             .remove(sub_id);
+    }
+
+    fn release_transient_req_permit_for_generation(
+        held: &TransientReqPermitMap,
+        sub_id: &SubscriptionId,
+        generation: u64,
+    ) -> bool {
+        let mut permits = held.lock().expect("transient permit map poisoned");
+        if permits
+            .get(sub_id)
+            .is_some_and(|permit| permit.generation == generation)
+        {
+            permits.remove(sub_id);
+            true
+        } else {
+            false
+        }
     }
 
     async fn close_and_release_transient_req_permit(&self, sub_id: &SubscriptionId) {
@@ -2357,13 +2340,14 @@ mod tests {
         drop(full_capacity);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn watchdog_forces_teardown_and_restores_progress() {
+    #[tokio::test]
+    async fn watchdog_release_is_scoped_to_the_subscription_generation() {
         let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
         connection.reset_subscription_budget(Some(10));
         let sub_id = SubscriptionId::new("watchdog-retains-slot");
+        let generation = connection.current_subscription_generation();
         let held = HeldTransientPermits {
-            generation: connection.current_subscription_generation(),
+            generation,
             _class_cap: connection
                 .transient_req_permits
                 .clone()
@@ -2377,58 +2361,25 @@ mod tests {
                 .expect("reserve ledger slot"),
         };
         connection.hold_transient_req_permit(sub_id.clone(), held);
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(TRANSIENT_REQ_PERMIT_TIMEOUT + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
 
         assert!(
-            connection
-                .transient_req_permits_held
-                .lock()
-                .expect("transient permit map poisoned")
-                .is_empty(),
-            "completed session teardown must release watchdog ownership"
+            !RelayConnection::release_transient_req_permit_for_generation(
+                &connection.transient_req_permits_held,
+                &sub_id,
+                generation.wrapping_add(1),
+            ),
+            "a stale watchdog must not release a newer session's slot"
+        );
+        assert!(
+            RelayConnection::release_transient_req_permit_for_generation(
+                &connection.transient_req_permits_held,
+                &sub_id,
+                generation,
+            ),
+            "the matching watchdog must release its closed subscription"
         );
         assert_eq!(connection.transient_req_permits.available_permits(), 5);
         assert_eq!(connection.subscription_budget().available_permits(), 8);
-    }
-
-    #[tokio::test]
-    async fn simultaneous_watchdogs_have_one_teardown_owner_and_close_admission() {
-        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
-        connection.reset_subscription_budget(Some(10));
-        let generation = connection.current_subscription_generation();
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
-        let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let connection = connection.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            let winners = std::sync::Arc::clone(&winners);
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                if connection.begin_watchdog_teardown(generation) {
-                    winners.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }));
-        }
-        barrier.wait().await;
-        for task in tasks {
-            task.await.expect("watchdog contender");
-        }
-
-        assert_eq!(winners.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(
-            connection.current_subscription_generation(),
-            generation.wrapping_add(1),
-            "the sole owner retires exactly one session generation"
-        );
-        let error = match connection.acquire_subscription_slots(1).await {
-            Ok(_) => panic!("teardown must close admission before disconnect awaits"),
-            Err(error) => error,
-        };
-        assert!(error.contains("session retired"), "{error}");
     }
 
     #[test]
