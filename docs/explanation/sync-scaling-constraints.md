@@ -198,11 +198,11 @@ Consequences:
 
 - Correct against any relay whose effective per-filter cap is ≥ 200. The
   smallest audited defaults are 250 (haven/Badger) and 300 (rnostr); the
-  gap below 250 is deliberate margin, because only events processed as
-  Saved or Duplicate count toward the threshold — events routed to
-  purgatory or rejected consume the relay's allowance without being
-  counted, so a threshold equal to a relay's cap would mistake a full page
-  for an exhausted filter.
+  current gap below 250 is no longer required for event-accounting safety:
+  every raw delivery matching a tracked filter now counts before
+  deduplication or write-policy processing. Purgatory-routed, rejected, and
+  repeated events therefore consume both the relay's allowance and our page
+  count, and the `until` cursor is derived from that same raw stream.
 - A relay capping a filter below 200, or enforcing an aggregate per-REQ
   cap, silently truncates history. No audited implementation has an
   aggregate cap. **Known live exception (2026-08-06): Ditto Relay applies
@@ -219,16 +219,13 @@ Consequences:
   raised from its original ultra-conservative 75 once the audit
   established the real floor; filters with 75–199 results no longer pay
   the extra page.
-- Planned design (accepted 2026-08-06, not implemented): keep omitting
+- Implementation in progress (design accepted 2026-08-06): keep omitting
   `limit` — an explicit limit would cap the relays that serve unbounded
-  pages — fix the counting, and adapt the threshold per relay:
-  1. **Count raw delivered events.** Today only events processed as
-     Saved or Duplicate count toward the threshold and the `until`
-     cursor, so purgatory-routed and rejected events consume relay
-     allowance invisibly; this is the sole reason thresholds need
-     margin. Counting every delivered event that matches the filter
-     (and cursoring on them) makes a truncated page count exactly the
-     relay's page size.
+  pages — count raw deliveries, and adapt the threshold per relay:
+  1. **Count raw delivered events (implemented).** Every delivered event
+     that matches a tracked filter is counted before deduplication and write
+     policy, and the cursor uses the same stream. Purgatory-routed, rejected,
+     and repeated events can no longer consume relay allowance invisibly.
   2. **Adaptive per-relay threshold:**
      `estimated_cap = max(largest observed page, advertised
      default_limit if present)`;

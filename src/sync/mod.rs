@@ -597,21 +597,17 @@ const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 /// always applied per filter, never in aggregate across a REQ, with the
 /// smallest finite default caps at 250 (haven/Badger) and 300 (rnostr).
 ///
-/// The threshold must sit below the smallest cap we may meet, with margin:
-/// only events processed as Saved or Duplicate are counted here, so events
-/// routed to purgatory or rejected consume the relay's allowance without
-/// being counted, and a threshold equal to a relay's cap would mistake a
-/// full page for an exhausted filter. 200 keeps a 50-event margin under the
-/// tightest audited default while sparing filters with fewer than 200
-/// results the redundant final page. A relay capped below this threshold
-/// silently truncates history. Known live exception (2026-08-06): Ditto
-/// Relay applies a 100-event default to filters that omit `limit` — which
-/// ours do — while advertising only its larger explicit-request cap in
-/// NIP-11. The accepted mitigation (not yet implemented) is to count raw
-/// delivered events instead of only Saved/Duplicate ones and adapt the
-/// threshold per relay from observed page sizes and advertised
-/// `default_limit`, with a floor of 90. See "Per-query result limits and
-/// the pagination model" in docs/explanation/sync-scaling-constraints.md.
+/// Every raw delivery matching a tracked filter counts, before write-policy
+/// processing. Purgatory-routed, rejected, and repeated events therefore
+/// consume both the relay's allowance and our page count, and the cursor is
+/// derived from that same raw stream. 200 remains a temporary static floor:
+/// a relay capped below it silently truncates history. Known live exception
+/// (2026-08-06): Ditto Relay applies a 100-event default to filters that omit
+/// `limit` — which ours do — while advertising only its larger
+/// explicit-request cap in NIP-11. The remaining accepted mitigation is to
+/// adapt the threshold per relay from observed raw page sizes and advertised
+/// `default_limit`, with a floor of 90. See "Per-query result limits and the
+/// pagination model" in docs/explanation/sync-scaling-constraints.md.
 const PAGINATION_THRESHOLD: usize = 200;
 
 /// Conservative number of OR filters carried by one NIP-01 REQ.
@@ -2798,6 +2794,23 @@ impl SyncManager {
             while let Some(relay_event) = event_rx.recv().await {
                 match relay_event {
                     RelayEvent::Event(event, subscription_id) => {
+                        // Count raw deliveries before deduplication or write policy. Relays spend
+                        // their result allowance on every matching delivery, including events we
+                        // route to purgatory, reject, or have already stored; pagination must use
+                        // that same stream for both its page count and `until` cursor.
+                        {
+                            let mut pending = pending_sync_index.write().await;
+                            if let Some(batches) = pending.get_mut(&relay_url_clone) {
+                                for batch in batches.iter_mut() {
+                                    if let Some(state) =
+                                        batch.pagination_state.get_mut(&subscription_id)
+                                    {
+                                        state.record_event(&event);
+                                    }
+                                }
+                            }
+                        }
+
                         // Skip events we've already rejected (announcements only)
                         if (event.kind == Kind::GitRepoAnnouncement
                             || event.kind == Kind::RepoState)
@@ -2869,19 +2882,13 @@ impl SyncManager {
                             }
                         }
 
-                        // Track pagination state for this subscription (REQ+EOSE)
-                        // and received event IDs for negentropy batches
+                        // Track received event IDs for negentropy batches. Unlike REQ+EOSE
+                        // pagination above, negentropy completion is concerned with events that
+                        // were actually saved or already present locally.
                         if result == ProcessResult::Saved || result == ProcessResult::Duplicate {
                             let mut pending = pending_sync_index.write().await;
                             if let Some(batches) = pending.get_mut(&relay_url_clone) {
                                 for batch in batches.iter_mut() {
-                                    // Track pagination state (REQ+EOSE path)
-                                    if let Some(state) =
-                                        batch.pagination_state.get_mut(&subscription_id)
-                                    {
-                                        state.record_event(&event);
-                                    }
-
                                     // Track received event IDs (negentropy path)
                                     // Only track if this batch has requested_event_ids set
                                     // and the subscription is one we're waiting on
@@ -5829,6 +5836,86 @@ mod tests {
                 .unwrap()
                 .contains(&Kind::TextNote),
             "the partial text-note filter should not advance"
+        );
+    }
+
+    #[test]
+    fn raw_pagination_counts_purgatory_and_rejected_deliveries() {
+        let keys = Keys::generate();
+        let filter = Filter::new().kinds([Kind::GitRepoAnnouncement, Kind::RepoState]);
+        let mut pagination = PaginationState::new(vec![filter]);
+        let deliveries = [
+            (
+                EventBuilder::new(Kind::GitRepoAnnouncement, "purgatory")
+                    .custom_created_at(Timestamp::from_secs(20))
+                    .finalize(&keys)
+                    .expect("build purgatory-routed event"),
+                ProcessResult::Purgatory,
+            ),
+            (
+                EventBuilder::new(Kind::RepoState, "rejected")
+                    .custom_created_at(Timestamp::from_secs(10))
+                    .finalize(&keys)
+                    .expect("build rejected event"),
+                ProcessResult::Rejected,
+            ),
+        ];
+
+        for (event, policy_result) in deliveries {
+            // The production handler records here, before it knows this result.
+            pagination.record_event(&event);
+            assert!(matches!(
+                policy_result,
+                ProcessResult::Purgatory | ProcessResult::Rejected
+            ));
+        }
+
+        assert_eq!(pagination.filters[0].event_count, 2);
+        assert_eq!(
+            pagination.filters[0].min_created_at,
+            Some(Timestamp::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn raw_pagination_counts_repeat_deliveries_at_the_boundary() {
+        let keys = Keys::generate();
+        let filter = Filter::new().kind(Kind::TextNote);
+        let mut pagination = PaginationState::new(vec![filter]);
+        let event = EventBuilder::new(Kind::TextNote, "same relay delivery")
+            .custom_created_at(Timestamp::from_secs(42))
+            .finalize(&keys)
+            .expect("build repeated event");
+
+        for _ in 0..PAGINATION_THRESHOLD {
+            // Repeat deliveries each consume a result slot even though the second and later
+            // process as Duplicate after the raw-delivery accounting point.
+            pagination.record_event(&event);
+        }
+
+        assert_eq!(pagination.filters[0].event_count, PAGINATION_THRESHOLD);
+        assert_eq!(pagination.next_page_filters().len(), 1);
+    }
+
+    #[test]
+    fn raw_pagination_counts_an_event_for_each_overlapping_filter() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "overlap")
+            .custom_created_at(Timestamp::from_secs(42))
+            .finalize(&keys)
+            .expect("build overlapping event");
+        let mut pagination = PaginationState::new(vec![
+            Filter::new().kind(Kind::TextNote),
+            Filter::new().author(keys.public_key()),
+        ]);
+
+        pagination.record_event(&event);
+
+        assert_eq!(pagination.filters[0].event_count, 1);
+        assert_eq!(pagination.filters[1].event_count, 1);
+        assert_eq!(
+            pagination.filters[0].min_created_at,
+            pagination.filters[1].min_created_at
         );
     }
 
