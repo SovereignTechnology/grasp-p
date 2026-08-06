@@ -190,46 +190,37 @@ whether it applies independently to each filter or to the merged REQ, which is
 why the source audit above remains necessary. Relay-specific extensions can
 add fields, but clients cannot assume common names or semantics.
 
-The client encodes this model in `PAGINATION_THRESHOLD` (200,
-`src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 200 counted
-events is treated as possibly-truncated and fetched again with `until` set
-to its oldest seen `created_at`; below 200 it is treated as exhausted.
+The client encodes this model in per-connection `RelayPaginationSession`
+state (`src/sync/mod.rs`). After EOSE it learns the largest raw page seen
+from that relay and computes `max(90, floor(0.9 × estimated_cap))`, where
+`estimated_cap` also includes an advertised NIP-11 `default_limit` while
+that hint remains trusted. A filter meeting the adaptive threshold is
+fetched again with `until` set to its oldest raw `created_at`.
 Consequences:
 
-- Correct against any relay whose effective per-filter cap is ≥ 200. The
-  smallest audited defaults are 250 (haven/Badger) and 300 (rnostr); the
-  gap below 250 is deliberate margin, because only events processed as
-  Saved or Duplicate count toward the threshold — events routed to
-  purgatory or rejected consume the relay's allowance without being
-  counted, so a threshold equal to a relay's cap would mistake a full page
-  for an exhausted filter.
-- A relay capping a filter below 200, or enforcing an aggregate per-REQ
-  cap, silently truncates history. No audited implementation has an
-  aggregate cap. **Known live exception (2026-08-06): Ditto Relay applies
-  a 100-event default to filters that omit `limit`** — which ours
-  currently do — while accepting explicit limits up to its advertised
-  `max_limit` (1000). Against a Ditto relay, filters with more than 100
-  results are silently truncated until historic filters carry an explicit
-  `limit`. Note that NIP-11 `max_limit` cannot reveal this: it advertises
-  the largest *accepted* request, not the default applied when `limit` is
-  omitted. Beyond Ditto, the remaining risk is a deliberately
-  restrictive, non-default strfry or rnostr configuration.
-- The price of the floor is one redundant page for any filter whose result
-  count lands between 200 and the relay's actual cap. The threshold was
-  raised from its original ultra-conservative 75 once the audit
-  established the real floor; filters with 75–199 results no longer pay
-  the extra page.
-- Planned design (accepted 2026-08-06, not implemented): keep omitting
+- Every raw delivery matching a tracked filter counts before deduplication
+  or write-policy processing. Purgatory-routed, rejected, and repeated
+  events therefore consume both the relay's allowance and our page count,
+  and the `until` cursor is derived from that same raw stream.
+- Ditto's 100-event omitted-limit default is now above the adaptive floor
+  and is learned from its first page even though it advertises only
+  `max_limit: 1000`. `max_limit` never raises the threshold because it
+  describes explicit limits, not the omitted-limit filters sent here.
+- A relay capping a filter below 90 can still silently truncate history.
+  No such deployment was found in the audit. No audited implementation
+  enforces an aggregate cap across filters in one REQ.
+- Larger learned pages raise the threshold and avoid redundant requests.
+  The 0.9 slack can still produce one final verification-shaped page when
+  a result count falls near the learned cap; this is the deliberate cost
+  of tolerating relay-side page shrinkage.
+- Implemented design (accepted 2026-08-06): keep omitting
   `limit` — an explicit limit would cap the relays that serve unbounded
-  pages — fix the counting, and adapt the threshold per relay:
-  1. **Count raw delivered events.** Today only events processed as
-     Saved or Duplicate count toward the threshold and the `until`
-     cursor, so purgatory-routed and rejected events consume relay
-     allowance invisibly; this is the sole reason thresholds need
-     margin. Counting every delivered event that matches the filter
-     (and cursoring on them) makes a truncated page count exactly the
-     relay's page size.
-  2. **Adaptive per-relay threshold:**
+  pages — count raw deliveries, and adapt the threshold per relay:
+  1. **Count raw delivered events (implemented).** Every delivered event
+     that matches a tracked filter is counted before deduplication and write
+     policy, and the cursor uses the same stream. Purgatory-routed, rejected,
+     and repeated events can no longer consume relay allowance invisibly.
+  2. **Adaptive per-relay threshold (implemented):**
      `estimated_cap = max(largest observed page, advertised
      default_limit if present)`;
      `threshold = max(90, floor(0.9 × estimated_cap))`. Observed pages
@@ -240,7 +231,7 @@ Consequences:
      Learned state is per connection session and NIP-11 is refetched on
      reconnect, so an operator lowering their cap cannot strand a stale
      threshold.
-  3. **NIP-11 fields:** `default_limit` ("maximum returned events if
+  3. **NIP-11 fields (implemented):** `default_limit` ("maximum returned events if
      you send a filter without a limit") is the standard field for
      exactly this and is used as a hint when advertised — though
      rarely: neither nos.lol nor relay.ditto.pub advertises it (checked

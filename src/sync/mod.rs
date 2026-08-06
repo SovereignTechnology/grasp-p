@@ -402,6 +402,12 @@ pub struct FilterPaginationState {
     pub min_created_at: Option<Timestamp>,
     /// Original filter to reconstruct for next page
     pub original_filter: Filter,
+    /// IDs delivered on this page, retained only long enough to verify a NIP-11 hint.
+    page_event_ids: HashSet<EventId>,
+    /// IDs from the page which caused a one-page NIP-11 hint verification.
+    verification_baseline: Option<HashSet<EventId>>,
+    /// Whether the verification page delivered an ID absent from its triggering page.
+    verification_productive: bool,
 }
 
 /// Pagination state for every OR filter carried by one subscription.
@@ -419,6 +425,9 @@ impl PaginationState {
                     event_count: 0,
                     min_created_at: None,
                     original_filter,
+                    page_event_ids: HashSet::new(),
+                    verification_baseline: None,
+                    verification_productive: false,
                 })
                 .collect(),
         }
@@ -431,6 +440,14 @@ impl PaginationState {
                 .match_event(event, MatchEventOptions::new())
             {
                 state.event_count += 1;
+                state.page_event_ids.insert(event.id);
+                if state
+                    .verification_baseline
+                    .as_ref()
+                    .is_some_and(|baseline| !baseline.contains(&event.id))
+                {
+                    state.verification_productive = true;
+                }
                 match state.min_created_at {
                     None => state.min_created_at = Some(event.created_at),
                     Some(min) if event.created_at < min => {
@@ -442,20 +459,140 @@ impl PaginationState {
         }
     }
 
-    fn next_page_filters(self) -> Vec<Filter> {
+    fn filters(&self) -> Vec<Filter> {
         self.filters
-            .into_iter()
-            .filter_map(|state| {
-                (state.event_count >= PAGINATION_THRESHOLD)
-                    .then_some(state.min_created_at)
-                    .flatten()
-                    .map(|min_created_at| {
-                        state
-                            .original_filter
-                            .until(Timestamp::from(min_created_at.as_secs()))
-                    })
-            })
+            .iter()
+            .map(|state| state.original_filter.clone())
             .collect()
+    }
+
+    fn next_page(mut self, session: &mut RelayPaginationSession) -> Option<Self> {
+        let mut next = Vec::new();
+        for mut state in self.filters.drain(..) {
+            session.observe_page(state.event_count);
+            let completed_verification = state.verification_baseline.is_some();
+
+            let continue_page = if completed_verification {
+                session.complete_hint_verification(state.verification_productive);
+                state.verification_productive && state.event_count >= session.pagination_threshold()
+            } else if state.event_count >= session.pagination_threshold() {
+                true
+            } else if state.event_count >= PAGINATION_THRESHOLD_FLOOR
+                && (session.begin_hint_verification() || session.hint_verification_in_progress())
+            {
+                state.verification_baseline = Some(std::mem::take(&mut state.page_event_ids));
+                true
+            } else {
+                false
+            };
+            if completed_verification {
+                state.verification_baseline = None;
+            }
+
+            let Some(min_created_at) = continue_page.then_some(state.min_created_at).flatten()
+            else {
+                continue;
+            };
+            state.original_filter = state
+                .original_filter
+                .until(Timestamp::from(min_created_at.as_secs()));
+            state.event_count = 0;
+            state.min_created_at = None;
+            state.page_event_ids.clear();
+            state.verification_productive = false;
+            next.push(state);
+        }
+        (!next.is_empty()).then_some(Self { filters: next })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaginationHint {
+    Absent,
+    Unverified(usize),
+    Verifying(usize),
+    Verified(usize),
+    Discarded,
+}
+
+#[derive(Debug, Clone)]
+struct RelayPaginationSession {
+    largest_raw_page: usize,
+    hint: PaginationHint,
+}
+
+impl Default for RelayPaginationSession {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl RelayPaginationSession {
+    fn new(advertised_default_limit: Option<usize>) -> Self {
+        Self {
+            largest_raw_page: 0,
+            hint: advertised_default_limit
+                .map(PaginationHint::Unverified)
+                .unwrap_or(PaginationHint::Absent),
+        }
+    }
+
+    fn observe_page(&mut self, raw_count: usize) {
+        self.largest_raw_page = self.largest_raw_page.max(raw_count);
+    }
+
+    fn active_hint(&self) -> Option<usize> {
+        match self.hint {
+            PaginationHint::Unverified(limit) | PaginationHint::Verified(limit) => Some(limit),
+            PaginationHint::Absent | PaginationHint::Verifying(_) | PaginationHint::Discarded => {
+                None
+            }
+        }
+    }
+
+    fn estimated_cap(&self) -> usize {
+        self.largest_raw_page.max(self.active_hint().unwrap_or(0))
+    }
+
+    fn pagination_threshold(&self) -> usize {
+        // Ten percent slack absorbs relay-side shrinkage such as expired-event filtering.
+        // The floor remains below Ditto's observed 100-event omitted-limit page, the smallest
+        // live default found in the relay audit. These are interoperability constants, not
+        // operator policy, so deliberately do not enlarge the four-source config surface.
+        PAGINATION_THRESHOLD_FLOOR.max(
+            self.estimated_cap()
+                .saturating_mul(PAGINATION_THRESHOLD_PERCENT)
+                / 100,
+        )
+    }
+
+    fn begin_hint_verification(&mut self) -> bool {
+        match self.hint {
+            PaginationHint::Unverified(limit) => {
+                self.hint = PaginationHint::Verifying(limit);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn hint_verification_in_progress(&self) -> bool {
+        matches!(self.hint, PaginationHint::Verifying(_))
+    }
+
+    fn complete_hint_verification(&mut self, productive: bool) {
+        match (self.hint, productive) {
+            (PaginationHint::Verifying(_) | PaginationHint::Verified(_), true) => {
+                // Several filters can share the grouped verification page. Any one of them
+                // finding an unseen event disproves the relay-wide hint, even if an earlier
+                // exhausted filter provisionally marked it verified.
+                self.hint = PaginationHint::Discarded;
+            }
+            (PaginationHint::Verifying(limit), false) => {
+                self.hint = PaginationHint::Verified(limit);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -562,7 +699,9 @@ struct ConnectAttemptToken(u64);
 
 #[derive(Debug)]
 enum ConnectAttemptOutcome {
-    Connected,
+    Connected {
+        advertised_default_limit: Option<usize>,
+    },
     Failed(String),
 }
 
@@ -584,35 +723,27 @@ const CONSOLIDATION_THRESHOLD: usize = 70;
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
-/// Per-filter threshold for historic REQ+EOSE pagination.
-///
-/// After EOSE, a filter that delivered at least this many counted events is
-/// treated as possibly truncated by the relay's per-filter result cap and is
-/// fetched again with `until` set to its oldest seen `created_at`; below the
-/// threshold it is treated as exhausted.
+/// Adaptive per-relay threshold for historic REQ+EOSE pagination.
 ///
 /// NIP-01 guarantees none of this; the model is empirical. A source audit of
 /// nine relay implementations (2026-08-06, recorded with citations in
 /// docs/explanation/sync-scaling-constraints.md) found result limits are
-/// always applied per filter, never in aggregate across a REQ, with the
-/// smallest finite default caps at 250 (haven/Badger) and 300 (rnostr).
+/// always applied per filter, never in aggregate across a REQ. Ditto is the
+/// smallest live omitted-limit default found, at 100 events.
 ///
-/// The threshold must sit below the smallest cap we may meet, with margin:
-/// only events processed as Saved or Duplicate are counted here, so events
-/// routed to purgatory or rejected consume the relay's allowance without
-/// being counted, and a threshold equal to a relay's cap would mistake a
-/// full page for an exhausted filter. 200 keeps a 50-event margin under the
-/// tightest audited default while sparing filters with fewer than 200
-/// results the redundant final page. A relay capped below this threshold
-/// silently truncates history. Known live exception (2026-08-06): Ditto
-/// Relay applies a 100-event default to filters that omit `limit` — which
-/// ours do — while advertising only its larger explicit-request cap in
-/// NIP-11. The accepted mitigation (not yet implemented) is to count raw
-/// delivered events instead of only Saved/Duplicate ones and adapt the
-/// threshold per relay from observed page sizes and advertised
-/// `default_limit`, with a floor of 90. See "Per-query result limits and
-/// the pagination model" in docs/explanation/sync-scaling-constraints.md.
-const PAGINATION_THRESHOLD: usize = 200;
+/// Every raw delivery matching a tracked filter counts, before write-policy
+/// processing. Purgatory-routed, rejected, and repeated events therefore
+/// consume both the relay's allowance and our page count, and the cursor is
+/// derived from that same raw stream. Each connection session learns its
+/// largest raw page and combines it with NIP-11 `default_limit` when present:
+/// `threshold = max(90, floor(0.9 * max(observed, default_limit)))`. A hint is
+/// verified once before it may stop pagination; a productive verification
+/// page discards it for that session. `max_limit` is intentionally ignored
+/// because these filters omit `limit`. State and NIP-11 data reset on every
+/// reconnect. See "Per-query result limits and the pagination model" in
+/// docs/explanation/sync-scaling-constraints.md.
+const PAGINATION_THRESHOLD_FLOOR: usize = 90;
+const PAGINATION_THRESHOLD_PERCENT: usize = 90;
 
 /// Conservative number of OR filters carried by one NIP-01 REQ.
 ///
@@ -1039,6 +1170,8 @@ pub struct SyncManager {
     rejected_events_index: Arc<RejectedEventsIndex>,
     /// Active relay connections - keyed by relay URL
     connections: HashMap<String, RelayConnection>,
+    /// Adaptive pagination learning for each relay's current connection session.
+    pagination_sessions: HashMap<String, RelayPaginationSession>,
     /// Event-directed relay targets rejected by the outbound target policy.
     ///
     /// Rejected URLs stay in `repo_sync_index` (they come from stored events),
@@ -1151,6 +1284,7 @@ impl SyncManager {
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
             connections: HashMap::new(),
+            pagination_sessions: HashMap::new(),
             rejected_relay_targets: HashSet::new(),
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             missing_event_recovery: Arc::new(std::sync::Mutex::new(
@@ -1288,10 +1422,16 @@ impl SyncManager {
             "EOSE processed for subscription"
         );
 
-        // Check for pagination: if this subscription hit the threshold, fetch next page
+        // Check for pagination using this relay connection session's observed page sizes and
+        // verified NIP-11 default-limit hint.
         if let Some(pagination_state) = batch.pagination_state.remove(&sub_id) {
-            let next_filters = pagination_state.next_page_filters();
-            if !next_filters.is_empty() {
+            let next_page = pagination_state.next_page(
+                self.pagination_sessions
+                    .entry(relay_url.to_string())
+                    .or_default(),
+            );
+            if let Some(next_page) = next_page {
+                let next_filters = next_page.filters();
                 let relay_url_for_pagination = relay_url.to_string();
                 let batch_id = batch.batch_id;
                 tracing::info!(
@@ -1325,7 +1465,7 @@ impl SyncManager {
                         relay_url_for_pagination,
                         batch_id,
                         deferred_sub_id,
-                        next_filters,
+                        next_page,
                     );
                     return;
                 }
@@ -1343,10 +1483,7 @@ impl SyncManager {
                                 {
                                     batch.outstanding_subs.insert(new_sub_id.clone());
                                     next_page_started = true;
-                                    batch.pagination_state.insert(
-                                        new_sub_id.clone(),
-                                        PaginationState::new(next_filters),
-                                    );
+                                    batch.pagination_state.insert(new_sub_id.clone(), next_page);
                                     tracing::info!(
                                         relay = %relay_url_for_pagination,
                                         new_sub_id = %new_sub_id,
@@ -1767,9 +1904,10 @@ impl SyncManager {
         relay_url: String,
         batch_id: u64,
         deferred_sub_id: SubscriptionId,
-        next_filters: Vec<Filter>,
+        next_page: PaginationState,
     ) {
         tokio::spawn(async move {
+            let next_filters = next_page.filters();
             tracing::info!(
                 relay = %relay_url,
                 batch_id,
@@ -1809,9 +1947,7 @@ impl SyncManager {
                     Ok(new_sub_id) => {
                         batch.outstanding_subs.remove(&deferred_sub_id);
                         batch.outstanding_subs.insert(new_sub_id.clone());
-                        batch
-                            .pagination_state
-                            .insert(new_sub_id.clone(), PaginationState::new(next_filters));
+                        batch.pagination_state.insert(new_sub_id.clone(), next_page);
                         tracing::info!(
                             relay = %relay_url,
                             new_sub_id = %new_sub_id,
@@ -2798,6 +2934,23 @@ impl SyncManager {
             while let Some(relay_event) = event_rx.recv().await {
                 match relay_event {
                     RelayEvent::Event(event, subscription_id) => {
+                        // Count raw deliveries before deduplication or write policy. Relays spend
+                        // their result allowance on every matching delivery, including events we
+                        // route to purgatory, reject, or have already stored; pagination must use
+                        // that same stream for both its page count and `until` cursor.
+                        {
+                            let mut pending = pending_sync_index.write().await;
+                            if let Some(batches) = pending.get_mut(&relay_url_clone) {
+                                for batch in batches.iter_mut() {
+                                    if let Some(state) =
+                                        batch.pagination_state.get_mut(&subscription_id)
+                                    {
+                                        state.record_event(&event);
+                                    }
+                                }
+                            }
+                        }
+
                         // Skip events we've already rejected (announcements only)
                         if (event.kind == Kind::GitRepoAnnouncement
                             || event.kind == Kind::RepoState)
@@ -2869,19 +3022,13 @@ impl SyncManager {
                             }
                         }
 
-                        // Track pagination state for this subscription (REQ+EOSE)
-                        // and received event IDs for negentropy batches
+                        // Track received event IDs for negentropy batches. Unlike REQ+EOSE
+                        // pagination above, negentropy completion is concerned with events that
+                        // were actually saved or already present locally.
                         if result == ProcessResult::Saved || result == ProcessResult::Duplicate {
                             let mut pending = pending_sync_index.write().await;
                             if let Some(batches) = pending.get_mut(&relay_url_clone) {
                                 for batch in batches.iter_mut() {
-                                    // Track pagination state (REQ+EOSE path)
-                                    if let Some(state) =
-                                        batch.pagination_state.get_mut(&subscription_id)
-                                    {
-                                        state.record_event(&event);
-                                    }
-
                                     // Track received event IDs (negentropy path)
                                     // Only track if this batch has requested_event_ids set
                                     // and the subscription is one we're waiting on
@@ -3399,7 +3546,9 @@ impl SyncManager {
             };
             let outcome = tokio::select! {
                 result = connection.connect(timeout) => match result {
-                    Ok(()) => ConnectAttemptOutcome::Connected,
+                    Ok(()) => ConnectAttemptOutcome::Connected {
+                        advertised_default_limit: connection.fetch_default_limit().await,
+                    },
                     Err(error) => ConnectAttemptOutcome::Failed(error),
                 },
                 _ = shutdown_rx.recv() => {
@@ -3450,7 +3599,16 @@ impl SyncManager {
         }
 
         match result.outcome {
-            ConnectAttemptOutcome::Connected => {
+            ConnectAttemptOutcome::Connected {
+                advertised_default_limit,
+            } => {
+                // A session begins only after a successful WebSocket connection. Replacing this
+                // entry on every connection result resets learned caps and re-applies the NIP-11
+                // hint fetched for that exact session.
+                self.pagination_sessions.insert(
+                    result.relay_url.clone(),
+                    RelayPaginationSession::new(advertised_default_limit),
+                );
                 self.health_tracker.record_success(&result.relay_url);
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_connection_attempt(&result.relay_url, true);
@@ -4073,6 +4231,9 @@ impl SyncManager {
     /// - Unexpected disconnects: Updates state to Disconnected, keeps RelayConnection for reconnect
     /// - Intentional disconnects: Completes cleanup of Disconnecting relays (removes from indices)
     async fn handle_disconnect(&mut self, relay_url: &str) {
+        // Learned page sizes and NIP-11 hints belong to the ended WebSocket session.
+        self.pagination_sessions.remove(relay_url);
+
         // Check if this was an intentional disconnect (Disconnecting status)
         let was_intentional = {
             let index = self.relay_sync_index.read().await;
@@ -5798,7 +5959,7 @@ mod tests {
         let mut pagination =
             PaginationState::new(vec![metadata_filter.clone(), note_filter.clone()]);
 
-        for created_at in 1..=PAGINATION_THRESHOLD {
+        for created_at in 1..=100 {
             let event = EventBuilder::new(Kind::Metadata, created_at.to_string())
                 .custom_created_at(Timestamp::from_secs(created_at as u64))
                 .finalize(&keys)
@@ -5811,7 +5972,10 @@ mod tests {
             .expect("build text note");
         pagination.record_event(&note);
 
-        let next_filters = pagination.next_page_filters();
+        let next_filters = pagination
+            .next_page(&mut RelayPaginationSession::default())
+            .expect("full observed page should paginate")
+            .filters();
         assert_eq!(next_filters.len(), 1);
         assert_eq!(next_filters[0].until, Some(Timestamp::from_secs(1)));
         assert!(
@@ -5830,6 +5994,160 @@ mod tests {
                 .contains(&Kind::TextNote),
             "the partial text-note filter should not advance"
         );
+    }
+
+    #[test]
+    fn raw_pagination_counts_purgatory_and_rejected_deliveries() {
+        let keys = Keys::generate();
+        let filter = Filter::new().kinds([Kind::GitRepoAnnouncement, Kind::RepoState]);
+        let mut pagination = PaginationState::new(vec![filter]);
+        let deliveries = [
+            (
+                EventBuilder::new(Kind::GitRepoAnnouncement, "purgatory")
+                    .custom_created_at(Timestamp::from_secs(20))
+                    .finalize(&keys)
+                    .expect("build purgatory-routed event"),
+                ProcessResult::Purgatory,
+            ),
+            (
+                EventBuilder::new(Kind::RepoState, "rejected")
+                    .custom_created_at(Timestamp::from_secs(10))
+                    .finalize(&keys)
+                    .expect("build rejected event"),
+                ProcessResult::Rejected,
+            ),
+        ];
+
+        for (event, policy_result) in deliveries {
+            // The production handler records here, before it knows this result.
+            pagination.record_event(&event);
+            assert!(matches!(
+                policy_result,
+                ProcessResult::Purgatory | ProcessResult::Rejected
+            ));
+        }
+
+        assert_eq!(pagination.filters[0].event_count, 2);
+        assert_eq!(
+            pagination.filters[0].min_created_at,
+            Some(Timestamp::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn raw_pagination_counts_repeat_deliveries_at_the_boundary() {
+        let keys = Keys::generate();
+        let filter = Filter::new().kind(Kind::TextNote);
+        let mut pagination = PaginationState::new(vec![filter]);
+        let event = EventBuilder::new(Kind::TextNote, "same relay delivery")
+            .custom_created_at(Timestamp::from_secs(42))
+            .finalize(&keys)
+            .expect("build repeated event");
+
+        for _ in 0..PAGINATION_THRESHOLD_FLOOR {
+            // Repeat deliveries each consume a result slot even though the second and later
+            // process as Duplicate after the raw-delivery accounting point.
+            pagination.record_event(&event);
+        }
+
+        assert_eq!(
+            pagination.filters[0].event_count,
+            PAGINATION_THRESHOLD_FLOOR
+        );
+        assert!(pagination
+            .next_page(&mut RelayPaginationSession::default())
+            .is_some());
+    }
+
+    #[test]
+    fn raw_pagination_counts_an_event_for_each_overlapping_filter() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "overlap")
+            .custom_created_at(Timestamp::from_secs(42))
+            .finalize(&keys)
+            .expect("build overlapping event");
+        let mut pagination = PaginationState::new(vec![
+            Filter::new().kind(Kind::TextNote),
+            Filter::new().author(keys.public_key()),
+        ]);
+
+        pagination.record_event(&event);
+
+        assert_eq!(pagination.filters[0].event_count, 1);
+        assert_eq!(pagination.filters[1].event_count, 1);
+        assert_eq!(
+            pagination.filters[0].min_created_at,
+            pagination.filters[1].min_created_at
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_selects_from_observation_and_hint() {
+        let mut observed_only = RelayPaginationSession::new(None);
+        observed_only.observe_page(100);
+        assert_eq!(observed_only.pagination_threshold(), 90);
+
+        let hint_only = RelayPaginationSession::new(Some(500));
+        assert_eq!(hint_only.pagination_threshold(), 450);
+
+        let mut hint_vs_observed = RelayPaginationSession::new(Some(500));
+        hint_vs_observed.observe_page(600);
+        assert_eq!(hint_vs_observed.pagination_threshold(), 540);
+
+        let mut sub_floor = RelayPaginationSession::new(Some(50));
+        sub_floor.observe_page(80);
+        assert_eq!(sub_floor.pagination_threshold(), 90);
+    }
+
+    #[test]
+    fn productive_verification_page_discards_the_hint() {
+        let keys = Keys::generate();
+        let mut first_page = PaginationState::new(vec![Filter::new().kind(Kind::TextNote)]);
+        for created_at in 100..200 {
+            let event = EventBuilder::new(Kind::TextNote, created_at.to_string())
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .expect("build first-page event");
+            first_page.record_event(&event);
+        }
+        let mut session = RelayPaginationSession::new(Some(1000));
+        let mut verification = first_page
+            .next_page(&mut session)
+            .expect("a suspiciously short hinted page needs verification");
+        assert_eq!(session.hint, PaginationHint::Verifying(1000));
+
+        let unseen = EventBuilder::new(Kind::TextNote, "older unseen event")
+            .custom_created_at(Timestamp::from_secs(99))
+            .finalize(&keys)
+            .expect("build productive verification event");
+        for _ in 0..100 {
+            verification.record_event(&unseen);
+        }
+
+        assert!(verification.next_page(&mut session).is_some());
+        assert_eq!(session.hint, PaginationHint::Discarded);
+        assert_eq!(session.pagination_threshold(), 90);
+    }
+
+    #[test]
+    fn empty_verification_page_confirms_the_hint_without_another_page() {
+        let keys = Keys::generate();
+        let mut first_page = PaginationState::new(vec![Filter::new().kind(Kind::TextNote)]);
+        for created_at in 100..200 {
+            let event = EventBuilder::new(Kind::TextNote, created_at.to_string())
+                .custom_created_at(Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .expect("build first-page event");
+            first_page.record_event(&event);
+        }
+        let mut session = RelayPaginationSession::new(Some(1000));
+        let verification = first_page
+            .next_page(&mut session)
+            .expect("a suspiciously short hinted page needs verification");
+
+        assert!(verification.next_page(&mut session).is_none());
+        assert_eq!(session.hint, PaginationHint::Verified(1000));
+        assert_eq!(session.pagination_threshold(), 900);
     }
 
     #[test]
