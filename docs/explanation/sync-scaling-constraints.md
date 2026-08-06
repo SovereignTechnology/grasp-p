@@ -61,10 +61,12 @@ requests" is emitted when NEG views exceed `maxSubsPerConnection`.
 | [relay.primal.net](https://relay.primal.net/) (strfry 1.0.3-1-g60d35a6) | 500 | **20** | 1000000 |
 | [nostr.wine](https://nostr.wine/) (operator software 0.3.3) | 1000 | 50 | 524288 |
 | [relay.damus.io](https://relay.damus.io/) (strfry 1.1.0-1-g691a533f11eb) | 500 | 200 | 1000000 |
+| [relay.ditto.pub](https://relay.ditto.pub/) (Ditto Relay 0.1.0) | 1000 | 20 | 4000000 |
 | [relay.nostr.band](https://relay.nostr.band/) | unavailable — HTTPS timed out twice | unavailable | unavailable |
 
 Live documents fetched 2026-08-06 with `Accept: application/nostr+json`.
-The first four advertise their result cap as `limitation.max_limit`.
+The five reachable relays advertise their result cap as
+`limitation.max_limit`.
 
 ### Discoverability gap (NIP-11)
 
@@ -81,7 +83,7 @@ reliably; both need conservative defaults and reactive fallback.
 - `max_reqs` = 500, enforced for REQ only (`src/nostr/builder.rs`).
 - Negentropy: **no concurrency limit at all** (upstream `TODO`), 60000-byte
   frame limit per NEG message.
-- No limits on filters per REQ or tag values per filter.
+- 20 filters per REQ by default; no limit on tag values per filter.
 - Query result limits (verified 2026-08-06 against the published
   `nostr-sdk-0.45.0` crate source, `src/local_relay/local/inner.rs`):
   enforced **per filter, not per REQ**. A filter without a `limit` is given
@@ -134,6 +136,56 @@ file:line citations is preserved in this file's history (commit
   nostr.wine 1000.
 - NIP-11 advertisement of the cap is uneven: strfry, nostream, and rnostr
   publish `max_limit`; nostr-rs-relay, khatru-family, and chorus do not.
+
+#### Implementation limit matrix
+
+These are implementation defaults, not claims about every deployment. `★`
+means that implementation emits the value in the corresponding standard
+NIP-11 `limitation` field; operators can still override or omit advertised
+values. `—` means no native limit was found at that layer, not that a reverse
+proxy, host, storage backend, or embedding application cannot impose one.
+
+| Implementation | Results / filter | Filters / subscription | Subscriptions / connection | Connections / IP | Evidence |
+| --- | ---: | ---: | ---: | ---: | --- |
+| nostr-sdk `LocalRelay` 0.45.0 | 500 | 20 | 500 | — (128 global) | published crate `local_relay/builder.rs:19-29,41-46,338-359` |
+| strfry 1.1.1 | 500 ★ | 200 | 200 ★ | — | [`strfry.conf:95-117`](https://github.com/hoytech/strfry/blob/1.1.1/strfry.conf#L95-L117), [`RelayWebsocket.cpp:89-97`](https://github.com/hoytech/strfry/blob/1.1.1/src/apps/relay/RelayWebsocket.cpp#L89-L97) |
+| nostr-rs-relay 0.10.0 | SQLite: unbounded; PostgreSQL: 1000 | — | — | — | [`sqlite.rs:1149-1155`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/sqlite.rs#L1149-L1155), [`postgres.rs:891-900`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/postgres.rs#L891-L900) |
+| khatru v0.19.1 | store-defined | — | — | — | per-filter dispatch in [`handlers.go:289-324`](https://github.com/fiatjaf/khatru/blob/v0.19.1/handlers.go#L289-L324) |
+| relayer v2.2.14 | store-defined / framework unbounded | — | — | — | [`handlers.go:182-255`](https://github.com/fiatjaf/relayer/blob/v2.2.14/handlers.go#L182-L255) |
+| nostream v3.0.0 | 500 default; requested maximum 5000 ★ | 10 ★ | 10 ★ | — | [`base.ts:87`](https://github.com/Cameri/nostream/blob/v3.0.0/src/constants/base.ts#L87), [`default-settings.yaml:215-222`](https://github.com/Cameri/nostream/blob/v3.0.0/resources/default-settings.yaml#L215-L222), [`root-request-handler.ts:87-104`](https://github.com/Cameri/nostream/blob/v3.0.0/src/handlers/request-handlers/root-request-handler.ts#L87-L104) |
+| rnostr v0.4.9 | 300 ★ | 10 ★ | 20 ★ | — | [`setting.rs:123-156,340-352`](https://github.com/rnostr/rnostr/blob/v0.4.9/relay/src/setting.rs#L123-L156) |
+| chorus v2.0.2 | unbounded | — | 128 ★ | 5 | [`config.rs:30-47,52-93`](https://github.com/mikedilger/chorus/blob/v2.0.2/src/config.rs#L30-L93), [`nip11.rs:143-153`](https://github.com/mikedilger/chorus/blob/v2.0.2/src/web/nip11.rs#L143-L153) |
+| haven v1.2.2 | LMDB: 375; Badger: 250 | — | — | — | backend construction in [`init.go:61-78`](https://github.com/bitvora/haven/blob/v1.2.2/init.go#L61-L78); eventstore v0.17.5 [`lmdb/query.go:26-43`](https://github.com/fiatjaf/eventstore/blob/v0.17.5/lmdb/query.go#L26-L43) |
+| Ditto Relay 0.1.0 (`cf34437`, no release tag) | 100 default; requested maximum 1000 ★ | 100 ★ | 20 ★ | — | [`relay.ts:188-206,1256-1307`](https://gitlab.com/soapbox-pub/ditto-relay/-/blob/cf3443718cb251801dd1842de1a847af50b155ad/src/relay.ts#L188-206), live [relay.ditto.pub](https://relay.ditto.pub/) NIP-11 |
+
+The result column distinguishes a filter's implicit default from the largest
+explicit request where they differ. This matters for pagination: nostream and
+Ditto normally return 500 and 100 respectively when `limit` is omitted even
+though they advertise the larger accepted `max_limit`.
+
+#### Admission and rate limits
+
+| Implementation | Default rate/admission rules | State decay or expiry |
+| --- | --- | --- |
+| nostr-sdk `LocalRelay` 0.45.0 | Per connection: 120 query messages/min, 30 AUTH events/min, 300 text messages/min; event writes 60/min | Minute-window limiters; configuration is per connection (published crate `local_relay/builder.rs:27-46,277-284`) |
+| strfry 1.1.1 | No native connection/IP/message/event rate limiter | None; deployment proxy or write-policy plugin may add one ([`TODO:13-15`](https://github.com/hoytech/strfry/blob/1.1.1/TODO#L13-L15)) |
+| nostr-rs-relay 0.10.0 | Disabled by default; optional global event-write rate and per-client subscription-creation rate | Governor token buckets averaged over one minute; tokens refill continuously ([`config.rs:64-79,311-324`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/config.rs#L64-L79), [`server.rs:1107-1117`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/server.rs#L1107-L1117)) |
+| khatru v0.19.1 | None unless policies are installed. Optional `ApplySaneDefaults`: per IP, 10-event burst draining 2 every 3 min; 100-filter burst draining 20/min; 100 connection attempts draining 1 every 5 min | Discrete leaky counters; idle keys disappear after about 15 min, 5 min, and 500 min respectively ([`sane_defaults.go:9-22`](https://github.com/fiatjaf/khatru/blob/v0.19.1/policies/sane_defaults.go#L9-L22), [`helpers.go:10-41`](https://github.com/fiatjaf/khatru/blob/v0.19.1/policies/helpers.go#L10-L41)) |
+| relayer v2.2.14 | Disabled by default; optional per-connection message limiter with configurable requests/second and burst | Standard Go token bucket with continuous refill; no fixed expiry ([`start.go:201-216`](https://github.com/fiatjaf/relayer/blob/v2.2.14/start.go#L201-L216)) |
+| nostream v3.0.0 | Per IP: 12 connection attempts/s and 48/min; 240 raw messages/min. Event rules are kind-specific (6–60/min) plus 720/hour overall | Default EWMA: each configured period is the half-life, so pressure decays rather than expiring at a boundary; optional sliding-window mode ([`default-settings.yaml:92-125,161-227`](https://github.com/Cameri/nostream/blob/v3.0.0/resources/default-settings.yaml#L92-L125), [`CONFIGURATION.md:154-167`](https://github.com/Cameri/nostream/blob/v3.0.0/CONFIGURATION.md#L154-L167)) |
+| rnostr v0.4.9 | Disabled by default; optional per-IP, optionally kind-scoped event quotas | Governor token bucket: burst equals the configured limit and refills continuously across its period; stale keys are swept every 60 s by default ([`rnostr.example.toml:105-136`](https://github.com/rnostr/rnostr/blob/v0.4.9/rnostr.example.toml#L105-L136), [`rate_limiter.rs:113-122,183-191`](https://github.com/rnostr/rnostr/blob/v0.4.9/extensions/src/rate_limiter.rs#L113-L122)) |
+| chorus v2.0.2 | Per connection, both directions: 16 MiB byte burst refilled at 1 MiB/s; closes on exhaustion. Five simultaneous connections/IP. At least 1 s reconnect ban after disconnect | Token bucket fully recovers from empty in 16 s; connection count releases on disconnect; reconnect ban has a configured/adaptive duration ([`chorus.toml:285-330`](https://github.com/mikedilger/chorus/blob/v2.0.2/contrib/chorus.toml#L285-L330)) |
+| haven v1.2.2 | Per-IP event and connection-attempt leaky counters, separately configurable for private/chat/inbox/outbox endpoints; e.g. each connection bucket bursts to 9 and drains 3 every 1–5 min | Same discrete khatru leaky-counter model; a full connection bucket clears in 3–15 min depending on endpoint ([`limits.go:59-102`](https://github.com/bitvora/haven/blob/v1.2.2/limits.go#L59-L102), [`init.go:126-138`](https://github.com/bitvora/haven/blob/v1.2.2/init.go#L126-L138)) |
+| Ditto Relay 0.1.0 (`cf34437`) | No native connection/IP/message/event rate limiter found; hard caps above still apply | None in the relay; deployment infrastructure may add limits |
+
+NIP-11 describes hard relay limitations, not rate-limit algorithms. The
+standard fields relevant here are `max_limit`, `max_filters`, and
+`max_subscriptions`; it has no standard fields for simultaneous connections
+per IP, connection-attempt rate, message/event/query rate, burst size, window,
+decay model, or retry-after time. Even an advertised `max_limit` does not say
+whether it applies independently to each filter or to the merged REQ, which is
+why the source audit above remains necessary. Relay-specific extensions can
+add fields, but clients cannot assume common names or semantics.
 
 The client encodes this model in `PAGINATION_THRESHOLD` (200,
 `src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 200 counted
