@@ -694,6 +694,12 @@ pub struct EoseNotification {
     pub sub_id: SubscriptionId,
 }
 
+#[derive(Debug)]
+struct LiveSubscriptionClosedNotification {
+    relay_url: String,
+    generation: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectAttemptToken(u64);
 
@@ -701,6 +707,7 @@ struct ConnectAttemptToken(u64);
 enum ConnectAttemptOutcome {
     Connected {
         advertised_default_limit: Option<usize>,
+        advertised_max_subscriptions: Option<usize>,
     },
     Failed(String),
 }
@@ -786,6 +793,13 @@ fn group_filters_for_req(filters: &[Filter]) -> Vec<Vec<Filter>> {
         groups.push(current);
     }
     groups
+}
+
+fn live_filter_groups(filters: &[Filter]) -> Vec<Vec<Filter>> {
+    group_filters_for_req(filters)
+        .into_iter()
+        .map(|group| group.into_iter().map(|filter| filter.limit(0)).collect())
+        .collect()
 }
 
 fn reserve_connect_attempt(
@@ -1205,6 +1219,8 @@ pub struct SyncManager {
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
     eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
+    /// Wakes the actor to restore complete persistent coverage after CLOSED.
+    live_closed_tx: Option<tokio::sync::mpsc::Sender<LiveSubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
@@ -1300,6 +1316,7 @@ impl SyncManager {
             deferred_consolidations: DeferredConsolidations::default(),
             disconnect_tx: None,
             eose_tx: None,
+            live_closed_tx: None,
             connect_attempt_result_tx: None,
             deferred_consolidation_tx: None,
             shutdown_tx: None,
@@ -2594,6 +2611,8 @@ impl SyncManager {
 
         // 3. Create EOSE channel for spawned tasks -> manager communication
         let (eose_tx, mut eose_rx) = mpsc::channel::<EoseNotification>(100);
+        let (live_closed_tx, mut live_closed_rx) =
+            mpsc::channel::<LiveSubscriptionClosedNotification>(100);
 
         // 4. Connection workers never mutate manager state. Their unbounded
         // result channel cannot make a completed worker wait behind the actor.
@@ -2622,6 +2641,7 @@ impl SyncManager {
         // 5b. Store channel senders for use by handlers
         self.disconnect_tx = Some(disconnect_tx.clone());
         self.eose_tx = Some(eose_tx.clone());
+        self.live_closed_tx = Some(live_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
         self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
@@ -2723,6 +2743,15 @@ impl SyncManager {
                             // All EOSE senders dropped - unlikely but handle gracefully
                             tracing::debug!("EOSE channel closed");
                         }
+                    }
+                }
+                closed = live_closed_rx.recv() => {
+                    if let Some(notification) = closed {
+                        let mut manager = sync_manager.lock().await;
+                        manager.restore_live_coverage_after_closed(
+                            &notification.relay_url,
+                            notification.generation,
+                        ).await;
                     }
                 }
                 result = connect_attempt_result_rx.recv() => {
@@ -2844,11 +2873,15 @@ impl SyncManager {
         }
 
         // Step 3: Check if consolidation is needed BEFORE adding new filters
-        self.maybe_consolidate(
-            &action.relay_url,
-            grouped_subscription_count(&action.filters),
-        )
-        .await;
+        if !self
+            .maybe_consolidate(
+                &action.relay_url,
+                grouped_subscription_count(&action.filters),
+            )
+            .await
+        {
+            return;
+        }
 
         // Subscribe to each filter and collect subscription IDs
         tracing::info!(
@@ -2860,7 +2893,13 @@ impl SyncManager {
             "handle_add_filters: calling sync_live and historic_sync"
         );
 
-        self.sync_live(&action.relay_url, &action.filters).await;
+        if self
+            .sync_live(&action.relay_url, &action.filters)
+            .await
+            .is_err()
+        {
+            return;
+        }
         self.historic_sync(&action.relay_url, action.filters, action.items, None)
             .await;
     }
@@ -2923,6 +2962,7 @@ impl SyncManager {
         let local_relay = self.local_relay.clone();
         let disconnect_tx = self.disconnect_tx.as_ref().unwrap().clone();
         let eose_tx = self.eose_tx.as_ref().unwrap().clone();
+        let live_closed_tx = self.live_closed_tx.as_ref().unwrap().clone();
         let metrics_clone = self.metrics.clone();
         let pending_sync_index = Arc::clone(&self.pending_sync_index);
         let health_tracker = Arc::clone(&self.health_tracker);
@@ -3090,16 +3130,27 @@ impl SyncManager {
                             );
                         }
                     }
-                    RelayEvent::Closed(reason) => {
+                    RelayEvent::Closed {
+                        subscription_id,
+                        reason,
+                        live_generation,
+                    } => {
                         // CLOSED message means one subscription was closed, not the whole connection
                         // This is normal behavior (e.g., when historic_sync completes)
                         tracing::debug!(
                             relay = %relay_url_clone,
+                            sub_id = %subscription_id,
                             reason = %reason,
                             "Relay closed a subscription (not a connection close)"
                         );
-                        // Don't break - other subscriptions remain active
-                        // Don't send disconnect - connection is still alive
+                        if let Some(generation) = live_generation {
+                            let _ = live_closed_tx
+                                .send(LiveSubscriptionClosedNotification {
+                                    relay_url: relay_url_clone.clone(),
+                                    generation,
+                                })
+                                .await;
+                        }
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -3226,12 +3277,43 @@ impl SyncManager {
         let filters = vec![filters::build_announcement_filter(None)];
 
         // Create live subscription for ongoing announcements
-        let _sub_ids = self.sync_live(relay_url, &filters).await;
+        if self.sync_live(relay_url, &filters).await.is_err() {
+            return;
+        }
 
         // Use historic_sync with empty PendingItems for generic filters
         // Generic filters (announcements) don't have associated repos or root_events
         let items = PendingItems::default();
         let _batch_id = self.historic_sync(relay_url, filters, items, since).await;
+    }
+
+    async fn sync_generic_history(&mut self, relay_url: &str, since: Option<Timestamp>) {
+        let filters = vec![filters::build_announcement_filter(None)];
+        let _batch_id = self
+            .historic_sync(relay_url, filters, PendingItems::default(), since)
+            .await;
+    }
+
+    /// Build the complete persistent coverage for one connection. L1 must be
+    /// admitted in the same transaction as rebuilt L2/L3 so a tight relay
+    /// budget cannot leave a successful generic REQ hiding partial repo
+    /// coverage.
+    async fn complete_live_filters(
+        &self,
+        relay_url: &str,
+        since: Option<Timestamp>,
+    ) -> Vec<Filter> {
+        let mut filters = vec![filters::build_announcement_filter(None)];
+        let index = self.relay_sync_index.read().await;
+        if let Some(state) = index.get(relay_url) {
+            filters.extend(filters::build_sync_level_aware_filters(
+                &state.repos,
+                &state.state_only_repos,
+                &state.root_events,
+                since,
+            ));
+        }
+        filters
     }
 
     /// Quick reconnect - for disconnections < 15 minutes
@@ -3276,68 +3358,19 @@ impl SyncManager {
             }
         };
 
-        self.sync_generic_filters(relay_url, announcement_since)
+        let complete_live = self.complete_live_filters(relay_url, Some(since)).await;
+        if self.sync_live(relay_url, &complete_live).await.is_err() {
+            tracing::warn!(
+                relay = %relay_url,
+                "Complete live coverage did not fit on reconnect; historic work deferred"
+            );
+            return;
+        }
+        self.sync_generic_history(relay_url, announcement_since)
             .await;
-
-        // Step 3: Rebuild L2+L3 from confirmed state with since filter
-        // This uses the preserved repos/root_events from RelaySyncIndex
-        self.rebuild_layer2_and_layer3(relay_url, Some(since)).await;
 
         // Step 4: compute_actions for any NEW items discovered while disconnected
         self.recompute_new_sync_filters_for_relay(relay_url).await;
-    }
-
-    /// Rebuild level-aware repository subscriptions for a relay
-    ///
-    /// Uses the confirmed repos and root_events from RelayState to build filters.
-    /// If since is provided, applies it to all filters for incremental sync.
-    ///
-    /// CRITICAL: This method now creates a PendingBatch to track subscriptions,
-    /// ensuring EOSE handling works correctly for live sync scenarios.
-    async fn rebuild_layer2_and_layer3(&mut self, relay_url: &str, since: Option<Timestamp>) {
-        // Get confirmed state from relay_sync_index
-        let (full_repos, state_only_repos, root_events) = {
-            let index = self.relay_sync_index.read().await;
-            match index.get(relay_url) {
-                Some(state) => (
-                    state.repos.clone(),
-                    state.state_only_repos.clone(),
-                    state.root_events.clone(),
-                ),
-                None => {
-                    tracing::warn!(
-                        relay = %relay_url,
-                        "No RelayState found for rebuild_layer2_and_layer3"
-                    );
-                    return;
-                }
-            }
-        };
-
-        // Nothing to rebuild if no confirmed items
-        if full_repos.is_empty() && state_only_repos.is_empty() && root_events.is_empty() {
-            tracing::debug!(
-                relay = %relay_url,
-                "No confirmed items to rebuild Layer 2/3 for"
-            );
-            return;
-        }
-
-        let filters = filters::build_sync_level_aware_filters(
-            &full_repos,
-            &state_only_repos,
-            &root_events,
-            since,
-        );
-
-        if filters.is_empty() {
-            tracing::debug!(
-                relay = %relay_url,
-                "No filters generated for Layer 2/3 rebuild"
-            );
-            return;
-        }
-        self.sync_live(relay_url, &filters).await;
     }
 
     /// Register a relay for managed connection/reconnection
@@ -3546,8 +3579,12 @@ impl SyncManager {
             };
             let outcome = tokio::select! {
                 result = connection.connect(timeout) => match result {
-                    Ok(()) => ConnectAttemptOutcome::Connected {
-                        advertised_default_limit: connection.fetch_default_limit().await,
+                    Ok(()) => {
+                        let hints = connection.fetch_limit_hints().await;
+                        ConnectAttemptOutcome::Connected {
+                            advertised_default_limit: hints.default_limit,
+                            advertised_max_subscriptions: hints.max_subscriptions,
+                        }
                     },
                     Err(error) => ConnectAttemptOutcome::Failed(error),
                 },
@@ -3601,7 +3638,11 @@ impl SyncManager {
         match result.outcome {
             ConnectAttemptOutcome::Connected {
                 advertised_default_limit,
+                advertised_max_subscriptions,
             } => {
+                if let Some(connection) = self.connections.get(&result.relay_url) {
+                    connection.reset_subscription_budget(advertised_max_subscriptions);
+                }
                 // A session begins only after a successful WebSocket connection. Replacing this
                 // entry on every connection result resets learned caps and re-applies the NIP-11
                 // hint fetched for that exact session.
@@ -4842,7 +4883,7 @@ impl SyncManager {
     ///
     /// The desired live set is an irreducible baseline, so a repository whose
     /// consolidated filters already exceed 70 must remain stable.
-    async fn maybe_consolidate(&mut self, relay_url: &str, new_count: usize) {
+    async fn maybe_consolidate(&mut self, relay_url: &str, new_count: usize) -> bool {
         let current_count = if let Some(connection) = self.connections.get(relay_url) {
             connection.subscription_count().await
         } else {
@@ -4850,8 +4891,12 @@ impl SyncManager {
         };
         let desired_baseline = self.desired_live_filter_count(relay_url).await;
         let fragmentation = consolidation_fragmentation(current_count, new_count, desired_baseline);
+        let budget_pressure = self
+            .connections
+            .get(relay_url)
+            .is_some_and(|connection| connection.needs_live_consolidation(new_count));
 
-        if should_consolidate(current_count, new_count, desired_baseline) {
+        if budget_pressure || should_consolidate(current_count, new_count, desired_baseline) {
             let has_pending_batches = self.has_pending_batches(relay_url).await;
             if !self
                 .deferred_consolidations
@@ -4864,9 +4909,10 @@ impl SyncManager {
                     desired_baseline,
                     fragmentation,
                     threshold = CONSOLIDATION_THRESHOLD,
-                    "Incremental filter fragmentation exceeds threshold; deferring consolidation until pending batches drain"
+                    budget_pressure,
+                    "Live subscription pressure requires consolidation; deferring until pending batches drain"
                 );
-                return;
+                return false;
             }
 
             tracing::info!(
@@ -4876,11 +4922,13 @@ impl SyncManager {
                 desired_baseline,
                 fragmentation,
                 threshold = CONSOLIDATION_THRESHOLD,
-                "Incremental filter fragmentation exceeds threshold, consolidating"
+                budget_pressure,
+                "Live subscription pressure requires consolidation"
             );
 
-            self.consolidate(relay_url).await;
+            return self.consolidate(relay_url).await;
         }
+        true
     }
 
     async fn process_deferred_consolidation(&mut self, relay_url: &str) {
@@ -4896,7 +4944,7 @@ impl SyncManager {
             relay = %relay_url,
             "Pending batches drained; running deferred consolidation"
         );
-        self.consolidate(relay_url).await;
+        let _ = self.consolidate(relay_url).await;
     }
 
     fn cancel_deferred_consolidation(&mut self, relay_url: &str, reason: &'static str) {
@@ -4914,14 +4962,18 @@ impl SyncManager {
     /// The caller must ensure pending batches have drained so EOSE processing
     /// never waits behind the sync actor lock.
     ///
-    /// Layer 1 (announcements) remains active and is NOT unsubscribed.
-    async fn consolidate(&mut self, relay_url: &str) {
+    async fn consolidate(&mut self, relay_url: &str) -> bool {
         tracing::info!(
             relay = %relay_url,
             "Starting consolidation"
         );
 
-        // Get connection and unsubscribe all
+        let now = Timestamp::now();
+        let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
+        let complete_live = self.complete_live_filters(relay_url, Some(since)).await;
+
+        // Replace L1+L2+L3 as one reserved transaction. The connection-level
+        // opener rolls every successful group back if a later group fails.
         let connection = match self.connections.get(relay_url) {
             Some(conn) => conn,
             None => {
@@ -4929,26 +4981,67 @@ impl SyncManager {
                     relay = %relay_url,
                     "No connection found, skipping consolidation"
                 );
-                return;
+                return false;
             }
         };
 
-        connection.unsubscribe_all().await;
+        let complete_group_count = grouped_subscription_count(&complete_live);
+        if !connection.complete_live_set_fits(complete_group_count) {
+            tracing::warn!(
+                relay = %relay_url,
+                complete_group_count,
+                "Complete live coverage exceeds the connection budget; keeping existing coverage and deferring replacement"
+            );
+            return false;
+        }
 
-        // Rebuild all subscriptions with since filter
-        let now = Timestamp::now();
-        let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
-
-        // Re-subscribe to Layer 1 with since filter
-        self.sync_generic_filters(relay_url, Some(since)).await;
-        // Rebuild Layer 2 and Layer 3 with since filter
-        self.rebuild_layer2_and_layer3(relay_url, Some(since)).await;
+        let complete_groups = live_filter_groups(&complete_live);
+        if connection
+            .replace_live_filter_groups(complete_groups)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                relay = %relay_url,
+                "Complete live coverage could not be replaced; historic work deferred"
+            );
+            return false;
+        }
+        self.sync_generic_history(relay_url, Some(since)).await;
 
         tracing::info!(
             relay = %relay_url,
             since = %since,
             "Consolidation complete - filter count reset"
         );
+        true
+    }
+
+    async fn restore_live_coverage_after_closed(&mut self, relay_url: &str, generation: u64) {
+        let Some(connection) = self.connections.get(relay_url) else {
+            return;
+        };
+        if connection.current_subscription_generation() != generation {
+            tracing::debug!(relay = %relay_url, generation, "Ignoring stale live CLOSED from retired session");
+            return;
+        }
+        let now = Timestamp::now();
+        let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
+        let filters = self.complete_live_filters(relay_url, Some(since)).await;
+        let Some(connection) = self.connections.get(relay_url) else {
+            return;
+        };
+        if connection.current_subscription_generation() != generation {
+            return;
+        }
+        if let Err(error) = connection
+            .replace_live_filter_groups(live_filter_groups(&filters))
+            .await
+        {
+            tracing::warn!(relay = %relay_url, %error, "Could not restore complete live coverage after relay CLOSED");
+        } else {
+            tracing::info!(relay = %relay_url, "Restored complete live coverage after relay CLOSED");
+        }
     }
 
     /// Check for relays that should be disconnected
@@ -5203,41 +5296,30 @@ impl SyncManager {
     ///
     /// # Returns
     /// Vec of subscription IDs for the live subscriptions, or empty if connection not found
-    async fn sync_live(&self, relay_url: &str, filters: &[Filter]) -> Vec<SubscriptionId> {
+    async fn sync_live(
+        &self,
+        relay_url: &str,
+        filters: &[Filter],
+    ) -> Result<Vec<SubscriptionId>, String> {
         if filters.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let connection = match self.connections.get(relay_url) {
             Some(conn) => conn,
             None => {
                 tracing::debug!(relay = %relay_url, "No connection found for live sync");
-                return vec![];
+                return Err(format!("No connection found for live sync on {relay_url}"));
             }
         };
 
-        let mut sub_ids = Vec::new();
-
-        for filter_group in group_filters_for_req(&filters) {
-            // Live subscriptions MUST use limit(0) to receive ONLY new events
-            // This prevents fetching historic events that would be miscounted as "live" in metrics
-            // The caller passes the same filters to both sync_live() and historic_sync()
-            // Live subscriptions do NOT auto-close - we want them to stay open for new events
-            let grouped_filters = filter_group
-                .into_iter()
-                .map(|filter| filter.limit(0))
-                .collect();
-            match connection.subscribe_filters(grouped_filters, false).await {
-                Ok(sub_id) => {
-                    sub_ids.push(sub_id);
-                }
-                Err(e) => {
-                    tracing::error!(relay = %relay_url, error = %e, "Failed to create live subscription");
-                }
-            }
-        }
-
-        sub_ids
+        let filter_groups = live_filter_groups(filters);
+        connection
+            .subscribe_live_filter_groups(filter_groups)
+            .await
+            .inspect_err(|error| {
+                tracing::error!(relay = %relay_url, error = %error, "Failed to create complete live subscription set");
+            })
     }
 
     /// Sync historical events and track in PendingSyncIndex
@@ -5594,7 +5676,7 @@ impl SyncManager {
                 requested_event_ids: None, // Not used for REQ+EOSE
                 received_event_ids: None,  // Not used for REQ+EOSE
                 initial_hydration_counts: None,
-                retry_count: 0,            // Not used for REQ+EOSE
+                retry_count: 0, // Not used for REQ+EOSE
                 failed: false,
             };
 
@@ -5671,19 +5753,13 @@ mod tests {
     fn own_relay_targets_are_excluded_from_sync_actions() {
         assert!(is_own_sync_target("wss://gitnostr.com", "gitnostr.com"));
         assert!(is_own_sync_target("ws://gitnostr.com", "gitnostr.com"));
-        assert!(is_own_sync_target(
-            "ws://127.0.0.1:7334",
-            "127.0.0.1:7334"
-        ));
+        assert!(is_own_sync_target("ws://127.0.0.1:7334", "127.0.0.1:7334"));
 
         assert!(!is_own_sync_target(
             "wss://gitnostr.com.attacker.example",
             "gitnostr.com"
         ));
-        assert!(!is_own_sync_target(
-            "ws://127.0.0.1:7335",
-            "127.0.0.1:7334"
-        ));
+        assert!(!is_own_sync_target("ws://127.0.0.1:7335", "127.0.0.1:7334"));
     }
 
     #[test]
