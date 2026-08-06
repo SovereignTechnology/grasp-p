@@ -652,6 +652,39 @@ impl RelayConnection {
         Ok(held)
     }
 
+    /// Acquire both transient constraints without waiting while holding only
+    /// one of them. This prevents class-cap waiters from pinning ledger slots
+    /// and ledger waiters from pinning the class cap.
+    async fn acquire_transient_permits(&self) -> Result<HeldTransientPermits, String> {
+        loop {
+            let ledger_slot = self.acquire_subscription_slots(1).await?;
+            if let Ok(class_cap) = self.transient_req_permits.clone().try_acquire_owned() {
+                return Ok(HeldTransientPermits {
+                    _class_cap: class_cap,
+                    generation: ledger_slot.generation,
+                    _ledger_slot: ledger_slot.permit,
+                });
+            }
+            drop(ledger_slot);
+
+            let class_cap = self
+                .transient_req_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| format!("Transient permits closed for {}", self.url))?;
+            if let Ok(ledger_slot) = self.try_acquire_subscription_slot() {
+                return Ok(HeldTransientPermits {
+                    _class_cap: class_cap,
+                    generation: ledger_slot.generation,
+                    _ledger_slot: ledger_slot.permit,
+                });
+            }
+            drop(class_cap);
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn ensure_current_session(&self, permit: &SessionPermit) -> Result<(), String> {
         self.ensure_current_generation(permit.generation)
     }
@@ -1042,7 +1075,10 @@ impl RelayConnection {
 
         let mut outputs = Vec::with_capacity(filter_groups.len());
         for filters in filter_groups {
-            self.ensure_current_session(&reservation)?;
+            if let Err(error) = self.ensure_current_session(&reservation) {
+                self.close_and_release_live_req_permits(&outputs).await;
+                return Err(error);
+            }
             let permit = reservation
                 .permit
                 .split(1)
@@ -1096,23 +1132,7 @@ impl RelayConnection {
                     self.url
                 ));
             }
-            let transient_cap = self
-                .transient_req_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| format!("Transient permits closed for {}", self.url))?;
-            match self.acquire_subscription_slots(1).await {
-                Ok(ledger_slot) => (
-                    Some(HeldTransientPermits {
-                        _class_cap: transient_cap,
-                        generation: ledger_slot.generation,
-                        _ledger_slot: ledger_slot.permit,
-                    }),
-                    None,
-                ),
-                Err(_) => return Err(format!("Subscription ledger closed for {}", self.url)),
-            }
+            (Some(self.acquire_transient_permits().await?), None)
         } else {
             let acquired = match reserved_live_permit {
                 Some(permit) => Ok(permit),
@@ -2415,6 +2435,63 @@ mod tests {
         assert!(error.contains("session retired"), "{error}");
         assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn transient_admission_never_waits_while_pinning_the_other_budget() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+
+        let all_class = connection
+            .transient_req_permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_TRANSIENT_REQS as u32)
+            .await
+            .expect("occupy transient class cap");
+        let class_waiter_connection = connection.clone();
+        let mut class_waiter =
+            tokio::spawn(async move { class_waiter_connection.acquire_transient_permits().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut class_waiter)
+                .await
+                .is_err(),
+            "consumer must remain queued while the class cap is occupied"
+        );
+        assert_eq!(
+            connection.subscription_budget().available_permits(),
+            8,
+            "waiting for the class cap must return its speculative ledger slot"
+        );
+        drop(all_class);
+        drop(class_waiter.await.expect("class waiter task").unwrap());
+
+        let all_ledger = connection
+            .subscription_budget()
+            .acquire_many_owned(8)
+            .await
+            .expect("occupy subscription ledger");
+        let ledger_waiter_connection = connection.clone();
+        let mut ledger_waiter =
+            tokio::spawn(async move { ledger_waiter_connection.acquire_transient_permits().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ledger_waiter)
+                .await
+                .is_err(),
+            "consumer must remain queued while the ledger is occupied"
+        );
+        assert_eq!(
+            connection.transient_req_permits.available_permits(),
+            MAX_CONCURRENT_TRANSIENT_REQS,
+            "waiting for the ledger must not pin the class cap"
+        );
+        drop(all_ledger);
+        drop(ledger_waiter.await.expect("ledger waiter task").unwrap());
+
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+        assert_eq!(
+            connection.transient_req_permits.available_permits(),
+            MAX_CONCURRENT_TRANSIENT_REQS
+        );
     }
 
     #[tokio::test]
