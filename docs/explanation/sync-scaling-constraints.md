@@ -127,31 +127,39 @@ file:line citations is preserved in this file's history (commit
   relayer, chorus — stores decide). "Unbounded" means the semantic query
   limit; timeouts, rate limits, and finite databases still shorten
   responses, as NIP-01 permits.
-- strfry and rnostr technically accept operator caps below 75, making
-  `PAGINATION_THRESHOLD` formally unsafe at that configuration boundary,
-  but no live sub-75 deployment was found; live strfry relays advertise
-  `max_limit` 500, nostr.wine 1000.
+- strfry and rnostr technically accept arbitrarily low operator caps,
+  making any fixed `PAGINATION_THRESHOLD` formally unsafe at that
+  configuration boundary, but no live deployment anywhere near the
+  threshold was found; live strfry relays advertise `max_limit` 500,
+  nostr.wine 1000.
 - NIP-11 advertisement of the cap is uneven: strfry, nostream, and rnostr
   publish `max_limit`; nostr-rs-relay, khatru-family, and chorus do not.
 
-The client encodes this model in `PAGINATION_THRESHOLD` (75,
-`src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 75 events is
-treated as possibly-truncated and fetched again with `until` set to its
-oldest seen `created_at`; below 75 it is treated as exhausted.
+The client encodes this model in `PAGINATION_THRESHOLD` (200,
+`src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 200 counted
+events is treated as possibly-truncated and fetched again with `until` set
+to its oldest seen `created_at`; below 200 it is treated as exhausted.
 Consequences:
 
-- Correct against any relay whose effective per-filter cap is ≥ 75. Although
-  strfry and rnostr technically accept lower configurations, all finite
-  audited defaults are at least 250 and live advertised values are 500–1000.
-- A relay capping a filter below 75, or enforcing an aggregate per-REQ cap,
-  silently truncates history. No audited implementation has an aggregate cap,
-  and no live sub-75 cap was observed. The remaining risk is a deliberately
-  restrictive, non-default strfry or rnostr configuration.
-- The price of the conservative floor is one redundant page for any filter
-  whose result count lands between 75 and the relay's actual cap. Future
-  lever (not implemented): learn each relay's effective cap from the
-  largest pages it returns and raise the assumed limit toward it, shrinking
-  the redundant-page window while keeping 75 as the safe floor.
+- Correct against any relay whose effective per-filter cap is ≥ 200. The
+  smallest audited defaults are 250 (haven/Badger) and 300 (rnostr); the
+  gap below 250 is deliberate margin, because only events processed as
+  Saved or Duplicate count toward the threshold — events routed to
+  purgatory or rejected consume the relay's allowance without being
+  counted, so a threshold equal to a relay's cap would mistake a full page
+  for an exhausted filter.
+- A relay capping a filter below 200, or enforcing an aggregate per-REQ
+  cap, silently truncates history. No audited implementation has an
+  aggregate cap; the remaining risk is a deliberately restrictive,
+  non-default strfry or rnostr configuration.
+- The price of the floor is one redundant page for any filter whose result
+  count lands between 200 and the relay's actual cap. The threshold was
+  raised from its original ultra-conservative 75 once the audit
+  established the real floor; filters with 75–199 results no longer pay
+  the extra page.
+- Future lever (not implemented): where NIP-11 advertises `max_limit`
+  (strfry, nostream, rnostr do), use it as a per-relay threshold, with
+  observed page sizes as fallback evidence and 200 as the static floor.
 
 ### Working floors
 

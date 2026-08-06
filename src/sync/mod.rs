@@ -578,13 +578,26 @@ const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
 /// Per-filter threshold for historic REQ+EOSE pagination.
 ///
-/// Grouped pagination assumes that relays apply result limits independently to
-/// each filter, return at least this many events for a non-exhausted filter,
-/// and do not impose an additional total-result cap across the whole REQ. This
-/// matches NIP-01's per-filter `limit` model and ngit-grasp's relay behavior.
-/// Relays that violate these assumptions can make one filter appear exhausted
-/// after another filter consumes the combined result allowance.
-const PAGINATION_THRESHOLD: usize = 75;
+/// After EOSE, a filter that delivered at least this many counted events is
+/// treated as possibly truncated by the relay's per-filter result cap and is
+/// fetched again with `until` set to its oldest seen `created_at`; below the
+/// threshold it is treated as exhausted.
+///
+/// NIP-01 guarantees none of this; the model is empirical. A source audit of
+/// nine relay implementations (2026-08-06, recorded with citations in
+/// docs/explanation/sync-scaling-constraints.md) found result limits are
+/// always applied per filter, never in aggregate across a REQ, with the
+/// smallest finite default caps at 250 (haven/Badger) and 300 (rnostr).
+///
+/// The threshold must sit below the smallest cap we may meet, with margin:
+/// only events processed as Saved or Duplicate are counted here, so events
+/// routed to purgatory or rejected consume the relay's allowance without
+/// being counted, and a threshold equal to a relay's cap would mistake a
+/// full page for an exhausted filter. 200 keeps a 50-event margin under the
+/// tightest audited default while sparing filters with fewer than 200
+/// results the redundant final page. A relay capped below this threshold
+/// silently truncates history; no such deployment is known.
+const PAGINATION_THRESHOLD: usize = 200;
 
 /// Conservative number of OR filters carried by one NIP-01 REQ.
 ///
