@@ -55,21 +55,26 @@ requests" is emitted when NEG views exceed `maxSubsPerConnection`.
 
 ### Live NIP-11 documents (operators tighten defaults)
 
-| Relay | `max_subscriptions` | `max_message_length` |
-| --- | --- | --- |
-| nos.lol (strfry) | **20** | 131072 |
-| relay.primal.net | **20** | 1000000 |
-| nostr.wine | 50 | 524288 |
-| relay.damus.io | 200 | 1000000 |
-| relay.nostr.band, relay.ngit.dev | not advertised | not advertised |
+| Relay | `max_limit` | `max_subscriptions` | `max_message_length` |
+| --- | --- | --- | --- |
+| [nos.lol](https://nos.lol/) (strfry 1.1.0) | 500 | **20** | 131072 |
+| [relay.primal.net](https://relay.primal.net/) (strfry 1.0.3-1-g60d35a6) | 500 | **20** | 1000000 |
+| [nostr.wine](https://nostr.wine/) (operator software 0.3.3) | 1000 | 50 | 524288 |
+| [relay.damus.io](https://relay.damus.io/) (strfry 1.1.0-1-g691a533f11eb) | 500 | 200 | 1000000 |
+| [relay.nostr.band](https://relay.nostr.band/) | unavailable — HTTPS timed out twice | unavailable | unavailable |
+
+Live documents fetched 2026-08-06 with `Accept: application/nostr+json`.
+The first four advertise their result cap as `limitation.max_limit`.
 
 ### Discoverability gap (NIP-11)
 
-NIP-11 `limitation` has **no field for tag values per filter and no field for
-filters per REQ**. Only `max_subscriptions` and `max_message_length` are
-advertised, and many relays omit `limitation` entirely. Consequence: filter
-sizing cannot be negotiated per relay — it must be statically conservative,
-with reactive fallback as the backstop.
+NIP-11 `limitation` has **no field for tag values per filter**. It does define
+`max_filters` (filters per subscription) and `max_limit` (query results), in
+addition to `max_subscriptions` and `max_message_length`, but implementations
+and operators advertise these unevenly. `max_limit` also cannot express
+whether the allowance is per filter or aggregate across a multi-filter REQ.
+Consequently neither filter sizing nor the pagination model can be negotiated
+reliably; both need conservative defaults and reactive fallback.
 
 ### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0)
 
@@ -104,15 +109,37 @@ implements is an empirical question, and it decides whether grouped
 REQ+EOSE pagination (per-filter `until` cursors inside one grouped
 subscription) is safe.
 
-Evidence so far:
+### Audit result: per-filter; 75 is practically conservative
 
-- **nostr-sdk `LocalRelay` 0.45.0 — verified per-filter** (see above).
-  During the 0.45.0 upgrade an aggregate merged-result cap was suspected;
-  inspection of the published crate source ruled it out.
-- **strfry, khatru, nostr-rs-relay, others — assumed per-filter,
-  unaudited.** Per-filter clamping is the natural implementation shape, but
-  we have not verified it against sources. An implementation audit is
-  pending; record findings here with version and file:line citations.
+All nine audited implementations process result limits per filter and none has
+an aggregate merged-result cap. That part of grouped pagination is supported.
+strfry and rnostr technically let an operator configure a per-filter cap below
+75, so `PAGINATION_THRESHOLD` is not formally correct for every permitted
+configuration: a full 50-event page, for example, would be mistaken for an
+exhausted filter. In practice, such a cap is unrealistically restrictive for a
+general-purpose relay. Every finite audited default is at least 250, and the
+four reachable live relays advertise 500 or 1000. **The threshold is therefore
+technically unsafe at the configuration boundary but practically an
+ultra-conservative production floor; this audit found no evidence of a live
+sub-75 deployment.**
+
+Source audit (2026-08-06; “none” means no built-in cap at that layer):
+
+| Implementation (release, commit) | Missing `limit` | Requested `limit` | Multi-filter REQ | Operator minimum / below 75? | `until` pagination | NIP-11 |
+| --- | --- | --- | --- | --- | --- | --- |
+| nostr-sdk `LocalRelay` 0.45.0 | 500 | clamped per filter by `max_filter_limit` and `max_query_results` (default effective 500) | independently queried, deduplicated merge, no aggregate cap | both settings are builder-configurable; already verified above | same cap | not material to this audit |
+| **strfry 1.1.1, [`3fd1bc5`](https://github.com/hoytech/strfry/tree/3fd1bc538e5e4dc2d122041064753be0177748b4)** | 500 | clamped to `maxFilterLimit` ([`src/filters.h:117-123,195-208`](https://github.com/hoytech/strfry/blob/1.1.1/src/filters.h#L117-L208)) | scans filters sequentially; the limit counter is cleared between filters while the full-set deduper is retained, so no aggregate cap ([`src/DBQuery.h:283-322,352-368`](https://github.com/hoytech/strfry/blob/1.1.1/src/DBQuery.h#L283-L368)) | technically any numeric `maxFilterLimit`, default 500; below 75 is possible but operationally implausible ([`strfry.conf:107-117`](https://github.com/hoytech/strfry/blob/1.1.1/strfry.conf#L107-L117)) | `until` only bounds matching / scan position; same per-filter cap ([`src/filters.h:195-215`](https://github.com/hoytech/strfry/blob/1.1.1/src/filters.h#L195-L215)) | advertises `max_limit` (confirmed by the three live strfry documents above) |
+| **nostr-rs-relay 0.10.0, [`b5c1f64`](https://github.com/scsibug/nostr-rs-relay/tree/b5c1f642e4f4c3b9c54f5d18d66f4c53642076b4)** | SQLite: unbounded; PostgreSQL: 1000 | SQLite: requested value, no clamp; PostgreSQL: clamped to 1000 ([SQLite `src/repo/sqlite.rs:1149-1155`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/sqlite.rs#L1149-L1155), [PostgreSQL `src/repo/postgres.rs:891-900`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/postgres.rs#L891-L900)) | both backends loop over filters and execute one query apiece; no aggregate counter ([SQLite `src/repo/sqlite.rs:378-391,505-518`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/sqlite.rs#L378-L518), [PostgreSQL `src/repo/postgres.rs:318-325,425-426`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/repo/postgres.rs#L318-L426)) | caps are hard-coded, not operator-configurable; no plausible cap below 75 | `until` is only a filter predicate; same backend-specific limit | does **not** advertise result limits; its NIP-11 `limitation` contains only payment/write flags ([`src/info.rs:9-19,79-87`](https://github.com/scsibug/nostr-rs-relay/blob/0.10.0/src/info.rs#L9-L19)) |
+| **khatru v0.19.1, [`8d5fc32`](https://github.com/fiatjaf/khatru/tree/8d5fc324f7a0bb2af083d8566b531ca3357ee652)** | none at framework layer; store-defined | no framework clamp; store-defined | explicitly dispatches every filter separately and waits for all before EOSE ([`handlers.go:289-324`](https://github.com/fiatjaf/khatru/blob/v0.19.1/handlers.go#L289-L324)); each query receives one filter ([`responding.go:12-59`](https://github.com/fiatjaf/khatru/blob/v0.19.1/responding.go#L12-L59)) | no built-in result-limit setting; a relay author can overwrite filters or choose a capped store, but that is application code, not operator configuration | passed unchanged to the store; no framework special case | no automatic result-limit advertisement; application-owned [`Relay.Info`](https://github.com/fiatjaf/khatru/blob/v0.19.1/relay.go#L26-L48) |
+| **relayer v2.2.14, [`4664acb`](https://github.com/fiatjaf/relayer/tree/4664acbeb2bd80f3b656a4433bbbeba5f302e979)** | effectively unbounded at framework layer (`9,999,999,999` safeguard) | enforced exactly as requested, per filter; no clamp ([`handlers.go:226-247`](https://github.com/fiatjaf/relayer/blob/v2.2.14/handlers.go#L226-L247)) | sequential per-filter queries and counters; no aggregate counter ([`handlers.go:182-255`](https://github.com/fiatjaf/relayer/blob/v2.2.14/handlers.go#L182-L255)) | no built-in result-limit setting; storage/application policy may add one | passed unchanged to storage; no framework special case | relay/application supplies NIP-11 metadata through its optional [`Informationer`](https://github.com/fiatjaf/relayer/blob/v2.2.14/interface.go#L40-L44); no automatic cap |
+| **nostream v3.0.0, [`bf3e3c8`](https://github.com/Cameri/nostream/tree/bf3e3c86072b7e0644bbbd778dbbb28a1be771d9)** | 500 ([`src/constants/base.ts:87`](https://github.com/Cameri/nostream/blob/v3.0.0/src/constants/base.ts#L87)) | not clamped: REQ is rejected if any requested limit exceeds configured `maxLimit` ([`src/handlers/subscribe-message-handler.ts:98-125`](https://github.com/Cameri/nostream/blob/v3.0.0/src/handlers/subscribe-message-handler.ts#L98-L125)) | one limited subquery per filter, combined with `UNION`; no outer aggregate limit ([`src/repositories/event-repository.ts:47-75`](https://github.com/Cameri/nostream/blob/v3.0.0/src/repositories/event-repository.ts#L47-L75)) | `maxLimit` defaults to 5000 and may be set below 75, but that rejects larger explicit requests and does not reduce the 500 default for an omitted limit; therefore it cannot silently create a sub-75 page ([`resources/default-settings.yaml:215-222`](https://github.com/Cameri/nostream/blob/v3.0.0/resources/default-settings.yaml#L215-L222)) | `until` adds a predicate to each same limited subquery ([`src/repositories/event-repository.ts:117-130`](https://github.com/Cameri/nostream/blob/v3.0.0/src/repositories/event-repository.ts#L117-L130)) | advertises both `max_limit` and nonstandard `default_limit` ([`src/handlers/request-handlers/root-request-handler.ts:87-104`](https://github.com/Cameri/nostream/blob/v3.0.0/src/handlers/request-handlers/root-request-handler.ts#L87-L104)) |
+| **rnostr v0.4.9, [`0983e52`](https://github.com/rnostr/rnostr/tree/0983e527b23d3fe18f3d92b407ce31793900e767)** | configured `max_limit`, default 300 | clamped per filter to `max_limit` ([`relay/src/message.rs:98-114`](https://github.com/rnostr/rnostr/blob/v0.4.9/relay/src/message.rs#L98-L114)) | reader loops and queries every filter separately; no aggregate counter ([`relay/src/reader.rs:20-43`](https://github.com/rnostr/rnostr/blob/v0.4.9/relay/src/reader.rs#L20-L43)) | technically any `u64` `max_limit`, default 300; below 75 is possible but operationally implausible ([`relay/src/setting.rs:123-156`](https://github.com/rnostr/rnostr/blob/v0.4.9/relay/src/setting.rs#L123-L156)) | passed to the same per-filter DB iterator; no special case | advertises the entire configured `limitation`, including `max_limit` ([`relay/src/setting.rs:340-352`](https://github.com/rnostr/rnostr/blob/v0.4.9/relay/src/setting.rs#L340-L352)) |
+| **chorus v2.0.2, [`411f16a`](https://github.com/mikedilger/chorus/tree/411f16ad18397cd3474016015f7f074a0c285430)** | unbounded (`u32::MAX`) in pinned pocket dependency ([`pocket-types/src/filter.rs:273-288`](https://github.com/mikedilger/pocket/blob/329334f20948c796c6016b673b92551ac4855ad7/pocket-types/src/filter.rs#L273-L288)) | exact requested value; no clamp | calls `find_events` once per filter, then sorts and deduplicates the merge with no aggregate truncation ([`src/nostr.rs:159-186`](https://github.com/mikedilger/chorus/blob/v2.0.2/src/nostr.rs#L159-L186)); the pinned store applies `.take(filter.limit())` ([`pocket-db/src/lib.rs:801-809`](https://github.com/mikedilger/pocket/blob/329334f20948c796c6016b673b92551ac4855ad7/pocket-db/src/lib.rs#L801-L809)) | no result-cap setting; no plausible operator cap below 75 | `until` only bounds the same store scan ([`pocket-db/src/lib.rs:775-805`](https://github.com/mikedilger/pocket/blob/329334f20948c796c6016b673b92551ac4855ad7/pocket-db/src/lib.rs#L775-L805)) | limitation advertises message/subscription limits, not a result cap ([`src/web/nip11.rs:143-153`](https://github.com/mikedilger/chorus/blob/v2.0.2/src/web/nip11.rs#L143-L153)) |
+| **haven v1.2.2, [`45d835f`](https://github.com/bitvora/haven/tree/45d835fbb98e71bf7dc96d073c92a8a9b4555e85)** | LMDB default: 375; optional Badger default: 250 | requested values up to backend maximum (1500 LMDB, 1000 Badger); larger requests fall back to 375/250 rather than clamp to the maximum ([eventstore v0.17.5 `lmdb/query.go:26-43`](https://github.com/fiatjaf/eventstore/blob/v0.17.5/lmdb/query.go#L26-L43), [`lmdb/lib.go:42-49`](https://github.com/fiatjaf/eventstore/blob/v0.17.5/lmdb/lib.go#L42-L49), [`badger/lib.go:60-66`](https://github.com/fiatjaf/eventstore/blob/v0.17.5/badger/lib.go#L60-L66)) | khatru dispatches per filter; Haven registers one backend query callback, so no aggregate cap ([`init.go:140-148`](https://github.com/bitvora/haven/blob/v1.2.2/init.go#L140-L148)) | Haven constructs backends without setting `MaxLimit`; no environment/operator result-cap setting and no plausible sub-75 cap ([`init.go:61-78`](https://github.com/bitvora/haven/blob/v1.2.2/init.go#L61-L78)) | ordinary REQ path and cap are unchanged; only negentropy selects the much larger backend limit | does not set a NIP-11 result cap |
+
+“Unbounded” above is the semantic query limit; timeouts, output rate limits,
+authorization, scraper rejection, and finite database contents can still make a
+relay return fewer events, as NIP-01 permits.
 
 The client encodes this model in `PAGINATION_THRESHOLD` (75,
 `src/sync/mod.rs`): after EOSE, a filter that delivered ≥ 75 events is
@@ -120,13 +147,13 @@ treated as possibly-truncated and fetched again with `until` set to its
 oldest seen `created_at`; below 75 it is treated as exhausted.
 Consequences:
 
-- Correct against any relay whose effective per-filter cap is ≥ 75. The
-  value sits deliberately far below every known default (500) so that no
-  plausible operator configuration falls under it.
-- A relay capping a filter below 75, or enforcing an aggregate per-REQ
-  cap, would silently truncate history. No such implementation is
-  currently known; the audit exists to keep that claim evidence-based
-  rather than assumed.
+- Correct against any relay whose effective per-filter cap is ≥ 75. Although
+  strfry and rnostr technically accept lower configurations, all finite
+  audited defaults are at least 250 and live advertised values are 500–1000.
+- A relay capping a filter below 75, or enforcing an aggregate per-REQ cap,
+  silently truncates history. No audited implementation has an aggregate cap,
+  and no live sub-75 cap was observed. The remaining risk is a deliberately
+  restrictive, non-default strfry or rnostr configuration.
 - The price of the conservative floor is one redundant page for any filter
   whose result count lands between 75 and the relay's actual cap. Future
   lever (not implemented): learn each relay's effective cap from the
