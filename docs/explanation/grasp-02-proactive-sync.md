@@ -1048,8 +1048,8 @@ The [`RelayHealthTracker`](src/sync/health.rs:209) manages connection health wit
 Healthy <-> Disconnected: Normal connection/disconnection
 Disconnected -> Degraded: Connection failure
 Degraded -> Dead: 24h+ of continuous failures
-Degraded -> Disconnected: Recovery (enters 5min stability period)
-Disconnected -> Healthy: Stable for 5 minutes after recovery
+Degraded -> Degraded: Handshake recovery starts a 5-minute stability period
+Degraded -> Healthy: The recovered connection survives 5 minutes under normal sync load
 Any -> RateLimited: NOTICE message from relay indicating rate limiting
 RateLimited -> Probing: After 65-second cooldown expires
 Probing -> previous state: Recovery REQs succeed
@@ -1067,6 +1067,8 @@ Probing -> RateLimited: Recovery REQ is rate limited again
   repeated notices during the same cooldown do not extend its deadline, while
   a rejection after that deadline starts a new cooldown
 - **Stability period**: 5 minutes after recovery before marking as Healthy
+  and clearing the failure streak. A short-lived successful handshake does not
+  reset exponential backoff; another disconnect continues the existing streak.
 
 ### Special Behaviors
 

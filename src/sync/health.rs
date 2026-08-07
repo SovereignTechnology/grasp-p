@@ -274,7 +274,9 @@ impl RelayHealthTracker {
 
     /// Record a successful connection to a relay
     ///
-    /// Clears connection failure counters. Sets connected = true.
+    /// Sets connected = true. A relay recovering from failures keeps its
+    /// failure streak until it survives the stability period under normal
+    /// workload; a WebSocket handshake alone is not proof of recovery.
     ///
     /// A successful WebSocket connection does not prove that the relay will
     /// accept a new REQ, so it deliberately leaves any active rate-limit
@@ -291,19 +293,35 @@ impl RelayHealthTracker {
             .flatten()
             .filter(|deadline| *deadline > now);
 
-        // Reset connection health. A live rate-limit cooldown is independent
-        // of whether the WebSocket handshake succeeded.
+        let was_connected = health.connected;
+        let recovering = health.consecutive_failures > 0 || health.last_failure_time.is_some();
+
+        // A live rate-limit cooldown is independent of whether the WebSocket
+        // handshake succeeded.
         health.connected = true;
         health.rate_limited = active_rate_limit.is_some();
-        health.consecutive_failures = 0;
-        health.first_failure_time = None;
-        health.last_failure_time = None;
-        health.last_success_time = Some(now);
+        if !recovering {
+            health.consecutive_failures = 0;
+            health.first_failure_time = None;
+            health.last_failure_time = None;
+        }
+        // Keep one stability boundary per session if a duplicate connection
+        // notification reaches this idempotent accounting boundary.
+        if !was_connected {
+            health.last_success_time = Some(now);
+        }
         health.last_attempt_time = Some(now);
         health.next_retry_at = active_rate_limit;
 
         let new_state = health.state();
-        if old_state != new_state {
+        if recovering && !was_connected {
+            tracing::info!(
+                relay = %relay_url,
+                consecutive_failures = health.consecutive_failures,
+                stability_secs = STABILITY_PERIOD_SECS,
+                "Relay connected; preserving failure streak until stable"
+            );
+        } else if old_state != new_state {
             tracing::info!(
                 "Relay {} connection recovered ({:?} -> {:?})",
                 relay_url,
@@ -311,6 +329,42 @@ impl RelayHealthTracker {
                 new_state
             );
         }
+    }
+
+    /// Promote recovered connections that have remained established through
+    /// the stability period under their normal workload.
+    pub fn promote_stable_connections(&self) -> Vec<String> {
+        let now = Instant::now();
+        let stability_period = Duration::from_secs(STABILITY_PERIOD_SECS);
+        let mut promoted = Vec::new();
+
+        for mut entry in self.health.iter_mut() {
+            let (relay_url, health) = entry.pair_mut();
+            if !health.connected || health.consecutive_failures == 0 {
+                continue;
+            }
+            let Some(connected_at) = health.last_success_time else {
+                continue;
+            };
+            if now.duration_since(connected_at) < stability_period {
+                continue;
+            }
+
+            health.consecutive_failures = 0;
+            health.first_failure_time = None;
+            health.last_failure_time = None;
+            if !health.is_rate_limited_now() {
+                health.next_retry_at = None;
+            }
+            promoted.push(relay_url.clone());
+            tracing::info!(
+                relay = %relay_url,
+                stability_secs = STABILITY_PERIOD_SECS,
+                "Relay connection proved stable; failure streak reset"
+            );
+        }
+
+        promoted
     }
 
     /// Record a connection failure for a relay
@@ -625,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_success_resets_to_healthy() {
+    fn recovered_handshake_preserves_backoff_until_stable() {
         let tracker = RelayHealthTracker::with_defaults();
         let url = "wss://test-relay.example.com";
 
@@ -637,9 +691,53 @@ mod tests {
 
         // Record success
         tracker.record_success(url);
+        assert_eq!(tracker.get_state(url), HealthState::Degraded);
+        assert_eq!(tracker.get_failure_count(url), 2);
+        assert!(tracker.should_attempt_connection(url));
+
+        // A further disconnect continues the existing failure streak rather
+        // than returning to the base backoff.
+        tracker.record_failure(url);
+        assert_eq!(tracker.get_failure_count(url), 3);
+        let remaining = tracker.get_remaining_backoff(url).unwrap();
+        assert!(remaining > Duration::from_secs(10));
+    }
+
+    #[test]
+    fn stable_recovered_connection_resets_failure_history() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let url = "wss://stable-relay.example.com";
+
+        tracker.record_failure(url);
+        tracker.record_success(url);
+        {
+            let mut entry = tracker.health.get_mut(url).unwrap();
+            entry.last_success_time =
+                Some(Instant::now() - Duration::from_secs(STABILITY_PERIOD_SECS + 1));
+        }
+
+        assert_eq!(tracker.promote_stable_connections(), vec![url.to_string()]);
         assert_eq!(tracker.get_state(url), HealthState::Healthy);
         assert_eq!(tracker.get_failure_count(url), 0);
-        assert!(tracker.should_attempt_connection(url));
+    }
+
+    #[test]
+    fn disconnected_relay_cannot_age_into_stable_recovery() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let url = "wss://disconnected-relay.example.com";
+
+        tracker.record_failure(url);
+        tracker.record_success(url);
+        tracker.record_failure(url);
+        {
+            let mut entry = tracker.health.get_mut(url).unwrap();
+            entry.last_success_time =
+                Some(Instant::now() - Duration::from_secs(STABILITY_PERIOD_SECS + 1));
+        }
+
+        assert!(tracker.promote_stable_connections().is_empty());
+        assert_eq!(tracker.get_state(url), HealthState::Degraded);
+        assert_eq!(tracker.get_failure_count(url), 2);
     }
 
     #[test]

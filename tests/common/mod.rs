@@ -3,6 +3,7 @@
 #![allow(unused_imports)] // Re-exports may not be used in all test configurations
 
 pub mod censoring_proxy;
+pub mod flapping_relay;
 pub mod git_server;
 pub mod mock_relay;
 pub mod neg_limiting_proxy;

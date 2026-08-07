@@ -1120,14 +1120,18 @@ async fn run_health_and_metrics_checker(
             _ = tokio::time::sleep(interval) => {
                 let mut manager = sync_manager.lock().await;
 
-                // 1. Check for disconnects and retry disconnected relays
+                // 1. Reset failure history only after a recovered connection
+                // has survived the stability period under normal sync load.
+                manager.health_tracker.promote_stable_connections();
+
+                // 2. Check for disconnects and retry disconnected relays
                 manager.check_disconnects().await;
                 manager.retry_disconnected_relays().await;
 
-                // 2. Check for rate limit recovery
+                // 3. Check for rate limit recovery
                 manager.check_rate_limit_recovery().await;
 
-                // 3. Check for naughty list expiration
+                // 4. Check for naughty list expiration
                 if let Some(naughty_list) = manager.health_tracker.naughty_list() {
                     let recovered = naughty_list.expire_old_entries();
                     for url in recovered {
@@ -1138,7 +1142,7 @@ async fn run_health_and_metrics_checker(
                     }
                 }
 
-                // 4. Update metrics with current health states and naughty list
+                // 5. Update metrics with current health states and naughty list
                 if let Some(ref metrics) = manager.metrics {
                     // Get all tracked relay URLs
                     let relay_urls: Vec<String> = {
@@ -3351,8 +3355,8 @@ impl SyncManager {
     /// 3. Rebuilding L2+L3 from preserved RelaySyncIndex state
     /// 4. Computing actions for new items discovered during catchup
     ///
-    /// Basic connection state and metrics are managed by handle_connect_or_reconnect.
-    /// This method handles reconnect-specific concerns (health tracking, reconnect metrics).
+    /// Basic connection health is managed by the connection worker and its
+    /// stability timer. This method handles reconnect-specific sync and metrics.
     async fn quick_reconnect(&mut self, relay_url: &str, since: Timestamp) {
         self.cancel_deferred_consolidation(relay_url, "quick reconnect");
 
@@ -3362,9 +3366,6 @@ impl SyncManager {
             let mut pending = self.pending_sync_index.write().await;
             pending.remove(relay_url);
         }
-
-        // Record successful reconnection in health tracker
-        self.health_tracker.record_success(relay_url);
 
         // Record reconnect-specific metrics (not basic connection metrics)
         if let Some(ref metrics) = self.metrics {
