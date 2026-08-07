@@ -119,7 +119,42 @@ struct HeldTransientPermits {
     _class_cap: tokio::sync::OwnedSemaphorePermit,
     _ledger_slot: tokio::sync::OwnedSemaphorePermit,
     generation: u64,
+    request_class: TransientRequestClass,
 }
+
+/// Bounded origin of an auto-close REQ, retained for watchdog diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientRequestClass {
+    HistoricPage,
+    PaginationPage,
+    PaginationVerification,
+    NegentropyHydration,
+    NegentropyRetry,
+    NegentropyFallback,
+}
+
+impl TransientRequestClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HistoricPage => "historic_page",
+            Self::PaginationPage => "pagination_page",
+            Self::PaginationVerification => "pagination_verification",
+            Self::NegentropyHydration => "negentropy_hydration",
+            Self::NegentropyRetry => "negentropy_retry",
+            Self::NegentropyFallback => "negentropy_fallback",
+        }
+    }
+}
+
+#[cfg(test)]
+const TRANSIENT_REQUEST_CLASSES: [TransientRequestClass; 6] = [
+    TransientRequestClass::HistoricPage,
+    TransientRequestClass::PaginationPage,
+    TransientRequestClass::PaginationVerification,
+    TransientRequestClass::NegentropyHydration,
+    TransientRequestClass::NegentropyRetry,
+    TransientRequestClass::NegentropyFallback,
+];
 
 #[derive(Clone)]
 struct SubscriptionLedgerSession {
@@ -655,7 +690,10 @@ impl RelayConnection {
     /// Acquire both transient constraints without waiting while holding only
     /// one of them. This prevents class-cap waiters from pinning ledger slots
     /// and ledger waiters from pinning the class cap.
-    async fn acquire_transient_permits(&self) -> Result<HeldTransientPermits, String> {
+    async fn acquire_transient_permits(
+        &self,
+        request_class: TransientRequestClass,
+    ) -> Result<HeldTransientPermits, String> {
         loop {
             let ledger_slot = self.acquire_subscription_slots(1).await?;
             if let Ok(class_cap) = self.transient_req_permits.clone().try_acquire_owned() {
@@ -663,6 +701,7 @@ impl RelayConnection {
                     _class_cap: class_cap,
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
+                    request_class,
                 });
             }
             drop(ledger_slot);
@@ -678,6 +717,7 @@ impl RelayConnection {
                     _class_cap: class_cap,
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
+                    request_class,
                 });
             }
             drop(class_cap);
@@ -741,7 +781,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.replace_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, false, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
         })
         .await
     }
@@ -1009,7 +1049,7 @@ impl RelayConnection {
     ///
     /// # Arguments
     /// * `filter` - The filter to subscribe to
-    /// * `auto_close` - If true, subscription automatically closes after EOSE (for historic sync). If false, stays open for new events (for live sync).
+    /// * `request_class` - Bounded historic-sync origin retained for watchdog diagnostics.
     ///
     /// # Returns
     /// * `Ok(SubscriptionId)` - The subscription ID on success
@@ -1017,9 +1057,9 @@ impl RelayConnection {
     pub async fn subscribe_filter(
         &self,
         filter: Filter,
-        auto_close: bool,
+        request_class: TransientRequestClass,
     ) -> Result<SubscriptionId, String> {
-        self.subscribe_filters(vec![filter], auto_close).await
+        self.subscribe_filters(vec![filter], request_class).await
     }
 
     /// Subscribe to several OR filters under one NIP-01 subscription ID.
@@ -1030,9 +1070,9 @@ impl RelayConnection {
     pub async fn subscribe_filters(
         &self,
         filters: Vec<Filter>,
-        auto_close: bool,
+        request_class: TransientRequestClass,
     ) -> Result<SubscriptionId, String> {
-        self.subscribe_filters_with_live_permit(filters, auto_close, None)
+        self.subscribe_filters_with_live_permit(filters, Some(request_class), None)
             .await
     }
 
@@ -1044,7 +1084,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.subscribe_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, false, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
         })
         .await
     }
@@ -1101,7 +1141,7 @@ impl RelayConnection {
     async fn subscribe_filters_with_live_permit(
         &self,
         filters: Vec<Filter>,
-        auto_close: bool,
+        transient_class: Option<TransientRequestClass>,
         reserved_live_permit: Option<SessionPermit>,
     ) -> Result<SubscriptionId, String> {
         if filters.is_empty() {
@@ -1112,7 +1152,7 @@ impl RelayConnection {
             relay = %self.url,
             filter_count = filters.len(),
             filters = ?filters,
-            auto_close = auto_close,
+            auto_close = transient_class.is_some(),
             "subscribe_filters called"
         );
 
@@ -1121,7 +1161,7 @@ impl RelayConnection {
         // exceeding relay subscription budgets. The permit is registered
         // against the subscription id on success and released when the
         // subscription's EOSE or CLOSED arrives (see run_event_loop).
-        let (transient_permit, live_permit) = if auto_close {
+        let (transient_permit, live_permit) = if let Some(request_class) = transient_class {
             if self.historic_capacity_consumed_by_live() {
                 tracing::warn!(
                     relay = %self.url,
@@ -1132,7 +1172,10 @@ impl RelayConnection {
                     self.url
                 ));
             }
-            (Some(self.acquire_transient_permits().await?), None)
+            (
+                Some(self.acquire_transient_permits(request_class).await?),
+                None,
+            )
         } else {
             let acquired = match reserved_live_permit {
                 Some(permit) => Ok(permit),
@@ -1162,7 +1205,7 @@ impl RelayConnection {
         // Transient permits are acquired through the same session helper; a
         // reset closes queued acquisitions and the helper checks generation.
         let retained_filters = filters.clone();
-        let output = if auto_close {
+        let output = if transient_class.is_some() {
             self.client
                 .subscribe(filters)
                 .close_on(
@@ -1184,7 +1227,7 @@ impl RelayConnection {
             return Err(format!("Failed to subscribe on {}: {}", self.url, failures));
         }
 
-        if auto_close {
+        if transient_class.is_some() {
             if let Some(permit) = transient_permit {
                 self.hold_transient_req_permit(output.value.clone(), permit);
             }
@@ -1323,32 +1366,37 @@ impl RelayConnection {
         let relay_url = self.url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(TRANSIENT_REQ_PERMIT_TIMEOUT).await;
-            let generation = held
+            let held_request = held
                 .lock()
                 .expect("transient permit map poisoned")
                 .get(&sub_id)
-                .map(|permits| permits.generation);
-            if let (Some(generation), Ok(Some(relay))) = (generation, client.relay(&url).await) {
+                .map(|permits| (permits.generation, permits.request_class));
+            if let (Some((generation, request_class)), Ok(Some(relay))) =
+                (held_request, client.relay(&url).await)
+            {
                 if relay
                     .send_msg(ClientMessage::close(sub_id.clone()))
                     .await
                     .is_ok()
                 {
-                    Self::release_transient_req_permit_for_generation(
-                        &held,
-                        &sub_id,
-                        generation,
-                    );
+                    Self::release_transient_req_permit_for_generation(&held, &sub_id, generation);
                     tracing::warn!(
                         relay = %relay_url,
                         sub_id = %sub_id,
+                        request_class = request_class.as_str(),
                         "Transient REQ watchdog sent CLOSE after missing EOSE/CLOSED"
                     );
+                    crate::metrics::record_transient_req_watchdog(request_class.as_str(), "closed");
                 } else {
                     tracing::warn!(
                         relay = %relay_url,
                         sub_id = %sub_id,
+                        request_class = request_class.as_str(),
                         "Transient REQ watchdog could not send CLOSE; retaining subscription slot"
+                    );
+                    crate::metrics::record_transient_req_watchdog(
+                        request_class.as_str(),
+                        "close_failed",
                     );
                 }
             }
@@ -2313,7 +2361,10 @@ mod tests {
         assert_eq!(ids.len(), 8);
         assert_eq!(connection.subscription_budget().available_permits(), 0);
         let error = connection
-            .subscribe_filter(Filter::new().kind(Kind::TextNote), true)
+            .subscribe_filter(
+                Filter::new().kind(Kind::TextNote),
+                TransientRequestClass::HistoricPage,
+            )
             .await
             .expect_err("history must defer when complete live coverage fills usable capacity");
         assert!(
@@ -2368,6 +2419,7 @@ mod tests {
         let generation = connection.current_subscription_generation();
         let held = HeldTransientPermits {
             generation,
+            request_class: TransientRequestClass::HistoricPage,
             _class_cap: connection
                 .transient_req_permits
                 .clone()
@@ -2449,8 +2501,11 @@ mod tests {
             .await
             .expect("occupy transient class cap");
         let class_waiter_connection = connection.clone();
-        let mut class_waiter =
-            tokio::spawn(async move { class_waiter_connection.acquire_transient_permits().await });
+        let mut class_waiter = tokio::spawn(async move {
+            class_waiter_connection
+                .acquire_transient_permits(TransientRequestClass::HistoricPage)
+                .await
+        });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut class_waiter)
                 .await
@@ -2471,8 +2526,11 @@ mod tests {
             .await
             .expect("occupy subscription ledger");
         let ledger_waiter_connection = connection.clone();
-        let mut ledger_waiter =
-            tokio::spawn(async move { ledger_waiter_connection.acquire_transient_permits().await });
+        let mut ledger_waiter = tokio::spawn(async move {
+            ledger_waiter_connection
+                .acquire_transient_permits(TransientRequestClass::HistoricPage)
+                .await
+        });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut ledger_waiter)
                 .await
@@ -2597,6 +2655,25 @@ mod tests {
         assert!(
             error.contains("No dependency polling capacity"),
             "unexpected dependency ledger error: {error}"
+        );
+    }
+
+    #[test]
+    fn transient_request_metric_labels_are_bounded_and_unique() {
+        let labels = TRANSIENT_REQUEST_CLASSES.map(TransientRequestClass::as_str);
+        let unique = labels.into_iter().collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(unique.len(), TRANSIENT_REQUEST_CLASSES.len());
+        assert_eq!(
+            unique,
+            std::collections::HashSet::from([
+                "historic_page",
+                "pagination_page",
+                "pagination_verification",
+                "negentropy_hydration",
+                "negentropy_retry",
+                "negentropy_fallback",
+            ])
         );
     }
 

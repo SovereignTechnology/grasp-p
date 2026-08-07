@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Expanded `grasp-audit` with stable machine-readable results, full JSON
   reports, explicit audit identities, and hardened discovered-server probes.
+- Added bounded request-class labels to transient-sync watchdog logs and
+  metrics so operators can identify which historic recovery path is stalling.
 
 ### Changed
 

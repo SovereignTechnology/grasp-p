@@ -34,7 +34,9 @@ pub use rejected_index::{EventType, RejectionReason};
 // Current code still uses the simple HashSet type alias below
 
 // Re-export relay connection types
-pub use relay_connection::{NegentropySyncResult, RelayConnection, RelayEvent};
+pub use relay_connection::{
+    NegentropySyncResult, RelayConnection, RelayEvent, TransientRequestClass,
+};
 
 // Re-export self-subscriber types
 pub use self_subscriber::SelfSubscriber;
@@ -464,6 +466,18 @@ impl PaginationState {
             .iter()
             .map(|state| state.original_filter.clone())
             .collect()
+    }
+
+    fn request_class(&self) -> TransientRequestClass {
+        if self
+            .filters
+            .iter()
+            .any(|state| state.verification_baseline.is_some())
+        {
+            TransientRequestClass::PaginationVerification
+        } else {
+            TransientRequestClass::PaginationPage
+        }
     }
 
     fn next_page(mut self, session: &mut RelayPaginationSession) -> Option<Self> {
@@ -1491,7 +1505,10 @@ impl SyncManager {
 
                 let mut next_page_started = false;
                 if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
-                    match conn.subscribe_filters(next_filters.clone(), true).await {
+                    match conn
+                        .subscribe_filters(next_filters.clone(), next_page.request_class())
+                        .await
+                    {
                         Ok(new_sub_id) => {
                             let mut pending = self.pending_sync_index.write().await;
                             if let Some(batches) = pending.get_mut(&relay_url_for_pagination) {
@@ -1637,7 +1654,13 @@ impl SyncManager {
                         let mut new_sub_ids = HashSet::new();
                         if let Some(conn) = self.connections.get(&relay_url_for_fallback) {
                             for filter_group in group_filters_for_req(&fallback_filters) {
-                                match conn.subscribe_filters(filter_group, true).await {
+                                match conn
+                                    .subscribe_filters(
+                                        filter_group,
+                                        TransientRequestClass::NegentropyFallback,
+                                    )
+                                    .await
+                                {
                                     Ok(sub_id) => {
                                         new_sub_ids.insert(sub_id);
                                     }
@@ -1808,7 +1831,10 @@ impl SyncManager {
                     let mut new_sub_ids = HashSet::new();
                     if let Some(conn) = self.connections.get(&relay_url_for_retry) {
                         for filter in retry_filters {
-                            match conn.subscribe_filter(filter, true).await {
+                            match conn
+                                .subscribe_filter(filter, TransientRequestClass::NegentropyRetry)
+                                .await
+                            {
                                 Ok(sub_id) => {
                                     new_sub_ids.insert(sub_id);
                                 }
@@ -1958,7 +1984,7 @@ impl SyncManager {
                 }
 
                 match connection
-                    .subscribe_filters(next_filters.clone(), true)
+                    .subscribe_filters(next_filters.clone(), next_page.request_class())
                     .await
                 {
                     Ok(new_sub_id) => {
@@ -5573,7 +5599,13 @@ impl SyncManager {
                 let mut subscription_ids = HashSet::new();
                 for (idx, filter) in ids_filters.iter().enumerate() {
                     if let Some(conn) = self.connections.get(relay_url) {
-                        match conn.subscribe_filter(filter.clone(), true).await {
+                        match conn
+                            .subscribe_filter(
+                                filter.clone(),
+                                TransientRequestClass::NegentropyHydration,
+                            )
+                            .await
+                        {
                             Ok(sub_id) => {
                                 subscription_ids.insert(sub_id);
                             }
@@ -5646,7 +5678,13 @@ impl SyncManager {
 
                 if let Some(conn) = self.connections.get(relay_url) {
                     let grouped_filters = filter_group;
-                    match conn.subscribe_filters(grouped_filters.clone(), true).await {
+                    match conn
+                        .subscribe_filters(
+                            grouped_filters.clone(),
+                            TransientRequestClass::HistoricPage,
+                        )
+                        .await
+                    {
                         Ok(sub_id) => {
                             subscription_ids.insert(sub_id.clone());
                             pagination_state.insert(sub_id, PaginationState::new(grouped_filters));
@@ -6195,6 +6233,10 @@ mod tests {
             .next_page(&mut session)
             .expect("a suspiciously short hinted page needs verification");
         assert_eq!(session.hint, PaginationHint::Verifying(1000));
+        assert_eq!(
+            verification.request_class(),
+            TransientRequestClass::PaginationVerification
+        );
 
         let unseen = EventBuilder::new(Kind::TextNote, "older unseen event")
             .custom_created_at(Timestamp::from_secs(99))
