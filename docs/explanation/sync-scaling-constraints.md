@@ -269,19 +269,45 @@ Derived from the tightest commonly observed values; all sizing below assumes:
 
 ## Our Approach: A Per-Connection Budget Ledger
 
-Each relay connection owns one budget of B subscription slots. Three
+Each relay connection owns one implemented budget ledger of B subscription slots. Three
 consumers share it, in priority order:
 
 1. **Live subscriptions** (persistent, `limit: 0`) — the product; sized first.
-2. **Reserved margin** (2 slots) — the Layer-1 announcement subscription plus
-   one spare for ad-hoc operations.
-3. **Historic sync** (transient) — negentropy rounds and REQ+EOSE fallback
-   subscriptions get the remainder: `N = clamp(B − L − margin, 1, 4)`.
+2. **Reserved margin** (2 slots) — control-plane safety capacity kept beyond
+   the live set (which includes Layer-1) for ad-hoc operations and recovery.
+3. **Historic sync and dependency recovery** (transient) — negentropy rounds,
+   REQ+EOSE pages/fallbacks/retries, and exact-ID purgatory polls draw from
+   the remainder. NEG retains its four-round class cap and transient REQ its
+   five-request class cap, but neither can exceed the shared residual.
 
-Historic work is transient, so even `N = 1` makes progress; live coverage is
-what must never be sacrificed. When even live subscriptions cannot fit
-(lever 4 below), the budget multiplies across connections rather than being
-overdrawn.
+NIP-11 `max_subscriptions` sets B for each new connection session; when it is
+absent B falls back to 20. Advertised values below that floor are honoured
+(notably nostream's default 10). Two slots remain reserved. Live filter groups
+are packed first and admitted atomically: if the complete live set cannot fit,
+the existing subscriptions are consolidated into the byte- and filter-count
+bounded REQ groups first. If the consolidated live set still cannot fit,
+partial coverage is not opened, historic work is deferred, and a warning
+surfaces the condition. Reconnect and consolidation build Layer 1, 2, and 3
+coverage together and reserve the whole grouped set before opening it. A
+failure while opening group N sends CLOSE for every earlier group and returns
+their slots, so callers never inherit hidden partial coverage. Replacement
+also remembers the exact previous grouping and restores it if the new complete
+set fails at runtime. Multi-connection sharding remains the later lever.
+
+A transient slot is released only after EOSE has caused CLOSE to be enqueued,
+after relay CLOSED, or after connection teardown. Because NIP-01 provides no
+CLOSE acknowledgement, the 120-second recovery path sends CLOSE for only the
+timed-out subscription and releases only that subscription's generation-scoped
+slot after the SDK accepts the message; valid production startup pages exceeded
+30 seconds, while two minutes remains a bounded escape from a stuck
+subscription. If CLOSE cannot be enqueued, the slot remains held until ordinary
+connection teardown so local accounting cannot run ahead of the relay. Exact-ID
+purgatory polling uses the same transient class bound and shared ledger as
+historic pagination. Unexpected CLOSED for a persistent live subscription is
+reported to the manager, which recomputes and transactionally reopens complete
+live coverage. Each reconnect closes the retired ledger and creates a new
+generation; queued or late borrowers therefore fail before sending on the new
+SDK session and cannot inflate or bypass its capacity.
 
 The levers, in the order we reach for them:
 
@@ -334,18 +360,20 @@ Negentropy reconciles one filter per round, and each in-flight round consumes
 a subscription slot **from the same budget as live subscriptions** (strfry).
 So concurrency is not a free scaling axis; it is the residual of the ledger:
 
-- Per-connection NEG concurrency `N = clamp(B − L − margin, 1, 4)` — with the
-  B = 20 floor and typical live loads, effectively ≤ 4.
+- Per-connection NEG concurrency is at most
+  `min(4, B − L − margin − other transients)`; when no residual remains,
+  historic work waits rather than overdrawing.
 - Rounds queue behind a per-connection semaphore; each completion releases
   the next. No timed batches or sleeps — throughput degrades smoothly instead
   of bursting into rejections.
 - Transient REQ+EOSE subscriptions — historic sync groups, fallback
-  filters, exact-ID fetches, retries, and pagination pages — queue behind
-  their own per-connection semaphore (5 permits): a permit is acquired when
+  filters, exact-ID fetches, retries, and pagination pages — retain a
+  five-request class cap inside the shared ledger: a slot is acquired when
   the auto-close REQ is sent and released when its EOSE or CLOSED arrives
-  (with a 30 s watchdog against relays that never answer). Live
-  subscriptions are not gated. 4 NEG + 5 REQ + 2 margin leaves at least
-  nine slots of the B = 20 floor for live subscriptions.
+  (with a 120 s watchdog that sends CLOSE for only the unresponsive
+  subscription before releasing its slot). Live subscriptions are ledgered first, so NEG,
+  transient REQ,
+  and purgatory exact-ID polling share only the remaining capacity.
 - Permit acquisition checks relay health first: while a rate-limit or
   transient-failure cooldown is active, queued rounds take the REQ+EOSE
   fallback path (which is itself budget-accounted) instead of firing into a
@@ -462,7 +490,7 @@ with the heuristics demoted to backstop.
 | 3 — bounded NEG concurrency | Stabilisation cycle 3 (in flight) |
 | 3 — bounded transient REQ+EOSE concurrency | Landed with cycle 3 (same PR) |
 | 1 + 2 — byte-budgeted chunking and REQ packing | Landed with cycle 3 (same PR) |
-| Ledger unification (live + historic + fallback against one budget, NIP-11-aware B/M) | Design accepted here; implement after cycles 3–4 |
+| Ledger unification (live + historic + fallback + purgatory polling against one NIP-11-aware subscription budget) | Implemented 2026-08-06; message-budget negotiation remains follow-up |
 | 4 — multi-connection sharding | Deferred until a relay's target set approaches the single-connection ceiling |
 | Serving-side limits + NIP-11 advertisement | Follow-up work item |
 

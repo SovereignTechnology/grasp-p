@@ -33,6 +33,27 @@ const NEGENTROPY_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 /// NIP-11 is advisory and must not hold up a connected relay indefinitely.
 const NIP11_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Conservative subscription budget when NIP-11 omits `max_subscriptions`.
+const FALLBACK_SUBSCRIPTION_BUDGET: usize = 20;
+
+/// Control-plane safety slots never offered to live or historic consumers.
+const SUBSCRIPTION_RESERVED_MARGIN: usize = 2;
+
+fn effective_subscription_budget(advertised: Option<usize>) -> usize {
+    advertised.unwrap_or(FALLBACK_SUBSCRIPTION_BUDGET)
+}
+
+fn usable_subscription_slots(advertised: Option<usize>) -> usize {
+    effective_subscription_budget(advertised).saturating_sub(SUBSCRIPTION_RESERVED_MARGIN)
+}
+
+#[cfg(test)]
+fn historic_slot_allowance(advertised: Option<usize>, live_slots: usize) -> usize {
+    usable_subscription_slots(advertised)
+        .saturating_sub(live_slots)
+        .min(MAX_CONCURRENT_NEG_DIFFS)
+}
+
 /// Cooldown schedule for transient negentropy failures.
 ///
 /// Indexed by the number of consecutive failed attempts (capped at the last
@@ -80,17 +101,52 @@ const MAX_CONCURRENT_TRANSIENT_REQS: usize = 5;
 /// Permits are normally released when the subscription's EOSE (or CLOSED)
 /// arrives. A relay that never answers would otherwise pin its permits
 /// forever and starve every later transient subscription on the
-/// connection, so a watchdog reclaims the permit after this deadline
-/// (twice the negentropy round timeout, generous for large REQ pages).
-const TRANSIENT_REQ_PERMIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// connection, so a watchdog sends CLOSE after this deadline (twice the
+/// negentropy round timeout, generous for large REQ pages). The slot is
+/// returned only after CLOSE is successfully enqueued; a send failure retains
+/// it until ordinary connection teardown.
+// Production startup pages on relay.ngit.dev legitimately exceeded 30 seconds;
+// allow two minutes before treating a missing EOSE/CLOSED as a stuck session.
+const TRANSIENT_REQ_PERMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Permits held by in-flight transient REQ subscriptions, keyed by
 /// subscription id and shared across connection clones.
 type TransientReqPermitMap = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<SubscriptionId, tokio::sync::OwnedSemaphorePermit>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<SubscriptionId, HeldTransientPermits>>,
 >;
+
+struct HeldTransientPermits {
+    _class_cap: tokio::sync::OwnedSemaphorePermit,
+    _ledger_slot: tokio::sync::OwnedSemaphorePermit,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct SubscriptionLedgerSession {
+    generation: u64,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+struct SessionPermit {
+    generation: u64,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct HeldLiveSubscription {
+    _ledger_slot: tokio::sync::OwnedSemaphorePermit,
+    generation: u64,
+    filters: Vec<Filter>,
+}
+
+type LiveReqPermitMap = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<SubscriptionId, HeldLiveSubscription>>,
+>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayLimitHints {
+    pub default_limit: Option<usize>,
+    pub max_subscriptions: Option<usize>,
+}
 
 /// How a failed negentropy diff should affect future NIP-77 attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +208,11 @@ pub enum RelayEvent {
     /// NOTICE message from relay
     Notice(String),
     /// Connection was closed
-    Closed(String),
+    Closed {
+        subscription_id: SubscriptionId,
+        reason: String,
+        live_generation: Option<u64>,
+    },
     /// Shutdown notification
     Shutdown,
 }
@@ -211,6 +271,11 @@ pub struct RelayConnection {
     /// Bounds concurrent negentropy diff rounds on this connection
     /// (shared across clones; see [`MAX_CONCURRENT_NEG_DIFFS`])
     neg_diff_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// One ledger shared by every relay-side subscription consumer. The
+    /// semaphore contains B minus the reserved margin for this session.
+    subscription_budget: std::sync::Arc<std::sync::Mutex<SubscriptionLedgerSession>>,
+    /// Usable capacity configured for the current session.
+    subscription_usable_slots: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Bounds concurrent transient (auto-close) REQ subscriptions on this
     /// connection (shared across clones; see
     /// [`MAX_CONCURRENT_TRANSIENT_REQS`])
@@ -218,6 +283,8 @@ pub struct RelayConnection {
     /// Permits held by open transient subscriptions, keyed by subscription
     /// id; released on EOSE/CLOSED, connection teardown, or the watchdog
     transient_req_permits_held: TransientReqPermitMap,
+    /// Ledger slots held for persistent subscriptions until CLOSE/teardown.
+    live_req_permits_held: LiveReqPermitMap,
 }
 
 impl RelayConnection {
@@ -274,10 +341,24 @@ impl RelayConnection {
             neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_NEG_DIFFS,
             )),
+            subscription_budget: std::sync::Arc::new(std::sync::Mutex::new(
+                SubscriptionLedgerSession {
+                    generation: 0,
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
+                    )),
+                },
+            )),
+            subscription_usable_slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
+            )),
             transient_req_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_TRANSIENT_REQS,
             )),
             transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
@@ -315,10 +396,24 @@ impl RelayConnection {
             neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_NEG_DIFFS,
             )),
+            subscription_budget: std::sync::Arc::new(std::sync::Mutex::new(
+                SubscriptionLedgerSession {
+                    generation: 0,
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
+                    )),
+                },
+            )),
+            subscription_usable_slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                FALLBACK_SUBSCRIPTION_BUDGET - SUBSCRIPTION_RESERVED_MARGIN,
+            )),
             transient_req_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_TRANSIENT_REQS,
             )),
             transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
@@ -417,17 +512,22 @@ impl RelayConnection {
     /// Fetch the omitted-limit page-size hint advertised by this connection's relay.
     ///
     /// This is deliberately fetched for every WebSocket session rather than cached on the
-    /// long-lived `RelayConnection`: operators can change their cap between reconnects. Only
-    /// NIP-11 `default_limit` is returned. `max_limit` describes explicit `limit` values and is
-    /// not applicable to the historic filters we intentionally send without one.
-    pub async fn fetch_default_limit(&self) -> Option<usize> {
-        let mut document_url = reqwest::Url::parse(&self.url).ok()?;
+    /// long-lived `RelayConnection`: operators can change their cap between reconnects.
+    /// `default_limit` sizes pagination and `max_subscriptions` configures the session ledger.
+    /// `max_limit` describes explicit `limit` values and is not applicable to the historic
+    /// filters we intentionally send without one.
+    pub async fn fetch_limit_hints(&self) -> RelayLimitHints {
+        let Ok(mut document_url) = reqwest::Url::parse(&self.url) else {
+            return RelayLimitHints::default();
+        };
         let http_scheme = match document_url.scheme() {
             "ws" => "http",
             "wss" => "https",
-            _ => return None,
+            _ => return RelayLimitHints::default(),
         };
-        document_url.set_scheme(http_scheme).ok()?;
+        if document_url.set_scheme(http_scheme).is_err() {
+            return RelayLimitHints::default();
+        }
 
         let fetch = async {
             let response = reqwest::Client::new()
@@ -447,22 +547,275 @@ impl RelayConnection {
         };
         let body = match tokio::time::timeout(NIP11_FETCH_TIMEOUT, fetch).await {
             Ok(Ok(Some(body))) => body,
-            Ok(Ok(None)) => return None,
+            Ok(Ok(None)) => return RelayLimitHints::default(),
             Ok(Err(error)) => {
                 tracing::debug!(relay = %self.url, error = %error, "NIP-11 fetch failed");
-                return None;
+                return RelayLimitHints::default();
             }
             Err(_) => {
                 tracing::debug!(relay = %self.url, "NIP-11 fetch timed out");
-                return None;
+                return RelayLimitHints::default();
             }
         };
-        let document = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok()?;
-        document
-            .limitation
-            .and_then(|limitation| limitation.default_limit)
-            .and_then(|limit| usize::try_from(limit).ok())
-            .filter(|limit| *limit > 0)
+        let Some(document) = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok()
+        else {
+            return RelayLimitHints::default();
+        };
+        let Some(limitation) = document.limitation else {
+            return RelayLimitHints::default();
+        };
+        RelayLimitHints {
+            default_limit: limitation
+                .default_limit
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| *limit > 0),
+            max_subscriptions: limitation
+                .max_subscriptions
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| *limit > 0),
+        }
+    }
+
+    /// Configure the one per-session ledger before any subscriptions open.
+    pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
+        self.clear_subscription_permits();
+        let budget = effective_subscription_budget(advertised);
+        let usable = usable_subscription_slots(advertised);
+        self.subscription_usable_slots
+            .store(usable, std::sync::atomic::Ordering::Relaxed);
+        let mut session = self
+            .subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned");
+        // Closing the retired semaphore wakes queued consumers with an error.
+        // The generation check below also rejects a holder that acquired just
+        // before reset but has not sent its SDK request yet.
+        session.semaphore.close();
+        *session = SubscriptionLedgerSession {
+            generation: session.generation.wrapping_add(1),
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(usable)),
+        };
+        tracing::info!(
+            relay = %self.url,
+            subscription_budget = budget,
+            usable_slots = usable,
+            advertised = advertised.is_some(),
+            "Configured per-connection subscription budget ledger"
+        );
+    }
+
+    #[cfg(test)]
+    fn subscription_budget(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        std::sync::Arc::clone(
+            &self
+                .subscription_budget
+                .lock()
+                .expect("subscription ledger poisoned")
+                .semaphore,
+        )
+    }
+
+    async fn acquire_subscription_slots(&self, count: u32) -> Result<SessionPermit, String> {
+        let snapshot = self
+            .subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .clone();
+        let permit = snapshot
+            .semaphore
+            .acquire_many_owned(count)
+            .await
+            .map_err(|_| format!("Subscription session retired for {}", self.url))?;
+        let held = SessionPermit {
+            generation: snapshot.generation,
+            permit,
+        };
+        self.ensure_current_session(&held)?;
+        Ok(held)
+    }
+
+    fn try_acquire_subscription_slot(&self) -> Result<SessionPermit, String> {
+        let snapshot = self
+            .subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .clone();
+        let permit = snapshot
+            .semaphore
+            .try_acquire_owned()
+            .map_err(|_| format!("Live subscription budget exhausted for {}", self.url))?;
+        let held = SessionPermit {
+            generation: snapshot.generation,
+            permit,
+        };
+        self.ensure_current_session(&held)?;
+        Ok(held)
+    }
+
+    /// Acquire both transient constraints without waiting while holding only
+    /// one of them. This prevents class-cap waiters from pinning ledger slots
+    /// and ledger waiters from pinning the class cap.
+    async fn acquire_transient_permits(&self) -> Result<HeldTransientPermits, String> {
+        loop {
+            let ledger_slot = self.acquire_subscription_slots(1).await?;
+            if let Ok(class_cap) = self.transient_req_permits.clone().try_acquire_owned() {
+                return Ok(HeldTransientPermits {
+                    _class_cap: class_cap,
+                    generation: ledger_slot.generation,
+                    _ledger_slot: ledger_slot.permit,
+                });
+            }
+            drop(ledger_slot);
+
+            let class_cap = self
+                .transient_req_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| format!("Transient permits closed for {}", self.url))?;
+            if let Ok(ledger_slot) = self.try_acquire_subscription_slot() {
+                return Ok(HeldTransientPermits {
+                    _class_cap: class_cap,
+                    generation: ledger_slot.generation,
+                    _ledger_slot: ledger_slot.permit,
+                });
+            }
+            drop(class_cap);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn ensure_current_session(&self, permit: &SessionPermit) -> Result<(), String> {
+        self.ensure_current_generation(permit.generation)
+    }
+
+    fn ensure_current_generation(&self, permit_generation: u64) -> Result<(), String> {
+        let generation = self
+            .subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .generation;
+        if generation == permit_generation {
+            Ok(())
+        } else {
+            Err(format!("Subscription session retired for {}", self.url))
+        }
+    }
+
+    pub fn current_subscription_generation(&self) -> u64 {
+        self.subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .generation
+    }
+
+    pub fn live_filter_groups(&self) -> Vec<Vec<Filter>> {
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .values()
+            .map(|held| held.filters.clone())
+            .collect()
+    }
+
+    async fn unsubscribe_live(&self) {
+        let ids: Vec<_> = self
+            .live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        for id in ids {
+            if let Err(error) = self.client.unsubscribe(&id).await {
+                tracing::debug!(relay = %self.url, sub_id = %id, %error, "Failed to close live subscription");
+            }
+            self.release_live_req_permit(&id);
+        }
+    }
+
+    /// Replace persistent coverage transactionally. If the new complete set
+    /// cannot be opened, restore the exact last-known-good filter grouping.
+    pub async fn replace_live_filter_groups(
+        &self,
+        filter_groups: Vec<Vec<Filter>>,
+    ) -> Result<Vec<SubscriptionId>, String> {
+        self.replace_live_filter_groups_with(filter_groups, |filters, permit| {
+            self.subscribe_filters_with_live_permit(filters, false, Some(permit))
+        })
+        .await
+    }
+
+    async fn replace_live_filter_groups_with<F, Fut>(
+        &self,
+        filter_groups: Vec<Vec<Filter>>,
+        mut subscribe_group: F,
+    ) -> Result<Vec<SubscriptionId>, String>
+    where
+        F: FnMut(Vec<Filter>, SessionPermit) -> Fut,
+        Fut: Future<Output = Result<SubscriptionId, String>>,
+    {
+        let previous = self.live_filter_groups();
+        self.unsubscribe_live().await;
+        match self
+            .subscribe_live_filter_groups_with(filter_groups, &mut subscribe_group)
+            .await
+        {
+            Ok(ids) => Ok(ids),
+            Err(replacement_error) => match self
+                .subscribe_live_filter_groups_with(previous, &mut subscribe_group)
+                .await
+            {
+                Ok(_) => Err(format!(
+                    "Live replacement failed; previous coverage restored: {replacement_error}"
+                )),
+                Err(restoration_error) => Err(format!(
+                    "Live replacement failed ({replacement_error}); previous coverage restoration failed ({restoration_error})"
+                )),
+            },
+        }
+    }
+
+    fn historic_capacity_consumed_by_live(&self) -> bool {
+        let usable = self
+            .subscription_usable_slots
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .len()
+            >= usable
+    }
+
+    pub fn can_admit_live_slots(&self, slots: usize) -> bool {
+        let usable = self
+            .subscription_usable_slots
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .len()
+            .saturating_add(slots)
+            <= usable
+    }
+
+    pub fn complete_live_set_fits(&self, slots: usize) -> bool {
+        slots
+            <= self
+                .subscription_usable_slots
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn needs_live_consolidation(&self, slots: usize) -> bool {
+        let usable = self
+            .subscription_usable_slots
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .len()
+            .saturating_add(slots)
+            >= usable
     }
 
     /// Run the event loop, sending events through the provided channel
@@ -547,7 +900,8 @@ impl RelayConnection {
                         // permit release must never depend on downstream
                         // consumers (the SyncManager actor may itself be
                         // waiting on a permit).
-                        self.release_transient_req_permit(&owned_sub_id);
+                        self.close_and_release_transient_req_permit(&owned_sub_id)
+                            .await;
                         if event_sender
                             .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
                             .await
@@ -586,10 +940,18 @@ impl RelayConnection {
                         message: msg,
                     } => {
                         // A CLOSED subscription can no longer produce EOSE;
-                        // free its transient permit if one is held.
-                        self.release_transient_req_permit(subscription_id.as_ref());
+                        // free whichever ledger ownership it held.
+                        let subscription_id = subscription_id.into_owned();
+                        let live_generation =
+                            self.release_subscription_permits_on_closed(&subscription_id);
                         tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
-                        let _ = event_sender.send(RelayEvent::Closed(msg.to_string())).await;
+                        let _ = event_sender
+                            .send(RelayEvent::Closed {
+                                subscription_id,
+                                reason: msg.to_string(),
+                                live_generation,
+                            })
+                            .await;
                         // Don't break - CLOSED is subscription-specific, not connection-specific
                         // The event loop should continue running for other active subscriptions
                     }
@@ -634,7 +996,7 @@ impl RelayConnection {
 
         // The connection is going away; every outstanding transient
         // subscription dies with it, so free their permits.
-        self.clear_transient_req_permits();
+        self.clear_subscription_permits();
 
         tracing::debug!(relay = %url, "Notification stream ended, event loop terminated");
     }
@@ -670,6 +1032,78 @@ impl RelayConnection {
         filters: Vec<Filter>,
         auto_close: bool,
     ) -> Result<SubscriptionId, String> {
+        self.subscribe_filters_with_live_permit(filters, auto_close, None)
+            .await
+    }
+
+    /// Atomically reserve the complete live filter set before opening any REQ.
+    /// This avoids partial coverage and prevents historic work from consuming
+    /// slots between sequential live subscription sends.
+    pub async fn subscribe_live_filter_groups(
+        &self,
+        filter_groups: Vec<Vec<Filter>>,
+    ) -> Result<Vec<SubscriptionId>, String> {
+        self.subscribe_live_filter_groups_with(filter_groups, |filters, permit| {
+            self.subscribe_filters_with_live_permit(filters, false, Some(permit))
+        })
+        .await
+    }
+
+    async fn subscribe_live_filter_groups_with<F, Fut>(
+        &self,
+        filter_groups: Vec<Vec<Filter>>,
+        mut subscribe_group: F,
+    ) -> Result<Vec<SubscriptionId>, String>
+    where
+        F: FnMut(Vec<Filter>, SessionPermit) -> Fut,
+        Fut: std::future::Future<Output = Result<SubscriptionId, String>>,
+    {
+        let count = u32::try_from(filter_groups.len())
+            .map_err(|_| "Too many live filter groups to reserve".to_string())?;
+        if !self.can_admit_live_slots(filter_groups.len()) {
+            tracing::warn!(
+                relay = %self.url,
+                requested_live_slots = count,
+                "Live coverage does not fit the per-connection budget; deferring historic work"
+            );
+            return Err(format!(
+                "Live subscription set exceeds budget for {}",
+                self.url
+            ));
+        }
+        let mut reservation = self.acquire_subscription_slots(count).await?;
+
+        let mut outputs = Vec::with_capacity(filter_groups.len());
+        for filters in filter_groups {
+            if let Err(error) = self.ensure_current_session(&reservation) {
+                self.close_and_release_live_req_permits(&outputs).await;
+                return Err(error);
+            }
+            let permit = reservation
+                .permit
+                .split(1)
+                .expect("complete live reservation contains one permit per group");
+            let permit = SessionPermit {
+                generation: reservation.generation,
+                permit,
+            };
+            match subscribe_group(filters, permit).await {
+                Ok(subscription_id) => outputs.push(subscription_id),
+                Err(error) => {
+                    self.close_and_release_live_req_permits(&outputs).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    async fn subscribe_filters_with_live_permit(
+        &self,
+        filters: Vec<Filter>,
+        auto_close: bool,
+        reserved_live_permit: Option<SessionPermit>,
+    ) -> Result<SubscriptionId, String> {
         if filters.is_empty() {
             return Err("Cannot subscribe with an empty filter set".to_string());
         }
@@ -687,20 +1121,47 @@ impl RelayConnection {
         // exceeding relay subscription budgets. The permit is registered
         // against the subscription id on success and released when the
         // subscription's EOSE or CLOSED arrives (see run_event_loop).
-        let permit = if auto_close {
-            match self.transient_req_permits.clone().acquire_owned().await {
-                Ok(permit) => Some(permit),
+        let (transient_permit, live_permit) = if auto_close {
+            if self.historic_capacity_consumed_by_live() {
+                tracing::warn!(
+                    relay = %self.url,
+                    "Historic REQ deferred: live subscriptions consume the usable budget"
+                );
+                return Err(format!(
+                    "No historic subscription capacity for {}",
+                    self.url
+                ));
+            }
+            (Some(self.acquire_transient_permits().await?), None)
+        } else {
+            let acquired = match reserved_live_permit {
+                Some(permit) => Ok(permit),
+                None => self.try_acquire_subscription_slot(),
+            };
+            match acquired {
+                Ok(permit) => (None, Some(permit)),
                 Err(_) => {
+                    tracing::warn!(
+                        relay = %self.url,
+                        "Live subscription deferred: per-connection budget exhausted"
+                    );
                     return Err(format!(
-                        "Failed to subscribe on {}: transient permit semaphore closed",
+                        "Live subscription budget exhausted for {}",
                         self.url
                     ));
                 }
             }
-        } else {
-            None
         };
 
+        if let Some(permit) = &live_permit {
+            self.ensure_current_session(permit)?;
+        }
+        if let Some(permit) = &transient_permit {
+            self.ensure_current_generation(permit.generation)?;
+        }
+        // Transient permits are acquired through the same session helper; a
+        // reset closes queued acquisitions and the helper checks generation.
+        let retained_filters = filters.clone();
         let output = if auto_close {
             self.client
                 .subscribe(filters)
@@ -723,8 +1184,23 @@ impl RelayConnection {
             return Err(format!("Failed to subscribe on {}: {}", self.url, failures));
         }
 
-        if let Some(permit) = permit {
-            self.hold_transient_req_permit(output.value.clone(), permit);
+        if auto_close {
+            if let Some(permit) = transient_permit {
+                self.hold_transient_req_permit(output.value.clone(), permit);
+            }
+        } else {
+            let live_permit = live_permit.expect("live subscription acquired a ledger slot");
+            self.live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned")
+                .insert(
+                    output.value.clone(),
+                    HeldLiveSubscription {
+                        _ledger_slot: live_permit.permit,
+                        generation: live_permit.generation,
+                        filters: retained_filters,
+                    },
+                );
         }
 
         tracing::debug!(
@@ -746,6 +1222,22 @@ impl RelayConnection {
         filter: Filter,
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
+        // Exact-ID purgatory recovery opens an ordinary transient REQ inside
+        // nostr-sdk. It must share the same permit bound as historic pages,
+        // fallbacks and retries rather than escaping the connection budget.
+        if self.historic_capacity_consumed_by_live() {
+            tracing::warn!(
+                relay = %self.url,
+                "Purgatory dependency poll deferred: live subscriptions consume the usable budget"
+            );
+            return Err(format!("No dependency polling capacity for {}", self.url));
+        }
+        let _transient_cap = self
+            .transient_req_permits
+            .acquire()
+            .await
+            .map_err(|_| format!("Transient permits closed for {}", self.url))?;
+        let ledger_slot = self.acquire_subscription_slots(1).await?;
         let relay = self
             .client
             .relay(&self.url)
@@ -763,6 +1255,7 @@ impl RelayConnection {
                 )
             })?;
 
+        self.ensure_current_session(&ledger_slot)?;
         relay
             .fetch_events(filter)
             .timeout(timeout)
@@ -793,8 +1286,8 @@ impl RelayConnection {
 
     /// Disconnect from the relay
     pub async fn disconnect(&self) {
-        self.clear_transient_req_permits();
         self.client.disconnect().await;
+        self.clear_subscription_permits();
         tracing::debug!(relay = %self.url, "Disconnected from relay");
     }
 
@@ -804,44 +1297,60 @@ impl RelayConnection {
     /// with consolidated filters. This sends CLOSE messages for all active
     /// subscriptions on the relay.
     pub async fn unsubscribe_all(&self) {
-        self.clear_transient_req_permits();
         if let Err(e) = self.client.unsubscribe_all().await {
             tracing::debug!(relay = %self.url, error = %e, "Failed to unsubscribe from all subscriptions");
         }
+        self.clear_subscription_permits();
         tracing::debug!(relay = %self.url, "Unsubscribed from all subscriptions");
     }
 
     /// Register a held transient-REQ permit for `sub_id` and start its
     /// watchdog.
-    fn hold_transient_req_permit(
-        &self,
-        sub_id: SubscriptionId,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
+    fn hold_transient_req_permit(&self, sub_id: SubscriptionId, permit: HeldTransientPermits) {
         self.transient_req_permits_held
             .lock()
             .expect("transient permit map poisoned")
             .insert(sub_id.clone(), permit);
 
-        // Watchdog: a relay that never sends EOSE (or CLOSED) must not pin
-        // its permits forever. Dropping the permit only frees our own
-        // slot; the subscription itself remains subject to the normal
-        // batch and disconnect cleanup paths.
+        // A timed-out REQ is closed individually. NIP-01 defines CLOSE as the
+        // client-side end of a subscription, so a successfully enqueued CLOSE
+        // is the accounting boundary after which this one slot can be reused.
+        // If CLOSE cannot be sent, retain the permit until ordinary connection
+        // teardown clears it; local capacity must not run ahead of the relay.
         let held = std::sync::Arc::clone(&self.transient_req_permits_held);
+        let client = self.client.clone();
+        let url = self.url.clone();
         let relay_url = self.url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(TRANSIENT_REQ_PERMIT_TIMEOUT).await;
-            let reclaimed = held
+            let generation = held
                 .lock()
                 .expect("transient permit map poisoned")
-                .remove(&sub_id)
-                .is_some();
-            if reclaimed {
-                tracing::debug!(
-                    relay = %relay_url,
-                    sub_id = %sub_id,
-                    "Transient REQ permit reclaimed by watchdog (no EOSE within deadline)"
-                );
+                .get(&sub_id)
+                .map(|permits| permits.generation);
+            if let (Some(generation), Ok(Some(relay))) = (generation, client.relay(&url).await) {
+                if relay
+                    .send_msg(ClientMessage::close(sub_id.clone()))
+                    .await
+                    .is_ok()
+                {
+                    Self::release_transient_req_permit_for_generation(
+                        &held,
+                        &sub_id,
+                        generation,
+                    );
+                    tracing::warn!(
+                        relay = %relay_url,
+                        sub_id = %sub_id,
+                        "Transient REQ watchdog sent CLOSE after missing EOSE/CLOSED"
+                    );
+                } else {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        sub_id = %sub_id,
+                        "Transient REQ watchdog could not send CLOSE; retaining subscription slot"
+                    );
+                }
             }
         });
     }
@@ -854,11 +1363,80 @@ impl RelayConnection {
             .remove(sub_id);
     }
 
+    fn release_transient_req_permit_for_generation(
+        held: &TransientReqPermitMap,
+        sub_id: &SubscriptionId,
+        generation: u64,
+    ) -> bool {
+        let mut permits = held.lock().expect("transient permit map poisoned");
+        if permits
+            .get(sub_id)
+            .is_some_and(|permit| permit.generation == generation)
+        {
+            permits.remove(sub_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn close_and_release_transient_req_permit(&self, sub_id: &SubscriptionId) {
+        let is_held = self
+            .transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .contains_key(sub_id);
+        if is_held {
+            // EOSE ends the stored-event phase, but an ordinary NIP-01 REQ is
+            // relay-side active until CLOSE. Wait for the SDK to enqueue CLOSE
+            // before making the ledger slot available to another consumer.
+            if let Ok(Some(relay)) = self.client.relay(&self.url).await {
+                let _ = relay.send_msg(ClientMessage::close(sub_id.clone())).await;
+            }
+            self.release_transient_req_permit(sub_id);
+        }
+    }
+
+    /// Release the live ledger slot held for `sub_id`, if any.
+    fn release_live_req_permit(&self, sub_id: &SubscriptionId) -> Option<u64> {
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .remove(sub_id)
+            .map(|held| held.generation)
+    }
+
+    fn release_subscription_permits_on_closed(&self, sub_id: &SubscriptionId) -> Option<u64> {
+        self.release_transient_req_permit(sub_id);
+        self.release_live_req_permit(sub_id)
+    }
+
+    /// Roll back a partially opened live group set. CLOSE is enqueued before
+    /// the corresponding ledger slot is returned, keeping local and relay
+    /// subscription accounting in lockstep.
+    async fn close_and_release_live_req_permits(&self, sub_ids: &[SubscriptionId]) {
+        let relay = self.client.relay(&self.url).await.ok().flatten();
+        for sub_id in sub_ids {
+            if let Some(relay) = &relay {
+                let _ = relay.send_msg(ClientMessage::close(sub_id.clone())).await;
+            }
+            let _ = self.release_live_req_permit(sub_id);
+        }
+    }
+
     /// Release every held transient-REQ permit (connection teardown).
     fn clear_transient_req_permits(&self) {
         self.transient_req_permits_held
             .lock()
             .expect("transient permit map poisoned")
+            .clear();
+    }
+
+    fn clear_subscription_permits(&self) {
+        self.clear_transient_req_permits();
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
             .clear();
     }
 
@@ -994,11 +1572,19 @@ impl RelayConnection {
         // and relays count each open round against a per-connection budget
         // shared with live subscriptions (see MAX_CONCURRENT_NEG_DIFFS).
         // The permit is held for the whole round, including the timeout.
+        if self.historic_capacity_consumed_by_live() {
+            tracing::warn!(
+                relay = %self.url,
+                "Negentropy round deferred: live subscriptions consume the usable budget"
+            );
+            return Err(format!("No negentropy capacity for {}", self.url));
+        }
         let _permit = self
             .neg_diff_permits
             .acquire()
             .await
             .map_err(|_| format!("Negentropy permits closed for {}", self.url))?;
+        let ledger_slot = self.acquire_subscription_slots(1).await?;
 
         // While this round was queued, an earlier round may have started a
         // transient-failure cooldown or received an explicit unsupported
@@ -1013,6 +1599,7 @@ impl RelayConnection {
         }
 
         // Use dry_run to only identify differences without downloading events
+        self.ensure_current_session(&ledger_slot)?;
         let sync_opts = SyncOptions::default().dry_run();
         let client = self.client.clone();
         let sync_task = async move {
@@ -1531,6 +2118,486 @@ mod tests {
             .await
             .expect_err("strict policy must reject an event-directed loopback dial");
         assert!(error.contains("Outbound target policy"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn purgatory_dependency_fetch_queues_behind_transient_req_permits() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        let occupied = connection
+            .transient_req_permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_TRANSIENT_REQS as u32)
+            .await
+            .expect("reserve every transient permit");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            connection.fetch_events(
+                Filter::new().id(EventId::from_byte_array([0; 32])),
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "dependency fetch bypassed the transient permit queue"
+        );
+
+        drop(occupied);
+        let error = connection
+            .fetch_events(
+                Filter::new().id(EventId::from_byte_array([0; 32])),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("unconnected fixture should fail after acquiring a permit");
+        assert!(error.contains("relay is not registered"), "{error}");
+    }
+
+    #[test]
+    fn subscription_ledger_uses_fallback_and_advertised_budgets() {
+        assert_eq!(effective_subscription_budget(None), 20);
+        assert_eq!(usable_subscription_slots(None), 18);
+
+        // nostream advertises ten subscriptions per connection: advertised
+        // limits override the fallback floor rather than being rounded up.
+        assert_eq!(effective_subscription_budget(Some(10)), 10);
+        assert_eq!(usable_subscription_slots(Some(10)), 8);
+        assert_eq!(historic_slot_allowance(Some(10), 3), 4);
+    }
+
+    #[test]
+    fn live_wants_everything_preserves_margin_and_defers_history() {
+        assert_eq!(historic_slot_allowance(Some(10), 7), 1);
+        assert_eq!(historic_slot_allowance(Some(10), 8), 0);
+        assert_eq!(historic_slot_allowance(Some(10), 9), 0);
+    }
+
+    #[tokio::test]
+    async fn live_set_is_rejected_atomically_when_it_wants_every_slot() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let groups = (0..9)
+            .map(|kind| vec![Filter::new().kind(Kind::Custom(20_000 + kind))])
+            .collect();
+
+        let error = connection
+            .subscribe_live_filter_groups(groups)
+            .await
+            .expect_err("nine live groups must not consume an eight-slot usable budget");
+        assert!(error.contains("exceeds budget"), "{error}");
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn failed_live_group_rolls_back_opened_groups_and_full_capacity() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = std::sync::Arc::clone(&connection.live_req_permits_held);
+        let groups = (0..3)
+            .map(|kind| vec![Filter::new().kind(Kind::Custom(21_000 + kind))])
+            .collect();
+
+        let error = connection
+            .subscribe_live_filter_groups_with(groups, move |_filters, permit| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let held = std::sync::Arc::clone(&held);
+                async move {
+                    if attempt == 2 {
+                        return Err("controlled third-group failure".to_string());
+                    }
+                    let sub_id = SubscriptionId::new(format!("opened-{attempt}"));
+                    held.lock().expect("live permit map poisoned").insert(
+                        sub_id.clone(),
+                        HeldLiveSubscription {
+                            generation: permit.generation,
+                            _ledger_slot: permit.permit,
+                            filters: _filters,
+                        },
+                    );
+                    Ok(sub_id)
+                }
+            })
+            .await
+            .expect_err("the controlled third group must fail");
+
+        assert_eq!(error, "controlled third-group failure");
+        assert!(
+            connection
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned")
+                .is_empty(),
+            "earlier successful live groups must be removed during rollback"
+        );
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn failed_live_replacement_restores_exact_previous_filter_groups() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let old_filters = vec![Filter::new().kind(Kind::Custom(21_500))];
+        let old_permit = connection.acquire_subscription_slots(1).await.unwrap();
+        connection.live_req_permits_held.lock().unwrap().insert(
+            SubscriptionId::new("old-live"),
+            HeldLiveSubscription {
+                generation: old_permit.generation,
+                _ledger_slot: old_permit.permit,
+                filters: old_filters.clone(),
+            },
+        );
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = std::sync::Arc::clone(&connection.live_req_permits_held);
+        let target = (0..3)
+            .map(|kind| vec![Filter::new().kind(Kind::Custom(21_600 + kind))])
+            .collect();
+
+        let error = connection
+            .replace_live_filter_groups_with(target, move |filters, permit| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let held = std::sync::Arc::clone(&held);
+                async move {
+                    if attempt == 2 {
+                        return Err("controlled third-group failure".to_string());
+                    }
+                    let sub_id = SubscriptionId::new(format!("replacement-{attempt}"));
+                    held.lock().unwrap().insert(
+                        sub_id.clone(),
+                        HeldLiveSubscription {
+                            generation: permit.generation,
+                            _ledger_slot: permit.permit,
+                            filters,
+                        },
+                    );
+                    Ok(sub_id)
+                }
+            })
+            .await
+            .expect_err("replacement must report its controlled failure");
+
+        assert!(error.contains("previous coverage restored"), "{error}");
+        assert_eq!(connection.live_filter_groups(), vec![old_filters]);
+        assert_eq!(connection.subscription_budget().available_permits(), 7);
+    }
+
+    #[tokio::test]
+    async fn complete_live_set_can_fill_usable_budget_but_history_defers() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let held = std::sync::Arc::clone(&connection.live_req_permits_held);
+        let groups = (0..8)
+            .map(|kind| vec![Filter::new().kind(Kind::Custom(22_000 + kind))])
+            .collect();
+
+        let ids = connection
+            .subscribe_live_filter_groups_with(groups, move |_filters, permit| {
+                let held = std::sync::Arc::clone(&held);
+                async move {
+                    let sub_id = SubscriptionId::generate();
+                    held.lock().expect("live permit map poisoned").insert(
+                        sub_id.clone(),
+                        HeldLiveSubscription {
+                            generation: permit.generation,
+                            _ledger_slot: permit.permit,
+                            filters: _filters,
+                        },
+                    );
+                    Ok(sub_id)
+                }
+            })
+            .await
+            .expect("exactly eight complete live groups fit the usable budget");
+
+        assert_eq!(ids.len(), 8);
+        assert_eq!(connection.subscription_budget().available_permits(), 0);
+        let error = connection
+            .subscribe_filter(Filter::new().kind(Kind::TextNote), true)
+            .await
+            .expect_err("history must defer when complete live coverage fills usable capacity");
+        assert!(
+            error.contains("No historic subscription capacity"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_live_subscription_restores_re_admittable_capacity() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let sub_id = SubscriptionId::new("relay-closed-live");
+        let permit = connection
+            .subscription_budget()
+            .acquire_owned()
+            .await
+            .expect("reserve live ledger slot");
+        connection
+            .live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .insert(
+                sub_id.clone(),
+                HeldLiveSubscription {
+                    generation: connection.current_subscription_generation(),
+                    _ledger_slot: permit,
+                    filters: vec![Filter::new().kind(Kind::TextNote)],
+                },
+            );
+        assert_eq!(connection.subscription_budget().available_permits(), 7);
+
+        assert_eq!(
+            connection.release_subscription_permits_on_closed(&sub_id),
+            Some(connection.current_subscription_generation()),
+            "CLOSED must identify the live session for manager recovery"
+        );
+
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+        let full_capacity = connection
+            .subscription_budget()
+            .try_acquire_many_owned(8)
+            .expect("CLOSED must make the complete live budget re-admittable");
+        drop(full_capacity);
+    }
+
+    #[tokio::test]
+    async fn watchdog_release_is_scoped_to_the_subscription_generation() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let sub_id = SubscriptionId::new("watchdog-retains-slot");
+        let generation = connection.current_subscription_generation();
+        let held = HeldTransientPermits {
+            generation,
+            _class_cap: connection
+                .transient_req_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("reserve transient class slot"),
+            _ledger_slot: connection
+                .subscription_budget()
+                .acquire_owned()
+                .await
+                .expect("reserve ledger slot"),
+        };
+        connection.hold_transient_req_permit(sub_id.clone(), held);
+
+        assert!(
+            !RelayConnection::release_transient_req_permit_for_generation(
+                &connection.transient_req_permits_held,
+                &sub_id,
+                generation.wrapping_add(1),
+            ),
+            "a stale watchdog must not release a newer session's slot"
+        );
+        assert!(
+            RelayConnection::release_transient_req_permit_for_generation(
+                &connection.transient_req_permits_held,
+                &sub_id,
+                generation,
+            ),
+            "the matching watchdog must release its closed subscription"
+        );
+        assert_eq!(connection.transient_req_permits.available_permits(), 5);
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[test]
+    fn watchdog_deadline_allows_slow_valid_startup_pages() {
+        assert_eq!(TRANSIENT_REQ_PERMIT_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn queued_consumer_cannot_send_after_session_reset() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let old = connection
+            .acquire_subscription_slots(8)
+            .await
+            .expect("occupy old session");
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiter_connection = connection.clone();
+        let waiter_sends = std::sync::Arc::clone(&sends);
+        let waiter = tokio::spawn(async move {
+            let permit = waiter_connection.acquire_subscription_slots(1).await?;
+            waiter_connection.ensure_current_session(&permit)?;
+            waiter_sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, String>(())
+        });
+        tokio::task::yield_now().await;
+
+        connection.reset_subscription_budget(Some(10));
+        drop(old);
+        let error = waiter
+            .await
+            .expect("waiter task")
+            .expect_err("retired-session waiter must fail");
+        assert!(error.contains("session retired"), "{error}");
+        assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn transient_admission_never_waits_while_pinning_the_other_budget() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+
+        let all_class = connection
+            .transient_req_permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_TRANSIENT_REQS as u32)
+            .await
+            .expect("occupy transient class cap");
+        let class_waiter_connection = connection.clone();
+        let mut class_waiter =
+            tokio::spawn(async move { class_waiter_connection.acquire_transient_permits().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut class_waiter)
+                .await
+                .is_err(),
+            "consumer must remain queued while the class cap is occupied"
+        );
+        assert_eq!(
+            connection.subscription_budget().available_permits(),
+            8,
+            "waiting for the class cap must return its speculative ledger slot"
+        );
+        drop(all_class);
+        drop(class_waiter.await.expect("class waiter task").unwrap());
+
+        let all_ledger = connection
+            .subscription_budget()
+            .acquire_many_owned(8)
+            .await
+            .expect("occupy subscription ledger");
+        let ledger_waiter_connection = connection.clone();
+        let mut ledger_waiter =
+            tokio::spawn(async move { ledger_waiter_connection.acquire_transient_permits().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ledger_waiter)
+                .await
+                .is_err(),
+            "consumer must remain queued while the ledger is occupied"
+        );
+        assert_eq!(
+            connection.transient_req_permits.available_permits(),
+            MAX_CONCURRENT_TRANSIENT_REQS,
+            "waiting for the ledger must not pin the class cap"
+        );
+        drop(all_ledger);
+        drop(ledger_waiter.await.expect("ledger waiter task").unwrap());
+
+        assert_eq!(connection.subscription_budget().available_permits(), 8);
+        assert_eq!(
+            connection.transient_req_permits.available_permits(),
+            MAX_CONCURRENT_TRANSIENT_REQS
+        );
+    }
+
+    #[tokio::test]
+    async fn session_reset_cannot_be_inflated_by_an_old_borrower() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        let old_ledger = connection.subscription_budget();
+        let old_borrow = old_ledger
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("borrow from old session");
+
+        connection.reset_subscription_budget(Some(10));
+        let new_ledger = connection.subscription_budget();
+        assert!(!std::sync::Arc::ptr_eq(&old_ledger, &new_ledger));
+        assert_eq!(new_ledger.available_permits(), 8);
+
+        drop(old_borrow);
+        assert_eq!(
+            new_ledger.available_permits(),
+            8,
+            "a borrower returning to the retired session must not inflate the new ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_neg_req_and_dependency_consumers_share_one_ledger() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let ledger = connection.subscription_budget();
+
+        let live = ledger
+            .clone()
+            .acquire_many_owned(3)
+            .await
+            .expect("reserve live groups");
+        let neg_class = connection
+            .neg_diff_permits
+            .acquire()
+            .await
+            .expect("reserve NEG class slot");
+        let neg = ledger
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("reserve NEG ledger slot");
+        let req_class = connection
+            .transient_req_permits
+            .acquire()
+            .await
+            .expect("reserve historic REQ class slot");
+        let req = ledger
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("reserve historic REQ ledger slot");
+        let dependency_class = connection
+            .transient_req_permits
+            .acquire()
+            .await
+            .expect("reserve dependency REQ class slot");
+        let dependency = ledger
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("reserve dependency ledger slot");
+
+        assert_eq!(ledger.available_permits(), 2);
+        let remainder = ledger
+            .clone()
+            .try_acquire_many_owned(2)
+            .expect("only the two remaining usable slots may be reserved");
+        assert!(
+            ledger.clone().try_acquire_owned().is_err(),
+            "combined consumers must not overdraw the per-session ledger"
+        );
+
+        drop((
+            remainder,
+            dependency,
+            dependency_class,
+            req,
+            req_class,
+            neg,
+            neg_class,
+            live,
+        ));
+        assert_eq!(ledger.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn purgatory_dependency_fetch_draws_from_shared_ledger() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(SUBSCRIPTION_RESERVED_MARGIN));
+
+        let error = connection
+            .fetch_events(
+                Filter::new().id(EventId::from_byte_array([0; 32])),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("dependency polling must defer when the ledger has no usable slot");
+        assert!(
+            error.contains("No dependency polling capacity"),
+            "unexpected dependency ledger error: {error}"
+        );
     }
 
     #[test]
