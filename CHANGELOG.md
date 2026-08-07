@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Published the source revision in build metrics, NIP-11 metadata, and the
+  landing page for Nix-built releases, where the filtered source archive does
+  not contain Git metadata.
 - Stopped routine client connection resets without a WebSocket close handshake
   from being reported as server errors, while retaining other embedded-relay
   failures at their original severity.

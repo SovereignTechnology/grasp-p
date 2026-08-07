@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, ngitGraspSourceRevision ? "unknown", ... }:
 
 with lib;
 
@@ -8,6 +8,7 @@ let
     pname = "ngit-grasp";
     version = "2.0.0";
     src = ../.;
+    NGIT_BUILD_REVISION = ngitGraspSourceRevision;
     cargoLock = {
       lockFile = ../Cargo.lock;
     };

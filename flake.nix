@@ -8,6 +8,12 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+    let
+      sourceRevision =
+        if self ? rev then self.rev
+        else if self ? dirtyRev then self.dirtyRev
+        else "unknown";
+    in
     (flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -44,6 +50,7 @@
           pname = "ngit-grasp";
           version = "2.0.0";
           src = ./.;
+          NGIT_BUILD_REVISION = sourceRevision;
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
@@ -80,7 +87,10 @@
         };
       })) // {
         # NixOS module for deployment
-        nixosModules.default = import ./nix/module.nix;
+        nixosModules.default = { ... }: {
+          imports = [ ./nix/module.nix ];
+          _module.args.ngitGraspSourceRevision = sourceRevision;
+        };
         nixosModules.ngit-grasp = self.nixosModules.default;
       };
 }

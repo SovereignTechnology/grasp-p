@@ -832,7 +832,7 @@ impl MetricsInner {
         build_info
             .with_label_values(&[
                 env!("CARGO_PKG_VERSION"),
-                option_env!("GIT_HASH").unwrap_or("unknown"),
+                option_env!("GIT_COMMIT").unwrap_or("unknown"),
             ])
             .set(1.0);
 
