@@ -731,6 +731,8 @@ impl Service<Request<Incoming>> for HttpService {
                         Ok(upgraded) => {
                             tracing::info!("WebSocket connection established from {}", addr);
                             // Track connection
+                            let _connection_timer =
+                                metrics_clone.as_ref().map(|m| m.start_connection_timer());
                             if let Some(ref m) = metrics_clone {
                                 m.connection_tracker().on_connect(addr.ip());
                                 m.record_websocket_connection();
