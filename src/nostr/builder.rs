@@ -1014,9 +1014,11 @@ pub async fn create_relay(
             notes_per_minute: 60, // Max events per minute per connection
         });
 
-    if let Some(max) = config.max_connections {
-        builder = builder.max_connections(max);
-    }
+    // `LocalRelayBuilder` otherwise applies rust-nostr's own finite default.
+    // In ngit-grasp, an unset limit deliberately delegates admission control to
+    // the OS and surrounding infrastructure, as documented by every config
+    // surface. Explicit operator limits remain exact.
+    builder = builder.max_connections(effective_max_connections(config.max_connections));
 
     let relay = builder.build();
 
@@ -1047,4 +1049,26 @@ pub async fn create_relay(
             history,
         },
     })
+}
+
+fn effective_max_connections(configured: Option<usize>) -> usize {
+    configured.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use super::effective_max_connections;
+
+    #[test]
+    fn unset_connection_limit_overrides_dependency_default() {
+        assert_eq!(
+            effective_max_connections(None),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[test]
+    fn configured_connection_limit_remains_exact() {
+        assert_eq!(effective_max_connections(Some(2)), 2);
+    }
 }

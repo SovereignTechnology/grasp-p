@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Upgraded the rust-nostr crates from `0.45.0-alpha.8` to the stable `0.45.0`
-  release, including the upstream NEG-OPEN handling fix.
+  release, including the upstream NEG-OPEN handling fix and new local-relay
+  resource hardening. ngit-grasp explicitly overrides rust-nostr's new
+  128-connection default to preserve its documented unbounded-by-default
+  inbound admission; explicitly configured connection caps remain exact.
 
 ### Security
 

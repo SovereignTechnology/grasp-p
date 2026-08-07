@@ -186,9 +186,17 @@ tests and closed development networks. Production relays must leave it unset.
 
 ### Per-IP Rate Limiting
 
-Per-IP connection and event rate limiting were considered but deferred until abuse is detected in production. The current protections (per-connection limits, total connection limit, content filtering) are sufficient for the git relay use case.
+Per-IP connection and event rate limiting remain a separate design concern.
+When `NGIT_MAX_CONNECTIONS` is unset, ngit-grasp deliberately has no
+application-level total connection cap and delegates resource protection to OS
+and infrastructure limits. Operators can set an explicit total cap, but that
+does not provide fairness between clients.
 
-**Decision rationale:** The primary DoS vector is connection exhaustion, which is addressed by the total connection limit (`NGIT_MAX_CONNECTIONS`). Per-IP enforcement would require custom middleware in rust-nostr relay-builder (which currently tracks limits per WebSocket connection, not per IP). If abuse is detected via the per-IP monitoring metrics, enforcement should be implemented as a PR to rust-nostr/relay-builder to benefit the entire Nostr ecosystem.
+**Design constraint:** Per-IP enforcement requires trustworthy client identity
+through the reverse proxy plus aggregation across rust-nostr WebSocket
+sessions. Forwarded-IP headers must only be accepted from configured trusted
+proxies; otherwise clients could spoof addresses and evade or weaponise the
+limit.
 
 **Related:** Git endpoint throttling (issue ff38) is a separate concern with different requirements.
 
@@ -200,7 +208,7 @@ Per-IP connection and event rate limiting were considered but deferred until abu
 | Max subscriptions (500) | ✅ Active | Yes | No (relay-builder default) |
 | Event rate limit (60/min) | ✅ Active | Yes | No (relay-builder default) |
 | **Total Connection Limit** |
-| Max connections (500) | ✅ Active | Yes | Yes (`NGIT_MAX_CONNECTIONS`) |
+| Max connections (unlimited by default) | Optional | When configured | Yes (`NGIT_MAX_CONNECTIONS`) |
 | **Per-IP Monitoring** |
 | Connection tracking | ✅ Active | No (monitor only) | Threshold only |
 | **Content Filtering** |
