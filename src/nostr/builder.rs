@@ -34,6 +34,15 @@ use crate::nostr::SharedDatabase;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
+/// Connection-wide frame allowance layered above the operation-specific
+/// write, query, and authentication quotas.
+///
+/// rust-nostr's 300/minute default closed production browser clients during
+/// ordinary bursty subscription churn. One hundred frames per second preserves a
+/// bounded catch-all for malformed/non-operation traffic while leaving the
+/// tighter operation quotas in charge of valid protocol work.
+const CLIENT_MESSAGES_PER_MINUTE: u32 = 6_000;
+
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
 /// Acts as the top-level admission gate and router.  Each incoming event is:
@@ -1014,7 +1023,7 @@ pub async fn create_relay(
         })
         .queries_per_minute(120)
         .auth_events_per_minute(30)
-        .messages_per_minute(300)
+        .messages_per_minute(CLIENT_MESSAGES_PER_MINUTE)
         .max_websocket_message_size(5 * 1024 * 1024)
         .max_event_size(config.relay_max_event_size_bytes)
         .websocket_handshake_timeout(Duration::from_secs(10))

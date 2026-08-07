@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release, including the upstream NEG-OPEN handling fix and new local-relay
   resource hardening. The embedded relay now imposes 500 active REQs per
   connection; per-minute connection quotas of 60 event writes, 120 queries,
-  30 authentication events, and 300 text messages; 20 filters per REQ; 500
+  30 authentication events, and 6,000 WebSocket messages (raised from
+  rust-nostr's 300/minute default after it disconnected legitimate bursty
+  clients in production); 20 filters per REQ; 500
   results per filter; 250-byte
   subscription IDs; 1 MiB retained subscription state; 10 active negentropy
   sessions and 50,000 negentropy items per connection; 5 MiB WebSocket

@@ -170,8 +170,8 @@ though they advertise the larger accepted `max_limit`.
 #### Admission and rate limits (condensed)
 
 Native rate limiting varies wildly and is invisible to clients. Our own
-embedded relay enforces per-connection per-minute quotas (120 queries, 300
-text messages, 60 event writes); nostream ships per-IP connection-attempt
+embedded relay enforces per-connection per-minute quotas (120 queries, 6,000
+WebSocket messages, 60 event writes); nostream ships per-IP connection-attempt
 and kind-specific event quotas with EWMA decay; khatru and haven offer
 discrete leaky counters that drain over minutes; nostr-rs-relay, relayer,
 and rnostr have token-bucket limiters that are disabled by default; chorus
