@@ -96,6 +96,12 @@ const MAX_CONCURRENT_NEG_DIFFS: usize = 4;
 /// docs/explanation/sync-scaling-constraints.md.
 const MAX_CONCURRENT_TRANSIENT_REQS: usize = 5;
 
+/// Events and lifecycle notifications waiting for the per-relay processor.
+///
+/// Transient permit release has a separate terminal-control listener, so this
+/// remains a bounded data-processing queue rather than a lifecycle boundary.
+pub(crate) const RELAY_EVENT_BUFFER_CAPACITY: usize = 1000;
+
 /// Upper bound on how long a transient-REQ permit may be held.
 ///
 /// Permits are normally released when the subscription's EOSE (or CLOSED)
@@ -120,6 +126,9 @@ struct HeldTransientPermits {
     _ledger_slot: tokio::sync::OwnedSemaphorePermit,
     generation: u64,
     request_class: TransientRequestClass,
+    opened_at: std::time::Instant,
+    last_event_at: Option<std::time::Instant>,
+    delivered_events: usize,
 }
 
 /// Bounded origin of an auto-close REQ, retained for watchdog diagnosis.
@@ -702,6 +711,9 @@ impl RelayConnection {
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
                     request_class,
+                    opened_at: std::time::Instant::now(),
+                    last_event_at: None,
+                    delivered_events: 0,
                 });
             }
             drop(ledger_slot);
@@ -718,6 +730,9 @@ impl RelayConnection {
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
                     request_class,
+                    opened_at: std::time::Instant::now(),
+                    last_event_at: None,
+                    delivered_events: 0,
                 });
             }
             drop(class_cap);
@@ -907,6 +922,46 @@ impl RelayConnection {
         // In nostr-sdk 0.45 this returns a Stream rather than a broadcast receiver.
         let mut notifications = relay.notifications();
 
+        // EVENT forwarding can block on the bounded processor queue. Subscribe
+        // independently to terminal messages so EOSE/CLOSED can still return
+        // transient ledger slots while the data lane drains. Relay
+        // notifications are broadcast, so this does not consume messages from
+        // the processor-facing stream below.
+        let terminal_connection = self.clone();
+        // Construct the receiver before spawning so no fast terminal can race
+        // task scheduling and arrive before the control lane is subscribed.
+        let mut terminals = relay.notifications();
+        let terminal_listener = tokio::spawn(async move {
+            while let Some(notification) = terminals.next().await {
+                match notification {
+                    RelayNotification::Message { message } => match *message {
+                        RelayMessage::EndOfStoredEvents(sub_id) => {
+                            terminal_connection
+                                .close_and_release_transient_req_permit(&sub_id.into_owned())
+                                .await;
+                        }
+                        RelayMessage::Closed {
+                            subscription_id, ..
+                        } => {
+                            terminal_connection
+                                .release_transient_req_permit(&subscription_id.into_owned());
+                        }
+                        _ => {}
+                    },
+                    RelayNotification::RelayStatus { status }
+                        if matches!(
+                            status,
+                            RelayStatus::Disconnected | RelayStatus::Terminated
+                        ) =>
+                    {
+                        terminal_connection.clear_subscription_permits();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         tracing::debug!(relay = %url, "Starting event loop with relay-level notifications");
 
         while let Some(notification) = notifications.next().await {
@@ -915,6 +970,7 @@ impl RelayConnection {
                     event,
                     subscription_id,
                 } => {
+                    self.record_transient_req_event(&subscription_id);
                     tracing::trace!(
                         relay = %url,
                         event_id = %event.id,
@@ -935,13 +991,6 @@ impl RelayConnection {
                         tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
                         // Convert Cow<SubscriptionId> to owned SubscriptionId
                         let owned_sub_id = sub_id.into_owned();
-                        // Release the transient permit BEFORE forwarding:
-                        // the forward can block on channel backpressure and
-                        // permit release must never depend on downstream
-                        // consumers (the SyncManager actor may itself be
-                        // waiting on a permit).
-                        self.close_and_release_transient_req_permit(&owned_sub_id)
-                            .await;
                         if event_sender
                             .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
                             .await
@@ -979,11 +1028,10 @@ impl RelayConnection {
                         subscription_id,
                         message: msg,
                     } => {
-                        // A CLOSED subscription can no longer produce EOSE;
-                        // free whichever ledger ownership it held.
+                        // The terminal-control listener owns transient release;
+                        // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
-                        let live_generation =
-                            self.release_subscription_permits_on_closed(&subscription_id);
+                        let live_generation = self.release_live_req_permit(&subscription_id);
                         tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
                         let _ = event_sender
                             .send(RelayEvent::Closed {
@@ -1033,6 +1081,8 @@ impl RelayConnection {
                 }
             }
         }
+
+        terminal_listener.abort();
 
         // The connection is going away; every outstanding transient
         // subscription dies with it, so free their permits.
@@ -1205,19 +1255,43 @@ impl RelayConnection {
         // Transient permits are acquired through the same session helper; a
         // reset closes queued acquisitions and the helper checks generation.
         let retained_filters = filters.clone();
+        // The relay can answer an empty or cached query before `subscribe`
+        // returns. Register transient ownership against a caller-chosen ID
+        // first so an immediate EOSE/CLOSED cannot race past local accounting.
+        let transient_sub_id = transient_class.map(|_| SubscriptionId::generate());
+        if let (Some(sub_id), Some(permit)) = (&transient_sub_id, transient_permit) {
+            self.hold_transient_req_permit(sub_id.clone(), permit);
+        }
         let output = if transient_class.is_some() {
             self.client
                 .subscribe(filters)
+                .with_id(
+                    transient_sub_id
+                        .clone()
+                        .expect("transient subscription has a pre-registered id"),
+                )
                 .close_on(
                     SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE),
                 )
                 .await
         } else {
             self.client.subscribe(filters).await
-        }
-        .map_err(|e| format!("Failed to subscribe on {}: {}", self.url, e))?;
+        };
+
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(sub_id) = &transient_sub_id {
+                    self.release_transient_req_permit(sub_id);
+                }
+                return Err(format!("Failed to subscribe on {}: {}", self.url, error));
+            }
+        };
 
         if !output.failed.is_empty() {
+            if let Some(sub_id) = &transient_sub_id {
+                self.release_transient_req_permit(sub_id);
+            }
             let failures = output
                 .failed
                 .values()
@@ -1227,11 +1301,7 @@ impl RelayConnection {
             return Err(format!("Failed to subscribe on {}: {}", self.url, failures));
         }
 
-        if transient_class.is_some() {
-            if let Some(permit) = transient_permit {
-                self.hold_transient_req_permit(output.value.clone(), permit);
-            }
-        } else {
+        if transient_class.is_none() {
             let live_permit = live_permit.expect("live subscription acquired a ledger slot");
             self.live_req_permits_held
                 .lock()
@@ -1374,6 +1444,21 @@ impl RelayConnection {
             if let (Some((generation, request_class)), Ok(Some(relay))) =
                 (held_request, client.relay(&url).await)
             {
+                let sdk_subscription_active = relay.subscription(&sub_id).await.is_some();
+                let diagnostic = held
+                    .lock()
+                    .expect("transient permit map poisoned")
+                    .get(&sub_id)
+                    .filter(|permits| permits.generation == generation)
+                    .map(|permits| {
+                        (
+                            permits.delivered_events,
+                            permits.opened_at.elapsed().as_secs(),
+                            permits.last_event_at.map(|at| at.elapsed().as_secs()),
+                        )
+                    });
+                let (delivered_events, open_seconds, idle_seconds) =
+                    diagnostic.unwrap_or((0, TRANSIENT_REQ_PERMIT_TIMEOUT.as_secs(), None));
                 if relay
                     .send_msg(ClientMessage::close(sub_id.clone()))
                     .await
@@ -1384,6 +1469,10 @@ impl RelayConnection {
                         relay = %relay_url,
                         sub_id = %sub_id,
                         request_class = request_class.as_str(),
+                        sdk_subscription_active,
+                        delivered_events,
+                        open_seconds,
+                        idle_seconds,
                         "Transient REQ watchdog sent CLOSE after missing EOSE/CLOSED"
                     );
                     crate::metrics::record_transient_req_watchdog(request_class.as_str(), "closed");
@@ -1392,6 +1481,10 @@ impl RelayConnection {
                         relay = %relay_url,
                         sub_id = %sub_id,
                         request_class = request_class.as_str(),
+                        sdk_subscription_active,
+                        delivered_events,
+                        open_seconds,
+                        idle_seconds,
                         "Transient REQ watchdog could not send CLOSE; retaining subscription slot"
                     );
                     crate::metrics::record_transient_req_watchdog(
@@ -1401,6 +1494,18 @@ impl RelayConnection {
                 }
             }
         });
+    }
+
+    fn record_transient_req_event(&self, sub_id: &SubscriptionId) {
+        if let Some(held) = self
+            .transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .get_mut(sub_id)
+        {
+            held.delivered_events = held.delivered_events.saturating_add(1);
+            held.last_event_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Release the transient-REQ permit held for `sub_id`, if any.
@@ -1454,6 +1559,7 @@ impl RelayConnection {
             .map(|held| held.generation)
     }
 
+    #[cfg(test)]
     fn release_subscription_permits_on_closed(&self, sub_id: &SubscriptionId) -> Option<u64> {
         self.release_transient_req_permit(sub_id);
         self.release_live_req_permit(sub_id)
@@ -2063,6 +2169,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_control_lane_releases_permits_behind_event_backpressure() {
+        const AUTHORS: usize = 3;
+        const EVENTS_PER_AUTHOR: usize = 400;
+
+        let relay = LocalRelayBuilder::default().build();
+        relay.run().await.expect("start burst relay");
+        let mut authors = Vec::with_capacity(AUTHORS);
+        for author_index in 0..AUTHORS {
+            let keys = Keys::generate();
+            authors.push(keys.public_key());
+            for event_index in 0..EVENTS_PER_AUTHOR {
+                let event = EventBuilder::new(
+                    Kind::TextNote,
+                    format!("burst-{author_index}-{event_index}"),
+                )
+                .finalize(&keys)
+                .expect("build burst event");
+                relay.add_event(event).await.expect("seed burst event");
+            }
+        }
+
+        let connection = RelayConnection::new(
+            relay.url().await.to_string(),
+            Keys::generate(),
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection.connect(3).await.expect("connect burst relay");
+        // Keep the data lane full after its first event. The independent
+        // terminal listener must still observe every EOSE and release slots.
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let event_loop = tokio::spawn(connection.clone().run_event_loop(event_tx));
+
+        for author in authors {
+            connection
+                .subscribe_filter(
+                    Filter::new().author(author),
+                    TransientRequestClass::NegentropyHydration,
+                )
+                .await
+                .expect("open bounded burst page");
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if connection
+                    .transient_req_permits_held
+                    .lock()
+                    .expect("transient permit map poisoned")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the terminal lane must release permits behind blocked EVENT delivery");
+
+        connection.disconnect().await;
+        relay.shutdown();
+        event_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn immediate_empty_eose_cannot_arrive_before_permit_registration() {
+        let relay = LocalRelayBuilder::default().build();
+        relay.run().await.expect("start empty relay");
+        let connection = RelayConnection::new(
+            relay.url().await.to_string(),
+            Keys::generate(),
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection.connect(3).await.expect("connect empty relay");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(RELAY_EVENT_BUFFER_CAPACITY);
+        let event_loop = tokio::spawn(connection.clone().run_event_loop(event_tx));
+        let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+        for _ in 0..25 {
+            connection
+                .subscribe_filter(
+                    Filter::new().kind(Kind::Custom(65_535)),
+                    TransientRequestClass::NegentropyHydration,
+                )
+                .await
+                .expect("open empty transient request");
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if connection
+                    .transient_req_permits_held
+                    .lock()
+                    .expect("transient permit map poisoned")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every immediate empty EOSE must release its registered permit");
+
+        connection.disconnect().await;
+        relay.shutdown();
+        event_loop.abort();
+        drain.abort();
+    }
+
+    #[tokio::test]
     async fn fetch_events_reports_an_unregistered_exact_relay() {
         let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
 
@@ -2420,6 +2638,9 @@ mod tests {
         let held = HeldTransientPermits {
             generation,
             request_class: TransientRequestClass::HistoricPage,
+            opened_at: std::time::Instant::now(),
+            last_event_at: None,
+            delivered_events: 0,
             _class_cap: connection
                 .transient_req_permits
                 .clone()
@@ -2433,6 +2654,17 @@ mod tests {
                 .expect("reserve ledger slot"),
         };
         connection.hold_transient_req_permit(sub_id.clone(), held);
+        connection.record_transient_req_event(&sub_id);
+
+        {
+            let permits = connection
+                .transient_req_permits_held
+                .lock()
+                .expect("transient permit map poisoned");
+            let diagnostic = permits.get(&sub_id).expect("held subscription diagnostic");
+            assert_eq!(diagnostic.delivered_events, 1);
+            assert!(diagnostic.last_event_at.is_some());
+        }
 
         assert!(
             !RelayConnection::release_transient_req_permit_for_generation(

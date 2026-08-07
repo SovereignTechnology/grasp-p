@@ -2972,7 +2972,8 @@ impl SyncManager {
             }
         };
 
-        let (event_tx, mut event_rx) = mpsc::channel::<RelayEvent>(1000);
+        let (event_tx, mut event_rx) =
+            mpsc::channel::<RelayEvent>(relay_connection::RELAY_EVENT_BUFFER_CAPACITY);
 
         // Spawn event loop task
         let relay_url_for_loop = relay_url.to_string();

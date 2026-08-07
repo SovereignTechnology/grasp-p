@@ -304,11 +304,23 @@ slot after the SDK accepts the message; valid production startup pages exceeded
 subscription. If CLOSE cannot be enqueued, the slot remains held until ordinary
 connection teardown so local accounting cannot run ahead of the relay. Exact-ID
 purgatory polling uses the same transient class bound and shared ledger as
-historic pagination. Unexpected CLOSED for a persistent live subscription is
+historic pagination. Transient subscription IDs and their permits are
+registered locally before the REQ is sent; this ordering is required because
+an empty or cached response can deliver EOSE/CLOSED before the SDK subscribe
+call returns. Subscribe failure rolls that pre-registration back. Unexpected
+CLOSED for a persistent live subscription is
 reported to the manager, which recomputes and transactionally reopens complete
 live coverage. Each reconnect closes the retired ledger and creates a new
 generation; queued or late borrowers therefore fail before sending on the new
 SDK session and cannot inflate or bypass its capacity.
+
+The per-relay event processor retains its 1,000-message bounded data queue.
+Permit release does not depend on that queue draining: a separate listener on
+rust-nostr's broadcast relay notifications consumes only EOSE/CLOSED terminals
+and closes/releases transient ownership. The processor-facing listener still
+delivers ordered EVENT and lifecycle work to the sync actor, but sustained page
+traffic cannot hide terminal accounting behind EVENT backpressure. The data
+queue remains finite as a memory-safety boundary for non-conforming peers.
 
 The levers, in the order we reach for them:
 
