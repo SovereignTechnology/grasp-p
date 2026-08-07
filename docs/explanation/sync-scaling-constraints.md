@@ -372,7 +372,11 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   five-request class cap inside the shared ledger: a slot is acquired when
   the auto-close REQ is sent and released when its EOSE or CLOSED arrives
   (with a 120 s watchdog that sends CLOSE for only the unresponsive
-  subscription before releasing its slot). Live subscriptions are ledgered first, so NEG,
+  subscription before releasing its slot). Each held permit retains one of a
+  fixed set of request classes (historic page, pagination page, hint
+  verification, negentropy hydration, retry, or semantic fallback); watchdog
+  logs and metrics expose that class without using relay URLs or subscription
+  IDs as metric labels. Live subscriptions are ledgered first, so NEG,
   transient REQ,
   and purgatory exact-ID polling share only the remaining capacity.
 - Permit acquisition checks relay health first: while a rate-limit or

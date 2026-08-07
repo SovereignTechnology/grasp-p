@@ -202,6 +202,26 @@ lazy_static! {
             .expect("register purgatory git fetch oids metric");
         metric
     };
+    static ref TRANSIENT_REQ_WATCHDOG_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_sync_transient_req_watchdog_total",
+                "Transient REQ watchdog outcomes by bounded request class",
+            ),
+            &["class", "outcome"],
+        )
+        .expect("build transient REQ watchdog metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register transient REQ watchdog metric");
+        metric
+    };
+}
+
+pub fn record_transient_req_watchdog(class: &str, outcome: &str) {
+    TRANSIENT_REQ_WATCHDOG_TOTAL
+        .with_label_values(&[class, outcome])
+        .inc();
 }
 
 /// Record one completed outbound purgatory git fetch pass.
