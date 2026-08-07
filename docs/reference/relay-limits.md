@@ -15,7 +15,7 @@ production admission policy.
 | Event writes per minute | 60 | Fixed | No standard field |
 | Queries per minute | 120 | Fixed | No standard field |
 | Authentication events per minute | 30 | Fixed | No standard field |
-| Text messages per minute | 300 | Fixed | No standard field |
+| WebSocket messages per minute | 6,000 | Fixed | No standard field |
 | WebSocket message size | 5 MiB | Fixed | `max_message_length` |
 | Handshake deadline | 10 seconds | Fixed | No standard field |
 | Subscription-ID length | 250 bytes | Fixed | `max_subid_length` |
