@@ -744,6 +744,10 @@ const CONSOLIDATION_THRESHOLD: usize = 70;
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
+/// Maximum number of collection members rendered in an INFO-level log field.
+/// Counts remain authoritative; samples keep remotely influenced logs bounded.
+const LOG_COLLECTION_SAMPLE_SIZE: usize = 5;
+
 /// Adaptive per-relay threshold for historic REQ+EOSE pagination.
 ///
 /// NIP-01 guarantees none of this; the model is empirical. A source audit of
@@ -2399,7 +2403,6 @@ impl SyncManager {
                 );
             }
 
-            // DEBUG TRACING: Log the root events being confirmed
             tracing::info!(
                 relay = %relay_url,
                 batch_id = batch_id,
@@ -2407,11 +2410,11 @@ impl SyncManager {
                 full_repos_confirmed = full_repos_count,
                 state_only_repos_confirmed = state_only_repos_count,
                 root_events_confirmed = events_count,
-                root_events_ids = ?batch.items.root_events.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                root_events_sample = ?batch.items.root_events.iter().take(LOG_COLLECTION_SAMPLE_SIZE).map(|id| id.to_hex()).collect::<Vec<_>>(),
                 total_full_repos = state.repos.len(),
                 total_state_only_repos = state.state_only_repos.len(),
                 total_root_events = state.root_events.len(),
-                all_root_events = ?state.root_events.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                all_root_events_sample = ?state.root_events.iter().take(LOG_COLLECTION_SAMPLE_SIZE).map(|id| id.to_hex()).collect::<Vec<_>>(),
                 is_generic_filter = is_generic_filter,
                 announcements_synced = state.announcements_synced,
                 had_failures = state.historic_sync_had_failures,
@@ -5148,7 +5151,7 @@ impl SyncManager {
 
         tracing::info!(
             count = to_disconnect.len(),
-            relays = ?to_disconnect,
+            relay_sample = ?to_disconnect.iter().take(LOG_COLLECTION_SAMPLE_SIZE).collect::<Vec<_>>(),
             "Found empty non-bootstrap relays to disconnect"
         );
 
@@ -5254,7 +5257,7 @@ impl SyncManager {
 
         tracing::info!(
             count = to_reconnect.len(),
-            relays = ?to_reconnect,
+            relay_sample = ?to_reconnect.iter().take(LOG_COLLECTION_SAMPLE_SIZE).collect::<Vec<_>>(),
             "Attempting reconnection for disconnected relays"
         );
 

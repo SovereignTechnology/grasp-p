@@ -20,6 +20,9 @@ use crate::nostr::SharedDatabase;
 
 use super::{AddFilters, RepoSyncIndex, RepoSyncNeeds, SyncLevel};
 
+/// Counts remain complete while remotely influenced log samples stay bounded.
+const LOG_COLLECTION_SAMPLE_SIZE: usize = 5;
+
 // =============================================================================
 // LoopControl - Result of notification processing
 // =============================================================================
@@ -275,7 +278,7 @@ impl SelfSubscriber {
                             event_id = %event.id,
                             repo_id = %repo_id,
                             relay_count = relays.len(),
-                            relays = ?relays,
+                            relay_sample = ?relays.iter().take(LOG_COLLECTION_SAMPLE_SIZE).collect::<Vec<_>>(),
                             "[DIAG] Queued 30617 announcement for batch processing"
                         );
                     }
@@ -574,7 +577,8 @@ impl SelfSubscriber {
         for (repo_id, needs) in &updates {
             tracing::info!(
                 repo_id = %repo_id,
-                relay_urls = ?needs.relays,
+                relay_count = needs.relays.len(),
+                relay_sample = ?needs.relays.iter().take(LOG_COLLECTION_SAMPLE_SIZE).collect::<Vec<_>>(),
                 "Discovered repo with relay URLs"
             );
         }
