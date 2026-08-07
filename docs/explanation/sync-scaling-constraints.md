@@ -70,8 +70,8 @@ The five reachable relays advertise their result cap as
 
 ### Discoverability gap (NIP-11)
 
-NIP-11 `limitation` has **no field for tag values per filter**. It does define
-`max_filters` (filters per subscription), `max_limit` (clamp applied to a
+NIP-11 `limitation` has **no field for tag values per filter or filter count
+per subscription**. It does define `max_limit` (clamp applied to a
 filter's explicit `limit`), and `default_limit` (maximum returned events when
 `limit` is omitted — the field pagination actually needs), in addition to
 `max_subscriptions` and `max_message_length`, but implementations and
@@ -182,7 +182,7 @@ infrastructure. The full survey with citations is preserved in this
 file's history (commit `9723ff4`).
 
 NIP-11 describes hard relay limitations, not rate-limit algorithms. The
-standard fields relevant here are `max_limit`, `max_filters`, and
+standard fields relevant here are `max_limit` and
 `max_subscriptions`; it has no standard fields for simultaneous connections
 per IP, connection-attempt rate, message/event/query rate, burst size, window,
 decay model, or retry-after time. Even an advertised `max_limit` does not say
@@ -250,10 +250,11 @@ Derived from the tightest commonly observed values; all sizing below assumes:
 - **Subscription budget B = 20** per connection (nos.lol, relay.primal.net,
   Ditto Relay default), shared between live REQs, NEG rounds, and fallback
   REQs. Caveat found by the 2026-08-06 limit matrix: nostream defaults to
-  **10** subscriptions per connection and 10 filters per REQ (both
-  advertised in NIP-11), below this floor — the fixed 4 NEG + 5 REQ + 2
+  **10** subscriptions per connection and 10 filters per REQ (the former is
+  standard NIP-11; nostream emits the latter as a relay-specific field), below
+  this floor — the fixed 4 NEG + 5 REQ + 2
   margin pattern alone would overdraw a default nostream before any live
-  subscriptions. Honouring advertised `max_subscriptions`/`max_filters`
+  subscriptions. Honouring advertised `max_subscriptions`
   is therefore required ledger work, not just an optimisation.
 - **Message budget M = 128 KB** (nos.lol); we target ≤ 96 KB of filter payload
   per message, a 1.3× margin for the envelope.
@@ -422,15 +423,17 @@ consequences:
 ## Serving-Side Obligations
 
 We are also a relay, and peer GRASP instances run this same sync against us.
-The embedded relay currently enforces **no negentropy concurrency limit**
-(upstream nostr-sdk `TODO`) and no filter-size limits — the mirror image of
-the client-side incident that motivated this document. At scale we must:
+The rust-nostr 0.45 embedded relay now enforces 10 active negentropy sessions,
+20 filters per REQ, and the other bounds recorded in the relay-limits
+reference. ngit-grasp explicitly selects those defaults and advertises the
+standard, discoverable subset. The remaining serving-side gap is a bound on
+tag-value/filter payload size, for which NIP-11 has no standard field. At scale
+we must:
 
-1. Enforce server-side bounds (NEG concurrency, filters per REQ, filter
-   payload) so one peer cannot exhaust us.
-2. Advertise our limits in NIP-11 `limitation` (`max_subscriptions`,
-   `max_message_length`) so well-behaved peers can budget against us —
-   partially compensating for the discoverability gap we suffer as a client.
+1. Retain the existing NEG, REQ, subscription-memory, message, event, and rate
+   bounds, and design a filter-payload bound if production evidence requires it.
+2. Keep NIP-11 `limitation` aligned with every enforced standard field so
+   well-behaved peers can budget against us.
 
 ---
 
@@ -466,11 +469,11 @@ deterministic and testable.
 
 **Pros:** honest relays advertise `max_subscriptions` and
 `max_message_length`; budgets could be exact.
-**Why partial:** the two advertised fields *are* consumed when present
-(relaxing B and M above the floors), but per-filter and filters-per-REQ
-limits simply have no NIP-11 field, and many relays omit `limitation`
-entirely — so floors remain necessary. Proposing a NIP-11 extension for
-filter-size limits is worthwhile upstream work.
+**Why partial:** `max_subscriptions` and `default_limit` are consumed when
+present, but message-size negotiation is not yet implemented, filter count has
+no current standard NIP-11 field, and many relays omit `limitation` entirely —
+so floors remain necessary. Proposing a NIP-11 extension for filter-size limits
+is worthwhile upstream work.
 
 ### Timed batching with pause-on-rate-limit
 
@@ -492,7 +495,7 @@ with the heuristics demoted to backstop.
 | 1 + 2 — byte-budgeted chunking and REQ packing | Landed with cycle 3 (same PR) |
 | Ledger unification (live + historic + fallback + purgatory polling against one NIP-11-aware subscription budget) | Implemented 2026-08-06; message-budget negotiation remains follow-up |
 | 4 — multi-connection sharding | Deferred until a relay's target set approaches the single-connection ceiling |
-| Serving-side limits + NIP-11 advertisement | Follow-up work item |
+| Serving-side limits + NIP-11 advertisement | Implemented 2026-08-07 for rust-nostr's enforceable limits and the standard discoverable subset; filter-payload bounding remains follow-up |
 
 ---
 

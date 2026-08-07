@@ -17,14 +17,25 @@ ngit-grasp employs multiple layers of defense:
 
 ### Per-Connection Rate Limits
 
-**Source:** Built-in to rust-nostr relay-builder
+**Source:** Enforced by rust-nostr relay-builder and explicitly selected by
+ngit-grasp. Discoverable sync limits and the Git-specific event bound are
+operator configurable; other dependency hardening is pinned in the builder.
 
 - **Subscription limit:** Max 500 concurrent subscriptions per connection
 - **Event publishing limit:** Max 60 events per minute per connection
 - **Subscription ID length:** Max 250 characters
 - **Filter limit:** Max 500 results per query (default)
+- **Event size:** Max 192 KiB by default, raised from rust-nostr's 64 KiB
+  default because valid NIP-34 patch events in production reach about 149 KiB
 
 These limits prevent individual connections from overwhelming the relay.
+The relay advertises the standard `max_subscriptions`, `max_limit`,
+`default_limit`, `max_message_length`, and `max_subid_length` NIP-11 fields.
+rust-nostr 0.45 also enforces fixed ngit-grasp-selected defaults of 120 queries,
+30 authentication events, and 300 text messages per minute; 20 filters per
+REQ; 1 MiB subscription state; 10 active negentropy sessions and 50,000
+negentropy items per connection; a 5 MiB WebSocket message; and a 10-second
+handshake deadline. NIP-11 has no standard fields for most of those controls.
 
 ### Per-IP Connection Monitoring
 

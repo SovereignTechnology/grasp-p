@@ -38,6 +38,9 @@ pub struct RelayInformationDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 
+    /// Standard NIP-11 limits enforced by the embedded relay.
+    pub limitation: RelayLimitation,
+
     // GRASP-01 Extensions (lines 24-28 of GRASP-01 spec)
     /// List of supported GRASPs (e.g., ["GRASP-01"])
     /// Required by GRASP-01 specification line 26
@@ -51,6 +54,16 @@ pub struct RelayInformationDocument {
     /// Required by GRASP-01 specification line 28 when events are curated
     #[serde(skip_serializing_if = "Option::is_none")]
     pub curation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayLimitation {
+    pub max_message_length: usize,
+    pub max_subscriptions: usize,
+    pub max_limit: usize,
+    pub max_subid_length: usize,
+    pub default_limit: usize,
+    pub restricted_writes: bool,
 }
 
 impl RelayInformationDocument {
@@ -131,6 +144,14 @@ impl RelayInformationDocument {
                 None => env!("CARGO_PKG_VERSION").to_string(),
             },
             icon: Some(format!("https://{}/icon.png", config.domain)),
+            limitation: RelayLimitation {
+                max_message_length: 5 * 1024 * 1024,
+                max_subscriptions: config.relay_max_subscriptions,
+                max_limit: config.relay_filter_limit,
+                max_subid_length: 250,
+                default_limit: config.relay_filter_limit,
+                restricted_writes: true,
+            },
 
             // GRASP Extensions
             supported_grasps,
@@ -184,6 +205,11 @@ mod tests {
             doc.icon,
             Some("https://relay.example.com/icon.png".to_string())
         );
+        assert_eq!(doc.limitation.max_subscriptions, 500);
+        assert_eq!(doc.limitation.max_limit, 500);
+        assert_eq!(doc.limitation.default_limit, 500);
+        assert_eq!(doc.limitation.max_message_length, 5 * 1024 * 1024);
+        assert!(doc.limitation.restricted_writes);
     }
 
     #[test]
@@ -211,6 +237,22 @@ mod tests {
         assert_eq!(parsed["supported_grasps"][0], "GRASP-01");
         assert_eq!(parsed["supported_grasps"][1], "GRASP-02");
         assert_eq!(parsed["icon"], "https://relay.example.com/icon.png");
+        assert_eq!(parsed["limitation"]["max_subscriptions"], 500);
+        assert_eq!(parsed["limitation"]["max_limit"], 500);
+        assert_eq!(parsed["limitation"]["default_limit"], 500);
+    }
+
+    #[test]
+    fn test_nip11_advertises_configured_sync_limits() {
+        let mut config = Config::for_testing();
+        config.relay_max_subscriptions = 20;
+        config.relay_filter_limit = 300;
+
+        let doc = RelayInformationDocument::from_config(&config);
+
+        assert_eq!(doc.limitation.max_subscriptions, 20);
+        assert_eq!(doc.limitation.max_limit, 300);
+        assert_eq!(doc.limitation.default_limit, 300);
     }
 
     #[test]

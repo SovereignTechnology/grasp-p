@@ -16,9 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Upgraded the rust-nostr crates from `0.45.0-alpha.8` to the stable `0.45.0`
   release, including the upstream NEG-OPEN handling fix and new local-relay
-  resource hardening. ngit-grasp explicitly overrides rust-nostr's new
-  128-connection default to preserve its documented unbounded-by-default
-  inbound admission; explicitly configured connection caps remain exact.
+  resource hardening. The embedded relay now imposes 500 active REQs per
+  connection; per-minute connection quotas of 60 event writes, 120 queries,
+  30 authentication events, and 300 text messages; 20 filters per REQ; 500
+  results per filter; 250-byte
+  subscription IDs; 1 MiB retained subscription state; 10 active negentropy
+  sessions and 50,000 negentropy items per connection; 5 MiB WebSocket
+  messages; and a 10-second handshake deadline. ngit-grasp deliberately:
+
+  - makes the discoverable subscription and filter-result limits configurable
+    and advertises them in NIP-11;
+  - raises rust-nostr's new 64 KiB event bound to a configurable 192 KiB
+    default because valid NIP-34 patch events in production reach about
+    149 KiB; and
+  - overrides rust-nostr's new 128-connection default to preserve documented
+    unbounded-by-default inbound admission, while keeping configured caps exact.
 
 ### Security
 

@@ -406,6 +406,22 @@ let
           "Maximum total connections to the relay (default: unlimited, defers to OS/infrastructure limits)";
       };
 
+      relayMaxSubscriptions = mkOption {
+        type = types.ints.positive;
+        default = 500;
+        description = "Maximum active REQ subscriptions per WebSocket connection";
+      };
+      relayMaxEventSizeBytes = mkOption {
+        type = types.ints.positive;
+        default = 192 * 1024;
+        description = "Maximum serialized event size in bytes";
+      };
+      relayFilterLimit = mkOption {
+        type = types.ints.positive;
+        default = 500;
+        description = "Per-filter result cap, including when limit is omitted";
+      };
+
       user = mkOption {
         type = types.str;
         default = "ngit-grasp-${name}";
@@ -491,6 +507,9 @@ let
       NGIT_GRASP06_ENABLE = if cfg.grasp06Enable then "true" else "false";
       NGIT_DELETION_REQUEST_DISRESPECTOR =
         if cfg.deletionRequestDisrespector then "true" else "false";
+      NGIT_RELAY_MAX_SUBSCRIPTIONS = toString cfg.relayMaxSubscriptions;
+      NGIT_RELAY_MAX_EVENT_SIZE_BYTES = toString cfg.relayMaxEventSizeBytes;
+      NGIT_RELAY_FILTER_LIMIT = toString cfg.relayFilterLimit;
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.relayName != null) {

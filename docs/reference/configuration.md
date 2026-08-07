@@ -1343,13 +1343,29 @@ NGIT_MAX_CONNECTIONS=100
 - When limit is reached, new connections are rejected
 - Existing connections continue to work normally
 
-**Related Limits:**
+#### Embedded relay resource limits
 
-Per-connection limits (built-in to relay-builder, not configurable):
-- Max subscriptions per connection: 500
-- Max events per minute per connection: 60
-- Max subscription ID length: 250 characters
-- Max results per filter: 500
+rust-nostr 0.45 introduced or tightened several local-relay defaults. ngit-grasp
+sets every effective value explicitly in code, but exposes only limits that a
+peer can discover and use to adapt sync, plus the Git-specific event-size
+policy.
+
+| Environment variable | Default | Meaning |
+| --- | ---: | --- |
+| `NGIT_RELAY_MAX_SUBSCRIPTIONS` | `500` | Active REQ subscriptions per WebSocket connection |
+| `NGIT_RELAY_FILTER_LIMIT` | `500` | Explicit and omitted-limit results per filter |
+| `NGIT_RELAY_MAX_EVENT_SIZE_BYTES` | `196608` | Serialized event bytes (192 KiB) |
+
+Every value must be greater than zero. The event limit must not exceed the
+fixed 5 MiB WebSocket message bound. Its default is three times rust-nostr's
+64 KiB default because production history contains a valid NIP-34 patch event
+of about 149 KiB; the bound retains approximately 29% headroom.
+
+The NIP-11 document advertises `NGIT_RELAY_MAX_SUBSCRIPTIONS` as
+`max_subscriptions`, and `NGIT_RELAY_FILTER_LIMIT` as both `max_limit` and
+`default_limit`. ngit-grasp peers already consume these fields for their
+per-connection subscription ledger and adaptive pagination. Event size has no
+equivalent standard NIP-11 field, so it remains documented configuration only.
 
 ---
 

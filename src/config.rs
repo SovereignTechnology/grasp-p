@@ -591,6 +591,22 @@ pub struct Config {
     #[arg(long, env = "NGIT_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
 
+    /// Maximum active REQ subscriptions per WebSocket connection
+    #[arg(long, env = "NGIT_RELAY_MAX_SUBSCRIPTIONS", default_value_t = 500)]
+    pub relay_max_subscriptions: usize,
+
+    /// Maximum serialized event size in bytes
+    #[arg(
+        long,
+        env = "NGIT_RELAY_MAX_EVENT_SIZE_BYTES",
+        default_value_t = 192 * 1024
+    )]
+    pub relay_max_event_size_bytes: usize,
+
+    /// Per-filter result cap, including when a filter omits limit
+    #[arg(long, env = "NGIT_RELAY_FILTER_LIMIT", default_value_t = 500)]
+    pub relay_filter_limit: usize,
+
     /// Log level for application logging
     #[arg(long, env = "NGIT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -883,6 +899,24 @@ impl Config {
             "used",
         )?;
 
+        let relay_limits = [
+            ("NGIT_RELAY_MAX_SUBSCRIPTIONS", self.relay_max_subscriptions),
+            (
+                "NGIT_RELAY_MAX_EVENT_SIZE_BYTES",
+                self.relay_max_event_size_bytes,
+            ),
+            ("NGIT_RELAY_FILTER_LIMIT", self.relay_filter_limit),
+        ];
+        if let Some((name, _)) = relay_limits.iter().find(|(_, value)| *value == 0) {
+            return Err(anyhow!("{name} must be greater than 0"));
+        }
+
+        if self.relay_max_event_size_bytes > 5 * 1024 * 1024 {
+            return Err(anyhow!(
+                "NGIT_RELAY_MAX_EVENT_SIZE_BYTES must not exceed the 5 MiB WebSocket message limit"
+            ));
+        }
+
         // Fatal error: repository_whitelist with archive_read_only=true (incompatible)
         if !repository_whitelist.is_empty() {
             let read_only = self.archive_read_only.unwrap_or(archive_enabled);
@@ -1076,6 +1110,9 @@ impl Config {
             event_blacklist: String::new(),
             deletion_request_disrespector: false,
             max_connections: None,
+            relay_max_subscriptions: 500,
+            relay_max_event_size_bytes: 192 * 1024,
+            relay_filter_limit: 500,
             log_level: "debug".to_string(),
         }
     }
@@ -1134,6 +1171,29 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:7334");
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    #[test]
+    fn relay_hardening_defaults_are_explicit() {
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("relay hardening defaults should parse");
+
+        assert_eq!(config.relay_max_subscriptions, 500);
+        assert_eq!(config.relay_max_event_size_bytes, 192 * 1024);
+        assert_eq!(config.relay_filter_limit, 500);
+    }
+
+    #[test]
+    fn event_limit_cannot_exceed_websocket_limit() {
+        let mut config = Config::for_testing();
+        config.relay_max_event_size_bytes = 5 * 1024 * 1024 + 1;
+
+        let error = config
+            .validate()
+            .expect_err("inconsistent size limits must fail");
+        assert!(error
+            .to_string()
+            .contains("NGIT_RELAY_MAX_EVENT_SIZE_BYTES must not exceed"));
     }
 
     #[test]

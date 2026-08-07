@@ -10,6 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Result;
 use nostr::nips::nip19::ToBech32;
@@ -1007,12 +1008,24 @@ pub async fn create_relay(
     let mut builder = LocalRelayBuilder::default()
         .database(database.clone())
         .write_policy(write_policy.clone())
-        // Explicitly set rate limits (make defaults visible in code)
-        // Per-connection limits: 500 max subscriptions, 60 events/min
         .rate_limit(RateLimit {
-            max_reqs: 500,        // Max concurrent subscriptions per connection
-            notes_per_minute: 60, // Max events per minute per connection
-        });
+            max_reqs: config.relay_max_subscriptions,
+            notes_per_minute: 60,
+        })
+        .queries_per_minute(120)
+        .auth_events_per_minute(30)
+        .messages_per_minute(300)
+        .max_websocket_message_size(5 * 1024 * 1024)
+        .max_event_size(config.relay_max_event_size_bytes)
+        .websocket_handshake_timeout(Duration::from_secs(10))
+        .max_subid_length(250)
+        .max_filters_per_req(20)
+        .max_subscription_bytes(1024 * 1024)
+        .max_negentropy_subscriptions(10)
+        .max_negentropy_items(50_000)
+        .max_filter_limit(config.relay_filter_limit)
+        .max_query_results(config.relay_filter_limit)
+        .default_filter_limit(config.relay_filter_limit);
 
     // `LocalRelayBuilder` otherwise applies rust-nostr's own finite default.
     // In ngit-grasp, an unset limit deliberately delegates admission control to
