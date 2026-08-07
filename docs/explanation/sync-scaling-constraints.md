@@ -395,9 +395,13 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   transient-failure cooldown is active, queued rounds take the REQ+EOSE
   fallback path (which is itself budget-accounted) instead of firing into a
   relay that just complained.
-- The reactive machinery (escalating cooldown, NOTICE-based rate-limit pause,
-  per-batch fallback) remains the backstop for relays whose limits are below
-  our floors — prevention first, reaction second.
+- The reactive machinery (escalating cooldown, rate-limit detection in both
+  NOTICE and subscription-specific CLOSED messages, and per-batch fallback)
+  remains the backstop for relays whose limits are below our floors. A
+  rate-limited CLOSED removes its incomplete historic batch from pending and
+  defers both that retry and live-coverage restoration until the cooldown;
+  rejected work is therefore neither falsely confirmed nor immediately
+  replayed into the limiter. Prevention remains first, reaction second.
 
 ### Lever 4: Multiple connections per relay (last resort)
 

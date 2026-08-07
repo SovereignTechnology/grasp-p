@@ -676,6 +676,26 @@ fn take_drained_batch_as_failed(
     Some(batch)
 }
 
+fn take_batch_containing_subscription(
+    pending: &mut HashMap<String, Vec<PendingBatch>>,
+    relay_url: &str,
+    subscription_id: &SubscriptionId,
+) -> Option<PendingBatch> {
+    let (batch_index, remove_relay) = {
+        let batches = pending.get(relay_url)?;
+        let batch_index = batches
+            .iter()
+            .position(|batch| batch.outstanding_subs.contains(subscription_id))?;
+        (batch_index, batches.len() == 1)
+    };
+
+    let batch = pending.get_mut(relay_url)?.remove(batch_index);
+    if remove_relay {
+        pending.remove(relay_url);
+    }
+    Some(batch)
+}
+
 fn mark_deferred_pagination(
     batch: &mut PendingBatch,
     completed_sub_id: &SubscriptionId,
@@ -709,9 +729,19 @@ pub struct EoseNotification {
 }
 
 #[derive(Debug)]
-struct LiveSubscriptionClosedNotification {
+struct SubscriptionClosedNotification {
     relay_url: String,
-    generation: u64,
+    subscription_id: SubscriptionId,
+    reason: String,
+    generation: Option<u64>,
+}
+
+fn is_rate_limit_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+    (message.contains("rate") && message.contains("limit"))
+        || message.contains("too many")
+        || message.contains("slow down")
+        || message.contains("throttl")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1241,8 +1271,8 @@ pub struct SyncManager {
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
     eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
-    /// Wakes the actor to restore complete persistent coverage after CLOSED.
-    live_closed_tx: Option<tokio::sync::mpsc::Sender<LiveSubscriptionClosedNotification>>,
+    /// Serializes CLOSED recovery and pending-batch cleanup through the actor.
+    subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
@@ -1338,7 +1368,7 @@ impl SyncManager {
             deferred_consolidations: DeferredConsolidations::default(),
             disconnect_tx: None,
             eose_tx: None,
-            live_closed_tx: None,
+            subscription_closed_tx: None,
             connect_attempt_result_tx: None,
             deferred_consolidation_tx: None,
             shutdown_tx: None,
@@ -2644,8 +2674,8 @@ impl SyncManager {
 
         // 3. Create EOSE channel for spawned tasks -> manager communication
         let (eose_tx, mut eose_rx) = mpsc::channel::<EoseNotification>(100);
-        let (live_closed_tx, mut live_closed_rx) =
-            mpsc::channel::<LiveSubscriptionClosedNotification>(100);
+        let (subscription_closed_tx, mut subscription_closed_rx) =
+            mpsc::channel::<SubscriptionClosedNotification>(100);
 
         // 4. Connection workers never mutate manager state. Their unbounded
         // result channel cannot make a completed worker wait behind the actor.
@@ -2674,7 +2704,7 @@ impl SyncManager {
         // 5b. Store channel senders for use by handlers
         self.disconnect_tx = Some(disconnect_tx.clone());
         self.eose_tx = Some(eose_tx.clone());
-        self.live_closed_tx = Some(live_closed_tx);
+        self.subscription_closed_tx = Some(subscription_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
         self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
@@ -2778,11 +2808,13 @@ impl SyncManager {
                         }
                     }
                 }
-                closed = live_closed_rx.recv() => {
+                closed = subscription_closed_rx.recv() => {
                     if let Some(notification) = closed {
                         let mut manager = sync_manager.lock().await;
-                        manager.restore_live_coverage_after_closed(
+                        manager.handle_subscription_closed(
                             &notification.relay_url,
+                            notification.subscription_id,
+                            &notification.reason,
                             notification.generation,
                         ).await;
                     }
@@ -2996,7 +3028,7 @@ impl SyncManager {
         let local_relay = self.local_relay.clone();
         let disconnect_tx = self.disconnect_tx.as_ref().unwrap().clone();
         let eose_tx = self.eose_tx.as_ref().unwrap().clone();
-        let live_closed_tx = self.live_closed_tx.as_ref().unwrap().clone();
+        let subscription_closed_tx = self.subscription_closed_tx.as_ref().unwrap().clone();
         let metrics_clone = self.metrics.clone();
         let pending_sync_index = Arc::clone(&self.pending_sync_index);
         let health_tracker = Arc::clone(&self.health_tracker);
@@ -3131,15 +3163,7 @@ impl SyncManager {
                             .await;
                     }
                     RelayEvent::Notice(notice) => {
-                        // Check for rate limiting indicators
-                        let notice_lower = notice.to_lowercase();
-                        let is_rate_limit = (notice_lower.contains("rate")
-                            && notice_lower.contains("limit"))
-                            || notice_lower.contains("too many")
-                            || notice_lower.contains("slow down")
-                            || notice_lower.contains("throttl");
-
-                        if is_rate_limit {
+                        if is_rate_limit_message(&notice) {
                             tracing::warn!(
                                 relay = %relay_url_clone,
                                 notice = %notice,
@@ -3177,14 +3201,38 @@ impl SyncManager {
                             reason = %reason,
                             "Relay closed a subscription (not a connection close)"
                         );
-                        if let Some(generation) = live_generation {
-                            let _ = live_closed_tx
-                                .send(LiveSubscriptionClosedNotification {
-                                    relay_url: relay_url_clone.clone(),
-                                    generation,
-                                })
-                                .await;
+                        if is_rate_limit_message(&reason) {
+                            let already_paused =
+                                health_tracker.is_rate_limited(&relay_url_clone);
+                            if already_paused {
+                                tracing::debug!(
+                                    relay = %relay_url_clone,
+                                    reason = %reason,
+                                    "Repeated rate-limiting CLOSED during active cooldown"
+                                );
+                            } else {
+                                tracing::info!(
+                                    relay = %relay_url_clone,
+                                    reason = %reason,
+                                    "Rate limiting CLOSED detected from relay"
+                                );
+                            }
+                            health_tracker.record_rate_limit(&relay_url_clone);
+                            if let Some(ref metrics) = metrics_clone {
+                                metrics.record_health_state(
+                                    &relay_url_clone,
+                                    health_tracker.get_state(&relay_url_clone),
+                                );
+                            }
                         }
+                        let _ = subscription_closed_tx
+                            .send(SubscriptionClosedNotification {
+                                relay_url: relay_url_clone.clone(),
+                                subscription_id,
+                                reason,
+                                generation: live_generation,
+                            })
+                            .await;
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -5074,6 +5122,42 @@ impl SyncManager {
         true
     }
 
+    async fn handle_subscription_closed(
+        &mut self,
+        relay_url: &str,
+        subscription_id: SubscriptionId,
+        reason: &str,
+        live_generation: Option<u64>,
+    ) {
+        if is_rate_limit_message(reason) {
+            let removed_batch = {
+                let mut pending = self.pending_sync_index.write().await;
+                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
+            };
+
+            if let Some(batch) = removed_batch {
+                tracing::warn!(
+                    relay = %relay_url,
+                    sub_id = %subscription_id,
+                    batch_id = batch.batch_id,
+                    "Rate-limited subscription aborted its pending batch; retry deferred until cooldown"
+                );
+            } else if live_generation.is_some() {
+                tracing::info!(
+                    relay = %relay_url,
+                    sub_id = %subscription_id,
+                    "Rate-limited live subscription restoration deferred until cooldown"
+                );
+            }
+            return;
+        }
+
+        if let Some(generation) = live_generation {
+            self.restore_live_coverage_after_closed(relay_url, generation)
+                .await;
+        }
+    }
+
     async fn restore_live_coverage_after_closed(&mut self, relay_url: &str, generation: u64) {
         let Some(connection) = self.connections.get(relay_url) else {
             return;
@@ -5302,6 +5386,18 @@ impl SyncManager {
 
             // Clear rate limit state
             self.health_tracker.clear_rate_limit(&relay_url);
+
+            // A rate-limited CLOSED deliberately leaves live coverage down so
+            // it cannot immediately recreate the rejected request burst.
+            // Restore persistent coverage first when the relay admits work again.
+            if let Some(generation) = self
+                .connections
+                .get(&relay_url)
+                .map(RelayConnection::current_subscription_generation)
+            {
+                self.restore_live_coverage_after_closed(&relay_url, generation)
+                    .await;
+            }
 
             // Only compute actions for this specific relay
             if let Some(relay_needs) = targets.get(&relay_url) {
@@ -6384,6 +6480,55 @@ mod tests {
         assert!(take_drained_batch_as_failed(&mut pending, relay_url, 42).is_none());
         assert_eq!(pending[relay_url].len(), 1);
         assert!(!pending[relay_url][0].failed);
+    }
+
+    #[test]
+    fn rate_limit_classifier_covers_notice_and_closed_reason_forms() {
+        for message in [
+            "rate-limited: too many queries",
+            "Rate limit exceeded",
+            "slow down please",
+            "subscription throttled",
+        ] {
+            assert!(is_rate_limit_message(message), "missed: {message}");
+        }
+        assert!(!is_rate_limit_message("blocked: unsupported filter"));
+    }
+
+    #[test]
+    fn rate_limited_closed_removes_only_its_pending_batch_for_retry() {
+        let relay_url = "wss://limited.example";
+        let rejected = SubscriptionId::new("rejected");
+        let accepted = SubscriptionId::new("accepted");
+        let make_batch = |batch_id, subscription_id| PendingBatch {
+            batch_id,
+            items: PendingItems::default(),
+            outstanding_subs: HashSet::from([subscription_id]),
+            sync_method: SyncMethod::ReqEose,
+            pagination_state: HashMap::new(),
+            requested_event_ids: None,
+            received_event_ids: None,
+            initial_hydration_counts: None,
+            retry_count: 0,
+            failed: false,
+        };
+        let mut pending = HashMap::from([(
+            relay_url.to_string(),
+            vec![
+                make_batch(1, rejected.clone()),
+                make_batch(2, accepted.clone()),
+            ],
+        )]);
+
+        let removed = take_batch_containing_subscription(&mut pending, relay_url, &rejected)
+            .expect("rejected subscription must release its batch for cooldown retry");
+        assert_eq!(removed.batch_id, 1);
+        assert_eq!(pending[relay_url].len(), 1);
+        assert!(pending[relay_url][0].outstanding_subs.contains(&accepted));
+
+        take_batch_containing_subscription(&mut pending, relay_url, &accepted)
+            .expect("last batch must also be removable");
+        assert!(!pending.contains_key(relay_url));
     }
 
     #[test]

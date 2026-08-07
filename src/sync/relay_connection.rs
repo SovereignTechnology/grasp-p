@@ -21,6 +21,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::is_rate_limit_message;
 use crate::nostr::SharedDatabase;
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 
@@ -1046,7 +1047,13 @@ impl RelayConnection {
                         // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
                         let live_generation = self.release_live_req_permit(&subscription_id);
-                        tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
+                        if is_rate_limit_message(&msg) {
+                            // The sync actor emits one canonical signal and owns
+                            // cooldown deduplication for a rate-limit episode.
+                            tracing::debug!(relay = %url, message = %msg, "Relay closed subscription");
+                        } else {
+                            tracing::info!(relay = %url, message = %msg, "Relay closed subscription");
+                        }
                         let _ = event_sender
                             .send(RelayEvent::Closed {
                                 subscription_id,
