@@ -3663,7 +3663,29 @@ impl SyncManager {
             return;
         }
 
-        match result.outcome {
+        let outcome = if matches!(result.outcome, ConnectAttemptOutcome::Connected { .. }) {
+            let still_connected = if let Some(connection) = self.connections.get(&result.relay_url)
+            {
+                connection.is_connected().await
+            } else {
+                false
+            };
+            if still_connected {
+                result.outcome
+            } else {
+                tracing::warn!(
+                    relay = %result.relay_url,
+                    "Rejecting stale connection success after relay disconnected during setup"
+                );
+                ConnectAttemptOutcome::Failed(
+                    "Relay disconnected before connection setup completed".to_string(),
+                )
+            }
+        } else {
+            result.outcome
+        };
+
+        match outcome {
             ConnectAttemptOutcome::Connected {
                 advertised_default_limit,
                 advertised_max_subscriptions,

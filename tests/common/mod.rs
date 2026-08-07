@@ -13,6 +13,7 @@ pub mod upload_pack_counting_proxy;
 pub mod port;
 pub mod purgatory_helpers;
 pub mod relay;
+pub mod setup_drop_relay;
 pub mod sync_helpers;
 
 pub use git_server::{SimpleGitServer, SmartGitServer};

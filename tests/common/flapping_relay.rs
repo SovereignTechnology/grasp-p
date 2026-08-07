@@ -51,7 +51,11 @@ impl FlappingRelay {
                                 let Ok(message) = message else { break };
                                 if matches!(message, Message::Text(ref text) if text.contains("\"REQ\"")) {
                                     // Dropping the socket after observable normal
-                                    // setup models the production peer reset.
+                                    // setup and a short established dwell models
+                                    // the production peer reset. The dwell also
+                                    // distinguishes this fixture from a peer that
+                                    // vanishes during connection setup.
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
                                     return;
                                 }
                             }

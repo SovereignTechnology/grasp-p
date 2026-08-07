@@ -307,6 +307,12 @@ This allows operators to monitor sync progress and distinguish between "connecte
 
 **Critical**: Event loops die on disconnect and cannot be reused.
 
+A successful WebSocket handshake is followed by a bounded NIP-11 fetch for
+session limits. The connection worker revalidates the SDK relay status when
+that setup result reaches the sync actor; if the peer disconnected meanwhile,
+the stale success is recorded as a failed attempt and no event loop or sync
+work is started for the dead session.
+
 ```mermaid
 flowchart LR
     CONN[Connection Success] --> SPAWN[handle_connect_or_reconnect<br/>spawns event loop]

@@ -620,6 +620,20 @@ impl RelayConnection {
         }
     }
 
+    /// Whether the SDK still considers this relay's WebSocket established.
+    ///
+    /// Connection setup performs bounded HTTP work after the handshake. The
+    /// peer can disappear during that window, so callers must revalidate the
+    /// session before committing its successful lifecycle transition.
+    pub async fn is_connected(&self) -> bool {
+        self.client
+            .relay(&self.url)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|relay| relay.status() == RelayStatus::Connected)
+    }
+
     /// Configure the one per-session ledger before any subscriptions open.
     pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
         self.clear_subscription_permits();

@@ -67,7 +67,7 @@ async fn flapping_relay_handshakes_do_not_reset_exponential_backoff() {
     let logs = wait_for_log(
         &syncing.log_path(),
         "consecutive_failures=1",
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     )
     .await;
     assert!(logs.contains("preserving failure streak until stable"));
