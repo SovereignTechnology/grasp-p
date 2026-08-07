@@ -2,9 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::signal;
 use tracing::info;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, EnvFilter, Layer};
 
-use ngit_grasp::{cleanup_empty_repos, config::Config, nostr, server::RelayServer};
+use ngit_grasp::{
+    cleanup_empty_repos, config::Config, logging::SuppressRoutineDisconnects, nostr,
+    server::RelayServer,
+};
 
 /// Top-level CLI dispatcher.
 ///
@@ -66,9 +69,9 @@ async fn main() -> Result<()> {
 /// the global tracing subscriber and signal handling.
 async fn run_relay(config: Config) -> Result<()> {
     // Initialize tracing with configured log level
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::new(&config.log_level))
-        .finish();
+    let filter = EnvFilter::new(&config.log_level).and(SuppressRoutineDisconnects);
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting ngit-grasp with log level: {}", config.log_level);

@@ -4,6 +4,7 @@ pub mod config;
 pub mod git;
 pub mod grasp06;
 pub mod http;
+pub mod logging;
 pub mod metrics;
 pub mod nostr;
 pub mod outbound;

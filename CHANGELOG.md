@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stopped routine client connection resets without a WebSocket close handshake
+  from being reported as server errors, while retaining other embedded-relay
+  failures at their original severity.
 - Adapted historic pagination to each relay's observed page size and guarded
   NIP-11 `default_limit` hint, so omitted-limit filters continue past relays
   that return small pages without trusting unrelated maximum-limit metadata.
