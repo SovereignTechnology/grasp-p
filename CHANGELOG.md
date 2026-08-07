@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Expanded `grasp-audit` with stable machine-readable results, full JSON
+  reports, explicit audit identities, and hardened discovered-server probes.
+
 ### Changed
 
 - Upgraded the rust-nostr crates from `0.45.0-alpha.8` to the stable `0.45.0`
@@ -37,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Adapted historic pagination to each relay's observed page size and guarded
+  NIP-11 `default_limit` hint, so omitted-limit filters continue past relays
+  that return small pages without trusting unrelated maximum-limit metadata.
+- Batched unresolved purgatory dependency IDs into one query per relay on the
+  existing 30-second cadence, reducing subscription and rate-limit pressure
+  without delaying newly available repository data.
+- Prevented naughty-listed and self-referential relay targets from being
+  rescheduled while unavailable or unnecessary.
+- Kept NIP-77 reconciliation enabled when historic hydration leaves a small
+  recoverable residual, and stopped repeatedly requesting Git object IDs that
+  a remote has already advertised as missing.
+- Stopped structurally malformed synced events from being downloaded and
+  revalidated on every historic pass.
 - Kept proactive sync within each relay connection's active-subscription
   allowance. Live subscriptions, negentropy rounds, historic and fallback
   queries, pagination verification, and purgatory dependency polling now share
