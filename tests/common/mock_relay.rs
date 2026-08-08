@@ -79,19 +79,25 @@ impl MockRelay {
     /// The relay accepts all events without validation and stores them
     /// in an in-memory database.
     pub async fn start() -> Self {
-        Self::start_with_rate_limit(RateLimit::default(), None).await
+        Self::start_with_options(RateLimit::default(), None, None).await
     }
 
     /// Start a mock relay with a custom per-connection active REQ limit.
     pub async fn start_with_max_reqs(max_reqs: usize) -> Self {
-        Self::start_with_rate_limit(
+        Self::start_with_options(
             RateLimit {
                 max_reqs,
                 ..RateLimit::default()
             },
             None,
+            None,
         )
         .await
+    }
+
+    /// Start a relay with a strict maximum number of filters in each REQ.
+    pub async fn start_with_max_filters(max_filters: usize) -> Self {
+        Self::start_with_options(RateLimit::default(), None, Some(max_filters)).await
     }
 
     /// Start a relay whose omitted-limit pages and NIP-11 hints can be varied independently.
@@ -100,20 +106,22 @@ impl MockRelay {
         advertised_default_limit: Option<usize>,
         advertised_max_limit: Option<usize>,
     ) -> Self {
-        Self::start_with_rate_limit(
+        Self::start_with_options(
             RateLimit::default(),
             Some(PaginationConfig {
                 page_size,
                 advertised_default_limit,
                 advertised_max_limit,
             }),
+            None,
         )
         .await
     }
 
-    async fn start_with_rate_limit(
+    async fn start_with_options(
         rate_limit: RateLimit,
         pagination: Option<PaginationConfig>,
+        max_filters: Option<usize>,
     ) -> Self {
         // Create and bind listener (eliminates port race condition)
         let std_listener =
@@ -130,7 +138,7 @@ impl MockRelay {
         let listener =
             TcpListener::from_std(std_listener).expect("Failed to convert to tokio listener");
 
-        Self::start_with_listener(listener, port, rate_limit, pagination).await
+        Self::start_with_listener(listener, port, rate_limit, pagination, max_filters).await
     }
 
     /// Start a mock relay on a specific port.
@@ -139,7 +147,7 @@ impl MockRelay {
         let listener = TcpListener::bind(addr)
             .await
             .expect("Failed to bind to address");
-        Self::start_with_listener(listener, port, RateLimit::default(), None).await
+        Self::start_with_listener(listener, port, RateLimit::default(), None, None).await
     }
 
     /// Internal method to start the relay with an existing listener.
@@ -148,6 +156,7 @@ impl MockRelay {
         port: u16,
         rate_limit: RateLimit,
         pagination: Option<PaginationConfig>,
+        max_filters: Option<usize>,
     ) -> Self {
         // Create a simple relay with no write policy (accepts all events)
         let mut builder = LocalRelayBuilder::default().rate_limit(rate_limit);
@@ -156,6 +165,9 @@ impl MockRelay {
                 .default_filter_limit(config.page_size)
                 .max_filter_limit(config.page_size.max(1000))
                 .max_query_results(config.page_size.max(1000));
+        }
+        if let Some(max_filters) = max_filters {
+            builder = builder.max_filters_per_req(max_filters);
         }
         let relay = builder.build();
 

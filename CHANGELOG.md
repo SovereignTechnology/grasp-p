@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Adapt to relays with undocumented per-REQ filter-count limits. Explicit
+  multi-filter refusals now lower a per-session grouping ceiling geometrically
+  and retry the exact live or historic coverage; response numbers are not
+  trusted because implementations variously report submitted counts or caps.
 - Stop permanently refused live subscriptions from rebuilding themselves in a
   tight loop. Blocked, restricted, membership-required, and filter-incompatible
   responses retain the connection, retire the rejected coverage for 24 hours,

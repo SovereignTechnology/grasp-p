@@ -781,6 +781,7 @@ struct SubscriptionClosedNotification {
     subscription_id: SubscriptionId,
     reason: String,
     generation: Option<u64>,
+    live_filter_count: Option<usize>,
 }
 
 fn is_rate_limit_message(message: &str) -> bool {
@@ -789,6 +790,12 @@ fn is_rate_limit_message(message: &str) -> bool {
         || message.contains("too many")
         || message.contains("slow down")
         || message.contains("throttl")
+}
+
+fn is_filter_count_refusal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("invalid number of filters")
+        || message.contains("max filter count")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,14 +818,14 @@ impl PolicyRefusal {
 }
 
 fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
+    if is_filter_count_refusal(message) {
+        return Some(PolicyRefusal::FilterIncompatible);
+    }
     if is_rate_limit_message(message) {
         return None;
     }
     let message = message.to_ascii_lowercase();
-    if message.contains("invalid number of filters")
-        || message.contains("filter validation failed")
-        || message.contains("unsupported filter")
-    {
+    if message.contains("unsupported filter") || message.contains("filter validation failed") {
         Some(PolicyRefusal::FilterIncompatible)
     } else if message.contains("not a member") || message.contains("membership") {
         Some(PolicyRefusal::MembershipRequired)
@@ -951,14 +958,14 @@ fn groups_within_subscription_byte_limit(
 /// Groups are cut when adding the next filter would exceed either the
 /// serialized byte budget or the filter-count cap. A single oversized filter
 /// still gets its own group, so progress is always made.
-fn group_filters_for_req(filters: &[Filter]) -> Vec<Vec<Filter>> {
+fn group_filters_for_req_with_max(filters: &[Filter], max_filters: usize) -> Vec<Vec<Filter>> {
     let mut groups: Vec<Vec<Filter>> = Vec::new();
     let mut current: Vec<Filter> = Vec::new();
     let mut bytes = 0usize;
     for filter in filters {
         let cost = filter.as_json().len();
         if !current.is_empty()
-            && (current.len() >= MAX_FILTERS_PER_REQ || bytes + cost > REQ_MESSAGE_BYTE_BUDGET)
+            && (current.len() >= max_filters.max(1) || bytes + cost > REQ_MESSAGE_BYTE_BUDGET)
         {
             groups.push(std::mem::take(&mut current));
             bytes = 0;
@@ -972,8 +979,12 @@ fn group_filters_for_req(filters: &[Filter]) -> Vec<Vec<Filter>> {
     groups
 }
 
-fn live_filter_groups(filters: &[Filter]) -> Vec<Vec<Filter>> {
-    group_filters_for_req(filters)
+fn group_filters_for_req(filters: &[Filter]) -> Vec<Vec<Filter>> {
+    group_filters_for_req_with_max(filters, MAX_FILTERS_PER_REQ)
+}
+
+fn live_filter_groups(filters: &[Filter], max_filters: usize) -> Vec<Vec<Filter>> {
+    group_filters_for_req_with_max(filters, max_filters)
         .into_iter()
         .map(|group| group.into_iter().map(|filter| filter.limit(0)).collect())
         .collect()
@@ -2943,6 +2954,7 @@ impl SyncManager {
                             notification.subscription_id,
                             &notification.reason,
                             notification.generation,
+                            notification.live_filter_count,
                         ).await;
                     }
                 }
@@ -3337,6 +3349,7 @@ impl SyncManager {
                         subscription_id,
                         reason,
                         live_generation,
+                        live_filter_count,
                     } => {
                         // CLOSED message means one subscription was closed, not the whole connection
                         // This is normal behavior (e.g., when historic_sync completes)
@@ -3347,6 +3360,7 @@ impl SyncManager {
                             "Relay closed a subscription (not a connection close)"
                         );
                         if is_rate_limit_message(&reason)
+                            && !is_filter_count_refusal(&reason)
                             && subscription_state_byte_limit(&reason).is_none()
                         {
                             let already_paused =
@@ -3378,6 +3392,7 @@ impl SyncManager {
                                 subscription_id,
                                 reason,
                                 generation: live_generation,
+                                live_filter_count,
                             })
                             .await;
                     }
@@ -5262,7 +5277,8 @@ impl SyncManager {
             return false;
         }
 
-        let unbounded_groups = live_filter_groups(&complete_live);
+        let unbounded_groups =
+            live_filter_groups(&complete_live, connection.max_filters_per_req());
         let remote_limit = connection.remote_subscription_byte_limit();
         let (complete_groups, overflow_groups) =
             groups_within_subscription_byte_limit(unbounded_groups, remote_limit, 0);
@@ -5305,6 +5321,7 @@ impl SyncManager {
         subscription_id: SubscriptionId,
         reason: &str,
         live_generation: Option<u64>,
+        live_filter_count: Option<usize>,
     ) {
         if let Some(limit) = subscription_state_byte_limit(reason) {
             tracing::warn!(
@@ -5327,7 +5344,7 @@ impl SyncManager {
             }
             return;
         }
-        if is_rate_limit_message(reason) {
+        if is_rate_limit_message(reason) && !is_filter_count_refusal(reason) {
             let removed_batch = {
                 let mut pending = self.pending_sync_index.write().await;
                 take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
@@ -5348,6 +5365,55 @@ impl SyncManager {
                 );
             }
             return;
+        }
+
+        if policy_refusal(reason) == Some(PolicyRefusal::FilterIncompatible) {
+            let pending_filter_count = {
+                let pending = self.pending_sync_index.read().await;
+                pending.get(relay_url).and_then(|batches| {
+                    batches.iter().find_map(|batch| {
+                        batch
+                            .pagination_state
+                            .get(&subscription_id)
+                            .map(|state| state.filters.len())
+                    })
+                })
+            };
+            if let (Some(rejected_count), Some(connection)) = (
+                live_filter_count.or(pending_filter_count),
+                self.connections.get(relay_url).cloned(),
+            ) {
+                if rejected_count > 1 {
+                    let learned_limit = connection
+                        .reduce_max_filters_per_req(rejected_count)
+                        .unwrap_or_else(|| connection.max_filters_per_req());
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_policy_refusal(relay_url, "filter_count");
+                    }
+                    tracing::warn!(
+                        relay = %relay_url,
+                        rejected_filter_count = rejected_count,
+                        learned_filter_count = learned_limit,
+                        reason,
+                        "Relay rejected filter count; regrouping complete live coverage"
+                    );
+                    let removed_batch = {
+                        let mut pending = self.pending_sync_index.write().await;
+                        take_batch_containing_subscription(
+                            &mut pending,
+                            relay_url,
+                            &subscription_id,
+                        )
+                    };
+                    if removed_batch.is_some() {
+                        self.recompute_new_sync_filters_for_relay(relay_url).await;
+                    } else if let Some(generation) = live_generation {
+                        self.restore_live_coverage_after_closed(relay_url, generation)
+                            .await;
+                    }
+                    return;
+                }
+            }
         }
 
         if let Some(category) = policy_refusal(reason) {
@@ -5399,7 +5465,10 @@ impl SyncManager {
             return;
         }
         if let Err(error) = connection
-            .replace_live_filter_groups(live_filter_groups(&filters))
+            .replace_live_filter_groups(live_filter_groups(
+                &filters,
+                connection.max_filters_per_req(),
+            ))
             .await
         {
             tracing::warn!(relay = %relay_url, %error, "Could not restore complete live coverage after relay CLOSED");
@@ -5757,7 +5826,7 @@ impl SyncManager {
             }
         };
 
-        let filter_groups = live_filter_groups(filters);
+        let filter_groups = live_filter_groups(filters, connection.max_filters_per_req());
         let remote_limit = connection.remote_subscription_byte_limit();
         let (filter_groups, overflow_groups) = groups_within_subscription_byte_limit(
             filter_groups,
@@ -6098,7 +6167,13 @@ impl SyncManager {
             let mut pagination_state = HashMap::new();
 
             // Keep several OR filters under each relay-visible subscription.
-            for (idx, filter_group) in group_filters_for_req(&filters_with_since)
+            let max_filters = self
+                .connections
+                .get(relay_url)
+                .map(RelayConnection::max_filters_per_req)
+                .unwrap_or(MAX_FILTERS_PER_REQ);
+            for (idx, filter_group) in
+                group_filters_for_req_with_max(&filters_with_since, max_filters)
                 .into_iter()
                 .enumerate()
             {
@@ -6823,6 +6898,10 @@ mod tests {
         );
         assert_eq!(
             policy_refusal("ERROR: filter validation failed: invalid number of filters: 8"),
+            Some(PolicyRefusal::FilterIncompatible)
+        );
+        assert_eq!(
+            policy_refusal("rate-limited: REQ exceeds max filter count 3"),
             Some(PolicyRefusal::FilterIncompatible)
         );
         assert_eq!(policy_refusal("rate-limited: too many queries"), None);

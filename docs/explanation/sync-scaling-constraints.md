@@ -82,6 +82,16 @@ filter or aggregate across a multi-filter REQ. Consequently neither filter
 sizing nor the pagination model can be negotiated reliably; both need
 conservative defaults, observation, and reactive fallback.
 
+The reactive filter-count fallback is session-local. An explicit
+filter-validation refusal for a multi-filter REQ geometrically lowers that
+connection's grouping ceiling (`10 → 5 → 2 → 1`, or from the actual rejected
+group size) and re-derives the rejected historic batch or complete live
+coverage without parsing arbitrary response numbers. This matters because
+strfry reports the submitted count (`invalid number of filters: 8`), whereas
+rust-nostr reports its configured ceiling. The learned ceiling never rises in
+the session and resets on reconnect. A one-filter refusal is not recoverable
+by regrouping and uses the ordinary long `filter_incompatible` policy pause.
+
 ### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0)
 
 - `max_reqs` = 500, enforced for REQ only (`src/nostr/builder.rs`).
@@ -404,7 +414,9 @@ into fewer REQs is what actually shrinks the persistent subscription count,
 so the rule is a byte budget per REQ message, with filter count as a
 secondary bound (strfry accepts 200 filters per REQ, but its optional
 strict `filterValidation` mode accepts only 3 — matched by three full 32 KB
-chunks per 96 KB REQ).
+chunks per 96 KB REQ). Smaller filters may initially pack up to 10; the
+session-local fallback above adapts them for strict relays while avoiding the
+persistent-subscription cost everywhere else.
 
 ### Lever 3: Bound and schedule concurrency (coordination with live sync)
 

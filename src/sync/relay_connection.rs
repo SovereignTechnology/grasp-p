@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::health::RATE_LIMIT_COOLDOWN_SECS;
-use super::{is_rate_limit_message, subscription_state_byte_limit};
+use super::{is_filter_count_refusal, is_rate_limit_message, subscription_state_byte_limit};
 use crate::nostr::SharedDatabase;
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 
@@ -76,6 +76,9 @@ fn usable_subscription_slots(advertised: Option<usize>) -> usize {
 }
 
 fn is_query_rate_limit_message(message: &str) -> bool {
+    if is_filter_count_refusal(message) {
+        return false;
+    }
     message.to_ascii_lowercase().contains("too many queries")
 }
 
@@ -329,6 +332,12 @@ struct HeldLiveSubscription {
     filters: Vec<Filter>,
 }
 
+#[derive(Clone, Copy)]
+struct ReleasedLiveSubscription {
+    generation: u64,
+    filter_count: usize,
+}
+
 type LiveReqPermitMap = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<SubscriptionId, HeldLiveSubscription>>,
 >;
@@ -403,6 +412,7 @@ pub enum RelayEvent {
         subscription_id: SubscriptionId,
         reason: String,
         live_generation: Option<u64>,
+        live_filter_count: Option<usize>,
     },
     /// Shutdown notification
     Shutdown,
@@ -490,6 +500,8 @@ pub struct RelayConnection {
     query_start_pacer: std::sync::Arc<QueryStartPacer>,
     /// Proactive spacing for non-urgent historic and dependency query starts.
     background_query_pacer: std::sync::Arc<BackgroundQueryPacer>,
+    /// Per-session ceiling learned from explicit filter-count refusals.
+    max_filters_per_req: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RelayConnection {
@@ -626,6 +638,9 @@ impl RelayConnection {
             byte_limited_transient_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
             background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
+            max_filters_per_req: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                super::MAX_FILTERS_PER_REQ,
+            )),
         }
     }
 
@@ -690,6 +705,9 @@ impl RelayConnection {
             byte_limited_transient_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
             background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
+            max_filters_per_req: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                super::MAX_FILTERS_PER_REQ,
+            )),
         }
     }
 
@@ -871,6 +889,10 @@ impl RelayConnection {
         self.background_query_pacer.reset();
         self.nip77_query_rate_limited
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.max_filters_per_req.store(
+            super::MAX_FILTERS_PER_REQ,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let budget = effective_subscription_budget(advertised);
         let usable = usable_subscription_slots(advertised);
         self.subscription_usable_slots
@@ -1023,6 +1045,26 @@ impl RelayConnection {
             .lock()
             .expect("subscription ledger poisoned")
             .generation
+    }
+
+    pub fn max_filters_per_req(&self) -> usize {
+        self.max_filters_per_req
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Geometrically lower the session ceiling after a relay explicitly
+    /// rejects a multi-filter REQ. Rejection text often echoes the submitted
+    /// count rather than disclosing the maximum, so it is never parsed as a
+    /// capability claim.
+    pub fn reduce_max_filters_per_req(&self, rejected_count: usize) -> Option<usize> {
+        if rejected_count <= 1 {
+            return None;
+        }
+        let candidate = (rejected_count / 2).max(1);
+        let previous = self
+            .max_filters_per_req
+            .fetch_min(candidate, std::sync::atomic::Ordering::Relaxed);
+        (candidate < previous).then_some(candidate)
     }
 
     pub fn live_filter_groups(&self) -> Vec<Vec<Filter>> {
@@ -1308,7 +1350,7 @@ impl RelayConnection {
                         // The terminal-control listener owns transient release;
                         // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
-                        let live_generation = self.release_live_req_permit(&subscription_id);
+                        let released_live = self.release_live_req_permit(&subscription_id);
                         if is_query_rate_limit_message(&msg) {
                             self.record_query_rate_limit();
                         }
@@ -1330,7 +1372,9 @@ impl RelayConnection {
                             .send(RelayEvent::Closed {
                                 subscription_id,
                                 reason: msg.to_string(),
-                                live_generation,
+                                live_generation: released_live.map(|released| released.generation),
+                                live_filter_count: released_live
+                                    .map(|released| released.filter_count),
                             })
                             .await;
                         // Don't break - CLOSED is subscription-specific, not connection-specific
@@ -1853,18 +1897,25 @@ impl RelayConnection {
     }
 
     /// Release the live ledger slot held for `sub_id`, if any.
-    fn release_live_req_permit(&self, sub_id: &SubscriptionId) -> Option<u64> {
+    fn release_live_req_permit(
+        &self,
+        sub_id: &SubscriptionId,
+    ) -> Option<ReleasedLiveSubscription> {
         self.live_req_permits_held
             .lock()
             .expect("live permit map poisoned")
             .remove(sub_id)
-            .map(|held| held.generation)
+            .map(|held| ReleasedLiveSubscription {
+                generation: held.generation,
+                filter_count: held.filters.len(),
+            })
     }
 
     #[cfg(test)]
     fn release_subscription_permits_on_closed(&self, sub_id: &SubscriptionId) -> Option<u64> {
         self.release_transient_req_permit(sub_id);
         self.release_live_req_permit(sub_id)
+            .map(|released| released.generation)
     }
 
     /// Roll back a partially opened live group set. CLOSE is enqueued before
@@ -2749,6 +2800,21 @@ mod tests {
         // We can't easily test with_database without a real database
         let conn = permissive_connection("git.shakespeare.diy", Keys::generate());
         assert_eq!(conn.url(), "wss://git.shakespeare.diy");
+    }
+
+    #[test]
+    fn filter_count_learning_halves_and_resets_per_session() {
+        let connection = permissive_connection("wss://strict.example", Keys::generate());
+
+        assert_eq!(connection.max_filters_per_req(), super::super::MAX_FILTERS_PER_REQ);
+        assert_eq!(connection.reduce_max_filters_per_req(8), Some(4));
+        assert_eq!(connection.reduce_max_filters_per_req(4), Some(2));
+        assert_eq!(connection.reduce_max_filters_per_req(2), Some(1));
+        assert_eq!(connection.reduce_max_filters_per_req(1), None);
+        assert_eq!(connection.reduce_max_filters_per_req(8), None);
+
+        connection.reset_subscription_budget(None);
+        assert_eq!(connection.max_filters_per_req(), super::super::MAX_FILTERS_PER_REQ);
     }
 
     #[tokio::test]

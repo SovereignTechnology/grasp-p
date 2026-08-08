@@ -202,6 +202,64 @@ async fn test_live_sync_batches_repo_filters_below_source_req_limit() {
     );
 }
 
+#[tokio::test]
+async fn live_sync_regroups_after_filter_count_refusal() {
+    let source = MockRelay::start_with_max_filters(3).await;
+    let syncing = TestRelay::start_with_sync(None).await;
+    let keys = Keys::generate();
+    let repo_id = "adaptive-filter-count";
+    let domains = [source.domain(), syncing.domain()];
+    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
+    let (announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+    let source_client = TestClient::new(source.url(), keys.clone())
+        .await
+        .expect("connect to strict source relay");
+    source_client
+        .send_event(&announcement)
+        .await
+        .expect("publish announcement to strict source relay");
+
+    let refusal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let metrics = fetch_metrics(&syncing.url()).await.unwrap_or_default();
+        if metrics.contains("ngit_sync_policy_refusals_total")
+            && metrics.contains("filter_count")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < refusal_deadline,
+            "sync client never observed the strict relay's filter-count refusal"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let issue = build_layer2_issue_with_q_tag(
+        &keys,
+        &repo_coord(&keys, repo_id),
+        "Delivered after adaptive regrouping",
+    )
+    .expect("build live issue");
+    source_client
+        .send_event(&issue)
+        .await
+        .expect("publish live issue after regrouping");
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(issue.id),
+            Duration::from_secs(10),
+        )
+        .await,
+        "exact live coverage should survive regrouping below the relay's limit"
+    );
+
+    source_client.disconnect().await;
+    syncing.stop().await;
+    source.stop().await;
+}
+
 /// Test 5: Live sync Layer 2 events
 ///
 /// Verifies that Layer 2 events (kind 1618 issues) published to one relay
