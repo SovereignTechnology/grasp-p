@@ -58,6 +58,15 @@ const QUERY_PACING_MAX_INTERVAL: Duration = Duration::from_secs(10);
 /// refusal after a full rate-limit window means the learned pace was too fast.
 const QUERY_RATE_LIMIT_EPISODE_GAP: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between non-urgent historic and dependency query starts.
+///
+/// Historic completeness matters, but does not require burst throughput. One
+/// background start per second is deliberately gentle to public relays and
+/// leaves query capacity for live coverage. This only controls
+/// application-visible starts; rust-nostr owns NIP-77 `NEG-MSG` continuations,
+/// so the reactive refusal handling remains necessary.
+const BACKGROUND_QUERY_INTERVAL: Duration = Duration::from_secs(1);
+
 fn effective_subscription_budget(advertised: Option<usize>) -> usize {
     advertised.unwrap_or(FALLBACK_SUBSCRIPTION_BUDGET)
 }
@@ -85,6 +94,39 @@ struct QueryPacingState {
 struct QueryStartPacer {
     gate: tokio::sync::Mutex<()>,
     state: std::sync::Mutex<QueryPacingState>,
+}
+
+/// Serialises background query starts from the beginning of each session.
+/// Live subscriptions bypass this gate and therefore retain priority.
+#[derive(Debug, Default)]
+struct BackgroundQueryPacer {
+    gate: tokio::sync::Mutex<()>,
+    last_start: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl BackgroundQueryPacer {
+    async fn wait_for_start(&self) {
+        let _gate = self.gate.lock().await;
+        let deadline = self
+            .last_start
+            .lock()
+            .expect("background query pacing state poisoned")
+            .map(|last| last + BACKGROUND_QUERY_INTERVAL);
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(deadline).await;
+        }
+        *self
+            .last_start
+            .lock()
+            .expect("background query pacing state poisoned") = Some(tokio::time::Instant::now());
+    }
+
+    fn reset(&self) {
+        *self
+            .last_start
+            .lock()
+            .expect("background query pacing state poisoned") = None;
+    }
 }
 
 impl QueryStartPacer {
@@ -438,6 +480,8 @@ pub struct RelayConnection {
     live_req_permits_held: LiveReqPermitMap,
     /// Learned per-session spacing for query starts after a query-rate refusal.
     query_start_pacer: std::sync::Arc<QueryStartPacer>,
+    /// Proactive spacing for non-urgent historic and dependency query starts.
+    background_query_pacer: std::sync::Arc<BackgroundQueryPacer>,
 }
 
 impl RelayConnection {
@@ -452,6 +496,10 @@ impl RelayConnection {
                     remaining.as_secs_f64()
                 )
             })
+    }
+
+    async fn await_background_query_start(&self) {
+        self.background_query_pacer.wait_for_start().await;
     }
 
     fn record_query_rate_limit(&self) {
@@ -548,6 +596,7 @@ impl RelayConnection {
                 std::collections::HashMap::new(),
             )),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
+            background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
         }
     }
 
@@ -607,6 +656,7 @@ impl RelayConnection {
                 std::collections::HashMap::new(),
             )),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
+            background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
         }
     }
 
@@ -785,6 +835,7 @@ impl RelayConnection {
     pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
         self.clear_subscription_permits();
         self.query_start_pacer.reset();
+        self.background_query_pacer.reset();
         self.nip77_query_rate_limited
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let budget = effective_subscription_budget(advertised);
@@ -1385,6 +1436,9 @@ impl RelayConnection {
         // Acquire pacing before subscription/class permits: a learned remote
         // query-rate window must not turn local capacity into queued sleepers.
         self.await_query_start().await?;
+        if transient_class.is_some() {
+            self.await_background_query_start().await;
+        }
 
         // Transient (auto-close) subscriptions share a bounded number of
         // per-connection slots so historic bursts queue instead of
@@ -1519,6 +1573,7 @@ impl RelayConnection {
         // nostr-sdk. It must share the same permit bound as historic pages,
         // fallbacks and retries rather than escaping the connection budget.
         self.await_query_start().await?;
+        self.await_background_query_start().await;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
@@ -1928,6 +1983,7 @@ impl RelayConnection {
         // shared with live subscriptions (see MAX_CONCURRENT_NEG_DIFFS).
         // The permit is held for the whole round, including the timeout.
         self.await_query_start().await?;
+        self.await_background_query_start().await;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
@@ -3201,6 +3257,27 @@ mod tests {
             .await
             .expect("paced query task should complete")
             .expect("paced query start should be admitted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_query_pacer_spaces_starts_from_session_beginning() {
+        let pacer = std::sync::Arc::new(BackgroundQueryPacer::default());
+        pacer.wait_for_start().await;
+
+        let waiting = {
+            let pacer = std::sync::Arc::clone(&pacer);
+            tokio::spawn(async move { pacer.wait_for_start().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(BACKGROUND_QUERY_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiting.await.expect("background query should be admitted");
+
+        pacer.reset();
+        pacer.wait_for_start().await;
     }
 
     #[tokio::test(start_paused = true)]

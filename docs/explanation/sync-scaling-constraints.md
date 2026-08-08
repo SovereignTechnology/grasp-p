@@ -203,13 +203,13 @@ whether it applies independently to each filter or to the merged REQ, which is
 why the source audit above remains necessary. Relay-specific extensions can
 add fields, but clients cannot assume common names or semantics.
 
-The implemented query-start pacer is therefore a reactive compatibility
-backstop: it remains inactive until an explicit `too many queries` response,
-then spaces all application-visible starts and selects REQ fallback because
-the application cannot pace individual `NEG-MSG` frames. Proactively being
-gentle with non-urgent historic work is desirable but separate. It requires
-request-class priority—live coverage first, dependency recovery next, bulk
-history last—rather than enabling this shared gate from connection startup.
+Two gates cover the distinct concerns. A proactive background gate spaces
+historic, dependency, pagination, hydration, retry, and NIP-77 round starts at
+one per second from session startup; persistent live subscriptions bypass it.
+A reactive compatibility gate remains inactive until an explicit
+`too many queries` response, then spaces every application-visible start and
+selects REQ fallback because the application cannot pace individual
+`NEG-MSG` frames.
 
 The client encodes this model in per-connection `RelayPaginationSession`
 state (`src/sync/mod.rs`). After EOSE it learns the largest raw page seen
@@ -400,15 +400,23 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
 - Rounds queue behind a per-connection semaphore; each completion releases
   the next. No timed batches or sleeps — throughput degrades smoothly instead
   of bursting into rejections.
-- The ledger bounds simultaneous resource use, not query starts over time. If
-  a relay returns `rate-limited: too many queries`, the current connection
+- The ledger bounds simultaneous resource use, not query starts over time.
+  Non-urgent historic REQs, pagination and hydration/retry pages, exact-ID
+  dependency fetches, and NIP-77 round starts proactively share a one-second
+  start interval from the beginning of each connection session. Persistent
+  live subscriptions bypass that background gate and retain priority. This
+  bounds application-visible starts, but cannot pace SDK-managed NIP-77
+  `NEG-MSG` continuations. If a relay returns
+  `rate-limited: too many queries`, the current connection
   first rejects locally queued starts for the existing 65-second cooldown so
   their incomplete work can be re-derived in priority order, then learns a
-  shared query-start interval: 600 ms initially (100 starts/minute, below our
-  own 120/minute serving limit), doubling on a later rate-limit episode up to
+  shared query-start interval: 600 ms initially (100 starts/minute, below the
+  rust-nostr 120/minute default), doubling on a later rate-limit episode up to
   10 seconds. Live, transient REQ, exact-ID fetch and NIP-77 round starts all
-  pass through that pacer. Relays that never report a query
-  rate limit remain unpaced, and reconnecting resets the per-session lesson.
+  pass through that reactive pacer in addition to background work retaining
+  its proactive spacing. Relays that never report a query rate limit still
+  receive proactively paced background work, while live starts remain
+  immediate; reconnecting resets both per-session gates.
   After any query-budget refusal, NIP-77 is skipped for the rest of the session:
   rust-nostr owns the internal `NEG-MSG` exchange, so the application cannot
   guarantee that each charged frame passes through its pacing gate. Historic

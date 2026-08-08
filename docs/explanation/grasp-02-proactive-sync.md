@@ -1062,13 +1062,15 @@ Probing -> previous state: Recovery REQs succeed
 Probing -> RateLimited: Recovery REQ is rate limited again
 ```
 
-The subscription ledger limits simultaneous work, while some relays also
-limit completed query operations per minute. A `too many queries` refusal
-therefore makes already-queued starts unwind during the 65-second cooldown so
-their work can be re-derived in priority order, then activates per-connection
-query-start pacing: 600 ms between starts initially, doubling for a distinct
-later episode up to 10 seconds. The pacing gate is shared by live and transient
-REQs, exact-ID fetches and NIP-77 round starts, and resets with the relay
+The subscription ledger limits simultaneous work, while a proactive
+per-connection gate spaces non-urgent historic, dependency, pagination,
+hydration, retry, and NIP-77 round starts at one per second. Persistent live
+subscriptions bypass that background gate. Some relays also limit completed
+query operations per minute. A `too many queries` refusal therefore makes
+already-queued starts unwind during the 65-second cooldown so their work can be
+re-derived in priority order, then activates a shared reactive gate for live
+and background operations: 600 ms between starts initially, doubling for a
+distinct later episode up to 10 seconds. Both gates reset with the relay
 connection session. Any query-rate refusal disables NIP-77 for the rest of the
 session and falls back to paced REQs, because rust-nostr owns the internal
 `NEG-MSG` frames and the application cannot guarantee their pacing.
