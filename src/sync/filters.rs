@@ -112,7 +112,8 @@ pub fn state_event_filters_for_our_repos(
     }
 
     let mut filters = Vec::new();
-    let identifier_vec: Vec<_> = identifiers.iter().collect();
+    let mut identifier_vec: Vec<_> = identifiers.iter().collect();
+    identifier_vec.sort_unstable();
 
     // Batch identifiers per filter within the serialized byte budget
     for chunk in chunk_values_by_bytes(&identifier_vec) {
@@ -153,7 +154,8 @@ pub fn tagged_one_of_our_repo_event_filters(
     }
 
     let mut filters = Vec::new();
-    let repo_refs: Vec<_> = repos.iter().collect();
+    let mut repo_refs: Vec<_> = repos.iter().collect();
+    repo_refs.sort_unstable();
 
     for chunk in chunk_values_by_bytes(&repo_refs) {
         // Lowercase 'a' tag - standard addressable reference
@@ -393,6 +395,37 @@ mod tests {
 
         // One chunk * 3 tag types
         assert_eq!(filters.len(), 3);
+    }
+
+    #[test]
+    fn repo_and_state_filter_serialization_is_insertion_order_independent() {
+        let ascending: HashSet<String> = (0..700)
+            .map(|index| format!("30617:pubkey:{index:04}-{}", "x".repeat(48)))
+            .collect();
+        let descending: HashSet<String> = (0..700)
+            .rev()
+            .map(|index| format!("30617:pubkey:{index:04}-{}", "x".repeat(48)))
+            .collect();
+
+        let repo_ascending: Vec<String> = tagged_one_of_our_repo_event_filters(&ascending, None)
+            .into_iter()
+            .map(|filter| filter.as_json())
+            .collect();
+        let repo_descending: Vec<String> = tagged_one_of_our_repo_event_filters(&descending, None)
+            .into_iter()
+            .map(|filter| filter.as_json())
+            .collect();
+        assert_eq!(repo_ascending, repo_descending);
+
+        let state_ascending: Vec<String> = state_event_filters_for_our_repos(&ascending, None)
+            .into_iter()
+            .map(|filter| filter.as_json())
+            .collect();
+        let state_descending: Vec<String> = state_event_filters_for_our_repos(&descending, None)
+            .into_iter()
+            .map(|filter| filter.as_json())
+            .collect();
+        assert_eq!(state_ascending, state_descending);
     }
 
     #[test]
