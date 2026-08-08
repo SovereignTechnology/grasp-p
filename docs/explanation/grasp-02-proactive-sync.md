@@ -788,24 +788,30 @@ live in
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 
-### Scheduled Direct-Member Descendants
+### Direct-Member Descendants
 
 Some collaboration events reference only their immediate parent. Once the
 ordinary Layer 3 filters have discovered an event which directly tags a
 repository root, each source relay is also queried for events whose `e`, `E`,
-or `q` tags reference that direct member. These filters are not retained live:
+or `q` tags reference that direct member.
 
-- one filter starts globally on the existing five-second maintenance cadence;
-- every request uses the existing historic REQ+EOSE path, including the
-  per-connection subscription ledger, proactive pacing, and pagination;
-- the first stable frontier receives a complete historic pass, then subsequent
-  rotations use a rolling 24-hour `since` window; and
+- complete descendant filters are retained live when they fit after core live
+  coverage while preserving the two control-plane slots and at least one
+  transient historic slot;
+- auxiliary subscriptions are tracked separately and retired before core
+  consolidation or restoration, so they never enter the core rollback set;
+- when the complete live set does not fit, one EOSE-closing filter starts on
+  the existing maintenance cadence through the ordinary historic queue,
+  pagination, shared ledger, and request pacing;
+- the fallback receives a complete initial pass, then rolling 24-hour passes;
+  and
 - recovered descendants never enter the frontier, so this is deliberately one
   additional generation rather than recursive thread traversal.
 
-The rotation restarts with a complete pass after a reconnect or daily
-reconciliation. This makes an interrupted filter recoverable without adding a
-durable cursor, another scheduler, retained subscription pressure, or
+An unexpected auxiliary CLOSED retires the remaining descendant subscriptions
+without rebuilding core coverage and falls back to history. Reconnect and daily
+reconciliation reconstruct the mode from current session capacity. This keeps
+the feature complete without durable cursors, another capacity ledger, or
 multi-connection sharding.
 
 ### Combined Layer 2+3 (SyncLevel-Aware)

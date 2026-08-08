@@ -707,6 +707,12 @@ struct DescendantSyncRotation {
     historic: bool,
 }
 
+#[derive(Debug)]
+struct DescendantLiveCoverage {
+    frontier: HashSet<EventId>,
+    subscription_ids: Vec<SubscriptionId>,
+}
+
 impl Default for DescendantSyncRotation {
     fn default() -> Self {
         Self {
@@ -1469,6 +1475,9 @@ pub struct SyncManager {
     byte_limited_live_relays: HashMap<String, Instant>,
     /// Per-relay snapshots for low-priority, EOSE-closing descendant queries.
     descendant_sync_rotations: HashMap<String, DescendantSyncRotation>,
+    /// Auxiliary persistent descendant coverage, kept separate from the core
+    /// desired set so it can be retired without replacing healthy core REQs.
+    descendant_live_coverage: HashMap<String, DescendantLiveCoverage>,
     /// Round-robin cursor so the maintenance loop starts at most one extra
     /// query globally per tick.
     descendant_relay_cursor: usize,
@@ -1573,6 +1582,7 @@ impl SyncManager {
             deferred_consolidations: DeferredConsolidations::default(),
             byte_limited_live_relays: HashMap::new(),
             descendant_sync_rotations: HashMap::new(),
+            descendant_live_coverage: HashMap::new(),
             descendant_relay_cursor: 0,
             disconnect_tx: None,
             eose_tx: None,
@@ -2801,6 +2811,9 @@ impl SyncManager {
     async fn daily_sync(&mut self, relay_url: &str) {
         tracing::info!(relay = %relay_url, "Starting daily sync");
         self.cancel_deferred_consolidation(relay_url, "daily sync reset");
+        let _ = self
+            .close_descendant_live_coverage(relay_url, "daily sync reset")
+            .await;
         self.descendant_sync_rotations.remove(relay_url);
 
         // Get connection
@@ -3651,6 +3664,39 @@ impl SyncManager {
         members
     }
 
+    async fn close_descendant_live_coverage(
+        &mut self,
+        relay_url: &str,
+        reason: &'static str,
+    ) -> bool {
+        let Some(coverage) = self.descendant_live_coverage.remove(relay_url) else {
+            return true;
+        };
+        if let Some(connection) = self.connections.get(relay_url) {
+            if let Err(error) = connection
+                .close_live_subscriptions(&coverage.subscription_ids)
+                .await
+            {
+                tracing::warn!(
+                    relay = %relay_url,
+                    %error,
+                    reason,
+                    "Could not retire auxiliary descendant live coverage"
+                );
+                self.descendant_live_coverage
+                    .insert(relay_url.to_string(), coverage);
+                return false;
+            }
+        }
+        tracing::info!(
+            relay = %relay_url,
+            subscription_count = coverage.subscription_ids.len(),
+            reason,
+            "Retired auxiliary descendant live coverage"
+        );
+        true
+    }
+
     /// Start at most one low-priority descendant query globally per tick.
     ///
     /// Each relay first receives a complete historic pass over a stable
@@ -3688,14 +3734,83 @@ impl SyncManager {
         self.descendant_relay_cursor = self.descendant_relay_cursor.wrapping_add(1);
         let root_events = targets[&relay_url].root_events.clone();
 
+        let mut refreshed_members = None;
+        if let Some(existing) = self.descendant_live_coverage.get(&relay_url) {
+            let members = self.direct_thread_members(&root_events).await;
+            if members == existing.frontier {
+                return;
+            }
+            refreshed_members = Some(members);
+            if !self
+                .close_descendant_live_coverage(&relay_url, "frontier changed")
+                .await
+            {
+                return;
+            }
+        }
+
         let needs_snapshot = self
             .descendant_sync_rotations
             .get(&relay_url)
             .is_none_or(|rotation| rotation.next_filter >= rotation.filters.len());
         if needs_snapshot {
-            let members = self.direct_thread_members(&root_events).await;
+            let members = match refreshed_members {
+                Some(members) => members,
+                None => self.direct_thread_members(&root_events).await,
+            };
             if members.is_empty() {
                 return;
+            }
+
+            let now = Timestamp::now();
+            let live_since = Timestamp::from(
+                now.as_secs()
+                    .saturating_sub(DESCENDANT_RECENT_WINDOW_SECS.min(15 * 60)),
+            );
+            let live_filters = filters::tagged_one_of_our_root_event_filters(
+                &members,
+                Some(live_since),
+            );
+            if let Some(connection) = self.connections.get(&relay_url).cloned() {
+                let groups = live_filter_groups(&live_filters, connection.max_filters_per_req());
+                if connection.can_admit_auxiliary_live_groups(&groups) {
+                    match connection
+                        .subscribe_auxiliary_live_filter_groups(groups)
+                        .await
+                    {
+                        Ok(subscription_ids) => {
+                            let filter_count = live_filters.len();
+                            self.descendant_live_coverage.insert(
+                                relay_url.clone(),
+                                DescendantLiveCoverage {
+                                    frontier: members,
+                                    subscription_ids: subscription_ids.clone(),
+                                },
+                            );
+                            self.descendant_sync_rotations.remove(&relay_url);
+                            tracing::info!(
+                                relay = %relay_url,
+                                filter_count,
+                                subscription_count = subscription_ids.len(),
+                                "Installed auxiliary descendant live coverage"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                relay = %relay_url,
+                                %error,
+                                "Descendant live admission failed; using historic rotation"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        relay = %relay_url,
+                        filter_count = live_filters.len(),
+                        "Descendant live coverage does not fit while preserving historic capacity"
+                    );
+                }
             }
 
             let rotation = self
@@ -4744,6 +4859,7 @@ impl SyncManager {
         // EOSE. Restart the bounded full rotation so that page is not treated
         // as complete on the next session.
         self.descendant_sync_rotations.remove(relay_url);
+        self.descendant_live_coverage.remove(relay_url);
 
         // Check if this was an intentional disconnect (Disconnecting status)
         let was_intentional = {
@@ -5456,6 +5572,16 @@ impl SyncManager {
             "Starting consolidation"
         );
 
+        // Descendant coverage is auxiliary and independently reconstructible.
+        // Retire it before capturing the core rollback set so it can neither
+        // displace newly required core coverage nor become part of that set.
+        if !self
+            .close_descendant_live_coverage(relay_url, "core consolidation")
+            .await
+        {
+            return false;
+        }
+
         let now = Timestamp::now();
         let since = Timestamp::from(now.as_secs().saturating_sub(QUICK_RECONNECT_WINDOW_SECS));
         let complete_live = self.complete_live_filters(relay_url, Some(since)).await;
@@ -5529,6 +5655,33 @@ impl SyncManager {
         live_generation: Option<u64>,
         live_filter_count: Option<usize>,
     ) {
+        let is_descendant_live = self
+            .descendant_live_coverage
+            .get(relay_url)
+            .is_some_and(|coverage| coverage.subscription_ids.contains(&subscription_id));
+        if is_descendant_live {
+            let coverage = self
+                .descendant_live_coverage
+                .remove(relay_url)
+                .expect("descendant subscription belonged to tracked coverage");
+            if let Some(connection) = self.connections.get(relay_url) {
+                let _ = connection
+                    .close_live_subscriptions(&coverage.subscription_ids)
+                    .await;
+            }
+            self.descendant_sync_rotations
+                .entry(relay_url.to_string())
+                .or_default()
+                .refresh(coverage.frontier, Timestamp::now());
+            tracing::warn!(
+                relay = %relay_url,
+                sub_id = %subscription_id,
+                reason,
+                "Descendant live subscription closed; using historic fallback"
+            );
+            return;
+        }
+
         if let Some(limit) = subscription_state_byte_limit(reason) {
             tracing::warn!(
                 relay = %relay_url,
@@ -5654,11 +5807,21 @@ impl SyncManager {
     }
 
     async fn restore_live_coverage_after_closed(&mut self, relay_url: &str, generation: u64) {
-        let Some(connection) = self.connections.get(relay_url) else {
+        let Some(current_generation) = self
+            .connections
+            .get(relay_url)
+            .map(RelayConnection::current_subscription_generation)
+        else {
             return;
         };
-        if connection.current_subscription_generation() != generation {
+        if current_generation != generation {
             tracing::debug!(relay = %relay_url, generation, "Ignoring stale live CLOSED from retired session");
+            return;
+        }
+        if !self
+            .close_descendant_live_coverage(relay_url, "core live restoration")
+            .await
+        {
             return;
         }
         let now = Timestamp::now();

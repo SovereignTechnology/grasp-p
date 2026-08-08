@@ -1170,6 +1170,100 @@ impl RelayConnection {
             <= usable
     }
 
+    /// Whether auxiliary persistent coverage fits while preserving one usable
+    /// ledger slot for transient history. The two control-plane slots have
+    /// already been removed from `usable` when the session ledger was built.
+    pub fn can_admit_auxiliary_live_groups(&self, filter_groups: &[Vec<Filter>]) -> bool {
+        let usable = self
+            .subscription_usable_slots
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let held = self
+            .live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned");
+        if held
+            .len()
+            .saturating_add(filter_groups.len())
+            .saturating_add(1)
+            > usable
+        {
+            return false;
+        }
+
+        let remote_limit = self.remote_subscription_byte_limit();
+        if remote_limit.is_none() {
+            return true;
+        }
+        let existing_bytes: usize = held
+            .values()
+            .map(|held| {
+                ClientMessage::req(SubscriptionId::generate(), held.filters.clone())
+                    .as_json()
+                    .len()
+            })
+            .sum();
+        let auxiliary_bytes: usize = filter_groups
+            .iter()
+            .map(|filters| {
+                ClientMessage::req(SubscriptionId::generate(), filters.clone())
+                    .as_json()
+                    .len()
+            })
+            .sum();
+        existing_bytes
+            .checked_add(auxiliary_bytes)
+            .and_then(|used| used.checked_add(super::SUBSCRIPTION_BYTE_RESERVED_MARGIN))
+            .is_some_and(|used| used <= remote_limit.unwrap())
+    }
+
+    /// Open separately tracked auxiliary live groups. The caller must first
+    /// use [`Self::can_admit_auxiliary_live_groups`] so one transient slot is
+    /// preserved; the shared ledger remains the final admission authority.
+    pub async fn subscribe_auxiliary_live_filter_groups(
+        &self,
+        filter_groups: Vec<Vec<Filter>>,
+    ) -> Result<Vec<SubscriptionId>, String> {
+        if !self.can_admit_auxiliary_live_groups(&filter_groups) {
+            return Err(format!(
+                "Auxiliary live coverage would consume historic capacity for {}",
+                self.url
+            ));
+        }
+        self.subscribe_live_filter_groups(filter_groups).await
+    }
+
+    /// Close a caller-owned subset of persistent subscriptions and return
+    /// their ledger slots only after CLOSE has been accepted by the SDK.
+    pub async fn close_live_subscriptions(
+        &self,
+        subscription_ids: &[SubscriptionId],
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for subscription_id in subscription_ids {
+            if let Err(error) = self.client.unsubscribe(subscription_id).await {
+                tracing::debug!(
+                    relay = %self.url,
+                    sub_id = %subscription_id,
+                    %error,
+                    "Failed to close caller-owned live subscription"
+                );
+                failures.push(format!("{subscription_id}: {error}"));
+                continue;
+            }
+            self.release_live_req_permit(subscription_id);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to close {} live subscriptions on {}: {}",
+                failures.len(),
+                self.url,
+                failures.join("; ")
+            ))
+        }
+    }
+
     pub fn complete_live_set_fits(&self, slots: usize) -> bool {
         slots
             <= self
@@ -2900,6 +2994,36 @@ mod tests {
             .expect_err("nine live groups must not consume an eight-slot usable budget");
         assert!(error.contains("exceeds budget"), "{error}");
         assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_live_admission_preserves_one_historic_slot() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+
+        for index in 0..6 {
+            let permit = connection.acquire_subscription_slots(1).await.unwrap();
+            connection.live_req_permits_held.lock().unwrap().insert(
+                SubscriptionId::new(format!("core-{index}")),
+                HeldLiveSubscription {
+                    generation: permit.generation,
+                    _ledger_slot: permit.permit,
+                    filters: vec![Filter::new().kind(Kind::Custom(20_100 + index))],
+                },
+            );
+        }
+
+        let one_group = vec![vec![Filter::new().kind(Kind::Custom(20_200))]];
+        assert!(connection.can_admit_auxiliary_live_groups(&one_group));
+
+        let two_groups = vec![
+            vec![Filter::new().kind(Kind::Custom(20_201))],
+            vec![Filter::new().kind(Kind::Custom(20_202))],
+        ];
+        assert!(
+            !connection.can_admit_auxiliary_live_groups(&two_groups),
+            "two auxiliary groups would consume the final historic slot"
+        );
     }
 
     #[tokio::test]
