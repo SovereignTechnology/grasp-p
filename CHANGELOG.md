@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history provides eventual coverage. The frontier is deliberately
   non-recursive and connection sharding remains unnecessary.
 
+### Changed
+
+- Minimise live-subscription churn as repository coverage grows: stable full
+  core groups and descendant groups remain open. The mutable core tail is
+  repacked in full when doing so releases slots; otherwise only the smallest
+  useful subset is replaced to absorb new filters. This accounts for both
+  filter-count and serialized-byte limits. Repository filter chunks are
+  deterministic, and failed tail replacement restores the previous tail.
+
 ## [2.1.2] - 2026-08-08
 
 ngit-grasp 2.1.2 is a patch release improving repository-event sync under
