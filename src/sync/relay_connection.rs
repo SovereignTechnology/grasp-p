@@ -21,6 +21,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::health::RATE_LIMIT_COOLDOWN_SECS;
 use super::is_rate_limit_message;
 use crate::nostr::SharedDatabase;
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
@@ -40,12 +41,114 @@ const FALLBACK_SUBSCRIPTION_BUDGET: usize = 20;
 /// Control-plane safety slots never offered to live or historic consumers.
 const SUBSCRIPTION_RESERVED_MARGIN: usize = 2;
 
+/// Initial spacing after a relay reports that its per-connection query-rate
+/// allowance is exhausted.
+///
+/// NIP-11 cannot advertise query-rate windows. One start every 600 ms is 100
+/// starts/minute, leaving operational slack below rust-nostr 0.45's newly
+/// introduced 120/minute LocalRelay default. This is deliberately reactive:
+/// proactively pacing non-urgent history needs request-class priority so live
+/// coverage is not delayed, and belongs in a separate scheduler change.
+const QUERY_PACING_INITIAL_INTERVAL: Duration = Duration::from_millis(600);
+
+/// Bound adaptive slowdown so a restrictive relay still makes progress.
+const QUERY_PACING_MAX_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Multiple refusals from one already-sent burst describe one episode. A new
+/// refusal after a full rate-limit window means the learned pace was too fast.
+const QUERY_RATE_LIMIT_EPISODE_GAP: Duration = Duration::from_secs(60);
+
 fn effective_subscription_budget(advertised: Option<usize>) -> usize {
     advertised.unwrap_or(FALLBACK_SUBSCRIPTION_BUDGET)
 }
 
 fn usable_subscription_slots(advertised: Option<usize>) -> usize {
     effective_subscription_budget(advertised).saturating_sub(SUBSCRIPTION_RESERVED_MARGIN)
+}
+
+fn is_query_rate_limit_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("too many queries")
+}
+
+#[derive(Debug, Default)]
+struct QueryPacingState {
+    interval: Option<Duration>,
+    last_start: Option<tokio::time::Instant>,
+    last_limit_signal: Option<tokio::time::Instant>,
+    paused_until: Option<tokio::time::Instant>,
+}
+
+/// Serialises query starts only after this connection has demonstrated a
+/// per-minute query limit. Simultaneous subscription capacity remains owned by
+/// the separate subscription ledger.
+#[derive(Debug, Default)]
+struct QueryStartPacer {
+    gate: tokio::sync::Mutex<()>,
+    state: std::sync::Mutex<QueryPacingState>,
+}
+
+impl QueryStartPacer {
+    fn record_rate_limit(&self) -> (Duration, bool) {
+        let now = tokio::time::Instant::now();
+        let mut state = self.state.lock().expect("query pacing state poisoned");
+        let new_episode = state
+            .last_limit_signal
+            .is_none_or(|last| now.duration_since(last) >= QUERY_RATE_LIMIT_EPISODE_GAP);
+        if new_episode {
+            state.interval = Some(match state.interval {
+                None => QUERY_PACING_INITIAL_INTERVAL,
+                Some(current) => current.saturating_mul(2).min(QUERY_PACING_MAX_INTERVAL),
+            });
+            state.paused_until = Some(now + Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
+        }
+        state.last_limit_signal = Some(now);
+        (
+            state.interval.unwrap_or(QUERY_PACING_INITIAL_INTERVAL),
+            new_episode,
+        )
+    }
+
+    async fn wait_for_start(&self) -> Result<(), Duration> {
+        let _gate = self.gate.lock().await;
+        let now = tokio::time::Instant::now();
+        if let Some(paused_until) = self
+            .state
+            .lock()
+            .expect("query pacing state poisoned")
+            .paused_until
+        {
+            if now < paused_until {
+                return Err(paused_until.duration_since(now));
+            }
+        }
+        let deadline = {
+            let state = self.state.lock().expect("query pacing state poisoned");
+            state
+                .interval
+                .zip(state.last_start)
+                .map(|(interval, last)| last + interval)
+        };
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(deadline).await;
+        }
+        let mut state = self.state.lock().expect("query pacing state poisoned");
+        if state.interval.is_some() {
+            state.last_start = Some(tokio::time::Instant::now());
+        }
+        Ok(())
+    }
+
+    fn reset(&self) {
+        *self.state.lock().expect("query pacing state poisoned") = QueryPacingState::default();
+    }
+
+    #[cfg(test)]
+    fn interval(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .expect("query pacing state poisoned")
+            .interval
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +412,9 @@ pub struct RelayConnection {
     nip77_warning_logged: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether this relay supports NIP-77 negentropy (0 = unknown, 2 = confirmed not supported)
     nip77_supported: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Whether an in-session NIP-77 round exhausted the relay's query-rate
+    /// budget. The SDK owns NEG-MSG exchange, so later work uses paced REQs.
+    nip77_query_rate_limited: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Consecutive transient negentropy failures (drives the cooldown schedule)
     nip77_transient_failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Deadline before which negentropy is not attempted (transient-failure cooldown)
@@ -330,9 +436,41 @@ pub struct RelayConnection {
     transient_req_permits_held: TransientReqPermitMap,
     /// Ledger slots held for persistent subscriptions until CLOSE/teardown.
     live_req_permits_held: LiveReqPermitMap,
+    /// Learned per-session spacing for query starts after a query-rate refusal.
+    query_start_pacer: std::sync::Arc<QueryStartPacer>,
 }
 
 impl RelayConnection {
+    async fn await_query_start(&self) -> Result<(), String> {
+        self.query_start_pacer
+            .wait_for_start()
+            .await
+            .map_err(|remaining| {
+                format!(
+                    "Query start deferred for {}: rate-limit cooldown {:.3}s remaining",
+                    self.url,
+                    remaining.as_secs_f64()
+                )
+            })
+    }
+
+    fn record_query_rate_limit(&self) {
+        let (interval, new_episode) = self.query_start_pacer.record_rate_limit();
+        if new_episode {
+            tracing::info!(
+                relay = %self.url,
+                query_start_interval_ms = interval.as_millis(),
+                "Activated adaptive query-start pacing"
+            );
+        }
+        if self.mark_negentropy_query_rate_limited() {
+            tracing::info!(
+                relay = %self.url,
+                "Falling back to paced REQs for the query-limited connection session"
+            );
+        }
+    }
+
     /// Normalize a relay URL to include a scheme (wss:// or ws://)
     ///
     /// If the URL already has a scheme, it's returned as-is.
@@ -381,6 +519,9 @@ impl RelayConnection {
             database: None,
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            nip77_query_rate_limited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
             neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -406,6 +547,7 @@ impl RelayConnection {
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
         }
     }
 
@@ -436,6 +578,9 @@ impl RelayConnection {
             database: Some(database),
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            nip77_query_rate_limited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             nip77_transient_failures: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nip77_cooldown_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
             neg_diff_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -461,6 +606,7 @@ impl RelayConnection {
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
         }
     }
 
@@ -638,6 +784,9 @@ impl RelayConnection {
     /// Configure the one per-session ledger before any subscriptions open.
     pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
         self.clear_subscription_permits();
+        self.query_start_pacer.reset();
+        self.nip77_query_rate_limited
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let budget = effective_subscription_budget(advertised);
         let usable = usable_subscription_slots(advertised);
         self.subscription_usable_slots
@@ -1019,6 +1168,9 @@ impl RelayConnection {
                         }
                     }
                     RelayMessage::Notice(msg) => {
+                        if is_query_rate_limit_message(&msg) {
+                            self.record_query_rate_limit();
+                        }
                         // Check if this is a negentropy-related notice
                         let is_negentropy_notice = msg.contains("envelope")
                             || msg.contains("NEG-")
@@ -1047,6 +1199,9 @@ impl RelayConnection {
                         // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
                         let live_generation = self.release_live_req_permit(&subscription_id);
+                        if is_query_rate_limit_message(&msg) {
+                            self.record_query_rate_limit();
+                        }
                         if is_rate_limit_message(&msg) {
                             // The sync actor emits one canonical signal and owns
                             // cooldown deduplication for a rate-limit episode.
@@ -1227,6 +1382,10 @@ impl RelayConnection {
             "subscribe_filters called"
         );
 
+        // Acquire pacing before subscription/class permits: a learned remote
+        // query-rate window must not turn local capacity into queued sleepers.
+        self.await_query_start().await?;
+
         // Transient (auto-close) subscriptions share a bounded number of
         // per-connection slots so historic bursts queue instead of
         // exceeding relay subscription budgets. The permit is registered
@@ -1359,6 +1518,7 @@ impl RelayConnection {
         // Exact-ID purgatory recovery opens an ordinary transient REQ inside
         // nostr-sdk. It must share the same permit bound as historic pages,
         // fallbacks and retries rather than escaping the connection budget.
+        self.await_query_start().await?;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
@@ -1647,6 +1807,14 @@ impl RelayConnection {
             return false;
         }
 
+        if self
+            .nip77_query_rate_limited
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::trace!(relay = %self.url, "Skipping negentropy - query-rate budget was exhausted this session");
+            return false;
+        }
+
         // Transient-failure cooldown: pause negentropy without ruling it out
         let cooldown_until = *self
             .nip77_cooldown_until
@@ -1672,6 +1840,18 @@ impl RelayConnection {
     pub fn mark_negentropy_unsupported(&self) {
         self.nip77_supported
             .store(2, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fall back to paced REQs for the rest of this connection session.
+    ///
+    /// rust-nostr owns the messages within a NIP-77 round, while relays can
+    /// charge every NEG-MSG against the same query-rate bucket as REQ. We can
+    /// pace round starts but not those internal messages, so retrying NIP-77
+    /// after cooldown can deterministically exhaust the bucket again.
+    fn mark_negentropy_query_rate_limited(&self) -> bool {
+        !self
+            .nip77_query_rate_limited
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record a transient negentropy failure and start (or keep) a cooldown.
@@ -1747,6 +1927,7 @@ impl RelayConnection {
         // and relays count each open round against a per-connection budget
         // shared with live subscriptions (see MAX_CONCURRENT_NEG_DIFFS).
         // The permit is held for the whole round, including the timeout.
+        self.await_query_start().await?;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
@@ -1852,6 +2033,9 @@ impl RelayConnection {
                 Ok(reconciliation)
             }
             Err(e) => {
+                if is_query_rate_limit_message(&e) {
+                    self.record_query_rate_limit();
+                }
                 match classify_negentropy_failure(&e) {
                     NegentropyFailure::Unsupported => {
                         self.mark_negentropy_unsupported();
@@ -2294,6 +2478,60 @@ mod tests {
         })
         .await
         .expect("every immediate empty EOSE must release its registered permit");
+
+        connection.disconnect().await;
+        relay.shutdown();
+        event_loop.abort();
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn query_rate_closed_paces_later_wire_requests() {
+        let relay = LocalRelayBuilder::default().queries_per_minute(1).build();
+        relay.run().await.expect("start query-limited relay");
+        let connection = RelayConnection::new(
+            relay.url().await.to_string(),
+            Keys::generate(),
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection
+            .connect(3)
+            .await
+            .expect("connect query-limited relay");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(RELAY_EVENT_BUFFER_CAPACITY);
+        let event_loop = tokio::spawn(connection.clone().run_event_loop(event_tx));
+        let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+        let filter = Filter::new().kind(Kind::Custom(65_534));
+        connection
+            .subscribe_filter(filter.clone(), TransientRequestClass::HistoricPage)
+            .await
+            .expect("first query consumes the relay token");
+        let _ = connection
+            .subscribe_filter(filter.clone(), TransientRequestClass::HistoricPage)
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while connection.query_start_pacer.interval().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rate-limited CLOSED should activate pacing");
+        assert!(
+            !connection.supports_negentropy().await,
+            "query-limited sessions must avoid unpaced NEG-MSG traffic"
+        );
+
+        let error = connection
+            .subscribe_filter(filter.clone(), TransientRequestClass::HistoricPage)
+            .await
+            .expect_err("work queued during cooldown must unwind");
+        assert!(
+            error.contains("rate-limit cooldown"),
+            "unexpected deferred-query error: {error}"
+        );
 
         connection.disconnect().await;
         relay.shutdown();
@@ -2928,6 +3166,97 @@ mod tests {
                 "negentropy_fallback",
             ])
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_pacer_activates_only_after_query_rate_limit() {
+        let pacer = std::sync::Arc::new(QueryStartPacer::default());
+        pacer
+            .wait_for_start()
+            .await
+            .expect("inactive pacer should admit immediately");
+        assert_eq!(pacer.interval(), None);
+
+        let (interval, new_episode) = pacer.record_rate_limit();
+        assert!(new_episode);
+        assert_eq!(interval, QUERY_PACING_INITIAL_INTERVAL);
+        assert!(pacer.wait_for_start().await.is_err());
+        tokio::time::advance(Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS)).await;
+        pacer
+            .wait_for_start()
+            .await
+            .expect("first recovery query should start after cooldown");
+
+        let waiting = {
+            let pacer = std::sync::Arc::clone(&pacer);
+            tokio::spawn(async move { pacer.wait_for_start().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(QUERY_PACING_INITIAL_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        waiting
+            .await
+            .expect("paced query task should complete")
+            .expect("paced query start should be admitted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_pacer_deduplicates_bursts_and_slows_new_episodes() {
+        let pacer = QueryStartPacer::default();
+        assert_eq!(
+            pacer.record_rate_limit(),
+            (QUERY_PACING_INITIAL_INTERVAL, true)
+        );
+        assert_eq!(
+            pacer.record_rate_limit(),
+            (QUERY_PACING_INITIAL_INTERVAL, false)
+        );
+
+        tokio::time::advance(Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS)).await;
+        pacer
+            .wait_for_start()
+            .await
+            .expect("a duplicate signal must not extend the cooldown");
+
+        tokio::time::advance(QUERY_RATE_LIMIT_EPISODE_GAP).await;
+        assert_eq!(
+            pacer.record_rate_limit(),
+            (QUERY_PACING_INITIAL_INTERVAL * 2, true)
+        );
+        pacer.reset();
+        assert_eq!(pacer.interval(), None);
+        pacer
+            .wait_for_start()
+            .await
+            .expect("session reset should clear the cooldown");
+    }
+
+    #[tokio::test]
+    async fn query_limited_negentropy_falls_back_until_session_reset() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        assert!(connection.supports_negentropy().await);
+        assert!(connection.mark_negentropy_query_rate_limited());
+        assert!(!connection.mark_negentropy_query_rate_limited());
+        assert!(!connection.supports_negentropy().await);
+
+        connection.reset_subscription_budget(None);
+        assert!(connection.supports_negentropy().await);
+    }
+
+    #[test]
+    fn query_pacing_classifier_excludes_subscription_capacity_limits() {
+        assert!(is_query_rate_limit_message(
+            "rate-limited: too many queries"
+        ));
+        assert!(!is_query_rate_limit_message(
+            "rate-limited: too many concurrent REQs"
+        ));
+        assert!(!is_query_rate_limit_message(
+            "rate-limited: active subscriptions exceed max size 1048576 bytes"
+        ));
     }
 
     #[test]

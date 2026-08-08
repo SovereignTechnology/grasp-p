@@ -181,6 +181,16 @@ strfry and Ditto have no native limiter at all, deferring to deployment
 infrastructure. The full survey with citations is preserved in this
 file's history (commit `9723ff4`).
 
+The 120-query allowance is a newly enabled rust-nostr 0.45 LocalRelay default,
+not a floor established by that survey. It is unusually restrictive: none of
+the other audited implementations enables an equivalent query-specific,
+per-connection default. A finite limit is still useful as one layer of DoS
+protection, but a small per-connection bucket is not sufficient protection by
+itself because a hostile client can multiply connections; per-IP admission and
+global resource bounds address that threat more directly. rust-nostr also
+charges SDK-managed NIP-77 `NEG-MSG` continuation frames to this same bucket,
+so one application-started reconciliation can consume multiple query tokens.
+
 NIP-11 describes hard relay limitations, not rate-limit algorithms. The
 standard fields relevant here are `max_limit` and
 `max_subscriptions`; it has no standard fields for simultaneous connections
@@ -189,6 +199,14 @@ decay model, or retry-after time. Even an advertised `max_limit` does not say
 whether it applies independently to each filter or to the merged REQ, which is
 why the source audit above remains necessary. Relay-specific extensions can
 add fields, but clients cannot assume common names or semantics.
+
+The implemented query-start pacer is therefore a reactive compatibility
+backstop: it remains inactive until an explicit `too many queries` response,
+then spaces all application-visible starts and selects REQ fallback because
+the application cannot pace individual `NEG-MSG` frames. Proactively being
+gentle with non-urgent historic work is desirable but separate. It requires
+request-class priority—live coverage first, dependency recovery next, bulk
+history last—rather than enabling this shared gate from connection startup.
 
 The client encodes this model in per-connection `RelayPaginationSession`
 state (`src/sync/mod.rs`). After EOSE it learns the largest raw page seen
@@ -379,6 +397,19 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
 - Rounds queue behind a per-connection semaphore; each completion releases
   the next. No timed batches or sleeps — throughput degrades smoothly instead
   of bursting into rejections.
+- The ledger bounds simultaneous resource use, not query starts over time. If
+  a relay returns `rate-limited: too many queries`, the current connection
+  first rejects locally queued starts for the existing 65-second cooldown so
+  their incomplete work can be re-derived in priority order, then learns a
+  shared query-start interval: 600 ms initially (100 starts/minute, below our
+  own 120/minute serving limit), doubling on a later rate-limit episode up to
+  10 seconds. Live, transient REQ, exact-ID fetch and NIP-77 round starts all
+  pass through that pacer. Relays that never report a query
+  rate limit remain unpaced, and reconnecting resets the per-session lesson.
+  After any query-budget refusal, NIP-77 is skipped for the rest of the session:
+  rust-nostr owns the internal `NEG-MSG` exchange, so the application cannot
+  guarantee that each charged frame passes through its pacing gate. Historic
+  recovery then uses the paced REQ path.
 - Transient REQ+EOSE subscriptions — historic sync groups, fallback
   filters, exact-ID fetches, retries, and pagination pages — retain a
   five-request class cap inside the shared ledger: a slot is acquired when
@@ -501,8 +532,10 @@ is worthwhile upstream work.
 **Cons:** reactive by construction (eats one rejection burst per relay per
 startup), needs heuristic NOTICE parsing as its *primary* control loop, and
 fixed pauses waste time on fast relays while still bursting slow ones.
-**Why not:** the semaphore ledger achieves the same containment continuously,
-with the heuristics demoted to backstop.
+**Why not:** fixed global batching would penalise every relay and cannot adapt
+to their different windows. The semaphore ledger continuously contains active
+resources; the implemented per-session pacer is activated only by an explicit
+query-rate refusal and then drains work smoothly at a learned rate.
 
 ---
 
