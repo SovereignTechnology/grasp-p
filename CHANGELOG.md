@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Log routine Git `info/refs` requests for repositories not yet available
+  locally at DEBUG rather than WARN; this is expected during propagation.
+
 ### Fixed
 
 - Preserve purgatory and rejected-event recovery across abrupt termination.

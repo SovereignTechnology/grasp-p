@@ -47,7 +47,7 @@ pub async fn handle_info_refs(
 
     // Check if repository exists
     if !repo_path.exists() {
-        warn!("Repository not found: {:?}", repo_path);
+        debug!("Repository not found: {:?}", repo_path);
         return Err(GitError::RepositoryNotFound);
     }
 
