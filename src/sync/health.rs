@@ -28,6 +28,11 @@ const DEAD_THRESHOLD_HOURS: u64 = 24;
 /// How often dead relays are retried (once per 24 hours)
 const DEAD_RETRY_INTERVAL_HOURS: u64 = 24;
 
+/// Policy-refusing relays are probed once per day without closing an otherwise
+/// useful connection. This reuses the dead-relay cadence while keeping policy
+/// refusal distinct from transport failure.
+const POLICY_RETRY_INTERVAL_HOURS: u64 = 24;
+
 /// Default maximum backoff duration in seconds (1 hour)
 const DEFAULT_MAX_BACKOFF_SECS: u64 = 3600;
 
@@ -54,6 +59,8 @@ pub enum HealthState {
     Dead,
     /// Rate limited by relay, temporary cooldown active
     RateLimited,
+    /// Connected, but the relay currently refuses our subscription policy.
+    PolicyLimited,
 }
 
 impl std::fmt::Display for HealthState {
@@ -64,6 +71,7 @@ impl std::fmt::Display for HealthState {
             HealthState::Degraded => write!(f, "degraded"),
             HealthState::Dead => write!(f, "dead"),
             HealthState::RateLimited => write!(f, "rate_limited"),
+            HealthState::PolicyLimited => write!(f, "policy_limited"),
         }
     }
 }
@@ -75,6 +83,8 @@ pub struct RelayHealth {
     pub connected: bool,
     /// Has this relay sent us a rate-limiting NOTICE recently
     pub rate_limited: bool,
+    /// Deadline for retrying subscriptions refused by relay policy.
+    pub policy_retry_at: Option<Instant>,
     /// Number of consecutive connection failures
     pub consecutive_failures: u32,
     /// Time of the first failure in the current failure streak
@@ -105,13 +115,18 @@ impl RelayHealth {
     ///
     /// ## State Logic
     ///
-    /// 1. **RateLimited**: If the rate-limit cooldown hasn't expired
-    /// 2. **Dead**: 24+ hours of continuous failures
-    /// 3. **Degraded**: Active connection failures OR in stability period after recovery
-    /// 4. **Disconnected**: Not connected, but no recent failures or issues
-    /// 5. **Healthy**: Connected and stable (past stability period with no failures)
+    /// 1. **PolicyLimited**: If a relay-policy recovery probe is pending
+    /// 2. **RateLimited**: If the rate-limit cooldown hasn't expired
+    /// 3. **Dead**: 24+ hours of continuous failures
+    /// 4. **Degraded**: Active connection failures OR in stability period after recovery
+    /// 5. **Disconnected**: Not connected, but no recent failures or issues
+    /// 6. **Healthy**: Connected and stable (past stability period with no failures)
     pub fn state(&self) -> HealthState {
         let now = Instant::now();
+
+        if self.policy_retry_at.is_some_and(|deadline| now < deadline) {
+            return HealthState::PolicyLimited;
+        }
 
         // Check rate limiting first (highest priority)
         if self.rate_limited {
@@ -178,6 +193,11 @@ impl RelayHealth {
         } else {
             false
         }
+    }
+
+    pub fn is_policy_limited_now(&self) -> bool {
+        self.policy_retry_at
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     /// Get the consecutive failure count
@@ -465,6 +485,46 @@ impl RelayHealthTracker {
         );
     }
 
+    /// Pause new subscription work after a definitive relay-policy refusal.
+    /// Existing connections remain available and one recovery probe is made
+    /// after the same 24-hour interval used for dead relays.
+    pub fn record_policy_refusal(&self, relay_url: &str) {
+        let now = Instant::now();
+        let mut entry = self.health.entry(relay_url.to_string()).or_default();
+        let health = entry.value_mut();
+        if health
+            .policy_retry_at
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        health.policy_retry_at =
+            Some(now + Duration::from_secs(POLICY_RETRY_INTERVAL_HOURS * 3600));
+    }
+
+    pub fn is_subscription_paused(&self, relay_url: &str) -> bool {
+        self.health
+            .get(relay_url)
+            .is_some_and(|entry| entry.is_rate_limited_now() || entry.is_policy_limited_now())
+    }
+
+    /// Clear expired policy refusals and return relays due one recovery probe.
+    pub fn exit_expired_policy_refusals(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut recovered = Vec::new();
+        for mut entry in self.health.iter_mut() {
+            let (url, health) = entry.pair_mut();
+            if health
+                .policy_retry_at
+                .is_some_and(|deadline| now >= deadline)
+            {
+                health.policy_retry_at = None;
+                recovered.push(url.clone());
+            }
+        }
+        recovered
+    }
+
     /// Clear rate limiting state for a specific relay
     ///
     /// This clears the rate-limit episode without affecting connection status
@@ -557,7 +617,9 @@ impl RelayHealthTracker {
 
                 // Check state-based logic
                 match health.state() {
-                    HealthState::Healthy | HealthState::Disconnected => true,
+                    HealthState::Healthy
+                    | HealthState::Disconnected
+                    | HealthState::PolicyLimited => true,
                     HealthState::Degraded | HealthState::Dead | HealthState::RateLimited => {
                         // Check if backoff/cooldown period has elapsed
                         match health.next_retry_at {
@@ -921,5 +983,31 @@ mod tests {
         assert!(health.is_rate_limited_now());
         assert_eq!(health.next_retry_at, deadline);
         assert!(health.connected);
+    }
+
+    #[test]
+    fn policy_refusal_keeps_connection_and_allows_one_daily_probe() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://members-only.example";
+
+        tracker.record_success(relay);
+        tracker.record_policy_refusal(relay);
+        let first_deadline = tracker.get_health(relay).unwrap().policy_retry_at;
+        tracker.record_policy_refusal(relay);
+
+        let health = tracker.get_health(relay).unwrap();
+        assert!(health.connected);
+        assert_eq!(health.state(), HealthState::PolicyLimited);
+        assert_eq!(health.policy_retry_at, first_deadline);
+        assert!(tracker.is_subscription_paused(relay));
+
+        tracker.health.get_mut(relay).unwrap().policy_retry_at =
+            Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            tracker.exit_expired_policy_refusals(),
+            vec![relay.to_string()]
+        );
+        assert!(!tracker.is_subscription_paused(relay));
+        assert!(tracker.exit_expired_policy_refusals().is_empty());
     }
 }

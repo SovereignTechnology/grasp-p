@@ -28,6 +28,8 @@ pub struct SyncMetrics {
     relay_status: IntGaugeVec,
     /// Per-relay consecutive failure count
     relay_failures: IntGaugeVec,
+    /// Subscription policy refusals by relay and bounded category.
+    policy_refusals_total: IntCounterVec,
 
     // === Event metrics ===
     /// Total events synced (newly saved events only)
@@ -94,7 +96,7 @@ impl SyncMetrics {
         let relay_status = IntGaugeVec::new(
             Opts::new(
                 "ngit_sync_relay_status",
-                "Relay health status (1=healthy, 2=disconnected, 3=degraded, 4=dead, 5=rate_limited)",
+                "Relay health status (1=healthy, 2=disconnected, 3=degraded, 4=dead, 5=rate_limited, 6=policy_limited)",
             ),
             &["relay"],
         )?;
@@ -108,6 +110,15 @@ impl SyncMetrics {
             &["relay"],
         )?;
         registry.register(Box::new(relay_failures.clone()))?;
+
+        let policy_refusals_total = IntCounterVec::new(
+            Opts::new(
+                "ngit_sync_policy_refusals_total",
+                "Subscription refusals by relay and bounded policy category",
+            ),
+            &["relay", "category"],
+        )?;
+        registry.register(Box::new(policy_refusals_total.clone()))?;
 
         // Event metrics
         let events_synced_total = IntCounter::with_opts(Opts::new(
@@ -223,6 +234,7 @@ impl SyncMetrics {
             connection_attempts_total,
             relay_status,
             relay_failures,
+            policy_refusals_total,
             events_synced_total,
             relays_tracked_total,
             relays_connected_total,
@@ -297,6 +309,7 @@ impl SyncMetrics {
     /// - Degraded = 3 (connection problems or unstable after recovery)
     /// - Dead = 4 (24h+ of failures)
     /// - RateLimited = 5 (rate limit cooldown active)
+    /// - PolicyLimited = 6 (relay policy refusal; daily probe pending)
     ///
     /// # Arguments
     ///
@@ -309,6 +322,7 @@ impl SyncMetrics {
             HealthState::Degraded => 3,
             HealthState::Dead => 4,
             HealthState::RateLimited => 5,
+            HealthState::PolicyLimited => 6,
         };
         self.relay_status
             .with_label_values(&[relay])
@@ -355,6 +369,12 @@ impl SyncMetrics {
         self.relay_failures
             .with_label_values(&[relay])
             .set(count as i64);
+    }
+
+    pub fn record_policy_refusal(&self, relay: &str, category: &str) {
+        self.policy_refusals_total
+            .with_label_values(&[relay, category])
+            .inc();
     }
 
     /// Update dead relay count.

@@ -791,6 +791,46 @@ fn is_rate_limit_message(message: &str) -> bool {
         || message.contains("throttl")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyRefusal {
+    Blocked,
+    Restricted,
+    MembershipRequired,
+    FilterIncompatible,
+}
+
+impl PolicyRefusal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Restricted => "restricted",
+            Self::MembershipRequired => "membership_required",
+            Self::FilterIncompatible => "filter_incompatible",
+        }
+    }
+}
+
+fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
+    if is_rate_limit_message(message) {
+        return None;
+    }
+    let message = message.to_ascii_lowercase();
+    if message.contains("invalid number of filters")
+        || message.contains("filter validation failed")
+        || message.contains("unsupported filter")
+    {
+        Some(PolicyRefusal::FilterIncompatible)
+    } else if message.contains("not a member") || message.contains("membership") {
+        Some(PolicyRefusal::MembershipRequired)
+    } else if message.contains("restricted") {
+        Some(PolicyRefusal::Restricted)
+    } else if message.contains("blocked") || message.contains("request rejected") {
+        Some(PolicyRefusal::Blocked)
+    } else {
+        None
+    }
+}
+
 fn subscription_state_byte_limit(message: &str) -> Option<usize> {
     let lower = message.to_ascii_lowercase();
     let marker = "active subscriptions exceed max size ";
@@ -1612,7 +1652,7 @@ impl SyncManager {
                 // A NOTICE can arrive immediately before this page's EOSE.
                 // Keep a sentinel in the batch and let a detached worker
                 // resume the exact grouped page after the cooldown.
-                if self.health_tracker.is_rate_limited(relay_url) {
+                if self.health_tracker.is_subscription_paused(relay_url) {
                     let deferred_sub_id = mark_deferred_pagination(batch, &sub_id);
                     drop(pending);
 
@@ -3028,7 +3068,7 @@ impl SyncManager {
         }
 
         // Step 2: Check if relay is rate-limited before creating new pending items
-        if self.health_tracker.is_rate_limited(&action.relay_url) {
+        if self.health_tracker.is_subscription_paused(&action.relay_url) {
             tracing::debug!(
                 relay = %action.relay_url,
                 full_repos = action.items.repos.len(),
@@ -5310,6 +5350,31 @@ impl SyncManager {
             return;
         }
 
+        if let Some(category) = policy_refusal(reason) {
+            let removed_batch = {
+                let mut pending = self.pending_sync_index.write().await;
+                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
+            };
+            self.health_tracker.record_policy_refusal(relay_url);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_policy_refusal(relay_url, category.label());
+                metrics.record_health_state(
+                    relay_url,
+                    self.health_tracker.get_state(relay_url),
+                );
+            }
+            tracing::warn!(
+                relay = %relay_url,
+                sub_id = %subscription_id,
+                category = category.label(),
+                reason,
+                retry_hours = 24,
+                pending_batch_removed = removed_batch.is_some(),
+                "Relay policy refused subscription; preserving connection and deferring coverage probe"
+            );
+            return;
+        }
+
         if let Some(generation) = live_generation {
             self.restore_live_coverage_after_closed(relay_url, generation)
                 .await;
@@ -5593,7 +5658,13 @@ impl SyncManager {
         use crate::sync::algorithms::{compute_actions, derive_relay_targets};
 
         // Exit rate limiting for relays whose cooldown has expired
-        let relays_to_recover: Vec<String> = self.health_tracker.exit_expired_rate_limits();
+        let mut relays_to_recover: Vec<String> = self.health_tracker.exit_expired_rate_limits();
+        let policy_relays = self.health_tracker.exit_expired_policy_refusals();
+        for relay in policy_relays {
+            if !relays_to_recover.contains(&relay) {
+                relays_to_recover.push(relay);
+            }
+        }
 
         if relays_to_recover.is_empty() {
             return;
@@ -5605,13 +5676,7 @@ impl SyncManager {
         drop(repo_index);
 
         for relay_url in relays_to_recover {
-            tracing::info!(
-                relay = %relay_url,
-                "Rate limit cooldown expired, recovering"
-            );
-
-            // Clear rate limit state
-            self.health_tracker.clear_rate_limit(&relay_url);
+            tracing::info!(relay = %relay_url, "Subscription pause expired; probing coverage");
 
             // A rate-limited CLOSED deliberately leaves live coverage down so
             // it cannot immediately recreate the rejected request burst.
@@ -5644,7 +5709,7 @@ impl SyncManager {
                         full_repo_count = action.items.repos.len(),
                         state_only_repo_count = action.items.state_only_repos.len(),
                         event_count = action.items.root_events.len(),
-                        "Submitting recovered actions after rate limit"
+                        "Submitting recovered actions after subscription pause"
                     );
                     self.handle_new_sync_filters(action).await;
                 }
@@ -6740,6 +6805,28 @@ mod tests {
             assert!(is_rate_limit_message(message), "missed: {message}");
         }
         assert!(!is_rate_limit_message("blocked: unsupported filter"));
+    }
+
+    #[test]
+    fn policy_refusal_classifier_uses_bounded_categories() {
+        assert_eq!(
+            policy_refusal("restricted: this relay does not accept REQs"),
+            Some(PolicyRefusal::Restricted)
+        );
+        assert_eq!(
+            policy_refusal("restricted: you are not a member of this relay"),
+            Some(PolicyRefusal::MembershipRequired)
+        );
+        assert_eq!(
+            policy_refusal("blocked: Request rejected"),
+            Some(PolicyRefusal::Blocked)
+        );
+        assert_eq!(
+            policy_refusal("ERROR: filter validation failed: invalid number of filters: 8"),
+            Some(PolicyRefusal::FilterIncompatible)
+        );
+        assert_eq!(policy_refusal("rate-limited: too many queries"), None);
+        assert_eq!(policy_refusal("error: temporary backend failure"), None);
     }
 
     #[test]

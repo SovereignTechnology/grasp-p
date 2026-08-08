@@ -89,7 +89,12 @@ pub struct RepoSyncNeeds {
 Ownership removal is deliberately passive. It does not close a healthy
 connection or replace a working live request. If a live request receives
 `CLOSED`, its replacement filters are derived from the current index and omit
-obsolete items. When the connection itself ends naturally, confirmed state is
+obsolete items. Definitive policy refusals (`blocked`, `restricted`, membership
+required, or incompatible filters) are the exception: the connection remains
+open, rejected coverage is not immediately recreated, and one recovery probe
+runs after 24 hours. The bounded refusal category is exported as a metric while
+the relay's full reason remains in logs. When the connection itself ends
+naturally, confirmed state is
 reconciled before reconnect: shared relays reconnect with current items only,
 while an unreferenced relay is retired instead of reconnected. This preserves
 continuous live coverage while allowing stale ownership to drain at ordinary
@@ -371,7 +376,9 @@ The sync system uses three background tasks that run continuously:
 2. **Retry disconnected**: Calls `retry_disconnected_relays()` to attempt
    reconnection per health tracker backoff while either confirmed or desired
    `RepoSyncIndex` work remains
-3. **Rate limit recovery**: Calls `check_rate_limit_recovery()` to clear expired rate limits
+3. **Subscription recovery**: Calls `check_rate_limit_recovery()` to clear
+   expired short rate-limit cooldowns and schedule one probe after a 24-hour
+   policy-refusal pause
 4. **Metrics update**: Updates Prometheus metrics with current health states
 
 **Why combined**: The 2-second interval provides good responsiveness for health changes while minimizing overhead. All operations are lightweight (index checks, no I/O except actual connection attempts).

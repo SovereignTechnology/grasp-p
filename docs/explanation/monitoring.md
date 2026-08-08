@@ -117,7 +117,8 @@ When GRASP-02 proactive sync is implemented, the following metrics will be added
 |--------|------|--------|-------------|
 | `ngit_sync_relay_connected` | Gauge | relay | Connection status (0=disconnected, 1=connecting, 2=syncing, 3=connected, 4=connected_historic_sync_failures) |
 | `ngit_sync_connection_attempts_total` | Counter | relay, result | Connection attempt outcomes |
-| `ngit_sync_relay_status` | Gauge | relay | Health status (1=healthy, 2=disconnected, 3=degraded, 4=dead, 5=rate_limited) |
+| `ngit_sync_relay_status` | Gauge | relay | Health status (1=healthy, 2=disconnected, 3=degraded, 4=dead, 5=rate_limited, 6=policy_limited) |
+| `ngit_sync_policy_refusals_total` | Counter | relay, category | Subscription policy refusals using bounded categories; raw reasons remain in logs |
 | `ngit_sync_relay_failures` | Gauge | relay | Current consecutive failure count |
 | `ngit_sync_events_synced_total` | Counter | - | Events synced (newly saved events only) |
 | `ngit_sync_relays_tracked_total` | Gauge | - | Total relays discovered |

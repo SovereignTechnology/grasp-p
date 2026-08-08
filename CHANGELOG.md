@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stop permanently refused live subscriptions from rebuilding themselves in a
+  tight loop. Blocked, restricted, membership-required, and filter-incompatible
+  responses retain the connection, retire the rejected coverage for 24 hours,
+  then receive one recovery probe; bounded metrics distinguish the policies.
 - Keep purgatory announcements, state events, and PR events alive while a
   concrete background Git sync for their repository is actively running. A
   large healthy clone can exceed the nominal 30-minute purgatory window;
