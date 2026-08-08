@@ -33,9 +33,11 @@ The relay advertises the standard `max_subscriptions`, `max_limit`,
 `default_limit`, `max_message_length`, and `max_subid_length` NIP-11 fields.
 rust-nostr 0.45 also enforces fixed ngit-grasp-selected defaults of 1,200 queries,
 30 authentication events, and 6,000 WebSocket messages per minute; 20 filters
-per REQ; 1 MiB subscription state; 10 active negentropy sessions and 50,000
-negentropy items per connection; a 5 MiB WebSocket message; and a 10-second
-handshake deadline. NIP-11 has no standard fields for most of those controls.
+per REQ; 5 MiB subscription state (raised from rust-nostr's 1 MiB default so
+repository-scale persistent live filters remain admitted); 10 active
+negentropy sessions and 50,000 negentropy items per connection; a 5 MiB
+WebSocket message; and a 10-second handshake deadline. NIP-11 has no standard
+fields for most of those controls.
 The query allowance is a temporary 10× override of rust-nostr's newly added
 120/minute default because NIP-77 currently charges each SDK-managed `NEG-MSG`
 continuation separately; it must be reviewed when upstream revises that

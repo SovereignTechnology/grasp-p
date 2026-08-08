@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Raise retained subscription state per connection from 1 MiB to 5 MiB. A
+  production 34-filter repository-sync live set reached roughly 1.2 MiB, so
+  rust-nostr's newly introduced default repeatedly closed part of persistent
+  coverage. The replacement remains a finite per-connection bound and matches
+  the relay's maximum admitted WebSocket message size.
+
 ## [2.1.1] - 2026-08-08
 
 ngit-grasp 2.1.1 is a patch release improving relay-to-relay sync stability

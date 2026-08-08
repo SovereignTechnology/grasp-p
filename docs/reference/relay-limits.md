@@ -20,7 +20,7 @@ production admission policy.
 | Handshake deadline | 10 seconds | Fixed | No standard field |
 | Subscription-ID length | 250 bytes | Fixed | `max_subid_length` |
 | Filters per REQ | 20 | Fixed | No standard field |
-| Subscription state per connection | 1 MiB | Fixed | No standard field |
+| Subscription state per connection | 5 MiB | Fixed | No standard field |
 | Active negentropy sessions per connection | 10 | Fixed | No standard field |
 | Negentropy items per connection | 50,000 | Fixed | No standard field |
 | Negentropy frame | 60,000 bytes | Fixed upstream | No standard field |
@@ -34,6 +34,14 @@ The 192 KiB event default is three times rust-nostr's new 64 KiB default.
 Production history contains a valid NIP-34 patch event of about 149 KiB, so
 64 KiB is incompatible with ngit-grasp's purpose. The raised limit remains
 bounded and below the 5 MiB WebSocket message ceiling.
+
+The 5 MiB subscription-state allowance raises rust-nostr's 1 MiB default.
+Repository sync keeps multiple byte-budgeted filters live: production's
+34-filter coverage reached roughly 1.2 MiB and the smaller bound silently left
+part of that coverage closed. The new allowance remains finite per connection,
+matches the maximum admitted WebSocket message, and provides about four times
+the observed working-set headroom. NIP-11 has no field for this cumulative
+byte limit, so clients cannot negotiate it.
 
 The 1,200-query allowance temporarily overrides rust-nostr 0.45's newly
 introduced 120/minute default. A finite per-connection bound remains one useful

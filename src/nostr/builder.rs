@@ -52,6 +52,16 @@ const CLIENT_MESSAGES_PER_MINUTE: u32 = 6_000;
 /// this 10× value after upstream separates or otherwise revises that accounting.
 const CLIENT_QUERIES_PER_MINUTE: u32 = 1_200;
 
+/// Cumulative serialized REQ state retained for one client connection.
+///
+/// Repository sync legitimately keeps multiple byte-budgeted live filters
+/// open at once. Production's 34-filter coverage reached about 1.2 MiB and
+/// was partially rejected by rust-nostr's 1 MiB default. Five MiB remains a
+/// finite per-connection allocation boundary while matching the largest
+/// individual WebSocket message we already admit and leaving roughly 4x room
+/// above the observed working set.
+const MAX_SUBSCRIPTION_STATE_BYTES: usize = 5 * 1024 * 1024;
+
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
 /// Acts as the top-level admission gate and router.  Each incoming event is:
@@ -1038,7 +1048,7 @@ pub async fn create_relay(
         .websocket_handshake_timeout(Duration::from_secs(10))
         .max_subid_length(250)
         .max_filters_per_req(20)
-        .max_subscription_bytes(1024 * 1024)
+        .max_subscription_bytes(MAX_SUBSCRIPTION_STATE_BYTES)
         .max_negentropy_subscriptions(10)
         .max_negentropy_items(50_000)
         .max_filter_limit(config.relay_filter_limit)
