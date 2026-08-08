@@ -633,6 +633,11 @@ impl RelayHealthTracker {
             .collect()
     }
 
+    /// Forget lifecycle state for a relay intentionally retired by ownership reconciliation.
+    pub fn forget_relay(&self, relay_url: &str) {
+        self.health.remove(relay_url);
+    }
+
     /// Get a clone of the health info for a relay
     pub fn get_health(&self, relay_url: &str) -> Option<RelayHealth> {
         self.health

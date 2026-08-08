@@ -394,6 +394,14 @@ impl SyncMetrics {
         self.relays_tracked_total.inc();
     }
 
+    /// Remove current-state metric series for a relay that is no longer tracked.
+    pub fn forget_relay(&self, relay: &str) {
+        let _ = self.relay_connected.remove_label_values(&[relay]);
+        let _ = self.relay_status.remove_label_values(&[relay]);
+        let _ = self.relay_failures.remove_label_values(&[relay]);
+        self.relays_tracked_total.dec();
+    }
+
     /// Get current tracked relay count.
     pub fn get_tracked_count(&self) -> i64 {
         self.relays_tracked_total.get()
@@ -626,6 +634,14 @@ mod tests {
 
         metrics.inc_tracked_count();
         assert_eq!(metrics.get_tracked_count(), 6);
+
+        metrics.record_connection_status(
+            "wss://obsolete.example",
+            crate::sync::ConnectionStatus::Connected,
+        );
+        metrics.record_health_state("wss://obsolete.example", HealthState::Healthy);
+        metrics.forget_relay("wss://obsolete.example");
+        assert_eq!(metrics.get_tracked_count(), 5);
 
         // Test connected count
         metrics.update_connected_count(3);

@@ -234,6 +234,11 @@ impl MockRelay {
 
     /// Stop the mock relay.
     pub async fn stop(mut self) {
+        // End active WebSocket sessions as well as refusing new accepts. Tests
+        // that exercise natural remote disconnects need the same lifecycle a
+        // real relay shutdown produces.
+        self.relay.shutdown();
+
         // Send shutdown signal
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());

@@ -368,6 +368,45 @@ impl RelayState {
     }
 }
 
+fn reconcile_purgatory_relay_ownership(
+    index: &mut HashMap<String, RepoSyncNeeds>,
+    announcements: &[(String, HashSet<String>)],
+) -> HashSet<String> {
+    let active: HashMap<&str, &HashSet<String>> = announcements
+        .iter()
+        .map(|(repo_id, relays)| (repo_id.as_str(), relays))
+        .collect();
+    let mut dirty_relays = HashSet::new();
+
+    index.retain(|repo_id, needs| {
+        if needs.sync_level == SyncLevel::Full {
+            return true;
+        }
+        if active.contains_key(repo_id.as_str()) {
+            return true;
+        }
+        dirty_relays.extend(needs.relays.iter().cloned());
+        false
+    });
+
+    for (repo_id, relays) in announcements {
+        let entry = index
+            .entry(repo_id.clone())
+            .or_insert_with(|| RepoSyncNeeds {
+                relays: HashSet::new(),
+                root_events: HashSet::new(),
+                sync_level: SyncLevel::StateOnly,
+            });
+        if entry.sync_level == SyncLevel::StateOnly && entry.relays != *relays {
+            dirty_relays.extend(entry.relays.iter().cloned());
+            dirty_relays.extend(relays.iter().cloned());
+            entry.relays = relays.clone();
+        }
+    }
+
+    dirty_relays
+}
+
 /// Method used for synchronization
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMethod {
@@ -2826,21 +2865,10 @@ impl SyncManager {
         loop {
             // Wait for an event without holding the lock
             tokio::select! {
-                action = action_rx.recv() => {
-                    match action {
-                        Some(add_filters) => {
-                            // SelfSubscriber actions are dirty-relay signals.
-                            // Recompute against current pending and confirmed
-                            // state instead of trusting a queued full-index
-                            // snapshot that may already be stale.
-                            let mut manager = sync_manager.lock().await;
-                            manager
-                                .recompute_new_sync_filters_for_relay(&add_filters.relay_url)
-                                .await;
-                        }
-                        None => break,
-                    }
-                }
+                // Lifecycle completions release resources and unblock later
+                // work. Drain them ahead of a continuously-ready discovery
+                // queue so retirement cannot remain half-finished under load.
+                biased;
                 disconnect = disconnect_rx.recv() => {
                     match disconnect {
                         Some(notification) => {
@@ -2894,6 +2922,21 @@ impl SyncManager {
                     if let Some(relay_url) = relay_url {
                         let mut manager = sync_manager.lock().await;
                         manager.process_deferred_consolidation(&relay_url).await;
+                    }
+                }
+                action = action_rx.recv() => {
+                    match action {
+                        Some(add_filters) => {
+                            // SelfSubscriber actions are dirty-relay signals.
+                            // Recompute against current pending and confirmed
+                            // state instead of trusting a queued full-index
+                            // snapshot that may already be stale.
+                            let mut manager = sync_manager.lock().await;
+                            manager
+                                .recompute_new_sync_filters_for_relay(&add_filters.relay_url)
+                                .await;
+                        }
+                        None => break,
                     }
                 }
             }
@@ -3967,31 +4010,20 @@ impl SyncManager {
         let announcements = self.purgatory.announcements_for_sync();
         let announcement_events = self.purgatory.announcement_events_for_sync();
 
-        if announcements.is_empty() {
-            return;
+        // Replace StateOnly relay ownership from the current purgatory
+        // snapshot and remove entries only after full expiry. Soft-expired
+        // announcements remain in the snapshot for their 24-hour revival
+        // window; promoted Full entries are never downgraded or removed here.
+        let dirty_relays = {
+            let mut index = self.repo_sync_index.write().await;
+            reconcile_purgatory_relay_ownership(&mut index, &announcements)
+        };
+        for relay_url in dirty_relays {
+            self.recompute_new_sync_filters_for_relay(&relay_url).await;
         }
 
-        // Register any new entries in repo_sync_index as StateOnly.
-        {
-            let mut index = self.repo_sync_index.write().await;
-            for (repo_id, relays) in &announcements {
-                let entry = index.entry(repo_id.clone()).or_insert_with(|| {
-                    tracing::debug!(
-                        repo_id = %repo_id,
-                        "Registering purgatory announcement in repo_sync_index as StateOnly"
-                    );
-                    RepoSyncNeeds {
-                        relays: std::collections::HashSet::new(),
-                        root_events: std::collections::HashSet::new(),
-                        sync_level: SyncLevel::StateOnly,
-                    }
-                });
-                // Don't downgrade an already-Full entry
-                // Add any new relay URLs
-                for relay in relays {
-                    entry.relays.insert(relay.clone());
-                }
-            }
+        if announcements.is_empty() {
+            return;
         }
 
         // A maintainer announcement or state may have been fetched and rejected
@@ -4463,57 +4495,26 @@ impl SyncManager {
         self.cancel_deferred_consolidation(relay_url, "relay disconnect");
 
         if was_intentional {
-            // Intentional disconnect - complete cleanup by removing state
             tracing::info!(relay = %relay_url, "Event loop terminated for intentional disconnect, completing cleanup");
-
-            // Update metrics to Disconnected before cleanup
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
-            }
-
-            // Remove from relay_sync_index
-            {
-                let mut index = self.relay_sync_index.write().await;
-                if index.remove(relay_url).is_some() {
-                    tracing::debug!(
-                        relay = %relay_url,
-                        "Removed relay from relay_sync_index"
-                    );
-                }
-            }
-
-            // Remove from pending_sync_index
-            {
-                let mut pending = self.pending_sync_index.write().await;
-                if pending.remove(relay_url).is_some() {
-                    tracing::debug!(
-                        relay = %relay_url,
-                        "Removed relay from pending_sync_index"
-                    );
-                }
-            }
-
-            // Remove the connection object (won't reconnect)
-            if self.connections.remove(relay_url).is_some() {
-                tracing::debug!(
-                    relay = %relay_url,
-                    "Removed connection from connections map"
-                );
-            }
-
-            // Drop pending missing-event recovery along with the relay.
-            self.missing_event_recovery
-                .lock()
-                .unwrap()
-                .clear_relay(relay_url);
-
-            // Update metrics - decrement connected count
-            if let Some(ref metrics) = self.metrics {
-                metrics.dec_connected_count();
-            }
-
-            tracing::info!(relay = %relay_url, "Intentional disconnect cleanup complete");
+            self.complete_ended_session(relay_url, true).await;
         } else {
+            // Ownership changes are passive: do not disturb a healthy session.
+            // Once the connection ends naturally, however, reconcile its
+            // confirmed state with the latest index before deciding whether it
+            // should ever reconnect.
+            let desired = {
+                let repo_index = self.repo_sync_index.read().await;
+                algorithms::derive_relay_targets(&repo_index).remove(relay_url)
+            };
+            let Some(desired) = desired else {
+                tracing::info!(
+                    relay = %relay_url,
+                    "Naturally ended relay session is no longer owned; retiring without reconnect"
+                );
+                self.complete_ended_session(relay_url, true).await;
+                return;
+            };
+
             // Unexpected disconnect - update state but keep for reconnection
             tracing::warn!(relay = %relay_url, "Unexpected relay disconnect detected");
 
@@ -4521,6 +4522,9 @@ impl SyncManager {
             {
                 let mut index = self.relay_sync_index.write().await;
                 if let Some(state) = index.get_mut(relay_url) {
+                    state.repos = desired.repos;
+                    state.state_only_repos = desired.state_only_repos;
+                    state.root_events = desired.root_events;
                     state.connection_status = ConnectionStatus::Disconnected;
                     state.disconnected_at = Some(Timestamp::now());
                     tracing::info!(
@@ -4570,6 +4574,48 @@ impl SyncManager {
                 health_state = %self.health_tracker.get_state(relay_url),
                 "Unexpected disconnect handling complete"
             );
+        }
+    }
+
+    /// Remove all state owned by an ended session that must not reconnect.
+    ///
+    /// Connected sessions reach this after their event loop terminates. An
+    /// already-disconnected session has no event loop left to notify us, so
+    /// `disconnect_relay` calls it directly without decrementing the connected
+    /// gauge a second time.
+    async fn complete_ended_session(&mut self, relay_url: &str, was_connected: bool) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
+        }
+
+        self.relay_sync_index.write().await.remove(relay_url);
+        self.pending_sync_index.write().await.remove(relay_url);
+        self.connections.remove(relay_url);
+        self.missing_event_recovery
+            .lock()
+            .unwrap()
+            .clear_relay(relay_url);
+        self.health_tracker.forget_relay(relay_url);
+
+        if let Some(ref metrics) = self.metrics {
+            if was_connected {
+                metrics.dec_connected_count();
+            }
+            metrics.forget_relay(relay_url);
+        }
+
+        tracing::info!(relay = %relay_url, "Ended relay session cleanup complete");
+
+        let still_desired = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index).contains_key(relay_url)
+        };
+        if still_desired && self.register_relay(relay_url.to_string(), false).await {
+            tracing::info!(
+                relay = %relay_url,
+                "Relay remains shared by current repository announcements; starting a clean session"
+            );
+            self.schedule_connect_relay(relay_url).await;
         }
     }
 
@@ -5415,6 +5461,18 @@ impl SyncManager {
     ///
     /// Used by check_disconnects for cleanup of empty relays.
     async fn disconnect_relay(&mut self, relay_url: &str) {
+        let prior_status = {
+            let index = self.relay_sync_index.read().await;
+            index.get(relay_url).map(|state| state.connection_status)
+        };
+        if prior_status == Some(ConnectionStatus::Disconnecting) {
+            tracing::debug!(
+                relay = %relay_url,
+                "Relay disconnect already in progress"
+            );
+            return;
+        }
+
         tracing::info!(relay = %relay_url, "Initiating disconnect for empty relay");
 
         // Mark relay as Disconnecting (keep state for event loop to drain)
@@ -5442,6 +5500,13 @@ impl SyncManager {
         // Update metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_connection_status(relay_url, ConnectionStatus::Disconnecting);
+        }
+
+        // An unexpected disconnect has already ended the event loop. There is
+        // no future notification to finish an intentional retirement.
+        if prior_status == Some(ConnectionStatus::Disconnected) {
+            self.complete_ended_session(relay_url, false).await;
+            return;
         }
 
         tracing::info!(relay = %relay_url, "Disconnect initiated, waiting for event loop termination");
@@ -6828,6 +6893,75 @@ mod tests {
             !source.is_disconnect_candidate(false, false),
             "cleanup must not race an in-flight connection worker"
         );
+    }
+
+    #[test]
+    fn purgatory_snapshot_replaces_state_only_relays_and_prunes_full_expiry() {
+        let active = "30617:owner:active".to_string();
+        let expired = "30617:owner:expired".to_string();
+        let promoted = "30617:owner:promoted".to_string();
+        let old = "wss://old.example".to_string();
+        let new = "wss://new.example".to_string();
+        let expired_relay = "wss://expired.example".to_string();
+        let promoted_relay = "wss://promoted.example".to_string();
+        let mut index = HashMap::from([
+            (
+                active.clone(),
+                RepoSyncNeeds {
+                    relays: HashSet::from([old.clone()]),
+                    sync_level: SyncLevel::StateOnly,
+                    ..Default::default()
+                },
+            ),
+            (
+                expired.clone(),
+                RepoSyncNeeds {
+                    relays: HashSet::from([expired_relay.clone()]),
+                    sync_level: SyncLevel::StateOnly,
+                    ..Default::default()
+                },
+            ),
+            (
+                promoted.clone(),
+                RepoSyncNeeds {
+                    relays: HashSet::from([promoted_relay.clone()]),
+                    sync_level: SyncLevel::Full,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let dirty = reconcile_purgatory_relay_ownership(
+            &mut index,
+            &[(active.clone(), HashSet::from([new.clone()]))],
+        );
+
+        assert_eq!(index[&active].relays, HashSet::from([new.clone()]));
+        assert!(!index.contains_key(&expired));
+        assert_eq!(index[&promoted].relays, HashSet::from([promoted_relay]));
+        assert_eq!(dirty, HashSet::from([old, new, expired_relay]));
+    }
+
+    #[test]
+    fn soft_expired_purgatory_entry_remains_while_present_in_snapshot() {
+        let repo = "30617:owner:revivable".to_string();
+        let relay = "wss://owner.example".to_string();
+        let mut index = HashMap::from([(
+            repo.clone(),
+            RepoSyncNeeds {
+                relays: HashSet::from([relay.clone()]),
+                sync_level: SyncLevel::StateOnly,
+                ..Default::default()
+            },
+        )]);
+
+        let dirty = reconcile_purgatory_relay_ownership(
+            &mut index,
+            &[(repo.clone(), HashSet::from([relay]))],
+        );
+
+        assert!(index.contains_key(&repo));
+        assert!(dirty.is_empty());
     }
 
     #[tokio::test]

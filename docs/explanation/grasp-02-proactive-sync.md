@@ -82,9 +82,18 @@ pub struct RepoSyncNeeds {
 
 **Two sources populate `RepoSyncIndex`:**
 
-1. **`SelfSubscriber`** — monitors the relay's own event stream for accepted announcements (kinds 30617, 1617, 1618, 1621). Adds entries with `SyncLevel::Full`. When an announcement is promoted from purgatory to the database, the SelfSubscriber sees it and upgrades the entry to `Full`.
+1. **`SelfSubscriber`** — monitors the relay's own event stream for accepted announcements (kinds 30617, 1617, 1618, 1621). Adds entries with `SyncLevel::Full`. When an announcement is promoted from purgatory to the database, the SelfSubscriber sees it and upgrades the entry to `Full`. Because kind 30617 is addressable, a newer announcement replaces that repository's relay set; root events add work without changing relay ownership. Both the old and new relay sets are marked dirty.
 
-2. **Purgatory announcement sync timer** (`run_purgatory_announcement_sync`, every 5 seconds) — iterates `purgatory.announcements_for_sync()` and ensures each purgatory announcement has a `SyncLevel::StateOnly` entry in `RepoSyncIndex`. This is the only registration path for purgatory announcements because they are not saved to the database and therefore never seen by the SelfSubscriber.
+2. **Purgatory announcement sync timer** (`run_purgatory_announcement_sync`, every 5 seconds) — reconciles `SyncLevel::StateOnly` entries against `purgatory.announcements_for_sync()`. Relay sets are replaced from the current snapshot. Soft-expired announcements remain present through their 24-hour revival window; only fully expired StateOnly entries are removed. Promoted `Full` entries are never downgraded or pruned by this path. This is the only registration path for purgatory announcements because they are not saved to the database and therefore never seen by the SelfSubscriber.
+
+Ownership removal is deliberately passive. It does not close a healthy
+connection or replace a working live request. If a live request receives
+`CLOSED`, its replacement filters are derived from the current index and omit
+obsolete items. When the connection itself ends naturally, confirmed state is
+reconciled before reconnect: shared relays reconnect with current items only,
+while an unreferenced relay is retired instead of reconnected. This preserves
+continuous live coverage while allowing stale ownership to drain at ordinary
+lifecycle boundaries.
 
 ### RelaySyncIndex (Confirmed State + Connection)
 
@@ -711,7 +720,7 @@ fn compute_actions(
 - **`register_relay()`**: Creates RelayConnection object, stores in HashMap, returns immediately
 - **`try_connect_relay()`**: Attempts connection using `connection.connect()` with timeout
 - **`handle_connect_or_reconnect()`**: Spawns event loop, updates state, decides sync strategy (fresh_start/quick_reconnect)
-- **`handle_disconnect()`**: Updates state to Disconnected, clears pending batches, keeps RelayConnection object
+- **`handle_disconnect()`**: Reconciles reusable state with current ownership after a natural disconnect; unreferenced relays are retired, while shared relays reconnect with current items only
 - **`retry_disconnected_relays()`**: Called every 2s, retries relays that pass health tracker checks
 
 ### Sync Entry Points

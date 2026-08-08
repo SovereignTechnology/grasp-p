@@ -43,6 +43,12 @@ enum LoopControl {
 struct PendingUpdates {
     /// Repos discovered since last batch, keyed by repo addressable ref
     repos: HashMap<String, RepoSyncNeeds>,
+    /// Latest announcement relay set for each addressable repository.
+    ///
+    /// Root events add work without changing ownership. Announcements replace
+    /// relay ownership, so keeping that distinction prevents obsolete URLs
+    /// from becoming permanent members of the sync index.
+    relay_replacements: HashMap<String, HashSet<String>>,
 }
 
 impl PendingUpdates {
@@ -50,23 +56,38 @@ impl PendingUpdates {
     fn new() -> Self {
         Self {
             repos: HashMap::new(),
+            relay_replacements: HashMap::new(),
         }
     }
 
-    /// Add or update a repo with its relays and root events
-    fn add_repo(
-        &mut self,
-        repo_id: String,
-        relays: HashSet<String>,
-        root_events: HashSet<EventId>,
-    ) {
-        let entry = self.repos.entry(repo_id).or_insert_with(|| RepoSyncNeeds {
-            relays: HashSet::new(),
-            root_events: HashSet::new(),
-            sync_level: SyncLevel::Full,
-        });
-        entry.relays.extend(relays);
-        entry.root_events.extend(root_events);
+    /// Record the latest addressable announcement for a repository.
+    fn replace_announcement_relays(&mut self, repo_id: String, relays: HashSet<String>) {
+        let entry = self
+            .repos
+            .entry(repo_id.clone())
+            .or_insert_with(|| RepoSyncNeeds {
+                relays: HashSet::new(),
+                root_events: HashSet::new(),
+                sync_level: SyncLevel::Full,
+            });
+        entry.relays = relays.clone();
+        self.relay_replacements.insert(repo_id, relays);
+    }
+
+    /// Add root-event work without changing announcement relay ownership.
+    fn add_root_event(&mut self, repo_id: String, relays: HashSet<String>, event_id: EventId) {
+        let entry = self
+            .repos
+            .entry(repo_id.clone())
+            .or_insert_with(|| RepoSyncNeeds {
+                relays: HashSet::new(),
+                root_events: HashSet::new(),
+                sync_level: SyncLevel::Full,
+            });
+        if !self.relay_replacements.contains_key(&repo_id) {
+            entry.relays.extend(relays);
+        }
+        entry.root_events.insert(event_id);
     }
 
     /// Check if there are any pending updates
@@ -75,8 +96,16 @@ impl PendingUpdates {
     }
 
     /// Take all pending updates, leaving empty
-    fn take(&mut self) -> HashMap<String, RepoSyncNeeds> {
-        std::mem::take(&mut self.repos)
+    fn take(
+        &mut self,
+    ) -> (
+        HashMap<String, RepoSyncNeeds>,
+        HashMap<String, HashSet<String>>,
+    ) {
+        (
+            std::mem::take(&mut self.repos),
+            std::mem::take(&mut self.relay_replacements),
+        )
     }
 }
 
@@ -194,7 +223,7 @@ impl SelfSubscriber {
         for event in announcements.iter() {
             if let Some(repo_id) = Self::extract_repo_id(event) {
                 let relays = Self::extract_relay_urls(event);
-                pending.add_repo(repo_id, relays, HashSet::new());
+                pending.replace_announcement_relays(repo_id, relays);
                 announcements_loaded += 1;
             }
         }
@@ -273,7 +302,7 @@ impl SelfSubscriber {
                         // 30617 announcements don't contribute to root_events - those are
                         // the 1617/1618/1621 event IDs that get added when we receive
                         // root events via handle_root_event. See mod.rs:71 for details.
-                        pending.add_repo(repo_id.clone(), relays.clone(), HashSet::new());
+                        pending.replace_announcement_relays(repo_id.clone(), relays.clone());
                         tracing::info!(
                             event_id = %event.id,
                             repo_id = %repo_id,
@@ -538,9 +567,7 @@ impl SelfSubscriber {
             // Also add root event to pending - this ensures batch processing runs
             // and creates Layer 3 filters for events referencing this root event.
             // CRITICAL: Include relays so derive_relay_targets knows where to send filters!
-            let mut root_events = HashSet::new();
-            root_events.insert(event.id);
-            pending.add_repo(repo_ref.clone(), relays.clone(), root_events);
+            pending.add_root_event(repo_ref.clone(), relays.clone(), event.id);
 
             tracing::debug!(
                 event_id = %event.id,
@@ -562,7 +589,7 @@ impl SelfSubscriber {
     /// Updates the RepoSyncIndex with discovered repos, then marks only the
     /// relays changed by this batch for SyncManager recomputation.
     async fn process_batch(&self, pending: &mut PendingUpdates) {
-        let updates = pending.take();
+        let (updates, relay_replacements) = pending.take();
 
         if updates.is_empty() {
             return;
@@ -583,7 +610,7 @@ impl SelfSubscriber {
             );
         }
 
-        let dirty_relays = dirty_relays(&updates);
+        let mut dirty_relays = dirty_relays(&updates);
 
         // Update RepoSyncIndex
         let mut index = self.repo_sync_index.write().await;
@@ -601,7 +628,12 @@ impl SelfSubscriber {
             // already exists as StateOnly (purgatory announcement) and is now being
             // promoted (git data arrived and the event was broadcast via notify_event).
             entry.sync_level = SyncLevel::Full;
-            entry.relays.extend(needs.relays);
+            if let Some(replacement) = relay_replacements.get(&repo_id) {
+                dirty_relays.extend(entry.relays.iter().cloned());
+                entry.relays = replacement.clone();
+            } else {
+                entry.relays.extend(needs.relays);
+            }
             entry.root_events.extend(needs.root_events);
 
             tracing::debug!(
@@ -729,5 +761,40 @@ mod tests {
             ]),
             "a fresh historic batch must not rebuild work for unrelated indexed relays"
         );
+    }
+
+    #[test]
+    fn announcement_replacement_does_not_union_obsolete_relays() {
+        let repo = "30617:owner:repo".to_string();
+        let old = "wss://old.example".to_string();
+        let new = "wss://new.example".to_string();
+        let mut pending = PendingUpdates::new();
+
+        pending.replace_announcement_relays(repo.clone(), HashSet::from([old]));
+        pending.replace_announcement_relays(repo.clone(), HashSet::from([new.clone()]));
+
+        let (updates, replacements) = pending.take();
+        assert_eq!(updates[&repo].relays, HashSet::from([new.clone()]));
+        assert_eq!(replacements[&repo], HashSet::from([new]));
+    }
+
+    #[test]
+    fn root_event_does_not_override_latest_announcement_relays() {
+        let repo = "30617:owner:repo".to_string();
+        let relay = "wss://owner.example".to_string();
+        let root = EventId::from_byte_array([7; 32]);
+        let mut pending = PendingUpdates::new();
+
+        pending.replace_announcement_relays(repo.clone(), HashSet::from([relay.clone()]));
+        pending.add_root_event(
+            repo.clone(),
+            HashSet::from(["wss://stale.example".to_string()]),
+            root,
+        );
+
+        let (updates, replacements) = pending.take();
+        assert_eq!(updates[&repo].relays, HashSet::from([relay.clone()]));
+        assert_eq!(updates[&repo].root_events, HashSet::from([root]));
+        assert_eq!(replacements[&repo], HashSet::from([relay]));
     }
 }

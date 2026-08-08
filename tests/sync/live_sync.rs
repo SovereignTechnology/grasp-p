@@ -24,6 +24,102 @@ use nostr_sdk::prelude::*;
 
 use crate::common::{sync_helpers::*, MockRelay, TestRelay};
 
+#[tokio::test]
+async fn replacement_announcement_retires_old_relay_only_after_natural_disconnect() {
+    let old_source = MockRelay::start().await;
+    let new_source = MockRelay::start().await;
+    let syncing = TestRelay::start_with_sync(None).await;
+    let keys = Keys::generate();
+    let repo_id = "replacement-retires-old-relay";
+    let initial_domains = [old_source.domain(), syncing.domain()];
+    let initial_refs = initial_domains
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    let (_initial, _git_dir) =
+        setup_announcement_on_relay(&syncing, &keys, &initial_refs, repo_id).await;
+
+    let old_label = format!(
+        r#"ngit_sync_relay_connected{{relay="{}"}}"#,
+        old_source.url()
+    );
+    let new_label = format!(
+        r#"ngit_sync_relay_connected{{relay="{}"}}"#,
+        new_source.url()
+    );
+    let wait_for_metrics = |required: String, absent: Option<String>| {
+        let relay_url = syncing.url();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let metrics = fetch_metrics(&relay_url).await.unwrap_or_default();
+                if metrics.contains(&required)
+                    && absent.as_ref().is_none_or(|label| !metrics.contains(label))
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert!(
+        wait_for_metrics(old_label.clone(), None).await,
+        "initial announcement should establish the old relay session"
+    );
+
+    let npub = keys.public_key().to_bech32().unwrap();
+    let replacement_domains = [new_source.domain(), syncing.domain()];
+    let replacement = EventBuilder::new(Kind::GitRepoAnnouncement, "replacement")
+        .tags(vec![
+            Tag::identifier(repo_id),
+            Tag::custom(
+                "clone",
+                replacement_domains
+                    .iter()
+                    .map(|domain| format!("http://{domain}/{npub}/{repo_id}.git"))
+                    .collect::<Vec<_>>(),
+            ),
+            Tag::custom(
+                "relays",
+                replacement_domains
+                    .iter()
+                    .map(|domain| format!("ws://{domain}"))
+                    .collect::<Vec<_>>(),
+            ),
+        ])
+        .custom_created_at(Timestamp::from(Timestamp::now().as_secs() + 1))
+        .finalize(&keys)
+        .unwrap();
+    let client = TestClient::new(syncing.url(), keys.clone()).await.unwrap();
+    client.send_event(&replacement).await.unwrap();
+
+    assert!(
+        wait_for_metrics(new_label, None).await,
+        "replacement should establish the new relay"
+    );
+    assert!(
+        fetch_metrics(&syncing.url())
+            .await
+            .unwrap_or_default()
+            .contains(&old_label),
+        "ownership replacement must not tear down the healthy old relay session"
+    );
+
+    old_source.stop().await;
+    assert!(
+        wait_for_metrics(String::new(), Some(old_label)).await,
+        "after the old relay ends naturally it should retire instead of reconnecting"
+    );
+
+    client.disconnect().await;
+    syncing.stop().await;
+    new_source.stop().await;
+}
+
 /// A source relay's active-REQ cap must not silently remove one of the
 /// repository filter variants.
 ///
