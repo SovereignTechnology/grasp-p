@@ -485,6 +485,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             vec![super::super::PendingBatch {
                 batch_id: 1,
+                purpose: super::super::PendingBatchPurpose::Core,
                 items: super::super::PendingItems {
                     repos: vec!["repo1".to_string()].into_iter().collect(),
                     state_only_repos: HashSet::new(),
@@ -592,6 +593,7 @@ mod tests {
             relay_url.to_string(),
             vec![super::super::PendingBatch {
                 batch_id: 1,
+                purpose: super::super::PendingBatchPurpose::Core,
                 items: PendingItems {
                     repos: HashSet::new(),
                     state_only_repos: HashSet::from(["repo1".to_string()]),
@@ -681,6 +683,7 @@ mod tests {
             "wss://relay1.com".to_string(),
             vec![super::super::PendingBatch {
                 batch_id: 1,
+                purpose: super::super::PendingBatchPurpose::Core,
                 items: super::super::PendingItems {
                     repos: vec!["repo1".to_string()].into_iter().collect(),
                     state_only_repos: HashSet::new(),

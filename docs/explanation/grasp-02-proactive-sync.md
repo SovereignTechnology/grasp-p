@@ -11,6 +11,9 @@ Features:
 - Fetches all repository announcements from connected relays to discover new repos listing our service
 - Discovers and dynamically connects to new relays listed by repository announcements we have accepted (with optional bootstrap relay to get started)
 - Fetches events tagging repositories we are interested in, as well as events tagging Issues, Patches and PRs of these repositories
+- Recovers one additional generation of events that tag those direct thread
+  members but omit repository and root-event tags, using scheduled history
+  queries rather than retained subscriptions
 - Supports live sync and historic sync (tries NIP-77 negentropy but falls back to REQ+EOSE with 'until' based pagination)
 - Plays nicely with other relays - connection backoff and rate-limiting detection with cooldown
 - Does a full reconciliation daily
@@ -784,6 +787,26 @@ live in
 - **Batching**: Byte-budgeted (32 KB of serialized tag values per filter, ~489 hex IDs; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
+
+### Scheduled Direct-Member Descendants
+
+Some collaboration events reference only their immediate parent. Once the
+ordinary Layer 3 filters have discovered an event which directly tags a
+repository root, each source relay is also queried for events whose `e`, `E`,
+or `q` tags reference that direct member. These filters are not retained live:
+
+- one filter starts globally on the existing five-second maintenance cadence;
+- every request uses the existing historic REQ+EOSE path, including the
+  per-connection subscription ledger, proactive pacing, and pagination;
+- the first stable frontier receives a complete historic pass, then subsequent
+  rotations use a rolling 24-hour `since` window; and
+- recovered descendants never enter the frontier, so this is deliberately one
+  additional generation rather than recursive thread traversal.
+
+The rotation restarts with a complete pass after a reconnect or daily
+reconciliation. This makes an interrupted filter recoverable without adding a
+durable cursor, another scheduler, retained subscription pressure, or
+multi-connection sharding.
 
 ### Combined Layer 2+3 (SyncLevel-Aware)
 

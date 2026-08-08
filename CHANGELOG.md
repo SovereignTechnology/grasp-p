@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Recover repository-event descendants which reference a direct thread member
+  but omit the repository and root-event tags. One low-priority, EOSE-closing
+  historic filter starts globally every five seconds while rotating across
+  relays: a complete initial pass followed by rolling 24-hour passes. The
+  frontier is deliberately non-recursive and uses the existing subscription
+  ledger, pagination, and request pacing rather than adding retained
+  subscriptions or connection sharding.
+
 ## [2.1.2] - 2026-08-08
 
 ngit-grasp 2.1.2 is a patch release improving repository-event sync under
