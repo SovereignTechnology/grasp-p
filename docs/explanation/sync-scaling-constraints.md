@@ -305,7 +305,8 @@ consumers share it, in priority order:
 NIP-11 `max_subscriptions` sets B for each new connection session; when it is
 absent B falls back to 20. Advertised values below that floor are honoured
 (notably nostream's default 10). Two slots remain reserved. Live filter groups
-are packed first and admitted atomically: if the complete live set cannot fit,
+are packed first and admitted atomically against the advertised
+subscription-count budget: if the complete live set cannot fit,
 the existing subscriptions are consolidated into the byte- and filter-count
 bounded REQ groups first. If the consolidated live set still cannot fit,
 partial coverage is not opened, historic work is deferred, and a warning
@@ -334,6 +335,23 @@ reported to the manager, which recomputes and transactionally reopens complete
 live coverage. Each reconnect closes the retired ledger and creates a new
 generation; queued or late borrowers therefore fail before sending on the new
 SDK session and cannot inflate or bypass its capacity.
+
+Some relays additionally cap the cumulative serialized REQ state retained by
+one connection. NIP-11 has no field for this limit, so it cannot be negotiated
+before the first refusal. A CLOSED reason of the rust-nostr form `active
+subscriptions exceed max size N bytes` is treated as a durable capacity signal,
+not as a temporary query-rate episode. The connection remembers N across
+reconnects and rebuilds its persistent filter groups within that byte budget,
+reserving one maximum-sized transient REQ. Byte-limited sessions serialize
+transient REQs so actual relay occupancy cannot overdraw that reserve.
+
+Persistent groups beyond the learned cap are not silently abandoned. One
+byte-limited relay is given a paced incremental historic catch-up every five
+minutes, with a one-minute overlap, through the same slot ledger and background
+query pacer as ordinary history. This preserves eventual completeness without
+recreating an impossible live set. The first capacity response remains
+unavoidable because the limit is not advertised; multi-connection sharding is
+still out of scope and would improve latency rather than correctness.
 
 The per-relay event processor retains its 1,000-message bounded data queue.
 Permit release does not depend on that queue draining: a separate listener on

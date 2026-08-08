@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Treat cumulative retained-subscription byte refusals as capacity signals,
+  not temporary query-rate episodes. The sync client learns the disclosed cap,
+  rebuilds persistent coverage within it while reserving one maximum transient
+  REQ, serializes transient work against that reserve, and covers overflow with
+  paced five-minute history plus overlap instead of retrying the same
+  impossible live set.
 - Raise retained subscription state per connection from 1 MiB to 5 MiB. A
   production 34-filter repository-sync live set reached roughly 1.2 MiB, so
   rust-nostr's newly introduced default repeatedly closed part of persistent

@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::health::RATE_LIMIT_COOLDOWN_SECS;
-use super::is_rate_limit_message;
+use super::{is_rate_limit_message, subscription_state_byte_limit};
 use crate::nostr::SharedDatabase;
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 
@@ -270,6 +270,7 @@ type TransientReqPermitMap = std::sync::Arc<
 struct HeldTransientPermits {
     _class_cap: tokio::sync::OwnedSemaphorePermit,
     _ledger_slot: tokio::sync::OwnedSemaphorePermit,
+    _byte_limit_gate: Option<tokio::sync::OwnedSemaphorePermit>,
     generation: u64,
     request_class: TransientRequestClass,
     opened_at: std::time::Instant,
@@ -478,6 +479,13 @@ pub struct RelayConnection {
     transient_req_permits_held: TransientReqPermitMap,
     /// Ledger slots held for persistent subscriptions until CLOSE/teardown.
     live_req_permits_held: LiveReqPermitMap,
+    /// Cumulative retained REQ bytes learned from a relay's CLOSED response.
+    /// Zero means the relay has not exposed a limit. The value survives
+    /// reconnects so a durable policy is not probed on every new session.
+    remote_subscription_byte_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Once a cumulative byte cap is learned, serialize transient REQs so the
+    /// reserved byte margin and actual relay-side occupancy cannot diverge.
+    byte_limited_transient_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Learned per-session spacing for query starts after a query-rate refusal.
     query_start_pacer: std::sync::Arc<QueryStartPacer>,
     /// Proactive spacing for non-urgent historic and dependency query starts.
@@ -516,6 +524,23 @@ impl RelayConnection {
                 relay = %self.url,
                 "Falling back to paced REQs for the query-limited connection session"
             );
+        }
+    }
+
+    fn record_subscription_byte_limit(&self, message: &str) -> Option<usize> {
+        let limit = subscription_state_byte_limit(message)?;
+        self.remote_subscription_byte_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        Some(limit)
+    }
+
+    pub fn remote_subscription_byte_limit(&self) -> Option<usize> {
+        match self
+            .remote_subscription_byte_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            limit => Some(limit),
         }
     }
 
@@ -595,6 +620,10 @@ impl RelayConnection {
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            remote_subscription_byte_limit: std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
+            byte_limited_transient_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
             background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
         }
@@ -655,6 +684,10 @@ impl RelayConnection {
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            remote_subscription_byte_limit: std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
+            byte_limited_transient_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             query_start_pacer: std::sync::Arc::new(QueryStartPacer::default()),
             background_query_pacer: std::sync::Arc::new(BackgroundQueryPacer::default()),
         }
@@ -918,11 +951,23 @@ impl RelayConnection {
         &self,
         request_class: TransientRequestClass,
     ) -> Result<HeldTransientPermits, String> {
+        let byte_limit_gate = if self.remote_subscription_byte_limit().is_some() {
+            Some(
+                self.byte_limited_transient_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| format!("Transient byte-limit gate closed for {}", self.url))?,
+            )
+        } else {
+            None
+        };
         loop {
             let ledger_slot = self.acquire_subscription_slots(1).await?;
             if let Ok(class_cap) = self.transient_req_permits.clone().try_acquire_owned() {
                 return Ok(HeldTransientPermits {
                     _class_cap: class_cap,
+                    _byte_limit_gate: byte_limit_gate,
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
                     request_class,
@@ -942,6 +987,7 @@ impl RelayConnection {
             if let Ok(ledger_slot) = self.try_acquire_subscription_slot() {
                 return Ok(HeldTransientPermits {
                     _class_cap: class_cap,
+                    _byte_limit_gate: byte_limit_gate,
                     generation: ledger_slot.generation,
                     _ledger_slot: ledger_slot.permit,
                     request_class,
@@ -986,6 +1032,19 @@ impl RelayConnection {
             .values()
             .map(|held| held.filters.clone())
             .collect()
+    }
+
+    pub fn live_subscription_bytes(&self) -> usize {
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .values()
+            .map(|held| {
+                ClientMessage::req(SubscriptionId::generate(), held.filters.clone())
+                    .as_json()
+                    .len()
+            })
+            .sum()
     }
 
     async fn unsubscribe_live(&self) {
@@ -1252,6 +1311,13 @@ impl RelayConnection {
                         let live_generation = self.release_live_req_permit(&subscription_id);
                         if is_query_rate_limit_message(&msg) {
                             self.record_query_rate_limit();
+                        }
+                        if let Some(limit) = self.record_subscription_byte_limit(&msg) {
+                            tracing::warn!(
+                                relay = %url,
+                                limit,
+                                "Learned remote cumulative subscription-state limit"
+                            );
                         }
                         if is_rate_limit_message(&msg) {
                             // The sync actor emits one canonical signal and owns
@@ -2956,6 +3022,7 @@ mod tests {
             opened_at: std::time::Instant::now(),
             last_event_at: None,
             delivered_events: 0,
+            _byte_limit_gate: None,
             _class_cap: connection
                 .transient_req_permits
                 .clone()
@@ -3097,6 +3164,32 @@ mod tests {
             connection.transient_req_permits.available_permits(),
             MAX_CONCURRENT_TRANSIENT_REQS
         );
+    }
+
+    #[tokio::test]
+    async fn learned_byte_limit_serializes_transient_occupancy() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection
+            .remote_subscription_byte_limit
+            .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
+        let first = connection
+            .acquire_transient_permits(TransientRequestClass::HistoricPage)
+            .await
+            .expect("first byte-limited transient");
+        let waiter_connection = connection.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiter_connection
+                .acquire_transient_permits(TransientRequestClass::HistoricPage)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "a second transient must wait while the byte margin is occupied"
+        );
+        drop(first);
+        drop(waiter.await.expect("transient waiter task").unwrap());
     }
 
     #[tokio::test]

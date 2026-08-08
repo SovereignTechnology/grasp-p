@@ -88,6 +88,14 @@ fn dependency_relay_retention() -> Duration {
     }
 }
 
+fn byte_limited_catchup_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(5 * 60)
+    }
+}
+
 fn select_purgatory_dependency_events(
     mut events: Vec<Event>,
     attempts: &mut HashMap<EventId, Instant>,
@@ -744,6 +752,14 @@ fn is_rate_limit_message(message: &str) -> bool {
         || message.contains("throttl")
 }
 
+fn subscription_state_byte_limit(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "active subscriptions exceed max size ";
+    let tail = lower.split_once(marker)?.1;
+    let digits = tail.split_whitespace().next()?;
+    digits.parse().ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectAttemptToken(u64);
 
@@ -816,6 +832,40 @@ const MAX_FILTERS_PER_REQ: usize = 10;
 /// REQ when chunks are full. See
 /// docs/explanation/sync-scaling-constraints.md.
 const REQ_MESSAGE_BYTE_BUDGET: usize = 96 * 1024;
+/// Leave room for one maximum-sized transient REQ when a relay discloses a
+/// cumulative retained-subscription byte cap. Byte-limited sessions serialize
+/// transient REQs through a matching connection gate.
+const SUBSCRIPTION_BYTE_RESERVED_MARGIN: usize = REQ_MESSAGE_BYTE_BUDGET + 256;
+
+fn req_message_size(filters: &[Filter]) -> usize {
+    ClientMessage::req(SubscriptionId::generate(), filters.to_vec())
+        .as_json()
+        .len()
+}
+
+fn groups_within_subscription_byte_limit(
+    groups: Vec<Vec<Filter>>,
+    limit: Option<usize>,
+    already_used: usize,
+) -> (Vec<Vec<Filter>>, usize) {
+    let Some(limit) = limit else {
+        return (groups, 0);
+    };
+    let live_budget = limit.saturating_sub(SUBSCRIPTION_BYTE_RESERVED_MARGIN);
+    let mut admitted = Vec::new();
+    let mut used = already_used;
+    let mut overflow = 0usize;
+    for group in groups {
+        let size = req_message_size(&group);
+        if used.checked_add(size).is_some_and(|total| total <= live_budget) {
+            used += size;
+            admitted.push(group);
+        } else {
+            overflow += 1;
+        }
+    }
+    (admitted, overflow)
+}
 
 /// Pack filters into REQ-sized groups.
 ///
@@ -1165,7 +1215,12 @@ async fn run_health_and_metrics_checker(
                 // 3. Check for rate limit recovery
                 manager.check_rate_limit_recovery().await;
 
-                // 4. Check for naughty list expiration
+                // 4. Keep deliberately bounded live coverage complete through
+                // paced incremental history rather than retrying an impossible
+                // persistent set.
+                manager.sync_due_byte_limited_relay().await;
+
+                // 5. Check for naughty list expiration
                 if let Some(naughty_list) = manager.health_tracker.naughty_list() {
                     let recovered = naughty_list.expire_old_entries();
                     for url in recovered {
@@ -1176,7 +1231,7 @@ async fn run_health_and_metrics_checker(
                     }
                 }
 
-                // 5. Update metrics with current health states and naughty list
+                // 6. Update metrics with current health states and naughty list
                 if let Some(ref metrics) = manager.metrics {
                     // Get all tracked relay URLs
                     let relay_urls: Vec<String> = {
@@ -1267,6 +1322,9 @@ pub struct SyncManager {
     connect_attempt_semaphore: Arc<Semaphore>,
     /// Relays whose subscription consolidation waits for in-flight batches to drain.
     deferred_consolidations: DeferredConsolidations,
+    /// Relays whose complete persistent filter set exceeds a learned remote
+    /// byte cap, mapped to their next bounded catch-up deadline.
+    byte_limited_live_relays: HashMap<String, Instant>,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
@@ -1366,6 +1424,7 @@ impl SyncManager {
             in_flight_connect_attempts: HashMap::new(),
             connect_attempt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS)),
             deferred_consolidations: DeferredConsolidations::default(),
+            byte_limited_live_relays: HashMap::new(),
             disconnect_tx: None,
             eose_tx: None,
             subscription_closed_tx: None,
@@ -2958,12 +3017,15 @@ impl SyncManager {
             "handle_add_filters: calling sync_live and historic_sync"
         );
 
-        if self
+        if let Err(error) = self
             .sync_live(&action.relay_url, &action.filters)
             .await
-            .is_err()
         {
-            return;
+            tracing::warn!(
+                relay = %action.relay_url,
+                %error,
+                "Live coverage could not be extended; continuing bounded historic sync"
+            );
         }
         self.historic_sync(&action.relay_url, action.filters, action.items, None)
             .await;
@@ -3201,7 +3263,9 @@ impl SyncManager {
                             reason = %reason,
                             "Relay closed a subscription (not a connection close)"
                         );
-                        if is_rate_limit_message(&reason) {
+                        if is_rate_limit_message(&reason)
+                            && subscription_state_byte_limit(&reason).is_none()
+                        {
                             let already_paused =
                                 health_tracker.is_rate_limited(&relay_url_clone);
                             if already_paused {
@@ -3396,6 +3460,18 @@ impl SyncManager {
             ));
         }
         filters
+    }
+
+    async fn desired_items_for_relay(&self, relay_url: &str) -> PendingItems {
+        let index = self.repo_sync_index.read().await;
+        let target = algorithms::derive_relay_targets(&index)
+            .remove(relay_url)
+            .unwrap_or_default();
+        PendingItems {
+            repos: target.repos,
+            state_only_repos: target.state_only_repos,
+            root_events: target.root_events,
+        }
     }
 
     /// Quick reconnect - for disconnections < 15 minutes
@@ -5080,7 +5156,7 @@ impl SyncManager {
         // Replace L1+L2+L3 as one reserved transaction. The connection-level
         // opener rolls every successful group back if a later group fails.
         let connection = match self.connections.get(relay_url) {
-            Some(conn) => conn,
+            Some(conn) => conn.clone(),
             None => {
                 tracing::debug!(
                     relay = %relay_url,
@@ -5100,7 +5176,10 @@ impl SyncManager {
             return false;
         }
 
-        let complete_groups = live_filter_groups(&complete_live);
+        let unbounded_groups = live_filter_groups(&complete_live);
+        let remote_limit = connection.remote_subscription_byte_limit();
+        let (complete_groups, overflow_groups) =
+            groups_within_subscription_byte_limit(unbounded_groups, remote_limit, 0);
         if connection
             .replace_live_filter_groups(complete_groups)
             .await
@@ -5112,11 +5191,23 @@ impl SyncManager {
             );
             return false;
         }
-        self.sync_generic_history(relay_url, Some(since)).await;
+        if overflow_groups > 0 {
+            self.byte_limited_live_relays.insert(
+                relay_url.to_string(),
+                Instant::now() + byte_limited_catchup_interval(),
+            );
+            let items = self.desired_items_for_relay(relay_url).await;
+            self.historic_sync(relay_url, complete_live, items, Some(since))
+                .await;
+        } else {
+            self.byte_limited_live_relays.remove(relay_url);
+            self.sync_generic_history(relay_url, Some(since)).await;
+        }
 
         tracing::info!(
             relay = %relay_url,
             since = %since,
+            overflow_groups,
             "Consolidation complete - filter count reset"
         );
         true
@@ -5129,6 +5220,27 @@ impl SyncManager {
         reason: &str,
         live_generation: Option<u64>,
     ) {
+        if let Some(limit) = subscription_state_byte_limit(reason) {
+            tracing::warn!(
+                relay = %relay_url,
+                limit,
+                "Remote retained-subscription capacity exhausted; rebuilding bounded live coverage"
+            );
+            self.byte_limited_live_relays
+                .insert(relay_url.to_string(), Instant::now());
+            if live_generation.is_none() {
+                let mut pending = self.pending_sync_index.write().await;
+                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id);
+            }
+            let has_pending = self.has_pending_batches(relay_url).await;
+            if self
+                .deferred_consolidations
+                .request(relay_url, has_pending)
+            {
+                let _ = self.consolidate(relay_url).await;
+            }
+            return;
+        }
         if is_rate_limit_message(reason) {
             let removed_batch = {
                 let mut pending = self.pending_sync_index.write().await;
@@ -5183,6 +5295,55 @@ impl SyncManager {
         } else {
             tracing::info!(relay = %relay_url, "Restored complete live coverage after relay CLOSED");
         }
+    }
+
+    async fn sync_due_byte_limited_relay(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .byte_limited_live_relays
+            .iter()
+            .find_map(|(relay, deadline)| (*deadline <= now).then(|| relay.clone()));
+        let Some(relay_url) = due else {
+            return;
+        };
+
+        if self.has_pending_batches(&relay_url).await {
+            self.byte_limited_live_relays.insert(
+                relay_url,
+                now + Duration::from_secs(10),
+            );
+            return;
+        }
+
+        let connected = self
+            .relay_sync_index
+            .read()
+            .await
+            .get(&relay_url)
+            .is_some_and(|state| state.connection_status.is_live_sync_active());
+        if !connected {
+            self.byte_limited_live_relays.insert(
+                relay_url,
+                now + byte_limited_catchup_interval(),
+            );
+            return;
+        }
+
+        self.byte_limited_live_relays.insert(
+            relay_url.clone(),
+            now + byte_limited_catchup_interval(),
+        );
+        let overlap = byte_limited_catchup_interval() + Duration::from_secs(60);
+        let since = Timestamp::from(Timestamp::now().as_secs().saturating_sub(overlap.as_secs()));
+        let filters = self.complete_live_filters(&relay_url, Some(since)).await;
+        let items = self.desired_items_for_relay(&relay_url).await;
+        tracing::info!(
+            relay = %relay_url,
+            since = %since,
+            "Starting paced catch-up for byte-limited persistent coverage"
+        );
+        self.historic_sync(&relay_url, filters, items, Some(since))
+            .await;
     }
 
     /// Check for relays that should be disconnected
@@ -5450,7 +5611,7 @@ impl SyncManager {
     /// # Returns
     /// Vec of subscription IDs for the live subscriptions, or empty if connection not found
     async fn sync_live(
-        &self,
+        &mut self,
         relay_url: &str,
         filters: &[Filter],
     ) -> Result<Vec<SubscriptionId>, String> {
@@ -5459,7 +5620,7 @@ impl SyncManager {
         }
 
         let connection = match self.connections.get(relay_url) {
-            Some(conn) => conn,
+            Some(conn) => conn.clone(),
             None => {
                 tracing::debug!(relay = %relay_url, "No connection found for live sync");
                 return Err(format!("No connection found for live sync on {relay_url}"));
@@ -5467,6 +5628,27 @@ impl SyncManager {
         };
 
         let filter_groups = live_filter_groups(filters);
+        let remote_limit = connection.remote_subscription_byte_limit();
+        let (filter_groups, overflow_groups) = groups_within_subscription_byte_limit(
+            filter_groups,
+            remote_limit,
+            connection.live_subscription_bytes(),
+        );
+        if overflow_groups > 0 {
+            self.byte_limited_live_relays.insert(
+                relay_url.to_string(),
+                Instant::now() + byte_limited_catchup_interval(),
+            );
+            tracing::warn!(
+                relay = %relay_url,
+                remote_limit,
+                overflow_groups,
+                "Persistent coverage bounded by remote subscription-state limit; overflow will use paced catch-up"
+            );
+        }
+        if filter_groups.is_empty() {
+            return Ok(Vec::new());
+        }
         connection
             .subscribe_live_filter_groups(filter_groups)
             .await
@@ -6493,6 +6675,36 @@ mod tests {
             assert!(is_rate_limit_message(message), "missed: {message}");
         }
         assert!(!is_rate_limit_message("blocked: unsupported filter"));
+    }
+
+    #[test]
+    fn subscription_state_limit_parser_is_specific_and_extracts_bytes() {
+        assert_eq!(
+            subscription_state_byte_limit(
+                "rate-limited: active subscriptions exceed max size 1048576 bytes"
+            ),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            subscription_state_byte_limit("rate-limited: too many queries"),
+            None
+        );
+    }
+
+    #[test]
+    fn learned_subscription_byte_limit_reserves_transient_capacity() {
+        let first = vec![Filter::new().kind(Kind::TextNote).limit(0)];
+        let second = vec![Filter::new().kind(Kind::Metadata).limit(0)];
+        let limit = SUBSCRIPTION_BYTE_RESERVED_MARGIN + req_message_size(&first);
+
+        let (admitted, overflow) = groups_within_subscription_byte_limit(
+            vec![first.clone(), second],
+            Some(limit),
+            0,
+        );
+
+        assert_eq!(admitted, vec![first]);
+        assert_eq!(overflow, 1);
     }
 
     #[test]
