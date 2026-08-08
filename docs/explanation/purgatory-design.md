@@ -348,6 +348,8 @@ fetch_repository_data_with_purgatory() checks DB + purgatory
 The protocol specifies 30-minute expiry for announcements. We implement a two-phase soft expiry:
 
 **Phase 1 — Initial 30-minute expiry (`soft_expired == false`):**
+- Defer the expiry sweep while a concrete background Git sync for the
+  repository is actively running
 - Delete the bare git repo (frees disk space, respects protocol expiry)
 - Set `soft_expired = true`
 - Extend `expires_at` by 24 hours (`SOFT_EXPIRY_EXTENDED`)
@@ -377,6 +379,14 @@ The 30-minute purgatory timer is reset (extended) in three scenarios:
 | Replacement announcement arrives | `AnnouncementPolicy::validate()` | Announcement updated |
 
 All three call `purgatory.extend_announcement_expiry(owner, identifier, 1800s)`.
+
+Background Git synchronization does not reset the 30-minute deadline. Instead,
+the expiry sweep skips matching announcements, state events and PR events only
+while `sync_identifier` is actively running. This lets a large but healthy
+clone finish without allowing an unavailable repository to live forever:
+queue entries waiting for their next attempt or in backoff remain eligible for
+normal expiry. When active work finishes, it either promotes the satisfied
+events or the next sweep expires any still-unsatisfied entries.
 
 ### Purgatory Lifecycle
 

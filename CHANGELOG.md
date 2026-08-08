@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep purgatory announcements, state events, and PR events alive while a
+  concrete background Git sync for their repository is actively running. A
+  large healthy clone can exceed the nominal 30-minute purgatory window;
+  queued and backoff-only work remains eligible for normal expiry so broken
+  repositories cannot extend retention indefinitely.
 - Preserve purgatory and rejected-event recovery across abrupt termination.
   Their snapshots now remain after restore and are atomically replaced every
   60 seconds, bounding crash loss to one interval instead of consuming the

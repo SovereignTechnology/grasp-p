@@ -307,6 +307,8 @@ pub struct Purgatory {
 5. **Automatic Expiry**: 30-minute default expiry, extensible during processing
    - Background cleanup task runs every 60 seconds
    - Removes expired entries from all stores
+   - Defers matching expiry while a concrete background Git sync is actively
+     running; queued/backoff work receives no extension
 
 #### Data Types
 
