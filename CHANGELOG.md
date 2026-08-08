@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pace query starts after a relay reports its per-connection query-rate budget
+  is exhausted, preventing fixed cooldown recovery from replaying the same
+  fast historic-sync burst indefinitely. If an SDK-managed NIP-77 exchange
+  exhausts that budget, use paced REQs for the rest of the connection session
+  because the application cannot pace individual `NEG-MSG` frames. This is a
+  reactive compatibility backstop for an unadvertised limit; proactive pacing
+  of lower-priority historic work remains separate so live coverage is not
+  delayed.
+
 ## [2.1.0] - 2026-08-07
 
 ngit-grasp 2.1.0 substantially improves proactive repository-event sync

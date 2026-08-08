@@ -35,7 +35,7 @@ const DEFAULT_MAX_BACKOFF_SECS: u64 = 3600;
 const DEFAULT_BASE_BACKOFF_SECS: u64 = 5;
 
 /// Rate limit cooldown duration in seconds (65 seconds = typical 60s limit + buffer)
-const RATE_LIMIT_COOLDOWN_SECS: u64 = 65;
+pub(super) const RATE_LIMIT_COOLDOWN_SECS: u64 = 65;
 
 /// Stability period after recovery before marking relay as fully healthy (5 minutes)
 /// A relay must maintain connection for this duration after failures before being marked Healthy

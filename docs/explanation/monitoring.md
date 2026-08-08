@@ -146,6 +146,15 @@ The `ngit_sync_relay_status` metric tracks relay health:
 - `4` = **Dead** - 24h+ of continuous failures
 - `5` = **RateLimited** - Rate limit cooldown active (65s)
 
+After a `too many queries` response, `Activated adaptive query-start pacing`
+reports the learned per-connection interval. It begins at 600 ms and doubles
+only when a distinct later episode proves that pace too fast. Queued starts
+unwind during the existing 65-second cooldown before paced recovery;
+reconnecting starts a fresh session without pacing.
+`Falling back to paced REQs for the query-limited connection session` means
+NIP-77 remains skipped until reconnect because SDK-managed `NEG-MSG` traffic
+cannot be passed individually through the learned gate.
+
 ### Example Grafana Queries
 
 ```promql
