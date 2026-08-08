@@ -801,18 +801,23 @@ or `q` tags reference that direct member.
 - auxiliary subscriptions are tracked separately and retired before core
   consolidation or restoration, so they never enter the core rollback set;
 - when the complete live set does not fit, one EOSE-closing filter starts on
-  the existing maintenance cadence through the ordinary historic queue,
-  pagination, shared ledger, and request pacing;
-- the fallback receives a complete initial pass, then rolling 24-hour passes;
-  and
+  each constrained relay on the existing five-second maintenance cadence,
+  through the ordinary historic queue, pagination, shared ledger, and request
+  pacing;
+- ordinary historic batches include the currently known direct-member filters;
+- fallback filters keep an in-memory cursor, advance it only after successful
+  EOSE, and query from the preceding successful upper bound with 15 minutes of
+  overlap; and
 - recovered descendants never enter the frontier, so this is deliberately one
   additional generation rather than recursive thread traversal.
 
 An unexpected auxiliary CLOSED retires the remaining descendant subscriptions
-without rebuilding core coverage and falls back to history. Reconnect and daily
-reconciliation reconstruct the mode from current session capacity. This keeps
-the feature complete without durable cursors, another capacity ledger, or
-multi-connection sharding.
+without rebuilding core coverage and falls back to history. A filter already
+queued or active blocks another fallback filter for that relay; failure leaves
+the same filter and cursor at the head. Reconnect and daily reconciliation
+reconstruct the mode from current session capacity. This keeps the feature
+complete without durable cursors, another capacity ledger, request-class
+priority, or multi-connection sharding.
 
 ### Combined Layer 2+3 (SyncLevel-Aware)
 

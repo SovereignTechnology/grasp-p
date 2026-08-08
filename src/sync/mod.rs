@@ -65,7 +65,7 @@ const MAX_PURGATORY_FILTER_ACTIONS_PER_TICK: usize = 1;
 const MAX_PURGATORY_DEPENDENCY_IDS_PER_QUERY: usize = 100;
 const SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS: usize = 20;
 const SEMANTIC_FALLBACK_MAX_DELIVERED_PERCENT: usize = 10;
-const DESCENDANT_RECENT_WINDOW_SECS: u64 = 24 * 60 * 60;
+const DESCENDANT_FALLBACK_OVERLAP_SECS: u64 = 15 * 60;
 
 fn should_use_semantic_fallback(requested_count: usize, received_count: usize) -> bool {
     requested_count >= SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS
@@ -702,9 +702,22 @@ pub enum PendingBatchPurpose {
 #[derive(Debug)]
 struct DescendantSyncRotation {
     frontier: HashSet<EventId>,
-    filters: Vec<Filter>,
+    filters: Vec<DescendantFilterCursor>,
     next_filter: usize,
-    historic: bool,
+    in_flight: Option<DescendantFilterInFlight>,
+}
+
+#[derive(Debug)]
+struct DescendantFilterCursor {
+    filter: Filter,
+    last_successful_until: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DescendantFilterInFlight {
+    batch_id: u64,
+    filter_index: usize,
+    until: Timestamp,
 }
 
 #[derive(Debug)]
@@ -719,25 +732,65 @@ impl Default for DescendantSyncRotation {
             frontier: HashSet::new(),
             filters: Vec::new(),
             next_filter: 0,
-            historic: true,
+            in_flight: None,
         }
     }
 }
 
 impl DescendantSyncRotation {
-    fn refresh(&mut self, members: HashSet<EventId>, now: Timestamp) {
-        if self.historic
-            && !self.filters.is_empty()
-            && self.next_filter >= self.filters.len()
-            && self.frontier == members
-        {
-            self.historic = false;
-        }
+    fn refresh(&mut self, members: HashSet<EventId>) {
+        let previous: HashMap<String, Option<Timestamp>> = self
+            .filters
+            .drain(..)
+            .map(|cursor| (cursor.filter.as_json(), cursor.last_successful_until))
+            .collect();
         self.frontier = members.clone();
-        let since = (!self.historic)
-            .then(|| Timestamp::from(now.as_secs().saturating_sub(DESCENDANT_RECENT_WINDOW_SECS)));
-        self.filters = filters::tagged_one_of_our_root_event_filters(&members, since);
+        self.filters = filters::tagged_one_of_our_root_event_filters(&members, None)
+            .into_iter()
+            .map(|filter| DescendantFilterCursor {
+                last_successful_until: previous.get(&filter.as_json()).copied().flatten(),
+                filter,
+            })
+            .collect();
         self.next_filter = 0;
+        self.in_flight = None;
+    }
+
+    fn next_request(&self, now: Timestamp) -> Option<(usize, Filter, Timestamp)> {
+        if self.in_flight.is_some() || self.filters.is_empty() {
+            return None;
+        }
+        let filter_index = self.next_filter % self.filters.len();
+        let cursor = &self.filters[filter_index];
+        let mut filter = cursor.filter.clone().until(now);
+        if let Some(last_until) = cursor.last_successful_until {
+            filter = filter.since(Timestamp::from(
+                last_until
+                    .as_secs()
+                    .saturating_sub(DESCENDANT_FALLBACK_OVERLAP_SECS),
+            ));
+        }
+        Some((filter_index, filter, now))
+    }
+
+    fn mark_started(&mut self, batch_id: u64, filter_index: usize, until: Timestamp) {
+        self.in_flight = Some(DescendantFilterInFlight {
+            batch_id,
+            filter_index,
+            until,
+        });
+    }
+
+    fn mark_completed(&mut self, batch_id: u64, succeeded: bool) -> bool {
+        let Some(in_flight) = self.in_flight.filter(|request| request.batch_id == batch_id) else {
+            return false;
+        };
+        self.in_flight = None;
+        if succeeded {
+            self.filters[in_flight.filter_index].last_successful_until = Some(in_flight.until);
+            self.next_filter = (in_flight.filter_index + 1) % self.filters.len();
+        }
+        true
     }
 }
 
@@ -1226,9 +1279,9 @@ async fn run_daily_timer(
 /// (see [`missing_events`]). Recovery attempts are backed off per relay, so
 /// the tick itself stays cheap when nothing is due.
 ///
-/// Finally, one relay at a time receives one low-priority repository-descendant
-/// history query. Reusing this five-second maintenance cadence bounds the new
-/// global query-start rate without another scheduler or configuration surface.
+/// Finally, one relay's live descendant admission is reconciled and every
+/// constrained relay may advance one queued descendant history query. Reusing
+/// this five-second cadence avoids another scheduler or configuration surface.
 async fn run_purgatory_announcement_sync(
     sync_manager: Arc<Mutex<SyncManager>>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -1478,8 +1531,8 @@ pub struct SyncManager {
     /// Auxiliary persistent descendant coverage, kept separate from the core
     /// desired set so it can be retired without replacing healthy core REQs.
     descendant_live_coverage: HashMap<String, DescendantLiveCoverage>,
-    /// Round-robin cursor so the maintenance loop starts at most one extra
-    /// query globally per tick.
+    /// Round-robin cursor so only one relay performs descendant live-mode
+    /// derivation and admission work per maintenance tick.
     descendant_relay_cursor: usize,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
@@ -2584,11 +2637,17 @@ impl SyncManager {
         let sync_method = batch.sync_method;
         let is_generic_filter = batch.purpose == PendingBatchPurpose::Announcements;
 
-        if batch.failed && batch.purpose == PendingBatchPurpose::Descendants {
-            // Do not let an interrupted page turn the initial complete pass
-            // into a recent-only rotation. Starting this tiny auxiliary state
-            // afresh is simpler and safer than persisting per-filter cursors.
-            self.descendant_sync_rotations.remove(relay_url);
+        if batch.purpose == PendingBatchPurpose::Descendants {
+            let succeeded = !batch.failed;
+            if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
+                rotation.mark_completed(batch_id, succeeded);
+            }
+            tracing::info!(
+                relay = %relay_url,
+                batch_id,
+                succeeded,
+                "Descendant historic query reached terminal batch state"
+            );
         }
 
         let mut relay_index = self.relay_sync_index.write().await;
@@ -3697,12 +3756,142 @@ impl SyncManager {
         true
     }
 
-    /// Start at most one low-priority descendant query globally per tick.
-    ///
-    /// Each relay first receives a complete historic pass over a stable
-    /// snapshot of direct thread members. Later passes use a rolling 24-hour
-    /// window. Every request uses the ordinary historic REQ+EOSE pagination
-    /// path, so it draws from the existing ledger and closes at EOSE.
+    async fn reconcile_descendant_mode(
+        &mut self,
+        relay_url: &str,
+        root_events: &HashSet<EventId>,
+    ) {
+        let members = self.direct_thread_members(root_events).await;
+        if members.is_empty() {
+            let _ = self
+                .close_descendant_live_coverage(relay_url, "frontier became empty")
+                .await;
+            self.descendant_sync_rotations.remove(relay_url);
+            return;
+        }
+        if self
+            .descendant_live_coverage
+            .get(relay_url)
+            .is_some_and(|coverage| coverage.frontier == members)
+        {
+            return;
+        }
+        if self.descendant_live_coverage.contains_key(relay_url)
+            && !self
+                .close_descendant_live_coverage(relay_url, "frontier changed")
+                .await
+        {
+            return;
+        }
+
+        let live_since = Timestamp::from(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(DESCENDANT_FALLBACK_OVERLAP_SECS),
+        );
+        let historic_filters = filters::tagged_one_of_our_root_event_filters(&members, None);
+        let live_filters =
+            filters::tagged_one_of_our_root_event_filters(&members, Some(live_since));
+        if let Some(connection) = self.connections.get(relay_url).cloned() {
+            let groups = live_filter_groups(&live_filters, connection.max_filters_per_req());
+            if connection.can_admit_auxiliary_live_groups(&groups) {
+                match connection
+                    .subscribe_auxiliary_live_filter_groups(groups)
+                    .await
+                {
+                    Ok(subscription_ids) => {
+                        let filter_count = live_filters.len();
+                        self.descendant_live_coverage.insert(
+                            relay_url.to_string(),
+                            DescendantLiveCoverage {
+                                frontier: members,
+                                subscription_ids: subscription_ids.clone(),
+                            },
+                        );
+                        self.descendant_sync_rotations.remove(relay_url);
+                        tracing::info!(
+                            relay = %relay_url,
+                            filter_count,
+                            subscription_count = subscription_ids.len(),
+                            "Installed auxiliary descendant live coverage"
+                        );
+                        // `limit:0` protects the future only. Pair every new
+                        // live frontier with a complete EOSE-closing baseline
+                        // so events stored before admission are not skipped.
+                        let _ = self
+                            .historic_sync_with_options(
+                                relay_url,
+                                historic_filters,
+                                PendingItems::default(),
+                                None,
+                                PendingBatchPurpose::Descendants,
+                                true,
+                            )
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            %error,
+                            "Descendant live admission failed; using historic rotation"
+                        );
+                    }
+                }
+            } else {
+                tracing::info!(
+                    relay = %relay_url,
+                    filter_count = live_filters.len(),
+                    "Descendant live coverage does not fit while preserving historic capacity"
+                );
+            }
+        }
+
+        let rotation = self
+            .descendant_sync_rotations
+            .entry(relay_url.to_string())
+            .or_default();
+        if rotation.frontier != members {
+            rotation.refresh(members);
+        }
+    }
+
+    async fn start_descendant_fallback(&mut self, relay_url: &str) {
+        let Some((filter_index, filter, until)) = self
+            .descendant_sync_rotations
+            .get(relay_url)
+            .and_then(|rotation| rotation.next_request(Timestamp::now()))
+        else {
+            return;
+        };
+        let filter_count = self.descendant_sync_rotations[relay_url].filters.len();
+        if let Some(batch_id) = self
+            .historic_sync_with_options(
+                relay_url,
+                vec![filter],
+                PendingItems::default(),
+                None,
+                PendingBatchPurpose::Descendants,
+                true,
+            )
+            .await
+        {
+            if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
+                rotation.mark_started(batch_id, filter_index, until);
+            }
+            tracing::info!(
+                relay = %relay_url,
+                batch_id,
+                filter_index,
+                filter_count,
+                until = until.as_secs(),
+                "Started queued descendant fallback query"
+            );
+        }
+    }
+
+    /// Reconcile one live-mode decision and advance every constrained relay by
+    /// at most one EOSE-closing request on each five-second maintenance tick.
     async fn tick_descendant_sync(&mut self) {
         let targets = {
             let index = self.repo_sync_index.read().await;
@@ -3730,128 +3919,21 @@ impl SyncManager {
             return;
         }
 
-        let relay_url = relay_urls[self.descendant_relay_cursor % relay_urls.len()].clone();
+        let reconcile_relay =
+            relay_urls[self.descendant_relay_cursor % relay_urls.len()].clone();
         self.descendant_relay_cursor = self.descendant_relay_cursor.wrapping_add(1);
-        let root_events = targets[&relay_url].root_events.clone();
+        self.reconcile_descendant_mode(
+            &reconcile_relay,
+            &targets[&reconcile_relay].root_events,
+        )
+        .await;
 
-        let mut refreshed_members = None;
-        if let Some(existing) = self.descendant_live_coverage.get(&relay_url) {
-            let members = self.direct_thread_members(&root_events).await;
-            if members == existing.frontier {
-                return;
-            }
-            refreshed_members = Some(members);
-            if !self
-                .close_descendant_live_coverage(&relay_url, "frontier changed")
-                .await
-            {
-                return;
-            }
-        }
-
-        let needs_snapshot = self
-            .descendant_sync_rotations
-            .get(&relay_url)
-            .is_none_or(|rotation| rotation.next_filter >= rotation.filters.len());
-        if needs_snapshot {
-            let members = match refreshed_members {
-                Some(members) => members,
-                None => self.direct_thread_members(&root_events).await,
-            };
-            if members.is_empty() {
-                return;
-            }
-
-            let now = Timestamp::now();
-            let live_since = Timestamp::from(
-                now.as_secs()
-                    .saturating_sub(DESCENDANT_RECENT_WINDOW_SECS.min(15 * 60)),
-            );
-            let live_filters = filters::tagged_one_of_our_root_event_filters(
-                &members,
-                Some(live_since),
-            );
-            if let Some(connection) = self.connections.get(&relay_url).cloned() {
-                let groups = live_filter_groups(&live_filters, connection.max_filters_per_req());
-                if connection.can_admit_auxiliary_live_groups(&groups) {
-                    match connection
-                        .subscribe_auxiliary_live_filter_groups(groups)
-                        .await
-                    {
-                        Ok(subscription_ids) => {
-                            let filter_count = live_filters.len();
-                            self.descendant_live_coverage.insert(
-                                relay_url.clone(),
-                                DescendantLiveCoverage {
-                                    frontier: members,
-                                    subscription_ids: subscription_ids.clone(),
-                                },
-                            );
-                            self.descendant_sync_rotations.remove(&relay_url);
-                            tracing::info!(
-                                relay = %relay_url,
-                                filter_count,
-                                subscription_count = subscription_ids.len(),
-                                "Installed auxiliary descendant live coverage"
-                            );
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                relay = %relay_url,
-                                %error,
-                                "Descendant live admission failed; using historic rotation"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::info!(
-                        relay = %relay_url,
-                        filter_count = live_filters.len(),
-                        "Descendant live coverage does not fit while preserving historic capacity"
-                    );
-                }
-            }
-
-            let rotation = self
-                .descendant_sync_rotations
-                .entry(relay_url.clone())
-                .or_default();
-            rotation.refresh(members, Timestamp::now());
-        }
-
-        let (filter, historic, filter_index, filter_count) = {
-            let rotation = self.descendant_sync_rotations.get(&relay_url).unwrap();
-            (
-                rotation.filters[rotation.next_filter].clone(),
-                rotation.historic,
-                rotation.next_filter,
-                rotation.filters.len(),
-            )
-        };
-        if self
-            .historic_sync_with_options(
-                &relay_url,
-                vec![filter],
-                PendingItems::default(),
-                None,
-                PendingBatchPurpose::Descendants,
-                true,
-            )
-            .await
-            .is_some()
-        {
-            self.descendant_sync_rotations
-                .get_mut(&relay_url)
-                .unwrap()
-                .next_filter += 1;
-            tracing::debug!(
-                relay = %relay_url,
-                historic,
-                filter_index,
-                filter_count,
-                "Started scheduled repository descendant query"
-            );
+        let constrained: Vec<String> = relay_urls
+            .into_iter()
+            .filter(|relay_url| self.descendant_sync_rotations.contains_key(relay_url))
+            .collect();
+        for relay_url in constrained {
+            self.start_descendant_fallback(&relay_url).await;
         }
     }
 
@@ -5647,6 +5729,14 @@ impl SyncManager {
         true
     }
 
+    fn release_removed_descendant_batch(&mut self, relay_url: &str, batch: &PendingBatch) {
+        if batch.purpose == PendingBatchPurpose::Descendants {
+            if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
+                rotation.mark_completed(batch.batch_id, false);
+            }
+        }
+    }
+
     async fn handle_subscription_closed(
         &mut self,
         relay_url: &str,
@@ -5672,7 +5762,7 @@ impl SyncManager {
             self.descendant_sync_rotations
                 .entry(relay_url.to_string())
                 .or_default()
-                .refresh(coverage.frontier, Timestamp::now());
+                .refresh(coverage.frontier);
             tracing::warn!(
                 relay = %relay_url,
                 sub_id = %subscription_id,
@@ -5690,9 +5780,14 @@ impl SyncManager {
             );
             self.byte_limited_live_relays
                 .insert(relay_url.to_string(), Instant::now());
-            if live_generation.is_none() {
+            let removed_batch = if live_generation.is_none() {
                 let mut pending = self.pending_sync_index.write().await;
-                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id);
+                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
+            } else {
+                None
+            };
+            if let Some(batch) = &removed_batch {
+                self.release_removed_descendant_batch(relay_url, batch);
             }
             let has_pending = self.has_pending_batches(relay_url).await;
             if self
@@ -5710,6 +5805,7 @@ impl SyncManager {
             };
 
             if let Some(batch) = removed_batch {
+                self.release_removed_descendant_batch(relay_url, &batch);
                 tracing::warn!(
                     relay = %relay_url,
                     sub_id = %subscription_id,
@@ -5764,7 +5860,8 @@ impl SyncManager {
                             &subscription_id,
                         )
                     };
-                    if removed_batch.is_some() {
+                    if let Some(batch) = &removed_batch {
+                        self.release_removed_descendant_batch(relay_url, batch);
                         self.recompute_new_sync_filters_for_relay(relay_url).await;
                     } else if let Some(generation) = live_generation {
                         self.restore_live_coverage_after_closed(relay_url, generation)
@@ -5780,6 +5877,9 @@ impl SyncManager {
                 let mut pending = self.pending_sync_index.write().await;
                 take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
             };
+            if let Some(batch) = &removed_batch {
+                self.release_removed_descendant_batch(relay_url, batch);
+            }
             self.health_tracker.record_policy_refusal(relay_url);
             if let Some(metrics) = &self.metrics {
                 metrics.record_policy_refusal(relay_url, category.label());
@@ -6311,10 +6411,16 @@ impl SyncManager {
     async fn historic_sync(
         &mut self,
         relay_url: &str,
-        filters: Vec<Filter>,
+        mut filters: Vec<Filter>,
         items: PendingItems,
         since: Option<Timestamp>,
     ) -> Option<u64> {
+        if !items.root_events.is_empty() {
+            let members = self.direct_thread_members(&items.root_events).await;
+            filters.extend(filters::tagged_one_of_our_root_event_filters(
+                &members, None,
+            ));
+        }
         self.historic_sync_with_options(
             relay_url,
             filters,
@@ -6742,30 +6848,57 @@ mod tests {
     }
 
     #[test]
-    fn descendant_rotation_becomes_recent_only_after_a_stable_historic_pass() {
+    fn descendant_rotation_advances_cursor_only_after_successful_eose() {
         let member = EventId::from_byte_array([7; 32]);
         let members = HashSet::from([member]);
         let now = Timestamp::from_secs(200_000);
         let mut rotation = DescendantSyncRotation::default();
 
-        rotation.refresh(members.clone(), now);
-        assert!(rotation.historic);
-        assert!(rotation
-            .filters
-            .iter()
-            .all(|filter| !serde_json::to_value(filter)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .contains_key("since")));
+        rotation.refresh(members);
+        let (filter_index, first, until) = rotation.next_request(now).unwrap();
+        assert!(serde_json::to_value(first).unwrap().get("since").is_none());
+        rotation.mark_started(41, filter_index, until);
+        assert!(rotation.next_request(now).is_none());
 
-        rotation.next_filter = rotation.filters.len();
-        rotation.refresh(members, now);
-        assert!(!rotation.historic);
-        assert!(rotation.filters.iter().all(|filter| {
-            serde_json::to_value(filter).unwrap()["since"]
-                == serde_json::json!(now.as_secs() - DESCENDANT_RECENT_WINDOW_SECS)
-        }));
+        assert!(rotation.mark_completed(41, false));
+        let (retry_index, retry, retry_until) = rotation.next_request(now).unwrap();
+        assert_eq!(retry_index, filter_index);
+        assert!(serde_json::to_value(retry).unwrap().get("since").is_none());
+        rotation.mark_started(42, retry_index, retry_until);
+        assert!(rotation.mark_completed(42, true));
+
+        // Complete the other two e/E/q variants so the rotation returns to
+        // the first filter with its successful cursor and overlap.
+        for batch_id in [43, 44] {
+            let (index, _, upper) = rotation.next_request(now).unwrap();
+            rotation.mark_started(batch_id, index, upper);
+            assert!(rotation.mark_completed(batch_id, true));
+        }
+        let (_, recent, _) = rotation.next_request(Timestamp::from_secs(201_000)).unwrap();
+        assert_eq!(
+            serde_json::to_value(recent).unwrap()["since"],
+            serde_json::json!(now.as_secs() - DESCENDANT_FALLBACK_OVERLAP_SECS)
+        );
+    }
+
+    #[test]
+    fn large_descendant_frontier_splits_across_live_subscriptions() {
+        let members: HashSet<EventId> = (0..600u32)
+            .map(|index| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&index.to_be_bytes());
+                EventId::from_byte_array(bytes)
+            })
+            .collect();
+        let filters = filters::tagged_one_of_our_root_event_filters(&members, None);
+        let groups = live_filter_groups(&filters, MAX_FILTERS_PER_REQ);
+
+        assert!(filters.len() > 3, "the frontier must span byte chunks");
+        assert!(
+            groups.len() > 1,
+            "large complete descendant coverage must reserve several subscriptions"
+        );
+        assert!(groups.iter().all(|group| group.len() <= MAX_FILTERS_PER_REQ));
     }
 
     #[test]
