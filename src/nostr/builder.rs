@@ -43,6 +43,15 @@ use crate::sync::rejected_index::RejectedEventsIndex;
 /// tighter operation quotas in charge of valid protocol work.
 const CLIENT_MESSAGES_PER_MINUTE: u32 = 6_000;
 
+/// Temporary compatibility override for rust-nostr 0.45's newly introduced
+/// 120-query-per-minute default.
+///
+/// A finite per-connection bound remains useful as one DoS layer, but 120 is
+/// too restrictive for legitimate sync and NIP-77 currently charges every
+/// SDK-managed `NEG-MSG` continuation against the same allowance. Re-evaluate
+/// this 10× value after upstream separates or otherwise revises that accounting.
+const CLIENT_QUERIES_PER_MINUTE: u32 = 1_200;
+
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
 /// Acts as the top-level admission gate and router.  Each incoming event is:
@@ -1021,7 +1030,7 @@ pub async fn create_relay(
             max_reqs: config.relay_max_subscriptions,
             notes_per_minute: 60,
         })
-        .queries_per_minute(120)
+        .queries_per_minute(CLIENT_QUERIES_PER_MINUTE)
         .auth_events_per_minute(30)
         .messages_per_minute(CLIENT_MESSAGES_PER_MINUTE)
         .max_websocket_message_size(5 * 1024 * 1024)

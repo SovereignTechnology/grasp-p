@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Temporarily override rust-nostr 0.45's newly introduced LocalRelay query
+  allowance from 120 to 1,200 messages per minute per connection. This retains
+  a finite DoS backstop while avoiding an unusually restrictive default that
+  also charges every SDK-managed NIP-77 `NEG-MSG` continuation. Re-evaluate
+  the 10× allowance after upstream revises that NIP-77 accounting.
 - Pace query starts after a relay reports its per-connection query-rate budget
   is exhausted, preventing fixed cooldown recovery from replaying the same
   fast historic-sync burst indefinitely. If an SDK-managed NIP-77 exchange

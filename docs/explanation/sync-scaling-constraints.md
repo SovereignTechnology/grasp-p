@@ -170,7 +170,7 @@ though they advertise the larger accepted `max_limit`.
 #### Admission and rate limits (condensed)
 
 Native rate limiting varies wildly and is invisible to clients. Our own
-embedded relay enforces per-connection per-minute quotas (120 queries, 6,000
+embedded relay enforces per-connection per-minute quotas (1,200 queries, 6,000
 WebSocket messages, 60 event writes); nostream ships per-IP connection-attempt
 and kind-specific event quotas with EWMA decay; khatru and haven offer
 discrete leaky counters that drain over minutes; nostr-rs-relay, relayer,
@@ -190,6 +190,9 @@ itself because a hostile client can multiply connections; per-IP admission and
 global resource bounds address that threat more directly. rust-nostr also
 charges SDK-managed NIP-77 `NEG-MSG` continuation frames to this same bucket,
 so one application-started reconciliation can consume multiple query tokens.
+ngit-grasp temporarily overrides that default to 1,200 queries/minute while
+retaining a finite per-connection backstop. Re-evaluate the 10× value after
+upstream separates or otherwise revises NIP-77 continuation accounting.
 
 NIP-11 describes hard relay limitations, not rate-limit algorithms. The
 standard fields relevant here are `max_limit` and
