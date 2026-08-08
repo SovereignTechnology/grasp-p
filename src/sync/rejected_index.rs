@@ -1092,9 +1092,10 @@ impl RejectedEventsIndex {
             },
         };
 
-        // Serialize to JSON and write to file
+        // Replace the previous checkpoint only after the new snapshot is
+        // complete and durable. An abrupt stop must leave one valid version.
         let json = serde_json::to_string_pretty(&state)?;
-        std::fs::write(path, json)?;
+        crate::atomic_file::write(path, json.as_bytes())?;
 
         Ok(())
     }
@@ -1103,7 +1104,9 @@ impl RejectedEventsIndex {
     ///
     /// Loads the serialized state from disk and populates both hot cache and cold index.
     /// Adjusts all timestamps by adding the downtime duration (time since save) to maintain
-    /// correct expiry behavior. Deletes the state file after successful restore.
+    /// correct expiry behavior. The checkpoint remains in place until a newer
+    /// periodic or shutdown snapshot atomically replaces it, so another crash
+    /// before graceful shutdown cannot erase all recovery history.
     ///
     /// # Arguments
     ///
@@ -1192,13 +1195,12 @@ impl RejectedEventsIndex {
             unrecoverable_entries.insert(event_id, entry);
         }
 
-        // Release locks before deleting file
+        // Release locks after the complete snapshot has been restored. Keep the
+        // checkpoint: it is the last crash-safe state until the periodic writer
+        // replaces it.
         drop(hot_entries);
         drop(cold_entries);
         drop(unrecoverable_entries);
-
-        // Delete the state file after successful restore
-        std::fs::remove_file(path)?;
 
         Ok(())
     }
@@ -1774,12 +1776,18 @@ mod tests {
             RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         index2.restore_from_disk(&state_path).unwrap();
 
-        // Verify state file was deleted after restore
-        assert!(!state_path.exists());
+        // The last durable checkpoint remains available after restore.
+        assert!(state_path.exists());
 
         // Verify hot cache restored
         assert_eq!(index2.hot_cache_len(), 1);
         assert!(index2.hot_cache.contains(&event.id));
+
+        // A second startup before the next checkpoint restores the same state.
+        let index3 =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        index3.restore_from_disk(&state_path).unwrap();
+        assert!(index3.hot_cache.contains(&event.id));
 
         // Verify cold index restored
         assert_eq!(index2.cold_index_len(), 1);
@@ -1963,8 +1971,8 @@ mod tests {
             RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         index2.restore_from_disk(&state_path).unwrap();
 
-        // File should be deleted after successful restore
-        assert!(!state_path.exists());
+        // The checkpoint remains crash-safe after successful restore.
+        assert!(state_path.exists());
     }
 
     #[tokio::test]

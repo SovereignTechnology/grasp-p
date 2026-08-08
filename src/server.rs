@@ -34,6 +34,10 @@ use crate::{
     sync::{naughty_list::NaughtyListTracker, rejected_index::RejectedEventsIndex, SyncManager},
 };
 
+/// Limits recovery work lost to an abrupt process or machine stop without
+/// turning every in-memory mutation into synchronous disk I/O.
+const SYNC_STATE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// A fully-wired relay that has bound its listener but not yet started
 /// accepting connections.
 ///
@@ -253,6 +257,32 @@ impl RelayServer {
             sync_manager.run().await;
         }));
 
+        // Retain a recent durable copy after startup. Restore deliberately
+        // leaves the prior checkpoint in place, and these atomic replacements
+        // bound any later crash loss to one interval.
+        let checkpoint_purgatory = purgatory.clone();
+        let checkpoint_rejected = rejected_events_index.clone();
+        let checkpoint_root = PathBuf::from(config.effective_git_data_path());
+        background_tasks.push(tokio::spawn(async move {
+            let first = tokio::time::Instant::now() + SYNC_STATE_CHECKPOINT_INTERVAL;
+            let mut interval = tokio::time::interval_at(first, SYNC_STATE_CHECKPOINT_INTERVAL);
+            loop {
+                interval.tick().await;
+                let purgatory_path = checkpoint_root.join("purgatory-state.json");
+                if let Err(error) = checkpoint_purgatory.save_to_disk(&purgatory_path) {
+                    warn!(%error, "Failed to checkpoint purgatory state");
+                }
+                let rejected_path = checkpoint_root.join("rejected-events-cache.json");
+                if let Err(error) = checkpoint_rejected.save_to_disk(&rejected_path) {
+                    warn!(%error, "Failed to checkpoint rejected-events cache");
+                }
+            }
+        }));
+        info!(
+            interval_secs = SYNC_STATE_CHECKPOINT_INTERVAL.as_secs(),
+            "Crash-safe sync-state checkpoint task started"
+        );
+
         // Spawn background cleanup task for purgatory entries (60s interval)
         let cleanup_purgatory = purgatory.clone();
         background_tasks.push(tokio::spawn(async move {
@@ -367,9 +397,9 @@ impl RelayServer {
     /// itself fails), then persist state and tear down background tasks.
     ///
     /// The shutdown sequence mirrors the binary's signal handling: stop the
-    /// holding-cleanup task gracefully, save purgatory state and the
-    /// rejected-events cache to disk, remove placeholder `refs/nostr/`
-    /// refs, and abort the remaining background loops.
+    /// holding-cleanup task gracefully, stop background mutation, save
+    /// purgatory state and the rejected-events cache to disk, and remove
+    /// placeholder `refs/nostr/` refs.
     pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         info!("Starting HTTP server on {}", self.config.bind_address);
 
@@ -393,6 +423,14 @@ impl RelayServer {
                 Ok(())
             }
         };
+
+        // Stop and join all state-mutating background loops before taking the
+        // final snapshot. This also prevents an older periodic checkpoint from
+        // racing and replacing the shutdown snapshot after it is written.
+        for task in self.background_tasks {
+            task.abort();
+            let _ = task.await;
+        }
 
         self.deletion_cleanup.shutdown().await;
 
@@ -424,12 +462,6 @@ impl RelayServer {
                 placeholder_ids.len()
             );
             git::cleanup_placeholder_refs(&self.git_data_path, &placeholder_ids);
-        }
-
-        // Abort detached background loops so the host process does not
-        // accumulate live tasks (and the state they capture) per instance.
-        for task in self.background_tasks {
-            task.abort();
         }
 
         result

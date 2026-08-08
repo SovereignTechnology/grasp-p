@@ -68,9 +68,11 @@ runtime:
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
 - Set up shared storage (LMDB or Memory), purgatory, sync manager, and
   background maintenance tasks
+- Atomically checkpoint purgatory and rejected-event recovery state every 60
+  seconds without consuming the checkpoint during restore
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
-  resolves, then persist state (purgatory, rejected-events cache,
-  placeholder ref cleanup) and stop background tasks
+  resolves, then stop background mutation, persist a final state snapshot
+  (purgatory and rejected-events cache), and clean up placeholder refs
 
 **Key Dependencies:**
 

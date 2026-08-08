@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve purgatory and rejected-event recovery across abrupt termination.
+  Their snapshots now remain after restore and are atomically replaced every
+  60 seconds, bounding crash loss to one interval instead of consuming the
+  only durable copy at startup.
 - Treat cumulative retained-subscription byte refusals as capacity signals,
   not temporary query-rate episodes. The sync client learns the disclosed cap,
   rebuilds persistent coverage within it while reserving one maximum transient

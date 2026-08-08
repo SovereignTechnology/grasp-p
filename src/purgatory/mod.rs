@@ -6,7 +6,8 @@
 //!
 //! ## Architecture
 //!
-//! - **In-memory only**: Data is lost on restart (acceptable per spec)
+//! - **Crash-safe checkpoints**: In-memory state is periodically snapshotted
+//!   and restored across graceful or abrupt restarts
 //! - **Thread-safe**: Uses DashMap for concurrent access from multiple handlers
 //! - **Automatic expiry**: Entries expire after 30 minutes by default
 //! - **Separate stores**: State events and PR events use different indexing strategies
@@ -1645,11 +1646,12 @@ impl Purgatory {
             expired_events,
         };
 
-        // Serialize to JSON and write to file
+        // Replace the previous checkpoint only after the new snapshot is
+        // complete and durable. An abrupt stop must leave one valid version.
         let json = serde_json::to_string_pretty(&state)?;
-        std::fs::write(path, json)?;
+        crate::atomic_file::write(path, json.as_bytes())?;
 
-        tracing::info!(
+        tracing::debug!(
             path = %path.display(),
             announcements = state.announcement_purgatory.len(),
             state_events = state.state_events.len(),
@@ -1667,8 +1669,9 @@ impl Purgatory {
     /// the current purgatory instance. Adjusts time-based fields to account for downtime
     /// between save and restore.
     ///
-    /// After successful restore, the state file is deleted to prevent accidental
-    /// double-restore.
+    /// The checkpoint remains after restore until a newer periodic or shutdown
+    /// snapshot atomically replaces it. Restoring it more than once is safe:
+    /// addressable entries replace their in-memory keys.
     ///
     /// # Arguments
     /// * `path` - Path to the saved state file
@@ -1815,10 +1818,6 @@ impl Purgatory {
             saved_at = ?state.saved_at,
             "Restored purgatory state from disk"
         );
-
-        // Delete state file after successful restore
-        std::fs::remove_file(path)?;
-        tracing::debug!(path = %path.display(), "Deleted state file after restore");
 
         Ok(())
     }
@@ -2491,8 +2490,8 @@ async fn test_save_and_restore_state_events() {
     let purgatory2 = Purgatory::new(PathBuf::new());
     purgatory2.restore_from_disk(&state_file).unwrap();
 
-    // Verify file was deleted after restore
-    assert!(!state_file.exists());
+    // The last durable checkpoint remains available after restore.
+    assert!(state_file.exists());
 
     // Verify state events were restored
     let (_, state_count, _) = purgatory2.count();
@@ -2504,6 +2503,11 @@ async fn test_save_and_restore_state_events() {
     // Verify event IDs match
     let restored_ids: Vec<EventId> = restored_entries.iter().map(|e| e.event.id).collect();
     assert!(restored_ids.contains(&event1_id));
+
+    // A second startup before the next checkpoint restores the same state.
+    let purgatory3 = Purgatory::new(PathBuf::new());
+    purgatory3.restore_from_disk(&state_file).unwrap();
+    assert_eq!(purgatory3.count().1, 2);
     assert!(restored_ids.contains(&event2_id));
 
     // Verify identifiers and authors match
@@ -3026,8 +3030,8 @@ async fn test_file_cleanup_after_successful_restore() {
     let purgatory2 = Purgatory::new(PathBuf::new());
     purgatory2.restore_from_disk(&state_file).unwrap();
 
-    // File should be deleted after successful restore
-    assert!(!state_file.exists());
+    // The checkpoint remains crash-safe after successful restore.
+    assert!(state_file.exists());
 }
 
 #[tokio::test]
@@ -3068,8 +3072,8 @@ async fn test_save_and_restore_announcement_events() {
     let purgatory2 = Purgatory::new(PathBuf::new());
     purgatory2.restore_from_disk(&state_file).unwrap();
 
-    // File should be deleted after restore
-    assert!(!state_file.exists());
+    // The checkpoint remains crash-safe after restore.
+    assert!(state_file.exists());
 
     // Verify announcement was restored
     let (ann_count, _, _) = purgatory2.count();

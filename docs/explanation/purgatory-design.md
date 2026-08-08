@@ -39,11 +39,18 @@ This ensures we only serve announcements for repos that actually have content.
 
 ## Key Design Principles
 
-### 1. Graceful-Shutdown Persistence
+### 1. Crash-Safe Checkpoint Persistence
 
-Purgatory state is **saved to disk on graceful shutdown** and **restored on startup**. This preserves in-flight work across planned restarts (deployments, reboots).
+Purgatory state is atomically checkpointed every 60 seconds, saved once more
+on graceful shutdown, and restored on startup. This preserves in-flight work
+across planned restarts and bounds state lost to an abrupt process or machine
+stop to the checkpoint interval.
 
-On `SIGINT` / Ctrl-C, `main.rs` calls `purgatory.save_to_disk()` before exiting. On startup, if the state file exists, `purgatory.restore_from_disk()` is called before the server begins accepting connections.
+The restored file remains in place until a complete newer snapshot is durable;
+restore never consumes the only crash-safe copy. Snapshot replacement writes a
+temporary file, syncs it, renames it over the checkpoint, and syncs the parent
+directory. On `SIGINT` / Ctrl-C, `RelayServer` first stops background mutation
+and then writes the final checkpoint before exiting.
 
 **What is persisted:**
 
@@ -55,13 +62,9 @@ On `SIGINT` / Ctrl-C, `main.rs` calls `purgatory.save_to_disk()` before exiting.
 | `expired_events` | ✅ Yes | Prevents re-sync loops after restart |
 | `sync_queue` | ❌ No | Rebuilt automatically after restore |
 
-**What is NOT persisted (unclean shutdown):**
-
-On a crash or `SIGKILL`, the state file is not written. In that case:
-
-- Events are still on other relays (can be re-submitted)
-- Git data can be re-pushed
-- 30-minute expiry means data is transient anyway
+**Unclean shutdown:** mutations after the most recent 60-second checkpoint can
+be lost. The previous complete checkpoint remains valid even if the process is
+terminated while its replacement is being written.
 
 **State file location:** `<git_data_path>/purgatory-state.json`
 

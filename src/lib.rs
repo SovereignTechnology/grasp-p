@@ -1,3 +1,4 @@
+mod atomic_file;
 pub mod audit_cleanup;
 pub mod cleanup_empty_repos;
 pub mod config;
