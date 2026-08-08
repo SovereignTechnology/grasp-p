@@ -20,6 +20,9 @@ pub use crate::sync::SyncMetrics;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+
 use lazy_static::lazy_static;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts,
@@ -29,9 +32,53 @@ use prometheus::{
 use bandwidth::BandwidthTracker;
 use connection::ConnectionTracker;
 
+#[cfg(target_os = "linux")]
+fn cgroup_v2_directory() -> Option<PathBuf> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = membership.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("0"), Some(""), Some(path)) => Some(path.trim_start_matches('/')),
+            _ => None,
+        }
+    })?;
+    Some(PathBuf::from("/sys/fs/cgroup").join(relative))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_cpu_seconds(directory: &std::path::Path) -> Option<f64> {
+    let stat = std::fs::read_to_string(directory.join("cpu.stat")).ok()?;
+    let usage_usec = stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("usage_usec"), Some(value)) => value.parse::<u64>().ok(),
+            _ => None,
+        }
+    })?;
+    Some(usage_usec as f64 / 1_000_000.0)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_bytes(directory: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(directory.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 lazy_static! {
     /// Global Prometheus registry for ngit-grasp metrics
-    pub static ref REGISTRY: Registry = Registry::new();
+    pub static ref REGISTRY: Registry = {
+        let registry = Registry::new();
+        #[cfg(target_os = "linux")]
+        registry
+            .register(Box::new(
+                prometheus::process_collector::ProcessCollector::for_self(),
+            ))
+            .expect("register process metrics");
+        registry
+    };
     static ref BLACKLIST_DELETIONS_TOTAL: CounterVec = {
         let metric = CounterVec::new(
             Opts::new(
@@ -674,6 +721,25 @@ impl Metrics {
             uptime
         ));
 
+        // A systemd service's cgroup includes ngit-grasp and the Git processes
+        // it launches, making these the headline measures of total service
+        // cost. ProcessCollector metrics remain useful for separating the
+        // daemon's own usage from its children. Omit these metrics gracefully
+        // outside a readable cgroup v2 hierarchy.
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = cgroup_v2_directory() {
+            if let Some(cpu_seconds) = cgroup_cpu_seconds(&directory) {
+                output.push_str(&format!(
+                    "# HELP ngit_cgroup_cpu_seconds_total Total CPU time used by ngit-grasp and child processes\n# TYPE ngit_cgroup_cpu_seconds_total counter\nngit_cgroup_cpu_seconds_total {cpu_seconds}\n"
+                ));
+            }
+            if let Some(memory_bytes) = cgroup_memory_bytes(&directory) {
+                output.push_str(&format!(
+                    "# HELP ngit_cgroup_memory_current_bytes Current memory used by ngit-grasp and child processes\n# TYPE ngit_cgroup_memory_current_bytes gauge\nngit_cgroup_memory_current_bytes {memory_bytes}\n"
+                ));
+            }
+        }
+
         output
     }
 
@@ -1010,6 +1076,19 @@ mod tests {
         // render() recounts from disk)
         let output = metrics.render();
         assert!(output.contains("ngit_repositories_total 0"));
+        assert!(output.contains("process_cpu_seconds_total"));
+        assert!(output.contains("process_resident_memory_bytes"));
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(directory) = cgroup_v2_directory() {
+                if cgroup_cpu_seconds(&directory).is_some() {
+                    assert!(output.contains("ngit_cgroup_cpu_seconds_total"));
+                }
+                if cgroup_memory_bytes(&directory).is_some() {
+                    assert!(output.contains("ngit_cgroup_memory_current_bytes"));
+                }
+            }
+        }
 
         // Create some repositories
         let npub1 = git_data_path.join("npub1test");

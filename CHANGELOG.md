@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Log routine Git `info/refs` requests for repositories not yet available
   locally at DEBUG rather than WARN; this is expected during propagation.
 
+### Added
+
+- Export total cgroup CPU and memory usage, including child Git processes,
+  through the Prometheus metrics endpoint on Linux. Process-only CPU, memory,
+  thread, and file-descriptor metrics provide diagnostic detail.
+
 ### Fixed
 
 - Preserve purgatory and rejected-event recovery across abrupt termination.

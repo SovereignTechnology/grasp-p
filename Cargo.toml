@@ -39,7 +39,7 @@ tar = "0.4"
 fs2 = "0.4"
 
 # Metrics
-prometheus = "0.14"
+prometheus = { version = "0.14", features = ["process"] }
 dashmap = "6"
 lazy_static = "1.4"
 

@@ -138,6 +138,22 @@ scrape_configs:
 - `ngit_uptime_seconds` - Server uptime
 - `ngit_build_info` - Version and commit info
 - `ngit_repositories_total` - Total hosted repositories
+- `ngit_cgroup_cpu_seconds_total` - Cumulative CPU time used by ngit-grasp and
+  its child Git processes; use `rate(ngit_cgroup_cpu_seconds_total[5m])` for
+  total service CPU cores consumed over time
+- `ngit_cgroup_memory_current_bytes` - Current memory used by ngit-grasp and
+  its child Git processes
+- `process_cpu_seconds_total` - Cumulative CPU time used by the ngit-grasp process;
+  use `rate(process_cpu_seconds_total[5m])` for CPU cores consumed over time
+- `process_resident_memory_bytes` - Resident memory used by the ngit-grasp process
+- `process_virtual_memory_bytes` - Virtual address space used by the process
+- `process_threads` - Number of operating-system threads in the process
+- `process_open_fds` / `process_max_fds` - Current and maximum file descriptors
+
+Use the `ngit_cgroup_*` metrics as the headline service resource measurements.
+The `process_*` metrics exclude child Git processes and are useful for separating
+daemon resource usage from Git work. Cgroup metrics are omitted when ngit-grasp
+is not running in a readable Linux cgroup v2 hierarchy.
 
 ## Example Alerts
 
