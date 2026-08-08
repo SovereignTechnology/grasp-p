@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-08-08
+
+ngit-grasp 2.1.2 is a patch release improving repository-event sync under
+cold-start archive load. It prevents permanent relay policy refusals from
+driving subscription rebuild loops, adapts request grouping to unusually low
+remote filter-count limits, and keeps valid purgatory events alive while their
+Git data is actively being fetched. It also adds whole-service resource
+metrics and reduces routine missing-repository log noise.
+
 ### Changed
 
 - Log routine Git `info/refs` requests for repositories not yet available
@@ -324,7 +333,8 @@ defensive limits explicit and operator-configurable.
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.1...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.2...HEAD
+[2.1.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.1...v2.1.2
 [2.1.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.0...v2.1.1
 [2.1.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.0.0...v2.1.0
 [2.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v1.2.0...v2.0.0
