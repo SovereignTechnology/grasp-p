@@ -367,16 +367,11 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
         return 0;
     }
 
-    // Per-domain limits alone do not bound aggregate work when a cold sync
-    // discovers many domains simultaneously. Wait for the process-wide permit
-    // before occupying a domain slot, then retain it for the complete remote
-    // Git pass so subprocess fan-out stays bounded.
-    let _background_permit = throttle_manager.acquire_global_request().await;
-
-    // Perform the fetch with per-domain throttle tracking.
-    throttle_manager.start_request(&domain);
+    // Own both process-wide and per-domain admission for the complete remote
+    // pass. The RAII permit makes capacity accounting cancellation-safe and
+    // keeps the ls-remote phase within the same domain bound as its fetches.
+    let _fetch_permit = throttle_manager.acquire_fetch_pass(&domain).await;
     let fetch_result = ctx.fetch_oids(&target_repo, url, &needed_oids).await;
-    throttle_manager.complete_request(&domain);
 
     let fetched_oids = match fetch_result {
         Ok(fetched) if !fetched.is_empty() => {

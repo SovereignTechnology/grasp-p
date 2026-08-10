@@ -330,12 +330,13 @@ Attempt 4: Try repo-A (index=0) → ...
 
 ### Trigger-Based Processing (Not Polling)
 
-Domain queues **don't poll** for capacity. Instead, processing is triggered by two events:
+Domain queues **don't poll** for concurrent capacity. Instead, processing is triggered by two events:
 
-1. **`complete_request()`** - A request finishes, slot frees
+1. **Fetch-pass permit drop** - A request finishes or is cancelled, so its
+   cancellation-safe RAII permit releases the slot
 2. **`enqueue_identifier()`** - New identifier added to queue
 
-Both methods check `has_capacity()` and trigger `try_process_next()` if true.
+Both paths check `has_capacity()` and trigger `try_process_next()` if true.
 
 **Why trigger-based?**
 
@@ -344,6 +345,14 @@ Both methods check `has_capacity()` and trigger `try_process_next()` if true.
 - ✅ Simpler reasoning (event-driven)
 
 **Implementation**: [`src/purgatory/sync/throttle.rs:ThrottleManager`](../../src/purgatory/sync/throttle.rs)
+
+The capacity check and reservation happen atomically under the domain's
+throttle lock. URL selection's earlier capacity observation is only a routing
+hint: the fetch pass must still acquire the permit before starting, so racing
+identifiers cannot all consume the final slot. One permit accounts for the
+whole current pass (`ls-remote` plus its fetch commands), preserving the
+existing per-pass rate semantics. It also owns process-wide pressure admission
+and drops that admission while waiting for a busy domain.
 
 ---
 
@@ -424,6 +433,10 @@ the sorted advertised OID set. Later passes skip those OIDs while the
 advertisement is unchanged; any ref-tip change clears that URL's memo and
 allows them to be retried. Entries expire lazily after 30 minutes and the
 memo is capped at 1,024 URLs, evicting the oldest entry when full.
+
+All three phases run beneath the pass's per-domain permit. Separating the
+comparison into its own helper in future must retain that permit; `ls-remote`
+is outbound work against the same Git server, not an unaccounted preflight.
 
 **Why not just list every OID as a want?** An earlier implementation did
 exactly that and dropped one OID from the batch on each `not our ref`
