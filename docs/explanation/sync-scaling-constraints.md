@@ -339,6 +339,11 @@ the incremental slot cost. Thus byte-bound groups are not rebuilt merely
 because they contain fewer than the maximum filter count. Repository and
 identifier inputs are sorted before byte chunking so equivalent coverage has
 stable group identity.
+Historic repository batches union root and direct-descendant values into one
+`e`/`E`/`q` family, and repository and addressable-descendant coordinates into
+one `a`/`A`/`q` family, before ordinary count/byte grouping. This lets one REQ
+deduplicate events matching both core and descendant references without
+creating a subscription per repository.
 If the changed tail cannot fit the count or learned byte budget, no extension
 is opened and historic recovery remains available. Capacity pressure is the
 backstop which may schedule a complete regroup after outstanding historic

@@ -851,6 +851,7 @@ fn descendant_event_coordinate(event: &Event) -> Option<String> {
     ))
 }
 
+#[cfg(test)]
 fn descendant_frontier_filters(
     frontier: &DescendantFrontier,
     since: Option<Timestamp>,
@@ -859,6 +860,36 @@ fn descendant_frontier_filters(
     filters.extend(filters::tagged_one_of_our_repo_event_filters(
         &frontier.coordinates,
         since,
+    ));
+    filters
+}
+
+fn packed_historic_filters(items: &PendingItems, frontier: &DescendantFrontier) -> Vec<Filter> {
+    let all_repos: HashSet<_> = items
+        .repos
+        .union(&items.state_only_repos)
+        .cloned()
+        .collect();
+    let mut filters = filters::state_event_filters_for_our_repos(&all_repos, None);
+
+    let coordinate_values: HashSet<_> = items
+        .repos
+        .union(&frontier.coordinates)
+        .cloned()
+        .collect();
+    filters.extend(filters::tagged_one_of_our_repo_event_filters(
+        &coordinate_values,
+        None,
+    ));
+
+    let event_values: HashSet<_> = items
+        .root_events
+        .union(&frontier.event_ids)
+        .cloned()
+        .collect();
+    filters.extend(filters::tagged_one_of_our_root_event_filters(
+        &event_values,
+        None,
     ));
     filters
 }
@@ -6496,14 +6527,19 @@ impl SyncManager {
     async fn historic_sync(
         &mut self,
         relay_url: &str,
-        mut filters: Vec<Filter>,
+        filters: Vec<Filter>,
         items: PendingItems,
         since: Option<Timestamp>,
     ) -> Option<u64> {
-        if !items.root_events.is_empty() {
+        let filters = if items.repos.is_empty()
+            && items.state_only_repos.is_empty()
+            && items.root_events.is_empty()
+        {
+            filters
+        } else {
             let frontier = self.direct_thread_members(&items.root_events).await;
-            filters.extend(descendant_frontier_filters(&frontier, None));
-        }
+            packed_historic_filters(&items, &frontier)
+        };
         self.historic_sync_with_options(
             relay_url,
             filters,
@@ -7067,6 +7103,31 @@ mod tests {
         assert!(rotated.iter().any(|filter| {
             filter.as_json() == Filter::new().kind(Kind::Custom(31_005)).as_json()
         }));
+    }
+
+    #[test]
+    fn historic_packing_unions_core_and_descendant_reference_values() {
+        let root = EventId::from_byte_array([1; 32]);
+        let descendant = EventId::from_byte_array([2; 32]);
+        let items = PendingItems {
+            repos: HashSet::from(["30617:owner:repo".to_string()]),
+            state_only_repos: HashSet::new(),
+            root_events: HashSet::from([root]),
+        };
+        let frontier = DescendantFrontier {
+            event_ids: HashSet::from([descendant]),
+            coordinates: HashSet::from(["1621:author:patch".to_string()]),
+        };
+
+        let packed = packed_historic_filters(&items, &frontier);
+        // One state filter plus one a/A/q and one e/E/q family. Appending
+        // descendants separately would produce thirteen filters here.
+        assert_eq!(packed.len(), 7);
+        let json = packed.iter().map(Filter::as_json).collect::<Vec<_>>().join("\n");
+        assert!(json.contains(&root.to_hex()));
+        assert!(json.contains(&descendant.to_hex()));
+        assert!(json.contains("30617:owner:repo"));
+        assert!(json.contains("1621:author:patch"));
     }
 
     #[test]
