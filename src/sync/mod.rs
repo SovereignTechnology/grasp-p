@@ -1157,6 +1157,13 @@ struct SubscriptionClosedNotification {
     live_filter_count: Option<usize>,
 }
 
+fn lifecycle_notification_channel<T>() -> (
+    tokio::sync::mpsc::UnboundedSender<T>,
+    tokio::sync::mpsc::UnboundedReceiver<T>,
+) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
 fn is_rate_limit_message(message: &str) -> bool {
     let message = message.to_lowercase();
     (message.contains("rate") && message.contains("limit"))
@@ -1787,9 +1794,10 @@ pub struct SyncManager {
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
-    eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
+    eose_tx: Option<tokio::sync::mpsc::UnboundedSender<EoseNotification>>,
     /// Serializes CLOSED recovery and pending-batch cleanup through the actor.
-    subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
+    subscription_closed_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
@@ -3251,9 +3259,13 @@ impl SyncManager {
         let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectNotification>(100);
 
         // 3. Create EOSE channel for spawned tasks -> manager communication
-        let (eose_tx, mut eose_rx) = mpsc::channel::<EoseNotification>(100);
+        // Lifecycle notifications must never backpressure the ordered EVENT
+        // processor. Their production is already bounded by the subscription
+        // ledger, while the actor may legitimately stay busy opening a large,
+        // paced historic batch for longer than a fixed inbox can absorb.
+        let (eose_tx, mut eose_rx) = lifecycle_notification_channel::<EoseNotification>();
         let (subscription_closed_tx, mut subscription_closed_rx) =
-            mpsc::channel::<SubscriptionClosedNotification>(100);
+            lifecycle_notification_channel::<SubscriptionClosedNotification>();
 
         // 4. Connection workers never mutate manager state. Their unbounded
         // result channel cannot make a completed worker wait behind the actor.
@@ -3778,8 +3790,7 @@ impl SyncManager {
                             .send(EoseNotification {
                                 relay_url: relay_url_clone.clone(),
                                 sub_id,
-                            })
-                            .await;
+                            });
                     }
                     RelayEvent::Notice(notice) => {
                         if is_rate_limit_message(&notice) {
@@ -3854,8 +3865,7 @@ impl SyncManager {
                                 reason,
                                 generation: live_generation,
                                 live_filter_count,
-                            })
-                            .await;
+                            });
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -7163,6 +7173,24 @@ mod tests {
             window.max_processing_time,
             std::time::Duration::from_millis(7)
         );
+    }
+
+    #[test]
+    fn lifecycle_inbox_accepts_production_sized_terminal_burst() {
+        let (tx, mut rx) = lifecycle_notification_channel::<EoseNotification>();
+        for index in 0..169 {
+            tx.send(EoseNotification {
+                relay_url: "wss://relay.example".to_string(),
+                sub_id: SubscriptionId::new(format!("hydration-{index}")),
+            })
+            .expect("the actor-side receiver remains alive");
+        }
+
+        assert_eq!(rx.len(), 169);
+        for _ in 0..169 {
+            rx.try_recv().expect("every terminal remains queued");
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

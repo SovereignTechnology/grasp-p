@@ -407,9 +407,12 @@ The per-relay event processor retains its 1,000-message bounded data queue.
 Permit release does not depend on that queue draining: a separate listener on
 rust-nostr's broadcast relay notifications consumes only EOSE/CLOSED terminals
 and closes/releases transient ownership. The processor-facing listener still
-delivers ordered EVENT and lifecycle work to the sync actor, but sustained page
-traffic cannot hide terminal accounting behind EVENT backpressure. The data
-queue remains finite as a memory-safety boundary for non-conforming peers.
+delivers ordered EVENT and lifecycle work to the sync actor. EOSE and CLOSED
+use non-blocking actor inboxes: their production is bounded by the session
+subscription ledger, and a large paced historic batch can keep the actor busy
+longer than a fixed lifecycle inbox could safely absorb. This prevents actor
+backpressure from stopping the ordered EVENT processor, while the EVENT queue
+remains finite as the memory-safety boundary for non-conforming peers.
 
 The levers, in the order we reach for them:
 
