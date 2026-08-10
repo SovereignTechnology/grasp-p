@@ -304,8 +304,9 @@ Derived from the tightest commonly observed values; all sizing below assumes:
 Each relay connection owns one implemented budget ledger of B subscription
 slots. Four consumers share it, in priority order:
 
-1. **Core live subscriptions** (persistent, `limit: 0`) — the product; sized
-   first.
+1. **Essential live subscriptions** (persistent, `limit: 0`) — announcements,
+   repository states, canonical repository `a` references and canonical root
+   `e` references are never demoted.
 2. **Reserved margin** (2 slots) — control-plane safety capacity kept beyond
    the live set (which includes Layer-1) for ad-hoc operations and recovery.
 3. **Historic sync and dependency recovery** (transient) — at least one usable
@@ -313,21 +314,24 @@ slots. Four consumers share it, in priority order:
    REQ+EOSE pages/fallbacks/retries, and exact-ID purgatory polls draw from
    the remainder. NEG retains its four-round class cap and transient REQ its
    five-request class cap, but neither can exceed the shared residual.
-4. **Descendant live coverage** (auxiliary persistent) — admitted only when
-   its complete separately grouped set fits after core coverage while still
-   preserving the margin and a transient slot. Otherwise each constrained
-   relay advances one cursor-overlapped REQ+EOSE filter per five-second tick
-   through the same transient queue. Direct thread members contribute their
-   event IDs; replaceable and addressable members also contribute their NIP-01
-   coordinates. The resulting `e`/`E`/`q` and `a`/`A`/coordinate-`q` filters
-   cover one descendant generation without recursively expanding the frontier.
+4. **Priority-tiered reference coverage** — remaining filters are considered
+   in this order: root `E`; core compatibility `q`/`A`; descendant canonical
+   `e`/`a`; descendant `q`. A complete tier remains persistent only when it
+   fits after essential coverage while preserving the margin and a transient
+   slot. Lower tiers advance one relay-compatible, cursor-overlapped REQ+EOSE
+   filter group per five-second tick through the same transient queue. Descendant uppercase
+   `E`/`A` references are historic-only. Direct thread members contribute
+   event IDs and replaceable/addressable coordinates, covering one descendant
+   generation without recursively expanding the frontier.
 
 NIP-11 `max_subscriptions` sets B for each new connection session; when it is
 absent B falls back to 20. Advertised values below that floor are honoured
-(notably nostream's default 10). Two slots remain reserved. Core live filter
-groups are packed first and admitted atomically against the advertised
-subscription-count budget. Incremental five-second batches preserve full core
-REQs and separately owned descendant REQs. The planner uses the same
+(notably nostream's default 10). Two slots remain reserved. Essential live
+filter groups are packed first and admitted atomically against the advertised
+subscription-count budget. Incremental five-second batches preserve full
+essential REQs and separately owned tiered reference REQs. Tier filters are
+packed across boundaries, while admission stops at a complete-tier boundary.
+The planner uses the same
 filter-count and serialized-byte grouping rules as wire submission. It repacks
 the complete mutable core tail with the new filters when that releases at least
 one slot; otherwise it retires only the smallest useful subset which reduces
@@ -340,9 +344,10 @@ is opened and historic recovery remains available. Capacity pressure is the
 backstop which may schedule a complete regroup after outstanding historic
 batches drain; an ordinary tail update never rebuilds stable full groups.
 
-Reconnect and exceptional full restoration still build Layer 1, 2, and 3
-coverage together and reserve the whole grouped set before opening it. Both
-full replacement and tail replacement remember the exact previous grouping:
+Reconnect and exceptional full restoration rebuild essential coverage first;
+the five-second reconciler then admits the largest complete prefix of reference
+tiers which fits the refreshed session budget. Both full replacement and tail
+replacement remember the exact previous grouping:
 a failure while opening a replacement closes every newly opened group and
 restores the retired groups. A partial CLOSE failure likewise reopens any tail
 groups which were already closed before reporting the failure. Multi-connection

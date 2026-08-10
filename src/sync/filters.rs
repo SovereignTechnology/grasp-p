@@ -31,6 +31,46 @@ pub struct TieredFilter {
     pub filter: Filter,
 }
 
+/// Build the live coverage that is never demoted under connection pressure.
+pub fn build_essential_live_filters(
+    full_repos: &HashSet<String>,
+    state_only_repos: &HashSet<String>,
+    root_events: &HashSet<EventId>,
+    since: Option<Timestamp>,
+) -> Vec<Filter> {
+    let all_repos: HashSet<String> = full_repos.union(state_only_repos).cloned().collect();
+    let mut filters = state_event_filters_for_our_repos(&all_repos, since);
+    if !full_repos.is_empty() {
+        filters.extend(
+            tiered_repo_event_filters(full_repos, false, since)
+                .into_iter()
+                .filter(|entry| entry.tier == CoverageTier::EssentialCore)
+                .map(|entry| entry.filter),
+        );
+    }
+    filters.extend(
+        tiered_root_event_filters(root_events, false, since)
+            .into_iter()
+            .filter(|entry| entry.tier == CoverageTier::EssentialCore)
+            .map(|entry| entry.filter),
+    );
+    filters
+}
+
+/// Build the priority-ordered core reference coverage that can move between a
+/// persistent subscription and paced REQ+EOSE rotation.
+pub fn tiered_auxiliary_core_filters(
+    full_repos: &HashSet<String>,
+    root_events: &HashSet<EventId>,
+    since: Option<Timestamp>,
+) -> Vec<TieredFilter> {
+    let mut filters = tiered_root_event_filters(root_events, false, since);
+    filters.extend(tiered_repo_event_filters(full_repos, false, since));
+    filters.retain(|entry| entry.tier != CoverageTier::EssentialCore);
+    filters.sort_by_key(|entry| entry.tier);
+    filters
+}
+
 fn tagged_filters<T: AsRef<str>>(
     values: &[T],
     tag: SingleLetterTag,
