@@ -490,10 +490,10 @@ where
 /// Events from a relay connection
 #[derive(Debug)]
 pub enum RelayEvent {
-    /// A new event was received (event, subscription_id)
-    Event(Box<Event>, SubscriptionId),
+    /// A new event was received (event, subscription_id, data-lane arrival).
+    Event(Box<Event>, SubscriptionId, std::time::Instant),
     /// End of stored events for a subscription
-    EndOfStoredEvents(SubscriptionId),
+    EndOfStoredEvents(SubscriptionId, std::time::Instant),
     /// NOTICE message from relay
     Notice(String),
     /// Connection was closed
@@ -1655,6 +1655,7 @@ impl RelayConnection {
                     event,
                     subscription_id,
                 } => {
+                    let data_lane_arrival = std::time::Instant::now();
                     self.record_transient_req_event(&subscription_id);
                     tracing::trace!(
                         relay = %url,
@@ -1663,7 +1664,11 @@ impl RelayConnection {
                         "Received event"
                     );
                     if event_sender
-                        .send(RelayEvent::Event(Box::new(*event), subscription_id.clone()))
+                        .send(RelayEvent::Event(
+                            Box::new(*event),
+                            subscription_id.clone(),
+                            data_lane_arrival,
+                        ))
                         .await
                         .is_err()
                     {
@@ -1673,11 +1678,15 @@ impl RelayConnection {
                 }
                 RelayNotification::Message { message } => match *message {
                     RelayMessage::EndOfStoredEvents(sub_id) => {
+                        let data_lane_arrival = std::time::Instant::now();
                         tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
                         // Convert Cow<SubscriptionId> to owned SubscriptionId
                         let owned_sub_id = sub_id.into_owned();
                         if event_sender
-                            .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
+                            .send(RelayEvent::EndOfStoredEvents(
+                                owned_sub_id,
+                                data_lane_arrival,
+                            ))
                             .await
                             .is_err()
                         {
