@@ -953,6 +953,10 @@ fn split_live_tier_prefix(
     (live, rotated)
 }
 
+fn complete_auxiliary_fallback(entries: &[filters::TieredFilter]) -> Vec<Filter> {
+    entries.iter().map(|entry| entry.filter.clone()).collect()
+}
+
 /// Items included in a pending batch
 #[derive(Debug, Clone, Default)]
 pub struct PendingItems {
@@ -3960,6 +3964,11 @@ impl SyncManager {
                     .await
                 {
                     Ok(subscription_ids) => {
+                        // A relay can close any one member of this live set.
+                        // Keep the complete frontier ready for rotation so
+                        // the CLOSED path preserves every tier immediately,
+                        // including those that had been live until now.
+                        let fallback_filters = complete_auxiliary_fallback(&historic_entries);
                         let filter_count = live_filters.len();
                         let event_id_count = frontier.event_ids.len();
                         let coordinate_count = frontier.coordinates.len();
@@ -3967,7 +3976,7 @@ impl SyncManager {
                             relay_url.to_string(),
                             DescendantLiveCoverage {
                                 coverage_fingerprint: desired_fingerprint.clone(),
-                                fallback_filters: rotated_filters.clone(),
+                                fallback_filters,
                                 subscription_ids: subscription_ids.clone(),
                             },
                         );
@@ -7103,6 +7112,12 @@ mod tests {
         assert!(rotated.iter().any(|filter| {
             filter.as_json() == Filter::new().kind(Kind::Custom(31_005)).as_json()
         }));
+
+        let fallback = complete_auxiliary_fallback(&entries);
+        assert_eq!(fallback.len(), entries.len());
+        assert!(live.iter().all(|live_filter| fallback
+            .iter()
+            .any(|filter| filter.as_json() == live_filter.as_json())));
     }
 
     #[test]
