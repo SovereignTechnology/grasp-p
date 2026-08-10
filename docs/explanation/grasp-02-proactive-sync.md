@@ -11,6 +11,9 @@ Features:
 - Fetches all repository announcements from connected relays to discover new repos listing our service
 - Discovers and dynamically connects to new relays listed by repository announcements we have accepted (with optional bootstrap relay to get started)
 - Fetches events tagging repositories we are interested in, as well as events tagging Issues, Patches and PRs of these repositories
+- Recovers one additional generation of events that tag those direct thread
+  members but omit repository and root-event tags, using scheduled history
+  queries rather than retained subscriptions
 - Supports live sync and historic sync (tries NIP-77 negentropy but falls back to REQ+EOSE with 'until' based pagination)
 - Plays nicely with other relays - connection backoff and rate-limiting detection with cooldown
 - Does a full reconciliation daily
@@ -784,6 +787,37 @@ live in
 - **Batching**: Byte-budgeted (32 KB of serialized tag values per filter, ~489 hex IDs; see [Sync Scaling Constraints](sync-scaling-constraints.md))
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
+
+### Direct-Member Descendants
+
+Some collaboration events reference only their immediate parent. Once the
+ordinary Layer 3 filters have discovered an event which directly tags a
+repository root, each source relay is also queried for events whose `e`, `E`,
+or `q` tags reference that direct member.
+
+- complete descendant filters are retained live when they fit after core live
+  coverage while preserving the two control-plane slots and at least one
+  transient historic slot;
+- auxiliary subscriptions are tracked separately and retired before core
+  consolidation or restoration, so they never enter the core rollback set;
+- when the complete live set does not fit, one EOSE-closing filter starts on
+  each constrained relay on the existing five-second maintenance cadence,
+  through the ordinary historic queue, pagination, shared ledger, and request
+  pacing;
+- ordinary historic batches include the currently known direct-member filters;
+- fallback filters keep an in-memory cursor, advance it only after successful
+  EOSE, and query from the preceding successful upper bound with 15 minutes of
+  overlap; and
+- recovered descendants never enter the frontier, so this is deliberately one
+  additional generation rather than recursive thread traversal.
+
+An unexpected auxiliary CLOSED retires the remaining descendant subscriptions
+without rebuilding core coverage and falls back to history. A filter already
+queued or active blocks another fallback filter for that relay; failure leaves
+the same filter and cursor at the head. Reconnect and daily reconciliation
+reconstruct the mode from current session capacity. This keeps the feature
+complete without durable cursors, another capacity ledger, request-class
+priority, or multi-connection sharding.
 
 ### Combined Layer 2+3 (SyncLevel-Aware)
 

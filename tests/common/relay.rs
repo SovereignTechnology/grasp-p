@@ -84,6 +84,7 @@ struct RelayOptions {
     relay_data_path: Option<PathBuf>,
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
     rejected_hot_cache_duration_secs: Option<u64>,
+    relay_max_subscriptions: Option<usize>,
     /// Run with the production outbound target policy (reject non-global
     /// event-directed sync targets). The fixture default is permissive
     /// because the entire test infrastructure lives on loopback.
@@ -303,6 +304,20 @@ impl TestRelay {
             port::reserve_port(),
             RelayOptions {
                 deletion_request_disrespector: true,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a source relay advertising and enforcing a small per-connection
+    /// subscription budget. Sync scenarios use this to exercise graceful
+    /// degradation paths selected from NIP-11.
+    pub async fn start_with_relay_max_subscriptions(limit: usize) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                relay_max_subscriptions: Some(limit),
                 ..RelayOptions::default()
             },
         )
@@ -579,6 +594,10 @@ impl TestRelay {
                 "NGIT_REJECTED_HOT_CACHE_DURATION_SECS",
                 duration_secs.to_string(),
             );
+        }
+
+        if let Some(limit) = options.relay_max_subscriptions {
+            cmd.env("NGIT_RELAY_MAX_SUBSCRIPTIONS", limit.to_string());
         }
 
         // Add negentropy disable flag if requested

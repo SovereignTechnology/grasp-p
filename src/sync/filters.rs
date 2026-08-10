@@ -216,7 +216,8 @@ pub fn tagged_one_of_our_root_event_filters(
     );
 
     let mut filters = Vec::new();
-    let event_ids: Vec<String> = root_events.iter().map(|id| id.to_hex()).collect();
+    let mut event_ids: Vec<String> = root_events.iter().map(|id| id.to_hex()).collect();
+    event_ids.sort_unstable();
 
     for (chunk_idx, chunk) in chunk_values_by_bytes(&event_ids).into_iter().enumerate() {
         // Lowercase 'e' tag - standard event reference

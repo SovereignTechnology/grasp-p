@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Recover repository-event descendants which reference a direct thread member
+  but omit the repository and root-event tags. When the per-connection ledger
+  can retain complete descendant coverage while preserving control and
+  historic capacity, those filters stay live; otherwise bounded EOSE-closing
+  history provides eventual coverage. The frontier is deliberately
+  non-recursive and connection sharding remains unnecessary.
+
 ## [2.1.2] - 2026-08-08
 
 ngit-grasp 2.1.2 is a patch release improving repository-event sync under

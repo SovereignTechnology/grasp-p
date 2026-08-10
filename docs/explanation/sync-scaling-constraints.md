@@ -301,24 +301,31 @@ Derived from the tightest commonly observed values; all sizing below assumes:
 
 ## Our Approach: A Per-Connection Budget Ledger
 
-Each relay connection owns one implemented budget ledger of B subscription slots. Three
-consumers share it, in priority order:
+Each relay connection owns one implemented budget ledger of B subscription
+slots. Four consumers share it, in priority order:
 
-1. **Live subscriptions** (persistent, `limit: 0`) — the product; sized first.
+1. **Core live subscriptions** (persistent, `limit: 0`) — the product; sized
+   first.
 2. **Reserved margin** (2 slots) — control-plane safety capacity kept beyond
    the live set (which includes Layer-1) for ad-hoc operations and recovery.
-3. **Historic sync and dependency recovery** (transient) — negentropy rounds,
+3. **Historic sync and dependency recovery** (transient) — at least one usable
+   slot remains after live admission; negentropy rounds,
    REQ+EOSE pages/fallbacks/retries, and exact-ID purgatory polls draw from
    the remainder. NEG retains its four-round class cap and transient REQ its
    five-request class cap, but neither can exceed the shared residual.
+4. **Descendant live coverage** (auxiliary persistent) — admitted only when
+   its complete separately grouped set fits after core coverage while still
+   preserving the margin and a transient slot. Otherwise each constrained
+   relay advances one cursor-overlapped REQ+EOSE filter per five-second tick
+   through the same transient queue.
 
 NIP-11 `max_subscriptions` sets B for each new connection session; when it is
 absent B falls back to 20. Advertised values below that floor are honoured
-(notably nostream's default 10). Two slots remain reserved. Live filter groups
-are packed first and admitted atomically against the advertised
-subscription-count budget: if the complete live set cannot fit,
+(notably nostream's default 10). Two slots remain reserved. Core live filter
+groups are packed first and admitted atomically against the advertised
+subscription-count budget: if the complete core live set cannot fit,
 the existing subscriptions are consolidated into the byte- and filter-count
-bounded REQ groups first. If the consolidated live set still cannot fit,
+bounded REQ groups first. If the consolidated core live set still cannot fit,
 partial coverage is not opened, historic work is deferred, and a warning
 surfaces the condition. Reconnect and consolidation build Layer 1, 2, and 3
 coverage together and reserve the whole grouped set before opening it. A
@@ -345,6 +352,12 @@ reported to the manager, which recomputes and transactionally reopens complete
 live coverage. Each reconnect closes the retired ledger and creates a new
 generation; queued or late borrowers therefore fail before sending on the new
 SDK session and cannot inflate or bypass its capacity.
+
+Descendant live subscriptions are kept outside the core rollback set. Core
+consolidation or restoration first closes them, and aborts if CLOSE cannot be
+sent, so auxiliary coverage cannot silently consume capacity needed by newly
+required core filters. An auxiliary CLOSED retires its remaining group and
+falls back to EOSE-closing history without rebuilding healthy core coverage.
 
 Some relays additionally cap the cumulative serialized REQ state retained by
 one connection. NIP-11 has no field for this limit, so it cannot be negotiated

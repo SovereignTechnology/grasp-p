@@ -33,6 +33,7 @@ mod common;
 mod sync {
     pub mod adaptive_pagination;
     pub mod catchup;
+    pub mod descendant_sync;
     pub mod discovery;
     pub mod historic_recovery;
     pub mod historic_sync;
