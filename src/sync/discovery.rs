@@ -5,13 +5,28 @@ use std::collections::{HashMap, HashSet};
 use nostr::nips::nip65::{self, RelayMetadata};
 use nostr_sdk::prelude::*;
 
-use super::algorithms::RelaySyncNeeds;
+use super::{algorithms::RelaySyncNeeds, RepoSyncNeeds, SyncLevel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedRoot {
     pub id: EventId,
     pub author: PublicKey,
     pub repository: String,
+}
+
+pub fn accepted_root_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a AcceptedRoot>,
+    repositories: &HashMap<String, RepoSyncNeeds>,
+) -> Vec<AcceptedRoot> {
+    candidates
+        .into_iter()
+        .filter(|root| {
+            repositories
+                .get(&root.repository)
+                .is_some_and(|needs| needs.sync_level == SyncLevel::Full)
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn accepted_roots<'a>(
@@ -91,6 +106,41 @@ pub fn merge_inbox_roots(
             .root_events
             .extend(roots.iter().copied());
     }
+}
+
+pub fn build_inbox_root_overlay(
+    author_roots: &HashMap<PublicKey, HashSet<EventId>>,
+    author_inboxes: &HashMap<PublicKey, HashSet<String>>,
+) -> HashMap<String, HashSet<EventId>> {
+    let mut overlay: HashMap<String, HashSet<EventId>> = HashMap::new();
+    for (author, inboxes) in author_inboxes {
+        let Some(roots) = author_roots.get(author) else {
+            continue;
+        };
+        for inbox in inboxes {
+            overlay
+                .entry(inbox.clone())
+                .or_default()
+                .extend(roots.iter().copied());
+        }
+    }
+    overlay
+}
+
+pub fn roots_to_retire(
+    ordinary_roots: &HashSet<EventId>,
+    old_overlay_roots: Option<&HashSet<EventId>>,
+    new_overlay_roots: Option<&HashSet<EventId>>,
+) -> HashSet<EventId> {
+    old_overlay_roots
+        .into_iter()
+        .flatten()
+        .filter(|root| {
+            !ordinary_roots.contains(root)
+                && !new_overlay_roots.is_some_and(|roots| roots.contains(root))
+        })
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]
@@ -188,5 +238,79 @@ mod tests {
         assert_eq!(target.root_events, HashSet::from([root]));
         assert!(target.repos.is_empty());
         assert!(target.state_only_repos.is_empty());
+    }
+
+    #[test]
+    fn replacement_and_root_removal_subtract_from_desired_overlay() {
+        let author = Keys::generate().public_key();
+        let root = EventId::from_byte_array([8; 32]);
+        let roots = HashMap::from([(author, HashSet::from([root]))]);
+        let first = build_inbox_root_overlay(
+            &roots,
+            &HashMap::from([(author, HashSet::from(["wss://a.example".to_string()]))]),
+        );
+        assert_eq!(first["wss://a.example"], HashSet::from([root]));
+
+        let replacement = build_inbox_root_overlay(
+            &roots,
+            &HashMap::from([(author, HashSet::from(["wss://b.example".to_string()]))]),
+        );
+        assert!(!replacement.contains_key("wss://a.example"));
+        assert_eq!(replacement["wss://b.example"], HashSet::from([root]));
+        assert!(build_inbox_root_overlay(&HashMap::new(), &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn removing_overlay_preserves_ordinary_root_ownership() {
+        let root = EventId::from_byte_array([9; 32]);
+        let relay = "wss://shared.example".to_string();
+        let mut targets = HashMap::from([(
+            relay.clone(),
+            RelaySyncNeeds {
+                root_events: HashSet::from([root]),
+                ..RelaySyncNeeds::default()
+            },
+        )]);
+        merge_inbox_roots(&mut targets, &HashMap::new());
+        assert_eq!(targets[&relay].root_events, HashSet::from([root]));
+        assert!(
+            roots_to_retire(&HashSet::from([root]), Some(&HashSet::from([root])), None).is_empty()
+        );
+    }
+
+    #[test]
+    fn state_only_root_becomes_an_inbox_source_after_promotion() {
+        let author = Keys::generate().public_key();
+        let root = AcceptedRoot {
+            id: EventId::from_byte_array([10; 32]),
+            author,
+            repository: "30617:owner:repo".to_string(),
+        };
+        let mut repositories = HashMap::from([(
+            root.repository.clone(),
+            RepoSyncNeeds {
+                sync_level: SyncLevel::StateOnly,
+                ..RepoSyncNeeds::default()
+            },
+        )]);
+        assert!(accepted_root_candidates([&root], &repositories).is_empty());
+
+        repositories.get_mut(&root.repository).unwrap().sync_level = SyncLevel::Full;
+        let accepted = accepted_root_candidates([&root], &repositories);
+        let author_roots = accepted.into_iter().fold(
+            HashMap::<PublicKey, HashSet<EventId>>::new(),
+            |mut roots, accepted| {
+                roots
+                    .entry(accepted.author)
+                    .or_default()
+                    .insert(accepted.id);
+                roots
+            },
+        );
+        let overlay = build_inbox_root_overlay(
+            &author_roots,
+            &HashMap::from([(author, HashSet::from(["wss://inbox.example".to_string()]))]),
+        );
+        assert_eq!(overlay["wss://inbox.example"], HashSet::from([root.id]));
     }
 }

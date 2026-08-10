@@ -976,6 +976,32 @@ impl RelayConnection {
             .is_some_and(|relay| relay.status() == RelayStatus::Connected)
     }
 
+    /// Whether a control-plane query could acquire every local subscription
+    /// constraint immediately on the current connected session.
+    ///
+    /// This is an admission sample, not a reservation: another actor may win
+    /// the permits before the caller starts. It prevents maintenance ticks
+    /// from spawning work that is already known to have to wait.
+    pub async fn has_immediate_transient_capacity(&self) -> bool {
+        if !self.is_connected().await || self.historic_capacity_consumed_by_live() {
+            return false;
+        }
+        if self.transient_req_permits.available_permits() == 0 {
+            return false;
+        }
+        if self.remote_subscription_byte_limit().is_some()
+            && self.byte_limited_transient_gate.available_permits() == 0
+        {
+            return false;
+        }
+        self.subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .semaphore
+            .available_permits()
+            > 0
+    }
+
     /// Configure the one per-session ledger before any subscriptions open.
     pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
         self.clear_subscription_permits();
@@ -2350,6 +2376,13 @@ impl RelayConnection {
             }
             self.release_transient_req_permit(sub_id);
         }
+    }
+
+    /// Abort caller-owned transient work after its manager batch is retired.
+    /// The slot is released only after CLOSE is accepted by the SDK; otherwise
+    /// session teardown remains the accounting backstop.
+    pub(super) async fn abort_transient_subscription(&self, sub_id: &SubscriptionId) {
+        self.close_and_release_transient_req_permit(sub_id).await;
     }
 
     /// Release the live ledger slot held for `sub_id`, if any.
@@ -4212,6 +4245,30 @@ mod tests {
             error.contains("No transient query capacity"),
             "unexpected dependency ledger error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn immediate_transient_capacity_rejects_a_saturated_session() {
+        let relay = LocalRelayBuilder::default().build();
+        relay.run().await.expect("start local relay");
+        let relay_url = relay.url().await.to_string();
+        let connection = permissive_connection(&relay_url, Keys::generate());
+        connection.connect(3).await.expect("connect local relay");
+        connection.reset_subscription_budget(Some(3));
+
+        assert!(connection.has_immediate_transient_capacity().await);
+        let ledger = connection.subscription_budget();
+        let _all_slots = ledger
+            .clone()
+            .acquire_many_owned(ledger.available_permits() as u32)
+            .await
+            .expect("saturate subscription ledger");
+
+        assert!(!connection.has_immediate_transient_capacity().await);
+        assert_eq!(connection.transient_req_permits.available_permits(), 5);
+
+        connection.disconnect().await;
+        relay.shutdown();
     }
 
     #[test]

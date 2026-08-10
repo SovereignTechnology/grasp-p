@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::nostr::SharedDatabase;
 
-use super::{AddFilters, RepoSyncIndex, RepoSyncNeeds, SyncLevel};
+use super::{AddFilters, RepoSyncIndex, RepoSyncNeeds, RootCandidateIndex, SyncLevel};
 
 /// Counts remain complete while remotely influenced log samples stay bounded.
 const LOG_COLLECTION_SAMPLE_SIZE: usize = 5;
@@ -136,6 +136,7 @@ pub struct SelfSubscriber {
     relay_domain: String,
     /// Shared index of repos to sync
     repo_sync_index: RepoSyncIndex,
+    root_candidate_index: RootCandidateIndex,
     /// Channel to send AddFilters actions to SyncManager
     action_tx: mpsc::Sender<AddFilters>,
     /// Last time we connected - used for since filter on reconnect
@@ -157,6 +158,7 @@ impl SelfSubscriber {
         own_relay_url: String,
         relay_domain: String,
         repo_sync_index: RepoSyncIndex,
+        root_candidate_index: RootCandidateIndex,
         action_tx: mpsc::Sender<AddFilters>,
         database: SharedDatabase,
     ) -> Self {
@@ -164,6 +166,7 @@ impl SelfSubscriber {
             own_relay_url,
             relay_domain,
             repo_sync_index,
+            root_candidate_index,
             action_tx,
             last_connected: None,
             database,
@@ -237,6 +240,10 @@ impl SelfSubscriber {
                     .or_insert_with(|| RepoSyncNeeds {
                         relays: HashSet::new(),
                         root_events: HashSet::new(),
+                        // Stage relay ownership while root reconstruction is
+                        // still in progress. process_batch performs the one
+                        // existing Full promotion after the complete startup
+                        // batch has been assembled.
                         sync_level: SyncLevel::StateOnly,
                     });
                 entry.relays.extend(needs.relays.clone());
@@ -564,6 +571,18 @@ impl SelfSubscriber {
             // Release lock before modifying pending
             drop(index);
 
+            // Keep compact metadata even while the repository is StateOnly.
+            // Discovery consults the current RepoSyncIndex level, so promotion
+            // activates an already-observed root without a database rescan.
+            self.root_candidate_index.write().await.insert(
+                event.id,
+                super::discovery::AcceptedRoot {
+                    id: event.id,
+                    author: event.pubkey,
+                    repository: repo_ref.clone(),
+                },
+            );
+
             // Also add root event to pending - this ensures batch processing runs
             // and creates Layer 3 filters for events referencing this root event.
             // CRITICAL: Include relays so derive_relay_targets knows where to send filters!
@@ -705,6 +724,82 @@ fn clone_url_to_relay_url(clone_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn startup_reconstruction_promotes_candidates_only_after_batch_completion() {
+        let keys = Keys::generate();
+        let identifier = "startup-staging";
+        let repo = format!("30617:{}:{identifier}", keys.public_key());
+        let relay = "wss://source.example";
+        let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+            .tags([
+                Tag::identifier(identifier),
+                Tag::custom("relays", [relay]),
+            ])
+            .finalize(&keys)
+            .expect("build announcement");
+        let root = EventBuilder::new(Kind::GitIssue, "")
+            .tag(Tag::custom("a", [repo.clone()]))
+            .finalize(&keys)
+            .expect("build root");
+        let database: SharedDatabase =
+            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        database
+            .save_event(&announcement)
+            .await
+            .expect("store announcement");
+        database.save_event(&root).await.expect("store root");
+        let repo_sync_index = Arc::new(RwLock::new(HashMap::new()));
+        let root_candidate_index = Arc::new(RwLock::new(HashMap::new()));
+        let (action_tx, _action_rx) = mpsc::channel(1);
+        let subscriber = SelfSubscriber::new(
+            "ws://127.0.0.1:1".to_string(),
+            "127.0.0.1:1".to_string(),
+            Arc::clone(&repo_sync_index),
+            Arc::clone(&root_candidate_index),
+            action_tx,
+            database,
+        );
+
+        let mut pending = subscriber.load_existing_events().await;
+        assert_eq!(
+            repo_sync_index.read().await[&repo].sync_level,
+            SyncLevel::StateOnly,
+            "startup reconstruction must not start full sync before the batch is complete"
+        );
+        assert!(root_candidate_index.read().await.contains_key(&root.id));
+        {
+            let candidates = root_candidate_index.read().await;
+            let repositories = repo_sync_index.read().await;
+            assert!(super::super::discovery::accepted_root_candidates(
+                candidates.values(),
+                &repositories,
+            )
+            .is_empty());
+        }
+
+        subscriber.process_batch(&mut pending).await;
+        assert_eq!(
+            repo_sync_index.read().await[&repo].sync_level,
+            SyncLevel::Full
+        );
+        {
+            let candidates = root_candidate_index.read().await;
+            let repositories = repo_sync_index.read().await;
+            assert_eq!(
+                super::super::discovery::accepted_root_candidates(
+                    candidates.values(),
+                    &repositories,
+                )
+                .into_iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+                vec![root.id]
+            );
+        }
+    }
 
     #[test]
     fn test_clone_url_to_relay_url_https() {

@@ -196,6 +196,11 @@ fn connections_for_relay_urls<T: Clone>(
 /// Key: repo addressable ref - 30617:pubkey:identifier
 pub type RepoSyncIndex = Arc<RwLock<HashMap<String, RepoSyncNeeds>>>;
 
+/// Compact metadata for roots observed by the self-subscription. Candidates
+/// remain inert while their repository is StateOnly and become eligible for
+/// NIP-65 discovery as soon as RepoSyncIndex promotes it to Full.
+pub type RootCandidateIndex = Arc<RwLock<HashMap<EventId, discovery::AcceptedRoot>>>;
+
 /// What we have CONFIRMED syncing - includes connection state for integrated lifecycle.
 /// Key: relay URL
 pub type RelaySyncIndex = Arc<RwLock<HashMap<String, RelayState>>>;
@@ -1293,6 +1298,18 @@ fn nip65_inventory_interval() -> Duration {
     }
 }
 
+fn nip65_author_retry_after(
+    query_succeeded: bool,
+    represented: &HashSet<PublicKey>,
+    author: &PublicKey,
+) -> Duration {
+    if query_succeeded && represented.contains(author) {
+        nip65_discovery_refresh_interval()
+    } else {
+        nip65_discovery_retry_interval()
+    }
+}
+
 #[derive(Debug)]
 struct Nip65DiscoveryResult {
     source_relay: String,
@@ -1813,6 +1830,7 @@ pub struct SyncManager {
     config: Config,
     /// What we want to sync (source of truth)
     repo_sync_index: RepoSyncIndex,
+    root_candidate_index: RootCandidateIndex,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
     /// In-flight subscription batches
@@ -1955,6 +1973,7 @@ impl SyncManager {
             local_relay,
             config: config.clone(),
             repo_sync_index: Arc::new(RwLock::new(HashMap::new())),
+            root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
@@ -3372,6 +3391,7 @@ impl SyncManager {
             format!("ws://{}", self.config.bind_address),
             self.service_domain.clone(),
             Arc::clone(&self.repo_sync_index),
+            Arc::clone(&self.root_candidate_index),
             action_tx,
             self.database.clone(),
         );
@@ -4736,25 +4756,10 @@ impl SyncManager {
             .next_inventory_at
             .is_none_or(|due| due <= now)
         {
-            let accepted_repositories: HashSet<String> =
-                self.repo_sync_index.read().await.keys().cloned().collect();
-            let roots = match self
-                .database
-                .query(Filter::new().kinds([
-                    Kind::GitPatch,
-                    Kind::GitIssue,
-                    Kind::GitPullRequest,
-                ]))
-                .await
-            {
-                Ok(events) => discovery::accepted_roots(events.iter(), &accepted_repositories),
-                Err(error) => {
-                    tracing::debug!(%error, "Deferring NIP-65 discovery: root query failed");
-                    return;
-                }
-            };
-
+            let candidates = self.root_candidate_index.read().await;
             let repo_index = self.repo_sync_index.read().await;
+            let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
+            drop(candidates);
             let bootstrap = self
                 .bootstrap_relay_url
                 .as_deref()
@@ -4796,15 +4801,19 @@ impl SyncManager {
                     .is_some_and(|sources| sources.contains(relay))
                 });
             self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
-            let old_overlay = self.nip65_discovery.inbox_roots.clone();
-            self.rebuild_nip65_inbox_roots();
-            if old_overlay != self.nip65_discovery.inbox_roots {
-                let mut dirty: HashSet<String> = old_overlay.into_keys().collect();
-                dirty.extend(self.nip65_discovery.inbox_roots.keys().cloned());
-                for relay in dirty {
-                    self.recompute_new_sync_filters_for_relay(&relay).await;
-                }
-            }
+            let overlay = discovery::build_inbox_root_overlay(
+                &self.nip65_discovery.author_roots,
+                &self.nip65_discovery.author_inboxes,
+            );
+            self.install_nip65_overlay(overlay).await;
+        }
+
+        // Discovery is deliberately single-flight. The immediate-capacity
+        // sample below can race with historic admission before fetch_events
+        // acquires its permit, but that race can create at most one waiter,
+        // never a maintenance-tick-sized queue of control-plane tasks.
+        if !self.nip65_discovery.in_flight.is_empty() {
+            return;
         }
 
         let mut candidates: HashMap<String, Vec<PublicKey>> = HashMap::new();
@@ -4829,6 +4838,9 @@ impl SyncManager {
             let Some(connection) = self.connections.get(&source).cloned() else {
                 continue;
             };
+            if !connection.has_immediate_transient_capacity().await {
+                continue;
+            }
             let mut authors = candidates.remove(&source).unwrap_or_default();
             authors.sort_by_key(PublicKey::to_hex);
             authors.truncate(NIP65_DISCOVERY_BATCH_AUTHORS);
@@ -4861,19 +4873,85 @@ impl SyncManager {
         }
     }
 
-    fn rebuild_nip65_inbox_roots(&mut self) {
-        self.nip65_discovery.inbox_roots.clear();
-        for (author, inboxes) in &self.nip65_discovery.author_inboxes {
-            let Some(roots) = self.nip65_discovery.author_roots.get(author) else {
-                continue;
-            };
-            for inbox in inboxes {
-                self.nip65_discovery
-                    .inbox_roots
-                    .entry(inbox.clone())
-                    .or_default()
-                    .extend(roots.iter().copied());
+    async fn install_nip65_overlay(
+        &mut self,
+        new_overlay: HashMap<String, HashSet<EventId>>,
+    ) {
+        let old_overlay = std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_overlay);
+        if old_overlay == self.nip65_discovery.inbox_roots {
+            return;
+        }
+        let ordinary_targets = {
+            let repo_index = self.repo_sync_index.read().await;
+            algorithms::derive_relay_targets(&repo_index)
+        };
+        let mut dirty_relays: HashSet<String> = old_overlay.keys().cloned().collect();
+        dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
+
+        for relay in dirty_relays {
+            let ordinary_roots = ordinary_targets
+                .get(&relay)
+                .map(|target| &target.root_events)
+                .cloned()
+                .unwrap_or_default();
+            let retired = discovery::roots_to_retire(
+                &ordinary_roots,
+                old_overlay.get(&relay),
+                self.nip65_discovery.inbox_roots.get(&relay),
+            );
+            if !retired.is_empty() {
+                let removed_batches = {
+                    let mut pending = self.pending_sync_index.write().await;
+                    let mut removed = Vec::new();
+                    if let Some(batches) = pending.get_mut(&relay) {
+                        let mut index = 0;
+                        while index < batches.len() {
+                            let references_retired = batches[index].purpose
+                                == PendingBatchPurpose::Descendants
+                                || batches[index]
+                                    .items
+                                    .root_events
+                                    .iter()
+                                    .any(|root| retired.contains(root));
+                            if references_retired {
+                                removed.push(batches.remove(index));
+                            } else {
+                                index += 1;
+                            }
+                        }
+                        if batches.is_empty() {
+                            pending.remove(&relay);
+                        }
+                    }
+                    removed
+                };
+                for batch in &removed_batches {
+                    self.close_removed_batch_subscriptions(&relay, batch).await;
+                    self.release_removed_descendant_batch(&relay, batch);
+                }
+                self.descendant_sync_rotations.remove(&relay);
+
+                let confirmed_changed = {
+                    let mut index = self.relay_sync_index.write().await;
+                    index.get_mut(&relay).is_some_and(|state| {
+                        let before = state.root_events.len();
+                        state.root_events.retain(|root| !retired.contains(root));
+                        state.root_events.len() != before
+                    })
+                };
+                let has_pending = self.has_pending_batches(&relay).await;
+                if self.deferred_consolidations.request(&relay, has_pending) {
+                    let _ = self.consolidate(&relay).await;
+                }
+                tracing::debug!(
+                    relay = %relay,
+                    retired_roots = retired.len(),
+                    confirmed_changed,
+                    retired_batches = removed_batches.len(),
+                    "Retired obsolete proactive inbox ownership"
+                );
             }
+            self.recompute_new_sync_filters_for_relay(&relay).await;
         }
     }
 
@@ -4883,22 +4961,24 @@ impl SyncManager {
                 .in_flight
                 .remove(&(result.source_relay.clone(), *author));
         }
-        let (events, retry_after) = match result.outcome {
-            Ok(events) => (events, nip65_discovery_refresh_interval()),
+        let (events, query_succeeded) = match result.outcome {
+            Ok(events) => (events, true),
             Err(error) => {
                 tracing::debug!(relay = %result.source_relay, %error, "NIP-65 discovery query failed");
-                (Vec::new(), nip65_discovery_retry_interval())
+                (Vec::new(), false)
             }
         };
-        let next_attempt = Instant::now() + retry_after;
+        let latest = discovery::latest_relay_lists(events, &result.authors);
+        let represented: HashSet<PublicKey> = latest.keys().copied().collect();
+        let now = Instant::now();
         for author in &result.authors {
+            let retry_after = nip65_author_retry_after(query_succeeded, &represented, author);
             self.nip65_discovery.next_attempt_at.insert(
                 (result.source_relay.clone(), *author),
-                next_attempt,
+                now + retry_after,
             );
         }
 
-        let latest = discovery::latest_relay_lists(events, &result.authors);
         let mut changed = false;
         for (author, candidate) in latest {
             if !self.nip65_discovery.author_roots.contains_key(&author) {
@@ -4924,20 +5004,17 @@ impl SyncManager {
         if !changed {
             return;
         }
-        let old_relays: HashSet<String> =
-            self.nip65_discovery.inbox_roots.keys().cloned().collect();
-        self.rebuild_nip65_inbox_roots();
-        let mut dirty_relays = old_relays;
-        dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
+        let overlay = discovery::build_inbox_root_overlay(
+            &self.nip65_discovery.author_roots,
+            &self.nip65_discovery.author_inboxes,
+        );
+        self.install_nip65_overlay(overlay).await;
         tracing::info!(
             source = %result.source_relay,
             authors = result.authors.len(),
             inbox_relays = self.nip65_discovery.inbox_roots.len(),
             "Updated proactive inbox coverage from NIP-65"
         );
-        for relay in dirty_relays {
-            self.recompute_new_sync_filters_for_relay(&relay).await;
-        }
     }
 
     async fn handle_connect_attempt_result(&mut self, result: ConnectAttemptResult) {
@@ -6337,6 +6414,21 @@ impl SyncManager {
         }
     }
 
+    async fn close_removed_batch_subscriptions(
+        &self,
+        relay_url: &str,
+        batch: &PendingBatch,
+    ) {
+        let Some(connection) = self.connections.get(relay_url) else {
+            return;
+        };
+        for subscription_id in &batch.outstanding_subs {
+            connection
+                .abort_transient_subscription(subscription_id)
+                .await;
+        }
+    }
+
     async fn handle_subscription_closed(
         &mut self,
         relay_url: &str,
@@ -7499,6 +7591,26 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_nip65_batch_retries_missing_authors_early() {
+        let returned = Keys::generate().public_key();
+        let missing = Keys::generate().public_key();
+        let represented = HashSet::from([returned]);
+
+        assert_eq!(
+            nip65_author_retry_after(true, &represented, &returned),
+            nip65_discovery_refresh_interval()
+        );
+        assert_eq!(
+            nip65_author_retry_after(true, &represented, &missing),
+            nip65_discovery_retry_interval()
+        );
+        assert_eq!(
+            nip65_author_retry_after(false, &represented, &returned),
+            nip65_discovery_retry_interval()
+        );
+    }
 
     #[test]
     fn event_pipeline_window_separates_queue_and_processing_costs() {
