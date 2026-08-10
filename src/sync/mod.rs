@@ -974,10 +974,6 @@ struct ConnectAttemptResult {
 /// Quick reconnect window in seconds (15 minutes)
 const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 
-/// Maximum incremental filter fragmentation above the desired live baseline
-/// before triggering consolidation.
-const CONSOLIDATION_THRESHOLD: usize = 70;
-
 /// Bound concurrent DNS and websocket handshakes so a large relay list cannot
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
@@ -1132,21 +1128,6 @@ async fn begin_connect_attempt(
     let permit = semaphore.acquire_owned().await.ok()?;
     health_tracker.record_attempt(relay_url);
     Some(permit)
-}
-
-fn consolidation_fragmentation(
-    current_count: usize,
-    new_count: usize,
-    desired_baseline: usize,
-) -> usize {
-    current_count
-        .saturating_add(new_count)
-        .saturating_sub(desired_baseline)
-}
-
-fn should_consolidate(current_count: usize, new_count: usize, desired_baseline: usize) -> bool {
-    consolidation_fragmentation(current_count, new_count, desired_baseline)
-        > CONSOLIDATION_THRESHOLD
 }
 
 fn grouped_subscription_count(filters: &[Filter]) -> usize {
@@ -3230,17 +3211,6 @@ impl SyncManager {
             return;
         }
 
-        // Step 3: Check if consolidation is needed BEFORE adding new filters
-        if !self
-            .maybe_consolidate(
-                &action.relay_url,
-                grouped_subscription_count(&action.filters),
-            )
-            .await
-        {
-            return;
-        }
-
         // Subscribe to each filter and collect subscription IDs
         tracing::info!(
             relay = %action.relay_url,
@@ -3251,15 +3221,28 @@ impl SyncManager {
             "handle_add_filters: calling sync_live and historic_sync"
         );
 
-        if let Err(error) = self
-            .sync_live(&action.relay_url, &action.filters)
-            .await
-        {
+        if let Err(error) = self.sync_live(&action.relay_url, &action.filters).await {
             tracing::warn!(
                 relay = %action.relay_url,
                 %error,
                 "Live coverage could not be extended; continuing bounded historic sync"
             );
+            if error.starts_with("Minimum-churn live extension needs")
+                || error.starts_with("Minimum-churn live extension exceeds")
+            {
+                let has_pending_batches = self.has_pending_batches(&action.relay_url).await;
+                if self
+                    .deferred_consolidations
+                    .request(&action.relay_url, has_pending_batches)
+                {
+                    let _ = self.consolidate(&action.relay_url).await;
+                } else {
+                    tracing::info!(
+                        relay = %action.relay_url,
+                        "Minimum-churn extension reached capacity; full consolidation deferred until pending batches drain"
+                    );
+                }
+            }
         }
         self.historic_sync(&action.relay_url, action.filters, action.items, None)
             .await;
@@ -5542,77 +5525,6 @@ impl SyncManager {
             .is_some_and(|batches| !batches.is_empty())
     }
 
-    async fn desired_live_filter_count(&self, relay_url: &str) -> usize {
-        let target = {
-            let repo_index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&repo_index).remove(relay_url)
-        };
-        let desired_repo_filters = target.map_or_else(Vec::new, |target| {
-            filters::build_sync_level_aware_filters(
-                &target.repos,
-                &target.state_only_repos,
-                &target.root_events,
-                None,
-            )
-        });
-
-        // Every connected relay carries one consolidated generic announcement
-        // subscription in addition to its repository-specific desired filters.
-        1 + grouped_subscription_count(&desired_repo_filters)
-    }
-
-    /// Check if incremental fragmentation exceeds the consolidation threshold.
-    ///
-    /// The desired live set is an irreducible baseline, so a repository whose
-    /// consolidated filters already exceed 70 must remain stable.
-    async fn maybe_consolidate(&mut self, relay_url: &str, new_count: usize) -> bool {
-        let current_count = if let Some(connection) = self.connections.get(relay_url) {
-            connection.subscription_count().await
-        } else {
-            0
-        };
-        let desired_baseline = self.desired_live_filter_count(relay_url).await;
-        let fragmentation = consolidation_fragmentation(current_count, new_count, desired_baseline);
-        let budget_pressure = self
-            .connections
-            .get(relay_url)
-            .is_some_and(|connection| connection.needs_live_consolidation(new_count));
-
-        if budget_pressure || should_consolidate(current_count, new_count, desired_baseline) {
-            let has_pending_batches = self.has_pending_batches(relay_url).await;
-            if !self
-                .deferred_consolidations
-                .request(relay_url, has_pending_batches)
-            {
-                tracing::info!(
-                    relay = %relay_url,
-                    current_count,
-                    new_count,
-                    desired_baseline,
-                    fragmentation,
-                    threshold = CONSOLIDATION_THRESHOLD,
-                    budget_pressure,
-                    "Live subscription pressure requires consolidation; deferring until pending batches drain"
-                );
-                return false;
-            }
-
-            tracing::info!(
-                relay = %relay_url,
-                current_count = current_count,
-                new_count = new_count,
-                desired_baseline,
-                fragmentation,
-                threshold = CONSOLIDATION_THRESHOLD,
-                budget_pressure,
-                "Live subscription pressure requires consolidation"
-            );
-
-            return self.consolidate(relay_url).await;
-        }
-        true
-    }
-
     async fn process_deferred_consolidation(&mut self, relay_url: &str) {
         let has_pending_batches = self.has_pending_batches(relay_url).await;
         if !self
@@ -6317,8 +6229,16 @@ impl SyncManager {
         if filter_groups.is_empty() {
             return Ok(Vec::new());
         }
+        let protected_subscription_ids = self
+            .descendant_live_coverage
+            .get(relay_url)
+            .map(|coverage| coverage.subscription_ids.clone())
+            .unwrap_or_default();
         connection
-            .subscribe_live_filter_groups(filter_groups)
+            .extend_live_filter_groups_minimally(
+                filter_groups,
+                &protected_subscription_ids,
+            )
             .await
             .inspect_err(|error| {
                 tracing::error!(relay = %relay_url, error = %error, "Failed to create complete live subscription set");
@@ -7126,29 +7046,6 @@ mod tests {
             connections_for_relay_urls(&connections, &candidates),
             vec![(canonical, 7)]
         );
-    }
-
-    #[test]
-    fn desired_baseline_above_threshold_does_not_reconsolidate() {
-        let desired_baseline = 178;
-
-        assert!(
-            !should_consolidate(desired_baseline, 1, desired_baseline),
-            "the irreducible desired set must be a stable post-rebuild baseline"
-        );
-        assert!(
-            !should_consolidate(
-                desired_baseline + CONSOLIDATION_THRESHOLD - 1,
-                1,
-                desired_baseline,
-            ),
-            "the configured fragmentation headroom is allowed above the baseline"
-        );
-        assert!(should_consolidate(
-            desired_baseline + CONSOLIDATION_THRESHOLD,
-            1,
-            desired_baseline,
-        ));
     }
 
     #[test]

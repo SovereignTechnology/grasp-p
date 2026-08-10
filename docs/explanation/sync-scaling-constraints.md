@@ -323,16 +323,27 @@ NIP-11 `max_subscriptions` sets B for each new connection session; when it is
 absent B falls back to 20. Advertised values below that floor are honoured
 (notably nostream's default 10). Two slots remain reserved. Core live filter
 groups are packed first and admitted atomically against the advertised
-subscription-count budget: if the complete core live set cannot fit,
-the existing subscriptions are consolidated into the byte- and filter-count
-bounded REQ groups first. If the consolidated core live set still cannot fit,
-partial coverage is not opened, historic work is deferred, and a warning
-surfaces the condition. Reconnect and consolidation build Layer 1, 2, and 3
-coverage together and reserve the whole grouped set before opening it. A
-failure while opening group N sends CLOSE for every earlier group and returns
-their slots, so callers never inherit hidden partial coverage. Replacement
-also remembers the exact previous grouping and restores it if the new complete
-set fails at runtime. Multi-connection sharding remains the later lever.
+subscription-count budget. Incremental five-second batches preserve full core
+REQs and separately owned descendant REQs. The planner uses the same
+filter-count and serialized-byte grouping rules as wire submission. It repacks
+the complete mutable core tail with the new filters when that releases at least
+one slot; otherwise it retires only the smallest useful subset which reduces
+the incremental slot cost. Thus byte-bound groups are not rebuilt merely
+because they contain fewer than the maximum filter count. Repository and
+identifier inputs are sorted before byte chunking so equivalent coverage has
+stable group identity.
+If the changed tail cannot fit the count or learned byte budget, no extension
+is opened and historic recovery remains available. Capacity pressure is the
+backstop which may schedule a complete regroup after outstanding historic
+batches drain; an ordinary tail update never rebuilds stable full groups.
+
+Reconnect and exceptional full restoration still build Layer 1, 2, and 3
+coverage together and reserve the whole grouped set before opening it. Both
+full replacement and tail replacement remember the exact previous grouping:
+a failure while opening a replacement closes every newly opened group and
+restores the retired groups. A partial CLOSE failure likewise reopens any tail
+groups which were already closed before reporting the failure. Multi-connection
+sharding remains the later lever.
 
 A transient slot is released only after EOSE has caused CLOSE to be enqueued,
 after relay CLOSED, or after connection teardown. Because NIP-01 provides no
