@@ -659,7 +659,12 @@ impl SyncContext for RealSyncContext {
                 .cloned()
                 .collect();
             if !advertised_tips.is_empty() {
-                let mut args = vec!["fetch".to_string(), url.clone()];
+                let mut args = vec![
+                    "fetch".to_string(),
+                    "--no-write-fetch-head".to_string(),
+                    "--no-auto-maintenance".to_string(),
+                    url.clone(),
+                ];
                 args.extend(advertised_tips.iter().cloned());
 
                 match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
@@ -713,7 +718,13 @@ impl SyncContext for RealSyncContext {
                 }
                 residual_attempted += 1;
 
-                let args = vec!["fetch".to_string(), url.clone(), oid.clone()];
+                let args = vec![
+                    "fetch".to_string(),
+                    "--no-write-fetch-head".to_string(),
+                    "--no-auto-maintenance".to_string(),
+                    url.clone(),
+                    oid.clone(),
+                ];
                 match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
                     Ok(result) if result.status.success() => {}
                     Ok(result) => {

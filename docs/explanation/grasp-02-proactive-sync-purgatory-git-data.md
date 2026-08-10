@@ -443,6 +443,10 @@ the remaining demand after the active pass finishes.
 All three phases run beneath the pass's per-domain permit. Separating the
 comparison into its own helper in future must retain that permit; `ls-remote`
 is outbound work against the same Git server, not an unaccounted preflight.
+Fetches request objects without writing `FETCH_HEAD` and suppress automatic
+maintenance. This keeps the object-only operation free of shared ref-state and
+maintenance side effects before repository-level delayed hedging permits a
+second source to write objects concurrently.
 
 **Why not just list every OID as a want?** An earlier implementation did
 exactly that and dropped one OID from the batch on each `not our ref`
