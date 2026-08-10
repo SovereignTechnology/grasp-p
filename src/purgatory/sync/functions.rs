@@ -367,7 +367,13 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
         return 0;
     }
 
-    // Perform the fetch with throttle tracking
+    // Per-domain limits alone do not bound aggregate work when a cold sync
+    // discovers many domains simultaneously. Wait for the process-wide permit
+    // before occupying a domain slot, then retain it for the complete remote
+    // Git pass so subprocess fan-out stays bounded.
+    let _background_permit = throttle_manager.acquire_global_request().await;
+
+    // Perform the fetch with per-domain throttle tracking.
     throttle_manager.start_request(&domain);
     let fetch_result = ctx.fetch_oids(&target_repo, url, &needed_oids).await;
     throttle_manager.complete_request(&domain);
