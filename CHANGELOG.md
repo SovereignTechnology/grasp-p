@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but omit the repository and root-event tags. When the per-connection ledger
   can retain complete descendant coverage while preserving control and
   historic capacity, those filters stay live; otherwise bounded EOSE-closing
-  history provides eventual coverage. The frontier is deliberately
-  non-recursive and connection sharding remains unnecessary.
+  history provides eventual coverage. Direct replaceable and addressable
+  members contribute both their event ID and NIP-01 coordinate, covering
+  descendants which use `a`, `A`, or coordinate-valued `q` tags. The frontier
+  is deliberately non-recursive and connection sharding remains unnecessary.
 
 ### Changed
 

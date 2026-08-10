@@ -317,7 +317,10 @@ slots. Four consumers share it, in priority order:
    its complete separately grouped set fits after core coverage while still
    preserving the margin and a transient slot. Otherwise each constrained
    relay advances one cursor-overlapped REQ+EOSE filter per five-second tick
-   through the same transient queue.
+   through the same transient queue. Direct thread members contribute their
+   event IDs; replaceable and addressable members also contribute their NIP-01
+   coordinates. The resulting `e`/`E`/`q` and `a`/`A`/coordinate-`q` filters
+   cover one descendant generation without recursively expanding the frontier.
 
 NIP-11 `max_subscriptions` sets B for each new connection session; when it is
 absent B falls back to 20. Advertised values below that floor are honoured

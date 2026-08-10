@@ -27,7 +27,7 @@ async fn wait_for_log(path: &std::path::Path, needle: &str, timeout: Duration) -
 /// pass. The recovered events do not recursively extend the frontier.
 #[tokio::test]
 async fn historic_sync_recovers_one_generation_of_parent_only_descendants() {
-    let source = TestRelay::start_with_relay_max_subscriptions(5).await;
+    let source = TestRelay::start_with_relay_max_subscriptions(4).await;
     let keys = Keys::generate();
     let repo_id = "scheduled-descendant-history";
 
@@ -158,6 +158,87 @@ async fn descendant_live_coverage_is_preferred_when_capacity_remains() {
         )
         .await,
         "parent-only descendant should arrive through retained live coverage"
+    );
+
+    source_client.disconnect().await;
+    syncing.stop().await;
+    source.stop().await;
+}
+
+/// A direct addressable thread member extends the non-recursive frontier by
+/// its coordinate as well as its event ID. Descendants which carry only an
+/// address tag must therefore be recovered by a constrained relay's historic
+/// fallback rotation.
+#[tokio::test]
+async fn historic_sync_recovers_address_tag_descendants() {
+    let source = TestRelay::start_with_relay_max_subscriptions(4).await;
+    let keys = Keys::generate();
+    let repo_id = "addressable-descendant-history";
+    let source_domains = [source.domain()];
+    let source_refs = source_domains
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let (_announcement, _source_git) =
+        setup_announcement_on_relay(&source, &keys, &source_refs, repo_id).await;
+    let source_client = TestClient::new(source.url(), keys.clone())
+        .await
+        .expect("connect to source relay");
+    let issue = build_layer2_issue_event(
+        &keys,
+        &repo_coord(&keys, repo_id),
+        "Addressable descendant root",
+    )
+    .expect("build issue");
+    let direct_addressable = EventBuilder::new(Kind::Custom(30_023), "Direct article")
+        .tags([
+            Tag::custom("d", ["direct-article"]),
+            Tag::custom("e", [issue.id.to_hex()]),
+        ])
+        .finalize(&keys)
+        .expect("build direct addressable member");
+    let coordinate = format!(
+        "30023:{}:direct-article",
+        direct_addressable.pubkey.to_hex()
+    );
+    let address_only_children = ["a", "A", "q"].map(|tag| {
+        EventBuilder::new(Kind::Custom(1_111), format!("{tag}-tag child"))
+            .tag(Tag::custom(tag, [coordinate.clone()]))
+            .finalize(&keys)
+            .expect("build address-only child")
+    });
+    source_client.send_event(&issue).await.unwrap();
+    source_client.send_event(&direct_addressable).await.unwrap();
+    for event in &address_only_children {
+        source_client.send_event(event).await.unwrap();
+    }
+
+    let syncing = TestRelay::start_with_sync(None).await;
+    let domains = [source.domain(), syncing.domain()];
+    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
+    let (_target_announcement, _target_git) =
+        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+
+    for event in &address_only_children {
+        assert!(
+            wait_for_event_on_relay(
+                syncing.url(),
+                Filter::new().id(event.id),
+                Duration::from_secs(25),
+            )
+            .await,
+            "historic fallback should recover the {} child",
+            event.content
+        );
+    }
+    assert!(
+        wait_for_log(
+            &syncing.log_path(),
+            "Started queued descendant fallback query",
+            Duration::from_secs(5),
+        )
+        .await,
+        "the constrained source should exercise coordinate fallback filters"
     );
 
     source_client.disconnect().await;
