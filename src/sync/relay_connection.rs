@@ -490,10 +490,10 @@ where
 /// Events from a relay connection
 #[derive(Debug)]
 pub enum RelayEvent {
-    /// A new event was received (event, subscription_id)
-    Event(Box<Event>, SubscriptionId),
+    /// A new event was received (event, subscription_id, data-lane arrival).
+    Event(Box<Event>, SubscriptionId, std::time::Instant),
     /// End of stored events for a subscription
-    EndOfStoredEvents(SubscriptionId),
+    EndOfStoredEvents(SubscriptionId, std::time::Instant),
     /// NOTICE message from relay
     Notice(String),
     /// Connection was closed
@@ -1201,7 +1201,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.replace_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
         })
         .await
     }
@@ -1229,7 +1229,9 @@ impl RelayConnection {
                     .map(|_| ())
                     .map_err(|error| format!("{subscription_id}: {error}"))
             },
-            |filters, permit| self.subscribe_filters_with_live_permit(filters, None, Some(permit)),
+            |filters, permit| {
+                self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
+            },
         )
         .await
     }
@@ -1653,6 +1655,7 @@ impl RelayConnection {
                     event,
                     subscription_id,
                 } => {
+                    let data_lane_arrival = std::time::Instant::now();
                     self.record_transient_req_event(&subscription_id);
                     tracing::trace!(
                         relay = %url,
@@ -1661,7 +1664,11 @@ impl RelayConnection {
                         "Received event"
                     );
                     if event_sender
-                        .send(RelayEvent::Event(Box::new(*event), subscription_id.clone()))
+                        .send(RelayEvent::Event(
+                            Box::new(*event),
+                            subscription_id.clone(),
+                            data_lane_arrival,
+                        ))
                         .await
                         .is_err()
                     {
@@ -1671,11 +1678,15 @@ impl RelayConnection {
                 }
                 RelayNotification::Message { message } => match *message {
                     RelayMessage::EndOfStoredEvents(sub_id) => {
+                        let data_lane_arrival = std::time::Instant::now();
                         tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");
                         // Convert Cow<SubscriptionId> to owned SubscriptionId
                         let owned_sub_id = sub_id.into_owned();
                         if event_sender
-                            .send(RelayEvent::EndOfStoredEvents(owned_sub_id))
+                            .send(RelayEvent::EndOfStoredEvents(
+                                owned_sub_id,
+                                data_lane_arrival,
+                            ))
                             .await
                             .is_err()
                         {
@@ -1816,6 +1827,24 @@ impl RelayConnection {
         self.subscribe_filters(vec![filter], request_class).await
     }
 
+    /// Open a transient subscription with an ID already registered by its
+    /// caller. Pending-batch owners use this to make an immediate EOSE visible
+    /// before the wire request can be answered.
+    pub async fn subscribe_filter_with_id(
+        &self,
+        filter: Filter,
+        request_class: TransientRequestClass,
+        subscription_id: SubscriptionId,
+    ) -> Result<SubscriptionId, String> {
+        self.subscribe_filters_with_live_permit(
+            vec![filter],
+            Some(request_class),
+            None,
+            Some(subscription_id),
+        )
+        .await
+    }
+
     /// Subscribe to several OR filters under one NIP-01 subscription ID.
     ///
     /// Relays apply active-REQ limits to subscription IDs, not to the filters
@@ -1826,7 +1855,7 @@ impl RelayConnection {
         filters: Vec<Filter>,
         request_class: TransientRequestClass,
     ) -> Result<SubscriptionId, String> {
-        self.subscribe_filters_with_live_permit(filters, Some(request_class), None)
+        self.subscribe_filters_with_live_permit(filters, Some(request_class), None, None)
             .await
     }
 
@@ -1838,7 +1867,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.subscribe_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
         })
         .await
     }
@@ -1897,6 +1926,7 @@ impl RelayConnection {
         filters: Vec<Filter>,
         transient_class: Option<TransientRequestClass>,
         reserved_live_permit: Option<SessionPermit>,
+        requested_subscription_id: Option<SubscriptionId>,
     ) -> Result<SubscriptionId, String> {
         if filters.is_empty() {
             return Err("Cannot subscribe with an empty filter set".to_string());
@@ -1969,7 +1999,9 @@ impl RelayConnection {
         // The relay can answer an empty or cached query before `subscribe`
         // returns. Register transient ownership against a caller-chosen ID
         // first so an immediate EOSE/CLOSED cannot race past local accounting.
-        let transient_sub_id = transient_class.map(|_| SubscriptionId::generate());
+        let transient_sub_id = transient_class.map(|_| {
+            requested_subscription_id.unwrap_or_else(SubscriptionId::generate)
+        });
         if let (Some(sub_id), Some(permit)) = (&transient_sub_id, transient_permit) {
             self.hold_transient_req_permit(sub_id.clone(), permit);
         }
@@ -3704,7 +3736,7 @@ mod tests {
                     }
                 },
                 |filters, permit| {
-                    connection.subscribe_filters_with_live_permit(filters, None, Some(permit))
+                    connection.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
                 },
             )
             .await

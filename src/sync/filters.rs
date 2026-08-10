@@ -13,6 +13,165 @@ use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
 
+/// Ordered live-coverage priorities. Lower-priority tiers may be served by
+/// paced REQ+EOSE rotation when the connection cannot keep every filter live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CoverageTier {
+    EssentialCore,
+    RootUppercase,
+    CoreCompatibility,
+    DescendantCanonical,
+    DescendantQuote,
+    HistoricOnly,
+}
+
+#[derive(Debug, Clone)]
+pub struct TieredFilter {
+    pub tier: CoverageTier,
+    pub filter: Filter,
+}
+
+/// Build the live coverage that is never demoted under connection pressure.
+pub fn build_essential_live_filters(
+    full_repos: &HashSet<String>,
+    state_only_repos: &HashSet<String>,
+    root_events: &HashSet<EventId>,
+    since: Option<Timestamp>,
+) -> Vec<Filter> {
+    let all_repos: HashSet<String> = full_repos.union(state_only_repos).cloned().collect();
+    let mut filters = state_event_filters_for_our_repos(&all_repos, since);
+    if !full_repos.is_empty() {
+        filters.extend(
+            tiered_repo_event_filters(full_repos, false, since)
+                .into_iter()
+                .filter(|entry| entry.tier == CoverageTier::EssentialCore)
+                .map(|entry| entry.filter),
+        );
+    }
+    filters.extend(
+        tiered_root_event_filters(root_events, false, since)
+            .into_iter()
+            .filter(|entry| entry.tier == CoverageTier::EssentialCore)
+            .map(|entry| entry.filter),
+    );
+    filters
+}
+
+/// Build the priority-ordered core reference coverage that can move between a
+/// persistent subscription and paced REQ+EOSE rotation.
+pub fn tiered_auxiliary_core_filters(
+    full_repos: &HashSet<String>,
+    root_events: &HashSet<EventId>,
+    since: Option<Timestamp>,
+) -> Vec<TieredFilter> {
+    let mut filters = tiered_root_event_filters(root_events, false, since);
+    filters.extend(tiered_repo_event_filters(full_repos, false, since));
+    filters.retain(|entry| entry.tier != CoverageTier::EssentialCore);
+    filters.sort_by_key(|entry| entry.tier);
+    filters
+}
+
+fn tagged_filters<T: AsRef<str>>(
+    values: &[T],
+    tag: SingleLetterTag,
+    since: Option<Timestamp>,
+) -> Vec<Filter> {
+    chunk_values_by_bytes(values)
+        .into_iter()
+        .map(|chunk| {
+            let mut filter = Filter::new();
+            for value in chunk {
+                filter = filter.custom_tag(tag, value.as_ref());
+            }
+            match since {
+                Some(timestamp) => filter.since(timestamp),
+                None => filter,
+            }
+        })
+        .collect()
+}
+
+fn tiered_tagged_filters<T: AsRef<str>>(
+    values: &[T],
+    tiers: &[(CoverageTier, SingleLetterTag)],
+    since: Option<Timestamp>,
+) -> Vec<TieredFilter> {
+    tiers
+        .iter()
+        .flat_map(|(tier, tag)| {
+            tagged_filters(values, *tag, since)
+                .into_iter()
+                .map(|filter| TieredFilter {
+                    tier: *tier,
+                    filter,
+                })
+        })
+        .collect()
+}
+
+/// Priority-labelled filters for repository coordinates.
+pub fn tiered_repo_event_filters(
+    repos: &HashSet<String>,
+    descendant: bool,
+    since: Option<Timestamp>,
+) -> Vec<TieredFilter> {
+    let mut values: Vec<_> = repos.iter().collect();
+    values.sort_unstable();
+    let tiers = if descendant {
+        [
+            (
+                CoverageTier::DescendantCanonical,
+                SingleLetterTag::LOWERCASE_A,
+            ),
+            (CoverageTier::DescendantQuote, SingleLetterTag::LOWERCASE_Q),
+            (CoverageTier::HistoricOnly, SingleLetterTag::UPPERCASE_A),
+        ]
+    } else {
+        [
+            (CoverageTier::EssentialCore, SingleLetterTag::LOWERCASE_A),
+            (
+                CoverageTier::CoreCompatibility,
+                SingleLetterTag::UPPERCASE_A,
+            ),
+            (
+                CoverageTier::CoreCompatibility,
+                SingleLetterTag::LOWERCASE_Q,
+            ),
+        ]
+    };
+    tiered_tagged_filters(&values, &tiers, since)
+}
+
+/// Priority-labelled filters for event references.
+pub fn tiered_root_event_filters(
+    root_events: &HashSet<EventId>,
+    descendant: bool,
+    since: Option<Timestamp>,
+) -> Vec<TieredFilter> {
+    let mut values: Vec<String> = root_events.iter().map(EventId::to_hex).collect();
+    values.sort_unstable();
+    let tiers = if descendant {
+        [
+            (
+                CoverageTier::DescendantCanonical,
+                SingleLetterTag::LOWERCASE_E,
+            ),
+            (CoverageTier::DescendantQuote, SingleLetterTag::LOWERCASE_Q),
+            (CoverageTier::HistoricOnly, SingleLetterTag::UPPERCASE_E),
+        ]
+    } else {
+        [
+            (CoverageTier::EssentialCore, SingleLetterTag::LOWERCASE_E),
+            (CoverageTier::RootUppercase, SingleLetterTag::UPPERCASE_E),
+            (
+                CoverageTier::CoreCompatibility,
+                SingleLetterTag::LOWERCASE_Q,
+            ),
+        ]
+    };
+    tiered_tagged_filters(&values, &tiers, since)
+}
+
 /// Serialized byte budget of tag values per filter chunk.
 ///
 /// Relay filter limits are byte caps, not item counts: strfry bounds the
@@ -362,6 +521,61 @@ mod tests {
 
         // Should create 3 filters (a, A, q) for one chunk
         assert_eq!(filters.len(), 3);
+    }
+
+    #[test]
+    fn core_reference_filters_have_stable_priority_tiers() {
+        let repos = HashSet::from(["30617:pubkey:repo".to_string()]);
+        let roots = HashSet::from([EventId::from_byte_array([0; 32])]);
+
+        let repo_tiers: Vec<_> = tiered_repo_event_filters(&repos, false, None)
+            .into_iter()
+            .map(|entry| entry.tier)
+            .collect();
+        assert_eq!(
+            repo_tiers,
+            [
+                CoverageTier::EssentialCore,
+                CoverageTier::CoreCompatibility,
+                CoverageTier::CoreCompatibility,
+            ]
+        );
+
+        let root_tiers: Vec<_> = tiered_root_event_filters(&roots, false, None)
+            .into_iter()
+            .map(|entry| entry.tier)
+            .collect();
+        assert_eq!(
+            root_tiers,
+            [
+                CoverageTier::EssentialCore,
+                CoverageTier::RootUppercase,
+                CoverageTier::CoreCompatibility,
+            ]
+        );
+    }
+
+    #[test]
+    fn descendant_reference_filters_put_uppercase_tags_in_history_only() {
+        let repos = HashSet::from(["1621:pubkey:patch".to_string()]);
+        let roots = HashSet::from([EventId::from_byte_array([0; 32])]);
+
+        for tiers in [
+            tiered_repo_event_filters(&repos, true, None),
+            tiered_root_event_filters(&roots, true, None),
+        ] {
+            assert_eq!(
+                tiers
+                    .into_iter()
+                    .map(|entry| entry.tier)
+                    .collect::<Vec<_>>(),
+                [
+                    CoverageTier::DescendantCanonical,
+                    CoverageTier::DescendantQuote,
+                    CoverageTier::HistoricOnly,
+                ]
+            );
+        }
     }
 
     #[test]

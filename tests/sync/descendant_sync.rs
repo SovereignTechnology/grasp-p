@@ -139,7 +139,7 @@ async fn descendant_live_coverage_is_preferred_when_capacity_remains() {
     assert!(
         wait_for_log(
             &syncing.log_path(),
-            "Installed auxiliary descendant live coverage",
+            "Installed priority-bounded auxiliary live coverage",
             Duration::from_secs(20),
         )
         .await,
