@@ -13,6 +13,7 @@
 //! See `docs/explanation/grasp-02-proactive-sync.md` for full design details.
 
 pub mod algorithms;
+pub mod discovery;
 pub mod filters;
 pub mod health;
 pub mod metrics;
