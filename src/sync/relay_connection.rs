@@ -1201,7 +1201,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.replace_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
         })
         .await
     }
@@ -1229,7 +1229,9 @@ impl RelayConnection {
                     .map(|_| ())
                     .map_err(|error| format!("{subscription_id}: {error}"))
             },
-            |filters, permit| self.subscribe_filters_with_live_permit(filters, None, Some(permit)),
+            |filters, permit| {
+                self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
+            },
         )
         .await
     }
@@ -1816,6 +1818,24 @@ impl RelayConnection {
         self.subscribe_filters(vec![filter], request_class).await
     }
 
+    /// Open a transient subscription with an ID already registered by its
+    /// caller. Pending-batch owners use this to make an immediate EOSE visible
+    /// before the wire request can be answered.
+    pub async fn subscribe_filter_with_id(
+        &self,
+        filter: Filter,
+        request_class: TransientRequestClass,
+        subscription_id: SubscriptionId,
+    ) -> Result<SubscriptionId, String> {
+        self.subscribe_filters_with_live_permit(
+            vec![filter],
+            Some(request_class),
+            None,
+            Some(subscription_id),
+        )
+        .await
+    }
+
     /// Subscribe to several OR filters under one NIP-01 subscription ID.
     ///
     /// Relays apply active-REQ limits to subscription IDs, not to the filters
@@ -1826,7 +1846,7 @@ impl RelayConnection {
         filters: Vec<Filter>,
         request_class: TransientRequestClass,
     ) -> Result<SubscriptionId, String> {
-        self.subscribe_filters_with_live_permit(filters, Some(request_class), None)
+        self.subscribe_filters_with_live_permit(filters, Some(request_class), None, None)
             .await
     }
 
@@ -1838,7 +1858,7 @@ impl RelayConnection {
         filter_groups: Vec<Vec<Filter>>,
     ) -> Result<Vec<SubscriptionId>, String> {
         self.subscribe_live_filter_groups_with(filter_groups, |filters, permit| {
-            self.subscribe_filters_with_live_permit(filters, None, Some(permit))
+            self.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
         })
         .await
     }
@@ -1897,6 +1917,7 @@ impl RelayConnection {
         filters: Vec<Filter>,
         transient_class: Option<TransientRequestClass>,
         reserved_live_permit: Option<SessionPermit>,
+        requested_subscription_id: Option<SubscriptionId>,
     ) -> Result<SubscriptionId, String> {
         if filters.is_empty() {
             return Err("Cannot subscribe with an empty filter set".to_string());
@@ -1969,7 +1990,9 @@ impl RelayConnection {
         // The relay can answer an empty or cached query before `subscribe`
         // returns. Register transient ownership against a caller-chosen ID
         // first so an immediate EOSE/CLOSED cannot race past local accounting.
-        let transient_sub_id = transient_class.map(|_| SubscriptionId::generate());
+        let transient_sub_id = transient_class.map(|_| {
+            requested_subscription_id.unwrap_or_else(SubscriptionId::generate)
+        });
         if let (Some(sub_id), Some(permit)) = (&transient_sub_id, transient_permit) {
             self.hold_transient_req_permit(sub_id.clone(), permit);
         }
@@ -3704,7 +3727,7 @@ mod tests {
                     }
                 },
                 |filters, permit| {
-                    connection.subscribe_filters_with_live_permit(filters, None, Some(permit))
+                    connection.subscribe_filters_with_live_permit(filters, None, Some(permit), None)
                 },
             )
             .await

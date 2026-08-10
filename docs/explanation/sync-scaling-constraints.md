@@ -370,7 +370,10 @@ purgatory polling uses the same transient class bound and shared ledger as
 historic pagination. Transient subscription IDs and their permits are
 registered locally before the REQ is sent; this ordering is required because
 an empty or cached response can deliver EOSE/CLOSED before the SDK subscribe
-call returns. Subscribe failure rolls that pre-registration back. Unexpected
+call returns. Negentropy hydration also registers the complete paced chunk set
+and its requested-event accounting in the pending batch before sending the
+first REQ, so early deliveries cannot become an artificial missing residual.
+Subscribe failure rolls both forms of pre-registration back. Unexpected
 CLOSED for a persistent live subscription is
 reported to the manager, which recomputes and transactionally reopens complete
 live coverage. Each reconnect closes the retired ledger and creates a new

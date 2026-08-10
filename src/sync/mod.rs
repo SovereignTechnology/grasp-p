@@ -1012,6 +1012,23 @@ fn take_batch_containing_subscription(
     Some(batch)
 }
 
+fn register_negentropy_hydration_attempt(
+    batch: &mut PendingBatch,
+    subscription_ids: impl IntoIterator<Item = SubscriptionId>,
+    requested_event_ids: impl IntoIterator<Item = EventId>,
+    is_retry: bool,
+) {
+    // Register the complete attempt before its first REQ is sent. A fast
+    // relay can deliver events and EOSE while later paced chunks are still
+    // waiting to open; pre-registration makes that whole stream attributable.
+    batch.outstanding_subs.extend(subscription_ids);
+    batch.requested_event_ids = Some(requested_event_ids.into_iter().collect());
+    batch.received_event_ids = Some(HashSet::new());
+    if is_retry {
+        batch.retry_count += 1;
+    }
+}
+
 fn mark_deferred_pagination(
     batch: &mut PendingBatch,
     completed_sub_id: &SubscriptionId,
@@ -2278,57 +2295,97 @@ impl SyncManager {
                     drop(pending);
 
                     // Create new subscriptions for missing events
-                    let retry_filters: Vec<_> = missing
+                    let retry_subscriptions: Vec<_> = missing
                         .chunks(300)
-                        .map(|c| Filter::new().ids(c.iter().copied()))
+                        .map(|chunk| {
+                            (
+                                SubscriptionId::generate(),
+                                Filter::new().ids(chunk.iter().copied()),
+                            )
+                        })
                         .collect();
+                    {
+                        let mut pending = self.pending_sync_index.write().await;
+                        if let Some(batch) = pending
+                            .get_mut(&relay_url_for_retry)
+                            .and_then(|batches| {
+                                batches.iter_mut().find(|batch| batch.batch_id == batch_id)
+                            })
+                        {
+                            register_negentropy_hydration_attempt(
+                                batch,
+                                retry_subscriptions
+                                    .iter()
+                                    .map(|(subscription_id, _)| subscription_id.clone()),
+                                missing.iter().copied(),
+                                true,
+                            );
+                        }
+                    }
 
-                    let mut new_sub_ids = HashSet::new();
-                    if let Some(conn) = self.connections.get(&relay_url_for_retry) {
-                        for filter in retry_filters {
-                            match conn
-                                .subscribe_filter(filter, TransientRequestClass::NegentropyRetry)
-                                .await
-                            {
-                                Ok(sub_id) => {
-                                    new_sub_ids.insert(sub_id);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        relay = %relay_url_for_retry,
-                                        batch_id = batch_id,
-                                        error = %e,
-                                        "Failed to create retry subscription for missing events"
-                                    );
+                    let mut successful_subscriptions = 0usize;
+                    for (subscription_id, filter) in &retry_subscriptions {
+                        let result = if let Some(conn) = self.connections.get(&relay_url_for_retry)
+                        {
+                            conn.subscribe_filter_with_id(
+                                filter.clone(),
+                                TransientRequestClass::NegentropyRetry,
+                                subscription_id.clone(),
+                            )
+                            .await
+                        } else {
+                            Err("Relay connection disappeared before hydration retry".to_string())
+                        };
+                        match result {
+                            Ok(_) => successful_subscriptions += 1,
+                            Err(e) => {
+                                tracing::error!(
+                                    relay = %relay_url_for_retry,
+                                    batch_id = batch_id,
+                                    error = %e,
+                                    "Failed to create retry subscription for missing events"
+                                );
+                                let mut pending = self.pending_sync_index.write().await;
+                                if let Some(batch) = pending
+                                    .get_mut(&relay_url_for_retry)
+                                    .and_then(|batches| {
+                                        batches.iter_mut().find(|batch| batch.batch_id == batch_id)
+                                    })
+                                {
+                                    batch.outstanding_subs.remove(subscription_id);
                                 }
                             }
                         }
                     }
 
-                    if !new_sub_ids.is_empty() {
-                        // Re-acquire lock and update batch with new subscriptions
+                    if successful_subscriptions > 0 {
+                        // Immediate EOSEs may have drained every successful
+                        // subscription before the final failed send unwound.
+                        // Complete that otherwise signal-less edge here.
                         let mut pending = self.pending_sync_index.write().await;
-                        if let Some(batches) = pending.get_mut(&relay_url_for_retry) {
-                            if let Some(batch) = batches.iter_mut().find(|b| b.batch_id == batch_id)
-                            {
-                                batch.outstanding_subs.extend(new_sub_ids.clone());
-                                // Update requested_event_ids to only include missing ones
-                                batch.requested_event_ids = Some(missing.iter().cloned().collect());
-                                // Clear received_event_ids for fresh tracking
-                                batch.received_event_ids = Some(HashSet::new());
-                                // Increment retry counter
-                                batch.retry_count += 1;
-
-                                tracing::info!(
-                                    relay = %relay_url_for_retry,
-                                    batch_id = batch_id,
-                                    retry_subs = new_sub_ids.len(),
-                                    missing_events = missing.len(),
-                                    retry_attempt = batch.retry_count,
-                                    "Created retry subscriptions for missing negentropy events"
-                                );
-                            }
+                        let completed_batch = take_drained_batch_as_failed(
+                            &mut pending,
+                            &relay_url_for_retry,
+                            batch_id,
+                        );
+                        let retry_attempt = pending
+                            .get(&relay_url_for_retry)
+                            .and_then(|batches| {
+                                batches.iter().find(|batch| batch.batch_id == batch_id)
+                            })
+                            .map(|batch| batch.retry_count);
+                        drop(pending);
+                        if let Some(batch) = completed_batch {
+                            self.confirm_batch(&relay_url_for_retry, batch).await;
                         }
+                        tracing::info!(
+                            relay = %relay_url_for_retry,
+                            batch_id = batch_id,
+                            retry_subs = successful_subscriptions,
+                            missing_events = missing.len(),
+                            retry_attempt = retry_attempt.unwrap_or(retry_count + 1),
+                            "Created retry subscriptions for missing negentropy events"
+                        );
                         // Early return - batch not complete yet, waiting for retry EOSE
                         return;
                     } else {
@@ -6788,49 +6845,69 @@ impl SyncManager {
                     "Creating subscriptions to fetch missing events by ID"
                 );
 
-                let mut subscription_ids = HashSet::new();
-                for (idx, filter) in ids_filters.iter().enumerate() {
-                    if let Some(conn) = self.connections.get(relay_url) {
-                        match conn
-                            .subscribe_filter(
-                                filter.clone(),
-                                TransientRequestClass::NegentropyHydration,
-                            )
-                            .await
-                        {
-                            Ok(sub_id) => {
-                                subscription_ids.insert(sub_id);
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    relay = %relay_url,
-                                    batch_id = batch_id,
-                                    chunk_idx = idx,
-                                    error = %e,
-                                    "Failed to subscribe to ID filter chunk"
-                                );
-                            }
-                        }
-                    }
-                }
+                let planned_subscriptions: Vec<_> = ids_filters
+                    .into_iter()
+                    .map(|filter| (SubscriptionId::generate(), filter))
+                    .collect();
                 {
                     let mut pending = self.pending_sync_index.write().await;
                     if let Some(relay_batches) = pending.get_mut(relay_url) {
                         if let Some(batch) =
                             relay_batches.iter_mut().find(|b| b.batch_id == batch_id)
                         {
-                            batch.outstanding_subs.extend(subscription_ids.clone());
-                            // Store requested event IDs for validation after EOSE
-                            batch.requested_event_ids =
-                                Some(all_remote_ids.iter().cloned().collect());
-                            batch.received_event_ids = Some(HashSet::new());
+                            register_negentropy_hydration_attempt(
+                                batch,
+                                planned_subscriptions
+                                    .iter()
+                                    .map(|(subscription_id, _)| subscription_id.clone()),
+                                all_remote_ids.iter().copied(),
+                                false,
+                            );
+                        }
+                    }
+                }
+                for (idx, (subscription_id, filter)) in
+                    planned_subscriptions.iter().enumerate()
+                {
+                    let result = if let Some(conn) = self.connections.get(relay_url) {
+                        conn.subscribe_filter_with_id(
+                            filter.clone(),
+                            TransientRequestClass::NegentropyHydration,
+                            subscription_id.clone(),
+                        )
+                        .await
+                    } else {
+                        Err("Relay connection disappeared before hydration REQ".to_string())
+                    };
+                    if let Err(e) = result {
+                        tracing::error!(
+                            relay = %relay_url,
+                            batch_id = batch_id,
+                            chunk_idx = idx,
+                            error = %e,
+                            "Failed to subscribe to ID filter chunk"
+                        );
+                        let completed_batch = {
+                            let mut pending = self.pending_sync_index.write().await;
+                            if let Some(batch) = pending
+                                .get_mut(relay_url)
+                                .and_then(|batches| {
+                                    batches.iter_mut().find(|batch| batch.batch_id == batch_id)
+                                })
+                            {
+                                batch.outstanding_subs.remove(subscription_id);
+                            }
+                            take_drained_batch_as_failed(&mut pending, relay_url, batch_id)
+                        };
+                        if let Some(batch) = completed_batch {
+                            self.confirm_batch(relay_url, batch).await;
                         }
                     }
                 }
                 tracing::debug!(
                     relay = %relay_url,
                     batch_id = batch_id,
-                    subscription_ids = subscription_ids.len(),
+                    subscription_ids = planned_subscriptions.len(),
                     events = all_remote_ids.len(),
                     "historic_sync (Negentropy) created subscriptions to fetch missing events by id, awaiting EOSE"
                 );
@@ -8136,6 +8213,51 @@ mod tests {
         assert_eq!(batch.sync_method, SyncMethod::Negentropy);
         assert_eq!(batch.retry_count, 0);
         assert!(!batch.failed);
+    }
+
+    #[test]
+    fn hydration_attempt_registers_every_chunk_before_immediate_delivery() {
+        let mut batch = PendingBatch {
+            batch_id: 7,
+            purpose: PendingBatchPurpose::Core,
+            items: PendingItems::default(),
+            outstanding_subs: HashSet::new(),
+            sync_method: SyncMethod::Negentropy,
+            pagination_state: HashMap::new(),
+            requested_event_ids: None,
+            received_event_ids: None,
+            initial_hydration_counts: None,
+            retry_count: 0,
+            failed: false,
+        };
+        let subscription_ids: Vec<_> = (0..169)
+            .map(|index| SubscriptionId::new(format!("hydration-{index}")))
+            .collect();
+        let event_ids = [EventId::from_byte_array([1; 32]), EventId::from_byte_array([2; 32])];
+
+        register_negentropy_hydration_attempt(
+            &mut batch,
+            subscription_ids.iter().cloned(),
+            event_ids,
+            false,
+        );
+
+        assert_eq!(batch.outstanding_subs.len(), 169);
+        assert_eq!(batch.requested_event_ids.as_ref().unwrap().len(), 2);
+        assert_eq!(batch.received_event_ids, Some(HashSet::new()));
+        for event_id in event_ids {
+            if batch.requested_event_ids.as_ref().unwrap().contains(&event_id) {
+                batch.received_event_ids.as_mut().unwrap().insert(event_id);
+            }
+        }
+        assert_eq!(batch.received_event_ids.as_ref().unwrap().len(), 2);
+        for subscription_id in &subscription_ids {
+            assert!(
+                batch.outstanding_subs.remove(subscription_id),
+                "an immediate terminal signal must find its pre-registered chunk"
+            );
+        }
+        assert!(batch.outstanding_subs.is_empty());
     }
 
     #[test]
