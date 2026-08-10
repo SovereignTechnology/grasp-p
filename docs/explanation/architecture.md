@@ -310,6 +310,22 @@ pub struct Purgatory {
    - Defers matching expiry while a concrete background Git sync is actively
      running; queued/backoff work receives no extension
 
+6. **Pressure-aware Background Git Fan-out**: event-directed recovery begins
+   with a one-second probe allowance of two remote Git passes per effective CPU
+   - Healthy observation windows grow the allowance by 20% or one pass,
+     whichever is greater, avoiding a lasting cap while giving the
+     retrospective pressure signal time to reflect each preceding step
+   - New CPU throttling or memory-high pressure reduces new admission to one
+     pass while already-running work drains naturally
+   - Linux services read their cgroup v2 constraints and pressure counters;
+     other environments fall back to processor count and healthy-window growth
+   - Existing per-domain limits remain responsible for being polite to each
+     remote server
+   - The probe and pressure gate prevent a cold sync spanning many domains from
+     spawning enough Git processes to starve this relay's HTTP and WebSocket
+     service
+   - Foreground Git requests do not draw from this background-only limit
+
 #### Data Types
 
 See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:
