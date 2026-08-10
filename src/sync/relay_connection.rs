@@ -2093,25 +2093,25 @@ impl RelayConnection {
 
     /// Fetch a bounded set of events directly from this relay.
     ///
-    /// This is reserved for dependency recovery where exact event IDs are
-    /// already known. The caller remains responsible for applying the write
-    /// policy and persistence path.
+    /// Used by small control-plane and dependency-recovery queries whose
+    /// caller owns result interpretation. It still consumes the same pacing,
+    /// transient-class and per-session ledger capacity as historic REQs.
     pub async fn fetch_events(
         &self,
         filter: Filter,
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
-        // Exact-ID purgatory recovery opens an ordinary transient REQ inside
-        // nostr-sdk. It must share the same permit bound as historic pages,
-        // fallbacks and retries rather than escaping the connection budget.
+        // The SDK owns this ordinary transient REQ until EOSE/CLOSED. It must
+        // share the same permit bound as historic pages, fallbacks and retries
+        // rather than escaping the connection budget.
         self.await_query_start().await?;
         self.await_background_query_start().await;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
-                "Purgatory dependency poll deferred: live subscriptions consume the usable budget"
+                "Control-plane query deferred: live subscriptions consume the usable budget"
             );
-            return Err(format!("No dependency polling capacity for {}", self.url));
+            return Err(format!("No transient query capacity for {}", self.url));
         }
         let _transient_cap = self
             .transient_req_permits
@@ -4209,7 +4209,7 @@ mod tests {
             .await
             .expect_err("dependency polling must defer when the ledger has no usable slot");
         assert!(
-            error.contains("No dependency polling capacity"),
+            error.contains("No transient query capacity"),
             "unexpected dependency ledger error: {error}"
         );
     }

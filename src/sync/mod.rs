@@ -1267,6 +1267,51 @@ struct ConnectAttemptResult {
     outcome: ConnectAttemptOutcome,
 }
 
+const NIP65_DISCOVERY_BATCH_AUTHORS: usize = 100;
+
+fn nip65_discovery_refresh_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(24 * 60 * 60)
+    }
+}
+
+fn nip65_discovery_retry_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(5 * 60)
+    }
+}
+
+fn nip65_inventory_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+#[derive(Debug)]
+struct Nip65DiscoveryResult {
+    source_relay: String,
+    authors: HashSet<PublicKey>,
+    outcome: Result<Vec<Event>, String>,
+}
+
+#[derive(Debug, Default)]
+struct Nip65DiscoveryState {
+    author_roots: HashMap<PublicKey, HashSet<EventId>>,
+    author_sources: HashMap<PublicKey, HashSet<String>>,
+    relay_lists: HashMap<PublicKey, Event>,
+    author_inboxes: HashMap<PublicKey, HashSet<String>>,
+    inbox_roots: HashMap<String, HashSet<EventId>>,
+    in_flight: HashSet<(String, PublicKey)>,
+    next_attempt_at: HashMap<(String, PublicKey), Instant>,
+    next_inventory_at: Option<Instant>,
+}
+
 /// Quick reconnect window in seconds (15 minutes)
 const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 
@@ -1701,7 +1746,12 @@ async fn run_health_and_metrics_checker(
                 // persistent set.
                 manager.sync_due_byte_limited_relay().await;
 
-                // 5. Check for naughty list expiration
+                // 5. Discover one bounded batch of root-author NIP-65 inboxes.
+                // The query uses an ordinary transient ledger slot and yields
+                // to historic work when no slot is immediately available.
+                manager.schedule_nip65_discovery().await;
+
+                // 6. Check for naughty list expiration
                 if let Some(naughty_list) = manager.health_tracker.naughty_list() {
                     let recovered = naughty_list.expire_old_entries();
                     for url in recovered {
@@ -1712,7 +1762,7 @@ async fn run_health_and_metrics_checker(
                     }
                 }
 
-                // 6. Update metrics with current health states and naughty list
+                // 7. Update metrics with current health states and naughty list
                 if let Some(ref metrics) = manager.metrics {
                     // Get all tracked relay URLs
                     let relay_urls: Vec<String> = {
@@ -1818,6 +1868,9 @@ pub struct SyncManager {
     /// Round-robin cursor so only one relay performs descendant live-mode
     /// derivation and admission work per maintenance tick.
     descendant_relay_cursor: usize,
+    /// Narrow GRASP-03 control-plane state. Event transport remains in the
+    /// ordinary GRASP-02 relay targets after inbox roots are overlaid.
+    nip65_discovery: Nip65DiscoveryState,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
@@ -1829,6 +1882,8 @@ pub struct SyncManager {
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
     deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    nip65_discovery_result_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -1923,11 +1978,13 @@ impl SyncManager {
             descendant_sync_rotations: HashMap::new(),
             descendant_live_coverage: HashMap::new(),
             descendant_relay_cursor: 0,
+            nip65_discovery: Nip65DiscoveryState::default(),
             disconnect_tx: None,
             eose_tx: None,
             subscription_closed_tx: None,
             connect_attempt_result_tx: None,
             deferred_consolidation_tx: None,
+            nip65_discovery_result_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
         }
@@ -3304,6 +3361,8 @@ impl SyncManager {
         // instead of waiting for pending work while holding the actor lock.
         let (deferred_consolidation_tx, mut deferred_consolidation_rx) =
             mpsc::unbounded_channel::<String>();
+        let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
+            mpsc::unbounded_channel::<Nip65DiscoveryResult>();
 
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -3325,6 +3384,7 @@ impl SyncManager {
         self.subscription_closed_tx = Some(subscription_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
         self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
+        self.nip65_discovery_result_tx = Some(nip65_discovery_result_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
         // 6. Connect to bootstrap relay if configured
@@ -3443,6 +3503,12 @@ impl SyncManager {
                     if let Some(relay_url) = relay_url {
                         let mut manager = sync_manager.lock().await;
                         manager.process_deferred_consolidation(&relay_url).await;
+                    }
+                }
+                result = nip65_discovery_result_rx.recv() => {
+                    if let Some(result) = result {
+                        let mut manager = sync_manager.lock().await;
+                        manager.handle_nip65_discovery_result(result).await;
                     }
                 }
                 action = action_rx.recv() => {
@@ -4293,10 +4359,7 @@ impl SyncManager {
     /// Reconcile one live-mode decision and advance every constrained relay by
     /// at most one EOSE-closing request on each five-second maintenance tick.
     async fn tick_descendant_sync(&mut self) {
-        let targets = {
-            let index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&index)
-        };
+        let targets = self.derive_targets().await;
         let states = self.relay_sync_index.read().await;
         let mut relay_urls: Vec<String> = targets
             .iter()
@@ -4360,8 +4423,9 @@ impl SyncManager {
     }
 
     async fn desired_items_for_relay(&self, relay_url: &str) -> PendingItems {
-        let index = self.repo_sync_index.read().await;
-        let target = algorithms::derive_relay_targets(&index)
+        let target = self
+            .derive_targets()
+            .await
             .remove(relay_url)
             .unwrap_or_default();
         PendingItems {
@@ -4658,6 +4722,224 @@ impl SyncManager {
         });
     }
 
+    async fn derive_targets(&self) -> HashMap<String, RelaySyncNeeds> {
+        let repo_index = self.repo_sync_index.read().await;
+        let mut targets = algorithms::derive_relay_targets(&repo_index);
+        discovery::merge_inbox_roots(&mut targets, &self.nip65_discovery.inbox_roots);
+        targets
+    }
+
+    async fn schedule_nip65_discovery(&mut self) {
+        let now = Instant::now();
+        if self
+            .nip65_discovery
+            .next_inventory_at
+            .is_none_or(|due| due <= now)
+        {
+            let accepted_repositories: HashSet<String> =
+                self.repo_sync_index.read().await.keys().cloned().collect();
+            let roots = match self
+                .database
+                .query(Filter::new().kinds([
+                    Kind::GitPatch,
+                    Kind::GitIssue,
+                    Kind::GitPullRequest,
+                ]))
+                .await
+            {
+                Ok(events) => discovery::accepted_roots(events.iter(), &accepted_repositories),
+                Err(error) => {
+                    tracing::debug!(%error, "Deferring NIP-65 discovery: root query failed");
+                    return;
+                }
+            };
+
+            let repo_index = self.repo_sync_index.read().await;
+            let bootstrap = self
+                .bootstrap_relay_url
+                .as_deref()
+                .and_then(|url| canonical_relay_key(url).ok());
+            let mut author_roots: HashMap<PublicKey, HashSet<EventId>> = HashMap::new();
+            let mut author_sources: HashMap<PublicKey, HashSet<String>> = HashMap::new();
+            for root in roots {
+                author_roots.entry(root.author).or_default().insert(root.id);
+                let sources = author_sources.entry(root.author).or_default();
+                if let Some(needs) = repo_index.get(&root.repository) {
+                    sources.extend(
+                        needs
+                            .relays
+                            .iter()
+                            .filter_map(|url| canonical_relay_key(url).ok()),
+                    );
+                }
+                if let Some(bootstrap) = &bootstrap {
+                    sources.insert(bootstrap.clone());
+                }
+            }
+            drop(repo_index);
+            self.nip65_discovery.author_roots = author_roots;
+            self.nip65_discovery.author_sources = author_sources;
+            let current_authors: HashSet<PublicKey> =
+                self.nip65_discovery.author_roots.keys().copied().collect();
+            self.nip65_discovery
+                .relay_lists
+                .retain(|author, _| current_authors.contains(author));
+            self.nip65_discovery
+                .author_inboxes
+                .retain(|author, _| current_authors.contains(author));
+            let current_sources = &self.nip65_discovery.author_sources;
+            self.nip65_discovery
+                .next_attempt_at
+                .retain(|(relay, author), _| {
+                    current_sources
+                    .get(author)
+                    .is_some_and(|sources| sources.contains(relay))
+                });
+            self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
+            let old_overlay = self.nip65_discovery.inbox_roots.clone();
+            self.rebuild_nip65_inbox_roots();
+            if old_overlay != self.nip65_discovery.inbox_roots {
+                let mut dirty: HashSet<String> = old_overlay.into_keys().collect();
+                dirty.extend(self.nip65_discovery.inbox_roots.keys().cloned());
+                for relay in dirty {
+                    self.recompute_new_sync_filters_for_relay(&relay).await;
+                }
+            }
+        }
+
+        let mut candidates: HashMap<String, Vec<PublicKey>> = HashMap::new();
+        for (author, sources) in &self.nip65_discovery.author_sources {
+            for source in sources {
+                let key = (source.clone(), *author);
+                if self.nip65_discovery.in_flight.contains(&key)
+                    || self
+                        .nip65_discovery
+                        .next_attempt_at
+                        .get(&key)
+                        .is_some_and(|due| *due > now)
+                {
+                    continue;
+                }
+                candidates.entry(source.clone()).or_default().push(*author);
+            }
+        }
+        let mut sources: Vec<String> = candidates.keys().cloned().collect();
+        sources.sort();
+        for source in sources {
+            let Some(connection) = self.connections.get(&source).cloned() else {
+                continue;
+            };
+            let mut authors = candidates.remove(&source).unwrap_or_default();
+            authors.sort_by_key(PublicKey::to_hex);
+            authors.truncate(NIP65_DISCOVERY_BATCH_AUTHORS);
+            let authors: HashSet<PublicKey> = authors.into_iter().collect();
+            if authors.is_empty() {
+                continue;
+            }
+            self.nip65_discovery.in_flight.extend(
+                authors
+                    .iter()
+                    .map(|author| (source.clone(), *author)),
+            );
+            let filter = Filter::new()
+                .kind(Kind::RelayList)
+                .authors(authors.iter().copied())
+                .limit(authors.len());
+            let Some(result_tx) = self.nip65_discovery_result_tx.clone() else {
+                return;
+            };
+            let source_relay = source.clone();
+            tokio::spawn(async move {
+                let outcome = connection.fetch_events(filter, Duration::from_secs(30)).await;
+                let _ = result_tx.send(Nip65DiscoveryResult {
+                    source_relay,
+                    authors,
+                    outcome,
+                });
+            });
+            break;
+        }
+    }
+
+    fn rebuild_nip65_inbox_roots(&mut self) {
+        self.nip65_discovery.inbox_roots.clear();
+        for (author, inboxes) in &self.nip65_discovery.author_inboxes {
+            let Some(roots) = self.nip65_discovery.author_roots.get(author) else {
+                continue;
+            };
+            for inbox in inboxes {
+                self.nip65_discovery
+                    .inbox_roots
+                    .entry(inbox.clone())
+                    .or_default()
+                    .extend(roots.iter().copied());
+            }
+        }
+    }
+
+    async fn handle_nip65_discovery_result(&mut self, result: Nip65DiscoveryResult) {
+        for author in &result.authors {
+            self.nip65_discovery
+                .in_flight
+                .remove(&(result.source_relay.clone(), *author));
+        }
+        let (events, retry_after) = match result.outcome {
+            Ok(events) => (events, nip65_discovery_refresh_interval()),
+            Err(error) => {
+                tracing::debug!(relay = %result.source_relay, %error, "NIP-65 discovery query failed");
+                (Vec::new(), nip65_discovery_retry_interval())
+            }
+        };
+        let next_attempt = Instant::now() + retry_after;
+        for author in &result.authors {
+            self.nip65_discovery.next_attempt_at.insert(
+                (result.source_relay.clone(), *author),
+                next_attempt,
+            );
+        }
+
+        let latest = discovery::latest_relay_lists(events, &result.authors);
+        let mut changed = false;
+        for (author, candidate) in latest {
+            if !self.nip65_discovery.author_roots.contains_key(&author) {
+                continue;
+            }
+            let replace = self
+                .nip65_discovery
+                .relay_lists
+                .get(&author)
+                .is_none_or(|current| {
+                    candidate.created_at > current.created_at
+                        || (candidate.created_at == current.created_at
+                            && candidate.id < current.id)
+                });
+            if replace {
+                self.nip65_discovery
+                    .author_inboxes
+                    .insert(author, discovery::inbox_relays(&candidate));
+                self.nip65_discovery.relay_lists.insert(author, candidate);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let old_relays: HashSet<String> =
+            self.nip65_discovery.inbox_roots.keys().cloned().collect();
+        self.rebuild_nip65_inbox_roots();
+        let mut dirty_relays = old_relays;
+        dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
+        tracing::info!(
+            source = %result.source_relay,
+            authors = result.authors.len(),
+            inbox_relays = self.nip65_discovery.inbox_roots.len(),
+            "Updated proactive inbox coverage from NIP-65"
+        );
+        for relay in dirty_relays {
+            self.recompute_new_sync_filters_for_relay(&relay).await;
+        }
+    }
+
     async fn handle_connect_attempt_result(&mut self, result: ConnectAttemptResult) {
         if !take_connect_attempt(
             &mut self.in_flight_connect_attempts,
@@ -4783,7 +5065,7 @@ impl SyncManager {
     /// Uses derive_relay_targets and compute_actions to find new items
     /// that need to be synced. Processes AddFilters actions for new items.
     async fn recompute_new_sync_filters_for_relay(&mut self, relay_url: &str) {
-        use crate::sync::algorithms::{compute_actions, derive_relay_targets};
+        use crate::sync::algorithms::compute_actions;
 
         let relay_url = match canonical_relay_key(relay_url) {
             Ok(relay_url) => relay_url,
@@ -4798,10 +5080,7 @@ impl SyncManager {
         };
 
         // Get current state from indexes (need to collect to avoid holding locks)
-        let all_targets = {
-            let repo_index = self.repo_sync_index.read().await;
-            derive_relay_targets(&repo_index)
-        };
+        let all_targets = self.derive_targets().await;
 
         // Filter to only targets for this specific relay
         let relay_target = match all_targets.get(&relay_url) {
@@ -4858,7 +5137,7 @@ impl SyncManager {
     ///
     /// Idempotent: existing entries are not downgraded (a promoted Full entry stays Full).
     async fn sync_purgatory_announcements_to_index(&mut self) {
-        use crate::sync::algorithms::{compute_actions, derive_relay_targets};
+        use crate::sync::algorithms::compute_actions;
 
         // Collect all purgatory announcements (snapshot - no async holds)
         let announcements = self.purgatory.announcements_for_sync();
@@ -4904,10 +5183,7 @@ impl SyncManager {
         // Recompute all outstanding actions on every pass. A bounded pass may
         // intentionally defer some relays, so restricting this to newly seen
         // URLs would lose that work on the next tick.
-        let all_targets = {
-            let repo_index = self.repo_sync_index.read().await;
-            derive_relay_targets(&repo_index)
-        };
+        let all_targets = self.derive_targets().await;
         let mut actions = {
             let pending_index = self.pending_sync_index.read().await;
             let relay_index = self.relay_sync_index.read().await;
@@ -5363,10 +5639,7 @@ impl SyncManager {
             // Once the connection ends naturally, however, reconcile its
             // confirmed state with the latest index before deciding whether it
             // should ever reconnect.
-            let desired = {
-                let repo_index = self.repo_sync_index.read().await;
-                algorithms::derive_relay_targets(&repo_index).remove(relay_url)
-            };
+            let desired = self.derive_targets().await.remove(relay_url);
             let Some(desired) = desired else {
                 tracing::info!(
                     relay = %relay_url,
@@ -5467,10 +5740,7 @@ impl SyncManager {
 
         tracing::info!(relay = %relay_url, "Ended relay session cleanup complete");
 
-        let still_desired = {
-            let repo_index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&repo_index).contains_key(relay_url)
-        };
+        let still_desired = self.derive_targets().await.contains_key(relay_url);
         if still_desired && self.register_relay(relay_url.to_string(), false).await {
             tracing::info!(
                 relay = %relay_url,
@@ -6397,12 +6667,8 @@ impl SyncManager {
         self.dependency_relay_deadlines
             .retain(|_, deadline| *deadline > now);
 
-        let mut desired_relays: HashSet<String> = {
-            let repo_index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&repo_index)
-                .into_keys()
-                .collect()
-        };
+        let mut desired_relays: HashSet<String> =
+            self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
 
         // Collect relays to disconnect
@@ -6515,12 +6781,8 @@ impl SyncManager {
     ///
     /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
-        let desired_relays: HashSet<String> = {
-            let repo_index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&repo_index)
-                .into_keys()
-                .collect()
-        };
+        let desired_relays: HashSet<String> =
+            self.derive_targets().await.into_keys().collect();
 
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {
@@ -6583,7 +6845,7 @@ impl SyncManager {
     /// 2. Recomputes required actions for that relay
     /// 3. Submits those actions
     async fn check_rate_limit_recovery(&mut self) {
-        use crate::sync::algorithms::{compute_actions, derive_relay_targets};
+        use crate::sync::algorithms::compute_actions;
 
         // Exit rate limiting for relays whose cooldown has expired
         let mut relays_to_recover: Vec<String> = self.health_tracker.exit_expired_rate_limits();
@@ -6599,9 +6861,7 @@ impl SyncManager {
         }
 
         // Recompute actions - could optimise by adding relays: Option<&[]> to derive_relay_targets
-        let repo_index = self.repo_sync_index.read().await;
-        let targets = derive_relay_targets(&repo_index);
-        drop(repo_index);
+        let targets = self.derive_targets().await;
 
         for relay_url in relays_to_recover {
             tracing::info!(relay = %relay_url, "Subscription pause expired; probing coverage");

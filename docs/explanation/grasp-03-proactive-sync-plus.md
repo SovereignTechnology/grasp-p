@@ -21,6 +21,13 @@ for accepted repositories. Discovery is best effort: completeness assumes the
 current relay-list event is available from at least one existing source. This
 avoids a new configuration surface and unbounded global discovery.
 
+The local accepted-root inventory refreshes once per minute. Remote discovery
+queries contain at most 100 authors, start at most one batch on each two-second
+maintenance tick, and refresh successful author/source pairs after 24 hours.
+Failures retry after five minutes. A query starts only when an existing relay
+session has immediate transient capacity, and its SDK-owned REQ draws from the
+same pacer and subscription ledger as historic work.
+
 ## Deliberately excluded
 
 - the old recursive `SyncScope` graph and response-author fan-out;

@@ -43,6 +43,7 @@ mod sync {
     pub mod naughty_list_scheduling;
     pub mod neg_concurrency;
     pub mod purgatory_fetch;
+    pub mod proactive_sync_plus;
     pub mod reconnect_backoff;
     pub mod req_concurrency;
     pub mod stale_connect_result;
