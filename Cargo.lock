@@ -1334,6 +1334,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "lazy_static",
+ "libc",
  "nostr",
  "nostr-lmdb",
  "nostr-memory",

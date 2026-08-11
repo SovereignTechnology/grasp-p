@@ -451,17 +451,19 @@ OIDs from two attempts are processed once.
 
 Each wave starts the first source in the event's deterministic source order. If it is still running after a
 conservative 30-second head start, one source on a different domain may start
-as a hedge. Both attempts may legitimately be large and are allowed to finish;
-the hedge delay is not a stall timeout. A third concurrent attempt is never
-started, and another URL on the primary's domain does not qualify as a hedge.
-Both attempts independently retain process-pressure and per-domain admission.
+as a hedge. The hedge delay is not a timeout: active transfers may run for any
+duration. A third concurrent attempt is never started, and another URL on the
+primary's domain does not qualify as a hedge. Both attempts independently
+retain process-pressure and per-domain admission. If neither attempt supplies
+an object—whether because it fails or is terminated after sustained
+inactivity—the remaining URLs are attempted sequentially.
 
 The wave does not infer a faster source from which command completes first.
 Both contenders write the same object database, so either command can observe
 objects installed by the other and completion order cannot truthfully
 attribute those objects to a source. Persistent source scoring therefore needs
 isolated per-attempt object stores (and explicit winner promotion) and remains
-out of scope. Progress-aware stall handling remains a later stage.
+out of scope.
 
 ### Streamed subprocess observability
 
@@ -480,11 +482,15 @@ Prometheus exposes active children, completion outcomes, durations, and
 drained bytes using only bounded `operation`, `role`, and `stream` labels.
 After 60 seconds an active child emits a structured warning containing its
 operation, primary/hedge role, elapsed time, time since its last output, and
-stream byte counts; it repeats no more than every five minutes. Silence remains
-observational: there is no inactivity timeout and source selection never uses
-progress text. The direct Git child uses kill-on-drop if its owning task is
-cancelled; whole-process-group cancellation remains follow-up work before any
-stall timeout can be safe. Normal commands are not cancelled by this stage.
+stream byte counts; it repeats no more than every five minutes. Five minutes
+without output is treated as a stalled transport, not as a total-duration
+limit. The direct Git child and its helpers run in a private process group;
+recovery sends that group SIGTERM, waits up to ten seconds, then sends SIGKILL
+so a helper cannot retain a pipe, socket, or repository lock. A transfer which
+continues producing output is never terminated, and completion timing is not
+used to rank sources. Cancellation keeps a synchronous process-group guard
+armed while the direct child still anchors the group identity, so dropping a
+fetch future kills its helpers before repository and domain permits return.
 
 Fetches request objects without writing `FETCH_HEAD` and suppress automatic
 maintenance. This keeps the object-only operation free of shared ref-state and

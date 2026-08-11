@@ -445,6 +445,23 @@ const GIT_STDOUT_CAPTURE_LIMIT: usize = 1024 * 1024;
 const GIT_STDERR_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 const GIT_LONG_RUNNING_AFTER: Duration = Duration::from_secs(60);
 const GIT_LONG_RUNNING_REPEAT: Duration = Duration::from_secs(300);
+const GIT_INACTIVITY_LIMIT: Duration = Duration::from_secs(5 * 60);
+const GIT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct GitProcessPolicy {
+    inactivity_limit: Duration,
+    termination_grace: Duration,
+}
+
+impl Default for GitProcessPolicy {
+    fn default() -> Self {
+        Self {
+            inactivity_limit: GIT_INACTIVITY_LIMIT,
+            termination_grace: GIT_TERMINATION_GRACE,
+        }
+    }
+}
 
 #[derive(Default)]
 struct GitActivity {
@@ -461,6 +478,36 @@ struct ObservedGitOutput {
     stderr_bytes: u64,
     stdout_truncated: bool,
     stderr_truncated: bool,
+}
+
+struct ProcessGroupGuard {
+    pgid: u32,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(pgid: u32) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        signal_process_group(self.pgid, signal)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cancellation drops this guard while the direct child still
+            // anchors the process-group identity. Synchronous best-effort
+            // cleanup prevents helpers outliving repository/domain permits.
+            let _ = signal_process_group(self.pgid, libc::SIGKILL);
+        }
+    }
 }
 
 async fn drain_git_stream<R: AsyncRead + Unpin>(
@@ -493,15 +540,36 @@ async fn drain_git_stream<R: AsyncRead + Unpin>(
 }
 
 async fn run_observed_git_command(
+    command: Command,
+    domain: &str,
+    operation: &'static str,
+    role: GitFetchRole,
+) -> Result<ObservedGitOutput> {
+    run_observed_git_command_with_policy(
+        command,
+        domain,
+        operation,
+        role,
+        GitProcessPolicy::default(),
+    )
+    .await
+}
+
+async fn run_observed_git_command_with_policy(
     mut command: Command,
     domain: &str,
     operation: &'static str,
     role: GitFetchRole,
+    policy: GitProcessPolicy,
 ) -> Result<ObservedGitOutput> {
     let role = role.as_str();
     let mut metric = crate::metrics::start_purgatory_git_subprocess(operation, role);
     let started = Instant::now();
     let activity = Arc::new(GitActivity::default());
+    // Give Git and every helper it creates (remote-http, credential helpers,
+    // upload-pack transports) a private process group. Inactivity recovery
+    // must not leave a descendant holding pipes, locks, or network sockets.
+    command.process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -509,6 +577,11 @@ async fn run_observed_git_command(
             return Err(error.into());
         }
     };
+    let mut process_group = ProcessGroupGuard::new(
+        child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("git {operation} child had no process id"))?,
+    );
     let Some(stdout) = child.stdout.take() else {
         metric.finish(false);
         return Err(anyhow::anyhow!("git {operation} stdout was not piped"));
@@ -538,10 +611,21 @@ async fn run_observed_git_command(
 
     let first_log = tokio::time::Instant::now() + GIT_LONG_RUNNING_AFTER;
     let mut long_running = tokio::time::interval_at(first_log, GIT_LONG_RUNNING_REPEAT);
+    let mut inactivity_check = tokio::time::interval(
+        policy.inactivity_limit.min(Duration::from_secs(1)),
+    );
+    inactivity_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stalled = false;
     let status = loop {
         tokio::select! {
             status = child.wait() => match status {
-                Ok(status) => break status,
+                Ok(status) => {
+                    // A normal Git exit means it has joined its helpers. Do
+                    // not retain an armed PGID after reaping the leader: that
+                    // identity could subsequently be reused.
+                    process_group.disarm();
+                    break status;
+                }
                 Err(error) => {
                     metric.finish(false);
                     return Err(error.into());
@@ -560,6 +644,41 @@ async fn run_observed_git_command(
                     stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed),
                     "Outbound purgatory Git subprocess remains active"
                 );
+            }
+            _ = inactivity_check.tick() => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let last_millis = activity.last_millis.load(Ordering::Relaxed);
+                if Duration::from_millis(elapsed_ms.saturating_sub(last_millis))
+                    < policy.inactivity_limit
+                {
+                    continue;
+                }
+                stalled = true;
+                tracing::warn!(
+                    domain = %domain,
+                    operation,
+                    role,
+                    elapsed_secs = elapsed_ms / 1000,
+                    quiet_secs = elapsed_ms.saturating_sub(last_millis) / 1000,
+                    stdout_bytes = activity.stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed),
+                    "Terminating inactive outbound purgatory Git process group"
+                );
+                process_group.signal(libc::SIGTERM)?;
+                // Keep the unreaped leader anchoring the PGID throughout the
+                // grace period. This avoids signalling a reused group id and
+                // still gives every helper a bounded chance to exit cleanly.
+                tokio::time::sleep(policy.termination_grace).await;
+                tracing::warn!(
+                    domain = %domain,
+                    operation,
+                    role,
+                    "Completing inactive outbound purgatory Git process-group cleanup"
+                );
+                process_group.signal(libc::SIGKILL)?;
+                let status = child.wait().await?;
+                process_group.disarm();
+                break status;
             }
         }
     };
@@ -589,7 +708,11 @@ async fn run_observed_git_command(
     let stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed);
     crate::metrics::record_purgatory_git_subprocess_output(operation, role, "stdout", stdout_bytes);
     crate::metrics::record_purgatory_git_subprocess_output(operation, role, "stderr", stderr_bytes);
-    metric.finish(status.success());
+    if stalled {
+        metric.finish_with_outcome("stalled");
+    } else {
+        metric.finish(status.success());
+    }
     let stdout_truncated = stdout_bytes > stdout.len() as u64;
     let stderr_truncated = stderr_bytes > stderr.len() as u64;
     Ok(ObservedGitOutput {
@@ -601,6 +724,23 @@ async fn run_observed_git_command(
         stdout_truncated,
         stderr_truncated,
     })
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `pid` is the live child id returned by Tokio, and the child was
+    // placed into a process group whose id equals that pid before spawn.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        // The group may exit between the inactivity check and the signal.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
 }
 
 /// Parse `git ls-remote` output into the set of advertised object ids.
@@ -1171,6 +1311,157 @@ mod fetch_helper_tests {
         assert_eq!(output.stderr, b"stderr");
         assert_eq!(output.stdout_bytes, 6);
         assert_eq!(output.stderr_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn continuing_output_prevents_inactivity_termination() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "for value in 1 2 3 4 5 6; do printf x; sleep 0.02; done",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_observed_git_command_with_policy(
+                command,
+                "test.example",
+                "fetch_batch",
+                GitFetchRole::Primary,
+                GitProcessPolicy {
+                    inactivity_limit: Duration::from_millis(50),
+                    termination_grace: Duration::from_millis(50),
+                },
+            ),
+        )
+        .await
+        .expect("active fixture has a bounded completion")
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"xxxxxx");
+    }
+
+    #[tokio::test]
+    async fn inactivity_terminates_the_whole_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let script = format!(
+            "trap '' TERM; sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let wait_for_pid = async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if !pid.is_empty() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let run = run_observed_git_command_with_policy(
+            command,
+            "test.example",
+            "fetch_batch",
+            GitFetchRole::Primary,
+            GitProcessPolicy {
+                inactivity_limit: Duration::from_millis(50),
+                termination_grace: Duration::from_millis(50),
+            },
+        );
+        let (pid, output) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(wait_for_pid, run)
+        })
+        .await
+        .expect("stalled fixture has bounded recovery");
+        let output = output.unwrap();
+        assert!(!output.status.success());
+
+        let pid: i32 = pid.parse().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            // Signal zero observes existence without changing process state.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "descendant survived");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_observed_command_reaps_descendants_before_follow_up_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("cancelled-descendant.pid");
+        let script = format!(
+            "trap '' TERM; sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let task = tokio::spawn(run_observed_git_command_with_policy(
+            command,
+            "test.example",
+            "fetch_batch",
+            GitFetchRole::Primary,
+            GitProcessPolicy {
+                inactivity_limit: Duration::from_secs(30),
+                termination_grace: Duration::from_millis(50),
+            },
+        ));
+
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if !pid.is_empty() {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture descendant should become observable");
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled command descendant should be reaped");
+
+        let mut follow_up = Command::new("sh");
+        follow_up
+            .args(["-c", "printf ready"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = run_observed_git_command(follow_up, "test.example", "fetch_batch", GitFetchRole::Primary)
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
     }
 
     #[tokio::test]

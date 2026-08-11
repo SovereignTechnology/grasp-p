@@ -492,6 +492,34 @@ async fn sync_identifier_from_urls<C: SyncContext + ?Sized>(
             outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
         }
     }
+
+    // A stalled subprocess is returned as an ordinary failed attempt after
+    // its process group has been reaped. If neither member of the bounded
+    // two-source wave supplied an object, keep walking the remaining sources
+    // sequentially rather than leaving this repository pinned to the pair.
+    // No third fetch overlaps the primary and hedge.
+    if outcome.fetched == 0 {
+        for fallback_url in urls.into_iter().skip(1) {
+            if fallback_url == hedge_url {
+                continue;
+            }
+            outcome.attempted_urls.push(fallback_url.clone());
+            let fetched = fetch_from_url(
+                ctx,
+                &target_repo,
+                &fallback_url,
+                &needed_oids,
+                throttle_manager,
+                GitFetchRole::Primary,
+            )
+            .await;
+            outcome.fetched +=
+                process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+            if outcome.fetched > 0 {
+                break;
+            }
+        }
+    }
     outcome
 }
 
@@ -1022,6 +1050,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn failed_pair_falls_back_to_a_third_source() {
+        let primary = "https://a.example/repo.git";
+        let hedge = "https://b.example/repo.git";
+        let fallback = "https://c.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_should_fail(primary)
+                .url_should_fail(hedge)
+                .url_waits_for_release(primary)
+                .url_provides(fallback, &["abc123"]),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), hedge.to_string(), fallback.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome.fetched, 1);
+        assert_eq!(
+            outcome.attempted_urls,
+            vec![primary.to_string(), hedge.to_string(), fallback.to_string()]
+        );
+        assert_eq!(mock.process_call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shared_object_observation_is_not_treated_as_source_attribution() {
         let primary = "https://a.example/repo.git";
         let observer = "https://b.example/repo.git";
@@ -1057,7 +1124,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn two_slow_fetches_never_admit_a_third() {
+    async fn two_slow_fetches_never_run_a_third_concurrently() {
         let first = "https://a.example/repo.git";
         let second = "https://b.example/repo.git";
         let third = "https://c.example/repo.git";
@@ -1087,7 +1154,7 @@ mod tests {
         mock.release_fetch(first);
         mock.release_fetch(second);
         task.await.unwrap();
-        assert!(!mock.fetch_log().iter().any(|url| url == third));
+        assert!(mock.fetch_log().iter().any(|url| url == third));
     }
 
     #[tokio::test]

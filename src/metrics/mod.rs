@@ -362,6 +362,10 @@ impl PurgatoryGitSubprocessGuard {
     pub fn finish(&mut self, success: bool) {
         self.outcome = if success { "success" } else { "failure" };
     }
+
+    pub fn finish_with_outcome(&mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
 }
 
 impl Drop for PurgatoryGitSubprocessGuard {
