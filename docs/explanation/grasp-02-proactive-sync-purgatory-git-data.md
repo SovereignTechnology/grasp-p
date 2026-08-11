@@ -449,17 +449,42 @@ already-satisfied work is coalesced while later OIDs are not lost. Promotion
 of newly available data is serialized by the same coordinator and duplicate
 OIDs from two attempts are processed once.
 
-Each wave starts the first source in deterministic URL order. If it is still running after a
+Each wave starts the first source in the event's deterministic source order. If it is still running after a
 conservative 30-second head start, one source on a different domain may start
 as a hedge. Both attempts may legitimately be large and are allowed to finish;
 the hedge delay is not a stall timeout. A third concurrent attempt is never
 started, and another URL on the primary's domain does not qualify as a hedge.
 Both attempts independently retain process-pressure and per-domain admission.
 
-The wave does not infer a winner from completion order. Both contenders write
-the same object database, so either command can observe objects installed by
-the other. Honest source scoring would require isolated per-attempt object
-stores and explicit winner promotion; that complexity remains out of scope.
+The wave does not infer a faster source from which command completes first.
+Both contenders write the same object database, so either command can observe
+objects installed by the other and completion order cannot truthfully
+attribute those objects to a source. Persistent source scoring therefore needs
+isolated per-attempt object stores (and explicit winner promotion) and remains
+out of scope. Progress-aware stall handling remains a later stage.
+
+### Streamed subprocess observability
+
+Outbound `ls-remote` and `fetch` commands use Tokio child processes with
+stdout and stderr drained concurrently, rather than blocking until a complete
+`Output` is buffered. Fetch commands request Git's progress stream and every
+child runs with `LC_ALL=C`, making phase text stable enough for observation
+without treating it as a protocol. Capture is operation-bounded while readers
+continue draining and counting bytes beyond the bound: advertisements retain
+at most 16 MiB, ordinary stdout 1 MiB, and stderr/progress 4 MiB. A noisy child
+therefore cannot deadlock on a full pipe or grow memory without limit. A
+truncated advertisement is detected explicitly and falls back to the existing
+residual-OID path.
+
+Prometheus exposes active children, completion outcomes, durations, and
+drained bytes using only bounded `operation`, `role`, and `stream` labels.
+After 60 seconds an active child emits a structured warning containing its
+operation, primary/hedge role, elapsed time, time since its last output, and
+stream byte counts; it repeats no more than every five minutes. Silence remains
+observational: there is no inactivity timeout and source selection never uses
+progress text. The direct Git child uses kill-on-drop if its owning task is
+cancelled; whole-process-group cancellation remains follow-up work before any
+stall timeout can be safe. Normal commands are not cancelled by this stage.
 
 Fetches request objects without writing `FETCH_HEAD` and suppress automatic
 maintenance. This keeps the object-only operation free of shared ref-state and

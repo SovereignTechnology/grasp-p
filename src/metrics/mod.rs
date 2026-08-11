@@ -249,6 +249,54 @@ lazy_static! {
             .expect("register purgatory git fetch oids metric");
         metric
     };
+    static ref PURGATORY_GIT_SUBPROCESS_ACTIVE: GaugeVec = {
+        let metric = GaugeVec::new(
+            Opts::new(
+                "ngit_purgatory_git_subprocess_active",
+                "Active outbound purgatory Git subprocesses by operation and hedge role",
+            ),
+            &["operation", "role"],
+        )
+        .expect("register purgatory Git subprocess active gauge");
+        REGISTRY.register(Box::new(metric.clone())).expect("register metric");
+        metric
+    };
+    static ref PURGATORY_GIT_SUBPROCESS_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_purgatory_git_subprocess_total",
+                "Completed outbound purgatory Git subprocesses by operation, hedge role, and outcome",
+            ),
+            &["operation", "role", "outcome"],
+        )
+        .expect("register purgatory Git subprocess counter");
+        REGISTRY.register(Box::new(metric.clone())).expect("register metric");
+        metric
+    };
+    static ref PURGATORY_GIT_SUBPROCESS_DURATION_SECONDS: HistogramVec = {
+        let metric = HistogramVec::new(
+            HistogramOpts::new(
+                "ngit_purgatory_git_subprocess_duration_seconds",
+                "Outbound purgatory Git subprocess duration by operation and hedge role",
+            ),
+            &["operation", "role"],
+        )
+        .expect("register purgatory Git subprocess duration histogram");
+        REGISTRY.register(Box::new(metric.clone())).expect("register metric");
+        metric
+    };
+    static ref PURGATORY_GIT_SUBPROCESS_OUTPUT_BYTES_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_purgatory_git_subprocess_output_bytes_total",
+                "Bytes drained from outbound purgatory Git subprocess output by operation, hedge role, and stream",
+            ),
+            &["operation", "role", "stream"],
+        )
+        .expect("register purgatory Git subprocess output counter");
+        REGISTRY.register(Box::new(metric.clone())).expect("register metric");
+        metric
+    };
     static ref TRANSIENT_REQ_WATCHDOG_TOTAL: CounterVec = {
         let metric = CounterVec::new(
             Opts::new(
@@ -301,6 +349,59 @@ pub fn record_purgatory_git_fetch_pass(
     PURGATORY_GIT_FETCH_OIDS_TOTAL
         .with_label_values(&["fetched"])
         .inc_by(fetched as f64);
+}
+
+pub struct PurgatoryGitSubprocessGuard {
+    operation: &'static str,
+    role: &'static str,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl PurgatoryGitSubprocessGuard {
+    pub fn finish(&mut self, success: bool) {
+        self.outcome = if success { "success" } else { "failure" };
+    }
+}
+
+impl Drop for PurgatoryGitSubprocessGuard {
+    fn drop(&mut self) {
+        PURGATORY_GIT_SUBPROCESS_ACTIVE
+            .with_label_values(&[self.operation, self.role])
+            .dec();
+        PURGATORY_GIT_SUBPROCESS_TOTAL
+            .with_label_values(&[self.operation, self.role, self.outcome])
+            .inc();
+        PURGATORY_GIT_SUBPROCESS_DURATION_SECONDS
+            .with_label_values(&[self.operation, self.role])
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
+pub fn start_purgatory_git_subprocess(
+    operation: &'static str,
+    role: &'static str,
+) -> PurgatoryGitSubprocessGuard {
+    PURGATORY_GIT_SUBPROCESS_ACTIVE
+        .with_label_values(&[operation, role])
+        .inc();
+    PurgatoryGitSubprocessGuard {
+        operation,
+        role,
+        started: Instant::now(),
+        outcome: "cancelled",
+    }
+}
+
+pub fn record_purgatory_git_subprocess_output(
+    operation: &str,
+    role: &str,
+    stream: &str,
+    bytes: u64,
+) {
+    PURGATORY_GIT_SUBPROCESS_OUTPUT_BYTES_TOTAL
+        .with_label_values(&[operation, role, stream])
+        .inc_by(bytes as f64);
 }
 
 pub fn record_blacklist_deletion_attempt(phase: &str) {

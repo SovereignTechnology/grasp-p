@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
-use super::context::SyncContext;
+use super::context::{GitFetchRole, SyncContext};
 use super::throttle::ThrottleManager;
 use crate::sync::naughty_list::NaughtyListTracker;
 
@@ -346,6 +346,7 @@ async fn fetch_from_url<C: SyncContext + ?Sized>(
     url: &str,
     needed_oids: &[String],
     throttle_manager: &Arc<ThrottleManager>,
+    role: GitFetchRole,
 ) -> Vec<String> {
     let domain = match extract_domain(url) {
         Some(d) => d,
@@ -353,7 +354,7 @@ async fn fetch_from_url<C: SyncContext + ?Sized>(
     };
 
     let _fetch_permit = throttle_manager.acquire_fetch_pass(&domain).await;
-    match ctx.fetch_oids(repo, url, needed_oids).await {
+    match ctx.fetch_oids_with_role(repo, url, needed_oids, role).await {
         Ok(fetched) => fetched,
         Err(error) => {
             debug!(url = %url, %error, "Fetch failed");
@@ -429,7 +430,6 @@ async fn sync_identifier_from_urls<C: SyncContext + ?Sized>(
     }
 
     urls.retain(|url| extract_domain(url).is_some());
-    urls.sort();
     let Some(primary_url) = urls.first().cloned() else {
         return outcome;
     };
@@ -447,6 +447,7 @@ async fn sync_identifier_from_urls<C: SyncContext + ?Sized>(
         &primary_url,
         &needed_oids,
         throttle_manager,
+        GitFetchRole::Primary,
     );
     tokio::pin!(primary);
     let mut processed = HashSet::new();
@@ -474,6 +475,7 @@ async fn sync_identifier_from_urls<C: SyncContext + ?Sized>(
         &hedge_url,
         &needed_oids,
         throttle_manager,
+        GitFetchRole::Hedge,
     );
     tokio::pin!(hedge);
 
@@ -988,7 +990,70 @@ mod tests {
         mock.release_fetch(primary);
         assert_eq!(task.await.unwrap().fetched, 1);
         assert_eq!(mock.process_call_count(), 1, "same OID is promoted once");
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn empty_primary_does_not_hide_a_productive_hedge() {
+        let primary = "https://a.example/repo.git";
+        let productive_hedge = "https://b.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(productive_hedge, &["abc123"])
+                .url_waits_for_release(primary),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), productive_hedge.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+        assert_eq!(task.await.unwrap().fetched, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_object_observation_is_not_treated_as_source_attribution() {
+        let primary = "https://a.example/repo.git";
+        let observer = "https://b.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(primary, &["abc123"])
+                .url_waits_after_fetch(primary)
+                .url_reports_shared_objects(observer),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), observer.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+        assert_eq!(task.await.unwrap().fetched, 1);
+        assert_eq!(mock.process_call_count(), 1);
+        // The observer returned the primary's shared object. There is
+        // deliberately no winner score or reorder API to receive that
+        // ambiguous result.
     }
 
     #[tokio::test(start_paused = true)]
