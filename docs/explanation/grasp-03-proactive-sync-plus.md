@@ -8,9 +8,9 @@ author's inbox even when those events are absent from repository relays.
 
 The implementation adds a narrow discovery control-plane, not a second sync
 engine: derive accepted root IDs and authors locally; ask a small existing
-index set for each author's latest NIP-65 kind `10002`; treat `read` and
-unmarked relays as inboxes; and merge inbox-to-root mappings into ordinary
-per-relay sync targets.
+index set for each author's latest profile kind `0` and NIP-65 kind `10002`;
+retain those replaceable events locally; treat `read` and unmarked relays as
+inboxes; and merge inbox-to-root mappings into ordinary per-relay sync targets.
 
 GRASP-02 then owns all transport. Its current root tiers, historic and
 live/rotating coverage, grouping, subscription ledger, rate-limit recovery,
@@ -31,7 +31,13 @@ transient capacity; if historic work wins the small race before the permit is
 acquired, that single batch may wait but discovery can never build a waiter
 queue. Its SDK-owned REQ draws from the same pacer and subscription ledger as
 historic work. Authors returned by a successful query refresh after 24 hours;
-missing authors and failed queries retry after five minutes.
+missing authors and failed queries retry after five minutes. Identity events
+pass through the ordinary write policy, persistence and broadcast path. Only a
+stored, accepted kind `10002` can change inbox ownership. On startup, retained
+relay lists for accepted root authors rebuild inbox ownership from the local
+database before any network refresh, so serving established coverage does not
+depend on an external index remaining available. Remote discovery then refreshes
+that retained state on the normal cadence.
 
 Inbox replacement/removal changes the desired overlay immediately. Pending
 batches which mention a retired overlay root are closed. Retirement is
@@ -49,9 +55,6 @@ restart; this change does not add a second deletion graph.
 
 - the old recursive `SyncScope` graph and response-author fan-out;
 - maintainer mailbox expansion unrelated to an accepted root;
-- profile, broad identity, or general kind-`10002` storage;
+- identity storage for authors other than accepted roots;
 - fallback lists and per-user configuration knobs; and
 - a separate GRASP-03 subscription scheduler.
-
-Kind `0` and general kind `10002` storage can follow if their value justifies
-the admission and lifecycle policy they require.

@@ -1831,6 +1831,7 @@ pub struct SyncManager {
     /// What we want to sync (source of truth)
     repo_sync_index: RepoSyncIndex,
     root_candidate_index: RootCandidateIndex,
+    proactive_root_authors: crate::nostr::policy::SharedProactiveRootAuthorIndex,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
     /// In-flight subscription batches
@@ -1964,6 +1965,7 @@ impl SyncManager {
             }
         }
 
+        let proactive_root_authors = write_policy.proactive_root_authors();
         Self {
             bootstrap_relay_url,
             service_domain,
@@ -1974,6 +1976,7 @@ impl SyncManager {
             config: config.clone(),
             repo_sync_index: Arc::new(RwLock::new(HashMap::new())),
             root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
+            proactive_root_authors,
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
@@ -4784,8 +4787,39 @@ impl SyncManager {
             drop(repo_index);
             self.nip65_discovery.author_roots = author_roots;
             self.nip65_discovery.author_sources = author_sources;
+            self.proactive_root_authors
+                .replace(self.nip65_discovery.author_roots.keys().copied().collect())
+                .await;
             let current_authors: HashSet<PublicKey> =
                 self.nip65_discovery.author_roots.keys().copied().collect();
+
+            // Rebuild inbox ownership from already accepted local state before
+            // attempting a network refresh. GRASP-03 retains kind 10002 so a
+            // restart must not make conversation coverage depend on the index
+            // source still being reachable.
+            let retained_relay_lists = if current_authors.is_empty() {
+                Some(std::collections::BTreeSet::<Event>::new())
+            } else {
+                self.database
+                    .query(
+                        Filter::new()
+                            .kind(Kind::RelayList)
+                            .authors(current_authors.iter().copied())
+                            .limit(current_authors.len()),
+                    )
+                    .await
+                    .ok()
+            };
+            if let Some(retained_relay_lists) = retained_relay_lists {
+                self.nip65_discovery.relay_lists =
+                    discovery::latest_relay_lists(retained_relay_lists, &current_authors);
+                self.nip65_discovery.author_inboxes = self
+                    .nip65_discovery
+                    .relay_lists
+                    .iter()
+                    .map(|(author, event)| (*author, discovery::inbox_relays(event)))
+                    .collect();
+            }
             self.nip65_discovery
                 .relay_lists
                 .retain(|author, _| current_authors.contains(author));
@@ -4854,9 +4888,9 @@ impl SyncManager {
                     .map(|author| (source.clone(), *author)),
             );
             let filter = Filter::new()
-                .kind(Kind::RelayList)
+                .kinds([Kind::Metadata, Kind::RelayList])
                 .authors(authors.iter().copied())
-                .limit(authors.len());
+                .limit(authors.len().saturating_mul(2));
             let Some(result_tx) = self.nip65_discovery_result_tx.clone() else {
                 return;
             };
@@ -4968,7 +5002,33 @@ impl SyncManager {
                 (Vec::new(), false)
             }
         };
-        let latest = discovery::latest_relay_lists(events, &result.authors);
+        let selected = discovery::latest_identity_events(events, &result.authors);
+        for event in selected {
+            let _ = Self::process_event_static(
+                &event,
+                &result.source_relay,
+                &self.database,
+                &self.write_policy,
+                &self.local_relay,
+                &self.rejected_events_index,
+                crate::nostr::persistence::SaveContext::RelaySync,
+            )
+            .await;
+        }
+        // Drive relay ownership only from the accepted database. A source can
+        // return a validly signed but policy-ineligible relay list; processing
+        // its raw response must not be enough to make us dial its URLs.
+        let stored_relay_lists = self
+            .database
+            .query(
+                Filter::new()
+                    .kind(Kind::RelayList)
+                    .authors(result.authors.iter().copied())
+                    .limit(result.authors.len()),
+            )
+            .await
+            .unwrap_or_default();
+        let latest = discovery::latest_relay_lists(stored_relay_lists, &result.authors);
         let represented: HashSet<PublicKey> = latest.keys().copied().collect();
         let now = Instant::now();
         for author in &result.authors {

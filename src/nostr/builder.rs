@@ -27,8 +27,8 @@ use crate::nostr::lifecycle::{
 use crate::nostr::persistence::{EventPersistence, SaveContext};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
-    AnnouncementPolicy, AnnouncementResult, PolicyContext, PrEventPolicy, ReferenceResult,
-    RelatedEventPolicy, StatePolicy, StateResult,
+    AnnouncementPolicy, AnnouncementResult, IdentityAdmission, PolicyContext, PrEventPolicy,
+    ReferenceResult, RelatedEventPolicy, SharedProactiveRootAuthorIndex, StatePolicy, StateResult,
 };
 use crate::nostr::SharedDatabase;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
@@ -84,6 +84,7 @@ pub struct Nip34WritePolicy {
     state_policy: StatePolicy,
     pr_event_policy: PrEventPolicy,
     related_event_policy: RelatedEventPolicy,
+    proactive_root_authors: SharedProactiveRootAuthorIndex,
     deletion: DeletionService,
     rejected_events_index: Arc<RwLock<Option<Arc<RejectedEventsIndex>>>>,
 }
@@ -132,9 +133,26 @@ impl Nip34WritePolicy {
             state_policy: StatePolicy::new(ctx.clone()),
             pr_event_policy: PrEventPolicy::new(ctx.clone(), repo_init_locks),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
+            proactive_root_authors: crate::nostr::policy::ProactiveRootAuthorIndex::shared(),
             deletion: DeletionService::new(deletion_ctx),
             rejected_events_index: Arc::new(RwLock::new(None)),
             ctx,
+        }
+    }
+
+    pub fn proactive_root_authors(&self) -> SharedProactiveRootAuthorIndex {
+        self.proactive_root_authors.clone()
+    }
+
+    async fn handle_proactive_identity(&self, event: &Event) -> WritePolicyResult {
+        match self.proactive_root_authors.admit(event).await {
+            IdentityAdmission::Accept => WritePolicyResult::Accept,
+            IdentityAdmission::IrrelevantAuthor => {
+                reject_restricted("Kind 0/10002 author must own an accepted repository root")
+            }
+            IdentityAdmission::NotIdentity => {
+                reject_invalid("Proactive identity policy received a non-identity event")
+            }
         }
     }
 
@@ -857,6 +875,7 @@ impl WritePolicy for Nip34WritePolicy {
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
             let result = match event.kind {
+                Kind::Metadata | Kind::RelayList => self.handle_proactive_identity(event).await,
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
                 Kind::RepoState => self.handle_state(event, is_synced).await,
                 Kind::GitPullRequest | Kind::GitPullRequestUpdate => {

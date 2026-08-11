@@ -83,6 +83,34 @@ pub fn latest_relay_lists(
     latest
 }
 
+/// Select the NIP-01-preferred profile and relay list for each requested
+/// author. Keeping selection here prevents a permissive source from making us
+/// process retained replaceable history that clients will never query.
+pub fn latest_identity_events(
+    events: impl IntoIterator<Item = Event>,
+    requested_authors: &HashSet<PublicKey>,
+) -> Vec<Event> {
+    let mut latest = HashMap::<(PublicKey, u16), Event>::new();
+    for event in events {
+        if !matches!(event.kind, Kind::Metadata | Kind::RelayList)
+            || !requested_authors.contains(&event.pubkey)
+        {
+            continue;
+        }
+        let key = (event.pubkey, event.kind.as_u16());
+        let replace = latest.get(&key).is_none_or(|current| {
+            event.created_at > current.created_at
+                || (event.created_at == current.created_at && event.id < current.id)
+        });
+        if replace {
+            latest.insert(key, event);
+        }
+    }
+    let mut events: Vec<Event> = latest.into_values().collect();
+    events.sort_by_key(|event| (event.pubkey.to_hex(), event.kind.as_u16()));
+    events
+}
+
 pub fn inbox_relays(event: &Event) -> HashSet<String> {
     if event.kind != Kind::RelayList {
         return HashSet::new();
@@ -312,5 +340,33 @@ mod tests {
             &HashMap::from([(author, HashSet::from(["wss://inbox.example".to_string()]))]),
         );
         assert_eq!(overlay["wss://inbox.example"], HashSet::from([root.id]));
+    }
+
+    #[test]
+    fn identity_selection_keeps_latest_profile_and_relay_list_per_author() {
+        let author = Keys::generate();
+        let unrelated = Keys::generate();
+        let event = |keys: &Keys, kind: Kind, timestamp: u64| {
+            EventBuilder::new(kind, timestamp.to_string())
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .finalize(keys)
+                .unwrap()
+        };
+        let old_profile = event(&author, Kind::Metadata, 10);
+        let profile = event(&author, Kind::Metadata, 20);
+        let relay_list = event(&author, Kind::RelayList, 30);
+        let ignored = event(&unrelated, Kind::Metadata, 40);
+
+        let selected = latest_identity_events(
+            vec![old_profile, profile.clone(), relay_list.clone(), ignored],
+            &HashSet::from([author.public_key()]),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|event| event.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([profile.id, relay_list.id])
+        );
     }
 }
