@@ -434,15 +434,33 @@ advertisement is unchanged; any ref-tip change clears that URL's memo and
 allows them to be retried. Entries expire lazily after 30 minutes and the
 memo is capped at 1,024 URLs, evicting the oldest entry when full.
 
-Remote politeness and local mutation safety have different keys. Domain
-permits protect each Git server; a repository coordinator keyed by the
-resolved local bare-repository path prevents independent identifier/domain
-workers from duplicating work in the same object database. A waiter re-checks
-the remaining demand after the active pass finishes.
-
 All three phases run beneath the pass's per-domain permit. Separating the
 comparison into its own helper in future must retain that permit; `ls-remote`
 is outbound work against the same Git server, not an unaccounted preflight.
+
+### Repository single-flight and delayed hedging
+
+Remote politeness and local mutation safety have different keys. Domain
+permits protect each Git server; a repository coordinator keyed by the
+resolved local bare-repository path prevents independent identifier/domain
+queues from starting uncoordinated work in the same object database. Demand
+arriving during an active wave waits, then re-checks the still-missing OIDs, so
+already-satisfied work is coalesced while later OIDs are not lost. Promotion
+of newly available data is serialized by the same coordinator and duplicate
+OIDs from two attempts are processed once.
+
+Each wave starts the first source in deterministic URL order. If it is still running after a
+conservative 30-second head start, one source on a different domain may start
+as a hedge. Both attempts may legitimately be large and are allowed to finish;
+the hedge delay is not a stall timeout. A third concurrent attempt is never
+started, and another URL on the primary's domain does not qualify as a hedge.
+Both attempts independently retain process-pressure and per-domain admission.
+
+The wave does not infer a winner from completion order. Both contenders write
+the same object database, so either command can observe objects installed by
+the other. Honest source scoring would require isolated per-attempt object
+stores and explicit winner promotion; that complexity remains out of scope.
+
 Fetches request objects without writing `FETCH_HEAD` and suppress automatic
 maintenance. This keeps the object-only operation free of shared ref-state and
 maintenance side effects before repository-level delayed hedging permits a

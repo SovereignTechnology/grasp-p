@@ -1131,9 +1131,8 @@ mod tests {
         let first = manager.acquire_fetch_pass("example.com").await;
 
         let waiting_manager = manager.clone();
-        let mut waiting = tokio::spawn(async move {
-            waiting_manager.acquire_fetch_pass("example.com").await
-        });
+        let mut waiting =
+            tokio::spawn(async move { waiting_manager.acquire_fetch_pass("example.com").await });
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut waiting)
                 .await
