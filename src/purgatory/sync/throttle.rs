@@ -18,9 +18,10 @@
 use dashmap::DashMap;
 use indexmap::IndexMap;
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tracing::debug;
 
 use super::context::SyncContext;
@@ -39,6 +40,7 @@ const PRESSURE_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 // Sustained CPU throttling can alternate healthy and pressured samples. Keep
 // the operational signal without turning that expected oscillation into spam.
 const PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const REPOSITORY_COORDINATOR_CLEANUP_THRESHOLD: usize = 4096;
 
 fn grow_healthy_allowance(current: usize) -> usize {
     // Pressure counters describe work that has already run. Grow gradually so
@@ -522,6 +524,10 @@ pub struct ThrottleManager {
     /// a wake for another domain is only a harmless extra check.
     domain_capacity: Arc<Notify>,
 
+    /// One coordinator lock per local object database. Waiting callers join
+    /// the active wave and re-check demand after it completes.
+    repository_fetches: DashMap<PathBuf, Weak<AsyncMutex<()>>>,
+
     /// Sync context for processing queued identifiers.
     /// Set once at startup via `set_context()`.
     ctx: OnceLock<Arc<dyn SyncContext>>,
@@ -563,9 +569,31 @@ impl ThrottleManager {
             max_per_minute_per_domain: max_per_minute,
             pressure_gate,
             domain_capacity: Arc::new(Notify::new()),
+            repository_fetches: DashMap::new(),
             ctx: OnceLock::new(),
             git_naughty_list: OnceLock::new(),
         }
+    }
+
+    pub(super) async fn coordinate_repository(&self, path: &Path) -> OwnedMutexGuard<()> {
+        if self.repository_fetches.len() >= REPOSITORY_COORDINATOR_CLEANUP_THRESHOLD {
+            self.repository_fetches
+                .retain(|_, lock| lock.strong_count() > 0);
+        }
+        let mut entry = self
+            .repository_fetches
+            .entry(path.to_path_buf())
+            .or_insert_with(Weak::new);
+        let lock = match entry.upgrade() {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(AsyncMutex::new(()));
+                *entry = Arc::downgrade(&lock);
+                lock
+            }
+        };
+        drop(entry);
+        lock.lock_owned().await
     }
 
     /// Atomically admit one complete remote Git pass.

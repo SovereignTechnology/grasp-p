@@ -939,6 +939,7 @@ mod fetch_helper_tests {
 pub mod mock {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::RwLock;
 
     /// Mock context for testing sync logic without I/O.
@@ -994,6 +995,11 @@ pub mod mock {
 
         /// Results from process_newly_available_git_data calls
         process_results: RwLock<Vec<ProcessResult>>,
+
+        /// Deterministic fetch barriers used by coordinator tests.
+        fetch_barriers: HashMap<String, Arc<tokio::sync::Semaphore>>,
+        fetch_started: Arc<tokio::sync::Notify>,
+        fetch_started_count: AtomicUsize,
     }
 
     impl Default for MockSyncContext {
@@ -1017,6 +1023,9 @@ pub mod mock {
                 target_repo_path: Some(PathBuf::from("/tmp/test-repo")),
                 fetch_should_fail: RwLock::new(HashSet::new()),
                 process_results: RwLock::new(Vec::new()),
+                fetch_barriers: HashMap::new(),
+                fetch_started: Arc::new(tokio::sync::Notify::new()),
+                fetch_started_count: AtomicUsize::new(0),
             }
         }
 
@@ -1074,6 +1083,26 @@ pub mod mock {
             self
         }
 
+        /// Hold this URL's fetch until the test explicitly releases it.
+        pub fn url_waits_for_release(mut self, url: &str) -> Self {
+            self.fetch_barriers
+                .insert(url.to_string(), Arc::new(tokio::sync::Semaphore::new(0)));
+            self
+        }
+
+        pub async fn wait_for_fetches(&self, count: usize) {
+            while self.fetch_started_count.load(Ordering::SeqCst) < count {
+                self.fetch_started.notified().await;
+            }
+        }
+
+        pub fn release_fetch(&self, url: &str) {
+            self.fetch_barriers
+                .get(url)
+                .expect("URL should have a configured fetch barrier")
+                .add_permits(1);
+        }
+
         /// Get the log of fetch attempts (URLs that were fetched from).
         pub fn fetch_log(&self) -> Vec<String> {
             self.fetch_log.read().unwrap().clone()
@@ -1087,6 +1116,10 @@ pub mod mock {
         /// Get the current set of needed OIDs.
         pub fn current_needed_oids(&self) -> HashSet<String> {
             self.needed_oids.read().unwrap().clone()
+        }
+
+        pub fn process_call_count(&self) -> usize {
+            self.process_results.read().unwrap().len()
         }
 
         /// Set whether there are pending events (can be called during test).
@@ -1176,6 +1209,15 @@ pub mod mock {
         ) -> Result<Vec<String>> {
             // Log the fetch attempt
             self.fetch_log.write().unwrap().push(url.to_string());
+            self.fetch_started_count.fetch_add(1, Ordering::SeqCst);
+            self.fetch_started.notify_waiters();
+            if let Some(barrier) = self.fetch_barriers.get(url) {
+                barrier
+                    .acquire()
+                    .await
+                    .expect("mock fetch barrier should remain open")
+                    .forget();
+            }
 
             // Check if this URL should fail
             if self.fetch_should_fail.read().unwrap().contains(url) {

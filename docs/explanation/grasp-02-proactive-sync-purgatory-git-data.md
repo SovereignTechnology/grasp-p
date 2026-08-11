@@ -434,6 +434,12 @@ advertisement is unchanged; any ref-tip change clears that URL's memo and
 allows them to be retried. Entries expire lazily after 30 minutes and the
 memo is capped at 1,024 URLs, evicting the oldest entry when full.
 
+Remote politeness and local mutation safety have different keys. Domain
+permits protect each Git server; a repository coordinator keyed by the
+resolved local bare-repository path prevents independent identifier/domain
+workers from duplicating work in the same object database. A waiter re-checks
+the remaining demand after the active pass finishes.
+
 All three phases run beneath the pass's per-domain permit. Separating the
 comparison into its own helper in future must retain that permit; `ls-remote`
 is outbound work against the same Git server, not an unaccounted preflight.

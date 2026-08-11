@@ -357,6 +357,11 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
         }
     };
 
+    // The local object database is the mutation boundary. A duplicate caller
+    // waits for the active pass, then re-checks demand so newly arrived OIDs
+    // are not lost and already satisfied work is not fetched twice.
+    let _repository = throttle_manager.coordinate_repository(&target_repo).await;
+
     // Collect needed OIDs
     let needed_oids: Vec<String> = ctx.collect_needed_oids(identifier).into_iter().collect();
     if needed_oids.is_empty() {
@@ -831,6 +836,42 @@ mod tests {
 
         // After completion, domain should not be throttled
         assert!(!throttle_manager.is_throttled("github.com"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_repo_demand_joins_one_fetch_pass() {
+        let url = "https://primary.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(url, &["abc123"])
+                .url_waits_for_release(url),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+
+        let first = {
+            let mock = mock.clone();
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                sync_identifier_from_url(&*mock, "repo", url, &manager).await
+            })
+        };
+        mock.wait_for_fetches(1).await;
+        let second = {
+            let mock = mock.clone();
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                sync_identifier_from_url(&*mock, "repo", url, &manager).await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(mock.fetch_log().len(), 1);
+
+        mock.release_fetch(url);
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 0);
+        assert_eq!(mock.fetch_log().len(), 1);
+        assert_eq!(mock.process_call_count(), 1);
     }
 
     #[tokio::test]
