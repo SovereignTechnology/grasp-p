@@ -7,6 +7,7 @@
 /// - `RelatedEventPolicy` - Forward/backward reference checking
 /// - Deletion handling lives in `crate::nostr::lifecycle`
 mod announcement;
+mod identity;
 mod pr_event;
 mod related;
 mod result;
@@ -17,6 +18,7 @@ pub(crate) use result::{
 };
 
 pub use announcement::{AnnouncementPolicy, AnnouncementResult};
+pub use identity::{IdentityAdmission, ProactiveRootAuthorIndex, SharedProactiveRootAuthorIndex};
 pub use pr_event::PrEventPolicy;
 pub use related::{ReferenceResult, RelatedEventPolicy};
 pub use state::{StatePolicy, StateResult};

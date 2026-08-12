@@ -16,6 +16,8 @@ const DEFAULT_DELETION_REQUEST_RETENTION_UNUSED_UNSERVED_GATING_ADDITIONAL_SECS:
 const DEFAULT_DELETION_REQUEST_RETENTION_USED_SERVED_AFTER_LAST_USED_SECS: u64 = 270 * 24 * 60 * 60;
 const DEFAULT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS: u64 =
     90 * 24 * 60 * 60;
+const DEFAULT_USER_INDEX_RELAYS: &str =
+    "wss://purplepag.es,wss://index.hzrd149.com,wss://indexer.coracle.social";
 
 /// Whitelist entry for repository/archive filtering
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,6 +388,15 @@ pub struct Config {
     /// Examples: "relay.example.com" -> "wss://relay.example.com", "wss://relay.example.com" -> unchanged
     #[arg(long, env = "NGIT_SYNC_BOOTSTRAP_RELAY_URL")]
     pub sync_bootstrap_relay_url: Option<String>,
+
+    /// Comma-separated relays used to discover eligible accepted repository participants'
+    /// NIP-65 relay lists.
+    #[arg(
+        long,
+        env = "NGIT_USER_INDEX_RELAYS",
+        default_value = DEFAULT_USER_INDEX_RELAYS
+    )]
+    pub user_index_relays: String,
 
     /// Maximum backoff time in seconds for sync relay reconnection (default: 3600 = 1 hour)
     #[arg(long, env = "NGIT_SYNC_MAX_BACKOFF_SECS", default_value_t = 3600)]
@@ -950,6 +961,16 @@ impl Config {
             .collect()
     }
 
+    /// Parse the comma-separated user-index relay URLs.
+    pub fn parse_user_index_relays(&self) -> Vec<String> {
+        self.user_index_relays
+            .split(',')
+            .map(str::trim)
+            .filter(|relay| !relay.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Get parsed archive configuration with computed read-only mode
     ///
     /// Read-only mode defaults to true if archive mode is enabled, false otherwise.
@@ -1080,6 +1101,7 @@ impl Config {
             metrics_connection_per_ip_abuse_threshold: 10,
             metrics_top_n_repos: 10,
             sync_bootstrap_relay_url: None,
+            user_index_relays: DEFAULT_USER_INDEX_RELAYS.to_string(),
             sync_max_backoff_secs: 3600,
             sync_disconnect_check_interval_secs: 60,
             sync_base_backoff_secs: 5,
@@ -1181,6 +1203,38 @@ mod tests {
         assert_eq!(config.relay_max_subscriptions, 500);
         assert_eq!(config.relay_max_event_size_bytes, 192 * 1024);
         assert_eq!(config.relay_filter_limit, 500);
+    }
+
+    #[test]
+    fn user_index_relay_defaults_are_explicit() {
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("user-index relay defaults should parse");
+
+        assert_eq!(
+            config.parse_user_index_relays(),
+            vec![
+                "wss://purplepag.es",
+                "wss://index.hzrd149.com",
+                "wss://indexer.coracle.social",
+            ]
+        );
+    }
+
+    #[test]
+    fn user_index_relays_parse_cli_list_and_ignore_empty_entries() {
+        let config = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--user-index-relays",
+            " wss://one.example ,, wss://two.example, ",
+        ])
+        .expect("user-index relay override should parse");
+
+        assert_eq!(
+            config.parse_user_index_relays(),
+            vec!["wss://one.example", "wss://two.example"]
+        );
     }
 
     #[test]

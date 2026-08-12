@@ -108,6 +108,13 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
+### [GRASP-03 Proactive Sync Plus](grasp-03-proactive-sync-plus.md)
+**NIP-65 inbox discovery for accepted repository conversations**
+
+**Read when:** You want to understand how accepted conversations are recovered from root-author inboxes
+
+---
+
 ### [Sync Scaling Constraints and Budgets](sync-scaling-constraints.md)
 **Relay-imposed limits and how sync spends them at scale**
 

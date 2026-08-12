@@ -976,6 +976,32 @@ impl RelayConnection {
             .is_some_and(|relay| relay.status() == RelayStatus::Connected)
     }
 
+    /// Whether a control-plane query could acquire every local subscription
+    /// constraint immediately on the current connected session.
+    ///
+    /// This is an admission sample, not a reservation: another actor may win
+    /// the permits before the caller starts. It prevents maintenance ticks
+    /// from spawning work that is already known to have to wait.
+    pub async fn has_immediate_transient_capacity(&self) -> bool {
+        if !self.is_connected().await || self.historic_capacity_consumed_by_live() {
+            return false;
+        }
+        if self.transient_req_permits.available_permits() == 0 {
+            return false;
+        }
+        if self.remote_subscription_byte_limit().is_some()
+            && self.byte_limited_transient_gate.available_permits() == 0
+        {
+            return false;
+        }
+        self.subscription_budget
+            .lock()
+            .expect("subscription ledger poisoned")
+            .semaphore
+            .available_permits()
+            > 0
+    }
+
     /// Configure the one per-session ledger before any subscriptions open.
     pub fn reset_subscription_budget(&self, advertised: Option<usize>) {
         self.clear_subscription_permits();
@@ -2093,25 +2119,25 @@ impl RelayConnection {
 
     /// Fetch a bounded set of events directly from this relay.
     ///
-    /// This is reserved for dependency recovery where exact event IDs are
-    /// already known. The caller remains responsible for applying the write
-    /// policy and persistence path.
+    /// Used by small control-plane and dependency-recovery queries whose
+    /// caller owns result interpretation. It still consumes the same pacing,
+    /// transient-class and per-session ledger capacity as historic REQs.
     pub async fn fetch_events(
         &self,
         filter: Filter,
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
-        // Exact-ID purgatory recovery opens an ordinary transient REQ inside
-        // nostr-sdk. It must share the same permit bound as historic pages,
-        // fallbacks and retries rather than escaping the connection budget.
+        // The SDK owns this ordinary transient REQ until EOSE/CLOSED. It must
+        // share the same permit bound as historic pages, fallbacks and retries
+        // rather than escaping the connection budget.
         self.await_query_start().await?;
         self.await_background_query_start().await;
         if self.historic_capacity_consumed_by_live() {
             tracing::warn!(
                 relay = %self.url,
-                "Purgatory dependency poll deferred: live subscriptions consume the usable budget"
+                "Control-plane query deferred: live subscriptions consume the usable budget"
             );
-            return Err(format!("No dependency polling capacity for {}", self.url));
+            return Err(format!("No transient query capacity for {}", self.url));
         }
         let _transient_cap = self
             .transient_req_permits
@@ -4209,9 +4235,33 @@ mod tests {
             .await
             .expect_err("dependency polling must defer when the ledger has no usable slot");
         assert!(
-            error.contains("No dependency polling capacity"),
+            error.contains("No transient query capacity"),
             "unexpected dependency ledger error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn immediate_transient_capacity_rejects_a_saturated_session() {
+        let relay = LocalRelayBuilder::default().build();
+        relay.run().await.expect("start local relay");
+        let relay_url = relay.url().await.to_string();
+        let connection = permissive_connection(&relay_url, Keys::generate());
+        connection.connect(3).await.expect("connect local relay");
+        connection.reset_subscription_budget(Some(3));
+
+        assert!(connection.has_immediate_transient_capacity().await);
+        let ledger = connection.subscription_budget();
+        let _all_slots = ledger
+            .clone()
+            .acquire_many_owned(ledger.available_permits() as u32)
+            .await
+            .expect("saturate subscription ledger");
+
+        assert!(!connection.has_immediate_transient_capacity().await);
+        assert_eq!(connection.transient_req_permits.available_permits(), 5);
+
+        connection.disconnect().await;
+        relay.shutdown();
     }
 
     #[test]
