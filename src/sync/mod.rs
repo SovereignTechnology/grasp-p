@@ -1336,6 +1336,7 @@ struct Nip65DiscoveryResult {
 #[derive(Debug, Default)]
 struct Nip65DiscoveryState {
     author_roots: HashMap<PublicKey, HashSet<EventId>>,
+    eligible_authors: HashSet<PublicKey>,
     author_sources: HashMap<PublicKey, HashSet<String>>,
     relay_lists: HashMap<PublicKey, Event>,
     author_inboxes: HashMap<PublicKey, HashSet<String>>,
@@ -4797,62 +4798,93 @@ impl SyncManager {
             let repo_index = self.repo_sync_index.read().await;
             let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
             drop(candidates);
-            let bootstrap = self
-                .bootstrap_relay_url
-                .as_deref()
-                .and_then(|url| canonical_relay_key(url).ok());
             let mut author_roots: HashMap<PublicKey, HashSet<EventId>> = HashMap::new();
-            let mut author_sources: HashMap<PublicKey, HashSet<String>> = HashMap::new();
             for root in roots {
                 author_roots.entry(root.author).or_default().insert(root.id);
-                let sources = author_sources.entry(root.author).or_default();
-                if let Some(needs) = repo_index.get(&root.repository) {
-                    sources.extend(
-                        needs
-                            .relays
-                            .iter()
-                            .filter_map(|url| canonical_relay_key(url).ok()),
-                    );
-                }
-                if let Some(bootstrap) = &bootstrap {
-                    sources.insert(bootstrap.clone());
-                }
             }
+
+            let announcements = self
+                .database
+                .query(Filter::new().kind(Kind::GitRepoAnnouncement))
+                .await
+                .unwrap_or_default();
+            let mut eligible_authors =
+                discovery::accepted_repository_authors(announcements.iter(), &repo_index);
+            eligible_authors.extend(author_roots.keys().copied());
             drop(repo_index);
             self.nip65_discovery.author_roots = author_roots;
-            self.nip65_discovery.author_sources = author_sources;
+            self.nip65_discovery.eligible_authors = eligible_authors;
             self.proactive_root_authors
-                .replace(self.nip65_discovery.author_roots.keys().copied().collect())
+                .replace(self.nip65_discovery.eligible_authors.clone())
                 .await;
-            let current_authors: HashSet<PublicKey> =
-                self.nip65_discovery.author_roots.keys().copied().collect();
+            let current_authors = self.nip65_discovery.eligible_authors.clone();
 
             // Rebuild inbox ownership from already accepted local state before
             // attempting a network refresh. GRASP-03 retains kind 10002 so a
             // restart must not make conversation coverage depend on the index
             // source still being reachable.
-            let retained_relay_lists = if current_authors.is_empty() {
+            let retained_identity = if current_authors.is_empty() {
                 Some(std::collections::BTreeSet::<Event>::new())
             } else {
                 self.database
                     .query(
                         Filter::new()
-                            .kind(Kind::RelayList)
+                            .kinds([Kind::Metadata, Kind::RelayList])
                             .authors(current_authors.iter().copied())
-                            .limit(current_authors.len()),
+                            .limit(current_authors.len().saturating_mul(2)),
                     )
                     .await
                     .ok()
             };
-            if let Some(retained_relay_lists) = retained_relay_lists {
-                self.nip65_discovery.relay_lists =
-                    discovery::latest_relay_lists(retained_relay_lists, &current_authors);
+            if let Some(retained_identity) = retained_identity {
+                let latest_identity = discovery::latest_identity_events(
+                    retained_identity.iter().cloned(),
+                    &current_authors,
+                );
+                self.nip65_discovery.relay_lists = discovery::latest_relay_lists(
+                    latest_identity,
+                    &current_authors,
+                );
                 self.nip65_discovery.author_inboxes = self
                     .nip65_discovery
                     .relay_lists
                     .iter()
                     .map(|(author, event)| (*author, discovery::inbox_relays(event)))
                     .collect();
+            }
+
+            let mut index_relays: HashSet<String> = self
+                .config
+                .parse_user_index_relays()
+                .into_iter()
+                .filter_map(|url| canonical_relay_key(&url).ok())
+                .collect();
+            if let Some(bootstrap) = self
+                .bootstrap_relay_url
+                .as_deref()
+                .and_then(|url| canonical_relay_key(url).ok())
+            {
+                index_relays.insert(bootstrap);
+            }
+            self.nip65_discovery.author_sources.clear();
+            for author in &current_authors {
+                let sources = self
+                    .nip65_discovery
+                    .author_sources
+                    .entry(*author)
+                    .or_default();
+                if let Some(relay_list) = self.nip65_discovery.relay_lists.get(author) {
+                    sources.extend(
+                        discovery::outbox_relays(relay_list)
+                            .into_iter()
+                            .filter_map(|url| canonical_relay_key(&url).ok()),
+                    );
+                } else {
+                    // Index/bootstrap relays only discover the first accepted
+                    // list. Once present, its outboxes become the authoritative
+                    // additive refresh graph and avoid redundant index traffic.
+                    sources.extend(index_relays.iter().cloned());
+                }
             }
             self.nip65_discovery
                 .relay_lists
@@ -4882,6 +4914,21 @@ impl SyncManager {
         // never a maintenance-tick-sized queue of control-plane tasks.
         if !self.nip65_discovery.in_flight.is_empty() {
             return;
+        }
+
+        let discovery_relays: HashSet<String> = self
+            .nip65_discovery
+            .author_sources
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        for relay in discovery_relays {
+            if !self.connections.contains_key(&relay)
+                && self.register_relay(relay.clone(), false).await
+            {
+                self.schedule_connect_relay(&relay).await;
+            }
         }
 
         let mut candidates: HashMap<String, Vec<PublicKey>> = HashMap::new();
@@ -4975,8 +5022,9 @@ impl SyncManager {
             }
         };
         let selected = discovery::latest_identity_events(events, &result.authors);
+        let mut represented_by_source = HashSet::new();
         for event in selected {
-            let _ = Self::process_event_static(
+            let process_result = Self::process_event_static(
                 &event,
                 &result.source_relay,
                 &self.database,
@@ -4986,6 +5034,11 @@ impl SyncManager {
                 crate::nostr::persistence::SaveContext::RelaySync,
             )
             .await;
+            if event.kind == Kind::RelayList
+                && matches!(process_result, ProcessResult::Saved | ProcessResult::Duplicate)
+            {
+                represented_by_source.insert(event.pubkey);
+            }
         }
         // Drive relay ownership only from the accepted database. A source can
         // return a validly signed but policy-ineligible relay list; processing
@@ -5001,10 +5054,10 @@ impl SyncManager {
             .await
             .unwrap_or_default();
         let latest = discovery::latest_relay_lists(stored_relay_lists, &result.authors);
-        let represented: HashSet<PublicKey> = latest.keys().copied().collect();
         let now = Instant::now();
         for author in &result.authors {
-            let retry_after = nip65_author_retry_after(query_succeeded, &represented, author);
+            let retry_after =
+                nip65_author_retry_after(query_succeeded, &represented_by_source, author);
             self.nip65_discovery.next_attempt_at.insert(
                 (result.source_relay.clone(), *author),
                 now + retry_after,
@@ -5013,7 +5066,7 @@ impl SyncManager {
 
         let mut changed = false;
         for (author, candidate) in latest {
-            if !self.nip65_discovery.author_roots.contains_key(&author) {
+            if !self.nip65_discovery.eligible_authors.contains(&author) {
                 continue;
             }
             let replace = self
@@ -5029,6 +5082,30 @@ impl SyncManager {
                 self.nip65_discovery
                     .author_inboxes
                     .insert(author, discovery::inbox_relays(&candidate));
+                let mut index_relays: HashSet<String> = self
+                    .config
+                    .parse_user_index_relays()
+                    .into_iter()
+                    .filter_map(|url| canonical_relay_key(&url).ok())
+                    .collect();
+                if let Some(bootstrap) = self
+                    .bootstrap_relay_url
+                    .as_deref()
+                    .and_then(|url| canonical_relay_key(url).ok())
+                {
+                    index_relays.insert(bootstrap);
+                }
+                let sources = self
+                    .nip65_discovery
+                    .author_sources
+                    .entry(author)
+                    .or_default();
+                sources.retain(|source| !index_relays.contains(source));
+                sources.extend(
+                    discovery::outbox_relays(&candidate)
+                        .into_iter()
+                        .filter_map(|url| canonical_relay_key(&url).ok()),
+                );
                 self.nip65_discovery.relay_lists.insert(author, candidate);
                 changed = true;
             }
@@ -7657,6 +7734,33 @@ mod tests {
         // leaves the physical subscription untouched.
         assert!(coverage.retain_for_removal_only_change(&HashSet::from([second])));
         assert_eq!(coverage.subscription_ids, subscription_ids);
+    }
+
+    #[test]
+    fn retained_list_does_not_mask_an_empty_new_outbox_response() {
+        let author_with_retained_list = Keys::generate().public_key();
+        // `represented_by_source` is intentionally empty: a relay list held
+        // in the local database came from an earlier source, while this newly
+        // followed outbox returned no list and needs the short retry cadence.
+        let represented_by_source = HashSet::new();
+
+        assert_eq!(
+            nip65_author_retry_after(
+                true,
+                &represented_by_source,
+                &author_with_retained_list,
+            ),
+            nip65_discovery_retry_interval()
+        );
+        let represented_by_source = HashSet::from([author_with_retained_list]);
+        assert_eq!(
+            nip65_author_retry_after(
+                true,
+                &represented_by_source,
+                &author_with_retained_list,
+            ),
+            nip65_discovery_refresh_interval()
+        );
     }
 
     #[test]

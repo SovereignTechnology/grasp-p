@@ -123,6 +123,58 @@ pub fn inbox_relays(event: &Event) -> HashSet<String> {
         .collect()
 }
 
+pub fn outbox_relays(event: &Event) -> HashSet<String> {
+    if event.kind != Kind::RelayList {
+        return HashSet::new();
+    }
+    nip65::extract_relay_list(event)
+        .into_iter()
+        .filter_map(|(relay, marker)| {
+            matches!(marker, None | Some(RelayMetadata::Write)).then(|| relay.to_string())
+        })
+        .collect()
+}
+
+/// Authors whose identity is part of accepted Full repository state: owners
+/// and declared maintainers. Root authors are merged by the caller because
+/// their compact candidate index is maintained separately.
+pub fn accepted_repository_authors<'a>(
+    announcements: impl IntoIterator<Item = &'a Event>,
+    repositories: &HashMap<String, RepoSyncNeeds>,
+) -> HashSet<PublicKey> {
+    let mut authors = HashSet::new();
+    for event in announcements {
+        if event.kind != Kind::GitRepoAnnouncement {
+            continue;
+        }
+        let Some(identifier) = event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some("d") && values.len() >= 2)
+                .then(|| values[1].clone())
+        }) else {
+            continue;
+        };
+        let repository = format!("30617:{}:{identifier}", event.pubkey);
+        if !repositories
+            .get(&repository)
+            .is_some_and(|needs| needs.sync_level == SyncLevel::Full)
+        {
+            continue;
+        }
+        authors.insert(event.pubkey);
+        for maintainer in event.tags.iter().filter(|tag| {
+            tag.as_slice().first().map(String::as_str) == Some("maintainers")
+        }) {
+            authors.extend(
+                maintainer.as_slice()[1..]
+                    .iter()
+                    .filter_map(|value| PublicKey::from_hex(value).ok()),
+            );
+        }
+    }
+    authors
+}
+
 pub fn merge_inbox_roots(
     targets: &mut HashMap<String, RelaySyncNeeds>,
     inbox_roots: &HashMap<String, HashSet<EventId>>,
@@ -222,6 +274,72 @@ mod tests {
                 "wss://read.example".to_string(),
                 "wss://both.example".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn relay_list_maps_write_and_unmarked_outboxes_but_not_read() {
+        let keys = Keys::generate();
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://read.example", "read"]),
+                Tag::custom("r", ["wss://write.example", "write"]),
+                Tag::custom("r", ["wss://both.example"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            outbox_relays(&relay_list),
+            HashSet::from([
+                "wss://write.example".to_string(),
+                "wss://both.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn identity_authors_are_bounded_to_full_repo_owners_and_maintainers() {
+        let owner = Keys::generate();
+        let maintainer = Keys::generate();
+        let ignored = Keys::generate();
+        let identifier = "accepted";
+        let accepted = event(
+            &owner,
+            Kind::GitRepoAnnouncement,
+            vec![
+                Tag::identifier(identifier),
+                Tag::custom("maintainers", [maintainer.public_key().to_hex()]),
+            ],
+            1,
+        );
+        let state_only = event(
+            &ignored,
+            Kind::GitRepoAnnouncement,
+            vec![Tag::identifier("pending")],
+            1,
+        );
+        let repositories = HashMap::from([
+            (
+                format!("30617:{}:{identifier}", owner.public_key()),
+                RepoSyncNeeds {
+                    sync_level: SyncLevel::Full,
+                    ..RepoSyncNeeds::default()
+                },
+            ),
+            (
+                format!("30617:{}:pending", ignored.public_key()),
+                RepoSyncNeeds {
+                    sync_level: SyncLevel::StateOnly,
+                    ..RepoSyncNeeds::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            accepted_repository_authors([&accepted, &state_only], &repositories),
+            HashSet::from([owner.public_key(), maintainer.public_key()])
         );
     }
 

@@ -12,6 +12,7 @@ use crate::common::{
 #[tokio::test]
 async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     let index = MockRelay::start().await;
+    let outbox = MockRelay::start().await;
     let inbox = MockRelay::start().await;
     let replacement_inbox = MockRelay::start().await;
     let owner = Keys::generate();
@@ -20,7 +21,10 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     let identifier = "minimal-proactive-sync-plus";
 
     let relay_list = EventBuilder::new(Kind::RelayList, "")
-        .tag(Tag::custom("r", vec![inbox.url(), "read"]))
+        .tags([
+            Tag::custom("r", vec![inbox.url(), "read"]),
+            Tag::custom("r", vec![outbox.url(), "write"]),
+        ])
         .custom_created_at(Timestamp::from(Timestamp::now().as_secs() - 10))
         .finalize(&root_author)
         .expect("build NIP-65 relay list");
@@ -47,6 +51,17 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     send_to_relay_url(index.url(), &relay_list)
         .await
         .expect("seed discovery index");
+    let replacement = EventBuilder::new(Kind::RelayList, "")
+        .tags([
+            Tag::custom("r", vec![replacement_inbox.url(), "read"]),
+            Tag::custom("r", vec![outbox.url(), "write"]),
+        ])
+        .custom_created_at(Timestamp::now())
+        .finalize(&root_author)
+        .expect("build outbox replacement relay list");
+    send_to_relay_url(outbox.url(), &replacement)
+        .await
+        .expect("seed newer relay list on advertised outbox");
 
     let syncing_git_dir = tempfile::tempdir().expect("create persistent git directory");
     let syncing_relay_dir = tempfile::tempdir().expect("create persistent relay directory");
@@ -117,14 +132,6 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
         "unrelated metadata on the discovery relay must remain absent"
     );
 
-    let replacement = EventBuilder::new(Kind::RelayList, "")
-        .tag(Tag::custom("r", vec![replacement_inbox.url(), "read"]))
-        .custom_created_at(Timestamp::now())
-        .finalize(&root_author)
-        .expect("build replacement relay list");
-    send_to_relay_url(index.url(), &replacement)
-        .await
-        .expect("replace root-author inbox");
     let replacement_reply = EventBuilder::new(Kind::TextNote, "replacement inbox reply")
         .tag(Tag::custom("e", vec![issue.id.to_hex()]))
         .finalize(&root_author)
@@ -182,5 +189,6 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
 
     syncing.stop().await;
     replacement_inbox.stop().await;
+    outbox.stop().await;
     inbox.stop().await;
 }

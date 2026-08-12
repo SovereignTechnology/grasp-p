@@ -25,17 +25,24 @@ Discovery remains best effort and bounded to this operator-visible source graph.
 The self-subscriber builds a compact root-candidate inventory during its
 existing startup load and maintains it incrementally as roots arrive. StateOnly
 candidates remain inert; promotion of their repository to Full makes them
-eligible without rescanning retained events. A once-per-minute reconciliation
-derives sources from this index. Remote queries contain at most 100 authors and
+eligible without rescanning retained events. Eligible identity authors are the
+owners and declared maintainers of accepted Full announcements plus accepted
+root authors—not every author retained by the relay. A once-per-minute
+reconciliation derives sources from this index. Remote queries contain at most 100 authors and
 only one discovery batch may be in flight globally. Admission samples immediate
 transient capacity; if historic work wins the small race before the permit is
 acquired, that single batch may wait but discovery can never build a waiter
 queue. Its SDK-owned REQ draws from the same pacer and subscription ledger as
 historic work. Authors returned by a successful query refresh after 24 hours;
-missing authors and failed queries retry after five minutes. Identity events
+missing authors and failed queries retry after five minutes. Configured user
+index relays discover authors with no accepted local relay list, requesting the
+profile alongside it. Accepted NIP-65
+write/unmarked outboxes are then followed additively for newer replacements;
+new outboxes discovered by a replacement join the same bounded round until no
+unvisited source remains. Identity events
 pass through the ordinary write policy, persistence and broadcast path. Only a
 stored, accepted kind `10002` can change inbox ownership. On startup, retained
-relay lists for accepted root authors rebuild inbox ownership from the local
+relay lists for eligible authors rebuild inbox ownership from the local
 database before any network refresh, so serving established coverage does not
 depend on an external index remaining available. Remote discovery then refreshes
 that retained state on the normal cadence.
