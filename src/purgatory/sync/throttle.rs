@@ -583,7 +583,7 @@ impl ThrottleManager {
         let mut entry = self
             .repository_fetches
             .entry(path.to_path_buf())
-            .or_insert_with(Weak::new);
+            .or_default();
         let lock = match entry.upgrade() {
             Some(lock) => lock,
             None => {

@@ -265,12 +265,7 @@ fn parse_neg_frame(text: &str) -> Option<NegFrame> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let array = value.as_array()?;
     let kind = array.first()?.as_str()?;
-    let subid = || {
-        array
-            .get(1)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
+    let subid = || array.get(1).and_then(|v| v.as_str()).map(|s| s.to_string());
     match kind {
         "NEG-OPEN" => Some(NegFrame::Open(subid()?)),
         "NEG-CLOSE" | "NEG-ERR" => Some(NegFrame::Close(subid()?)),

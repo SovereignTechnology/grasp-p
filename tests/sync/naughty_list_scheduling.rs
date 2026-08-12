@@ -88,9 +88,7 @@ async fn naughty_relay_is_not_scheduled_for_reconnection() {
     assert_eq!(accepted.load(Ordering::SeqCst), 1, "first dial is required");
 
     let reconnect_deadline = tokio::time::Instant::now() + RECONNECT_OBSERVATION;
-    while tokio::time::Instant::now() < reconnect_deadline
-        && accepted.load(Ordering::SeqCst) == 1
-    {
+    while tokio::time::Instant::now() < reconnect_deadline && accepted.load(Ordering::SeqCst) == 1 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(

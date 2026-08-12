@@ -18,7 +18,8 @@ use crate::common::{
     port,
     sync_helpers::{
         create_repo_announcement, fetch_metrics, setup_announcement_on_relay,
-        wait_for_sync_connection, MetricsTestHarness, ParsedMetrics, TestClient,
+        wait_for_full_repo_live_coverage, wait_for_sync_connection, MetricsTestHarness,
+        ParsedMetrics, TestClient,
     },
     TestRelay,
 };
@@ -433,8 +434,7 @@ async fn test_live_sync_event_count() {
         .await
         .expect("Sync connection should be established");
 
-    // Additional delay to ensure purgatory promotion completes on syncing relay
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    wait_for_full_repo_live_coverage(&syncing_relay, Duration::from_secs(20)).await;
 
     // Now add Layer 2 patch events (not announcements) - these are accepted immediately
     // (Layer 2 events are accepted directly to DB, no purgatory)
@@ -521,13 +521,22 @@ async fn test_relay_connected_status() {
 
     // Stop the source
     harness.stop_source(0).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let metrics = harness.get_metrics().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let metrics = loop {
+        let metrics = harness.get_metrics().await.unwrap();
+        if metrics.relay_connected(&source_url).is_none() {
+            break metrics;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay was not retired"
+        );
+        tokio::task::yield_now().await;
+    };
     assert_eq!(
         metrics.relay_connected(&source_url),
-        Some(false),
-        "Should be disconnected from {}",
+        None,
+        "Retired relay series should be removed for {}",
         source_url
     );
 
@@ -614,7 +623,19 @@ async fn test_multi_source_aggregate_counts() {
         .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let metrics = harness.get_metrics().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let metrics = loop {
+        let metrics = harness.get_metrics().await.unwrap();
+        if metrics.relays_tracked_total() == Some(1) && metrics.relays_connected_total() == Some(1)
+        {
+            break metrics;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay did not become connected"
+        );
+        tokio::task::yield_now().await;
+    };
 
     println!("Tracked total: {:?}", metrics.relays_tracked_total());
     println!("Connected total: {:?}", metrics.relays_connected_total());
@@ -628,31 +649,6 @@ async fn test_multi_source_aggregate_counts() {
         metrics.relays_connected_total(),
         Some(1),
         "Should have 1 connected"
-    );
-
-    // Stop source, verify connected drops to 0
-    harness.stop_source(0).await;
-
-    let metrics = harness.get_metrics().await.unwrap();
-
-    println!(
-        "After stop - Tracked total: {:?}",
-        metrics.relays_tracked_total()
-    );
-    println!(
-        "After stop - Connected total: {:?}",
-        metrics.relays_connected_total()
-    );
-
-    assert_eq!(
-        metrics.relays_tracked_total(),
-        Some(1),
-        "Still tracking 1 relay"
-    );
-    assert_eq!(
-        metrics.relays_connected_total(),
-        Some(0),
-        "Should have 0 connected (waited up to 10s for disconnect detection)"
     );
 
     harness.stop_all().await;

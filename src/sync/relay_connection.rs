@@ -399,14 +399,12 @@ fn plan_live_tail_extension(
             let mut trial_filters = replacement_filters.clone();
             trial_filters.extend(filters.iter().cloned());
             trial_filters.sort_unstable_by_key(|filter| filter.as_json());
-            let trial_groups =
-                super::group_filters_for_req_with_max(&trial_filters, max_filters);
-            let trial_net_new_slots =
-                trial_groups.len() as isize - (retired.len() + 1) as isize;
+            let trial_groups = super::group_filters_for_req_with_max(&trial_filters, max_filters);
+            let trial_net_new_slots = trial_groups.len() as isize - (retired.len() + 1) as isize;
             if trial_net_new_slots < net_new_slots
-                && best.as_ref().is_none_or(
-                    |(_, _, _, best_net)| trial_net_new_slots < *best_net,
-                )
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, _, _, best_net)| trial_net_new_slots < *best_net)
             {
                 best = Some((index, trial_filters, trial_groups, trial_net_new_slots));
             }
@@ -1653,7 +1651,7 @@ impl RelayConnection {
                     RelayNotification::Message { message } => match *message {
                         RelayMessage::EndOfStoredEvents(sub_id) => {
                             terminal_connection
-                                .close_and_release_transient_req_permit(&sub_id.into_owned())
+                                .close_and_release_transient_req_permit(&sub_id)
                                 .await;
                         }
                         RelayMessage::Closed {
@@ -1669,12 +1667,9 @@ impl RelayConnection {
                         }
                         _ => {}
                     },
-                    RelayNotification::RelayStatus { status }
-                        if matches!(
-                            status,
-                            RelayStatus::Disconnected | RelayStatus::Terminated
-                        ) =>
-                    {
+                    RelayNotification::RelayStatus {
+                        status: RelayStatus::Disconnected | RelayStatus::Terminated,
+                    } => {
                         terminal_connection.clear_subscription_permits();
                         break;
                     }
@@ -2048,9 +2043,8 @@ impl RelayConnection {
         // The relay can answer an empty or cached query before `subscribe`
         // returns. Register transient ownership against a caller-chosen ID
         // first so an immediate EOSE/CLOSED cannot race past local accounting.
-        let transient_sub_id = transient_class.map(|_| {
-            requested_subscription_id.unwrap_or_else(SubscriptionId::generate)
-        });
+        let transient_sub_id = transient_class
+            .map(|_| requested_subscription_id.unwrap_or_else(SubscriptionId::generate));
         if let (Some(sub_id), Some(permit)) = (&transient_sub_id, transient_permit) {
             self.hold_transient_req_permit(sub_id.clone(), permit);
         }
@@ -2209,10 +2203,7 @@ impl RelayConnection {
         }
     }
 
-    pub(super) async fn retire_auth_refused_subscription(
-        &self,
-        subscription_id: &SubscriptionId,
-    ) {
+    pub(super) async fn retire_auth_refused_subscription(&self, subscription_id: &SubscriptionId) {
         self.release_transient_req_permit(subscription_id);
         self.release_live_req_permit(subscription_id);
         if let Err(error) = self.client.unsubscribe(subscription_id).await {
@@ -2379,10 +2370,7 @@ impl RelayConnection {
     }
 
     /// Release the live ledger slot held for `sub_id`, if any.
-    fn release_live_req_permit(
-        &self,
-        sub_id: &SubscriptionId,
-    ) -> Option<ReleasedLiveSubscription> {
+    fn release_live_req_permit(&self, sub_id: &SubscriptionId) -> Option<ReleasedLiveSubscription> {
         self.live_req_permits_held
             .lock()
             .expect("live permit map poisoned")
@@ -3323,7 +3311,10 @@ mod tests {
     fn filter_count_learning_halves_and_resets_per_session() {
         let connection = permissive_connection("wss://strict.example", Keys::generate());
 
-        assert_eq!(connection.max_filters_per_req(), super::super::MAX_FILTERS_PER_REQ);
+        assert_eq!(
+            connection.max_filters_per_req(),
+            super::super::MAX_FILTERS_PER_REQ
+        );
         assert_eq!(connection.reduce_max_filters_per_req(8), Some(4));
         assert_eq!(connection.reduce_max_filters_per_req(4), Some(2));
         assert_eq!(connection.reduce_max_filters_per_req(2), Some(1));
@@ -3331,7 +3322,10 @@ mod tests {
         assert_eq!(connection.reduce_max_filters_per_req(8), None);
 
         connection.reset_subscription_budget(None);
-        assert_eq!(connection.max_filters_per_req(), super::super::MAX_FILTERS_PER_REQ);
+        assert_eq!(
+            connection.max_filters_per_req(),
+            super::super::MAX_FILTERS_PER_REQ
+        );
     }
 
     #[tokio::test]
@@ -3581,10 +3575,7 @@ mod tests {
     fn minimum_churn_extension_preserves_a_byte_full_partial_group() {
         let byte_full_id = SubscriptionId::new("byte-full-core");
         let large_value = "x".repeat(crate::sync::REQ_MESSAGE_BYTE_BUDGET);
-        let byte_full = vec![Filter::new().custom_tag(
-            SingleLetterTag::LOWERCASE_A,
-            large_value,
-        )];
+        let byte_full = vec![Filter::new().custom_tag(SingleLetterTag::LOWERCASE_A, large_value)];
         let new_filter = Filter::new().kind(Kind::Custom(23_400));
 
         let plan = plan_live_tail_extension(
@@ -3618,7 +3609,10 @@ mod tests {
 
         assert_eq!(plan.retired.len(), 13);
         assert_eq!(plan.replacement_groups.len(), 2);
-        assert_eq!(plan.replacement_groups.iter().map(Vec::len).sum::<usize>(), 14);
+        assert_eq!(
+            plan.replacement_groups.iter().map(Vec::len).sum::<usize>(),
+            14
+        );
         assert_eq!(plan.retired.len() - plan.replacement_groups.len(), 11);
     }
 
@@ -3673,7 +3667,7 @@ mod tests {
             .expect("open initial core groups");
         let auxiliary_ids = connection
             .subscribe_auxiliary_live_filter_groups(vec![vec![
-                Filter::new().kind(Kind::Custom(23_700)),
+                Filter::new().kind(Kind::Custom(23_700))
             ]])
             .await
             .expect("open auxiliary group");
@@ -3689,22 +3683,26 @@ mod tests {
             .await
             .expect("extend only the mutable core tail");
 
-        let held = connection
-            .live_req_permits_held
-            .lock()
-            .expect("live permit map poisoned");
-        assert!(held.contains_key(&core_ids[0]), "full core group was replaced");
-        assert!(
-            !held.contains_key(&core_ids[1]),
-            "partial core tail was not replaced"
-        );
-        assert!(
-            held.contains_key(&auxiliary_ids[0]),
-            "auxiliary group was replaced"
-        );
-        assert_eq!(replacement_ids.len(), 1);
-        assert_eq!(held[&replacement_ids[0]].filters.len(), 3);
-        drop(held);
+        {
+            let held = connection
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned");
+            assert!(
+                held.contains_key(&core_ids[0]),
+                "full core group was replaced"
+            );
+            assert!(
+                !held.contains_key(&core_ids[1]),
+                "partial core tail was not replaced"
+            );
+            assert!(
+                held.contains_key(&auxiliary_ids[0]),
+                "auxiliary group was replaced"
+            );
+            assert_eq!(replacement_ids.len(), 1);
+            assert_eq!(held[&replacement_ids[0]].filters.len(), 3);
+        }
 
         connection.disconnect().await;
         relay.shutdown();
@@ -3732,7 +3730,7 @@ mod tests {
             .expect("open initial core groups");
         let auxiliary_ids = connection
             .subscribe_auxiliary_live_filter_groups(vec![vec![
-                Filter::new().kind(Kind::Custom(24_200)),
+                Filter::new().kind(Kind::Custom(24_200))
             ]])
             .await
             .expect("open auxiliary group");
@@ -3777,21 +3775,26 @@ mod tests {
             .expect_err("controlled replacement must fail");
 
         assert!(error.contains("prior tail restored"), "{error}");
-        let held = connection
-            .live_req_permits_held
-            .lock()
-            .expect("live permit map poisoned");
-        assert!(held.contains_key(&core_ids[0]), "full core group was churned");
-        assert!(
-            held.contains_key(&auxiliary_ids[0]),
-            "auxiliary group was churned"
-        );
-        assert!(
-            held.values().any(|subscription| subscription.filters == tail),
-            "the exact retired tail was not restored"
-        );
-        assert_eq!(held.len(), 3);
-        drop(held);
+        {
+            let held = connection
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned");
+            assert!(
+                held.contains_key(&core_ids[0]),
+                "full core group was churned"
+            );
+            assert!(
+                held.contains_key(&auxiliary_ids[0]),
+                "auxiliary group was churned"
+            );
+            assert!(
+                held.values()
+                    .any(|subscription| subscription.filters == tail),
+                "the exact retired tail was not restored"
+            );
+            assert_eq!(held.len(), 3);
+        }
 
         connection.disconnect().await;
         relay.shutdown();
@@ -3839,8 +3842,8 @@ mod tests {
                 ]],
                 &[],
                 move |subscription_id| {
-                    let attempt = close_attempts_for_call
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let attempt =
+                        close_attempts_for_call.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let client = close_client.clone();
                     async move {
                         if attempt == 1 {

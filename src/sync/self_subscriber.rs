@@ -734,18 +734,14 @@ mod tests {
         let repo = format!("30617:{}:{identifier}", keys.public_key());
         let relay = "wss://source.example";
         let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
-            .tags([
-                Tag::identifier(identifier),
-                Tag::custom("relays", [relay]),
-            ])
+            .tags([Tag::identifier(identifier), Tag::custom("relays", [relay])])
             .finalize(&keys)
             .expect("build announcement");
         let root = EventBuilder::new(Kind::GitIssue, "")
             .tag(Tag::custom("a", [repo.clone()]))
             .finalize(&keys)
             .expect("build root");
-        let database: SharedDatabase =
-            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
         database
             .save_event(&announcement)
             .await

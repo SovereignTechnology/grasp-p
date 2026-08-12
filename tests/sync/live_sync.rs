@@ -53,7 +53,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
-                let metrics = fetch_metrics(&relay_url).await.unwrap_or_default();
+                let metrics = fetch_metrics(relay_url).await.unwrap_or_default();
                 if metrics.contains(&required)
                     && absent.as_ref().is_none_or(|label| !metrics.contains(label))
                 {
@@ -102,7 +102,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
         "replacement should establish the new relay"
     );
     assert!(
-        fetch_metrics(&syncing.url())
+        fetch_metrics(syncing.url())
             .await
             .unwrap_or_default()
             .contains(&old_label),
@@ -150,6 +150,7 @@ async fn test_live_sync_batches_repo_filters_below_source_req_limit() {
     wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(5))
         .await
         .expect("syncing relay should connect to constrained source");
+    wait_for_new_descendant_live_generation(&syncing, 0, Duration::from_secs(20)).await;
 
     // Observe one q-tagged event completing the round trip before testing a
     // second live event. This proves the relevant subscription is installed
@@ -222,10 +223,8 @@ async fn live_sync_regroups_after_filter_count_refusal() {
 
     let refusal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let metrics = fetch_metrics(&syncing.url()).await.unwrap_or_default();
-        if metrics.contains("ngit_sync_policy_refusals_total")
-            && metrics.contains("filter_count")
-        {
+        let metrics = fetch_metrics(syncing.url()).await.unwrap_or_default();
+        if metrics.contains("ngit_sync_policy_refusals_total") && metrics.contains("filter_count") {
             break;
         }
         assert!(
@@ -463,8 +462,10 @@ async fn test_live_sync_layer3_events() {
         .author(keys.public_key())
         .id(comment_id);
 
+    // Root confirmation can require a historic batch before the bounded
+    // descendant maintenance tick schedules this pre-existing comment.
     let comment_synced =
-        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(20)).await;
     println!(
         "Comment {} synced to relay_b: {}",
         comment_id, comment_synced

@@ -161,10 +161,10 @@ async fn test_full_purgatory_save_restore_cycle() {
     let purgatory2 = Purgatory::new(&git_data_path);
     purgatory2.restore_from_disk(&state_path).unwrap();
 
-    // Verify state file was deleted after restore
+    // Restore retains the last crash-safe checkpoint until it is replaced.
     assert!(
-        !state_path.exists(),
-        "State file should be deleted after restore"
+        state_path.exists(),
+        "State file should remain after restore"
     );
 
     // Verify all data was restored
@@ -269,8 +269,8 @@ async fn test_rejected_cache_save_restore_cycle() {
     let index2 = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
     index2.restore_from_disk(&state_path).unwrap();
 
-    // Verify state file was deleted
-    assert!(!state_path.exists());
+    // Restore retains the last crash-safe checkpoint until it is replaced.
+    assert!(state_path.exists());
 
     // Verify all entries restored
     assert_eq!(index2.hot_cache_len(), 3);
@@ -372,9 +372,9 @@ async fn test_rejected_cache_downtime_adjustment() {
     assert!(index2.contains(&event.id));
 }
 
-/// Test 5: File cleanup - verify state files are deleted after successful restore
+/// Test 5: Verify the purgatory checkpoint remains after successful restore
 #[tokio::test]
-async fn test_purgatory_file_cleanup_after_restore() {
+async fn test_purgatory_checkpoint_retained_after_restore() {
     let temp_dir = tempfile::tempdir().unwrap();
     let git_data_path = temp_dir.path().join("git");
     let state_path = temp_dir.path().join("purgatory.json");
@@ -394,16 +394,16 @@ async fn test_purgatory_file_cleanup_after_restore() {
     let purgatory2 = Purgatory::new(&git_data_path);
     purgatory2.restore_from_disk(&state_path).unwrap();
 
-    // Verify file was deleted
+    // Restore must not consume the last good checkpoint.
     assert!(
-        !state_path.exists(),
-        "State file should be deleted after successful restore"
+        state_path.exists(),
+        "State file should remain after successful restore"
     );
 }
 
-/// Test 6: Rejected cache file cleanup
+/// Test 6: Rejected cache checkpoint retention
 #[tokio::test]
-async fn test_rejected_cache_file_cleanup_after_restore() {
+async fn test_rejected_cache_checkpoint_retained_after_restore() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("rejected_cache.json");
 
@@ -427,8 +427,8 @@ async fn test_rejected_cache_file_cleanup_after_restore() {
     let index2 = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
     index2.restore_from_disk(&state_path).unwrap();
 
-    // Verify file was deleted
-    assert!(!state_path.exists());
+    // Restore must not consume the last good checkpoint.
+    assert!(state_path.exists());
 }
 
 /// Test 7: Graceful degradation - missing purgatory file
@@ -857,8 +857,8 @@ async fn test_announcement_save_restore_cycle() {
     purgatory2.restore_from_disk(&state_path).unwrap();
 
     assert!(
-        !state_path.exists(),
-        "State file should be deleted after restore"
+        state_path.exists(),
+        "State file should remain after restore"
     );
 
     let (ann_count2, _, _) = purgatory2.count();

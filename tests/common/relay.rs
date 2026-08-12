@@ -864,6 +864,7 @@ impl Drop for TestRelay {
 /// `EarlyExit` is the retry-eligible case (subprocess died before
 /// becoming ready — almost always a lost bind race); `Ready` is the
 /// happy path.
+#[allow(clippy::large_enum_variant)]
 enum StartOutcome {
     Ready(TestRelay),
     EarlyExit { status: std::process::ExitStatus },
