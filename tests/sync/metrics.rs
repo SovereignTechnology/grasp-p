@@ -18,7 +18,8 @@ use crate::common::{
     port,
     sync_helpers::{
         create_repo_announcement, fetch_metrics, setup_announcement_on_relay,
-        wait_for_sync_connection, MetricsTestHarness, ParsedMetrics, TestClient,
+        wait_for_full_repo_live_coverage, wait_for_sync_connection, MetricsTestHarness,
+        ParsedMetrics, TestClient,
     },
     TestRelay,
 };
@@ -433,8 +434,7 @@ async fn test_live_sync_event_count() {
         .await
         .expect("Sync connection should be established");
 
-    // Additional delay to ensure purgatory promotion completes on syncing relay
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    wait_for_full_repo_live_coverage(&syncing_relay, Duration::from_secs(20)).await;
 
     // Now add Layer 2 patch events (not announcements) - these are accepted immediately
     // (Layer 2 events are accepted directly to DB, no purgatory)

@@ -45,6 +45,24 @@ pub async fn wait_for_new_descendant_live_generation(
     }
 }
 
+pub async fn wait_for_full_repo_live_coverage(relay: &TestRelay, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let log = std::fs::read_to_string(relay.log_path()).unwrap_or_default();
+        let installed = log
+            .rfind("new_full_repos=1")
+            .is_some_and(|offset| log[offset..].contains("Extended core live coverage"));
+        if installed {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "full-repository live coverage was not installed before the deadline"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 // NOTE: Using rust-nostr Kind variants:
 // - Kind::GitIssue.as_u16() -> Kind::GitIssue (1621)
 // - Kind::Comment.as_u16() -> Kind::Comment (1111)
