@@ -798,7 +798,7 @@ struct DescendantFrontier {
     coordinates: HashSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DescendantSyncRotation {
     coverage_fingerprint: Vec<String>,
     filters: Vec<DescendantFilterCursor>,
@@ -839,17 +839,6 @@ impl DescendantLiveCoverage {
             return true;
         }
         false
-    }
-}
-
-impl Default for DescendantSyncRotation {
-    fn default() -> Self {
-        Self {
-            coverage_fingerprint: Vec::new(),
-            filters: Vec::new(),
-            next_filter: 0,
-            in_flight: None,
-        }
     }
 }
 

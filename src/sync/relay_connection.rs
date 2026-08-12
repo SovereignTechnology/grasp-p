@@ -1651,7 +1651,7 @@ impl RelayConnection {
                     RelayNotification::Message { message } => match *message {
                         RelayMessage::EndOfStoredEvents(sub_id) => {
                             terminal_connection
-                                .close_and_release_transient_req_permit(&sub_id.into_owned())
+                                .close_and_release_transient_req_permit(&sub_id)
                                 .await;
                         }
                         RelayMessage::Closed {
@@ -1667,12 +1667,9 @@ impl RelayConnection {
                         }
                         _ => {}
                     },
-                    RelayNotification::RelayStatus { status }
-                        if matches!(
-                            status,
-                            RelayStatus::Disconnected | RelayStatus::Terminated
-                        ) =>
-                    {
+                    RelayNotification::RelayStatus {
+                        status: RelayStatus::Disconnected | RelayStatus::Terminated,
+                    } => {
                         terminal_connection.clear_subscription_permits();
                         break;
                     }
@@ -3686,25 +3683,26 @@ mod tests {
             .await
             .expect("extend only the mutable core tail");
 
-        let held = connection
-            .live_req_permits_held
-            .lock()
-            .expect("live permit map poisoned");
-        assert!(
-            held.contains_key(&core_ids[0]),
-            "full core group was replaced"
-        );
-        assert!(
-            !held.contains_key(&core_ids[1]),
-            "partial core tail was not replaced"
-        );
-        assert!(
-            held.contains_key(&auxiliary_ids[0]),
-            "auxiliary group was replaced"
-        );
-        assert_eq!(replacement_ids.len(), 1);
-        assert_eq!(held[&replacement_ids[0]].filters.len(), 3);
-        drop(held);
+        {
+            let held = connection
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned");
+            assert!(
+                held.contains_key(&core_ids[0]),
+                "full core group was replaced"
+            );
+            assert!(
+                !held.contains_key(&core_ids[1]),
+                "partial core tail was not replaced"
+            );
+            assert!(
+                held.contains_key(&auxiliary_ids[0]),
+                "auxiliary group was replaced"
+            );
+            assert_eq!(replacement_ids.len(), 1);
+            assert_eq!(held[&replacement_ids[0]].filters.len(), 3);
+        }
 
         connection.disconnect().await;
         relay.shutdown();
@@ -3777,25 +3775,26 @@ mod tests {
             .expect_err("controlled replacement must fail");
 
         assert!(error.contains("prior tail restored"), "{error}");
-        let held = connection
-            .live_req_permits_held
-            .lock()
-            .expect("live permit map poisoned");
-        assert!(
-            held.contains_key(&core_ids[0]),
-            "full core group was churned"
-        );
-        assert!(
-            held.contains_key(&auxiliary_ids[0]),
-            "auxiliary group was churned"
-        );
-        assert!(
-            held.values()
-                .any(|subscription| subscription.filters == tail),
-            "the exact retired tail was not restored"
-        );
-        assert_eq!(held.len(), 3);
-        drop(held);
+        {
+            let held = connection
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned");
+            assert!(
+                held.contains_key(&core_ids[0]),
+                "full core group was churned"
+            );
+            assert!(
+                held.contains_key(&auxiliary_ids[0]),
+                "auxiliary group was churned"
+            );
+            assert!(
+                held.values()
+                    .any(|subscription| subscription.filters == tail),
+                "the exact retired tail was not restored"
+            );
+            assert_eq!(held.len(), 3);
+        }
 
         connection.disconnect().await;
         relay.shutdown();

@@ -116,7 +116,6 @@ pub fn inbox_relays(event: &Event) -> HashSet<String> {
         return HashSet::new();
     }
     nip65::extract_relay_list(event)
-        .into_iter()
         .filter_map(|(relay, marker)| {
             matches!(marker, None | Some(RelayMetadata::Read)).then(|| relay.to_string())
         })
@@ -128,7 +127,6 @@ pub fn outbox_relays(event: &Event) -> HashSet<String> {
         return HashSet::new();
     }
     nip65::extract_relay_list(event)
-        .into_iter()
         .filter_map(|(relay, marker)| {
             matches!(marker, None | Some(RelayMetadata::Write)).then(|| relay.to_string())
         })
