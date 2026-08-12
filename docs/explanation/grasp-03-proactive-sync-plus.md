@@ -4,6 +4,11 @@ GRASP-03 extends repository-declared GRASP-02 coverage to the Nostr outbox
 model. An accepted issue, patch or pull request may have replies in the root
 author's inbox even when those events are absent from repository relays.
 
+The overlay is enabled by default and can be disabled with
+`NGIT_SYNC_PLUS_ENABLED=false`. Because it extends the proactive GRASP-02
+manager, it is effective only while that manager is running. NIP-11 advertises
+`GRASP-03` only when the overlay is enabled.
+
 ## Minimal approach
 
 The implementation adds a narrow discovery control-plane, not a second sync

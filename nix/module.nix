@@ -103,6 +103,16 @@ let
         description = "Bootstrap relay URL to sync from on startup (optional)";
       };
 
+      syncPlusEnabled = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Enable GRASP-03 Sync+ mailbox discovery on top of proactive
+          GRASP-02 sync. This has no effect unless the relay service, and
+          therefore its proactive sync manager, is enabled.
+        '';
+      };
+
       userIndexRelays = mkOption {
         type = types.listOf types.str;
         default = [
@@ -486,6 +496,7 @@ let
         toString cfg.metricsConnectionPerIpAbuseThreshold;
       NGIT_METRICS_TOP_N_REPOS = toString cfg.metricsTopNRepos;
       NGIT_SYNC_MAX_BACKOFF_SECS = toString cfg.syncMaxBackoffSecs;
+      NGIT_SYNC_PLUS_ENABLED = if cfg.syncPlusEnabled then "true" else "false";
       NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS =
         toString cfg.syncDisconnectCheckIntervalSecs;
       NGIT_SYNC_BASE_BACKOFF_SECS = toString cfg.syncBaseBackoffSecs;

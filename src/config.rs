@@ -389,6 +389,15 @@ pub struct Config {
     #[arg(long, env = "NGIT_SYNC_BOOTSTRAP_RELAY_URL")]
     pub sync_bootstrap_relay_url: Option<String>,
 
+    /// Enable GRASP-03 Sync+ mailbox discovery on top of proactive GRASP-02 sync.
+    #[arg(
+        long,
+        env = "NGIT_SYNC_PLUS_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub sync_plus_enabled: bool,
+
     /// Comma-separated relays used to discover eligible accepted repository participants'
     /// NIP-65 relay lists.
     #[arg(
@@ -1101,6 +1110,7 @@ impl Config {
             metrics_connection_per_ip_abuse_threshold: 10,
             metrics_top_n_repos: 10,
             sync_bootstrap_relay_url: None,
+            sync_plus_enabled: true,
             user_index_relays: DEFAULT_USER_INDEX_RELAYS.to_string(),
             sync_max_backoff_secs: 3600,
             sync_disconnect_check_interval_secs: 60,
@@ -1218,6 +1228,22 @@ mod tests {
                 "wss://indexer.coracle.social",
             ]
         );
+    }
+
+    #[test]
+    fn sync_plus_is_enabled_by_default_and_can_be_disabled() {
+        let default = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("Sync+ default should parse");
+        assert!(default.sync_plus_enabled);
+
+        let disabled = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--sync-plus-enabled=false",
+        ])
+        .expect("Sync+ opt-out should parse");
+        assert!(!disabled.sync_plus_enabled);
     }
 
     #[test]

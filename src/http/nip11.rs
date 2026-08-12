@@ -80,6 +80,9 @@ impl RelayInformationDocument {
             supported_grasps.push("GRASP-05".to_string());
         }
         supported_grasps.push("GRASP-02".to_string());
+        if config.sync_plus_enabled {
+            supported_grasps.push("GRASP-03".to_string());
+        }
         if config.grasp06_enable {
             supported_grasps.push("GRASP-06".to_string());
         }
@@ -197,8 +200,10 @@ mod tests {
         // (disrespector off).
         assert!(doc.supported_nips.contains(&9));
         assert!(doc.supported_nips.contains(&62));
-        // Without archive mode, only GRASP-01 and GRASP-02
-        assert_eq!(doc.supported_grasps, vec!["GRASP-01", "GRASP-02"]);
+        assert_eq!(
+            doc.supported_grasps,
+            vec!["GRASP-01", "GRASP-02", "GRASP-03"]
+        );
         assert!(doc.repo_acceptance_criteria.contains("None"));
         assert!(doc.curation.is_none());
         assert_eq!(
@@ -236,6 +241,7 @@ mod tests {
         assert_eq!(parsed["name"], "Test Relay");
         assert_eq!(parsed["supported_grasps"][0], "GRASP-01");
         assert_eq!(parsed["supported_grasps"][1], "GRASP-02");
+        assert_eq!(parsed["supported_grasps"][2], "GRASP-03");
         assert_eq!(parsed["icon"], "https://relay.example.com/icon.png");
         assert_eq!(parsed["limitation"]["max_subscriptions"], 500);
         assert_eq!(parsed["limitation"]["max_limit"], 500);
@@ -268,7 +274,7 @@ mod tests {
         // Archive mode enabled: should include GRASP-05
         assert_eq!(
             doc.supported_grasps,
-            vec!["GRASP-01", "GRASP-05", "GRASP-02"]
+            vec!["GRASP-01", "GRASP-05", "GRASP-02", "GRASP-03"]
         );
         // Archive read-only: should have curation field
         assert!(doc.curation.is_some());
@@ -291,7 +297,7 @@ mod tests {
         // Archive whitelist enabled: should include GRASP-05
         assert_eq!(
             doc.supported_grasps,
-            vec!["GRASP-01", "GRASP-05", "GRASP-02"]
+            vec!["GRASP-01", "GRASP-05", "GRASP-02", "GRASP-03"]
         );
         // Archive read-only defaults to true: should have curation field
         assert!(doc.curation.is_some());
@@ -312,7 +318,10 @@ mod tests {
         let doc = RelayInformationDocument::from_config(&config);
 
         // Repository whitelist doesn't enable GRASP-05
-        assert_eq!(doc.supported_grasps, vec!["GRASP-01", "GRASP-02"]);
+        assert_eq!(
+            doc.supported_grasps,
+            vec!["GRASP-01", "GRASP-02", "GRASP-03"]
+        );
         // Should have curation field for repository whitelist
         assert!(doc.curation.is_some());
         assert!(doc
@@ -336,7 +345,7 @@ mod tests {
         // Should have GRASP-05 enabled due to archive whitelist
         assert_eq!(
             doc.supported_grasps,
-            vec!["GRASP-01", "GRASP-05", "GRASP-02"]
+            vec!["GRASP-01", "GRASP-05", "GRASP-02", "GRASP-03"]
         );
         // Should have curation field reflecting BOTH archive and repository whitelist
         assert!(doc.curation.is_some());
@@ -366,8 +375,18 @@ mod tests {
         // to match the insertion order in from_config().
         assert_eq!(
             doc.supported_grasps,
-            vec!["GRASP-01", "GRASP-02", "GRASP-06"]
+            vec!["GRASP-01", "GRASP-02", "GRASP-03", "GRASP-06"]
         );
+    }
+
+    #[test]
+    fn test_nip11_omits_grasp_03_when_sync_plus_is_disabled() {
+        let mut config = Config::for_testing();
+        config.sync_plus_enabled = false;
+
+        let doc = RelayInformationDocument::from_config(&config);
+
+        assert_eq!(doc.supported_grasps, vec!["GRASP-01", "GRASP-02"]);
     }
 
     #[test]

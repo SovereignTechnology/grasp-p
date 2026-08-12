@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a default-on `NGIT_SYNC_PLUS_ENABLED` opt-out and advertise GRASP-03 in
+  NIP-11 only when the Sync+ overlay is effective.
 - Recover repository-event descendants which reference a direct thread member
   but omit the repository and root-event tags. When the per-connection ledger
   can retain complete descendant coverage while preserving control and
