@@ -206,3 +206,99 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     outbox.stop().await;
     inbox.stop().await;
 }
+
+#[tokio::test]
+async fn missing_relay_list_uses_bounded_fallback_coverage() {
+    let index = MockRelay::start().await;
+    let fallback = MockRelay::start().await;
+    let discovered_inbox = MockRelay::start().await;
+    let owner = Keys::generate();
+    let root_author = Keys::generate();
+    let identifier = "missing-list-fallback";
+    let syncing_git_dir = tempfile::tempdir().expect("create persistent git directory");
+    let syncing_relay_dir = tempfile::tempdir().expect("create persistent relay directory");
+    let syncing = TestRelay::start_on_reservation_persistent_sync_with_fallback(
+        reserve_port(),
+        index.url().to_string(),
+        fallback.url().to_string(),
+        syncing_git_dir.path().to_path_buf(),
+        syncing_relay_dir.path().to_path_buf(),
+    )
+    .await;
+    let syncing_domain = syncing.domain();
+    let (_announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &owner, &[&syncing_domain], identifier).await;
+    let issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root with no published relay list",
+    )
+    .expect("build accepted root");
+    let client = TestClient::new(syncing.url(), root_author.clone())
+        .await
+        .expect("connect to target");
+    client.send_event(&issue).await.expect("publish root");
+
+    let reply = EventBuilder::new(Kind::TextNote, "fallback-only reply")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .finalize(&root_author)
+        .expect("build reply");
+    send_to_relay_url(fallback.url(), &reply)
+        .await
+        .expect("seed fallback relay");
+
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(reply.id),
+            Duration::from_secs(20),
+        )
+        .await,
+        "a successful empty index lookup should activate bounded fallback coverage"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Updated proactive inbox coverage from NIP-65")
+                && line.contains("fallback_authors=1")
+        }),
+        "fallback activation should remain observable"
+    );
+
+    let relay_list = EventBuilder::new(Kind::RelayList, "")
+        .tag(Tag::custom("r", vec![discovered_inbox.url(), "read"]))
+        .finalize(&root_author)
+        .expect("build later relay list");
+    send_to_relay_url(index.url(), &relay_list)
+        .await
+        .expect("publish later relay list to index");
+    let declared_reply = EventBuilder::new(Kind::TextNote, "declared-inbox reply")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .finalize(&root_author)
+        .expect("build declared-inbox reply");
+    send_to_relay_url(discovered_inbox.url(), &declared_reply)
+        .await
+        .expect("seed declared inbox");
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(declared_reply.id),
+            Duration::from_secs(20),
+        )
+        .await,
+        "a later accepted relay list should replace desired fallback coverage"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read updated relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Updated proactive inbox coverage from NIP-65")
+                && line.contains("fallback_authors=0")
+        }),
+        "accepted NIP-65 ownership should retire the author from desired fallback coverage"
+    );
+
+    syncing.stop().await;
+    discovered_inbox.stop().await;
+    fallback.stop().await;
+    index.stop().await;
+}

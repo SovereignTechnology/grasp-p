@@ -358,6 +358,25 @@ strings. Empty comma-separated entries and surrounding whitespace are ignored.
 
 ---
 
+#### `NGIT_SYNC_PLUS_FALLBACK_RELAYS`
+
+**Description:** Bounded inbox fallback relays for eligible Sync+ authors whose NIP-65 list was not found
+**Type:** String list (comma-separated WebSocket URLs)
+**Default:** `wss://relay.ditto.pub,wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net`
+**Required:** No
+
+```bash
+NGIT_SYNC_PLUS_FALLBACK_RELAYS=wss://relay.ditto.pub,wss://nos.lol
+```
+
+The corresponding NixOS option is `syncPlusFallbackRelays`. Fallback coverage
+starts only after a successful user-index query returns no accepted kind
+`10002` for an eligible author. A subsequently discovered relay list replaces
+the fallback in desired coverage without eagerly closing shared subscriptions.
+Set the list empty to disable this recovery while retaining ordinary Sync+.
+
+---
+
 #### `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`
 
 **Description:** Allow event-directed sync targets that are not globally reachable

@@ -191,6 +191,8 @@ pub fn merge_inbox_roots(
 pub fn build_inbox_root_overlay(
     author_roots: &HashMap<PublicKey, HashSet<EventId>>,
     author_inboxes: &HashMap<PublicKey, HashSet<String>>,
+    fallback_authors: &HashSet<PublicKey>,
+    fallback_relays: &HashSet<String>,
 ) -> HashMap<String, HashSet<EventId>> {
     let mut overlay: HashMap<String, HashSet<EventId>> = HashMap::new();
     for (author, inboxes) in author_inboxes {
@@ -200,6 +202,17 @@ pub fn build_inbox_root_overlay(
         for inbox in inboxes {
             overlay
                 .entry(inbox.clone())
+                .or_default()
+                .extend(roots.iter().copied());
+        }
+    }
+    for author in fallback_authors {
+        let Some(roots) = author_roots.get(author) else {
+            continue;
+        };
+        for relay in fallback_relays {
+            overlay
+                .entry(relay.clone())
                 .or_default()
                 .extend(roots.iter().copied());
         }
@@ -378,16 +391,26 @@ mod tests {
         let first = build_inbox_root_overlay(
             &roots,
             &HashMap::from([(author, HashSet::from(["wss://a.example".to_string()]))]),
+            &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(first["wss://a.example"], HashSet::from([root]));
 
         let replacement = build_inbox_root_overlay(
             &roots,
             &HashMap::from([(author, HashSet::from(["wss://b.example".to_string()]))]),
+            &HashSet::new(),
+            &HashSet::new(),
         );
         assert!(!replacement.contains_key("wss://a.example"));
         assert_eq!(replacement["wss://b.example"], HashSet::from([root]));
-        assert!(build_inbox_root_overlay(&HashMap::new(), &HashMap::new()).is_empty());
+        assert!(build_inbox_root_overlay(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -437,8 +460,31 @@ mod tests {
         let overlay = build_inbox_root_overlay(
             &author_roots,
             &HashMap::from([(author, HashSet::from(["wss://inbox.example".to_string()]))]),
+            &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(overlay["wss://inbox.example"], HashSet::from([root.id]));
+    }
+
+    #[test]
+    fn missing_list_authors_use_only_bounded_fallback_relays() {
+        let author = Keys::generate().public_key();
+        let unrelated = Keys::generate().public_key();
+        let root = EventId::from_byte_array([11; 32]);
+        let overlay = build_inbox_root_overlay(
+            &HashMap::from([(author, HashSet::from([root]))]),
+            &HashMap::new(),
+            &HashSet::from([author, unrelated]),
+            &HashSet::from([
+                "wss://fallback-one.example".to_string(),
+                "wss://fallback-two.example".to_string(),
+            ]),
+        );
+
+        assert_eq!(overlay.len(), 2);
+        assert!(overlay
+            .values()
+            .all(|roots| roots == &HashSet::from([root])));
     }
 
     #[test]

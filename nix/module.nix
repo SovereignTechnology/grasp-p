@@ -124,6 +124,20 @@ let
           "Relays used to discover eligible accepted repository participants' NIP-65 relay lists";
       };
 
+      syncPlusFallbackRelays = mkOption {
+        type = types.listOf types.str;
+        default = [
+          "wss://relay.ditto.pub"
+          "wss://relay.damus.io"
+          "wss://nos.lol"
+          "wss://relay.primal.net"
+        ];
+        description = ''
+          Bounded inbox fallback relays used for eligible Sync+ authors only
+          after a user-index query succeeds without a NIP-65 relay list.
+        '';
+      };
+
       databaseBackend = mkOption {
         type = types.enum [ "lmdb" "memory" ];
         default = "lmdb";
@@ -534,6 +548,8 @@ let
       NGIT_RELAY_MAX_EVENT_SIZE_BYTES = toString cfg.relayMaxEventSizeBytes;
       NGIT_RELAY_FILTER_LIMIT = toString cfg.relayFilterLimit;
       NGIT_USER_INDEX_RELAYS = concatStringsSep "," cfg.userIndexRelays;
+      NGIT_SYNC_PLUS_FALLBACK_RELAYS =
+        concatStringsSep "," cfg.syncPlusFallbackRelays;
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.relayName != null) {

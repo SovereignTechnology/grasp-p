@@ -27,6 +27,14 @@ follows its `write` and unmarked outboxes instead, allowing newer replacements
 to converge without making arbitrary repository relays identity sources.
 Discovery remains best effort and bounded to this operator-visible source graph.
 
+If a successful user-index query returns no accepted kind `10002`, accepted
+roots by that author temporarily use the operator-configured Sync+ fallback
+relay set as inboxes. This is the same root-only overlay consumed by ordinary
+GRASP-02 historic, live and rotating coverage; it creates no separate
+subscription scheduler. An accepted relay list removes the author from desired
+fallback coverage and installs its declared inboxes. Existing shared live
+subscriptions still drain naturally, as with any other relay-list replacement.
+
 The self-subscriber builds a compact root-candidate inventory during its
 existing startup load and maintains it incrementally as roots arrive. StateOnly
 candidates remain inert; promotion of their repository to Full makes them
@@ -73,5 +81,5 @@ accepted events on restart; this change does not add a second deletion graph.
 - the old recursive `SyncScope` graph and response-author fan-out;
 - maintainer mailbox expansion unrelated to an accepted root;
 - identity storage for authors other than accepted roots;
-- fallback lists and per-user configuration knobs; and
+- per-user fallback configuration knobs; and
 - a separate GRASP-03 subscription scheduler.
