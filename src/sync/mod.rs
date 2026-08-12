@@ -4450,7 +4450,7 @@ impl SyncManager {
         let mut relay_urls: Vec<String> = targets
             .iter()
             .filter(|(relay_url, needs)| {
-                !needs.root_events.is_empty()
+                (!needs.repos.is_empty() || !needs.root_events.is_empty())
                     && states.get(*relay_url).is_some_and(|state| {
                         matches!(
                             state.connection_status,

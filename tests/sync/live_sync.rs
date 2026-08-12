@@ -150,6 +150,7 @@ async fn test_live_sync_batches_repo_filters_below_source_req_limit() {
     wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(5))
         .await
         .expect("syncing relay should connect to constrained source");
+    wait_for_new_descendant_live_generation(&syncing, 0, Duration::from_secs(20)).await;
 
     // Observe one q-tagged event completing the round trip before testing a
     // second live event. This proves the relevant subscription is installed
