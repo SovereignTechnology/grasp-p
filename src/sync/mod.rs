@@ -1545,18 +1545,6 @@ impl DeferredConsolidations {
     }
 }
 
-fn notify_deferred_consolidation_after_batch_completion(
-    deferred: &DeferredConsolidations,
-    sender: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-    relay_url: &str,
-) {
-    if deferred.contains(relay_url) {
-        if let Some(sender) = sender {
-            let _ = sender.send(relay_url.to_string());
-        }
-    }
-}
-
 // =============================================================================
 // Daily Timer
 // =============================================================================
@@ -1921,8 +1909,6 @@ pub struct SyncManager {
     subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
-    /// Wakes the actor when a batch completion may unblock consolidation.
-    deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     nip65_discovery_result_tx: Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
@@ -2027,7 +2013,6 @@ impl SyncManager {
             eose_tx: None,
             subscription_closed_tx: None,
             connect_attempt_result_tx: None,
-            deferred_consolidation_tx: None,
             nip65_discovery_result_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
@@ -3170,11 +3155,14 @@ impl SyncManager {
         // Release lock before checking if historic sync is complete
         drop(relay_index);
 
-        notify_deferred_consolidation_after_batch_completion(
-            &self.deferred_consolidations,
-            self.deferred_consolidation_tx.as_ref(),
-            relay_url,
-        );
+        // Batch completion already runs inside the sync actor and all index
+        // guards are released. Process a ready deferral directly instead of
+        // retaining self-addressed wakeups in another queue.
+        if self.deferred_consolidations.contains(relay_url) {
+            // Consolidation can synchronously complete an empty historic
+            // batch, so erase that finite recursive future from the type.
+            Box::pin(self.process_deferred_consolidation(relay_url)).await;
+        }
 
         // Spawn background task to check if historic sync is complete
         // This avoids blocking the confirm_batch flow for 6 seconds
@@ -3399,10 +3387,6 @@ impl SyncManager {
         let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
             mpsc::unbounded_channel::<ConnectAttemptResult>();
 
-        // Batch completion can be synchronous, so use a non-blocking wakeup
-        // instead of waiting for pending work while holding the actor lock.
-        let (deferred_consolidation_tx, mut deferred_consolidation_rx) =
-            mpsc::unbounded_channel::<String>();
         let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
             mpsc::unbounded_channel::<Nip65DiscoveryResult>();
 
@@ -3426,7 +3410,6 @@ impl SyncManager {
         self.eose_tx = Some(eose_tx.clone());
         self.subscription_closed_tx = Some(subscription_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
-        self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.nip65_discovery_result_tx = Some(nip65_discovery_result_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
@@ -3540,12 +3523,6 @@ impl SyncManager {
                         None => {
                             tracing::debug!("Connect attempt result channel closed");
                         }
-                    }
-                }
-                relay_url = deferred_consolidation_rx.recv() => {
-                    if let Some(relay_url) = relay_url {
-                        let mut manager = sync_manager.lock().await;
-                        manager.process_deferred_consolidation(&relay_url).await;
                     }
                 }
                 result = nip65_discovery_result_rx.recv() => {
@@ -8601,28 +8578,19 @@ mod tests {
     fn deferred_consolidation_runs_only_after_final_batch_completion() {
         let relay_url = "wss://relay.example";
         let mut deferred = DeferredConsolidations::default();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(
             !deferred.request(relay_url, true),
             "an in-flight batch must defer instead of waiting in the sync actor"
-        );
-        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
-        assert_eq!(
-            receiver.try_recv().unwrap(),
-            relay_url,
-            "batch completion must wake the actor without awaiting under its lock"
         );
         assert!(
             !deferred.take_ready(relay_url, true),
             "consolidation must remain queued while another batch is pending"
         );
 
-        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
-        assert_eq!(receiver.try_recv().unwrap(), relay_url);
         assert!(
             deferred.take_ready(relay_url, false),
-            "the final batch completion must make consolidation runnable"
+            "the final actor-owned batch completion must make consolidation runnable"
         );
         assert!(
             !deferred.take_ready(relay_url, false),
@@ -8635,16 +8603,9 @@ mod tests {
         for reason in ["reset", "disconnect"] {
             let relay_url = format!("wss://{reason}.example");
             let mut deferred = DeferredConsolidations::default();
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
             assert!(!deferred.request(&relay_url, true));
-            notify_deferred_consolidation_after_batch_completion(
-                &deferred,
-                Some(&sender),
-                &relay_url,
-            );
             assert!(deferred.cancel(&relay_url));
-            assert_eq!(receiver.try_recv().unwrap(), relay_url);
             assert!(
                 !deferred.take_ready(&relay_url, false),
                 "a queued wakeup must not resurrect consolidation after {reason}"
