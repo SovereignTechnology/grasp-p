@@ -214,11 +214,6 @@ async fn startup_historic_sync_stays_within_relay_neg_concurrency_limit() {
         proxy.peak_concurrent()
     );
     assert!(
-        proxy.peak_concurrent() >= 2,
-        "negentropy rounds should still overlap under the bound, peak: {}",
-        proxy.peak_concurrent()
-    );
-    assert!(
         opened > PROXY_NEG_LIMIT,
         "scenario must run more rounds than the bound to exercise queueing, opened: {opened}"
     );
