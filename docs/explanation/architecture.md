@@ -1,5 +1,9 @@
 # ngit-grasp Architecture
 
+Transient collections, queues, tasks, and peer-selected identifiers follow the
+ownership and cleanup invariants in
+[Peer-controlled state ownership](peer-controlled-state.md).
+
 ## Executive Summary
 
 `ngit-grasp` implements the GRASP protocol in Rust with **inline authorization** rather than Git hooks. Git push operations are intercepted and validated at the HTTP handler level before reaching the Git repository, eliminating the need for pre-receive hooks.
