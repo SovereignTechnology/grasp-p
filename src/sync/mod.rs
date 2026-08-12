@@ -1908,8 +1908,8 @@ pub struct SyncManager {
     /// Serializes CLOSED recovery and pending-batch cleanup through the actor.
     subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
-    connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
-    nip65_discovery_result_tx: Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
+    connect_attempt_result_tx: Option<tokio::sync::mpsc::Sender<ConnectAttemptResult>>,
+    nip65_discovery_result_tx: Option<tokio::sync::mpsc::Sender<Nip65DiscoveryResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -3374,21 +3374,20 @@ impl SyncManager {
         let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectNotification>(100);
 
         // 3. Create EOSE channel for spawned tasks -> manager communication
-        // Lifecycle notifications must never backpressure the ordered EVENT
-        // processor. Their production is already bounded by the subscription
-        // ledger, while the actor may legitimately stay busy opening a large,
-        // paced historic batch for longer than a fixed inbox can absorb.
+        // The independent terminal-control listener has already released
+        // transient resources. These actor notifications may therefore apply
+        // bounded backpressure without stranding subscription-ledger slots.
         let (eose_tx, mut eose_rx) = lifecycle_notification_channel::<EoseNotification>();
         let (subscription_closed_tx, mut subscription_closed_rx) =
             lifecycle_notification_channel::<SubscriptionClosedNotification>();
 
-        // 4. Connection workers never mutate manager state. Their unbounded
-        // result channel cannot make a completed worker wait behind the actor.
+        // Connection workers never mutate manager state. At most the global
+        // connection-attempt cap can complete while the actor is busy.
         let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
-            mpsc::unbounded_channel::<ConnectAttemptResult>();
+            mpsc::channel::<ConnectAttemptResult>(MAX_CONCURRENT_CONNECT_ATTEMPTS);
 
         let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
-            mpsc::unbounded_channel::<Nip65DiscoveryResult>();
+            mpsc::channel::<Nip65DiscoveryResult>(1);
 
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -4788,6 +4787,7 @@ impl SyncManager {
                     token,
                     outcome,
                 })
+                .await
                 .is_err()
             {
                 connection.disconnect().await;
@@ -4997,11 +4997,13 @@ impl SyncManager {
                 let outcome = connection
                     .fetch_events(filter, Duration::from_secs(30))
                     .await;
-                let _ = result_tx.send(Nip65DiscoveryResult {
-                    source_relay,
-                    authors,
-                    outcome,
-                });
+                let _ = result_tx
+                    .send(Nip65DiscoveryResult {
+                        source_relay,
+                        authors,
+                        outcome,
+                    })
+                    .await;
             });
             break;
         }
