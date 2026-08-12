@@ -290,6 +290,25 @@ NGIT_DATABASE_BACKEND=memory
 
 These options configure the proactive sync feature that synchronizes events from other relays.
 
+#### `NGIT_SYNC_PLUS_ENABLED`
+
+**Description:** Enable GRASP-03 Sync+ mailbox discovery on top of proactive GRASP-02 sync
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+```bash
+# Opt out of mailbox discovery while retaining ordinary proactive sync
+NGIT_SYNC_PLUS_ENABLED=false
+```
+
+The corresponding NixOS option is `syncPlusEnabled`. The setting is effective
+only while the relay service's proactive sync manager is running. When false,
+the relay retains GRASP-02 sync but does not discover NIP-65 inboxes and omits
+`GRASP-03` from its NIP-11 `supported_grasps` list.
+
+---
+
 #### `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
 
 **Description:** URL of the bootstrap relay to initially sync events from

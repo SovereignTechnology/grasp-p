@@ -580,6 +580,11 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 
 For full design details, see [grasp-02-proactive-sync.md](grasp-02-proactive-sync.md).
 
+GRASP-03 Sync+ is a default-on mailbox-discovery overlay on this manager. Set
+`NGIT_SYNC_PLUS_ENABLED=false` to retain GRASP-02 sync without discovering
+root-author NIP-65 inboxes; NIP-11 advertises `GRASP-03` only while the overlay
+is enabled.
+
 ### Rejected Events Index
 
 The rejected events index solves two critical problems during sync:

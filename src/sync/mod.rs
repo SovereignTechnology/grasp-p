@@ -4816,6 +4816,13 @@ impl SyncManager {
     }
 
     async fn schedule_nip65_discovery(&mut self) {
+        // GRASP-03 is an optional overlay on the always-running GRASP-02
+        // manager. When disabled, do not inventory authors, retain identity
+        // authority, open discovery connections, or add inbox roots.
+        if !self.config.sync_plus_enabled {
+            return;
+        }
+
         let now = Instant::now();
         if self
             .nip65_discovery
