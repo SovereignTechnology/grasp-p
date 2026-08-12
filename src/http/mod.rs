@@ -1,6 +1,7 @@
-/// HTTP Server Module
-///
-/// Provides hyper HTTP server with WebSocket upgrade support for the Nostr relay.
+//! HTTP Server Module
+//!
+//! Provides hyper HTTP server with WebSocket upgrade support for the Nostr relay.
+mod client_ip;
 pub mod landing;
 pub mod nip11;
 
@@ -722,14 +723,23 @@ impl Service<Request<Incoming>> for HttpService {
                 let key = req.headers().get("sec-websocket-key");
                 let derived = key.map(|k| derive_accept_key(k.as_bytes()));
 
-                let addr = self.remote;
+                let peer = self.remote;
+                let addr = client_ip::resolve_client_addr(
+                    peer,
+                    req.headers(),
+                    &self.config.trusted_proxy_cidrs,
+                );
                 let relay = self.relay.clone();
                 let metrics_clone = self.metrics.clone();
 
                 tokio::spawn(async move {
                     match hyper::upgrade::on(req).await {
                         Ok(upgraded) => {
-                            tracing::info!("WebSocket connection established from {}", addr);
+                            tracing::info!(
+                                client_ip = %addr.ip(),
+                                peer = %peer,
+                                "WebSocket connection established"
+                            );
                             // Track connection
                             let _connection_timer =
                                 metrics_clone.as_ref().map(|m| m.start_connection_timer());
@@ -740,9 +750,18 @@ impl Service<Request<Incoming>> for HttpService {
                             if let Err(e) =
                                 relay.take_connection(TokioIo::new(upgraded), addr).await
                             {
-                                tracing::error!("Relay error for {}: {}", addr, e);
+                                tracing::error!(
+                                    client_ip = %addr.ip(),
+                                    peer = %peer,
+                                    error = %e,
+                                    "Relay connection failed"
+                                );
                             }
-                            tracing::info!("WebSocket connection closed for {}", addr);
+                            tracing::info!(
+                                client_ip = %addr.ip(),
+                                peer = %peer,
+                                "WebSocket connection closed"
+                            );
                             // Untrack connection
                             if let Some(ref m) = metrics_clone {
                                 m.connection_tracker().on_disconnect(addr.ip());
@@ -907,6 +926,12 @@ pub async fn run_server_on_listener(
     tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
     tracing::info!("Domain: {}", config.domain);
+    if !config.trusted_proxy_cidrs.is_empty() {
+        tracing::info!(
+            trusted_proxy_cidrs = ?config.trusted_proxy_cidrs,
+            "Trusted proxy client IP resolution enabled"
+        );
+    }
 
     loop {
         let (socket, addr) = listener.accept().await?;

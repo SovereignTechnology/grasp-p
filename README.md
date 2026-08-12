@@ -450,16 +450,17 @@ passes the key through a protected systemd credential.
 
 #### Core Settings
 
-| Option            | CLI Flag              | Environment Variable     | Default                                      |
-| ----------------- | --------------------- | ------------------------ | -------------------------------------------- |
-| Domain            | `--domain`            | `NGIT_DOMAIN`            | (required)                                   |
-| Relay owner nsec  | —                     | `NGIT_RELAY_OWNER_NSEC`  | systemd credential, then `.relay-owner.nsec` |
-| Relay name        | `--relay-name`        | `NGIT_RELAY_NAME`        | `${domain} grasp relay`                      |
-| Relay description | `--relay-description` | `NGIT_RELAY_DESCRIPTION` | `Git Nostr Relay - a grasp implementation`   |
-| Git data path     | `--git-data-path`     | `NGIT_GIT_DATA_PATH`     | `./data/git` (temp dir for memory backend)   |
-| Relay data path   | `--relay-data-path`   | `NGIT_RELAY_DATA_PATH`   | `./data/relay` (temp dir for memory backend) |
-| Bind address      | `--bind-address`      | `NGIT_BIND_ADDRESS`      | `127.0.0.1:7334` (NGIT on phone keypad)      |
-| Database backend  | `--database-backend`  | `NGIT_DATABASE_BACKEND`  | `lmdb`                                       |
+| Option              | CLI Flag                 | Environment Variable        | Default                                      |
+| ------------------- | ------------------------ | --------------------------- | -------------------------------------------- |
+| Domain              | `--domain`               | `NGIT_DOMAIN`               | (required)                                   |
+| Relay owner nsec    | —                        | `NGIT_RELAY_OWNER_NSEC`     | systemd credential, then `.relay-owner.nsec` |
+| Relay name          | `--relay-name`           | `NGIT_RELAY_NAME`           | `${domain} grasp relay`                      |
+| Relay description   | `--relay-description`    | `NGIT_RELAY_DESCRIPTION`    | `Git Nostr Relay - a grasp implementation`   |
+| Git data path       | `--git-data-path`        | `NGIT_GIT_DATA_PATH`        | `./data/git` (temp dir for memory backend)   |
+| Relay data path     | `--relay-data-path`      | `NGIT_RELAY_DATA_PATH`      | `./data/relay` (temp dir for memory backend) |
+| Bind address        | `--bind-address`         | `NGIT_BIND_ADDRESS`         | `127.0.0.1:7334` (NGIT on phone keypad)      |
+| Trusted proxy CIDRs | `--trusted-proxy-cidrs`  | `NGIT_TRUSTED_PROXY_CIDRS`  | (empty; forwarded headers ignored)           |
+| Database backend    | `--database-backend`     | `NGIT_DATABASE_BACKEND`     | `lmdb`                                       |
 
 #### GRASP-02 Sync Settings
 
@@ -514,6 +515,10 @@ export NGIT_DOMAIN=gitnostr.com
 export NGIT_RELAY_OWNER_NSEC=nsec1...  # Or let it auto-generate from .relay-owner.nsec
 export NGIT_BIND_ADDRESS=0.0.0.0:7334
 export NGIT_DATABASE_BACKEND=lmdb
+
+# When a private backend is reached only through a reverse proxy:
+# export NGIT_BIND_ADDRESS=127.0.0.1:7334
+# export NGIT_TRUSTED_PROXY_CIDRS=127.0.0.1/32
 
 # Optional: Enable proactive sync from a bootstrap relay
 export NGIT_SYNC_BOOTSTRAP_RELAY_URL=wss://relay.damus.io

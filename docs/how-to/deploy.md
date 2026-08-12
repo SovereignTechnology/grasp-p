@@ -72,6 +72,8 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
     # Network
     bindAddress = "127.0.0.1";
     port = 8082;
+    # Only Caddy can reach the loopback backend, so its forwarded client IP is trusted.
+    trustedProxyCidrs = [ "127.0.0.1/32" ];
     
     # Storage
     dataDir = "/persistent/ngit-grasp";
@@ -95,8 +97,8 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
   services.caddy.virtualHosts."ngit.example.com" = {
     extraConfig = ''
       reverse_proxy 127.0.0.1:8082 {
-        header_down X-Real-IP {http.request.remote}
-        header_down X-Forwarded-For {http.request.remote}
+        # Caddy manages X-Forwarded-For automatically.
+        header_up X-Real-IP {remote_host}
       }
     '';
   };
@@ -108,6 +110,11 @@ Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
 - **Instance name** (`production`): Can be any name. Used for systemd service (`ngit-grasp-production`)
 - **domain**: Your relay's domain (used in GRASP validation)
 - **port**: Local port (use reverse proxy for HTTPS)
+- **trustedProxyCidrs**: Proxy source ranges allowed to supply the client IP
+  - Keep empty for a directly exposed listener
+  - Keep the backend private; trusting a public-facing source range permits spoofed headers
+  - Caddy automatically maintains `X-Forwarded-For`; `header_up`, not `header_down`,
+    changes headers sent to the backend
 - **dataDir**: Where git repos and database are stored
 - **relayOwnerNsecFile**: Path to file containing relay owner's nsec
   - Passed to ngit-grasp as a protected systemd credential, not a process argument
@@ -268,6 +275,8 @@ git ls-remote https://ngit.example.com/<npub>/<repo>.git
 ### Network
 - `bindAddress` - IP to bind to (default: "127.0.0.1")
 - `port` - Port to listen on (default: 7334)
+- `trustedProxyCidrs` - Proxy networks allowed to provide the WebSocket client
+  IP (default: empty; forwarded headers ignored)
 
 ### Storage
 - `dataDir` - Base directory for data (default: /var/lib/ngit-grasp-{name})

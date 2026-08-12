@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Added `trusted_proxy_cidrs` to the public `Config` struct. Rust consumers
+  that construct `Config` with a struct literal must provide it.
+
+### Security
+
+- Added opt-in trusted-proxy CIDRs so WebSocket connection policy, per-IP
+  metrics, abuse indicators, and logs can use the real client address without
+  trusting spoofable forwarding headers from arbitrary direct peers.
+
 ### Added
 
 - Add bounded, operator-configurable inbox fallback coverage when a successful

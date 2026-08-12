@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
+use ipnet::IpNet;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -359,6 +360,12 @@ pub struct Config {
     /// Server bind address (IP:PORT)
     #[arg(long, env = "NGIT_BIND_ADDRESS", default_value = "127.0.0.1:7334")]
     pub bind_address: String,
+
+    /// Proxy address ranges allowed to supply client IP forwarding headers.
+    ///
+    /// Empty by default so forwarded headers from direct clients are ignored.
+    #[arg(long, env = "NGIT_TRUSTED_PROXY_CIDRS", value_delimiter = ',')]
+    pub trusted_proxy_cidrs: Vec<IpNet>,
 
     /// Database backend type
     #[arg(long, env = "NGIT_DATABASE_BACKEND", value_enum, default_value_t = DatabaseBackend::Lmdb)]
@@ -1125,6 +1132,7 @@ impl Config {
             git_data_path: "./test_data/git".to_string(),
             relay_data_path: "./test_data/relay".to_string(),
             bind_address: "127.0.0.1:7334".to_string(),
+            trusted_proxy_cidrs: Vec::new(),
             database_backend: DatabaseBackend::Memory,
             metrics_enabled: true,
             metrics_connection_per_ip_abuse_threshold: 10,
@@ -1213,6 +1221,7 @@ fn secure_secret_file_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::Mutex;
 
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1222,8 +1231,58 @@ mod tests {
         let config = Config::for_testing();
         assert_eq!(config.domain, "localhost:7334");
         assert_eq!(config.bind_address, "127.0.0.1:7334");
+        assert!(config.trusted_proxy_cidrs.is_empty());
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    #[test]
+    fn test_trusted_proxy_cidrs_parse_from_cli() {
+        let config = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--trusted-proxy-cidrs",
+            "127.0.0.1/32,10.0.0.0/8,2001:db8::/32",
+        ])
+        .expect("trusted proxy CIDRs should parse");
+
+        assert_eq!(config.trusted_proxy_cidrs.len(), 3);
+        assert!(config.trusted_proxy_cidrs[0].contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(config.trusted_proxy_cidrs[1].contains(&"10.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(config.trusted_proxy_cidrs[2].contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxy_cidrs_reject_invalid_networks() {
+        let error = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--trusted-proxy-cidrs",
+            "127.0.0.1/32,not-a-network",
+        ])
+        .expect_err("invalid trusted proxy CIDRs must stop startup");
+
+        assert!(error.to_string().contains("not-a-network"));
+    }
+
+    #[test]
+    fn test_trusted_proxy_cidrs_parse_from_environment() {
+        const VARIABLE: &str = "NGIT_TRUSTED_PROXY_CIDRS";
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        let original = std::env::var_os(VARIABLE);
+        std::env::set_var(VARIABLE, "127.0.0.1/32,::1/128");
+
+        let result = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"]);
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
+
+        let config = result.expect("trusted proxy CIDRs should parse from the environment");
+        assert_eq!(config.trusted_proxy_cidrs.len(), 2);
     }
 
     #[test]

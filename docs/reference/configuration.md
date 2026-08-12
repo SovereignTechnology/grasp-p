@@ -47,8 +47,57 @@ NGIT_BIND_ADDRESS=127.0.0.1:3000
 **Notes:**
 
 - Use `127.0.0.1` for local development
-- Use `0.0.0.0` for production (behind reverse proxy)
+- Prefer a loopback or private address behind a production reverse proxy
+- Use `0.0.0.0` only when the listener must be directly reachable
 - Ensure firewall rules allow the port
+
+---
+
+#### `NGIT_TRUSTED_PROXY_CIDRS`
+
+**Description:** Comma-separated IPv4 or IPv6 networks whose forwarding
+headers may identify a WebSocket client
+
+**Type:** CIDR list
+
+**Default:** Empty
+
+**Required:** No
+
+**Examples:**
+
+```bash
+# Caddy or nginx connects over IPv4 loopback
+NGIT_TRUSTED_PROXY_CIDRS=127.0.0.1/32
+
+# Reverse proxy may connect over either loopback family
+NGIT_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+
+# Two private proxy tiers
+NGIT_TRUSTED_PROXY_CIDRS=10.10.0.0/24,10.20.0.0/24
+```
+
+When the TCP peer is in one of these networks, ngit-grasp resolves the client
+from `X-Forwarded-For`, `Forwarded`, or `X-Real-IP`, in that order. Forwarding
+chains are walked from the TCP peer inward and stop at the first untrusted hop.
+This resolved IP is used for relay connection policy, per-IP connection
+metrics, abuse indicators, and WebSocket connection logs.
+
+Forwarding headers are always ignored for untrusted TCP peers. Malformed
+headers also fall back to the peer address rather than a less authoritative
+header. Invalid CIDRs stop startup.
+
+**Security requirements:**
+
+- Leave this empty for a directly exposed ngit-grasp listener.
+- Configure the reverse proxy to append or overwrite forwarding headers rather
+  than passing client-controlled values unchanged.
+- Bind ngit-grasp to loopback/private interfaces or firewall the backend so
+  untrusted clients cannot connect from an address included in this list.
+- Include every proxy hop that should be traversed. The first address outside
+  the trusted ranges is treated as the client.
+
+The corresponding NixOS option is `trustedProxyCidrs`.
 
 ---
 
@@ -1568,13 +1617,16 @@ NGIT_RELAY_NAME="GitNostr Public Relay"
 NGIT_RELAY_DESCRIPTION="Public GRASP relay for open source projects"
 NGIT_GIT_DATA_PATH=/var/lib/ngit-grasp/git
 NGIT_RELAY_DATA_PATH=/var/lib/ngit-grasp/relay
-NGIT_BIND_ADDRESS=0.0.0.0:7334
+NGIT_BIND_ADDRESS=127.0.0.1:7334
+NGIT_TRUSTED_PROXY_CIDRS=127.0.0.1/32
 RUST_LOG=info,ngit_grasp=debug
 ```
 
 **Additional production considerations:**
 
 - Use reverse proxy (nginx, Caddy) for HTTPS
+- Keep the backend private and set `NGIT_TRUSTED_PROXY_CIDRS` to the actual
+  proxy source networks if client-IP accounting is required
 - Set up log rotation
 - Configure monitoring
 - Implement backup strategy
