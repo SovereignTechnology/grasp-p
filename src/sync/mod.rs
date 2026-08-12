@@ -1803,6 +1803,30 @@ async fn run_health_and_metrics_checker(
                         let entries = naughty_list.get_all();
                         metrics.update_naughty_list(entries);
                     }
+
+                    let (pending_batches, pending_subscriptions) = {
+                        let pending = manager.pending_sync_index.read().await;
+                        (
+                            pending.values().map(Vec::len).sum(),
+                            pending
+                                .values()
+                                .flatten()
+                                .map(|batch| batch.outstanding_subs.len())
+                                .sum(),
+                        )
+                    };
+                    for (class, count) in [
+                        ("pending_batches", pending_batches),
+                        ("pending_subscriptions", pending_subscriptions),
+                        ("auth_retries", manager.auth_required_attempts.len()),
+                        ("queued_connection_attempts", manager.in_flight_connect_attempts.len()),
+                        ("purgatory_dependencies", manager.purgatory_dependency_attempts.len()),
+                        ("dependency_relays", manager.dependency_relay_deadlines.len()),
+                        ("deferred_consolidations", manager.deferred_consolidations.relays.len()),
+                        ("descendant_rotations", manager.descendant_sync_rotations.len()),
+                    ] {
+                        metrics.set_retained_state(class, count);
+                    }
                 }
             }
             _ = shutdown_rx.recv() => {
