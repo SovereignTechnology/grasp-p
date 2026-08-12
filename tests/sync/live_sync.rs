@@ -53,7 +53,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
-                let metrics = fetch_metrics(&relay_url).await.unwrap_or_default();
+                let metrics = fetch_metrics(relay_url).await.unwrap_or_default();
                 if metrics.contains(&required)
                     && absent.as_ref().is_none_or(|label| !metrics.contains(label))
                 {
@@ -102,7 +102,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
         "replacement should establish the new relay"
     );
     assert!(
-        fetch_metrics(&syncing.url())
+        fetch_metrics(syncing.url())
             .await
             .unwrap_or_default()
             .contains(&old_label),
@@ -223,7 +223,7 @@ async fn live_sync_regroups_after_filter_count_refusal() {
 
     let refusal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let metrics = fetch_metrics(&syncing.url()).await.unwrap_or_default();
+        let metrics = fetch_metrics(syncing.url()).await.unwrap_or_default();
         if metrics.contains("ngit_sync_policy_refusals_total") && metrics.contains("filter_count") {
             break;
         }
