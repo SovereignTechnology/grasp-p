@@ -148,6 +148,20 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
         .await,
         "replacement NIP-65 inbox should become the desired root source"
     );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("NIP-65 discovery connection ready without repository sync")
+                && line.contains(outbox.url())
+        }),
+        "the advertised outbox connection should be identified as discovery-only"
+    );
+    assert!(
+        !sync_log.lines().any(|line| {
+            line.contains("Starting fresh_start") && line.contains(outbox.url())
+        }),
+        "querying an advertised outbox must not start ordinary repository sync against it"
+    );
     let draining_reply = EventBuilder::new(Kind::TextNote, "reply on naturally draining inbox")
         .tag(Tag::custom("e", vec![issue.id.to_hex()]))
         .finalize(&root_author)

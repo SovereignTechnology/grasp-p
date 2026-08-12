@@ -33,7 +33,14 @@ only one discovery batch may be in flight globally. Admission samples immediate
 transient capacity; if historic work wins the small race before the permit is
 acquired, that single batch may wait but discovery can never build a waiter
 queue. Its SDK-owned REQ draws from the same pacer and subscription ledger as
-historic work. Authors returned by a successful query refresh after 24 hours;
+historic work. Discovery sources use the managed connection safety and
+reconnection machinery, but are a distinct control-plane role: connecting to a
+user index or outbox does not start ordinary announcement, repository, or
+descendant sync against it. At most one new discovery source is dialled per
+maintenance pass, and an exclusively discovery connection retires after its
+currently due author batches drain. A relay that independently becomes a
+repository source is promoted to the ordinary lifecycle without opening a
+duplicate connection. Authors returned by a successful query refresh after 24 hours;
 missing authors and failed queries retry after five minutes. Configured user
 index relays discover authors with no accepted local relay list, requesting the
 profile alongside it. Accepted NIP-65
