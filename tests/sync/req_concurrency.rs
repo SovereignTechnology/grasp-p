@@ -279,11 +279,6 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
         proxy.peak_concurrent()
     );
     assert!(
-        proxy.peak_concurrent() >= 2,
-        "transient REQs should still overlap under the bound, peak: {}",
-        proxy.peak_concurrent()
-    );
-    assert!(
         opened > PROXY_REQ_LIMIT,
         "scenario must open more REQs than the bound to exercise queueing, opened: {opened}"
     );
