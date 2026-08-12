@@ -548,6 +548,10 @@ impl TestRelay {
             .env("NGIT_RELAY_DATA_PATH", &relay_data_path)
             .env("NGIT_RELAY_OWNER_NSEC", &test_nsec)
             .env("NGIT_TEST", "1") // Enable test mode: fast timers (200ms batch window, 200ms purgatory sync)
+            // Integration tests must never depend on or send discovery traffic
+            // to the production user-index defaults. A configured loopback
+            // bootstrap below becomes the scenario's sole index source.
+            .env("NGIT_USER_INDEX_RELAYS", "")
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
             .env("NGIT_SYNC_STARTUP_JITTER_MS", "0") // No jitter for tests
             .env("NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS", "1") // Fast reconnect attempts for tests
@@ -578,7 +582,8 @@ impl TestRelay {
 
         // Add bootstrap relay URL if provided
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
-            cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url);
+            cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url)
+                .env("NGIT_USER_INDEX_RELAYS", bootstrap_url);
         }
 
         // The test infrastructure runs entirely on loopback, which the
