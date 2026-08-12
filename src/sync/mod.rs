@@ -1177,8 +1177,28 @@ fn is_filter_count_refusal(message: &str) -> bool {
     message.contains("invalid number of filters") || message.contains("max filter count")
 }
 
+fn is_auth_required_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("auth-required") || message.contains("authentication required")
+}
+
+fn reserve_authentication_retry(
+    attempts: &mut HashSet<(String, SubscriptionId)>,
+    relay_url: &str,
+    subscription_id: &SubscriptionId,
+) -> bool {
+    let attempt = (relay_url.to_string(), subscription_id.clone());
+    if attempts.insert(attempt.clone()) {
+        true
+    } else {
+        attempts.remove(&attempt);
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyRefusal {
+    AuthenticationRequired,
     Blocked,
     Restricted,
     MembershipRequired,
@@ -1188,6 +1208,7 @@ enum PolicyRefusal {
 impl PolicyRefusal {
     fn label(self) -> &'static str {
         match self {
+            Self::AuthenticationRequired => "authentication_required",
             Self::Blocked => "blocked",
             Self::Restricted => "restricted",
             Self::MembershipRequired => "membership_required",
@@ -1204,7 +1225,8 @@ fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
         return None;
     }
     let message = message.to_ascii_lowercase();
-    if message.contains("unsupported filter") || message.contains("filter validation failed") {
+    if message.contains("unsupported filter") || message.contains("filter validation failed")
+    {
         Some(PolicyRefusal::FilterIncompatible)
     } else if message.contains("not a member") || message.contains("membership") {
         Some(PolicyRefusal::MembershipRequired)
@@ -1768,6 +1790,10 @@ pub struct SyncManager {
     purgatory_dependency_attempts: HashMap<EventId, Instant>,
     /// Temporary source relays retained while rejected dependencies are recovered.
     dependency_relay_deadlines: HashMap<String, Instant>,
+    /// First auth-required CLOSED per subscription. rust-nostr retains the
+    /// same ID while it answers NIP-42; a repeat means authentication did not
+    /// authorize this query and becomes a bounded policy refusal.
+    auth_required_attempts: HashSet<(String, SubscriptionId)>,
     /// Health tracker for relay connection state
     health_tracker: Arc<RelayHealthTracker>,
     /// Counter for generating unique batch IDs
@@ -1885,6 +1911,7 @@ impl SyncManager {
             )),
             purgatory_dependency_attempts: HashMap::new(),
             dependency_relay_deadlines: HashMap::new(),
+            auth_required_attempts: HashSet::new(),
             health_tracker: Arc::new(RelayHealthTracker::new(config)),
             next_batch_id: 0,
             next_connect_attempt_token: 0,
@@ -5314,6 +5341,8 @@ impl SyncManager {
         // as complete on the next session.
         self.descendant_sync_rotations.remove(relay_url);
         self.descendant_live_coverage.remove(relay_url);
+        self.auth_required_attempts
+            .retain(|(attempt_relay, _)| attempt_relay != relay_url);
 
         // Check if this was an intentional disconnect (Disconnecting status)
         let was_intentional = {
@@ -6049,6 +6078,64 @@ impl SyncManager {
             .descendant_live_coverage
             .get(relay_url)
             .is_some_and(|coverage| coverage.subscription_ids.contains(&subscription_id));
+        let policy_category = if is_auth_required_message(reason) {
+            if reserve_authentication_retry(
+                &mut self.auth_required_attempts,
+                relay_url,
+                &subscription_id,
+            ) {
+                tracing::info!(
+                    relay = %relay_url,
+                    sub_id = %subscription_id,
+                    "Relay requested authentication; retaining subscription for one NIP-42 retry"
+                );
+                return;
+            }
+            if let Some(connection) = self.connections.get(relay_url) {
+                connection
+                    .retire_auth_refused_subscription(&subscription_id)
+                    .await;
+            }
+            Some(PolicyRefusal::AuthenticationRequired)
+        } else {
+            policy_refusal(reason)
+        };
+        if let Some(category) = policy_category
+            .filter(|category| *category != PolicyRefusal::FilterIncompatible)
+        {
+            let removed_batch = {
+                let mut pending = self.pending_sync_index.write().await;
+                take_batch_containing_subscription(&mut pending, relay_url, &subscription_id)
+            };
+            if let Some(batch) = &removed_batch {
+                self.release_removed_descendant_batch(relay_url, batch);
+            }
+            if is_descendant_live {
+                if let Some(coverage) = self.descendant_live_coverage.remove(relay_url) {
+                    if let Some(connection) = self.connections.get(relay_url) {
+                        let _ = connection
+                            .close_live_subscriptions(&coverage.subscription_ids)
+                            .await;
+                    }
+                }
+            }
+            self.health_tracker.record_policy_refusal(relay_url);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_policy_refusal(relay_url, category.label());
+                metrics.record_health_state(relay_url, self.health_tracker.get_state(relay_url));
+            }
+            tracing::warn!(
+                relay = %relay_url,
+                sub_id = %subscription_id,
+                category = category.label(),
+                reason,
+                retry_hours = 24,
+                pending_batch_removed = removed_batch.is_some(),
+                descendant_live = is_descendant_live,
+                "Relay policy refused subscription; preserving connection and deferring coverage probe"
+            );
+            return;
+        }
         if is_descendant_live {
             let coverage = self
                 .descendant_live_coverage
@@ -6200,8 +6287,17 @@ impl SyncManager {
         }
 
         if let Some(generation) = live_generation {
-            self.restore_live_coverage_after_closed(relay_url, generation)
-                .await;
+            self.health_tracker.record_rate_limit(relay_url);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_health_state(relay_url, self.health_tracker.get_state(relay_url));
+            }
+            tracing::warn!(
+                relay = %relay_url,
+                sub_id = %subscription_id,
+                generation,
+                reason,
+                "Unexpected live subscription closure; deferring one repair attempt until cooldown"
+            );
         }
     }
 
@@ -7953,6 +8049,11 @@ mod tests {
     #[test]
     fn policy_refusal_classifier_uses_bounded_categories() {
         assert_eq!(
+            policy_refusal("auth-required: this relay only serves private notes"),
+            None,
+            "authentication gets one SDK-owned retry before it becomes a policy refusal"
+        );
+        assert_eq!(
             policy_refusal("restricted: this relay does not accept REQs"),
             Some(PolicyRefusal::Restricted)
         );
@@ -7974,6 +8075,25 @@ mod tests {
         );
         assert_eq!(policy_refusal("rate-limited: too many queries"), None);
         assert_eq!(policy_refusal("error: temporary backend failure"), None);
+    }
+
+    #[test]
+    fn authentication_gets_one_same_subscription_retry() {
+        let relay = "wss://private.example";
+        let subscription_id = SubscriptionId::new("auth-retry");
+        let mut attempts = HashSet::new();
+
+        assert!(reserve_authentication_retry(
+            &mut attempts,
+            relay,
+            &subscription_id
+        ));
+        assert!(!reserve_authentication_retry(
+            &mut attempts,
+            relay,
+            &subscription_id
+        ));
+        assert!(attempts.is_empty(), "a refused retry must retire its marker");
     }
 
     #[test]
