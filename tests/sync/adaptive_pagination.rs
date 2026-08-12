@@ -144,7 +144,22 @@ async fn honest_default_limit_stops_after_its_verification_page() {
         "/tmp/relay-{}.log",
         syncing.domain().split(':').next_back().unwrap()
     );
-    let log = std::fs::read_to_string(&log_path).expect("read syncing relay log");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).expect("read syncing relay log");
+        if log
+            .matches("Grouped subscription hit pagination threshold")
+            .count()
+            >= 1
+        {
+            break log;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "verification page was not scheduled before the deadline"
+        );
+        tokio::task::yield_now().await;
+    };
     assert_eq!(
         log.matches("Grouped subscription hit pagination threshold")
             .count(),
