@@ -1173,11 +1173,14 @@ struct SubscriptionClosedNotification {
     live_filter_count: Option<usize>,
 }
 
-fn lifecycle_notification_channel<T>() -> (
-    tokio::sync::mpsc::UnboundedSender<T>,
-    tokio::sync::mpsc::UnboundedReceiver<T>,
-) {
-    tokio::sync::mpsc::unbounded_channel()
+// One global actor consumes terminal state changes from every outbound relay.
+// A hostile peer can repeat EOSE/CLOSED indefinitely, so this queue must bound
+// retained memory independently of the per-connection subscription ledger.
+const LIFECYCLE_NOTIFICATION_CAPACITY: usize = 1_000;
+
+fn lifecycle_notification_channel<T>(
+) -> (tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>) {
+    tokio::sync::mpsc::channel(LIFECYCLE_NOTIFICATION_CAPACITY)
 }
 
 fn is_rate_limit_message(message: &str) -> bool {
@@ -1913,10 +1916,9 @@ pub struct SyncManager {
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
-    eose_tx: Option<tokio::sync::mpsc::UnboundedSender<EoseNotification>>,
+    eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
     /// Serializes CLOSED recovery and pending-batch cleanup through the actor.
-    subscription_closed_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<SubscriptionClosedNotification>>,
+    subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
@@ -3935,10 +3937,12 @@ impl SyncManager {
                             sub_id = %sub_id,
                             "EOSE received, notifying SyncManager"
                         );
-                        let _ = eose_tx.send(EoseNotification {
-                            relay_url: relay_url_clone.clone(),
-                            sub_id,
-                        });
+                        let _ = eose_tx
+                            .send(EoseNotification {
+                                relay_url: relay_url_clone.clone(),
+                                sub_id,
+                            })
+                            .await;
                     }
                     RelayEvent::Notice(notice) => {
                         if is_rate_limit_message(&notice) {
@@ -4006,13 +4010,15 @@ impl SyncManager {
                                 );
                             }
                         }
-                        let _ = subscription_closed_tx.send(SubscriptionClosedNotification {
-                            relay_url: relay_url_clone.clone(),
-                            subscription_id,
-                            reason,
-                            generation: live_generation,
-                            live_filter_count,
-                        });
+                        let _ = subscription_closed_tx
+                            .send(SubscriptionClosedNotification {
+                                relay_url: relay_url_clone.clone(),
+                                subscription_id,
+                                reason,
+                                generation: live_generation,
+                                live_filter_count,
+                            })
+                            .await;
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -7885,7 +7891,7 @@ mod tests {
     fn lifecycle_inbox_accepts_production_sized_terminal_burst() {
         let (tx, mut rx) = lifecycle_notification_channel::<EoseNotification>();
         for index in 0..169 {
-            tx.send(EoseNotification {
+            tx.try_send(EoseNotification {
                 relay_url: "wss://relay.example".to_string(),
                 sub_id: SubscriptionId::new(format!("hydration-{index}")),
             })
@@ -8240,6 +8246,29 @@ mod tests {
         let second = reserve_connect_attempt(&mut in_flight, &mut next_token, relay)
             .expect("relay should be schedulable after completion");
         assert_ne!(first, second, "attempt identities must not be reused");
+    }
+
+    #[test]
+    fn lifecycle_notifications_apply_fixed_backpressure_under_peer_repetition() {
+        let (sender, mut receiver) = lifecycle_notification_channel();
+
+        for sequence in 0..LIFECYCLE_NOTIFICATION_CAPACITY {
+            sender
+                .try_send(sequence)
+                .expect("the documented lifecycle capacity should be usable");
+        }
+        assert!(
+            matches!(
+                sender.try_send(LIFECYCLE_NOTIFICATION_CAPACITY),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            ),
+            "repeated peer terminals must backpressure instead of retaining unbounded memory"
+        );
+
+        assert_eq!(receiver.try_recv().unwrap(), 0);
+        sender
+            .try_send(LIFECYCLE_NOTIFICATION_CAPACITY)
+            .expect("draining one terminal must release exactly one queue slot");
     }
 
     #[tokio::test]
