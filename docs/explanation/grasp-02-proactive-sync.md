@@ -92,11 +92,23 @@ pub struct RepoSyncNeeds {
 Ownership removal is deliberately passive. It does not close a healthy
 connection or replace a working live request. If a live request receives
 `CLOSED`, its replacement filters are derived from the current index and omit
-obsolete items. Definitive policy refusals (`blocked`, `restricted`, membership
-required, or incompatible filters) are the exception: the connection remains
-open, rejected coverage is not immediately recreated, and one recovery probe
+obsolete items. On the first `auth-required` response, rust-nostr retains the
+same subscription and answers the relay's NIP-42 challenge with the configured
+relay-owner key. If that same subscription is refused again, authentication did
+not authorize the query and it becomes a definitive policy refusal. Other
+definitive refusals (`blocked`, `restricted`, membership required, or
+incompatible filters) follow the same policy path:
+the connection remains open, rejected coverage is not immediately recreated,
+and one recovery probe
 runs after 24 hours. The bounded refusal category is exported as a metric while
-the relay's full reason remains in logs. When the connection itself ends
+the relay's full reason remains in logs. Apart from the one in-progress NIP-42
+retry, every peer `CLOSED` also removes that subscription from rust-nostr's
+desired-subscription registry; the sync actor exclusively owns any recovery.
+An unclassified live `CLOSED` also waits for the ordinary 65-second cooldown
+before one repair attempt. This generic circuit breaker prevents unfamiliar
+relay wording from becoming an immediate rebuild loop while retaining eventual
+coverage recovery.
+When the connection itself ends
 naturally, confirmed state is
 reconciled before reconnect: shared relays reconnect with current items only,
 while an unreferenced relay is retired instead of reconnected. This preserves

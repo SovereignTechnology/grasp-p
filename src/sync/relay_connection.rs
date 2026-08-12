@@ -82,6 +82,11 @@ fn is_query_rate_limit_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("too many queries")
 }
 
+fn is_auth_required_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("auth-required") || message.contains("authentication required")
+}
+
 #[derive(Debug, Default)]
 struct QueryPacingState {
     interval: Option<Duration>,
@@ -1626,10 +1631,15 @@ impl RelayConnection {
                                 .await;
                         }
                         RelayMessage::Closed {
-                            subscription_id, ..
+                            subscription_id,
+                            message,
                         } => {
-                            terminal_connection
-                                .release_transient_req_permit(&subscription_id.into_owned());
+                            let subscription_id = subscription_id.into_owned();
+                            if !is_auth_required_message(&message) {
+                                terminal_connection
+                                    .retire_peer_closed_subscription(&subscription_id)
+                                    .await;
+                            }
                         }
                         _ => {}
                     },
@@ -1728,7 +1738,20 @@ impl RelayConnection {
                         // The terminal-control listener owns transient release;
                         // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
-                        let released_live = self.release_live_req_permit(&subscription_id);
+                        // rust-nostr needs the same subscription and ledger
+                        // slot alive while it answers a first NIP-42 challenge.
+                        let released_live = if is_auth_required_message(&msg) {
+                            self.live_req_permits_held
+                                .lock()
+                                .expect("live permit map poisoned")
+                                .get(&subscription_id)
+                                .map(|held| ReleasedLiveSubscription {
+                                    generation: held.generation,
+                                    filter_count: held.filters.len(),
+                                })
+                        } else {
+                            self.release_live_req_permit(&subscription_id)
+                        };
                         if is_query_rate_limit_message(&msg) {
                             self.record_query_rate_limit();
                         }
@@ -2140,6 +2163,40 @@ impl RelayConnection {
     /// The number of active subscriptions
     pub async fn subscription_count(&self) -> usize {
         self.client.subscriptions().await.len()
+    }
+
+    async fn retire_peer_closed_subscription(&self, subscription_id: &SubscriptionId) {
+        self.release_transient_req_permit(subscription_id);
+        // A peer CLOSED is terminal for this subscription. In particular,
+        // rust-nostr retains auth-required REQs when an authenticator is
+        // configured so it can retry them after NIP-42. SyncManager owns all
+        // deliberate recovery, therefore keeping that desired entry lets SDK
+        // retries bypass our cooldowns and grow the registry with every
+        // replacement generation.
+        if let Err(error) = self.client.unsubscribe(subscription_id).await {
+            tracing::debug!(
+                relay = %self.url,
+                sub_id = %subscription_id,
+                error = %error,
+                "Failed to retire peer-closed subscription"
+            );
+        }
+    }
+
+    pub(super) async fn retire_auth_refused_subscription(
+        &self,
+        subscription_id: &SubscriptionId,
+    ) {
+        self.release_transient_req_permit(subscription_id);
+        self.release_live_req_permit(subscription_id);
+        if let Err(error) = self.client.unsubscribe(subscription_id).await {
+            tracing::debug!(
+                relay = %self.url,
+                sub_id = %subscription_id,
+                error = %error,
+                "Failed to retire subscription rejected after authentication"
+            );
+        }
     }
 
     /// Disconnect from the relay
@@ -3055,6 +3112,41 @@ mod tests {
         relay.shutdown();
         event_loop.abort();
         drain.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_closed_subscription_is_removed_from_sdk_registry() {
+        let relay = LocalRelayBuilder::default().build();
+        relay.run().await.expect("start registry relay");
+        let connection = RelayConnection::new(
+            relay.url().await.to_string(),
+            Keys::generate(),
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection.connect(3).await.expect("connect registry relay");
+
+        let subscription_id = connection
+            .subscribe_live_filter_groups(vec![vec![Filter::new().kind(Kind::TextNote)]])
+            .await
+            .expect("open live subscription")
+            .into_iter()
+            .next()
+            .expect("one live subscription");
+        assert_eq!(connection.subscription_count().await, 1);
+
+        connection
+            .retire_peer_closed_subscription(&subscription_id)
+            .await;
+
+        assert_eq!(
+            connection.subscription_count().await,
+            0,
+            "a terminal peer CLOSED must not remain eligible for SDK replay"
+        );
+
+        connection.disconnect().await;
+        relay.shutdown();
     }
 
     #[tokio::test]

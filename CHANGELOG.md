@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retire peer-closed outbound subscriptions from rust-nostr's desired registry
+  without interrupting NIP-42: the first `auth-required` response keeps the
+  same subscription and ledger slot for one authenticated retry, while a repeat
+  refusal becomes a 24-hour policy pause. This prevents authentication replay
+  and live repair from multiplying rejected IDs without bound. Policy detection
+  precedes descendant fallback, while an unclassified live closure waits for
+  the ordinary cooldown before one repair attempt.
+
 - Bound duplicate repository Git acquisition to one primary and one delayed
   distinct-domain hedge, and recover from silent transports without imposing a
   total fetch deadline. Continuously active large transfers remain unbounded;
