@@ -323,6 +323,22 @@ NGIT_SYNC_BOOTSTRAP_RELAY_URL=ws://127.0.0.1:8081
 
 ---
 
+#### `NGIT_USER_INDEX_RELAYS`
+
+**Description:** Comma-separated relay URLs used to discover eligible accepted repository participants' NIP-65 relay lists
+**Type:** String list (comma-separated WebSocket URLs)
+**Default:** `wss://purplepag.es,wss://index.hzrd149.com,wss://indexer.coracle.social`
+**Required:** No
+
+```bash
+NGIT_USER_INDEX_RELAYS=wss://purplepag.es,wss://index.example.com
+```
+
+The corresponding NixOS option is `userIndexRelays`, expressed as a list of
+strings. Empty comma-separated entries and surrounding whitespace are ignored.
+
+---
+
 #### `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`
 
 **Description:** Allow event-directed sync targets that are not globally reachable

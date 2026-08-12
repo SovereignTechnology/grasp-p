@@ -19,7 +19,8 @@ pagination and per-relay connection lifecycle apply unchanged.
 The index set is the configured bootstrap relay plus relays already declared
 for accepted repositories. Discovery is best effort: completeness assumes the
 current relay-list event is available from at least one existing source. This
-avoids a new configuration surface and unbounded global discovery.
+keeps discovery bounded to an operator-visible set of user-index relays rather
+than allowing unbounded global discovery.
 
 The self-subscriber builds a compact root-candidate inventory during its
 existing startup load and maintains it incrementally as roots arrive. StateOnly
