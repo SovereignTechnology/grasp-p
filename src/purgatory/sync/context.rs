@@ -611,9 +611,8 @@ async fn run_observed_git_command_with_policy(
 
     let first_log = tokio::time::Instant::now() + GIT_LONG_RUNNING_AFTER;
     let mut long_running = tokio::time::interval_at(first_log, GIT_LONG_RUNNING_REPEAT);
-    let mut inactivity_check = tokio::time::interval(
-        policy.inactivity_limit.min(Duration::from_secs(1)),
-    );
+    let mut inactivity_check =
+        tokio::time::interval(policy.inactivity_limit.min(Duration::from_secs(1)));
     inactivity_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stalled = false;
     let status = loop {
@@ -1395,7 +1394,10 @@ mod fetch_helper_tests {
             if !alive {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "descendant survived");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "descendant survived"
+            );
             tokio::task::yield_now().await;
         }
     }
@@ -1457,9 +1459,14 @@ mod fetch_helper_tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let output = run_observed_git_command(follow_up, "test.example", "fetch_batch", GitFetchRole::Primary)
-            .await
-            .unwrap();
+        let output = run_observed_git_command(
+            follow_up,
+            "test.example",
+            "fetch_batch",
+            GitFetchRole::Primary,
+        )
+        .await
+        .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"ready");
     }

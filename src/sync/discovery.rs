@@ -162,9 +162,11 @@ pub fn accepted_repository_authors<'a>(
             continue;
         }
         authors.insert(event.pubkey);
-        for maintainer in event.tags.iter().filter(|tag| {
-            tag.as_slice().first().map(String::as_str) == Some("maintainers")
-        }) {
+        for maintainer in event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("maintainers"))
+        {
             authors.extend(
                 maintainer.as_slice()[1..]
                     .iter()

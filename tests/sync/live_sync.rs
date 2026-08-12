@@ -223,9 +223,7 @@ async fn live_sync_regroups_after_filter_count_refusal() {
     let refusal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let metrics = fetch_metrics(&syncing.url()).await.unwrap_or_default();
-        if metrics.contains("ngit_sync_policy_refusals_total")
-            && metrics.contains("filter_count")
-        {
+        if metrics.contains("ngit_sync_policy_refusals_total") && metrics.contains("filter_count") {
             break;
         }
         assert!(

@@ -226,7 +226,11 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
 
     // 6. The issues must arrive via historic sync (sampled ends of the
     //    range cover the byte-budgeted chunks).
-    for issue_id in [issue_ids[0], issue_ids[ISSUE_COUNT / 2], issue_ids[ISSUE_COUNT - 1]] {
+    for issue_id in [
+        issue_ids[0],
+        issue_ids[ISSUE_COUNT / 2],
+        issue_ids[ISSUE_COUNT - 1],
+    ] {
         assert!(
             wait_for_event_on_relay(
                 syncing.url(),
@@ -263,7 +267,8 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     // 9. The regression assertions (cumulative across both phases; the
     //    trickle-shaped phase 1 must stay within the bound too).
     assert_eq!(
-        rejected, 0,
+        rejected,
+        0,
         "relay exceeded the per-connection REQ concurrency limit \
          (opened: {opened}, peak: {})",
         proxy.peak_concurrent()

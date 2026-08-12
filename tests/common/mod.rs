@@ -8,13 +8,13 @@ pub mod git_server;
 pub mod mock_relay;
 pub mod neg_limiting_proxy;
 pub mod nip09_helpers;
-pub mod req_limiting_proxy;
-pub mod upload_pack_counting_proxy;
 pub mod port;
 pub mod purgatory_helpers;
 pub mod relay;
+pub mod req_limiting_proxy;
 pub mod setup_drop_relay;
 pub mod sync_helpers;
+pub mod upload_pack_counting_proxy;
 
 pub use git_server::{SimpleGitServer, SmartGitServer};
 pub use mock_relay::MockRelay;

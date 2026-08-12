@@ -854,7 +854,11 @@ impl Default for DescendantSyncRotation {
 }
 
 fn filter_group_fingerprint(filters: &[Filter]) -> String {
-    filters.iter().map(Filter::as_json).collect::<Vec<_>>().join("\n")
+    filters
+        .iter()
+        .map(Filter::as_json)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn rotation_fingerprint(filters: &[Filter], max_filters_per_req: usize) -> Vec<String> {
@@ -869,7 +873,12 @@ impl DescendantSyncRotation {
         let previous: HashMap<String, Option<Timestamp>> = self
             .filters
             .drain(..)
-            .map(|cursor| (filter_group_fingerprint(&cursor.filters), cursor.last_successful_until))
+            .map(|cursor| {
+                (
+                    filter_group_fingerprint(&cursor.filters),
+                    cursor.last_successful_until,
+                )
+            })
             .collect();
         self.filters = group_filters_for_req_with_max(&filters, max_filters_per_req)
             .into_iter()
@@ -981,11 +990,7 @@ fn packed_historic_filters(items: &PendingItems, frontier: &DescendantFrontier) 
         .collect();
     let mut filters = filters::state_event_filters_for_our_repos(&all_repos, None);
 
-    let coordinate_values: HashSet<_> = items
-        .repos
-        .union(&frontier.coordinates)
-        .cloned()
-        .collect();
+    let coordinate_values: HashSet<_> = items.repos.union(&frontier.coordinates).cloned().collect();
     filters.extend(filters::tagged_one_of_our_repo_event_filters(
         &coordinate_values,
         None,
@@ -1247,8 +1252,7 @@ fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
         return None;
     }
     let message = message.to_ascii_lowercase();
-    if message.contains("unsupported filter") || message.contains("filter validation failed")
-    {
+    if message.contains("unsupported filter") || message.contains("filter validation failed") {
         Some(PolicyRefusal::FilterIncompatible)
     } else if message.contains("not a member") || message.contains("membership") {
         Some(PolicyRefusal::MembershipRequired)
@@ -1924,8 +1928,7 @@ pub struct SyncManager {
     connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
     /// Wakes the actor when a batch completion may unblock consolidation.
     deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    nip65_discovery_result_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
+    nip65_discovery_result_tx: Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -2532,9 +2535,8 @@ impl SyncManager {
                         .collect();
                     {
                         let mut pending = self.pending_sync_index.write().await;
-                        if let Some(batch) = pending
-                            .get_mut(&relay_url_for_retry)
-                            .and_then(|batches| {
+                        if let Some(batch) =
+                            pending.get_mut(&relay_url_for_retry).and_then(|batches| {
                                 batches.iter_mut().find(|batch| batch.batch_id == batch_id)
                             })
                         {
@@ -2572,9 +2574,8 @@ impl SyncManager {
                                     "Failed to create retry subscription for missing events"
                                 );
                                 let mut pending = self.pending_sync_index.write().await;
-                                if let Some(batch) = pending
-                                    .get_mut(&relay_url_for_retry)
-                                    .and_then(|batches| {
+                                if let Some(batch) =
+                                    pending.get_mut(&relay_url_for_retry).and_then(|batches| {
                                         batches.iter_mut().find(|batch| batch.batch_id == batch_id)
                                     })
                                 {
@@ -3438,10 +3439,7 @@ impl SyncManager {
         if let Some(ref bootstrap_url) = self.bootstrap_relay_url.clone() {
             match canonical_relay_key(bootstrap_url) {
                 Ok(relay_url) => {
-                    if self
-                        .register_relay(relay_url.clone(), true, false)
-                        .await
-                    {
+                    if self.register_relay(relay_url.clone(), true, false).await {
                         self.schedule_connect_relay(&relay_url).await;
                     }
                 }
@@ -3626,9 +3624,7 @@ impl SyncManager {
         // A relay first reached through NIP-65 may later become an ordinary
         // repository target. Promote that existing connection before reading
         // its state so subsequent reconnects and sync work use the full role.
-        let promoted_from_discovery = self
-            .nip65_discovery_only_relays
-            .remove(&action.relay_url);
+        let promoted_from_discovery = self.nip65_discovery_only_relays.remove(&action.relay_url);
         if promoted_from_discovery {
             tracing::info!(
                 relay = %action.relay_url,
@@ -3946,11 +3942,10 @@ impl SyncManager {
                             sub_id = %sub_id,
                             "EOSE received, notifying SyncManager"
                         );
-                        let _ = eose_tx
-                            .send(EoseNotification {
-                                relay_url: relay_url_clone.clone(),
-                                sub_id,
-                            });
+                        let _ = eose_tx.send(EoseNotification {
+                            relay_url: relay_url_clone.clone(),
+                            sub_id,
+                        });
                     }
                     RelayEvent::Notice(notice) => {
                         if is_rate_limit_message(&notice) {
@@ -4018,14 +4013,13 @@ impl SyncManager {
                                 );
                             }
                         }
-                        let _ = subscription_closed_tx
-                            .send(SubscriptionClosedNotification {
-                                relay_url: relay_url_clone.clone(),
-                                subscription_id,
-                                reason,
-                                generation: live_generation,
-                                live_filter_count,
-                            });
+                        let _ = subscription_closed_tx.send(SubscriptionClosedNotification {
+                            relay_url: relay_url_clone.clone(),
+                            subscription_id,
+                            reason,
+                            generation: live_generation,
+                            live_filter_count,
+                        });
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -4474,14 +4468,10 @@ impl SyncManager {
             return;
         }
 
-        let reconcile_relay =
-            relay_urls[self.descendant_relay_cursor % relay_urls.len()].clone();
+        let reconcile_relay = relay_urls[self.descendant_relay_cursor % relay_urls.len()].clone();
         self.descendant_relay_cursor = self.descendant_relay_cursor.wrapping_add(1);
-        self.reconcile_descendant_mode(
-            &reconcile_relay,
-            &targets[&reconcile_relay],
-        )
-        .await;
+        self.reconcile_descendant_mode(&reconcile_relay, &targets[&reconcile_relay])
+            .await;
 
         let constrained: Vec<String> = relay_urls
             .into_iter()
@@ -4890,10 +4880,8 @@ impl SyncManager {
                     retained_identity.iter().cloned(),
                     &current_authors,
                 );
-                self.nip65_discovery.relay_lists = discovery::latest_relay_lists(
-                    latest_identity,
-                    &current_authors,
-                );
+                self.nip65_discovery.relay_lists =
+                    discovery::latest_relay_lists(latest_identity, &current_authors);
                 self.nip65_discovery.author_inboxes = self
                     .nip65_discovery
                     .relay_lists
@@ -4946,8 +4934,8 @@ impl SyncManager {
                 .next_attempt_at
                 .retain(|(relay, author), _| {
                     current_sources
-                    .get(author)
-                    .is_some_and(|sources| sources.contains(relay))
+                        .get(author)
+                        .is_some_and(|sources| sources.contains(relay))
                 });
             self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
             let overlay = discovery::build_inbox_root_overlay(
@@ -4997,11 +4985,9 @@ impl SyncManager {
             if authors.is_empty() {
                 continue;
             }
-            self.nip65_discovery.in_flight.extend(
-                authors
-                    .iter()
-                    .map(|author| (source.clone(), *author)),
-            );
+            self.nip65_discovery
+                .in_flight
+                .extend(authors.iter().map(|author| (source.clone(), *author)));
             let filter = Filter::new()
                 .kinds([Kind::Metadata, Kind::RelayList])
                 .authors(authors.iter().copied())
@@ -5011,7 +4997,9 @@ impl SyncManager {
             };
             let source_relay = source.clone();
             tokio::spawn(async move {
-                let outcome = connection.fetch_events(filter, Duration::from_secs(30)).await;
+                let outcome = connection
+                    .fetch_events(filter, Duration::from_secs(30))
+                    .await;
                 let _ = result_tx.send(Nip65DiscoveryResult {
                     source_relay,
                     authors,
@@ -5039,10 +5027,7 @@ impl SyncManager {
         }
     }
 
-    async fn install_nip65_overlay(
-        &mut self,
-        new_overlay: HashMap<String, HashSet<EventId>>,
-    ) {
+    async fn install_nip65_overlay(&mut self, new_overlay: HashMap<String, HashSet<EventId>>) {
         let old_overlay = std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_overlay);
         if old_overlay == self.nip65_discovery.inbox_roots {
             return;
@@ -5086,7 +5071,10 @@ impl SyncManager {
             )
             .await;
             if event.kind == Kind::RelayList
-                && matches!(process_result, ProcessResult::Saved | ProcessResult::Duplicate)
+                && matches!(
+                    process_result,
+                    ProcessResult::Saved | ProcessResult::Duplicate
+                )
             {
                 represented_by_source.insert(event.pubkey);
             }
@@ -5109,10 +5097,9 @@ impl SyncManager {
         for author in &result.authors {
             let retry_after =
                 nip65_author_retry_after(query_succeeded, &represented_by_source, author);
-            self.nip65_discovery.next_attempt_at.insert(
-                (result.source_relay.clone(), *author),
-                now + retry_after,
-            );
+            self.nip65_discovery
+                .next_attempt_at
+                .insert((result.source_relay.clone(), *author), now + retry_after);
         }
 
         let mut changed = false;
@@ -5126,8 +5113,7 @@ impl SyncManager {
                 .get(&author)
                 .is_none_or(|current| {
                     candidate.created_at > current.created_at
-                        || (candidate.created_at == current.created_at
-                            && candidate.id < current.id)
+                        || (candidate.created_at == current.created_at && candidate.id < current.id)
                 });
             if replace {
                 self.nip65_discovery
@@ -5193,8 +5179,11 @@ impl SyncManager {
             return;
         }
         let now = Instant::now();
-        let has_due_author = self.nip65_discovery.author_sources.iter().any(
-            |(author, sources)| {
+        let has_due_author = self
+            .nip65_discovery
+            .author_sources
+            .iter()
+            .any(|(author, sources)| {
                 sources.contains(source)
                     && !self
                         .nip65_discovery
@@ -5205,8 +5194,7 @@ impl SyncManager {
                         .next_attempt_at
                         .get(&(source.to_string(), *author))
                         .is_none_or(|due| *due <= now)
-            },
-        );
+            });
         if !has_due_author {
             tracing::debug!(
                 relay = %source,
@@ -5666,10 +5654,7 @@ impl SyncManager {
                     Instant::now() + dependency_relay_retention(),
                 );
                 if !self.connections.contains_key(&relay_url) {
-                    if !self
-                        .register_relay(relay_url.clone(), false, false)
-                        .await
-                    {
+                    if !self.register_relay(relay_url.clone(), false, false).await {
                         continue;
                     }
                     self.schedule_connect_relay(&relay_url).await;
@@ -6655,8 +6640,8 @@ impl SyncManager {
         } else {
             policy_refusal(reason)
         };
-        if let Some(category) = policy_category
-            .filter(|category| *category != PolicyRefusal::FilterIncompatible)
+        if let Some(category) =
+            policy_category.filter(|category| *category != PolicyRefusal::FilterIncompatible)
         {
             let removed_batch = {
                 let mut pending = self.pending_sync_index.write().await;
@@ -6951,8 +6936,7 @@ impl SyncManager {
         self.dependency_relay_deadlines
             .retain(|_, deadline| *deadline > now);
 
-        let mut desired_relays: HashSet<String> =
-            self.derive_targets().await.into_keys().collect();
+        let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
 
         // Collect relays to disconnect
@@ -7065,8 +7049,7 @@ impl SyncManager {
     ///
     /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
-        let desired_relays: HashSet<String> =
-            self.derive_targets().await.into_keys().collect();
+        let desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
 
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {
@@ -7626,9 +7609,7 @@ impl SyncManager {
                         }
                     }
                 }
-                for (idx, (subscription_id, filter)) in
-                    planned_subscriptions.iter().enumerate()
-                {
+                for (idx, (subscription_id, filter)) in planned_subscriptions.iter().enumerate() {
                     let result = if let Some(conn) = self.connections.get(relay_url) {
                         conn.subscribe_filter_with_id(
                             filter.clone(),
@@ -7649,12 +7630,9 @@ impl SyncManager {
                         );
                         let completed_batch = {
                             let mut pending = self.pending_sync_index.write().await;
-                            if let Some(batch) = pending
-                                .get_mut(relay_url)
-                                .and_then(|batches| {
-                                    batches.iter_mut().find(|batch| batch.batch_id == batch_id)
-                                })
-                            {
+                            if let Some(batch) = pending.get_mut(relay_url).and_then(|batches| {
+                                batches.iter_mut().find(|batch| batch.batch_id == batch_id)
+                            }) {
                                 batch.outstanding_subs.remove(subscription_id);
                             }
                             take_drained_batch_as_failed(&mut pending, relay_url, batch_id)
@@ -7843,20 +7821,12 @@ mod tests {
         let represented_by_source = HashSet::new();
 
         assert_eq!(
-            nip65_author_retry_after(
-                true,
-                &represented_by_source,
-                &author_with_retained_list,
-            ),
+            nip65_author_retry_after(true, &represented_by_source, &author_with_retained_list,),
             nip65_discovery_retry_interval()
         );
         let represented_by_source = HashSet::from([author_with_retained_list]);
         assert_eq!(
-            nip65_author_retry_after(
-                true,
-                &represented_by_source,
-                &author_with_retained_list,
-            ),
+            nip65_author_retry_after(true, &represented_by_source, &author_with_retained_list,),
             nip65_discovery_refresh_interval()
         );
     }
@@ -7879,14 +7849,8 @@ mod tests {
         assert_eq!(window.saved, 1);
         assert_eq!(window.duplicate, 1);
         assert_eq!(window.queue_delay, std::time::Duration::from_millis(20));
-        assert_eq!(
-            window.max_queue_delay,
-            std::time::Duration::from_millis(12)
-        );
-        assert_eq!(
-            window.processing_time,
-            std::time::Duration::from_millis(10)
-        );
+        assert_eq!(window.max_queue_delay, std::time::Duration::from_millis(12));
+        assert_eq!(window.processing_time, std::time::Duration::from_millis(10));
         assert_eq!(
             window.max_processing_time,
             std::time::Duration::from_millis(7)
@@ -8013,18 +7977,18 @@ mod tests {
             MAX_FILTERS_PER_REQ,
         );
         let (filter_index, first, until) = rotation.next_request(now).unwrap();
-        assert!(first.iter().all(|filter| {
-            serde_json::to_value(filter).unwrap().get("since").is_none()
-        }));
+        assert!(first
+            .iter()
+            .all(|filter| { serde_json::to_value(filter).unwrap().get("since").is_none() }));
         rotation.mark_started(41, filter_index, until);
         assert!(rotation.next_request(now).is_none());
 
         assert!(rotation.mark_completed(41, false));
         let (retry_index, retry, retry_until) = rotation.next_request(now).unwrap();
         assert_eq!(retry_index, filter_index);
-        assert!(retry.iter().all(|filter| {
-            serde_json::to_value(filter).unwrap().get("since").is_none()
-        }));
+        assert!(retry
+            .iter()
+            .all(|filter| { serde_json::to_value(filter).unwrap().get("since").is_none() }));
         rotation.mark_started(42, retry_index, retry_until);
         assert!(rotation.mark_completed(42, true));
 
@@ -8102,7 +8066,11 @@ mod tests {
         // One state filter plus one a/A/q and one e/E/q family. Appending
         // descendants separately would produce thirteen filters here.
         assert_eq!(packed.len(), 7);
-        let json = packed.iter().map(Filter::as_json).collect::<Vec<_>>().join("\n");
+        let json = packed
+            .iter()
+            .map(Filter::as_json)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(json.contains(&root.to_hex()));
         assert!(json.contains(&descendant.to_hex()));
         assert!(json.contains("30617:owner:repo"));
@@ -8715,7 +8683,10 @@ mod tests {
             relay,
             &subscription_id
         ));
-        assert!(attempts.is_empty(), "a refused retry must retire its marker");
+        assert!(
+            attempts.is_empty(),
+            "a refused retry must retire its marker"
+        );
     }
 
     #[test]
@@ -9144,7 +9115,10 @@ mod tests {
         let subscription_ids: Vec<_> = (0..169)
             .map(|index| SubscriptionId::new(format!("hydration-{index}")))
             .collect();
-        let event_ids = [EventId::from_byte_array([1; 32]), EventId::from_byte_array([2; 32])];
+        let event_ids = [
+            EventId::from_byte_array([1; 32]),
+            EventId::from_byte_array([2; 32]),
+        ];
 
         register_negentropy_hydration_attempt(
             &mut batch,
@@ -9157,7 +9131,12 @@ mod tests {
         assert_eq!(batch.requested_event_ids.as_ref().unwrap().len(), 2);
         assert_eq!(batch.received_event_ids, Some(HashSet::new()));
         for event_id in event_ids {
-            if batch.requested_event_ids.as_ref().unwrap().contains(&event_id) {
+            if batch
+                .requested_event_ids
+                .as_ref()
+                .unwrap()
+                .contains(&event_id)
+            {
                 batch.received_event_ids.as_mut().unwrap().insert(event_id);
             }
         }

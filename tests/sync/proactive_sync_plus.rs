@@ -5,8 +5,8 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 
 use crate::common::{
-    build_layer2_issue_event, repo_coord, send_to_relay_url, setup_announcement_on_relay,
-    wait_for_event_on_relay, MockRelay, TestClient, TestRelay, reserve_port,
+    build_layer2_issue_event, repo_coord, reserve_port, send_to_relay_url,
+    setup_announcement_on_relay, wait_for_event_on_relay, MockRelay, TestClient, TestRelay,
 };
 
 #[tokio::test]
@@ -157,9 +157,9 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
         "the advertised outbox connection should be identified as discovery-only"
     );
     assert!(
-        !sync_log.lines().any(|line| {
-            line.contains("Starting fresh_start") && line.contains(outbox.url())
-        }),
+        !sync_log
+            .lines()
+            .any(|line| { line.contains("Starting fresh_start") && line.contains(outbox.url()) }),
         "querying an advertised outbox must not start ordinary repository sync against it"
     );
     let draining_reply = EventBuilder::new(Kind::TextNote, "reply on naturally draining inbox")
