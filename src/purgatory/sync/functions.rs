@@ -15,9 +15,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
-use super::context::SyncContext;
+use super::context::{GitFetchRole, SyncContext};
 use super::throttle::ThrottleManager;
 use crate::sync::naughty_list::NaughtyListTracker;
+
+/// A primary gets a substantial head start before one alternative server is
+/// allowed to duplicate the same object demand. This is a hedge trigger, not
+/// a timeout: neither legitimate long-running fetch is killed.
+const REPOSITORY_FETCH_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct RepositoryFetchOutcome {
+    fetched: usize,
+    attempted_urls: Vec<String>,
+}
 
 /// Extract domain from a URL.
 ///
@@ -324,17 +335,62 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
     url: &str,
     throttle_manager: &Arc<ThrottleManager>,
 ) -> usize {
+    sync_identifier_from_urls(ctx, identifier, vec![url.to_string()], throttle_manager)
+        .await
+        .fetched
+}
+
+async fn fetch_from_url<C: SyncContext + ?Sized>(
+    ctx: &C,
+    repo: &std::path::Path,
+    url: &str,
+    needed_oids: &[String],
+    throttle_manager: &Arc<ThrottleManager>,
+    role: GitFetchRole,
+) -> Vec<String> {
     let domain = match extract_domain(url) {
         Some(d) => d,
-        None => {
-            debug!(
-                identifier = %identifier,
-                url = %url,
-                "Could not extract domain from URL"
-            );
-            return 0;
-        }
+        None => return Vec::new(),
     };
+
+    let _fetch_permit = throttle_manager.acquire_fetch_pass(&domain).await;
+    match ctx.fetch_oids_with_role(repo, url, needed_oids, role).await {
+        Ok(fetched) => fetched,
+        Err(error) => {
+            debug!(url = %url, %error, "Fetch failed");
+            Vec::new()
+        }
+    }
+}
+
+async fn process_unique_fetched<C: SyncContext + ?Sized>(
+    ctx: &C,
+    repo: &std::path::Path,
+    fetched: Vec<String>,
+    processed: &mut HashSet<String>,
+) -> usize {
+    let new_oids: HashSet<String> = fetched
+        .into_iter()
+        .filter(|oid| !processed.contains(oid))
+        .collect();
+    if new_oids.is_empty() {
+        return 0;
+    }
+    if let Err(error) = ctx.process_newly_available_git_data(repo, &new_oids).await {
+        debug!(%error, "Failed to process newly available git data");
+        return 0;
+    }
+    processed.extend(new_oids.iter().cloned());
+    new_oids.len()
+}
+
+async fn sync_identifier_from_urls<C: SyncContext + ?Sized>(
+    ctx: &C,
+    identifier: &str,
+    mut urls: Vec<String>,
+    throttle_manager: &Arc<ThrottleManager>,
+) -> RepositoryFetchOutcome {
+    let mut outcome = RepositoryFetchOutcome::default();
 
     // Get repository data for target repo path
     let repo_data = match ctx.fetch_repository_data_with_purgatory(identifier).await {
@@ -345,7 +401,7 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
                 error = %e,
                 "Failed to fetch repo data"
             );
-            return 0;
+            return outcome;
         }
     };
 
@@ -353,9 +409,15 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
         Some(path) => path,
         None => {
             debug!(identifier = %identifier, "No target repo found");
-            return 0;
+            return outcome;
         }
     };
+
+    // The path, rather than the identifier or remote domain, is the local
+    // mutation boundary. A waiting caller re-checks demand after the active
+    // wave, coalescing duplicate notifications without losing newly arrived
+    // OIDs.
+    let _repository = throttle_manager.coordinate_repository(&target_repo).await;
 
     // Collect needed OIDs
     let needed_oids: Vec<String> = ctx.collect_needed_oids(identifier).into_iter().collect();
@@ -364,65 +426,101 @@ pub async fn sync_identifier_from_url<C: SyncContext + ?Sized>(
             identifier = %identifier,
             "No OIDs needed - nothing to fetch"
         );
-        return 0;
+        return outcome;
     }
 
-    // Per-domain limits alone do not bound aggregate work when a cold sync
-    // discovers many domains simultaneously. Wait for the process-wide permit
-    // before occupying a domain slot, then retain it for the complete remote
-    // Git pass so subprocess fan-out stays bounded.
-    let _background_permit = throttle_manager.acquire_global_request().await;
-
-    // Perform the fetch with per-domain throttle tracking.
-    throttle_manager.start_request(&domain);
-    let fetch_result = ctx.fetch_oids(&target_repo, url, &needed_oids).await;
-    throttle_manager.complete_request(&domain);
-
-    let fetched_oids = match fetch_result {
-        Ok(fetched) if !fetched.is_empty() => {
-            debug!(
-                identifier = %identifier,
-                url = %url,
-                oids_fetched = fetched.len(),
-                "Fetch succeeded"
-            );
-            fetched
-        }
-        Ok(_) => {
-            debug!(
-                identifier = %identifier,
-                url = %url,
-                "Fetch returned no OIDs (not available on remote)"
-            );
-            vec![]
-        }
-        Err(e) => {
-            debug!(
-                identifier = %identifier,
-                url = %url,
-                error = %e,
-                "Fetch failed"
-            );
-            vec![]
-        }
+    urls.retain(|url| extract_domain(url).is_some());
+    let Some(primary_url) = urls.first().cloned() else {
+        return outcome;
     };
+    let primary_domain = extract_domain(&primary_url).unwrap();
+    let hedge_url = urls
+        .iter()
+        .skip(1)
+        .find(|url| extract_domain(url).as_deref() != Some(primary_domain.as_str()))
+        .cloned();
 
-    // Try to process any events that can now be satisfied
-    if !fetched_oids.is_empty() {
-        let new_oids: HashSet<String> = fetched_oids.iter().cloned().collect();
-        if let Err(e) = ctx
-            .process_newly_available_git_data(&target_repo, &new_oids)
-            .await
-        {
-            debug!(
-                identifier = %identifier,
-                error = %e,
-                "Failed to process newly available git data"
-            );
+    outcome.attempted_urls.push(primary_url.clone());
+    let primary = fetch_from_url(
+        ctx,
+        &target_repo,
+        &primary_url,
+        &needed_oids,
+        throttle_manager,
+        GitFetchRole::Primary,
+    );
+    tokio::pin!(primary);
+    let mut processed = HashSet::new();
+
+    let delay = tokio::time::sleep(REPOSITORY_FETCH_HEDGE_DELAY);
+    tokio::pin!(delay);
+    tokio::select! {
+        biased;
+        fetched = &mut primary => {
+            outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+            return outcome;
+        }
+        _ = &mut delay => {}
+    }
+
+    let Some(hedge_url) = hedge_url else {
+        let fetched = primary.await;
+        outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+        return outcome;
+    };
+    outcome.attempted_urls.push(hedge_url.clone());
+    let hedge = fetch_from_url(
+        ctx,
+        &target_repo,
+        &hedge_url,
+        &needed_oids,
+        throttle_manager,
+        GitFetchRole::Hedge,
+    );
+    tokio::pin!(hedge);
+
+    tokio::select! {
+        biased;
+        fetched = &mut primary => {
+            outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+            let fetched = hedge.await;
+            outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+        }
+        fetched = &mut hedge => {
+            outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+            let fetched = primary.await;
+            outcome.fetched += process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
         }
     }
 
-    fetched_oids.len()
+    // A stalled subprocess is returned as an ordinary failed attempt after
+    // its process group has been reaped. If neither member of the bounded
+    // two-source wave supplied an object, keep walking the remaining sources
+    // sequentially rather than leaving this repository pinned to the pair.
+    // No third fetch overlaps the primary and hedge.
+    if outcome.fetched == 0 {
+        for fallback_url in urls.into_iter().skip(1) {
+            if fallback_url == hedge_url {
+                continue;
+            }
+            outcome.attempted_urls.push(fallback_url.clone());
+            let fetched = fetch_from_url(
+                ctx,
+                &target_repo,
+                &fallback_url,
+                &needed_oids,
+                throttle_manager,
+                GitFetchRole::Primary,
+            )
+            .await;
+            outcome.fetched +=
+                process_unique_fetched(ctx, &target_repo, fetched, &mut processed).await;
+            if outcome.fetched > 0 {
+                break;
+            }
+        }
+    }
+    outcome
 }
 
 /// Sync git data for an identifier.
@@ -477,9 +575,28 @@ pub async fn sync_identifier<C: SyncContext + ?Sized>(
                     "Found non-throttled URL to try"
                 );
 
-                // Fetch from this URL
-                sync_identifier_from_url(ctx, identifier, &url, throttle_manager).await;
-                tried_urls.insert(url);
+                // Build one wave from currently admissible sources. The
+                // coordinator starts the preferred primary immediately and
+                // at most one distinct-domain hedge after its head start.
+                let mut wave_urls = vec![url.clone()];
+                let mut discovered = tried_urls.clone();
+                discovered.insert(url);
+                while let Some(candidate) = sync_identifier_next_url(
+                    ctx,
+                    identifier,
+                    None,
+                    &discovered,
+                    throttle_manager,
+                    git_naughty_list,
+                )
+                .await
+                {
+                    discovered.insert(candidate.clone());
+                    wave_urls.push(candidate);
+                }
+                let outcome =
+                    sync_identifier_from_urls(ctx, identifier, wave_urls, throttle_manager).await;
+                tried_urls.extend(outcome.attempted_urls);
 
                 // Check if sync is now complete
                 if !ctx.has_pending_events(identifier) {
@@ -836,6 +953,276 @@ mod tests {
 
         // After completion, domain should not be throttled
         assert!(!throttle_manager.is_throttled("github.com"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_repo_demand_joins_one_fetch_wave() {
+        let url = "https://primary.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(url, &["abc123"])
+                .url_waits_for_release(url),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+
+        let first_mock = mock.clone();
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move {
+            sync_identifier_from_url(&*first_mock, "repo", url, &first_manager).await
+        });
+        mock.wait_for_fetches(1).await;
+
+        let second_mock = mock.clone();
+        let second_manager = manager.clone();
+        let second = tokio::spawn(async move {
+            sync_identifier_from_url(&*second_mock, "repo", url, &second_manager).await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(mock.fetch_log().len(), 1);
+
+        mock.release_fetch(url);
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 0);
+        assert_eq!(mock.fetch_log().len(), 1);
+        assert_eq!(mock.process_call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_distinct_domain_hedge_can_supply_the_oid() {
+        let primary = "https://a.example/repo.git";
+        let hedge = "https://b.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(primary, &["abc123"])
+                .url_provides(hedge, &["abc123"])
+                .url_waits_for_release(primary),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), hedge.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        assert_eq!(mock.process_call_count(), 1, "hedge should supply the OID");
+        mock.release_fetch(primary);
+        assert_eq!(task.await.unwrap().fetched, 1);
+        assert_eq!(mock.process_call_count(), 1, "same OID is promoted once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_primary_does_not_hide_a_productive_hedge() {
+        let primary = "https://a.example/repo.git";
+        let productive_hedge = "https://b.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(productive_hedge, &["abc123"])
+                .url_waits_for_release(primary),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), productive_hedge.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+        assert_eq!(task.await.unwrap().fetched, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_pair_falls_back_to_a_third_source() {
+        let primary = "https://a.example/repo.git";
+        let hedge = "https://b.example/repo.git";
+        let fallback = "https://c.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_should_fail(primary)
+                .url_should_fail(hedge)
+                .url_waits_for_release(primary)
+                .url_provides(fallback, &["abc123"]),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), hedge.to_string(), fallback.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+
+        let outcome = task.await.unwrap();
+        assert_eq!(outcome.fetched, 1);
+        assert_eq!(
+            outcome.attempted_urls,
+            vec![primary.to_string(), hedge.to_string(), fallback.to_string()]
+        );
+        assert_eq!(mock.process_call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_object_observation_is_not_treated_as_source_attribution() {
+        let primary = "https://a.example/repo.git";
+        let observer = "https://b.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_provides(primary, &["abc123"])
+                .url_waits_after_fetch(primary)
+                .url_reports_shared_objects(observer),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), observer.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        mock.release_fetch(primary);
+        assert_eq!(task.await.unwrap().fetched, 1);
+        assert_eq!(mock.process_call_count(), 1);
+        // The observer returned the primary's shared object. There is
+        // deliberately no winner score or reorder API to receive that
+        // ambiguous result.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_slow_fetches_never_run_a_third_concurrently() {
+        let first = "https://a.example/repo.git";
+        let second = "https://b.example/repo.git";
+        let third = "https://c.example/repo.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_waits_for_release(first)
+                .url_waits_for_release(second),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![first.to_string(), second.to_string(), third.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY).await;
+        mock.wait_for_fetches(2).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY * 10).await;
+        assert_eq!(mock.fetch_log().len(), 2);
+        mock.release_fetch(first);
+        mock.release_fetch(second);
+        task.await.unwrap();
+        assert!(mock.fetch_log().iter().any(|url| url == third));
+    }
+
+    #[tokio::test]
+    async fn different_repository_paths_fetch_independently() {
+        let first_url = "https://a.example/one.git";
+        let second_url = "https://b.example/two.git";
+        let first = Arc::new(
+            MockSyncContext::new()
+                .with_target_repo("/tmp/repo-one")
+                .with_needed_oids(&["one"])
+                .url_waits_for_release(first_url),
+        );
+        let second = Arc::new(
+            MockSyncContext::new()
+                .with_target_repo("/tmp/repo-two")
+                .with_needed_oids(&["two"])
+                .url_waits_for_release(second_url),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+
+        let first_task = {
+            let ctx = first.clone();
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                sync_identifier_from_url(&*ctx, "one", first_url, &manager).await
+            })
+        };
+        let second_task = {
+            let ctx = second.clone();
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                sync_identifier_from_url(&*ctx, "two", second_url, &manager).await
+            })
+        };
+        first.wait_for_fetches(1).await;
+        second.wait_for_fetches(1).await;
+        first.release_fetch(first_url);
+        second.release_fetch(second_url);
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_domain_alternative_is_not_a_hedge() {
+        let primary = "https://same.example/one.git";
+        let alternative = "https://same.example/two.git";
+        let mock = Arc::new(
+            MockSyncContext::new()
+                .with_needed_oids(&["abc123"])
+                .url_waits_for_release(primary),
+        );
+        let manager = Arc::new(ThrottleManager::new(5, 100));
+        let task_mock = mock.clone();
+        let task_manager = manager.clone();
+        let task = tokio::spawn(async move {
+            sync_identifier_from_urls(
+                &*task_mock,
+                "repo",
+                vec![primary.to_string(), alternative.to_string()],
+                &task_manager,
+            )
+            .await
+        });
+        mock.wait_for_fetches(1).await;
+        tokio::time::advance(REPOSITORY_FETCH_HEDGE_DELAY * 2).await;
+        assert_eq!(mock.fetch_log(), vec![primary.to_string()]);
+        mock.release_fetch(primary);
+        task.await.unwrap();
     }
 
     #[tokio::test]

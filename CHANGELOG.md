@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter-count and serialized-byte limits. Repository filter chunks are
   deterministic, and failed tail replacement restores the previous tail.
 
+### Fixed
+
+- Bound duplicate repository Git acquisition to one primary and one delayed
+  distinct-domain hedge, and recover from silent transports without imposing a
+  total fetch deadline. Continuously active large transfers remain unbounded;
+  a process group silent for five minutes is terminated gracefully then
+  forcibly, after which remaining sources are tried sequentially. Concurrent
+  object acquisition does not write `FETCH_HEAD`, run automatic maintenance,
+  or infer source speed from a shared object database.
+
 ## [2.1.2] - 2026-08-08
 
 ngit-grasp 2.1.2 is a patch release improving repository-event sync under

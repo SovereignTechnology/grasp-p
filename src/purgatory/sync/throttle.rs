@@ -18,9 +18,10 @@
 use dashmap::DashMap;
 use indexmap::IndexMap;
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tracing::debug;
 
 use super::context::SyncContext;
@@ -39,6 +40,7 @@ const PRESSURE_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 // Sustained CPU throttling can alternate healthy and pressured samples. Keep
 // the operational signal without turning that expected oscillation into spam.
 const PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const REPOSITORY_COORDINATOR_CLEANUP_THRESHOLD: usize = 4096;
 
 fn grow_healthy_allowance(current: usize) -> usize {
     // Pressure counters describe work that has already run. Grow gradually so
@@ -347,6 +349,35 @@ impl DomainThrottle {
         recent_count < self.max_per_minute as usize
     }
 
+    /// Reserve capacity while holding the domain mutex.
+    ///
+    /// Combining the capacity check and accounting increment closes the race
+    /// where several callers could all observe the last slot before any of
+    /// them recorded their request.
+    fn try_start_request(&mut self) -> bool {
+        self.cleanup_request_times();
+        if !self.has_capacity() {
+            return false;
+        }
+        self.start_request();
+        true
+    }
+
+    /// Time until rate-window capacity can become available. `None` means the
+    /// caller is blocked only by concurrent work and should await a release.
+    fn retry_after(&mut self) -> Option<Duration> {
+        self.cleanup_request_times();
+        if self.in_flight >= self.max_concurrent {
+            return None;
+        }
+        if self.request_times.len() < self.max_per_minute as usize {
+            return Some(Duration::ZERO);
+        }
+        self.request_times.front().map(|started| {
+            Duration::from_secs(60).saturating_sub(Instant::now().duration_since(*started))
+        })
+    }
+
     /// Check if there are any identifiers in the queue.
     pub fn has_queued_work(&self) -> bool {
         !self.queue.is_empty()
@@ -366,7 +397,10 @@ impl DomainThrottle {
     pub fn complete_request(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
 
-        // Clean old timestamps outside the 60-second window
+        self.cleanup_request_times();
+    }
+
+    fn cleanup_request_times(&mut self) {
         let now = Instant::now();
         let window = Duration::from_secs(60);
         while self
@@ -485,6 +519,15 @@ pub struct ThrottleManager {
     /// Resource-pressure admission gate shared across every remote domain.
     pressure_gate: Arc<BackgroundPressureGate>,
 
+    /// Wakes fetch passes waiting for a per-domain slot. The domain state is
+    /// still checked under its mutex, so a shared notifier is sufficient and
+    /// a wake for another domain is only a harmless extra check.
+    domain_capacity: Arc<Notify>,
+
+    /// One coordinator lock per local object database. Waiting callers join
+    /// the active wave and re-check demand after it completes.
+    repository_fetches: DashMap<PathBuf, Weak<AsyncMutex<()>>>,
+
     /// Sync context for processing queued identifiers.
     /// Set once at startup via `set_context()`.
     ctx: OnceLock<Arc<dyn SyncContext>>,
@@ -492,6 +535,19 @@ pub struct ThrottleManager {
     /// Naughty list tracker for git remote domains with persistent errors.
     /// Set once at startup via `set_git_naughty_list()`.
     git_naughty_list: OnceLock<Arc<NaughtyListTracker>>,
+}
+
+/// Cancellation-safe ownership of one remote Git pass's admission.
+pub(super) struct FetchPassPermit {
+    manager: Arc<ThrottleManager>,
+    domain: String,
+    _global: BackgroundPressurePermit,
+}
+
+impl Drop for FetchPassPermit {
+    fn drop(&mut self) {
+        self.manager.release_domain_request(&self.domain);
+    }
 }
 
 impl ThrottleManager {
@@ -512,15 +568,76 @@ impl ThrottleManager {
             max_concurrent_per_domain: max_concurrent,
             max_per_minute_per_domain: max_per_minute,
             pressure_gate,
+            domain_capacity: Arc::new(Notify::new()),
+            repository_fetches: DashMap::new(),
             ctx: OnceLock::new(),
             git_naughty_list: OnceLock::new(),
         }
     }
 
-    /// Wait for process-wide background Git capacity.
+    pub(super) async fn coordinate_repository(&self, path: &Path) -> OwnedMutexGuard<()> {
+        if self.repository_fetches.len() >= REPOSITORY_COORDINATOR_CLEANUP_THRESHOLD {
+            self.repository_fetches
+                .retain(|_, lock| lock.strong_count() > 0);
+        }
+        let mut entry = self
+            .repository_fetches
+            .entry(path.to_path_buf())
+            .or_insert_with(Weak::new);
+        let lock = match entry.upgrade() {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(AsyncMutex::new(()));
+                *entry = Arc::downgrade(&lock);
+                lock
+            }
+        };
+        drop(entry);
+        lock.lock_owned().await
+    }
+
+    /// Atomically admit one complete remote Git pass.
     ///
-    /// The owned permit spans the complete `fetch_oids` pass (ls-remote plus
-    /// any fetches) and releases automatically on every return or cancellation.
+    /// The returned permit spans `ls-remote` and every fetch needed by the
+    /// pass. It owns both process-wide pressure admission and the per-domain
+    /// reservation, and releases both on every return, panic, or cancellation.
+    /// Keeping this as the sole admission API also ensures that extracting the
+    /// `ls-remote` phase cannot accidentally bypass domain accounting.
+    pub(super) async fn acquire_fetch_pass(self: &Arc<Self>, domain: &str) -> FetchPassPermit {
+        loop {
+            // Register before checking capacity so a release between the
+            // failed check and the await cannot be lost.
+            let notified = self.domain_capacity.notified();
+            let global = self.pressure_gate.acquire().await;
+
+            let retry_after = {
+                let entry = self.get_or_create_throttle(domain);
+                let mut throttle = entry.lock().unwrap();
+                if throttle.try_start_request() {
+                    return FetchPassPermit {
+                        manager: self.clone(),
+                        domain: domain.to_string(),
+                        _global: global,
+                    };
+                }
+                throttle.retry_after()
+            };
+
+            // Do not pin scarce process-wide capacity while this particular
+            // remote domain is full.
+            drop(global);
+            if let Some(delay) = retry_after {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn acquire_global_request(&self) -> BackgroundPressurePermit {
         self.pressure_gate.acquire().await
     }
@@ -582,9 +699,9 @@ impl ThrottleManager {
         self.throttles.get(domain).unwrap()
     }
 
-    /// Record that a request is starting for a domain.
-    ///
-    /// Increments in-flight count and records timestamp for rate limiting.
+    /// Direct accounting hook retained only for tests that arrange a domain's
+    /// pre-existing saturation before exercising URL selection.
+    #[cfg(test)]
     pub fn start_request(&self, domain: &str) {
         let entry = self.get_or_create_throttle(domain);
         let mut throttle = entry.lock().unwrap();
@@ -610,7 +727,7 @@ impl ThrottleManager {
     ///
     /// # Arguments
     /// * `domain` - The domain that completed a request
-    pub fn complete_request(self: &Arc<Self>, domain: &str) {
+    fn release_domain_request(self: &Arc<Self>, domain: &str) {
         let should_trigger = {
             if let Some(entry) = self.throttles.get(domain) {
                 let mut throttle = entry.lock().unwrap();
@@ -620,6 +737,8 @@ impl ThrottleManager {
                 false
             }
         };
+
+        self.domain_capacity.notify_waiters();
 
         if should_trigger {
             self.try_process_next(domain);
@@ -1004,6 +1123,56 @@ mod tests {
 
         // Domain throttle should now exist
         assert!(manager.throttles.contains_key("example.com"));
+    }
+
+    #[tokio::test]
+    async fn fetch_pass_admission_atomically_holds_the_domain_slot() {
+        let manager = Arc::new(ThrottleManager::new(1, 100));
+        let first = manager.acquire_fetch_pass("example.com").await;
+
+        let waiting_manager = manager.clone();
+        let mut waiting =
+            tokio::spawn(async move { waiting_manager.acquire_fetch_pass("example.com").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "a second pass must not race through the same domain's last slot"
+        );
+
+        drop(first);
+        let _second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("dropping the first permit should wake the waiter")
+            .expect("waiter task should finish");
+
+        let throttle = manager.throttles.get("example.com").unwrap();
+        assert_eq!(throttle.lock().unwrap().request_times.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_fetch_pass_releases_domain_admission() {
+        let manager = Arc::new(ThrottleManager::new(1, 100));
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let holding_manager = manager.clone();
+        let holding = tokio::spawn(async move {
+            let _permit = holding_manager.acquire_fetch_pass("example.com").await;
+            let _ = acquired_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        acquired_rx.await.expect("holder should acquire the permit");
+
+        holding.abort();
+        holding
+            .await
+            .expect_err("the holding task should be cancelled");
+
+        let _replacement = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.acquire_fetch_pass("example.com"),
+        )
+        .await
+        .expect("cancellation must return domain capacity");
     }
 
     #[tokio::test]

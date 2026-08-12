@@ -330,12 +330,13 @@ Attempt 4: Try repo-A (index=0) → ...
 
 ### Trigger-Based Processing (Not Polling)
 
-Domain queues **don't poll** for capacity. Instead, processing is triggered by two events:
+Domain queues **don't poll** for concurrent capacity. Instead, processing is triggered by two events:
 
-1. **`complete_request()`** - A request finishes, slot frees
+1. **Fetch-pass permit drop** - A request finishes or is cancelled, so its
+   cancellation-safe RAII permit releases the slot
 2. **`enqueue_identifier()`** - New identifier added to queue
 
-Both methods check `has_capacity()` and trigger `try_process_next()` if true.
+Both paths check `has_capacity()` and trigger `try_process_next()` if true.
 
 **Why trigger-based?**
 
@@ -344,6 +345,14 @@ Both methods check `has_capacity()` and trigger `try_process_next()` if true.
 - ✅ Simpler reasoning (event-driven)
 
 **Implementation**: [`src/purgatory/sync/throttle.rs:ThrottleManager`](../../src/purgatory/sync/throttle.rs)
+
+The capacity check and reservation happen atomically under the domain's
+throttle lock. URL selection's earlier capacity observation is only a routing
+hint: the fetch pass must still acquire the permit before starting, so racing
+identifiers cannot all consume the final slot. One permit accounts for the
+whole current pass (`ls-remote` plus its fetch commands), preserving the
+existing per-pass rate semantics. It also owns process-wide pressure admission
+and drops that admission while waiting for a busy domain.
 
 ---
 
@@ -424,6 +433,69 @@ the sorted advertised OID set. Later passes skip those OIDs while the
 advertisement is unchanged; any ref-tip change clears that URL's memo and
 allows them to be retried. Entries expire lazily after 30 minutes and the
 memo is capped at 1,024 URLs, evicting the oldest entry when full.
+
+All three phases run beneath the pass's per-domain permit. Separating the
+comparison into its own helper in future must retain that permit; `ls-remote`
+is outbound work against the same Git server, not an unaccounted preflight.
+
+### Repository single-flight and delayed hedging
+
+Remote politeness and local mutation safety have different keys. Domain
+permits protect each Git server; a repository coordinator keyed by the
+resolved local bare-repository path prevents independent identifier/domain
+queues from starting uncoordinated work in the same object database. Demand
+arriving during an active wave waits, then re-checks the still-missing OIDs, so
+already-satisfied work is coalesced while later OIDs are not lost. Promotion
+of newly available data is serialized by the same coordinator and duplicate
+OIDs from two attempts are processed once.
+
+Each wave starts the first source in the event's deterministic source order. If it is still running after a
+conservative 30-second head start, one source on a different domain may start
+as a hedge. The hedge delay is not a timeout: active transfers may run for any
+duration. A third concurrent attempt is never started, and another URL on the
+primary's domain does not qualify as a hedge. Both attempts independently
+retain process-pressure and per-domain admission. If neither attempt supplies
+an object—whether because it fails or is terminated after sustained
+inactivity—the remaining URLs are attempted sequentially.
+
+The wave does not infer a faster source from which command completes first.
+Both contenders write the same object database, so either command can observe
+objects installed by the other and completion order cannot truthfully
+attribute those objects to a source. Persistent source scoring therefore needs
+isolated per-attempt object stores (and explicit winner promotion) and remains
+out of scope.
+
+### Streamed subprocess observability
+
+Outbound `ls-remote` and `fetch` commands use Tokio child processes with
+stdout and stderr drained concurrently, rather than blocking until a complete
+`Output` is buffered. Fetch commands request Git's progress stream and every
+child runs with `LC_ALL=C`, making phase text stable enough for observation
+without treating it as a protocol. Capture is operation-bounded while readers
+continue draining and counting bytes beyond the bound: advertisements retain
+at most 16 MiB, ordinary stdout 1 MiB, and stderr/progress 4 MiB. A noisy child
+therefore cannot deadlock on a full pipe or grow memory without limit. A
+truncated advertisement is detected explicitly and falls back to the existing
+residual-OID path.
+
+Prometheus exposes active children, completion outcomes, durations, and
+drained bytes using only bounded `operation`, `role`, and `stream` labels.
+After 60 seconds an active child emits a structured warning containing its
+operation, primary/hedge role, elapsed time, time since its last output, and
+stream byte counts; it repeats no more than every five minutes. Five minutes
+without output is treated as a stalled transport, not as a total-duration
+limit. The direct Git child and its helpers run in a private process group;
+recovery sends that group SIGTERM, waits up to ten seconds, then sends SIGKILL
+so a helper cannot retain a pipe, socket, or repository lock. A transfer which
+continues producing output is never terminated, and completion timing is not
+used to rank sources. Cancellation keeps a synchronous process-group guard
+armed while the direct child still anchors the group identity, so dropping a
+fetch future kills its helpers before repository and domain permits return.
+
+Fetches request objects without writing `FETCH_HEAD` and suppress automatic
+maintenance. This keeps the object-only operation free of shared ref-state and
+maintenance side effects before repository-level delayed hedging permits a
+second source to write objects concurrently.
 
 **Why not just list every OID as a want?** An earlier implementation did
 exactly that and dropped one OID from the batch on each `not our ref`

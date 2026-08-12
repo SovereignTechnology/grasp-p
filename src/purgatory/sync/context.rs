@@ -17,6 +17,21 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFetchRole {
+    Primary,
+    Hedge,
+}
+
+impl GitFetchRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Hedge => "hedge",
+        }
+    }
+}
+
 use crate::git::authorization::RepositoryData;
 use crate::git::sync::PurgatoryPromotionHooks;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
@@ -131,8 +146,23 @@ pub trait SyncContext: Send + Sync {
     ///
     /// # Returns
     /// List of OIDs that were successfully fetched
-    async fn fetch_oids(&self, repo_path: &Path, url: &str, oids: &[String])
-        -> Result<Vec<String>>;
+    async fn fetch_oids(
+        &self,
+        repo_path: &Path,
+        url: &str,
+        oids: &[String],
+    ) -> Result<Vec<String>> {
+        self.fetch_oids_with_role(repo_path, url, oids, GitFetchRole::Primary)
+            .await
+    }
+
+    async fn fetch_oids_with_role(
+        &self,
+        repo_path: &Path,
+        url: &str,
+        oids: &[String],
+        role: GitFetchRole,
+    ) -> Result<Vec<String>>;
 
     /// Process newly available git data.
     ///
@@ -192,8 +222,11 @@ pub trait SyncContext: Send + Sync {
 // =============================================================================
 
 use nostr_sdk::local_relay::LocalRelay;
-use std::process::Command;
+use std::process::ExitStatus;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
 use tracing::debug;
 
 use crate::nostr::builder::Nip34WritePolicy;
@@ -399,8 +432,315 @@ fn hardened_git_command(repo_path: &Path, resolve_pin: Option<&str>, args: &[Str
         .env_remove("all_proxy")
         .env_remove("ALL_PROXY")
         .env_remove("GIT_PROXY_COMMAND")
+        .env("LC_ALL", "C")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .current_dir(repo_path);
     command
+}
+
+const LS_REMOTE_STDOUT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+const GIT_STDOUT_CAPTURE_LIMIT: usize = 1024 * 1024;
+const GIT_STDERR_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_LONG_RUNNING_AFTER: Duration = Duration::from_secs(60);
+const GIT_LONG_RUNNING_REPEAT: Duration = Duration::from_secs(300);
+const GIT_INACTIVITY_LIMIT: Duration = Duration::from_secs(5 * 60);
+const GIT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct GitProcessPolicy {
+    inactivity_limit: Duration,
+    termination_grace: Duration,
+}
+
+impl Default for GitProcessPolicy {
+    fn default() -> Self {
+        Self {
+            inactivity_limit: GIT_INACTIVITY_LIMIT,
+            termination_grace: GIT_TERMINATION_GRACE,
+        }
+    }
+}
+
+#[derive(Default)]
+struct GitActivity {
+    last_millis: AtomicU64,
+    stdout_bytes: AtomicU64,
+    stderr_bytes: AtomicU64,
+}
+
+struct ObservedGitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct ProcessGroupGuard {
+    pgid: u32,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(pgid: u32) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        signal_process_group(self.pgid, signal)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cancellation drops this guard while the direct child still
+            // anchors the process-group identity. Synchronous best-effort
+            // cleanup prevents helpers outliving repository/domain permits.
+            let _ = signal_process_group(self.pgid, libc::SIGKILL);
+        }
+    }
+}
+
+async fn drain_git_stream<R: AsyncRead + Unpin>(
+    mut stream: R,
+    capture_limit: usize,
+    started: Instant,
+    activity: Arc<GitActivity>,
+    stdout: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        activity
+            .last_millis
+            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let counter = if stdout {
+            &activity.stdout_bytes
+        } else {
+            &activity.stderr_bytes
+        };
+        counter.fetch_add(read as u64, Ordering::Relaxed);
+        let remaining = capture_limit.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    Ok(captured)
+}
+
+async fn run_observed_git_command(
+    command: Command,
+    domain: &str,
+    operation: &'static str,
+    role: GitFetchRole,
+) -> Result<ObservedGitOutput> {
+    run_observed_git_command_with_policy(
+        command,
+        domain,
+        operation,
+        role,
+        GitProcessPolicy::default(),
+    )
+    .await
+}
+
+async fn run_observed_git_command_with_policy(
+    mut command: Command,
+    domain: &str,
+    operation: &'static str,
+    role: GitFetchRole,
+    policy: GitProcessPolicy,
+) -> Result<ObservedGitOutput> {
+    let role = role.as_str();
+    let mut metric = crate::metrics::start_purgatory_git_subprocess(operation, role);
+    let started = Instant::now();
+    let activity = Arc::new(GitActivity::default());
+    // Give Git and every helper it creates (remote-http, credential helpers,
+    // upload-pack transports) a private process group. Inactivity recovery
+    // must not leave a descendant holding pipes, locks, or network sockets.
+    command.process_group(0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            metric.finish(false);
+            return Err(error.into());
+        }
+    };
+    let mut process_group = ProcessGroupGuard::new(
+        child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("git {operation} child had no process id"))?,
+    );
+    let Some(stdout) = child.stdout.take() else {
+        metric.finish(false);
+        return Err(anyhow::anyhow!("git {operation} stdout was not piped"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        metric.finish(false);
+        return Err(anyhow::anyhow!("git {operation} stderr was not piped"));
+    };
+    let stdout_reader = tokio::spawn(drain_git_stream(
+        stdout,
+        if operation == "ls_remote" {
+            LS_REMOTE_STDOUT_CAPTURE_LIMIT
+        } else {
+            GIT_STDOUT_CAPTURE_LIMIT
+        },
+        started,
+        activity.clone(),
+        true,
+    ));
+    let stderr_reader = tokio::spawn(drain_git_stream(
+        stderr,
+        GIT_STDERR_CAPTURE_LIMIT,
+        started,
+        activity.clone(),
+        false,
+    ));
+
+    let first_log = tokio::time::Instant::now() + GIT_LONG_RUNNING_AFTER;
+    let mut long_running = tokio::time::interval_at(first_log, GIT_LONG_RUNNING_REPEAT);
+    let mut inactivity_check = tokio::time::interval(
+        policy.inactivity_limit.min(Duration::from_secs(1)),
+    );
+    inactivity_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stalled = false;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) => {
+                    // A normal Git exit means it has joined its helpers. Do
+                    // not retain an armed PGID after reaping the leader: that
+                    // identity could subsequently be reused.
+                    process_group.disarm();
+                    break status;
+                }
+                Err(error) => {
+                    metric.finish(false);
+                    return Err(error.into());
+                }
+            },
+            _ = long_running.tick() => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let last_millis = activity.last_millis.load(Ordering::Relaxed);
+                tracing::warn!(
+                    domain = %domain,
+                    operation,
+                    role,
+                    elapsed_secs = elapsed_ms / 1000,
+                    quiet_secs = elapsed_ms.saturating_sub(last_millis) / 1000,
+                    stdout_bytes = activity.stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed),
+                    "Outbound purgatory Git subprocess remains active"
+                );
+            }
+            _ = inactivity_check.tick() => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let last_millis = activity.last_millis.load(Ordering::Relaxed);
+                if Duration::from_millis(elapsed_ms.saturating_sub(last_millis))
+                    < policy.inactivity_limit
+                {
+                    continue;
+                }
+                stalled = true;
+                tracing::warn!(
+                    domain = %domain,
+                    operation,
+                    role,
+                    elapsed_secs = elapsed_ms / 1000,
+                    quiet_secs = elapsed_ms.saturating_sub(last_millis) / 1000,
+                    stdout_bytes = activity.stdout_bytes.load(Ordering::Relaxed),
+                    stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed),
+                    "Terminating inactive outbound purgatory Git process group"
+                );
+                process_group.signal(libc::SIGTERM)?;
+                // Keep the unreaped leader anchoring the PGID throughout the
+                // grace period. This avoids signalling a reused group id and
+                // still gives every helper a bounded chance to exit cleanly.
+                tokio::time::sleep(policy.termination_grace).await;
+                tracing::warn!(
+                    domain = %domain,
+                    operation,
+                    role,
+                    "Completing inactive outbound purgatory Git process-group cleanup"
+                );
+                process_group.signal(libc::SIGKILL)?;
+                let status = child.wait().await?;
+                process_group.disarm();
+                break status;
+            }
+        }
+    };
+    let stdout = match stdout_reader.await {
+        Ok(Ok(stdout)) => stdout,
+        Ok(Err(error)) => {
+            metric.finish(false);
+            return Err(error.into());
+        }
+        Err(error) => {
+            metric.finish(false);
+            return Err(error.into());
+        }
+    };
+    let stderr = match stderr_reader.await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(error)) => {
+            metric.finish(false);
+            return Err(error.into());
+        }
+        Err(error) => {
+            metric.finish(false);
+            return Err(error.into());
+        }
+    };
+    let stdout_bytes = activity.stdout_bytes.load(Ordering::Relaxed);
+    let stderr_bytes = activity.stderr_bytes.load(Ordering::Relaxed);
+    crate::metrics::record_purgatory_git_subprocess_output(operation, role, "stdout", stdout_bytes);
+    crate::metrics::record_purgatory_git_subprocess_output(operation, role, "stderr", stderr_bytes);
+    if stalled {
+        metric.finish_with_outcome("stalled");
+    } else {
+        metric.finish(status.success());
+    }
+    let stdout_truncated = stdout_bytes > stdout.len() as u64;
+    let stderr_truncated = stderr_bytes > stderr.len() as u64;
+    Ok(ObservedGitOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_bytes,
+        stderr_bytes,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `pid` is the live child id returned by Tokio, and the child was
+    // placed into a process group whose id equals that pid before spawn.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        // The group may exit between the inactivity check and the signal.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
 }
 
 /// Parse `git ls-remote` output into the set of advertised object ids.
@@ -547,11 +887,12 @@ impl SyncContext for RealSyncContext {
         crate::git::oid_exists(repo_path, oid)
     }
 
-    async fn fetch_oids(
+    async fn fetch_oids_with_role(
         &self,
         repo_path: &Path,
         url: &str,
         oids: &[String],
+        role: GitFetchRole,
     ) -> Result<Vec<String>> {
         if oids.is_empty() {
             return Ok(vec![]);
@@ -602,185 +943,224 @@ impl SyncContext for RealSyncContext {
         };
         let resolve_pin = resolve_pin_entry(&resolved);
 
-        // Use tokio::task::spawn_blocking for the git fetch since it's blocking
         let repo_path = repo_path.to_path_buf();
         let url = url.to_string();
+        let domain = extract_domain(&url).unwrap_or_else(|| "unknown".to_string());
         let missing_oids: Vec<String> = missing.into_iter().cloned().collect();
         let naughty_list = self.git_naughty_list.clone();
         let miss_memo = self.miss_memo.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            // Phase 1: compare the remote's advertised refs against our
-            // needs. Most needed OIDs are ref tips declared by state events
-            // (PR tips appear under `refs/nostr/<event-id>`), so the
-            // advertisement tells us up front which OIDs the remote can
-            // serve — instead of discovering each missing one through a
-            // failed "not our ref" upload-pack round trip.
-            let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
-            let advertised =
-                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &ls_remote_args)
-                    .output()
-                {
-                    Ok(result) if result.status.success() => {
-                        parse_advertised_oids(&String::from_utf8_lossy(&result.stdout))
-                    }
-                    Ok(result) => {
-                        let stderr = String::from_utf8_lossy(&result.stderr);
-                        record_remote_failure(&naughty_list, &url, &stderr, "ls-remote");
-                        return Err(anyhow::anyhow!(
-                            "git ls-remote failed for {}: {}",
-                            url,
-                            stderr
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "git ls-remote command error for {}: {}",
-                            url,
-                            e
-                        ))
-                    }
-                };
-            let advert_fingerprint = advertised_oids_fingerprint(&advertised);
-            let memoized_missing = {
-                let mut memo = miss_memo
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                memoized_missing_for_url(&mut memo, &url, advert_fingerprint, Instant::now())
-            };
-
-            // Phase 2: batch-fetch the needed OIDs the remote actually
-            // advertises. Advertised OIDs are always valid wants, so
-            // "not our ref" cannot occur here and one batch cannot be
-            // failed by an OID the remote never had.
-            let advertised_tips: Vec<String> = missing_oids
-                .iter()
-                .filter(|oid| advertised.contains(*oid))
-                .cloned()
-                .collect();
-            if !advertised_tips.is_empty() {
-                let mut args = vec!["fetch".to_string(), url.clone()];
-                args.extend(advertised_tips.iter().cloned());
-
-                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
-                    Ok(result) if result.status.success() => {}
-                    Ok(result) => {
-                        let stderr = String::from_utf8_lossy(&result.stderr);
-                        if is_object_missing_error(&stderr) {
-                            // The remote's refs changed between ls-remote and
-                            // fetch. Fall through: every still-missing OID is
-                            // retried individually below.
-                            debug!(
-                                url = %url,
-                                error = %stderr,
-                                "Advertised tip vanished between ls-remote and \
-                                 fetch - falling back to per-OID fetches"
-                            );
-                        } else {
-                            record_remote_failure(&naughty_list, &url, &stderr, "fetch");
-                            return Err(anyhow::anyhow!(
-                                "git fetch failed for {}: {}",
-                                url,
-                                stderr
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "git fetch command error for {}: {}",
-                            url,
-                            e
-                        ))
-                    }
+        // Phase 1: compare the remote's advertised refs against our
+        // needs. Most needed OIDs are ref tips declared by state events
+        // (PR tips appear under `refs/nostr/<event-id>`), so the
+        // advertisement tells us up front which OIDs the remote can
+        // serve — instead of discovering each missing one through a
+        // failed "not our ref" upload-pack round trip.
+        let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
+        let advertised = match run_observed_git_command(
+            hardened_git_command(&repo_path, resolve_pin.as_deref(), &ls_remote_args),
+            &domain,
+            "ls_remote",
+            role,
+        )
+        .await
+        {
+            Ok(result) if result.status.success() => {
+                if result.stdout_truncated {
+                    tracing::warn!(
+                        url = %url,
+                        captured_bytes = result.stdout.len(),
+                        total_bytes = result.stdout_bytes,
+                        "Git advertisement exceeded capture bound; using residual fetch path"
+                    );
+                    HashSet::new()
+                } else {
+                    parse_advertised_oids(&String::from_utf8_lossy(&result.stdout))
                 }
             }
+            Ok(result) => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                record_remote_failure(&naughty_list, &url, &stderr, "ls-remote");
+                return Err(anyhow::anyhow!(
+                    "git ls-remote failed for {}: {}",
+                    url,
+                    stderr
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "git ls-remote command error for {}: {}",
+                    url,
+                    e
+                ))
+            }
+        };
+        let advert_fingerprint = advertised_oids_fingerprint(&advertised);
+        let memoized_missing = {
+            let mut memo = miss_memo
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            memoized_missing_for_url(&mut memo, &url, advert_fingerprint, Instant::now())
+        };
 
-            // Phase 3: request residual OIDs that were not advertised and
-            // did not arrive as ancestors of the fetched tips, one at a
-            // time. Arbitrary-SHA1 wants may still be refused by some
-            // servers, so a per-OID failure must cost exactly one small
-            // round trip and must not abort the rest.
-            let mut residual_attempted = 0usize;
-            let mut residual_missing = 0usize;
-            let mut residual_skipped = 0usize;
-            for oid in &missing_oids {
-                if crate::git::oid_exists(&repo_path, oid) {
-                    continue;
-                }
-                if memoized_missing.contains(oid) {
-                    residual_skipped += 1;
-                    continue;
-                }
-                residual_attempted += 1;
+        // Phase 2: batch-fetch the needed OIDs the remote actually
+        // advertises. Advertised OIDs are always valid wants, so
+        // "not our ref" cannot occur here and one batch cannot be
+        // failed by an OID the remote never had.
+        let advertised_tips: Vec<String> = missing_oids
+            .iter()
+            .filter(|oid| advertised.contains(*oid))
+            .cloned()
+            .collect();
+        if !advertised_tips.is_empty() {
+            let mut args = vec![
+                "fetch".to_string(),
+                "--no-write-fetch-head".to_string(),
+                "--no-auto-maintenance".to_string(),
+                "--progress".to_string(),
+                url.clone(),
+            ];
+            args.extend(advertised_tips.iter().cloned());
 
-                let args = vec!["fetch".to_string(), url.clone(), oid.clone()];
-                match hardened_git_command(&repo_path, resolve_pin.as_deref(), &args).output() {
-                    Ok(result) if result.status.success() => {}
-                    Ok(result) => {
-                        let stderr = String::from_utf8_lossy(&result.stderr);
-                        if is_object_missing_error(&stderr) {
-                            residual_missing += 1;
-                            let mut memo = miss_memo
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if let Some(entry) = memo.get_mut(&url) {
-                                if entry.advert_fingerprint == advert_fingerprint {
-                                    entry.missing.insert(oid.clone());
-                                    entry.last_touched = Instant::now();
-                                }
-                            }
-                            debug!(
-                                url = %url,
-                                oid = %oid,
-                                "OID not available on remote"
-                            );
-                        } else {
-                            // A genuine remote failure: record it and stop
-                            // hammering the server, but keep what the batch
-                            // already fetched.
-                            record_remote_failure(&naughty_list, &url, &stderr, "fetch");
-                            break;
-                        }
+            match run_observed_git_command(
+                hardened_git_command(&repo_path, resolve_pin.as_deref(), &args),
+                &domain,
+                "fetch_batch",
+                role,
+            )
+            .await
+            {
+                Ok(result) if result.status.success() => {}
+                Ok(result) => {
+                    if result.stderr_truncated {
+                        debug!(url = %url, total_bytes = result.stderr_bytes, "Git fetch stderr was truncated");
                     }
-                    Err(e) => {
-                        debug!(url = %url, oid = %oid, error = %e, "git fetch command error");
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    if is_object_missing_error(&stderr) {
+                        // The remote's refs changed between ls-remote and
+                        // fetch. Fall through: every still-missing OID is
+                        // retried individually below.
+                        debug!(
+                            url = %url,
+                            error = %stderr,
+                            "Advertised tip vanished between ls-remote and \
+                             fetch - falling back to per-OID fetches"
+                        );
+                    } else {
+                        record_remote_failure(&naughty_list, &url, &stderr, "fetch");
+                        return Err(anyhow::anyhow!("git fetch failed for {}: {}", url, stderr));
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "git fetch command error for {}: {}",
+                        url,
+                        e
+                    ))
+                }
+            }
+        }
+
+        // Phase 3: request residual OIDs that were not advertised and
+        // did not arrive as ancestors of the fetched tips, one at a
+        // time. Arbitrary-SHA1 wants may still be refused by some
+        // servers, so a per-OID failure must cost exactly one small
+        // round trip and must not abort the rest.
+        let mut residual_attempted = 0usize;
+        let mut residual_missing = 0usize;
+        let mut residual_skipped = 0usize;
+        for oid in &missing_oids {
+            if crate::git::oid_exists(&repo_path, oid) {
+                continue;
+            }
+            if memoized_missing.contains(oid) {
+                residual_skipped += 1;
+                continue;
+            }
+            residual_attempted += 1;
+
+            let args = vec![
+                "fetch".to_string(),
+                "--no-write-fetch-head".to_string(),
+                "--no-auto-maintenance".to_string(),
+                "--progress".to_string(),
+                url.clone(),
+                oid.clone(),
+            ];
+            match run_observed_git_command(
+                hardened_git_command(&repo_path, resolve_pin.as_deref(), &args),
+                &domain,
+                "fetch_residual",
+                role,
+            )
+            .await
+            {
+                Ok(result) if result.status.success() => {}
+                Ok(result) => {
+                    if result.stderr_truncated {
+                        debug!(url = %url, oid = %oid, total_bytes = result.stderr_bytes, "Git fetch stderr was truncated");
+                    }
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    if is_object_missing_error(&stderr) {
+                        residual_missing += 1;
+                        let mut memo = miss_memo
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(entry) = memo.get_mut(&url) {
+                            if entry.advert_fingerprint == advert_fingerprint {
+                                entry.missing.insert(oid.clone());
+                                entry.last_touched = Instant::now();
+                            }
+                        }
+                        debug!(
+                            url = %url,
+                            oid = %oid,
+                            "OID not available on remote"
+                        );
+                    } else {
+                        // A genuine remote failure: record it and stop
+                        // hammering the server, but keep what the batch
+                        // already fetched.
+                        record_remote_failure(&naughty_list, &url, &stderr, "fetch");
                         break;
                     }
                 }
+                Err(e) => {
+                    debug!(url = %url, oid = %oid, error = %e, "git fetch command error");
+                    break;
+                }
             }
+        }
 
-            let fetched: Vec<String> = missing_oids
-                .iter()
-                .filter(|oid| crate::git::oid_exists(&repo_path, oid))
-                .cloned()
-                .collect();
+        let fetched: Vec<String> = missing_oids
+            .iter()
+            .filter(|oid| crate::git::oid_exists(&repo_path, oid))
+            .cloned()
+            .collect();
 
-            // One summary line per outbound fetch pass: this is the
-            // client-side visibility the drop-one-and-retry loop lacked
-            // (it logged only at debug level, so a relay crawling a remote
-            // was invisible in its own production logs).
-            tracing::info!(
-                url = %url,
-                needed = missing_oids.len(),
-                advertised_tips = advertised_tips.len(),
-                residual_attempted = residual_attempted,
-                residual_missing = residual_missing,
-                residual_skipped = residual_skipped,
-                fetched = fetched.len(),
-                "Purgatory git fetch pass complete"
-            );
-            crate::metrics::record_purgatory_git_fetch_pass(
-                advertised_tips.len(),
-                residual_attempted,
-                residual_missing,
-                residual_skipped,
-                fetched.len(),
-            );
+        // One summary line per outbound fetch pass: this is the
+        // client-side visibility the drop-one-and-retry loop lacked
+        // (it logged only at debug level, so a relay crawling a remote
+        // was invisible in its own production logs).
+        tracing::info!(
+            url = %url,
+            needed = missing_oids.len(),
+            advertised_tips = advertised_tips.len(),
+            residual_attempted = residual_attempted,
+            residual_missing = residual_missing,
+            residual_skipped = residual_skipped,
+            fetched = fetched.len(),
+            "Purgatory git fetch pass complete"
+        );
+        crate::metrics::record_purgatory_git_fetch_pass(
+            advertised_tips.len(),
+            residual_attempted,
+            residual_missing,
+            residual_skipped,
+            fetched.len(),
+        );
 
-            Ok(fetched)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {}", e))?
+        Ok(fetched)
     }
 
     async fn process_newly_available_git_data(
@@ -852,6 +1232,296 @@ impl SyncContext for RealSyncContext {
 #[cfg(test)]
 mod fetch_helper_tests {
     use super::*;
+
+    fn create_source_repo(root: &Path, name: &str, contents: &str) -> (PathBuf, String) {
+        let path = root.join(name);
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet", path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["config", "user.name", "Test"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(path.join("payload"), contents).unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["add", "payload"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["commit", "--quiet", "-m", "fixture"])
+            .status()
+            .unwrap()
+            .success());
+        let oid = std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        (
+            path,
+            String::from_utf8(oid.stdout).unwrap().trim().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_drain_bounds_capture_but_counts_all_activity() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let activity = Arc::new(GitActivity::default());
+        let reader_activity = activity.clone();
+        let drain = tokio::spawn(async move {
+            drain_git_stream(reader, 10, Instant::now(), reader_activity, true).await
+        });
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &[b'x'; 100])
+            .await
+            .unwrap();
+        drop(writer);
+        let captured = drain.await.unwrap().unwrap();
+        assert_eq!(captured, vec![b'x'; 10]);
+        assert_eq!(activity.stdout_bytes.load(Ordering::Relaxed), 100);
+        assert!(activity.last_millis.load(Ordering::Relaxed) <= 1_000);
+    }
+
+    #[tokio::test]
+    async fn observed_runner_streams_both_outputs_and_preserves_exit_status() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf stdout; printf stderr >&2; exit 7"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output =
+            run_observed_git_command(command, "test.example", "fetch_batch", GitFetchRole::Hedge)
+                .await
+                .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+        assert_eq!(output.stdout_bytes, 6);
+        assert_eq!(output.stderr_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn continuing_output_prevents_inactivity_termination() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "for value in 1 2 3 4 5 6; do printf x; sleep 0.02; done",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_observed_git_command_with_policy(
+                command,
+                "test.example",
+                "fetch_batch",
+                GitFetchRole::Primary,
+                GitProcessPolicy {
+                    inactivity_limit: Duration::from_millis(50),
+                    termination_grace: Duration::from_millis(50),
+                },
+            ),
+        )
+        .await
+        .expect("active fixture has a bounded completion")
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"xxxxxx");
+    }
+
+    #[tokio::test]
+    async fn inactivity_terminates_the_whole_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let script = format!(
+            "trap '' TERM; sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let wait_for_pid = async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if !pid.is_empty() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let run = run_observed_git_command_with_policy(
+            command,
+            "test.example",
+            "fetch_batch",
+            GitFetchRole::Primary,
+            GitProcessPolicy {
+                inactivity_limit: Duration::from_millis(50),
+                termination_grace: Duration::from_millis(50),
+            },
+        );
+        let (pid, output) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(wait_for_pid, run)
+        })
+        .await
+        .expect("stalled fixture has bounded recovery");
+        let output = output.unwrap();
+        assert!(!output.status.success());
+
+        let pid: i32 = pid.parse().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            // Signal zero observes existence without changing process state.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "descendant survived");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_observed_command_reaps_descendants_before_follow_up_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("cancelled-descendant.pid");
+        let script = format!(
+            "trap '' TERM; sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let task = tokio::spawn(run_observed_git_command_with_policy(
+            command,
+            "test.example",
+            "fetch_batch",
+            GitFetchRole::Primary,
+            GitProcessPolicy {
+                inactivity_limit: Duration::from_secs(30),
+                termination_grace: Duration::from_millis(50),
+            },
+        ));
+
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if !pid.is_empty() {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture descendant should become observable");
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled command descendant should be reaped");
+
+        let mut follow_up = Command::new("sh");
+        follow_up
+            .args(["-c", "printf ready"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = run_observed_git_command(follow_up, "test.example", "fetch_batch", GitFetchRole::Primary)
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+    }
+
+    #[tokio::test]
+    async fn concurrent_object_only_fetches_leave_shared_bare_repo_consistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first_source, first_oid) = create_source_repo(temp.path(), "first", "first");
+        let (second_source, second_oid) = create_source_repo(temp.path(), "second", "second");
+        let target = temp.path().join("target.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet", target.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        let fetch = |source: PathBuf, oid: String, role| {
+            let mut command = Command::new("git");
+            command
+                .current_dir(&target)
+                .args(["fetch", "--no-write-fetch-head", "--no-auto-maintenance"])
+                .arg(source)
+                .arg(oid)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            run_observed_git_command(command, "local.test", "fetch_batch", role)
+        };
+        let (first, second) = tokio::join!(
+            fetch(first_source, first_oid.clone(), GitFetchRole::Primary),
+            fetch(second_source, second_oid.clone(), GitFetchRole::Hedge)
+        );
+        assert!(first.unwrap().status.success());
+        assert!(second.unwrap().status.success());
+        assert!(!target.join("FETCH_HEAD").exists());
+        let refs = std::process::Command::new("git")
+            .current_dir(&target)
+            .args(["for-each-ref", "--format=%(refname)"])
+            .output()
+            .unwrap();
+        assert!(refs.status.success());
+        assert!(refs.stdout.is_empty(), "object fetch must not update refs");
+
+        for oid in [first_oid, second_oid] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&target)
+                .args(["cat-file", "-e", &format!("{oid}^{{commit}}")])
+                .status()
+                .unwrap()
+                .success());
+        }
+        let fsck = std::process::Command::new("git")
+            .current_dir(&target)
+            .args(["fsck", "--no-dangling"])
+            .output()
+            .unwrap();
+        assert!(
+            fsck.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+    }
 
     #[test]
     fn parse_advertised_oids_collects_ref_tips_and_peeled_tags() {
@@ -939,6 +1609,7 @@ mod fetch_helper_tests {
 pub mod mock {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::RwLock;
 
     /// Mock context for testing sync logic without I/O.
@@ -994,6 +1665,13 @@ pub mod mock {
 
         /// Results from process_newly_available_git_data calls
         process_results: RwLock<Vec<ProcessResult>>,
+
+        /// Deterministic fetch barriers used by coordinator tests.
+        fetch_barriers: HashMap<String, Arc<tokio::sync::Semaphore>>,
+        fetch_completion_barriers: HashMap<String, Arc<tokio::sync::Semaphore>>,
+        urls_report_shared_objects: HashSet<String>,
+        fetch_started: Arc<tokio::sync::Notify>,
+        fetch_started_count: AtomicUsize,
     }
 
     impl Default for MockSyncContext {
@@ -1017,6 +1695,11 @@ pub mod mock {
                 target_repo_path: Some(PathBuf::from("/tmp/test-repo")),
                 fetch_should_fail: RwLock::new(HashSet::new()),
                 process_results: RwLock::new(Vec::new()),
+                fetch_barriers: HashMap::new(),
+                fetch_completion_barriers: HashMap::new(),
+                urls_report_shared_objects: HashSet::new(),
+                fetch_started: Arc::new(tokio::sync::Notify::new()),
+                fetch_started_count: AtomicUsize::new(0),
             }
         }
 
@@ -1074,6 +1757,42 @@ pub mod mock {
             self
         }
 
+        /// Hold this URL's fetch until the test explicitly releases it.
+        pub fn url_waits_for_release(mut self, url: &str) -> Self {
+            self.fetch_barriers
+                .insert(url.to_string(), Arc::new(tokio::sync::Semaphore::new(0)));
+            self
+        }
+
+        /// Hold this URL after it has made its objects visible in the shared
+        /// mock object database but before its fetch call returns.
+        pub fn url_waits_after_fetch(mut self, url: &str) -> Self {
+            self.fetch_completion_barriers
+                .insert(url.to_string(), Arc::new(tokio::sync::Semaphore::new(0)));
+            self
+        }
+
+        /// Model the real implementation's final shared-ODB scan: this URL
+        /// reports requested objects installed by a concurrent command.
+        pub fn url_reports_shared_objects(mut self, url: &str) -> Self {
+            self.urls_report_shared_objects.insert(url.to_string());
+            self
+        }
+
+        pub async fn wait_for_fetches(&self, count: usize) {
+            while self.fetch_started_count.load(Ordering::SeqCst) < count {
+                self.fetch_started.notified().await;
+            }
+        }
+
+        pub fn release_fetch(&self, url: &str) {
+            self.fetch_barriers
+                .get(url)
+                .or_else(|| self.fetch_completion_barriers.get(url))
+                .expect("URL should have a configured fetch barrier")
+                .add_permits(1);
+        }
+
         /// Get the log of fetch attempts (URLs that were fetched from).
         pub fn fetch_log(&self) -> Vec<String> {
             self.fetch_log.read().unwrap().clone()
@@ -1087,6 +1806,10 @@ pub mod mock {
         /// Get the current set of needed OIDs.
         pub fn current_needed_oids(&self) -> HashSet<String> {
             self.needed_oids.read().unwrap().clone()
+        }
+
+        pub fn process_call_count(&self) -> usize {
+            self.process_results.read().unwrap().len()
         }
 
         /// Set whether there are pending events (can be called during test).
@@ -1168,14 +1891,24 @@ pub mod mock {
             !self.needed_oids.read().unwrap().contains(oid)
         }
 
-        async fn fetch_oids(
+        async fn fetch_oids_with_role(
             &self,
             _repo_path: &Path,
             url: &str,
             oids: &[String],
+            _role: GitFetchRole,
         ) -> Result<Vec<String>> {
             // Log the fetch attempt
             self.fetch_log.write().unwrap().push(url.to_string());
+            self.fetch_started_count.fetch_add(1, Ordering::SeqCst);
+            self.fetch_started.notify_waiters();
+            if let Some(barrier) = self.fetch_barriers.get(url) {
+                barrier
+                    .acquire()
+                    .await
+                    .expect("mock fetch barrier should remain open")
+                    .forget();
+            }
 
             // Check if this URL should fail
             if self.fetch_should_fail.read().unwrap().contains(url) {
@@ -1186,11 +1919,18 @@ pub mod mock {
             let provides = self.url_provides_oids.get(url).cloned().unwrap_or_default();
 
             // Find which requested OIDs this URL can provide
-            let fetched: Vec<String> = oids
-                .iter()
-                .filter(|oid| provides.contains(*oid))
-                .cloned()
-                .collect();
+            let fetched: Vec<String> = if self.urls_report_shared_objects.contains(url) {
+                let needed = self.needed_oids.read().unwrap();
+                oids.iter()
+                    .filter(|oid| !needed.contains(*oid))
+                    .cloned()
+                    .collect()
+            } else {
+                oids.iter()
+                    .filter(|oid| provides.contains(*oid))
+                    .cloned()
+                    .collect()
+            };
 
             // Remove fetched OIDs from needed set
             {
@@ -1198,6 +1938,14 @@ pub mod mock {
                 for oid in &fetched {
                     needed.remove(oid);
                 }
+            }
+
+            if let Some(barrier) = self.fetch_completion_barriers.get(url) {
+                barrier
+                    .acquire()
+                    .await
+                    .expect("mock completion barrier should remain open")
+                    .forget();
             }
 
             Ok(fetched)
