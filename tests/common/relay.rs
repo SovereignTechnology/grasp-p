@@ -73,6 +73,7 @@ pub struct TestRelay {
 #[derive(Default, Clone)]
 struct RelayOptions {
     bootstrap_relay_url: Option<String>,
+    sync_plus_fallback_relays: Option<String>,
     disable_negentropy: bool,
     archive_all: bool,
     archive_read_only: bool,
@@ -426,6 +427,28 @@ impl TestRelay {
         .await
     }
 
+    /// Start a persistent syncing relay with an explicit Sync+ fallback set.
+    pub async fn start_on_reservation_persistent_sync_with_fallback(
+        reservation: PortReservation,
+        bootstrap_relay_url: String,
+        fallback_relay_url: String,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url: Some(bootstrap_relay_url),
+                sync_plus_fallback_relays: Some(fallback_relay_url),
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay with every configurable option, on a pre-reserved port.
     ///
     /// Prefer the narrower constructors above — this exists so the option
@@ -552,6 +575,7 @@ impl TestRelay {
             // to the production user-index defaults. A configured loopback
             // bootstrap below becomes the scenario's sole index source.
             .env("NGIT_USER_INDEX_RELAYS", "")
+            .env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", "")
             .env("NGIT_SYNC_STARTUP_DELAY_SECS", "0") // No startup delay for faster tests
             .env("NGIT_SYNC_STARTUP_JITTER_MS", "0") // No jitter for tests
             .env("NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS", "1") // Fast reconnect attempts for tests
@@ -584,6 +608,9 @@ impl TestRelay {
         if let Some(ref bootstrap_url) = options.bootstrap_relay_url {
             cmd.env("NGIT_SYNC_BOOTSTRAP_RELAY_URL", bootstrap_url)
                 .env("NGIT_USER_INDEX_RELAYS", bootstrap_url);
+        }
+        if let Some(ref fallback_relays) = options.sync_plus_fallback_relays {
+            cmd.env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", fallback_relays);
         }
 
         // The test infrastructure runs entirely on loopback, which the

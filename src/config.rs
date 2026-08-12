@@ -18,6 +18,8 @@ const DEFAULT_DELETION_REQUEST_RETENTION_USED_UNSERVED_GATING_ADDITIONAL_SECS: u
     90 * 24 * 60 * 60;
 const DEFAULT_USER_INDEX_RELAYS: &str =
     "wss://purplepag.es,wss://index.hzrd149.com,wss://indexer.coracle.social";
+const DEFAULT_SYNC_PLUS_FALLBACK_RELAYS: &str =
+    "wss://relay.ditto.pub,wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net";
 
 /// Whitelist entry for repository/archive filtering
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,6 +408,14 @@ pub struct Config {
         default_value = DEFAULT_USER_INDEX_RELAYS
     )]
     pub user_index_relays: String,
+
+    /// Comma-separated inbox fallbacks for eligible authors whose NIP-65 relay list is absent.
+    #[arg(
+        long,
+        env = "NGIT_SYNC_PLUS_FALLBACK_RELAYS",
+        default_value = DEFAULT_SYNC_PLUS_FALLBACK_RELAYS
+    )]
+    pub sync_plus_fallback_relays: String,
 
     /// Maximum backoff time in seconds for sync relay reconnection (default: 3600 = 1 hour)
     #[arg(long, env = "NGIT_SYNC_MAX_BACKOFF_SECS", default_value_t = 3600)]
@@ -980,6 +990,16 @@ impl Config {
             .collect()
     }
 
+    /// Parse the comma-separated Sync+ fallback relay URLs.
+    pub fn parse_sync_plus_fallback_relays(&self) -> Vec<String> {
+        self.sync_plus_fallback_relays
+            .split(',')
+            .map(str::trim)
+            .filter(|relay| !relay.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Get parsed archive configuration with computed read-only mode
     ///
     /// Read-only mode defaults to true if archive mode is enabled, false otherwise.
@@ -1112,6 +1132,7 @@ impl Config {
             sync_bootstrap_relay_url: None,
             sync_plus_enabled: true,
             user_index_relays: DEFAULT_USER_INDEX_RELAYS.to_string(),
+            sync_plus_fallback_relays: DEFAULT_SYNC_PLUS_FALLBACK_RELAYS.to_string(),
             sync_max_backoff_secs: 3600,
             sync_disconnect_check_interval_secs: 60,
             sync_base_backoff_secs: 5,
@@ -1228,6 +1249,30 @@ mod tests {
                 "wss://indexer.coracle.social",
             ]
         );
+    }
+
+    #[test]
+    fn sync_plus_fallback_defaults_and_empty_override_are_explicit() {
+        let default = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("Sync+ fallback defaults should parse");
+        assert_eq!(
+            default.parse_sync_plus_fallback_relays(),
+            vec![
+                "wss://relay.ditto.pub",
+                "wss://relay.damus.io",
+                "wss://nos.lol",
+                "wss://relay.primal.net",
+            ]
+        );
+
+        let disabled = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--sync-plus-fallback-relays=",
+        ])
+        .expect("empty Sync+ fallback override should parse");
+        assert!(disabled.parse_sync_plus_fallback_relays().is_empty());
     }
 
     #[test]

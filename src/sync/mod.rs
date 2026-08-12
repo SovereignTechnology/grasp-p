@@ -1333,6 +1333,10 @@ struct Nip65DiscoveryState {
     author_sources: HashMap<PublicKey, HashSet<String>>,
     relay_lists: HashMap<PublicKey, Event>,
     author_inboxes: HashMap<PublicKey, HashSet<String>>,
+    /// Eligible authors for whom at least one successful index query returned
+    /// no accepted relay list. They use the operator's bounded fallback set
+    /// until an accepted kind 10002 arrives.
+    fallback_authors: HashSet<PublicKey>,
     inbox_roots: HashMap<String, HashSet<EventId>>,
     in_flight: HashSet<(String, PublicKey)>,
     next_attempt_at: HashMap<(String, PublicKey), Instant>,
@@ -4815,6 +4819,14 @@ impl SyncManager {
         targets
     }
 
+    fn configured_nip65_fallback_relays(&self) -> HashSet<String> {
+        self.config
+            .parse_sync_plus_fallback_relays()
+            .into_iter()
+            .filter_map(|url| canonical_relay_key(&url).ok())
+            .collect()
+    }
+
     async fn schedule_nip65_discovery(&mut self) {
         // GRASP-03 is an optional overlay on the always-running GRASP-02
         // manager. When disabled, do not inventory authors, retain identity
@@ -4925,6 +4937,10 @@ impl SyncManager {
             self.nip65_discovery
                 .author_inboxes
                 .retain(|author, _| current_authors.contains(author));
+            self.nip65_discovery.fallback_authors.retain(|author| {
+                current_authors.contains(author)
+                    && !self.nip65_discovery.relay_lists.contains_key(author)
+            });
             let current_sources = &self.nip65_discovery.author_sources;
             self.nip65_discovery
                 .next_attempt_at
@@ -4937,6 +4953,8 @@ impl SyncManager {
             let overlay = discovery::build_inbox_root_overlay(
                 &self.nip65_discovery.author_roots,
                 &self.nip65_discovery.author_inboxes,
+                &self.nip65_discovery.fallback_authors,
+                &self.configured_nip65_fallback_relays(),
             );
             self.install_nip65_overlay(overlay).await;
         }
@@ -5089,6 +5107,8 @@ impl SyncManager {
             .await
             .unwrap_or_default();
         let latest = discovery::latest_relay_lists(stored_relay_lists, &result.authors);
+        let authors_with_lists: HashSet<PublicKey> = latest.keys().copied().collect();
+        let previous_fallback_authors = self.nip65_discovery.fallback_authors.clone();
         let now = Instant::now();
         for author in &result.authors {
             let retry_after =
@@ -5096,9 +5116,14 @@ impl SyncManager {
             self.nip65_discovery
                 .next_attempt_at
                 .insert((result.source_relay.clone(), *author), now + retry_after);
+            if authors_with_lists.contains(author) {
+                self.nip65_discovery.fallback_authors.remove(author);
+            } else if query_succeeded && self.nip65_discovery.author_roots.contains_key(author) {
+                self.nip65_discovery.fallback_authors.insert(*author);
+            }
         }
 
-        let mut changed = false;
+        let mut changed = previous_fallback_authors != self.nip65_discovery.fallback_authors;
         for (author, candidate) in latest {
             if !self.nip65_discovery.eligible_authors.contains(&author) {
                 continue;
@@ -5152,12 +5177,15 @@ impl SyncManager {
         let overlay = discovery::build_inbox_root_overlay(
             &self.nip65_discovery.author_roots,
             &self.nip65_discovery.author_inboxes,
+            &self.nip65_discovery.fallback_authors,
+            &self.configured_nip65_fallback_relays(),
         );
         self.install_nip65_overlay(overlay).await;
         tracing::info!(
             source = %result.source_relay,
             authors = result.authors.len(),
             inbox_relays = self.nip65_discovery.inbox_roots.len(),
+            fallback_authors = self.nip65_discovery.fallback_authors.len(),
             "Updated proactive inbox coverage from NIP-65"
         );
 
