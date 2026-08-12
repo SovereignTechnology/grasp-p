@@ -1331,7 +1331,7 @@ mod fetch_helper_tests {
                 "fetch_batch",
                 GitFetchRole::Primary,
                 GitProcessPolicy {
-                    inactivity_limit: Duration::from_millis(50),
+                    inactivity_limit: Duration::from_millis(500),
                     termination_grace: Duration::from_millis(50),
                 },
             ),
