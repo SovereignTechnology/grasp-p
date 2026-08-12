@@ -461,8 +461,10 @@ async fn test_live_sync_layer3_events() {
         .author(keys.public_key())
         .id(comment_id);
 
+    // Root confirmation can require a historic batch before the bounded
+    // descendant maintenance tick schedules this pre-existing comment.
     let comment_synced =
-        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(20)).await;
     println!(
         "Comment {} synced to relay_b: {}",
         comment_id, comment_synced
