@@ -141,22 +141,21 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
         .await,
         "replacement NIP-65 inbox should become the desired root source"
     );
-
-    let obsolete_reply = EventBuilder::new(Kind::TextNote, "obsolete inbox reply")
+    let draining_reply = EventBuilder::new(Kind::TextNote, "reply on naturally draining inbox")
         .tag(Tag::custom("e", vec![issue.id.to_hex()]))
         .finalize(&root_author)
-        .expect("build obsolete-inbox reply");
-    send_to_relay_url(inbox.url(), &obsolete_reply)
+        .expect("build draining reply");
+    send_to_relay_url(inbox.url(), &draining_reply)
         .await
-        .expect("seed obsolete inbox after replacement");
+        .expect("seed old inbox while its live subscription drains");
     assert!(
-        !wait_for_event_on_relay(
+        wait_for_event_on_relay(
             syncing.url(),
-            Filter::new().id(obsolete_reply.id),
-            Duration::from_secs(3),
+            Filter::new().id(draining_reply.id),
+            Duration::from_secs(5),
         )
         .await,
-        "obsolete inbox coverage should be retired after replacement"
+        "replacement must not eagerly close existing descendant live coverage"
     );
 
     // A restart must reconstruct the accepted kind-10002 overlay locally.

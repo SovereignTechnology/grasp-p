@@ -2378,13 +2378,6 @@ impl RelayConnection {
         }
     }
 
-    /// Abort caller-owned transient work after its manager batch is retired.
-    /// The slot is released only after CLOSE is accepted by the SDK; otherwise
-    /// session teardown remains the accounting backstop.
-    pub(super) async fn abort_transient_subscription(&self, sub_id: &SubscriptionId) {
-        self.close_and_release_transient_req_permit(sub_id).await;
-    }
-
     /// Release the live ledger slot held for `sub_id`, if any.
     fn release_live_req_permit(
         &self,

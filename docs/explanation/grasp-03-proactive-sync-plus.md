@@ -16,11 +16,11 @@ GRASP-02 then owns all transport. Its current root tiers, historic and
 live/rotating coverage, grouping, subscription ledger, rate-limit recovery,
 pagination and per-relay connection lifecycle apply unchanged.
 
-The index set is the configured bootstrap relay plus relays already declared
-for accepted repositories. Discovery is best effort: completeness assumes the
-current relay-list event is available from at least one existing source. This
-keeps discovery bounded to an operator-visible set of user-index relays rather
-than allowing unbounded global discovery.
+Authors without an accepted stored relay list are queried through the configured
+user-index set plus the bootstrap relay. Once a list is retained, discovery
+follows its `write` and unmarked outboxes instead, allowing newer replacements
+to converge without making arbitrary repository relays identity sources.
+Discovery remains best effort and bounded to this operator-visible source graph.
 
 The self-subscriber builds a compact root-candidate inventory during its
 existing startup load and maintains it incrementally as roots arrive. StateOnly
@@ -40,17 +40,14 @@ database before any network refresh, so serving established coverage does not
 depend on an external index remaining available. Remote discovery then refreshes
 that retained state on the normal cadence.
 
-Inbox replacement/removal changes the desired overlay immediately. Pending
-batches which mention a retired overlay root are closed. Retirement is
-deliberately conservative: every descendant batch on that relay is also closed
-and re-derived, because those batches share the changing root frontier and do
-not retain enough provenance for narrower cancellation. Confirmed or live
-coverage is rebuilt through the existing consolidation path before additions
-are re-derived. This removes obsolete inbox ownership without inventing another
-subscription lifecycle. A root that is still ordinarily owned by the same
-relay remains in that target. Root deletion follows the existing GRASP-02
-root-index lifecycle and is reconstructed from retained accepted events on
-restart; this change does not add a second deletion graph.
+Inbox replacement/removal changes desired ownership immediately. Additions are
+derived promptly. Removals prevent future rotating and historic work, but do
+not eagerly CLOSE live descendants or abort shared in-flight batches: existing
+coverage drains on its natural EOSE/CLOSED/disconnect or an ordinary later
+consolidation rebuild. This avoids interrupting unrelated roots and subscription
+churn merely because one author replaced a relay list. Root deletion follows
+the existing GRASP-02 root-index lifecycle and is reconstructed from retained
+accepted events on restart; this change does not add a second deletion graph.
 
 ## Deliberately excluded
 

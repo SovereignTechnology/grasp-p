@@ -821,9 +821,25 @@ struct DescendantFilterInFlight {
 
 #[derive(Debug)]
 struct DescendantLiveCoverage {
-    coverage_fingerprint: Vec<String>,
+    /// Individual filters physically covered by the still-open REQs. Desired
+    /// coverage may become a subset while these drain naturally.
+    covered_filters: HashSet<String>,
+    desired_filters: HashSet<String>,
     fallback_filters: Vec<Filter>,
     subscription_ids: Vec<SubscriptionId>,
+}
+
+impl DescendantLiveCoverage {
+    fn retain_for_removal_only_change(&mut self, desired: &HashSet<String>) -> bool {
+        if desired == &self.desired_filters {
+            return true;
+        }
+        if desired.is_subset(&self.covered_filters) {
+            self.desired_filters.clone_from(desired);
+            return true;
+        }
+        false
+    }
 }
 
 impl Default for DescendantSyncRotation {
@@ -4216,25 +4232,6 @@ impl SyncManager {
         let frontier = self.direct_thread_members(&target.root_events).await;
         let historic_entries =
             tiered_auxiliary_filters(&target.repos, &target.root_events, &frontier, None);
-        let desired_fingerprint: Vec<_> = historic_entries
-            .iter()
-            .map(|entry| entry.filter.as_json())
-            .collect();
-        if self
-            .descendant_live_coverage
-            .get(relay_url)
-            .is_some_and(|coverage| coverage.coverage_fingerprint == desired_fingerprint)
-        {
-            return;
-        }
-        if self.descendant_live_coverage.contains_key(relay_url)
-            && !self
-                .close_descendant_live_coverage(relay_url, "tiered coverage changed")
-                .await
-        {
-            return;
-        }
-
         let live_since = Timestamp::from(
             Timestamp::now()
                 .as_secs()
@@ -4246,6 +4243,42 @@ impl SyncManager {
                 connection.max_filters_per_req(),
                 |groups| connection.can_admit_auxiliary_live_groups(groups),
             );
+            let desired_live_filters: HashSet<_> =
+                live_filters.iter().map(Filter::as_json).collect();
+            if let Some(coverage) = self.descendant_live_coverage.get_mut(relay_url) {
+                let desired_changed = desired_live_filters != coverage.desired_filters;
+                if coverage.retain_for_removal_only_change(&desired_live_filters) {
+                    // Removal-only changes update desired fallback coverage but
+                    // do not churn a shared live REQ. Its obsolete filters die
+                    // at CLOSED/disconnect; additions still rebuild below.
+                    let max_filters = connection.max_filters_per_req();
+                    let rotation = self
+                        .descendant_sync_rotations
+                        .entry(relay_url.to_string())
+                        .or_default();
+                    if rotation.coverage_fingerprint
+                        != rotation_fingerprint(&rotated_filters, max_filters)
+                    {
+                        rotation.refresh(rotated_filters, max_filters);
+                    }
+                    coverage.fallback_filters = complete_auxiliary_fallback(&historic_entries);
+                    if desired_changed {
+                        tracing::info!(
+                            relay = %relay_url,
+                            retained_subscription_count = coverage.subscription_ids.len(),
+                            "Retaining removal-only auxiliary live coverage until natural closure"
+                        );
+                    }
+                    return;
+                }
+            }
+            if self.descendant_live_coverage.contains_key(relay_url)
+                && !self
+                    .close_descendant_live_coverage(relay_url, "tiered coverage changed")
+                    .await
+            {
+                return;
+            }
             let live_filters: Vec<_> = live_filters
                 .into_iter()
                 .map(|filter| filter.since(live_since))
@@ -4268,7 +4301,8 @@ impl SyncManager {
                         self.descendant_live_coverage.insert(
                             relay_url.to_string(),
                             DescendantLiveCoverage {
-                                coverage_fingerprint: desired_fingerprint.clone(),
+                                covered_filters: desired_live_filters.clone(),
+                                desired_filters: desired_live_filters,
                                 fallback_filters,
                                 subscription_ids: subscription_ids.clone(),
                             },
@@ -4915,76 +4949,14 @@ impl SyncManager {
         if old_overlay == self.nip65_discovery.inbox_roots {
             return;
         }
-        let ordinary_targets = {
-            let repo_index = self.repo_sync_index.read().await;
-            algorithms::derive_relay_targets(&repo_index)
-        };
         let mut dirty_relays: HashSet<String> = old_overlay.keys().cloned().collect();
         dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
 
         for relay in dirty_relays {
-            let ordinary_roots = ordinary_targets
-                .get(&relay)
-                .map(|target| &target.root_events)
-                .cloned()
-                .unwrap_or_default();
-            let retired = discovery::roots_to_retire(
-                &ordinary_roots,
-                old_overlay.get(&relay),
-                self.nip65_discovery.inbox_roots.get(&relay),
-            );
-            if !retired.is_empty() {
-                let removed_batches = {
-                    let mut pending = self.pending_sync_index.write().await;
-                    let mut removed = Vec::new();
-                    if let Some(batches) = pending.get_mut(&relay) {
-                        let mut index = 0;
-                        while index < batches.len() {
-                            let references_retired = batches[index].purpose
-                                == PendingBatchPurpose::Descendants
-                                || batches[index]
-                                    .items
-                                    .root_events
-                                    .iter()
-                                    .any(|root| retired.contains(root));
-                            if references_retired {
-                                removed.push(batches.remove(index));
-                            } else {
-                                index += 1;
-                            }
-                        }
-                        if batches.is_empty() {
-                            pending.remove(&relay);
-                        }
-                    }
-                    removed
-                };
-                for batch in &removed_batches {
-                    self.close_removed_batch_subscriptions(&relay, batch).await;
-                    self.release_removed_descendant_batch(&relay, batch);
-                }
-                self.descendant_sync_rotations.remove(&relay);
-
-                let confirmed_changed = {
-                    let mut index = self.relay_sync_index.write().await;
-                    index.get_mut(&relay).is_some_and(|state| {
-                        let before = state.root_events.len();
-                        state.root_events.retain(|root| !retired.contains(root));
-                        state.root_events.len() != before
-                    })
-                };
-                let has_pending = self.has_pending_batches(&relay).await;
-                if self.deferred_consolidations.request(&relay, has_pending) {
-                    let _ = self.consolidate(&relay).await;
-                }
-                tracing::debug!(
-                    relay = %relay,
-                    retired_roots = retired.len(),
-                    confirmed_changed,
-                    retired_batches = removed_batches.len(),
-                    "Retired obsolete proactive inbox ownership"
-                );
-            }
+            // Desired ownership changes immediately, but existing descendant
+            // work retires only at its natural EOSE/CLOSED/disconnect or a
+            // later ordinary consolidation. Closing shared batches here can
+            // interrupt unrelated roots and churn otherwise healthy live REQs.
             self.recompute_new_sync_filters_for_relay(&relay).await;
         }
     }
@@ -6474,21 +6446,6 @@ impl SyncManager {
         }
     }
 
-    async fn close_removed_batch_subscriptions(
-        &self,
-        relay_url: &str,
-        batch: &PendingBatch,
-    ) {
-        let Some(connection) = self.connections.get(relay_url) else {
-            return;
-        };
-        for subscription_id in &batch.outstanding_subs {
-            connection
-                .abort_transient_subscription(subscription_id)
-                .await;
-        }
-    }
-
     async fn handle_subscription_closed(
         &mut self,
         relay_url: &str,
@@ -7670,6 +7627,36 @@ mod tests {
             nip65_author_retry_after(false, &represented, &returned),
             nip65_discovery_retry_interval()
         );
+    }
+
+    #[test]
+    fn maintenance_reconciliation_keeps_subscription_ids_for_removal_only_coverage() {
+        let first_id = EventId::from_byte_array([1; 32]);
+        let second_id = EventId::from_byte_array([2; 32]);
+        let first_filter = Filter::new().event(first_id);
+        let second_filter = Filter::new().event(second_id);
+        let first = first_filter.as_json();
+        let second = second_filter.as_json();
+        let subscription_ids = vec![SubscriptionId::new("live-descendants")];
+        let mut coverage = DescendantLiveCoverage {
+            covered_filters: HashSet::from([first.clone(), second.clone()]),
+            desired_filters: HashSet::from([first, second.clone()]),
+            fallback_filters: vec![first_filter, second_filter.clone()],
+            subscription_ids: subscription_ids.clone(),
+        };
+
+        assert!(coverage.retain_for_removal_only_change(&HashSet::from([second.clone()])));
+        assert_eq!(coverage.subscription_ids, subscription_ids);
+        coverage.fallback_filters = vec![second_filter];
+        assert_eq!(coverage.fallback_filters.len(), 1);
+        assert!(coverage.fallback_filters[0].as_json().contains(&second));
+        assert!(!coverage.fallback_filters[0]
+            .as_json()
+            .contains(&first_id.to_hex()));
+        // A later maintenance tick sees stable desired coverage and still
+        // leaves the physical subscription untouched.
+        assert!(coverage.retain_for_removal_only_change(&HashSet::from([second])));
+        assert_eq!(coverage.subscription_ids, subscription_ids);
     }
 
     #[test]

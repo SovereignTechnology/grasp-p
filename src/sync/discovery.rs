@@ -155,22 +155,6 @@ pub fn build_inbox_root_overlay(
     overlay
 }
 
-pub fn roots_to_retire(
-    ordinary_roots: &HashSet<EventId>,
-    old_overlay_roots: Option<&HashSet<EventId>>,
-    new_overlay_roots: Option<&HashSet<EventId>>,
-) -> HashSet<EventId> {
-    old_overlay_roots
-        .into_iter()
-        .flatten()
-        .filter(|root| {
-            !ordinary_roots.contains(root)
-                && !new_overlay_roots.is_some_and(|roots| roots.contains(root))
-        })
-        .copied()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,9 +285,6 @@ mod tests {
         )]);
         merge_inbox_roots(&mut targets, &HashMap::new());
         assert_eq!(targets[&relay].root_events, HashSet::from([root]));
-        assert!(
-            roots_to_retire(&HashSet::from([root]), Some(&HashSet::from([root])), None).is_empty()
-        );
     }
 
     #[test]
