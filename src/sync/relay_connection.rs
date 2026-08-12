@@ -2185,6 +2185,22 @@ impl RelayConnection {
         self.client.subscriptions().await.len()
     }
 
+    /// Whether this session still owns a ledger permit for a subscription.
+    ///
+    /// Peer-supplied CLOSED identifiers must not create application retry
+    /// state unless they name work admitted through our bounded ledger.
+    pub(super) fn holds_subscription_permit(&self, subscription_id: &SubscriptionId) -> bool {
+        self.transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .contains_key(subscription_id)
+            || self
+                .live_req_permits_held
+                .lock()
+                .expect("live permit map poisoned")
+                .contains_key(subscription_id)
+    }
+
     async fn retire_peer_closed_subscription(&self, subscription_id: &SubscriptionId) {
         self.release_transient_req_permit(subscription_id);
         // A peer CLOSED is terminal for this subscription. In particular,
@@ -3411,6 +3427,29 @@ mod tests {
             .expect_err("nine live groups must not consume an eight-slot usable budget");
         assert!(error.contains("exceeds budget"), "{error}");
         assert_eq!(connection.subscription_budget().available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn peer_subscription_identity_is_bounded_by_owned_ledger_permits() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        connection.reset_subscription_budget(Some(10));
+        let owned = SubscriptionId::new("owned-live");
+        let forged = SubscriptionId::new("peer-forged");
+        let permit = connection.acquire_subscription_slots(1).await.unwrap();
+        connection.live_req_permits_held.lock().unwrap().insert(
+            owned.clone(),
+            HeldLiveSubscription {
+                generation: permit.generation,
+                _ledger_slot: permit.permit,
+                filters: vec![Filter::new().kind(Kind::TextNote)],
+            },
+        );
+
+        assert!(connection.holds_subscription_permit(&owned));
+        assert!(
+            !connection.holds_subscription_permit(&forged),
+            "a peer-selected CLOSED id must not become application-owned state"
+        );
     }
 
     #[tokio::test]

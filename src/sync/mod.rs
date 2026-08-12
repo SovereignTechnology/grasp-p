@@ -6649,6 +6649,17 @@ impl SyncManager {
             .get(relay_url)
             .is_some_and(|coverage| coverage.subscription_ids.contains(&subscription_id));
         let policy_category = if is_auth_required_message(reason) {
+            let Some(connection) = self.connections.get(relay_url) else {
+                return;
+            };
+            if !connection.holds_subscription_permit(&subscription_id) {
+                tracing::debug!(
+                    relay = %relay_url,
+                    sub_id = %subscription_id,
+                    "Ignoring auth-required CLOSED for an unowned subscription"
+                );
+                return;
+            }
             if reserve_authentication_retry(
                 &mut self.auth_required_attempts,
                 relay_url,
@@ -6661,11 +6672,9 @@ impl SyncManager {
                 );
                 return;
             }
-            if let Some(connection) = self.connections.get(relay_url) {
-                connection
-                    .retire_auth_refused_subscription(&subscription_id)
-                    .await;
-            }
+            connection
+                .retire_auth_refused_subscription(&subscription_id)
+                .await;
             Some(PolicyRefusal::AuthenticationRequired)
         } else {
             policy_refusal(reason)
