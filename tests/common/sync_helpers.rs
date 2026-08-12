@@ -18,6 +18,33 @@ use nostr_sdk::prelude::*;
 use super::port::{self, PortReservation};
 use super::relay::TestRelay;
 
+const DESCENDANT_LIVE_LOG: &str = "Installed priority-bounded auxiliary live coverage";
+
+pub fn descendant_live_generation(relay: &TestRelay) -> usize {
+    std::fs::read_to_string(relay.log_path())
+        .unwrap_or_default()
+        .matches(DESCENDANT_LIVE_LOG)
+        .count()
+}
+
+pub async fn wait_for_new_descendant_live_generation(
+    relay: &TestRelay,
+    previous: usize,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if descendant_live_generation(relay) > previous {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "descendant live coverage was not installed before the deadline"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 // NOTE: Using rust-nostr Kind variants:
 // - Kind::GitIssue.as_u16() -> Kind::GitIssue (1621)
 // - Kind::Comment.as_u16() -> Kind::Comment (1111)

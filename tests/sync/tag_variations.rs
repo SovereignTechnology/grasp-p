@@ -348,6 +348,7 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
     let issue = build_layer2_issue_event(&keys, &repo_coordinate, "Parent Issue for Tag 9a Test")
         .expect("Failed to create issue");
     let issue_id = issue.id;
+    let descendant_generation = descendant_live_generation(&relay_b);
 
     let client_a = TestClient::new(relay_a.url(), keys.clone())
         .await
@@ -366,8 +367,12 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
-    // Wait for Layer 3 subscriptions to be established
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_new_descendant_live_generation(
+        &relay_b,
+        descendant_generation,
+        Duration::from_secs(20),
+    )
+    .await;
 
     // 6. Create and send Layer 3 reply with lowercase 'e' tag (kind 1)
     let reply = build_layer3_reply_with_e_tag(&keys, &issue_id, "Reply with lowercase e tag")
@@ -455,6 +460,7 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
     let issue = build_layer2_issue_event(&keys, &repo_coordinate, "Parent Issue for Tag 9b Test")
         .expect("Failed to create issue");
     let issue_id = issue.id;
+    let descendant_generation = descendant_live_generation(&relay_b);
 
     let client_a = TestClient::new(relay_a.url(), keys.clone())
         .await
@@ -473,8 +479,12 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
-    // Wait for Layer 3 subscriptions to be established
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_new_descendant_live_generation(
+        &relay_b,
+        descendant_generation,
+        Duration::from_secs(20),
+    )
+    .await;
 
     // 6. Create and send Layer 3 comment with uppercase 'E' tag (kind 1111)
     let comment =
@@ -566,6 +576,7 @@ async fn test_layer3_sync_with_q_tag() {
     let issue = build_layer2_issue_event(&keys, &repo_coordinate, "Parent Issue for Tag 9c Test")
         .expect("Failed to create issue");
     let issue_id = issue.id;
+    let descendant_generation = descendant_live_generation(&relay_b);
 
     let client_a = TestClient::new(relay_a.url(), keys.clone())
         .await
@@ -584,8 +595,12 @@ async fn test_layer3_sync_with_q_tag() {
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
-    // Wait for Layer 3 subscriptions to be established
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_new_descendant_live_generation(
+        &relay_b,
+        descendant_generation,
+        Duration::from_secs(20),
+    )
+    .await;
 
     // 6. Create and send Layer 3 quote with 'q' tag (kind 1)
     let quote = build_layer3_quote_with_q_tag(&keys, &issue_id, "Quote with q tag")
