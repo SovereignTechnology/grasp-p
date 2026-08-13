@@ -33,6 +33,7 @@ use crate::metrics::Metrics;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::lifecycle::RepositoryLifecycle;
 use crate::nostr::SharedDatabase;
+use crate::private::{nip98, PrivateAccess};
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
@@ -42,7 +43,8 @@ type HttpBody = GitResponseBody;
 /// CORS headers required by GRASP-01 specification (lines 48-51)
 const CORS_ALLOW_ORIGIN: &str = "*";
 const CORS_ALLOW_METHODS: &str = "GET, POST";
-const CORS_ALLOW_HEADERS: &str = "Content-Type";
+const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, Git-Protocol";
+const CORS_EXPOSE_HEADERS: &str = "WWW-Authenticate";
 
 /// Embedded icon image (Grasp logo)
 const ICON_PNG: &[u8] = include_bytes!("../../static/icon.png");
@@ -65,43 +67,7 @@ fn parse_repo_url(path: &str) -> Option<(String, String)> {
     if path.starts_with("/prs/") || path.starts_with("prs/") {
         return None;
     }
-
-    // Remove leading slash
-    let path = path.strip_prefix('/').unwrap_or(path);
-
-    // Split into components
-    let parts: Vec<&str> = path.split('/').collect();
-
-    // Must be exactly 2 parts: npub and repo.git (no subpath)
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let npub = parts[0];
-    let repo_part = git::percent_decode(parts[1]);
-
-    // The repo part must end with .git
-    if !repo_part.ends_with(".git") {
-        return None;
-    }
-
-    // Must have an npub that looks valid (starts with npub1)
-    if !npub.starts_with("npub1") {
-        return None;
-    }
-
-    // Extract identifier (remove .git suffix)
-    let identifier = repo_part
-        .strip_suffix(".git")
-        .unwrap_or(&repo_part)
-        .to_string();
-
-    // Identifier must not be empty
-    if identifier.is_empty() {
-        return None;
-    }
-
-    Some((npub.to_string(), identifier))
+    git::parse_repository_root_url(path)
 }
 
 /// Add CORS headers to a response builder
@@ -110,6 +76,7 @@ fn add_cors_headers(builder: hyper::http::response::Builder) -> hyper::http::res
         .header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
         .header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS)
         .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
+        .header("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)
 }
 
 /// HTTP Service that serves both WebSocket (relay) and HTML landing page
@@ -132,6 +99,8 @@ struct HttpService {
     /// Per-path init mutexes for GRASP-06 `/prs/` on-demand bare-repo
     /// creation. See [`crate::grasp06::receive::RepoInitLocks`].
     repo_init_locks: RepoInitLocks,
+    /// GRASP-08 access list. Present only when private mode is enabled.
+    private_access: Option<PrivateAccess>,
 }
 
 impl HttpService {
@@ -147,6 +116,7 @@ impl HttpService {
         lifecycle: Arc<RepositoryLifecycle>,
         rejected_events_index: Arc<RejectedEventsIndex>,
         repo_init_locks: RepoInitLocks,
+        private_access: Option<PrivateAccess>,
     ) -> Self {
         Self {
             relay,
@@ -159,6 +129,7 @@ impl HttpService {
             lifecycle,
             rejected_events_index,
             repo_init_locks,
+            private_access,
         }
     }
 }
@@ -431,6 +402,24 @@ impl Service<Request<Incoming>> for HttpService {
 
         // Check for Git HTTP requests first
         if let Some((npub, identifier, subpath)) = git::parse_git_url(&path) {
+            if let Some(access) = &self.private_access {
+                let authorized = nip98::canonical_repository_url(&self.config, &path)
+                    .is_some_and(|url| nip98::validate_request(&req, &url, access).is_ok());
+                if !authorized {
+                    let response = nip98::unauthorized_response(&self.config);
+                    return Box::pin(async move {
+                        let (parts, body) = response.into_parts();
+                        Ok(add_cors_headers(Response::builder().status(parts.status))
+                            .header(
+                                "www-authenticate",
+                                parts.headers["www-authenticate"].clone(),
+                            )
+                            .body(body)
+                            .unwrap())
+                    });
+                }
+            }
+
             // Extract Git-Protocol header for protocol v2 support
             let git_protocol = req
                 .headers()
@@ -457,7 +446,8 @@ impl Service<Request<Incoming>> for HttpService {
                 content_encoding
             );
 
-            let repo_path = git::resolve_repo_path(&git_data_path, &npub, &identifier);
+            let repo_path = git::resolve_repo_path(&git_data_path, &npub, &identifier)
+                .expect("parse_git_url validated repository coordinate");
             let metrics_clone = self.metrics.clone();
             let relay = self.relay.clone();
 
@@ -709,8 +699,27 @@ impl Service<Request<Incoming>> for HttpService {
         // GRASP-01: "SHOULD serve a webpage at the same endpoint linking to git nostr client(s)
         // to browse the repository and a 404 page for repositories it doesn't host"
         if let Some((npub, identifier)) = parse_repo_url(&path) {
+            if let Some(access) = &self.private_access {
+                let authorized = nip98::canonical_repository_url(&self.config, &path)
+                    .is_some_and(|url| nip98::validate_request(&req, &url, access).is_ok());
+                if !authorized {
+                    let response = nip98::unauthorized_response(&self.config);
+                    return Box::pin(async move {
+                        let (parts, body) = response.into_parts();
+                        Ok(add_cors_headers(Response::builder().status(parts.status))
+                            .header(
+                                "www-authenticate",
+                                parts.headers["www-authenticate"].clone(),
+                            )
+                            .body(body)
+                            .unwrap())
+                    });
+                }
+            }
+
             let config = self.config.clone();
-            let repo_path = git::resolve_repo_path(&git_data_path, &npub, &identifier);
+            let repo_path = git::resolve_repo_path(&git_data_path, &npub, &identifier)
+                .expect("parse_repo_url validated repository coordinate");
 
             tracing::debug!(
                 "Repository URL request: {} (npub={}, id={}, path={:?})",
@@ -769,6 +778,8 @@ impl Service<Request<Incoming>> for HttpService {
                 );
                 let relay = self.relay.clone();
                 let metrics_clone = self.metrics.clone();
+                let private_access = self.private_access.clone();
+                let relay_domain = self.config.domain.clone();
 
                 tokio::spawn(async move {
                     match hyper::upgrade::on(req).await {
@@ -785,7 +796,23 @@ impl Service<Request<Incoming>> for HttpService {
                                 m.connection_tracker().on_connect(addr.ip());
                                 m.record_websocket_connection();
                             }
-                            if let Err(e) =
+                            if let Some(access) = private_access {
+                                if let Err(e) = crate::private::ws_auth::authenticate_and_bridge(
+                                    TokioIo::new(upgraded),
+                                    addr,
+                                    relay,
+                                    &relay_domain,
+                                    access,
+                                )
+                                .await
+                                {
+                                    tracing::debug!(
+                                        "Private relay connection ended for {}: {}",
+                                        addr,
+                                        e
+                                    );
+                                }
+                            } else if let Err(e) =
                                 relay.take_connection(TokioIo::new(upgraded), addr).await
                             {
                                 tracing::error!(
@@ -918,6 +945,7 @@ pub async fn run_server(
     lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
+    private_access: Option<PrivateAccess>,
 ) -> anyhow::Result<()> {
     let bind_addr: SocketAddr = config.bind_address.parse()?;
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -932,6 +960,7 @@ pub async fn run_server(
         lifecycle,
         rejected_events_index,
         repo_init_locks,
+        private_access,
     )
     .await
 }
@@ -960,6 +989,7 @@ pub async fn run_server_on_listener(
     lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
+    private_access: Option<PrivateAccess>,
 ) -> anyhow::Result<()> {
     tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
@@ -985,6 +1015,7 @@ pub async fn run_server_on_listener(
             lifecycle.clone(),
             rejected_events_index.clone(),
             repo_init_locks.clone(),
+            private_access.clone(),
         );
 
         tokio::spawn(async move {

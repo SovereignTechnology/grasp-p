@@ -390,6 +390,35 @@ let
         '';
       };
 
+      privateMode = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Enable GRASP-08 private-service authentication. All Nostr clients
+          must authenticate with NIP-42 and all standard Git Smart HTTP
+          requests must carry a repository-scoped NIP-98 credential.
+          Cannot be combined with grasp06Enable.
+        '';
+      };
+
+      privateMembers = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "npub1alice..." "npub1bob..." ];
+        description = ''
+          Service-wide GRASP-08 member whitelist. At least one valid npub is
+          required when privateMode is enabled. Malformed entries make the
+          service fail at startup.
+        '';
+      };
+
+      privatePublicOrigin = mkOption {
+        type = types.str;
+        default = "";
+        example = "https://private.example";
+        description = "Canonical external origin used by private Git NIP-98 credentials.";
+      };
+
       repositoryWhitelist = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -571,6 +600,9 @@ let
       NGIT_EVENT_BLACKLIST = concatStringsSep "," cfg.eventBlacklist;
       NGIT_LOG_LEVEL = cfg.logLevel;
       NGIT_GRASP06_ENABLE = if cfg.grasp06Enable then "true" else "false";
+      NGIT_PRIVATE_MODE = if cfg.privateMode then "true" else "false";
+      NGIT_PRIVATE_MEMBERS = concatStringsSep "," cfg.privateMembers;
+      NGIT_PRIVATE_PUBLIC_ORIGIN = cfg.privatePublicOrigin;
       NGIT_DELETION_REQUEST_DISRESPECTOR =
         if cfg.deletionRequestDisrespector then "true" else "false";
       NGIT_RELAY_MAX_SUBSCRIPTIONS = toString cfg.relayMaxSubscriptions;

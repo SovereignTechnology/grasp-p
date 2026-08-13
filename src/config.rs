@@ -591,6 +591,27 @@ pub struct Config {
     #[arg(long, env = "NGIT_GRASP06_ENABLE", default_value_t = false)]
     pub grasp06_enable: bool,
 
+    /// Enable GRASP-08 private-service authentication.
+    ///
+    /// When enabled, every Nostr WebSocket session must authenticate with
+    /// NIP-42 and every standard Git Smart HTTP request must carry the
+    /// GRASP-08 repository-scoped NIP-98 credential.
+    #[arg(long, env = "NGIT_PRIVATE_MODE", default_value_t = false)]
+    pub private_mode: bool,
+
+    /// Service-wide GRASP-08 member whitelist as comma-separated npubs.
+    ///
+    /// Required and fail-closed when private mode is enabled.
+    #[arg(long, env = "NGIT_PRIVATE_MEMBERS", default_value = "")]
+    pub private_members: String,
+
+    /// Canonical externally visible origin used by GRASP-08 NIP-98 `u` tags.
+    ///
+    /// Set this when TLS terminates upstream or a non-loopback deployment uses
+    /// plain HTTP. When empty, the origin is inferred from `NGIT_DOMAIN`.
+    #[arg(long, env = "NGIT_PRIVATE_PUBLIC_ORIGIN", default_value = "")]
+    pub private_public_origin: String,
+
     /// Repository whitelist: comma-separated list of npub/identifier/npub/identifier entries
     /// Formats: "npub1...", "npub1.../identifier", "identifier"
     /// When set, only announcements matching the whitelist AND listing the service are accepted
@@ -906,6 +927,38 @@ impl Config {
         // Validate repository whitelist configuration
         let repository_whitelist = WhitelistEntry::parse_whitelist(&self.repository_whitelist);
 
+        let private_members = self.parse_private_members()?;
+        if self.private_mode && private_members.is_empty() {
+            return Err(anyhow!(
+                "NGIT_PRIVATE_MODE=true requires at least one npub in NGIT_PRIVATE_MEMBERS"
+            ));
+        }
+        if !self.private_mode && !private_members.is_empty() {
+            return Err(anyhow!(
+                "NGIT_PRIVATE_MEMBERS requires NGIT_PRIVATE_MODE=true"
+            ));
+        }
+        if self.private_mode && self.grasp06_enable {
+            return Err(anyhow!(
+                "NGIT_PRIVATE_MODE=true cannot be combined with NGIT_GRASP06_ENABLE=true because \
+                 the GRASP-06 contributor endpoint is intentionally unauthenticated"
+            ));
+        }
+        if !self.private_public_origin.trim().is_empty() {
+            let origin = Url::parse(self.private_public_origin.trim())
+                .context("NGIT_PRIVATE_PUBLIC_ORIGIN must be an absolute URL")?;
+            if !matches!(origin.scheme(), "http" | "https")
+                || origin.host_str().is_none()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+            {
+                return Err(anyhow!(
+                    "NGIT_PRIVATE_PUBLIC_ORIGIN must be an http(s) origin without a path, query, or fragment"
+                ));
+            }
+        }
+
         if self.holding_retention_secs == 0 {
             return Err(anyhow!(
                 "NGIT_HOLDING_RETENTION_SECS must be greater than 0"
@@ -1020,6 +1073,28 @@ impl Config {
             .map(str::trim)
             .filter(|relay| !relay.is_empty())
             .map(str::to_owned)
+            .collect()
+    }
+
+    /// Parse the GRASP-08 service-wide member whitelist.
+    ///
+    /// Unlike repository/archive curation lists, malformed private members are
+    /// fatal: skipping an access-control entry would silently lock a user out.
+    pub fn parse_private_members(&self) -> Result<Vec<PublicKey>> {
+        self.private_members
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if !value.starts_with("npub1") {
+                    return Err(anyhow!(
+                        "Invalid NGIT_PRIVATE_MEMBERS entry '{value}': expected an npub"
+                    ));
+                }
+                PublicKey::from_bech32(value).with_context(|| {
+                    format!("Invalid npub in NGIT_PRIVATE_MEMBERS entry '{value}'")
+                })
+            })
             .collect()
     }
 
@@ -1182,6 +1257,9 @@ impl Config {
             archive_grasp_services: String::new(),
             archive_read_only: None,
             grasp06_enable: false,
+            private_mode: false,
+            private_members: String::new(),
+            private_public_origin: String::new(),
             repository_whitelist: String::new(),
             repository_blacklist: String::new(),
             blacklist_auto_restore: false,
