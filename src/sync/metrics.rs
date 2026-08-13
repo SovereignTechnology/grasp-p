@@ -62,8 +62,6 @@ pub struct SyncMetrics {
     // === Naughty List Metrics ===
     /// Number of relays on naughty list by category
     naughty_relays_total: IntGaugeVec,
-    /// Detailed info about naughty relays (relay, category, reason)
-    naughty_relay_info: IntGaugeVec,
 }
 
 impl SyncMetrics {
@@ -220,15 +218,6 @@ impl SyncMetrics {
         )?;
         registry.register(Box::new(naughty_relays_total.clone()))?;
 
-        let naughty_relay_info = IntGaugeVec::new(
-            Opts::new(
-                "ngit_sync_naughty_relay_info",
-                "Detailed info about naughty relays (occurrence count)",
-            ),
-            &["relay", "category", "reason"],
-        )?;
-        registry.register(Box::new(naughty_relay_info.clone()))?;
-
         Ok(Self {
             relay_connected,
             connection_attempts_total,
@@ -247,7 +236,6 @@ impl SyncMetrics {
             rejected_cold_index_expired_total,
             rejected_invalidated_total,
             naughty_relays_total,
-            naughty_relay_info,
         })
     }
 
@@ -535,28 +523,20 @@ impl SyncMetrics {
     pub fn update_naughty_list(&self, entries: Vec<(String, super::naughty_list::NaughtyEntry)>) {
         use super::naughty_list::NaughtyCategory;
 
-        // Reset all naughty list metrics
+        // Reset the bounded aggregate before rebuilding its three categories.
         self.naughty_relays_total.reset();
-        self.naughty_relay_info.reset();
 
         // Count by category
         let mut dns_count = 0;
         let mut tls_count = 0;
         let mut protocol_count = 0;
 
-        // Update metrics for each naughty relay
-        for (url, entry) in entries {
-            // Update category counts
+        for (_, entry) in entries {
             match entry.category {
                 NaughtyCategory::DnsLookupFailed => dns_count += 1,
                 NaughtyCategory::TlsCertificateInvalid => tls_count += 1,
                 NaughtyCategory::ProtocolError => protocol_count += 1,
             }
-
-            // Update detailed info (occurrence count)
-            self.naughty_relay_info
-                .with_label_values(&[url.as_str(), entry.category.as_str(), entry.reason.as_str()])
-                .set(entry.occurrence_count as i64);
         }
 
         // Set category totals
@@ -575,6 +555,8 @@ impl SyncMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::{Encoder, TextEncoder};
+    use std::time::Instant;
 
     fn create_test_registry() -> Registry {
         Registry::new()
@@ -713,5 +695,62 @@ mod tests {
 
         // Test state invalidation metrics
         metrics.record_rejected_invalidation("state", 1);
+    }
+
+    #[test]
+    fn test_naughty_list_metrics_have_fixed_peer_independent_cardinality() {
+        use super::super::naughty_list::{NaughtyCategory, NaughtyEntry};
+
+        let registry = create_test_registry();
+        let metrics = SyncMetrics::register(&registry).unwrap();
+        let categories = [
+            NaughtyCategory::DnsLookupFailed,
+            NaughtyCategory::TlsCertificateInvalid,
+            NaughtyCategory::ProtocolError,
+        ];
+
+        for batch in 0..4 {
+            let entries = (0..300)
+                .map(|index| {
+                    (
+                        format!("wss://peer-{batch}-{index}.attacker.example"),
+                        NaughtyEntry {
+                            category: categories[index % categories.len()],
+                            reason: format!("peer-controlled-reason-{batch}-{index}"),
+                            first_seen: Instant::now(),
+                            last_seen: Instant::now(),
+                            occurrence_count: index as u32 + 1,
+                        },
+                    )
+                })
+                .collect();
+
+            metrics.update_naughty_list(entries);
+
+            let families = registry.gather();
+            assert!(families
+                .iter()
+                .all(|family| family.name() != "ngit_sync_naughty_relay_info"));
+            let aggregate = families
+                .iter()
+                .find(|family| family.name() == "ngit_sync_naughty_relays_total")
+                .expect("missing aggregate naughty-list metric");
+            assert_eq!(aggregate.get_metric().len(), 3);
+            assert!(aggregate.get_metric().iter().all(|metric| {
+                metric.get_label().len() == 1
+                    && metric.get_label()[0].name() == "category"
+                    && matches!(
+                        metric.get_label()[0].value(),
+                        "dns_lookup_failed" | "tls_certificate_invalid" | "protocol_error"
+                    )
+                    && metric.get_gauge().value() == 100.0
+            }));
+
+            let mut encoded = Vec::new();
+            TextEncoder::new().encode(&families, &mut encoded).unwrap();
+            let encoded = String::from_utf8(encoded).unwrap();
+            assert!(!encoded.contains("attacker.example"));
+            assert!(!encoded.contains("peer-controlled-reason"));
+        }
     }
 }
