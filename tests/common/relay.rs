@@ -86,6 +86,7 @@ struct RelayOptions {
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
     rejected_hot_cache_duration_secs: Option<u64>,
     relay_max_subscriptions: Option<usize>,
+    sync_recursive_descendant_limit: Option<usize>,
     /// Run with the production outbound target policy (reject non-global
     /// event-directed sync targets). The fixture default is permissive
     /// because the entire test infrastructure lives on loopback.
@@ -427,6 +428,31 @@ impl TestRelay {
         .await
     }
 
+    /// Start a persistent syncing relay with a small recursive-descendant
+    /// allowance so saturation and restart reconstruction can be exercised.
+    pub async fn start_on_reservation_persistent_sync_with_recursive_limit(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        disable_negentropy: bool,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+        recursive_descendant_limit: usize,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                disable_negentropy,
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                sync_recursive_descendant_limit: Some(recursive_descendant_limit),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a persistent syncing relay with an explicit Sync+ fallback set.
     pub async fn start_on_reservation_persistent_sync_with_fallback(
         reservation: PortReservation,
@@ -630,6 +656,10 @@ impl TestRelay {
 
         if let Some(limit) = options.relay_max_subscriptions {
             cmd.env("NGIT_RELAY_MAX_SUBSCRIPTIONS", limit.to_string());
+        }
+
+        if let Some(limit) = options.sync_recursive_descendant_limit {
+            cmd.env("NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT", limit.to_string());
         }
 
         // Add negentropy disable flag if requested

@@ -424,6 +424,15 @@ pub struct Config {
     )]
     pub sync_plus_fallback_relays: String,
 
+    /// Soft limit on recursive query-frontier members below each event which directly tags
+    /// a repository root. Direct root-tagging events are not counted.
+    #[arg(
+        long,
+        env = "NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT",
+        default_value_t = 500
+    )]
+    pub sync_recursive_descendant_limit: usize,
+
     /// Maximum backoff time in seconds for sync relay reconnection (default: 3600 = 1 hour)
     #[arg(long, env = "NGIT_SYNC_MAX_BACKOFF_SECS", default_value_t = 3600)]
     pub sync_max_backoff_secs: u64,
@@ -908,6 +917,12 @@ impl Config {
             ));
         }
 
+        if self.sync_recursive_descendant_limit == 0 {
+            return Err(anyhow!(
+                "NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT must be greater than 0"
+            ));
+        }
+
         Self::validate_deletion_request_retention_duration(
             self.deletion_request_retention_unused_served_secs,
             "NGIT_DELETION_REQUEST_RETENTION_UNUSED_SERVED_SECS",
@@ -1141,6 +1156,7 @@ impl Config {
             sync_plus_enabled: true,
             user_index_relays: DEFAULT_USER_INDEX_RELAYS.to_string(),
             sync_plus_fallback_relays: DEFAULT_SYNC_PLUS_FALLBACK_RELAYS.to_string(),
+            sync_recursive_descendant_limit: 500,
             sync_max_backoff_secs: 3600,
             sync_disconnect_check_interval_secs: 60,
             sync_base_backoff_secs: 5,
@@ -1348,6 +1364,33 @@ mod tests {
         ])
         .expect("Sync+ opt-out should parse");
         assert!(!disabled.sync_plus_enabled);
+    }
+
+    #[test]
+    fn recursive_descendant_limit_defaults_to_500_and_accepts_small_soak_values() {
+        let default = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("recursive descendant default should parse");
+        assert_eq!(default.sync_recursive_descendant_limit, 500);
+
+        let tiny = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--sync-recursive-descendant-limit=3",
+        ])
+        .expect("tiny recursive descendant limit should parse");
+        assert_eq!(tiny.sync_recursive_descendant_limit, 3);
+    }
+
+    #[test]
+    fn recursive_descendant_limit_must_be_positive() {
+        let mut config = Config::for_testing();
+        config.sync_recursive_descendant_limit = 0;
+
+        let error = config.validate().expect_err("zero limit must be rejected");
+        assert!(error
+            .to_string()
+            .contains("NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT must be greater than 0"));
     }
 
     #[test]

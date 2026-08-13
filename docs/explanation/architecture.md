@@ -547,6 +547,13 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 - **Rejected events index** - prevents wasteful broad re-fetching while retaining exact IDs for dependency recovery
 - **Desired-source retention** keeps listed GRASP-02 relays retryable until
   repository work is actually confirmed, including StateOnly invitation sync
+- **Bounded recursive related-event coverage** turns accepted descendants into
+  the next remote query frontier through event and address references, with an
+  eight-generation traversal and a configurable soft limit, defaulting to 500,
+  for each subtree rooted at an event which directly tags a repository root.
+  The local database deterministically reconstructs saturated branches after
+  restart; relay connections retain independent progress and require no shared
+  admission coordinator
 
 **Architecture:**
 

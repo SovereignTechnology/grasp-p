@@ -65,7 +65,9 @@ const MAX_PURGATORY_DEPENDENCY_IDS_PER_QUERY: usize = 100;
 const SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS: usize = 20;
 const SEMANTIC_FALLBACK_MAX_DELIVERED_PERCENT: usize = 10;
 const DESCENDANT_FALLBACK_OVERLAP_SECS: u64 = 15 * 60;
-
+/// Maximum number of locally known parent/child generations expanded into a
+/// relay's related-event query frontier.
+const MAX_DESCENDANT_FRONTIER_DEPTH: usize = 8;
 fn should_use_semantic_fallback(requested_count: usize, received_count: usize) -> bool {
     requested_count >= SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS
         && received_count.saturating_mul(100)
@@ -883,25 +885,9 @@ struct DescendantFilterInFlight {
 
 #[derive(Debug)]
 struct DescendantLiveCoverage {
-    /// Individual filters physically covered by the still-open REQs. Desired
-    /// coverage may become a subset while these drain naturally.
-    covered_filters: HashSet<String>,
     desired_filters: HashSet<String>,
     fallback_filters: Vec<Filter>,
     subscription_ids: Vec<SubscriptionId>,
-}
-
-impl DescendantLiveCoverage {
-    fn retain_for_removal_only_change(&mut self, desired: &HashSet<String>) -> bool {
-        if desired == &self.desired_filters {
-            return true;
-        }
-        if desired.is_subset(&self.covered_filters) {
-            self.desired_filters.clone_from(desired);
-            return true;
-        }
-        false
-    }
 }
 
 fn filter_group_fingerprint(filters: &[Filter]) -> String {
@@ -1018,6 +1004,238 @@ fn descendant_event_coordinate(event: &Event) -> Option<String> {
         event.pubkey.to_hex(),
         identifier
     ))
+}
+
+/// Derive a bounded transitive frontier from related events already accepted
+/// into the local database.
+///
+/// A newly fetched event becomes a parent on the next reconciliation tick, so
+/// remote traversal progresses without retaining another durable cursor. Both
+/// event IDs and replaceable/addressable coordinates participate because
+/// clients may continue a thread through either reference form.
+async fn recursive_descendant_frontier(
+    database: &SharedDatabase,
+    root_events: &HashSet<EventId>,
+    max_recursive_events_per_branch: usize,
+) -> DescendantFrontier {
+    recursive_descendant_frontier_with_limits(
+        database,
+        root_events,
+        MAX_DESCENDANT_FRONTIER_DEPTH,
+        max_recursive_events_per_branch,
+    )
+    .await
+}
+
+async fn recursive_descendant_frontier_with_limits(
+    database: &SharedDatabase,
+    root_events: &HashSet<EventId>,
+    max_depth: usize,
+    max_recursive_events_per_branch: usize,
+) -> DescendantFrontier {
+    let mut frontier = DescendantFrontier::default();
+    if max_depth == 0 || root_events.is_empty() {
+        return frontier;
+    }
+
+    // Every event directly tagging a root owns an independent recursive
+    // subtree. The direct event itself remains complete core coverage.
+    let mut direct_events = HashMap::<EventId, Event>::new();
+    for filter in filters::tagged_one_of_our_root_event_filters(root_events, None) {
+        match database.query(filter).await {
+            Ok(events) => {
+                for event in events
+                    .iter()
+                    .filter(|event| !root_events.contains(&event.id))
+                {
+                    direct_events
+                        .entry(event.id)
+                        .or_insert_with(|| event.clone());
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    root_event_count = root_events.len(),
+                    "Failed to derive direct repository thread members"
+                );
+                return DescendantFrontier::default();
+            }
+        }
+    }
+
+    let mut direct_events: Vec<_> = direct_events.into_iter().collect();
+    direct_events.sort_by(|(left_id, left), (right_id, right)| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let direct_event_ids: HashSet<_> = direct_events.iter().map(|(id, _)| *id).collect();
+    let mut branch_member_counts = HashMap::<EventId, usize>::new();
+    let mut event_branches = HashMap::<EventId, HashSet<EventId>>::new();
+    let mut coordinate_branches = HashMap::<String, HashSet<EventId>>::new();
+    let mut event_seeds = HashMap::<EventId, HashSet<EventId>>::new();
+    let mut coordinate_seeds = HashMap::<String, HashSet<EventId>>::new();
+    for (event_id, event) in direct_events {
+        branch_member_counts.insert(event_id, 0);
+        event_branches.entry(event_id).or_default().insert(event_id);
+        event_seeds.entry(event_id).or_default().insert(event_id);
+        if let Some(coordinate) = descendant_event_coordinate(&event) {
+            coordinate_branches
+                .entry(coordinate.clone())
+                .or_default()
+                .insert(event_id);
+            coordinate_seeds
+                .entry(coordinate)
+                .or_default()
+                .insert(event_id);
+        }
+    }
+
+    if max_depth == 1 || (event_seeds.is_empty() && coordinate_seeds.is_empty()) {
+        frontier.event_ids.extend(event_seeds.into_keys());
+        frontier.coordinates.extend(coordinate_seeds.into_keys());
+        return frontier;
+    }
+
+    for depth in 2..=max_depth {
+        let mut layer_events = HashMap::<EventId, Event>::new();
+        let event_seed_ids: HashSet<_> = event_seeds.keys().copied().collect();
+        let coordinate_seed_ids: HashSet<_> = coordinate_seeds.keys().cloned().collect();
+        let mut layer_filters =
+            filters::tagged_one_of_our_root_event_filters(&event_seed_ids, None);
+        layer_filters.extend(filters::tagged_one_of_our_repo_event_filters(
+            &coordinate_seed_ids,
+            None,
+        ));
+
+        for filter in layer_filters {
+            match database.query(filter).await {
+                Ok(events) => {
+                    for event in events.iter() {
+                        if root_events.contains(&event.id)
+                            || direct_event_ids.contains(&event.id)
+                            || layer_events.contains_key(&event.id)
+                        {
+                            continue;
+                        }
+                        layer_events.insert(event.id, event.clone());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        depth,
+                        event_seed_count = event_seeds.len(),
+                        coordinate_seed_count = coordinate_seeds.len(),
+                        direct_event_count = direct_event_ids.len(),
+                        "Failed to derive recursive repository thread members"
+                    );
+                    return frontier;
+                }
+            }
+        }
+
+        let mut layer_events: Vec<_> = layer_events.into_iter().collect();
+        layer_events.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut next_event_seeds = HashMap::<EventId, HashSet<EventId>>::new();
+        let mut next_coordinate_seeds = HashMap::<String, HashSet<EventId>>::new();
+        for (event_id, event) in layer_events {
+            let (addressable_refs, event_refs) =
+                crate::nostr::policy::RelatedEventPolicy::extract_reference_tags(&event);
+            let mut inherited_branches = HashSet::new();
+            for parent in event_refs {
+                if let Some(branches) = event_branches.get(&parent) {
+                    inherited_branches.extend(branches.iter().copied());
+                }
+            }
+            for parent in addressable_refs {
+                if let Some(branches) = coordinate_branches.get(&parent) {
+                    inherited_branches.extend(branches.iter().copied());
+                }
+            }
+            if let Some(existing_branches) = event_branches.get(&event_id) {
+                inherited_branches.retain(|branch| !existing_branches.contains(branch));
+            }
+
+            let mut admitted_branches = HashSet::new();
+            for branch in inherited_branches {
+                let member_count = branch_member_counts.entry(branch).or_default();
+                if *member_count < max_recursive_events_per_branch {
+                    *member_count += 1;
+                    admitted_branches.insert(branch);
+                }
+            }
+            if admitted_branches.is_empty() {
+                continue;
+            }
+            event_branches
+                .entry(event_id)
+                .or_default()
+                .extend(admitted_branches.iter().copied());
+            if let Some(coordinate) = descendant_event_coordinate(&event) {
+                coordinate_branches
+                    .entry(coordinate)
+                    .or_default()
+                    .extend(admitted_branches.iter().copied());
+            }
+
+            let expandable_branches: HashSet<_> = admitted_branches
+                .into_iter()
+                .filter(|branch| branch_member_counts[branch] < max_recursive_events_per_branch)
+                .collect();
+            if expandable_branches.is_empty() {
+                continue;
+            }
+            next_event_seeds.insert(event_id, expandable_branches.clone());
+            if let Some(coordinate) = descendant_event_coordinate(&event) {
+                next_coordinate_seeds.insert(coordinate, expandable_branches);
+            }
+        }
+
+        if next_event_seeds.is_empty() && next_coordinate_seeds.is_empty() {
+            break;
+        }
+        event_seeds = next_event_seeds;
+        coordinate_seeds = next_coordinate_seeds;
+    }
+
+    let exhausted_branches: HashSet<_> = branch_member_counts
+        .iter()
+        .filter(|(_, member_count)| **member_count >= max_recursive_events_per_branch)
+        .map(|(branch, _)| *branch)
+        .collect();
+    for (event_id, branches) in &event_branches {
+        if branches
+            .iter()
+            .any(|branch| !exhausted_branches.contains(branch))
+        {
+            frontier.event_ids.insert(*event_id);
+        }
+    }
+    for (coordinate, branches) in &coordinate_branches {
+        if branches
+            .iter()
+            .any(|branch| !exhausted_branches.contains(branch))
+        {
+            frontier.coordinates.insert(coordinate.clone());
+        }
+    }
+
+    tracing::debug!(
+        depth_limit = max_depth,
+        event_count = frontier.event_ids.len(),
+        coordinate_count = frontier.coordinates.len(),
+        branch_count = branch_member_counts.len(),
+        exhausted_branch_count = exhausted_branches.len(),
+        "Derived bounded recursive repository thread frontier"
+    );
+    frontier
 }
 
 #[cfg(test)]
@@ -4320,37 +4538,17 @@ impl SyncManager {
             .await;
     }
 
-    /// Find the existing first-generation members of repository root threads.
-    ///
-    /// Only events that directly reference a root are admitted to this
-    /// frontier. Events fetched by the descendant rotation are deliberately
-    /// not fed back into it, keeping this feature non-recursive.
-    async fn direct_thread_members(&self, root_events: &HashSet<EventId>) -> DescendantFrontier {
-        let mut frontier = DescendantFrontier::default();
-        for filter in filters::tagged_one_of_our_root_event_filters(root_events, None) {
-            match self.database.query(filter).await {
-                Ok(events) => {
-                    for event in events
-                        .iter()
-                        .filter(|event| !root_events.contains(&event.id))
-                    {
-                        frontier.event_ids.insert(event.id);
-                        if let Some(coordinate) = descendant_event_coordinate(event) {
-                            frontier.coordinates.insert(coordinate);
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        root_event_count = root_events.len(),
-                        "Failed to derive direct repository thread members"
-                    );
-                    return DescendantFrontier::default();
-                }
-            }
-        }
-        frontier
+    /// Find the bounded transitive members of repository root threads.
+    async fn descendant_thread_members(
+        &self,
+        root_events: &HashSet<EventId>,
+    ) -> DescendantFrontier {
+        recursive_descendant_frontier(
+            &self.database,
+            root_events,
+            self.config.sync_recursive_descendant_limit,
+        )
+        .await
     }
 
     async fn close_descendant_live_coverage(
@@ -4391,7 +4589,7 @@ impl SyncManager {
         relay_url: &str,
         target: &algorithms::RelaySyncNeeds,
     ) {
-        let frontier = self.direct_thread_members(&target.root_events).await;
+        let frontier = self.descendant_thread_members(&target.root_events).await;
         let historic_entries =
             tiered_auxiliary_filters(&target.repos, &target.root_events, &frontier, None);
         let live_since = Timestamp::from(
@@ -4408,11 +4606,7 @@ impl SyncManager {
             let desired_live_filters: HashSet<_> =
                 live_filters.iter().map(Filter::as_json).collect();
             if let Some(coverage) = self.descendant_live_coverage.get_mut(relay_url) {
-                let desired_changed = desired_live_filters != coverage.desired_filters;
-                if coverage.retain_for_removal_only_change(&desired_live_filters) {
-                    // Removal-only changes update desired fallback coverage but
-                    // do not churn a shared live REQ. Its obsolete filters die
-                    // at CLOSED/disconnect; additions still rebuild below.
+                if desired_live_filters == coverage.desired_filters {
                     let max_filters = connection.max_filters_per_req();
                     let rotation = self
                         .descendant_sync_rotations
@@ -4424,13 +4618,6 @@ impl SyncManager {
                         rotation.refresh(rotated_filters, max_filters);
                     }
                     coverage.fallback_filters = complete_auxiliary_fallback(&historic_entries);
-                    if desired_changed {
-                        tracing::info!(
-                            relay = %relay_url,
-                            retained_subscription_count = coverage.subscription_ids.len(),
-                            "Retaining removal-only auxiliary live coverage until natural closure"
-                        );
-                    }
                     return;
                 }
             }
@@ -4463,7 +4650,6 @@ impl SyncManager {
                         self.descendant_live_coverage.insert(
                             relay_url.to_string(),
                             DescendantLiveCoverage {
-                                covered_filters: desired_live_filters.clone(),
                                 desired_filters: desired_live_filters,
                                 fallback_filters,
                                 subscription_ids: subscription_ids.clone(),
@@ -7655,7 +7841,7 @@ impl SyncManager {
         {
             filters
         } else {
-            let frontier = self.direct_thread_members(&items.root_events).await;
+            let frontier = self.descendant_thread_members(&items.root_events).await;
             packed_historic_filters(&items, &frontier)
         };
         self.historic_sync_with_options(
@@ -8168,36 +8354,6 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_reconciliation_keeps_subscription_ids_for_removal_only_coverage() {
-        let first_id = EventId::from_byte_array([1; 32]);
-        let second_id = EventId::from_byte_array([2; 32]);
-        let first_filter = Filter::new().event(first_id);
-        let second_filter = Filter::new().event(second_id);
-        let first = first_filter.as_json();
-        let second = second_filter.as_json();
-        let subscription_ids = vec![SubscriptionId::new("live-descendants")];
-        let mut coverage = DescendantLiveCoverage {
-            covered_filters: HashSet::from([first.clone(), second.clone()]),
-            desired_filters: HashSet::from([first, second.clone()]),
-            fallback_filters: vec![first_filter, second_filter.clone()],
-            subscription_ids: subscription_ids.clone(),
-        };
-
-        assert!(coverage.retain_for_removal_only_change(&HashSet::from([second.clone()])));
-        assert_eq!(coverage.subscription_ids, subscription_ids);
-        coverage.fallback_filters = vec![second_filter];
-        assert_eq!(coverage.fallback_filters.len(), 1);
-        assert!(coverage.fallback_filters[0].as_json().contains(&second));
-        assert!(!coverage.fallback_filters[0]
-            .as_json()
-            .contains(&first_id.to_hex()));
-        // A later maintenance tick sees stable desired coverage and still
-        // leaves the physical subscription untouched.
-        assert!(coverage.retain_for_removal_only_change(&HashSet::from([second])));
-        assert_eq!(coverage.subscription_ids, subscription_ids);
-    }
-
-    #[test]
     fn retained_list_does_not_mask_an_empty_new_outbox_response() {
         let author_with_retained_list = Keys::generate().public_key();
         // `represented_by_source` is intentionally empty: a relay list held
@@ -8331,6 +8487,147 @@ mod tests {
         );
         assert_eq!(descendant_event_coordinate(&regular), None);
         assert_eq!(descendant_event_coordinate(&malformed_addressable), None);
+    }
+
+    #[tokio::test]
+    async fn descendant_frontier_recurses_through_event_and_coordinate_references() {
+        let keys = Keys::generate();
+        let root = EventBuilder::new(Kind::GitIssue, "root")
+            .finalize(&keys)
+            .expect("build root");
+        let addressable = EventBuilder::new(Kind::Custom(30_023), "first descendant")
+            .tags([Tag::identifier("thread-member"), Tag::event(root.id)])
+            .finalize(&keys)
+            .expect("build addressable descendant");
+        let coordinate = descendant_event_coordinate(&addressable).unwrap();
+        let coordinate_child = EventBuilder::new(Kind::TextNote, "coordinate child")
+            .tag(Tag::custom("a", [coordinate.clone()]))
+            .finalize(&keys)
+            .expect("build coordinate child");
+        let grandchild = EventBuilder::new(Kind::TextNote, "grandchild")
+            .tag(Tag::event(coordinate_child.id))
+            .finalize(&keys)
+            .expect("build grandchild");
+        let unrelated = EventBuilder::new(Kind::TextNote, "unrelated")
+            .finalize(&keys)
+            .expect("build unrelated event");
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        for event in [
+            &root,
+            &addressable,
+            &coordinate_child,
+            &grandchild,
+            &unrelated,
+        ] {
+            database.save_event(event).await.expect("save test event");
+        }
+
+        let frontier =
+            recursive_descendant_frontier(&database, &HashSet::from([root.id]), 500).await;
+
+        assert_eq!(
+            frontier.event_ids,
+            HashSet::from([addressable.id, coordinate_child.id, grandchild.id])
+        );
+        assert_eq!(frontier.coordinates, HashSet::from([coordinate]));
+        assert!(!frontier.event_ids.contains(&unrelated.id));
+    }
+
+    #[tokio::test]
+    async fn descendant_frontier_stops_at_the_depth_bound() {
+        let keys = Keys::generate();
+        let root = EventBuilder::new(Kind::GitIssue, "root")
+            .finalize(&keys)
+            .expect("build root");
+        let mut chain = Vec::new();
+        let mut parent = root.id;
+        for depth in 1..=MAX_DESCENDANT_FRONTIER_DEPTH + 1 {
+            let child = EventBuilder::new(Kind::TextNote, format!("depth {depth}"))
+                .tag(Tag::event(parent))
+                .finalize(&keys)
+                .expect("build descendant");
+            parent = child.id;
+            chain.push(child);
+        }
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        database.save_event(&root).await.expect("save root");
+        for event in &chain {
+            database.save_event(event).await.expect("save descendant");
+        }
+
+        let frontier =
+            recursive_descendant_frontier(&database, &HashSet::from([root.id]), 500).await;
+
+        assert_eq!(frontier.event_ids.len(), MAX_DESCENDANT_FRONTIER_DEPTH);
+        assert!(chain[..MAX_DESCENDANT_FRONTIER_DEPTH]
+            .iter()
+            .all(|event| frontier.event_ids.contains(&event.id)));
+        assert!(!frontier
+            .event_ids
+            .contains(&chain[MAX_DESCENDANT_FRONTIER_DEPTH].id));
+    }
+
+    #[tokio::test]
+    async fn descendant_frontier_preserves_direct_members_and_bounds_recursive_events() {
+        let keys = Keys::generate();
+        let root = EventBuilder::new(Kind::GitIssue, "root")
+            .finalize(&keys)
+            .expect("build root");
+        let direct = EventBuilder::new(Kind::TextNote, "direct member")
+            .tag(Tag::event(root.id))
+            .custom_created_at(Timestamp::from_secs(1))
+            .finalize(&keys)
+            .expect("build direct member");
+        let direct_siblings: Vec<Event> = (0..3)
+            .map(|index| {
+                EventBuilder::new(Kind::TextNote, format!("direct sibling {index}"))
+                    .tag(Tag::event(root.id))
+                    .custom_created_at(Timestamp::from_secs(2 + index))
+                    .finalize(&keys)
+                    .expect("build direct sibling")
+            })
+            .collect();
+        let mut children = Vec::new();
+        for created_at in [30, 10, 20] {
+            children.push(
+                EventBuilder::new(Kind::TextNote, format!("created at {created_at}"))
+                    .tag(Tag::event(direct.id))
+                    .custom_created_at(Timestamp::from_secs(created_at))
+                    .finalize(&keys)
+                    .expect("build child"),
+            );
+        }
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        database
+            .save_event(&direct)
+            .await
+            .expect("save direct member");
+        for event in &direct_siblings {
+            database
+                .save_event(event)
+                .await
+                .expect("save direct sibling");
+        }
+        for event in &children {
+            database.save_event(event).await.expect("save child");
+        }
+
+        let frontier = recursive_descendant_frontier_with_limits(
+            &database,
+            &HashSet::from([root.id]),
+            MAX_DESCENDANT_FRONTIER_DEPTH,
+            2,
+        )
+        .await;
+
+        assert_eq!(frontier.event_ids.len(), 3);
+        assert!(!frontier.event_ids.contains(&direct.id));
+        assert!(direct_siblings
+            .iter()
+            .all(|event| frontier.event_ids.contains(&event.id)));
+        assert!(children
+            .iter()
+            .all(|child| !frontier.event_ids.contains(&child.id)));
     }
 
     #[test]

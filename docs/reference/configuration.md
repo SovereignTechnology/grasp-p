@@ -358,6 +358,32 @@ the relay retains GRASP-02 sync but does not discover NIP-65 inboxes and omits
 
 ---
 
+#### `NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT`
+
+**Description:** Soft limit on recursive query-frontier members below each event which directly tags a repository root
+**Type:** Positive integer
+**Default:** `500`
+**Required:** No
+
+```bash
+# Exercise branch saturation in a fresh archive or test environment
+NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT=3
+```
+
+Direct repository-root events and events which independently tag a root do not
+consume this allowance. Once the deterministic breadth-first frontier contains
+the configured number of descendants for a branch, none of that branch's
+members are used in further child queries. Already active requests can still
+store more than the configured number, which is why this is a soft limit; those
+extra events do not extend the branch. Startup and historic reconciliation
+derive the same frontier from locally stored events, so a saturated branch does
+not receive a fresh budget. Source relays retain independent connections and
+sync progress; there is no cross-relay counter or coordinator.
+
+The corresponding NixOS option is `syncRecursiveDescendantLimit`.
+
+---
+
 #### `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
 
 **Description:** URL of the bootstrap relay to initially sync events from
