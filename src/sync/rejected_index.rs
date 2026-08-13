@@ -94,6 +94,16 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+/// Hard bounds for dependency-sensitive related events retained across restarts.
+///
+/// Full events are required for immediate re-processing, but relay-controlled
+/// payloads must not turn dependency recovery into an unbounded memory or
+/// checkpoint sink. Oversized events remain eligible for a later broad fetch.
+const RELATED_MAX_ENTRIES: usize = 1_024;
+const RELATED_MAX_SERIALIZED_BYTES: usize = 8 * 1024 * 1024;
+const RELATED_MAX_EVENT_BYTES: usize = 128 * 1024;
+pub(crate) const RELATED_RETRY_CLOSURE_LIMIT: usize = 512;
+
 /// Type of event stored in the rejected events index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
@@ -231,6 +241,182 @@ struct SerializableUnrecoverableIndex {
     entries: HashMap<EventId, SerializableUnrecoverableEntry>,
 }
 
+/// A related event whose policy rejection can become valid when another event
+/// or repository address is accepted.
+#[derive(Debug, Clone)]
+struct RelatedDependencyEntry {
+    event: Event,
+    event_refs: HashSet<EventId>,
+    addressable_refs: HashSet<String>,
+    relay_hints: HashSet<String>,
+    rejected_at: Instant,
+    serialized_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableRelatedDependencyEntry {
+    event: Event,
+    event_refs: HashSet<EventId>,
+    addressable_refs: HashSet<String>,
+    #[serde(default)]
+    relay_hints: HashSet<String>,
+    rejected_at_offset_secs: u64,
+}
+
+/// Bounded, durable full-event index for dependency-sensitive related events.
+#[derive(Debug, Clone)]
+struct RelatedDependencyIndex {
+    entries: Arc<RwLock<HashMap<EventId, RelatedDependencyEntry>>>,
+    expiry_duration: Duration,
+}
+
+impl RelatedDependencyIndex {
+    fn new(expiry_duration: Duration) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            expiry_duration,
+        }
+    }
+
+    fn event_coordinate(event: &Event) -> Option<String> {
+        let kind = event.kind.as_u16();
+        if (10_000..20_000).contains(&kind) {
+            return Some(format!("{}:{}", kind, event.pubkey.to_hex()));
+        }
+        if !(30_000..40_000).contains(&kind) {
+            return None;
+        }
+        let identifier = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind() == "d")
+            .and_then(|tag| tag.content())?;
+        Some(format!("{}:{}:{}", kind, event.pubkey.to_hex(), identifier))
+    }
+
+    fn serialized_event_bytes(event: &Event) -> Option<usize> {
+        serde_json::to_vec(event).ok().map(|bytes| bytes.len())
+    }
+
+    fn add(
+        &self,
+        event: Event,
+        event_refs: HashSet<EventId>,
+        addressable_refs: HashSet<String>,
+        relay_url: Option<String>,
+    ) -> bool {
+        let Some(serialized_bytes) = Self::serialized_event_bytes(&event) else {
+            return false;
+        };
+        if serialized_bytes > RELATED_MAX_EVENT_BYTES {
+            return false;
+        }
+
+        let mut entries = self.entries.write().unwrap();
+        if let Some(existing) = entries.get_mut(&event.id) {
+            existing.relay_hints.extend(relay_url);
+            return true;
+        }
+
+        entries.insert(
+            event.id,
+            RelatedDependencyEntry {
+                event,
+                event_refs,
+                addressable_refs,
+                relay_hints: relay_url.into_iter().collect(),
+                rejected_at: Instant::now(),
+                serialized_bytes,
+            },
+        );
+        Self::enforce_bounds(&mut entries);
+        true
+    }
+
+    fn insert_restored(&self, entry: RelatedDependencyEntry) {
+        if entry.serialized_bytes > RELATED_MAX_EVENT_BYTES {
+            return;
+        }
+        let mut entries = self.entries.write().unwrap();
+        entries.insert(entry.event.id, entry);
+        Self::enforce_bounds(&mut entries);
+    }
+
+    fn enforce_bounds(entries: &mut HashMap<EventId, RelatedDependencyEntry>) {
+        while entries.len() > RELATED_MAX_ENTRIES
+            || entries
+                .values()
+                .map(|entry| entry.serialized_bytes)
+                .sum::<usize>()
+                > RELATED_MAX_SERIALIZED_BYTES
+        {
+            let Some(oldest) = entries
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.rejected_at
+                        .cmp(&right.rejected_at)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(event_id, _)| *event_id)
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+        }
+    }
+
+    fn contains(&self, event_id: &EventId) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .get(event_id)
+            .is_some_and(|entry| entry.rejected_at.elapsed() < self.expiry_duration)
+    }
+
+    fn candidates_resolved_by(&self, accepted: &Event) -> Vec<Event> {
+        let (accepted_addressable_refs, accepted_event_refs) =
+            crate::nostr::policy::RelatedEventPolicy::extract_reference_tags(accepted);
+        let accepted_addressable_refs: HashSet<_> = accepted_addressable_refs.into_iter().collect();
+        let accepted_event_refs: HashSet<_> = accepted_event_refs.into_iter().collect();
+        let accepted_coordinate = Self::event_coordinate(accepted);
+        let now = Instant::now();
+        let entries = self.entries.read().unwrap();
+        let mut candidates: Vec<_> = entries
+            .values()
+            .filter(|entry| {
+                now.duration_since(entry.rejected_at) < self.expiry_duration
+                    && (entry.event_refs.contains(&accepted.id)
+                        || accepted_event_refs.contains(&entry.event.id)
+                        || accepted_coordinate
+                            .as_ref()
+                            .is_some_and(|coordinate| entry.addressable_refs.contains(coordinate))
+                        || Self::event_coordinate(&entry.event).is_some_and(|coordinate| {
+                            accepted_addressable_refs.contains(&coordinate)
+                        }))
+            })
+            .map(|entry| (entry.rejected_at, entry.event.id, entry.event.clone()))
+            .collect();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        candidates.into_iter().map(|(_, _, event)| event).collect()
+    }
+
+    fn remove(&self, event_id: &EventId) {
+        self.entries.write().unwrap().remove(event_id);
+    }
+
+    fn cleanup_expired(&self) -> usize {
+        let mut entries = self.entries.write().unwrap();
+        let initial = entries.len();
+        let now = Instant::now();
+        entries.retain(|_, entry| now.duration_since(entry.rejected_at) < self.expiry_duration);
+        initial - entries.len()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.read().unwrap().len()
+    }
+}
+
 /// Complete rejected cache state for persistence
 ///
 /// Stores both hot cache and cold index with version and timestamp information.
@@ -250,6 +436,9 @@ struct RejectedCacheState {
     /// Defaults to empty when restoring caches saved before this index existed.
     #[serde(default)]
     unrecoverable: SerializableUnrecoverableIndex,
+    /// Full related events awaiting an accepted reference dependency.
+    #[serde(default)]
+    related_dependencies: HashMap<EventId, SerializableRelatedDependencyEntry>,
 }
 
 /// Hot cache: Stores full events for immediate re-processing
@@ -636,6 +825,7 @@ pub struct RejectedEventsIndex {
     hot_cache: HotCache,
     cold_index: ColdIndex,
     unrecoverable: UnrecoverableIndex,
+    related_dependencies: RelatedDependencyIndex,
     metrics: Option<super::metrics::SyncMetrics>,
 }
 
@@ -646,6 +836,7 @@ impl std::fmt::Debug for RejectedEventsIndex {
             .field("hot_cache", &self.hot_cache)
             .field("cold_index", &self.cold_index)
             .field("unrecoverable", &self.unrecoverable)
+            .field("related_dependencies", &self.related_dependencies)
             .field("metrics", &self.metrics.is_some())
             .finish()
     }
@@ -663,6 +854,7 @@ impl RejectedEventsIndex {
             hot_cache: HotCache::new(hot_cache_duration),
             cold_index: ColdIndex::new(cold_index_duration),
             unrecoverable: UnrecoverableIndex::new(cold_index_duration),
+            related_dependencies: RelatedDependencyIndex::new(cold_index_duration),
             metrics: None,
         }
     }
@@ -683,6 +875,7 @@ impl RejectedEventsIndex {
             hot_cache: HotCache::new(hot_cache_duration),
             cold_index: ColdIndex::new(cold_index_duration),
             unrecoverable: UnrecoverableIndex::new(cold_index_duration),
+            related_dependencies: RelatedDependencyIndex::new(cold_index_duration),
             metrics: Some(metrics),
         };
 
@@ -813,6 +1006,42 @@ impl RejectedEventsIndex {
         self.hot_cache.contains(event_id)
             || self.cold_index.contains(event_id)
             || self.unrecoverable.contains(event_id)
+            || self.related_dependencies.contains(event_id)
+    }
+
+    /// Whether an indexed event is waiting on a dependency and must not be
+    /// treated as a terminally accounted hydration outcome.
+    pub fn is_dependency_pending(&self, event_id: &EventId) -> bool {
+        self.related_dependencies.contains(event_id)
+            || self
+                .cold_index
+                .entries
+                .read()
+                .unwrap()
+                .get(event_id)
+                .is_some_and(|entry| {
+                    entry.reason == RejectionReason::MaintainerNotYetValid
+                        && entry.rejected_at.elapsed() < self.cold_index.expiry_duration
+                })
+    }
+
+    /// Retain a policy-orphaned related event until either direction of its
+    /// reference relationship becomes accepted.
+    pub fn add_related_from_relay(
+        &self,
+        event: Event,
+        event_refs: HashSet<EventId>,
+        addressable_refs: HashSet<String>,
+        relay_url: Option<String>,
+    ) -> bool {
+        self.related_dependencies
+            .add(event, event_refs, addressable_refs, relay_url)
+    }
+
+    /// Return retained events whose backward or forward reference was made
+    /// valid by `accepted`.
+    pub fn related_candidates_resolved_by(&self, accepted: &Event) -> Vec<Event> {
+        self.related_dependencies.candidates_resolved_by(accepted)
     }
 
     /// Track a structurally unrecoverable event by ID alone.
@@ -920,6 +1149,7 @@ impl RejectedEventsIndex {
     pub fn remove(&self, event_id: &EventId) {
         self.hot_cache.remove(event_id);
         self.cold_index.remove(event_id);
+        self.related_dependencies.remove(event_id);
     }
 
     /// Clean up expired entries from both tiers
@@ -965,6 +1195,12 @@ impl RejectedEventsIndex {
         self.unrecoverable.cleanup_expired()
     }
 
+    /// Clean up related events whose dependency did not resolve within the
+    /// durable cold-index retention window.
+    pub fn cleanup_expired_related(&self) -> usize {
+        self.related_dependencies.cleanup_expired()
+    }
+
     /// Get current number of entries in cold index
     pub fn cold_index_len(&self) -> usize {
         self.cold_index.len()
@@ -973,6 +1209,11 @@ impl RejectedEventsIndex {
     /// Get current number of entries in the unrecoverable index
     pub fn unrecoverable_len(&self) -> usize {
         self.unrecoverable.len()
+    }
+
+    /// Get the number of retained dependency-sensitive related events.
+    pub fn related_len(&self) -> usize {
+        self.related_dependencies.len()
     }
 
     /// Get all rejected event IDs (from both hot cache and cold index)
@@ -993,6 +1234,9 @@ impl RejectedEventsIndex {
         // Add from unrecoverable index
         let unrecoverable_entries = self.unrecoverable.entries.read().unwrap();
         ids.extend(unrecoverable_entries.keys().cloned());
+
+        let related_entries = self.related_dependencies.entries.read().unwrap();
+        ids.extend(related_entries.keys().cloned());
 
         ids
     }
@@ -1018,6 +1262,7 @@ impl RejectedEventsIndex {
         let hot_entries = self.hot_cache.entries.read().unwrap();
         let cold_entries = self.cold_index.entries.read().unwrap();
         let unrecoverable_entries = self.unrecoverable.entries.read().unwrap();
+        let related_entries = self.related_dependencies.entries.read().unwrap();
 
         // Convert hot cache entries to serializable format
         let serializable_hot_entries: HashMap<EventId, SerializableHotCacheEntry> = hot_entries
@@ -1074,6 +1319,25 @@ impl RejectedEventsIndex {
                 })
                 .collect();
 
+        let serializable_related_entries: HashMap<EventId, SerializableRelatedDependencyEntry> =
+            related_entries
+                .iter()
+                .map(|(event_id, entry)| {
+                    (
+                        *event_id,
+                        SerializableRelatedDependencyEntry {
+                            event: entry.event.clone(),
+                            event_refs: entry.event_refs.clone(),
+                            addressable_refs: entry.addressable_refs.clone(),
+                            relay_hints: entry.relay_hints.clone(),
+                            rejected_at_offset_secs: now
+                                .duration_since(entry.rejected_at)
+                                .as_secs(),
+                        },
+                    )
+                })
+                .collect();
+
         // Create complete state
         let state = RejectedCacheState {
             version: 1,
@@ -1090,6 +1354,7 @@ impl RejectedEventsIndex {
                 expiry_duration_secs: self.unrecoverable.expiry_duration.as_secs(),
                 entries: serializable_unrecoverable_entries,
             },
+            related_dependencies: serializable_related_entries,
         };
 
         // Replace the previous checkpoint only after the new snapshot is
@@ -1202,6 +1467,28 @@ impl RejectedEventsIndex {
         drop(cold_entries);
         drop(unrecoverable_entries);
 
+        for (_, serializable_entry) in state.related_dependencies {
+            let total_offset =
+                Duration::from_secs(serializable_entry.rejected_at_offset_secs) + downtime;
+            if total_offset >= self.related_dependencies.expiry_duration {
+                continue;
+            }
+            let Some(serialized_bytes) =
+                RelatedDependencyIndex::serialized_event_bytes(&serializable_entry.event)
+            else {
+                continue;
+            };
+            self.related_dependencies
+                .insert_restored(RelatedDependencyEntry {
+                    event: serializable_entry.event,
+                    event_refs: serializable_entry.event_refs,
+                    addressable_refs: serializable_entry.addressable_refs,
+                    relay_hints: serializable_entry.relay_hints,
+                    rejected_at: now_instant - total_offset,
+                    serialized_bytes,
+                });
+        }
+
         Ok(())
     }
 }
@@ -1209,7 +1496,9 @@ impl RejectedEventsIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::prelude::{EventBuilder, FinalizeUnsignedEvent, Keys, Kind, SignEvent};
+    use nostr_sdk::prelude::{
+        EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, SignEvent,
+    };
 
     async fn create_test_event() -> Event {
         let keys = Keys::generate();
@@ -2251,5 +2540,100 @@ mod tests {
             .hot_cache
             .get_maintainer_events(&event.pubkey, "test-repo", None);
         assert_eq!(events.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn related_dependencies_resolve_in_both_reference_directions() {
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let keys = Keys::generate();
+        let accepted_parent = create_test_event().await;
+        let backward_child = EventBuilder::new(Kind::TextNote, "backward child")
+            .tags([nostr_sdk::prelude::Tag::event(accepted_parent.id)])
+            .finalize(&keys)
+            .expect("build backward child");
+        assert!(index.add_related_from_relay(
+            backward_child.clone(),
+            HashSet::from([accepted_parent.id]),
+            HashSet::new(),
+            Some("wss://source.example".to_string()),
+        ));
+
+        let backward = index.related_candidates_resolved_by(&accepted_parent);
+        assert_eq!(
+            backward.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![backward_child.id]
+        );
+
+        let forward_orphan = EventBuilder::new(Kind::TextNote, "forward orphan")
+            .finalize(&keys)
+            .expect("build forward orphan");
+        assert!(index.add_related_from_relay(
+            forward_orphan.clone(),
+            HashSet::new(),
+            HashSet::new(),
+            None,
+        ));
+        let accepted_forward_ref = EventBuilder::new(Kind::TextNote, "accepted forward ref")
+            .tags([nostr_sdk::prelude::Tag::event(forward_orphan.id)])
+            .finalize(&keys)
+            .expect("build accepted forward ref");
+
+        let forward = index.related_candidates_resolved_by(&accepted_forward_ref);
+        assert!(forward.iter().any(|event| event.id == forward_orphan.id));
+    }
+
+    #[tokio::test]
+    async fn related_dependencies_survive_checkpoint_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("rejected-events-cache.json");
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let parent = create_test_event().await;
+        let keys = Keys::generate();
+        let child = EventBuilder::new(Kind::TextNote, "durable child")
+            .tags([nostr_sdk::prelude::Tag::event(parent.id)])
+            .finalize(&keys)
+            .expect("build durable child");
+        assert!(index.add_related_from_relay(
+            child.clone(),
+            HashSet::from([parent.id]),
+            HashSet::new(),
+            Some("wss://source.example".to_string()),
+        ));
+        index.save_to_disk(&state_path).unwrap();
+
+        let restored =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        restored.restore_from_disk(&state_path).unwrap();
+
+        assert!(restored.is_dependency_pending(&child.id));
+        assert_eq!(restored.related_len(), 1);
+        assert_eq!(
+            restored
+                .related_candidates_resolved_by(&parent)
+                .into_iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![child.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn related_dependencies_evict_oldest_entry_at_the_count_bound() {
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
+        let keys = Keys::generate();
+        let oldest = EventBuilder::new(Kind::TextNote, "oldest")
+            .finalize(&keys)
+            .expect("build oldest event");
+        assert!(index.add_related_from_relay(oldest.clone(), HashSet::new(), HashSet::new(), None,));
+
+        for sequence in 0..RELATED_MAX_ENTRIES {
+            let event = EventBuilder::new(Kind::TextNote, sequence.to_string())
+                .finalize(&keys)
+                .expect("build bounded event");
+            assert!(index.add_related_from_relay(event, HashSet::new(), HashSet::new(), None,));
+        }
+
+        assert_eq!(index.related_len(), RELATED_MAX_ENTRIES);
+        assert!(!index.contains(&oldest.id));
     }
 }

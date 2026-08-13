@@ -960,6 +960,23 @@ This prevents both failure modes: broad synchronization does not repeatedly
 download known-invalid events, while a dependency-resolvable event cannot become
 permanently suppressed merely because its full hot-cache copy expired.
 
+Related events have a second dependency race: a comment, reaction, zap request,
+or other repository-thread event can arrive before the event or repository
+address that makes it admissible. Sync-originated `restricted` orphan results
+are therefore retained as full events in the same crash-safe checkpoint for up
+to seven days. Acceptance of either side of the relationship re-evaluates a
+bounded iterative closure, covering both backward references (the orphan points
+to the newly accepted event/address) and forward references (the newly accepted
+event points to the orphan). Entries are removed only after a terminal policy
+outcome.
+
+This durable tier is relay-input bounded: at most 1,024 events, 8 MiB total,
+128 KiB per event, and 512 attempts in one triggered closure. Oldest entries
+are evicted first. Evicted or oversized events are not marked as locally held,
+so later broad synchronization may offer them again. Exact-ID hydration also
+keeps dependency-pending cached IDs unresolved rather than misclassifying a
+cached policy orphan as recovered.
+
 See [Architecture: Rejected Events Index](architecture.md#rejected-events-index)
 and [`src/sync/rejected_index.rs`](../../src/sync/rejected_index.rs) for the
 design and implementation.
