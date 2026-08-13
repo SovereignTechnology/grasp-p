@@ -37,6 +37,7 @@ base64 = "0.22"
 flate2 = "1.0"
 tar = "0.4"
 fs2 = "0.4"
+ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
 
 # Metrics

@@ -25,6 +25,9 @@
     # Network
     bindAddress = "127.0.0.1";
     port = 8082;
+    # Trust forwarding headers only from the loopback Caddy connection.
+    # Keep this empty if ngit-grasp is directly exposed.
+    trustedProxyCidrs = [ "127.0.0.1/32" ];
 
     # Storage
     dataDir = "/persistent/ngit-danconwaydev-com-ngit-grasp";
@@ -58,8 +61,8 @@
   services.caddy.virtualHosts."ngit.danconwaydev.com" = {
     extraConfig = ''
       reverse_proxy 127.0.0.1:8082 {
-        header_down X-Real-IP {http.request.remote}
-        header_down X-Forwarded-For {http.request.remote}
+        # Caddy manages X-Forwarded-For automatically.
+        header_up X-Real-IP {remote_host}
       }
     '';
   };

@@ -41,6 +41,19 @@ let
         description = "IP address to bind to";
       };
 
+      trustedProxyCidrs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "127.0.0.1/32" "::1/128" "10.0.0.0/8" ];
+        description = ''
+          IP address ranges for reverse proxies whose Forwarded,
+          X-Forwarded-For, or X-Real-IP headers may identify WebSocket
+          clients. Leave empty unless ngit-grasp is behind a trusted proxy.
+          Keep the backend unreachable from untrusted networks and include
+          every trusted proxy hop needed to resolve a forwarding chain.
+        '';
+      };
+
       port = mkOption {
         type = types.port;
         default = 7334;
@@ -552,6 +565,8 @@ let
         concatStringsSep "," cfg.syncPlusFallbackRelays;
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
+    } // optionalAttrs (cfg.trustedProxyCidrs != [ ]) {
+      NGIT_TRUSTED_PROXY_CIDRS = concatStringsSep "," cfg.trustedProxyCidrs;
     } // optionalAttrs (cfg.relayName != null) {
       NGIT_RELAY_NAME = cfg.relayName;
     } // optionalAttrs (cfg.archiveReadOnly != null) {
