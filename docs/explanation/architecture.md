@@ -689,6 +689,11 @@ Private mode is an optional access layer around the normal GRASP runtime. A
 single `PrivateAccess` set is shared by the HTTP and WebSocket services.
 Repository admission and push authorization remain the GRASP-01 policies; a
 private credential proves service membership but never grants push rights.
+The effective set combines operator-configured members with NIP-11 owner
+pubkeys learned for relays referenced by accepted announcements. Purgatory-only
+announcements are excluded. Reconciliation reuses the accepted repository index
+and the NIP-11 fetch already performed once per connection session, so private
+mode adds neither outbound connections nor subscriptions.
 
 For Nostr, Hyper completes the public WebSocket upgrade and a message-level
 proxy sends and validates NIP-42 authentication before a connection reaches
@@ -710,6 +715,12 @@ preventing unauthenticated repository enumeration.
 Private mode advertises GRASP-08 plus NIP-42 and NIP-98 in NIP-11. It is
 incompatible with GRASP-06 because that extension deliberately exposes an
 unauthenticated contributor write surface.
+
+One process currently represents one private collaborator service. Operators
+can run several independently configured instances for different groups. Fleet
+provisioning and lifecycle automation are deliberately left to a later change;
+they are deployment conveniences rather than part of the authentication
+boundary implemented here.
 
 ## Future Extensions
 

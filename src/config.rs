@@ -599,9 +599,11 @@ pub struct Config {
     #[arg(long, env = "NGIT_PRIVATE_MODE", default_value_t = false)]
     pub private_mode: bool,
 
-    /// Service-wide GRASP-08 member whitelist as comma-separated npubs.
+    /// Permanently configured GRASP-08 members as comma-separated npubs.
     ///
-    /// Required and fail-closed when private mode is enabled.
+    /// The effective whitelist also includes NIP-11 owners of relays referenced
+    /// by accepted repository announcements. Required and fail-closed when
+    /// private mode is enabled.
     #[arg(long, env = "NGIT_PRIVATE_MEMBERS", default_value = "")]
     pub private_members: String,
 

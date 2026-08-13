@@ -233,6 +233,7 @@ impl RelayServer {
             &config,
             PathBuf::from(config.effective_git_data_path()),
             metrics.as_ref().and_then(|m| m.sync_metrics().cloned()),
+            private_access.clone(),
         );
 
         if config.sync_bootstrap_relay_url.is_some() {

@@ -57,6 +57,7 @@ use crate::nostr::SharedDatabase;
 use crate::outbound::{
     url_matches_service_domain, OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource,
 };
+use crate::private::PrivateAccess;
 use nostr_sdk::prelude::LocalRelay;
 
 const MAX_PURGATORY_DEPENDENCY_EVENTS_PER_TICK: usize = 32;
@@ -205,6 +206,22 @@ fn dependency_relay_retention() -> Duration {
     } else {
         Duration::from_secs(60)
     }
+}
+
+fn effective_private_members(
+    configured: &HashSet<PublicKey>,
+    accepted_relays: &HashSet<String>,
+    relay_owners: &HashMap<String, PublicKey>,
+) -> HashSet<PublicKey> {
+    configured
+        .iter()
+        .copied()
+        .chain(
+            relay_owners
+                .iter()
+                .filter_map(|(relay, owner)| accepted_relays.contains(relay).then_some(*owner)),
+        )
+        .collect()
 }
 
 fn byte_limited_catchup_interval() -> Duration {
@@ -1767,6 +1784,7 @@ enum ConnectAttemptOutcome {
     Connected {
         advertised_default_limit: Option<usize>,
         advertised_max_subscriptions: Option<usize>,
+        advertised_owner: Option<PublicKey>,
     },
     Failed(String),
 }
@@ -2201,6 +2219,7 @@ async fn run_purgatory_announcement_sync(
             _ = tokio::time::sleep(interval) => {
                 let mut manager = sync_manager.lock().await;
                 manager.sync_purgatory_announcements_to_index().await;
+                manager.reconcile_private_membership().await;
                 manager.tick_missing_event_recovery().await;
                 manager.tick_descendant_sync().await;
             }
@@ -2443,6 +2462,12 @@ pub struct SyncManager {
     repo_sync_index: RepoSyncIndex,
     root_candidate_index: RootCandidateIndex,
     proactive_participant_authors: crate::nostr::policy::SharedProactiveParticipantAuthorIndex,
+    /// GRASP-08 access shared with the inbound HTTP/WebSocket boundary.
+    private_access: Option<PrivateAccess>,
+    /// Operator-configured members form the permanent base of private access.
+    configured_private_members: HashSet<PublicKey>,
+    /// Latest NIP-11 owner learned for each connected repository relay.
+    relay_owners: HashMap<String, PublicKey>,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
     /// In-flight subscription batches
@@ -2544,6 +2569,7 @@ impl SyncManager {
         config: &Config,
         data_path: PathBuf,
         sync_metrics: Option<SyncMetrics>,
+        private_access: Option<PrivateAccess>,
     ) -> Self {
         // Extract purgatory from write_policy for read-only access
         let purgatory = write_policy.purgatory().clone();
@@ -2579,6 +2605,11 @@ impl SyncManager {
         }
 
         let proactive_participant_authors = write_policy.proactive_participant_authors();
+        let configured_private_members = config
+            .parse_private_members()
+            .expect("private members were validated before SyncManager construction")
+            .into_iter()
+            .collect();
         Self {
             bootstrap_relay_url,
             service_domain,
@@ -2590,6 +2621,9 @@ impl SyncManager {
             repo_sync_index: Arc::new(RwLock::new(HashMap::new())),
             root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
             proactive_participant_authors,
+            private_access,
+            configured_private_members,
+            relay_owners: HashMap::new(),
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
@@ -5431,6 +5465,7 @@ impl SyncManager {
                         ConnectAttemptOutcome::Connected {
                             advertised_default_limit: hints.default_limit,
                             advertised_max_subscriptions: hints.max_subscriptions,
+                            advertised_owner: hints.owner,
                         }
                     },
                     Err(error) => ConnectAttemptOutcome::Failed(error),
@@ -5459,6 +5494,38 @@ impl SyncManager {
         let mut targets = algorithms::derive_relay_targets(&repo_index);
         discovery::merge_inbox_roots(&mut targets, &self.nip65_discovery.inbox_roots);
         targets
+    }
+
+    /// Rebuild GRASP-08 membership from accepted-announcement sync state and
+    /// the latest NIP-11 owner learned for each referenced relay.
+    ///
+    /// Purgatory announcements are deliberately excluded: they have not yet
+    /// passed repository admission and therefore cannot grant service access.
+    async fn reconcile_private_membership(&self) {
+        let Some(access) = &self.private_access else {
+            return;
+        };
+        let repo_index = self.repo_sync_index.read().await;
+        let accepted_relays: HashSet<String> = repo_index
+            .values()
+            .filter(|needs| needs.sync_level == SyncLevel::Full)
+            .flat_map(|needs| needs.relays.iter())
+            .filter_map(|relay| canonical_relay_key(relay).ok())
+            .collect();
+        drop(repo_index);
+        let members = effective_private_members(
+            &self.configured_private_members,
+            &accepted_relays,
+            &self.relay_owners,
+        );
+        if access.replace(members) {
+            tracing::info!(
+                configured_members = self.configured_private_members.len(),
+                accepted_relay_count = accepted_relays.len(),
+                effective_members = access.len(),
+                "Reconciled GRASP-08 service membership"
+            );
+        }
     }
 
     fn configured_nip65_fallback_relays(&self) -> HashSet<String> {
@@ -6185,7 +6252,17 @@ impl SyncManager {
             ConnectAttemptOutcome::Connected {
                 advertised_default_limit,
                 advertised_max_subscriptions,
+                advertised_owner,
             } => {
+                match advertised_owner {
+                    Some(owner) => {
+                        self.relay_owners.insert(result.relay_url.clone(), owner);
+                    }
+                    None => {
+                        self.relay_owners.remove(&result.relay_url);
+                    }
+                }
+                self.reconcile_private_membership().await;
                 if let Some(connection) = self.connections.get(&result.relay_url) {
                     connection.reset_subscription_budget(advertised_max_subscriptions);
                 }
@@ -8913,6 +8990,23 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(!rejected.contains(&child.id));
+    }
+
+    #[test]
+    fn private_members_include_only_owners_of_accepted_relays() {
+        let configured = Keys::generate().public_key();
+        let accepted_owner = Keys::generate().public_key();
+        let unrelated_owner = Keys::generate().public_key();
+        let members = effective_private_members(
+            &HashSet::from([configured]),
+            &HashSet::from(["wss://accepted.example/".to_string()]),
+            &HashMap::from([
+                ("wss://accepted.example/".to_string(), accepted_owner),
+                ("wss://unrelated.example/".to_string(), unrelated_owner),
+            ]),
+        );
+
+        assert_eq!(members, HashSet::from([configured, accepted_owner]));
     }
 
     #[test]

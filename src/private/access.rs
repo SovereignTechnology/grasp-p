@@ -51,14 +51,21 @@ impl PrivateAccess {
     }
 
     /// Atomically replace membership and notify active sessions.
-    pub fn replace(&self, members: impl IntoIterator<Item = PublicKey>) {
-        *self
+    pub fn replace(&self, members: impl IntoIterator<Item = PublicKey>) -> bool {
+        let members = members.into_iter().collect();
+        let mut current = self
             .inner
             .members
             .write()
-            .expect("private access lock poisoned") = members.into_iter().collect();
+            .expect("private access lock poisoned");
+        if *current == members {
+            return false;
+        }
+        *current = members;
+        drop(current);
         let next = self.inner.generation.borrow().wrapping_add(1);
         self.inner.generation.send_replace(next);
+        true
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -81,9 +88,12 @@ mod tests {
         assert!(access.contains(&first));
         assert!(!access.contains(&second));
 
-        access.replace([second]);
+        assert!(access.replace([second]));
         assert!(!access.contains(&first));
         assert!(access.contains(&second));
+        assert_eq!(*generation.borrow(), 1);
+
+        assert!(!access.replace([second]));
         assert_eq!(*generation.borrow(), 1);
     }
 }

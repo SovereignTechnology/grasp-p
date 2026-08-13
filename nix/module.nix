@@ -406,9 +406,11 @@ let
         default = [ ];
         example = [ "npub1alice..." "npub1bob..." ];
         description = ''
-          Service-wide GRASP-08 member whitelist. At least one valid npub is
-          required when privateMode is enabled. Malformed entries make the
-          service fail at startup.
+          Permanently configured GRASP-08 service members. The effective
+          whitelist also includes NIP-11 owners of relays referenced by
+          accepted repository announcements. At least one valid configured
+          npub is required when privateMode is enabled; malformed entries make
+          the service fail at startup.
         '';
       };
 

@@ -1021,7 +1021,7 @@ GRASP-06 contributor endpoint is intentionally unauthenticated.
 
 #### `NGIT_PRIVATE_MEMBERS`
 
-**Description:** Service-wide private-service member whitelist
+**Description:** Permanently configured members of the service-wide private-service whitelist
 **Type:** Comma-separated npubs
 **Default:** Empty
 **Required:** Yes when `NGIT_PRIVATE_MODE=true`
@@ -1029,6 +1029,12 @@ GRASP-06 contributor endpoint is intentionally unauthenticated.
 ```bash
 NGIT_PRIVATE_MEMBERS=npub1alice...,npub1bob...
 ```
+
+The effective GRASP-08 whitelist is the union of these configured members and
+the NIP-11 owner pubkeys of relays referenced by accepted repository
+announcements. Relay owners are learned by the NIP-11 request already made for
+sync limits; this does not open another connection or subscription. A relay
+listed only by an unpromoted purgatory announcement cannot grant access.
 
 #### `NGIT_PRIVATE_PUBLIC_ORIGIN`
 

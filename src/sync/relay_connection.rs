@@ -438,6 +438,28 @@ type LiveReqPermitMap = std::sync::Arc<
 pub struct RelayLimitHints {
     pub default_limit: Option<usize>,
     pub max_subscriptions: Option<usize>,
+    /// Relay operator identity advertised by NIP-11. Private GRASP services
+    /// grant this identity access only when the relay is referenced by an
+    /// accepted repository announcement.
+    pub owner: Option<PublicKey>,
+}
+
+fn parse_relay_limit_hints(body: &str) -> RelayLimitHints {
+    let Some(document) = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok() else {
+        return RelayLimitHints::default();
+    };
+    let limitation = document.limitation.unwrap_or_default();
+    RelayLimitHints {
+        default_limit: limitation
+            .default_limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0),
+        max_subscriptions: limitation
+            .max_subscriptions
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0),
+        owner: document.pubkey,
+    }
 }
 
 /// How a failed negentropy diff should affect future NIP-77 attempts.
@@ -941,23 +963,7 @@ impl RelayConnection {
                 return RelayLimitHints::default();
             }
         };
-        let Some(document) = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok()
-        else {
-            return RelayLimitHints::default();
-        };
-        let Some(limitation) = document.limitation else {
-            return RelayLimitHints::default();
-        };
-        RelayLimitHints {
-            default_limit: limitation
-                .default_limit
-                .and_then(|limit| usize::try_from(limit).ok())
-                .filter(|limit| *limit > 0),
-            max_subscriptions: limitation
-                .max_subscriptions
-                .and_then(|limit| usize::try_from(limit).ok())
-                .filter(|limit| *limit > 0),
-        }
+        parse_relay_limit_hints(&body)
     }
 
     /// Whether the SDK still considers this relay's WebSocket established.
@@ -2744,6 +2750,18 @@ impl RelayConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip11_owner_is_retained_without_a_limitation_object() {
+        let owner = Keys::generate().public_key();
+        let body = format!(r#"{{"pubkey":"{}"}}"#, owner.to_hex());
+
+        let hints = parse_relay_limit_hints(&body);
+
+        assert_eq!(hints.owner, Some(owner));
+        assert_eq!(hints.default_limit, None);
+        assert_eq!(hints.max_subscriptions, None);
+    }
 
     /// Event-directed connection with the permissive policy used by tests
     /// that dial loopback fixtures.
