@@ -42,6 +42,8 @@ pub struct SyncMetrics {
     relays_connected_total: IntGauge,
     /// Relays marked as dead
     relays_dead_total: IntGauge,
+    /// Aggregate cardinality of long-lived sync-manager state by fixed class.
+    retained_state_current: IntGaugeVec,
 
     // === Rejected Events Index Metrics (unified with event_type label) ===
     /// Current number of entries in hot cache (by event_type: announcement, state)
@@ -144,6 +146,15 @@ impl SyncMetrics {
         ))?;
         registry.register(Box::new(relays_dead_total.clone()))?;
 
+        let retained_state_current = IntGaugeVec::new(
+            Opts::new(
+                "ngit_sync_retained_state_current",
+                "Current retained sync-manager entries by fixed state class",
+            ),
+            &["class"],
+        )?;
+        registry.register(Box::new(retained_state_current.clone()))?;
+
         // Rejected events metrics (unified with event_type label)
         let rejected_hot_cache_current = IntGaugeVec::new(
             Opts::new(
@@ -228,6 +239,7 @@ impl SyncMetrics {
             relays_tracked_total,
             relays_connected_total,
             relays_dead_total,
+            retained_state_current,
             rejected_hot_cache_current,
             rejected_hot_cache_hits_total,
             rejected_hot_cache_misses_total,
@@ -423,6 +435,14 @@ impl SyncMetrics {
     /// Get current dead relay count.
     pub fn get_dead_count(&self) -> i64 {
         self.relays_dead_total.get()
+    }
+
+    /// Record one aggregate long-lived state cardinality. Callers must use the
+    /// fixed class vocabulary documented by the sync manager.
+    pub fn set_retained_state(&self, class: &str, count: usize) {
+        self.retained_state_current
+            .with_label_values(&[class])
+            .set(count as i64);
     }
 
     // === Rejected Events Recording Methods (unified with event_type parameter) ===
@@ -661,6 +681,30 @@ mod tests {
         // Second registration should fail (metrics already registered)
         let metrics2 = SyncMetrics::register(&registry);
         assert!(metrics2.is_err());
+    }
+
+    #[test]
+    fn retained_state_metric_uses_fixed_aggregate_classes() {
+        let registry = create_test_registry();
+        let metrics = SyncMetrics::register(&registry).unwrap();
+
+        metrics.set_retained_state("pending_batches", 12);
+        metrics.set_retained_state("queued_connection_attempts", 3);
+
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "ngit_sync_retained_state_current")
+            .expect("retained-state metric must be exported");
+        assert_eq!(family.get_metric().len(), 2);
+        assert_eq!(
+            family
+                .get_metric()
+                .iter()
+                .map(|metric| metric.get_gauge().value() as i64)
+                .sum::<i64>(),
+            15
+        );
     }
 
     #[test]

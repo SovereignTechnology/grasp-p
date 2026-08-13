@@ -1173,11 +1173,14 @@ struct SubscriptionClosedNotification {
     live_filter_count: Option<usize>,
 }
 
-fn lifecycle_notification_channel<T>() -> (
-    tokio::sync::mpsc::UnboundedSender<T>,
-    tokio::sync::mpsc::UnboundedReceiver<T>,
-) {
-    tokio::sync::mpsc::unbounded_channel()
+// One global actor consumes terminal state changes from every outbound relay.
+// A hostile peer can repeat EOSE/CLOSED indefinitely, so this queue must bound
+// retained memory independently of the per-connection subscription ledger.
+const LIFECYCLE_NOTIFICATION_CAPACITY: usize = 1_000;
+
+fn lifecycle_notification_channel<T>(
+) -> (tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>) {
+    tokio::sync::mpsc::channel(LIFECYCLE_NOTIFICATION_CAPACITY)
 }
 
 fn is_rate_limit_message(message: &str) -> bool {
@@ -1542,18 +1545,6 @@ impl DeferredConsolidations {
     }
 }
 
-fn notify_deferred_consolidation_after_batch_completion(
-    deferred: &DeferredConsolidations,
-    sender: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-    relay_url: &str,
-) {
-    if deferred.contains(relay_url) {
-        if let Some(sender) = sender {
-            let _ = sender.send(relay_url.to_string());
-        }
-    }
-}
-
 // =============================================================================
 // Daily Timer
 // =============================================================================
@@ -1812,6 +1803,30 @@ async fn run_health_and_metrics_checker(
                         let entries = naughty_list.get_all();
                         metrics.update_naughty_list(entries);
                     }
+
+                    let (pending_batches, pending_subscriptions) = {
+                        let pending = manager.pending_sync_index.read().await;
+                        (
+                            pending.values().map(Vec::len).sum(),
+                            pending
+                                .values()
+                                .flatten()
+                                .map(|batch| batch.outstanding_subs.len())
+                                .sum(),
+                        )
+                    };
+                    for (class, count) in [
+                        ("pending_batches", pending_batches),
+                        ("pending_subscriptions", pending_subscriptions),
+                        ("auth_retries", manager.auth_required_attempts.len()),
+                        ("queued_connection_attempts", manager.in_flight_connect_attempts.len()),
+                        ("purgatory_dependencies", manager.purgatory_dependency_attempts.len()),
+                        ("dependency_relays", manager.dependency_relay_deadlines.len()),
+                        ("deferred_consolidations", manager.deferred_consolidations.relays.len()),
+                        ("descendant_rotations", manager.descendant_sync_rotations.len()),
+                    ] {
+                        metrics.set_retained_state(class, count);
+                    }
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -1913,15 +1928,12 @@ pub struct SyncManager {
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
     /// Channel for EOSE notifications (set during run)
-    eose_tx: Option<tokio::sync::mpsc::UnboundedSender<EoseNotification>>,
+    eose_tx: Option<tokio::sync::mpsc::Sender<EoseNotification>>,
     /// Serializes CLOSED recovery and pending-batch cleanup through the actor.
-    subscription_closed_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<SubscriptionClosedNotification>>,
+    subscription_closed_tx: Option<tokio::sync::mpsc::Sender<SubscriptionClosedNotification>>,
     /// Returns connection outcomes to the sync actor for serialized state changes.
-    connect_attempt_result_tx: Option<tokio::sync::mpsc::UnboundedSender<ConnectAttemptResult>>,
-    /// Wakes the actor when a batch completion may unblock consolidation.
-    deferred_consolidation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    nip65_discovery_result_tx: Option<tokio::sync::mpsc::UnboundedSender<Nip65DiscoveryResult>>,
+    connect_attempt_result_tx: Option<tokio::sync::mpsc::Sender<ConnectAttemptResult>>,
+    nip65_discovery_result_tx: Option<tokio::sync::mpsc::Sender<Nip65DiscoveryResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -2025,7 +2037,6 @@ impl SyncManager {
             eose_tx: None,
             subscription_closed_tx: None,
             connect_attempt_result_tx: None,
-            deferred_consolidation_tx: None,
             nip65_discovery_result_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
@@ -3168,11 +3179,14 @@ impl SyncManager {
         // Release lock before checking if historic sync is complete
         drop(relay_index);
 
-        notify_deferred_consolidation_after_batch_completion(
-            &self.deferred_consolidations,
-            self.deferred_consolidation_tx.as_ref(),
-            relay_url,
-        );
+        // Batch completion already runs inside the sync actor and all index
+        // guards are released. Process a ready deferral directly instead of
+        // retaining self-addressed wakeups in another queue.
+        if self.deferred_consolidations.contains(relay_url) {
+            // Consolidation can synchronously complete an empty historic
+            // batch, so erase that finite recursive future from the type.
+            Box::pin(self.process_deferred_consolidation(relay_url)).await;
+        }
 
         // Spawn background task to check if historic sync is complete
         // This avoids blocking the confirm_batch flow for 6 seconds
@@ -3384,25 +3398,20 @@ impl SyncManager {
         let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<DisconnectNotification>(100);
 
         // 3. Create EOSE channel for spawned tasks -> manager communication
-        // Lifecycle notifications must never backpressure the ordered EVENT
-        // processor. Their production is already bounded by the subscription
-        // ledger, while the actor may legitimately stay busy opening a large,
-        // paced historic batch for longer than a fixed inbox can absorb.
+        // The independent terminal-control listener has already released
+        // transient resources. These actor notifications may therefore apply
+        // bounded backpressure without stranding subscription-ledger slots.
         let (eose_tx, mut eose_rx) = lifecycle_notification_channel::<EoseNotification>();
         let (subscription_closed_tx, mut subscription_closed_rx) =
             lifecycle_notification_channel::<SubscriptionClosedNotification>();
 
-        // 4. Connection workers never mutate manager state. Their unbounded
-        // result channel cannot make a completed worker wait behind the actor.
+        // Connection workers never mutate manager state. At most the global
+        // connection-attempt cap can complete while the actor is busy.
         let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
-            mpsc::unbounded_channel::<ConnectAttemptResult>();
+            mpsc::channel::<ConnectAttemptResult>(MAX_CONCURRENT_CONNECT_ATTEMPTS);
 
-        // Batch completion can be synchronous, so use a non-blocking wakeup
-        // instead of waiting for pending work while holding the actor lock.
-        let (deferred_consolidation_tx, mut deferred_consolidation_rx) =
-            mpsc::unbounded_channel::<String>();
         let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
-            mpsc::unbounded_channel::<Nip65DiscoveryResult>();
+            mpsc::channel::<Nip65DiscoveryResult>(1);
 
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -3424,7 +3433,6 @@ impl SyncManager {
         self.eose_tx = Some(eose_tx.clone());
         self.subscription_closed_tx = Some(subscription_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
-        self.deferred_consolidation_tx = Some(deferred_consolidation_tx);
         self.nip65_discovery_result_tx = Some(nip65_discovery_result_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
@@ -3538,12 +3546,6 @@ impl SyncManager {
                         None => {
                             tracing::debug!("Connect attempt result channel closed");
                         }
-                    }
-                }
-                relay_url = deferred_consolidation_rx.recv() => {
-                    if let Some(relay_url) = relay_url {
-                        let mut manager = sync_manager.lock().await;
-                        manager.process_deferred_consolidation(&relay_url).await;
                     }
                 }
                 result = nip65_discovery_result_rx.recv() => {
@@ -3935,10 +3937,12 @@ impl SyncManager {
                             sub_id = %sub_id,
                             "EOSE received, notifying SyncManager"
                         );
-                        let _ = eose_tx.send(EoseNotification {
-                            relay_url: relay_url_clone.clone(),
-                            sub_id,
-                        });
+                        let _ = eose_tx
+                            .send(EoseNotification {
+                                relay_url: relay_url_clone.clone(),
+                                sub_id,
+                            })
+                            .await;
                     }
                     RelayEvent::Notice(notice) => {
                         if is_rate_limit_message(&notice) {
@@ -4006,13 +4010,15 @@ impl SyncManager {
                                 );
                             }
                         }
-                        let _ = subscription_closed_tx.send(SubscriptionClosedNotification {
-                            relay_url: relay_url_clone.clone(),
-                            subscription_id,
-                            reason,
-                            generation: live_generation,
-                            live_filter_count,
-                        });
+                        let _ = subscription_closed_tx
+                            .send(SubscriptionClosedNotification {
+                                relay_url: relay_url_clone.clone(),
+                                subscription_id,
+                                reason,
+                                generation: live_generation,
+                                live_filter_count,
+                            })
+                            .await;
                     }
                     RelayEvent::Shutdown => {
                         tracing::info!(relay = %relay_url_clone, "Relay shutdown detected");
@@ -4805,6 +4811,7 @@ impl SyncManager {
                     token,
                     outcome,
                 })
+                .await
                 .is_err()
             {
                 connection.disconnect().await;
@@ -5014,11 +5021,13 @@ impl SyncManager {
                 let outcome = connection
                     .fetch_events(filter, Duration::from_secs(30))
                     .await;
-                let _ = result_tx.send(Nip65DiscoveryResult {
-                    source_relay,
-                    authors,
-                    outcome,
-                });
+                let _ = result_tx
+                    .send(Nip65DiscoveryResult {
+                        source_relay,
+                        authors,
+                        outcome,
+                    })
+                    .await;
             });
             break;
         }
@@ -6643,6 +6652,17 @@ impl SyncManager {
             .get(relay_url)
             .is_some_and(|coverage| coverage.subscription_ids.contains(&subscription_id));
         let policy_category = if is_auth_required_message(reason) {
+            let Some(connection) = self.connections.get(relay_url) else {
+                return;
+            };
+            if !connection.holds_subscription_permit(&subscription_id) {
+                tracing::debug!(
+                    relay = %relay_url,
+                    sub_id = %subscription_id,
+                    "Ignoring auth-required CLOSED for an unowned subscription"
+                );
+                return;
+            }
             if reserve_authentication_retry(
                 &mut self.auth_required_attempts,
                 relay_url,
@@ -6655,11 +6675,9 @@ impl SyncManager {
                 );
                 return;
             }
-            if let Some(connection) = self.connections.get(relay_url) {
-                connection
-                    .retire_auth_refused_subscription(&subscription_id)
-                    .await;
-            }
+            connection
+                .retire_auth_refused_subscription(&subscription_id)
+                .await;
             Some(PolicyRefusal::AuthenticationRequired)
         } else {
             policy_refusal(reason)
@@ -7885,7 +7903,7 @@ mod tests {
     fn lifecycle_inbox_accepts_production_sized_terminal_burst() {
         let (tx, mut rx) = lifecycle_notification_channel::<EoseNotification>();
         for index in 0..169 {
-            tx.send(EoseNotification {
+            tx.try_send(EoseNotification {
                 relay_url: "wss://relay.example".to_string(),
                 sub_id: SubscriptionId::new(format!("hydration-{index}")),
             })
@@ -8242,6 +8260,29 @@ mod tests {
         assert_ne!(first, second, "attempt identities must not be reused");
     }
 
+    #[test]
+    fn lifecycle_notifications_apply_fixed_backpressure_under_peer_repetition() {
+        let (sender, mut receiver) = lifecycle_notification_channel();
+
+        for sequence in 0..LIFECYCLE_NOTIFICATION_CAPACITY {
+            sender
+                .try_send(sequence)
+                .expect("the documented lifecycle capacity should be usable");
+        }
+        assert!(
+            matches!(
+                sender.try_send(LIFECYCLE_NOTIFICATION_CAPACITY),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            ),
+            "repeated peer terminals must backpressure instead of retaining unbounded memory"
+        );
+
+        assert_eq!(receiver.try_recv().unwrap(), 0);
+        sender
+            .try_send(LIFECYCLE_NOTIFICATION_CAPACITY)
+            .expect("draining one terminal must release exactly one queue slot");
+    }
+
     #[tokio::test]
     async fn connect_attempt_semaphore_caps_parallel_workers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8563,28 +8604,19 @@ mod tests {
     fn deferred_consolidation_runs_only_after_final_batch_completion() {
         let relay_url = "wss://relay.example";
         let mut deferred = DeferredConsolidations::default();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(
             !deferred.request(relay_url, true),
             "an in-flight batch must defer instead of waiting in the sync actor"
-        );
-        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
-        assert_eq!(
-            receiver.try_recv().unwrap(),
-            relay_url,
-            "batch completion must wake the actor without awaiting under its lock"
         );
         assert!(
             !deferred.take_ready(relay_url, true),
             "consolidation must remain queued while another batch is pending"
         );
 
-        notify_deferred_consolidation_after_batch_completion(&deferred, Some(&sender), relay_url);
-        assert_eq!(receiver.try_recv().unwrap(), relay_url);
         assert!(
             deferred.take_ready(relay_url, false),
-            "the final batch completion must make consolidation runnable"
+            "the final actor-owned batch completion must make consolidation runnable"
         );
         assert!(
             !deferred.take_ready(relay_url, false),
@@ -8597,16 +8629,9 @@ mod tests {
         for reason in ["reset", "disconnect"] {
             let relay_url = format!("wss://{reason}.example");
             let mut deferred = DeferredConsolidations::default();
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
             assert!(!deferred.request(&relay_url, true));
-            notify_deferred_consolidation_after_batch_completion(
-                &deferred,
-                Some(&sender),
-                &relay_url,
-            );
             assert!(deferred.cancel(&relay_url));
-            assert_eq!(receiver.try_recv().unwrap(), relay_url);
             assert!(
                 !deferred.take_ready(&relay_url, false),
                 "a queued wakeup must not resurrect consolidation after {reason}"

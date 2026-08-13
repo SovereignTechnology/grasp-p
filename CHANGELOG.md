@@ -14,12 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Bound every sync-actor notification channel and require `auth-required`
+  retry IDs to own a current subscription-ledger permit. Repeated terminals,
+  forged subscription IDs, and delayed worker results can no longer create
+  unbounded retained memory.
 - Added opt-in trusted-proxy CIDRs so WebSocket connection policy, per-IP
   metrics, abuse indicators, and logs can use the real client address without
   trusting spoofable forwarding headers from arbitrary direct peers.
 
 ### Added
 
+- Add fixed-cardinality aggregate metrics for important long-lived sync state
+  and document the producer, cleanup owner, bound, and terminal behavior of
+  every peer-influenced transient subsystem.
 - Add bounded, operator-configurable inbox fallback coverage when a successful
   Sync+ user-index query finds no accepted NIP-65 relay list for a root author.
 - Add a default-on `NGIT_SYNC_PLUS_ENABLED` opt-out and advertise GRASP-03 in
