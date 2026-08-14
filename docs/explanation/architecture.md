@@ -596,12 +596,13 @@ The rejected events index solves two critical problems during sync:
 1. **Negentropy sync efficiency**: Prevents repeatedly downloading events that will be rejected again
 2. **Race condition resolution**: Enables immediate hot-cache re-processing or an exact-ID fetch after the full event expires
 
-**Two-Tier Architecture:**
+**Bounded Architecture:**
 
 | Tier | Duration | Storage | Purpose |
 |------|----------|---------|---------|
 | Hot Cache | 2 minutes | Full events | Immediate re-processing when dependencies arrive |
 | Cold Index | 7 days | Metadata only | Prevent re-fetch during negentropy sync |
+| Related Dependency Index | 7 days | Full events + reference keys + relay hints | Retry policy orphans when either side of their relationship is accepted |
 
 **Event Flow:**
 
@@ -627,6 +628,13 @@ Exact-ID Recovery
 Negentropy Sync
     │
     └──▶ Exclude Cold Index IDs from "missing events" calculation
+
+Related Event Rejected as an Orphan
+    │
+    ├──▶ Retain the full event in the crash-safe checkpoint
+    ├──▶ Match later accepted IDs and addresses in both directions
+    ├──▶ Re-process an iterative closure of newly unblocked events
+    └──▶ Keep retryable results pending; remove terminal outcomes
 ```
 
 Exact-ID recovery runs as bounded background work, so a slow relay does not hold
@@ -639,6 +647,9 @@ timeout.
 - Repository announcements (kind 30617) rejected for not listing this service or a dependency-resolvable maintainer validation failure
 - State events (kind 30618) rejected for missing announcements or dependency-resolvable authorization failures
 - Permanently invalid events classified as `Other` remain excluded and are not exact-refetched
+- Related comments, reactions, zap requests, and other policy orphans are
+  retained under fixed limits: 1,024 entries, 8 MiB total, 128 KiB per event,
+  and 512 attempts per triggered closure
 
 **Source Code:** [`src/sync/rejected_index.rs`](../../src/sync/rejected_index.rs)
 

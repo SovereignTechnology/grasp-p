@@ -31,8 +31,6 @@ pub use metrics::SyncMetrics;
 
 // Re-export rejected index types
 pub use rejected_index::{EventType, RejectionReason};
-// Note: RejectedEventsIndex struct exists in rejected_index.rs but not yet used
-// Current code still uses the simple HashSet type alias below
 
 // Re-export relay connection types
 pub use relay_connection::{
@@ -1772,12 +1770,14 @@ async fn run_rejected_index_cleanup(
                 let (_, ann_cold_expired) = manager.rejected_events_index.cleanup_expired_for_type("announcement");
                 let (_, state_cold_expired) = manager.rejected_events_index.cleanup_expired_for_type("state");
                 let unrecoverable_expired = manager.rejected_events_index.cleanup_expired_unrecoverable();
+                let related_expired = manager.rejected_events_index.cleanup_expired_related();
 
-                if ann_cold_expired + state_cold_expired + unrecoverable_expired > 0 {
+                if ann_cold_expired + state_cold_expired + unrecoverable_expired + related_expired > 0 {
                     tracing::info!(
                         announcements = ann_cold_expired,
                         states = state_cold_expired,
                         unrecoverable = unrecoverable_expired,
+                        related = related_expired,
                         "Cleaned up expired entries from rejected events cold index"
                     );
                 }
@@ -1886,6 +1886,7 @@ async fn run_health_and_metrics_checker(
                         ("queued_connection_attempts", manager.in_flight_connect_attempts.len()),
                         ("purgatory_dependencies", manager.purgatory_dependency_attempts.len()),
                         ("dependency_relays", manager.dependency_relay_deadlines.len()),
+                        ("related_dependency_events", manager.rejected_events_index.related_len()),
                         ("deferred_consolidations", manager.deferred_consolidations.relays.len()),
                         ("descendant_rotations", manager.descendant_sync_rotations.len()),
                     ] {
@@ -2993,19 +2994,23 @@ impl SyncManager {
             if let Some(metrics) = metrics.as_ref() {
                 metrics.record_hydration_events(&relay_url, "recovery", "delivered", 1);
             }
-            // Events already tracked as rejected count as recovered without
-            // re-processing: re-validation is owned by the rejected-index
-            // re-processing machinery, and unrecoverable IDs never revalidate.
+            // Permanent cached rejections account for the requested ID.
+            // Dependency-sensitive entries remain pending until their normal
+            // re-processing machinery observes the missing accepted event.
             if rejected_events_index.contains(&event.id) {
+                let dependency_pending = rejected_events_index.is_dependency_pending(&event.id);
                 tracing::debug!(
                     relay = %relay_url,
                     event_id = %event.id,
+                    dependency_pending,
                     "Recovered missing event already tracked as rejected, skipping re-processing"
                 );
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.record_hydration_events(&relay_url, "recovery", "rejected_cached", 1);
                 }
-                recovered.insert(event.id);
+                if !dependency_pending {
+                    recovered.insert(event.id);
+                }
                 continue;
             }
             let result = Self::process_event_static(
@@ -6365,6 +6370,30 @@ impl SyncManager {
         rejected_events_index: &Arc<RejectedEventsIndex>,
         save_context: crate::nostr::persistence::SaveContext,
     ) -> ProcessResult {
+        Self::process_event_static_inner(
+            event,
+            relay_url,
+            database,
+            write_policy,
+            local_relay,
+            rejected_events_index,
+            save_context,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_event_static_inner(
+        event: &Event,
+        relay_url: &str,
+        database: &SharedDatabase,
+        write_policy: &Nip34WritePolicy,
+        local_relay: &LocalRelay,
+        rejected_events_index: &Arc<RejectedEventsIndex>,
+        save_context: crate::nostr::persistence::SaveContext,
+        resolve_related_dependencies: bool,
+    ) -> ProcessResult {
         use nostr_sdk::prelude::{WritePolicy, WritePolicyResult};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         // Check if event already exists
@@ -6568,6 +6597,51 @@ impl SyncManager {
                     }
                 }
 
+                if resolve_related_dependencies {
+                    let mut queue: VecDeque<Event> = rejected_events_index
+                        .related_candidates_resolved_by(event)
+                        .into_iter()
+                        .collect();
+                    let mut attempted = HashSet::new();
+                    let mut saved = 0usize;
+                    while let Some(candidate) = queue.pop_front() {
+                        if attempted.len() >= rejected_index::RELATED_RETRY_CLOSURE_LIMIT
+                            || !attempted.insert(candidate.id)
+                        {
+                            continue;
+                        }
+                        let outcome = Box::pin(Self::process_event_static_inner(
+                            &candidate,
+                            relay_url,
+                            database,
+                            write_policy,
+                            local_relay,
+                            rejected_events_index,
+                            save_context,
+                            false,
+                        ))
+                        .await;
+                        if outcome.is_terminally_accounted() {
+                            rejected_events_index.remove(&candidate.id);
+                        }
+                        if outcome == ProcessResult::Saved {
+                            saved += 1;
+                            queue.extend(
+                                rejected_events_index.related_candidates_resolved_by(&candidate),
+                            );
+                        }
+                    }
+                    if !attempted.is_empty() {
+                        tracing::info!(
+                            trigger_event = %event.id,
+                            attempted = attempted.len(),
+                            saved,
+                            remaining = rejected_events_index.related_len(),
+                            "Reprocessed dependency-sensitive related-event closure"
+                        );
+                    }
+                }
+
                 ProcessResult::Saved
             }
             WritePolicyResult::Reject {
@@ -6670,6 +6744,25 @@ impl SyncManager {
                                 "Synced event missing 'd' tag, tracked as unrecoverable by ID"
                             );
                         }
+                    } else if process_result == ProcessResult::Rejected(PolicyRejection::Restricted)
+                        && message.contains(
+                            "event must reference an accepted repository or accepted event",
+                        )
+                    {
+                        let (addressable_refs, event_refs) =
+                            crate::nostr::policy::RelatedEventPolicy::extract_reference_tags(event);
+                        let retained = rejected_events_index.add_related_from_relay(
+                            event.clone(),
+                            event_refs.into_iter().collect(),
+                            addressable_refs.into_iter().collect(),
+                            Some(relay_url.to_string()),
+                        );
+                        tracing::debug!(
+                            event_id = %event.id,
+                            kind = %event.kind.as_u16(),
+                            retained,
+                            "Indexed dependency-sensitive related event for durable retry"
+                        );
                     }
 
                     process_result
@@ -7977,6 +8070,82 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_dependency_reprocesses_a_synced_policy_orphan() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let git_data_path = directory.path().join("git");
+        let mut config = Config::for_testing();
+        config.git_data_path = git_data_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_data_path));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+        )
+        .await
+        .expect("create test relay runtime");
+        let rejected = Arc::new(RejectedEventsIndex::new(
+            Duration::from_secs(120),
+            Duration::from_secs(604800),
+        ));
+        let keys = Keys::generate();
+        let parent = EventBuilder::new(Kind::GitUserGraspList, "dependency")
+            .finalize(&keys)
+            .expect("build accepted dependency");
+        let child = EventBuilder::new(Kind::TextNote, "dependent comment")
+            .tags([Tag::event(parent.id)])
+            .finalize(&keys)
+            .expect("build dependent event");
+
+        let orphan_result = SyncManager::process_event_static(
+            &child,
+            "wss://source.example",
+            &runtime.stores.database,
+            &runtime.write_policy,
+            &runtime.relay,
+            &rejected,
+            crate::nostr::persistence::SaveContext::RelaySync,
+        )
+        .await;
+        assert_eq!(
+            orphan_result,
+            ProcessResult::Rejected(PolicyRejection::Restricted)
+        );
+        assert!(rejected.is_dependency_pending(&child.id));
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&child.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let parent_result = SyncManager::process_event_static(
+            &parent,
+            "wss://source.example",
+            &runtime.stores.database,
+            &runtime.write_policy,
+            &runtime.relay,
+            &rejected,
+            crate::nostr::persistence::SaveContext::RelaySync,
+        )
+        .await;
+        assert_eq!(parent_result, ProcessResult::Saved);
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&child.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!rejected.contains(&child.id));
+    }
 
     #[test]
     fn partial_nip65_batch_retries_missing_authors_early() {
