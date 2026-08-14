@@ -67,8 +67,17 @@ pub struct RelayLimitation {
 }
 
 impl RelayInformationDocument {
-    /// Create NIP-11 relay information document from configuration
+    /// Create a NIP-11 document for a relay served at the domain root.
     pub fn from_config(config: &Config) -> Self {
+        Self::from_config_at_path(config, "/")
+    }
+
+    /// Create a NIP-11 document for the path where the relay was requested.
+    ///
+    /// NIP-05 `_@domain` can only resolve a relay served at the domain root,
+    /// because clients always request `/.well-known/nostr.json`. A relay
+    /// mounted below any other path must therefore not advertise NIP-05.
+    pub fn from_config_at_path(config: &Config, relay_path: &str) -> Self {
         // Get validated configuration (config.validate() must be called at startup)
         let archive_config = config.archive_config();
         let archive_enabled = archive_config.enabled();
@@ -128,6 +137,9 @@ impl RelayInformationDocument {
                     34, // NIP-34: Git repository announcements
                     77, // NIP-77: Negentropy sync (reconciliation protocol)
                 ];
+                if relay_path == "/" {
+                    nips.push(5); // NIP-05: Root-domain identity
+                }
                 // NIP-09 (deletion) and NIP-62 (request to vanish) are honoured
                 // only when not running as an archival "disrespector" relay. When
                 // disrespector mode is on the relay stores but ignores deletion /
@@ -137,8 +149,8 @@ impl RelayInformationDocument {
                 if !config.deletion_request_disrespector {
                     nips.push(9); // NIP-09: Event deletion requests
                     nips.push(62); // NIP-62: Request to vanish
-                    nips.sort_unstable();
                 }
+                nips.sort_unstable();
                 nips
             },
             software: "https://gitworkshop.dev/danconwaydev.com/ngit-grasp".to_string(),
@@ -193,6 +205,7 @@ mod tests {
         assert!(pubkey.chars().all(|c| c.is_ascii_hexdigit()));
 
         assert!(doc.supported_nips.contains(&1));
+        assert!(doc.supported_nips.contains(&5));
         assert!(doc.supported_nips.contains(&11));
         assert!(doc.supported_nips.contains(&34));
         assert!(doc.supported_nips.contains(&77));
@@ -398,6 +411,17 @@ mod tests {
         // by default.
         assert!(doc.supported_nips.contains(&9));
         assert!(doc.supported_nips.contains(&62));
+    }
+
+    #[test]
+    fn test_nip11_advertises_nip05_only_at_domain_root() {
+        let config = Config::for_testing();
+
+        let root_doc = RelayInformationDocument::from_config_at_path(&config, "/");
+        let nested_doc = RelayInformationDocument::from_config_at_path(&config, "/relay");
+
+        assert!(root_doc.supported_nips.contains(&5));
+        assert!(!nested_doc.supported_nips.contains(&5));
     }
 
     #[test]

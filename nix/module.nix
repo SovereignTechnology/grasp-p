@@ -85,7 +85,9 @@ let
         default = null;
         example = "/run/agenix/ngit-grasp-relay-owner-nsec";
         description = ''
-          Runtime secret file containing the relay owner's nsec (private key).
+          Runtime secret file containing the relay owner's nsec (private key),
+          used for the NIP-05 root identity when served at the domain root,
+          NIP-11 relay information, and relay authentication.
           The service receives it as a systemd credential named
           `${relayOwnerNsecCredential}`, so the secret is never placed in the
           process command line.
@@ -103,7 +105,9 @@ let
         default = null;
         example = "nsec1...";
         description = ''
-          Relay owner's nsec (private key) for signing and authentication.
+          Relay owner's nsec (private key) for the NIP-05 root identity when
+          served at the domain root, NIP-11 relay information, signing, and
+          authentication.
           Less secure than relayOwnerNsecFile as it ends up in nix store.
           Only used if relayOwnerNsecFile is not set.
         '';

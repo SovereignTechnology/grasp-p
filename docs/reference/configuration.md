@@ -148,6 +148,8 @@ NGIT_RELAY_OWNER_NSEC=nsec1...
 
 **Used for:**
 
+- Deriving the `_@domain` NIP-05 identity served from `/.well-known/nostr.json`
+  when the relay itself is available at the domain root (`/`)
 - Deriving the operator pubkey in the NIP-11 relay information document
 - NIP-42 authentication when synchronizing from other relays
 

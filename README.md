@@ -8,6 +8,7 @@ A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized
 
 - **Git Smart HTTP Backend**: Serves Git repositories over HTTP
 - **Nostr Relay**: Stores and validates repository announcements and state events
+- **Root Nostr Identity**: Serves `_@domain` through the NIP-05 well-known endpoint when mounted at the domain root
 - **Integrated Authorization**: Validates Git pushes against Nostr state events without requiring external hooks
 
 Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-relay)) which uses nginx + git-http-backend + pre-receive hooks + Khatru (Go), `ngit-grasp` provides a unified Rust service that handles both Git and Nostr protocols natively.
@@ -119,6 +120,7 @@ See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for f
 - ✅ Git capabilities: `allow-tip-sha1-in-want`, `allow-reachable-sha1-in-want`, `uploadpack.allowFilter`
 - ✅ CORS support for web-based Git clients
 - ✅ NIP-11 relay information document
+- ✅ NIP-05 `_@domain` identity backed by the relay operator public key when the relay is mounted at `/`
 - ✅ **Purgatory**: Events without git data held for 30 minutes, auto-released when data arrives
 - ✅ **Deletion Lifecycle**: NIP-09/NIP-62 support with GRASP-aware cascade deletion, related git-data archival/removal, holding/archive recovery, and archival-relay disrespector mode
 
@@ -672,6 +674,7 @@ ngit-grasp/
 │   ├── http/
 │   │   ├── mod.rs           # HTTP module
 │   │   ├── landing.rs       # Landing page handler
+│   │   ├── nip05.rs         # NIP-05 root identity document
 │   │   └── nip11.rs         # NIP-11 relay info document
 │   └── metrics/
 │       ├── mod.rs           # Prometheus metrics (Git, Nostr, Sync)
