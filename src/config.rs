@@ -329,9 +329,11 @@ pub struct Config {
     ///
     /// Used for:
     /// - NIP-05 `_@domain` well-known identity when served at the domain root
+    /// - Signing the minimal kind-0 bot profile and kind-10002 relay list published at startup
+    /// - Trusted admission of service events authored by this identity (for example, ngit-ci)
     /// - NIP-11 relay information document (pubkey field derived from this nsec)
     /// - NIP-42 authentication when syncing from other relays
-    /// - Future: signing events, WoT-based rate limiting of syncing relays
+    /// - Future: WoT-based rate limiting of syncing relays
     ///
     /// Loaded from the `relay_owner_nsec` systemd credential,
     /// `NGIT_RELAY_OWNER_NSEC`, or `.relay-owner.nsec`; never accepted on argv.
@@ -408,8 +410,8 @@ pub struct Config {
     )]
     pub sync_plus_enabled: bool,
 
-    /// Comma-separated relays used to discover eligible accepted repository participants'
-    /// NIP-65 relay lists.
+    /// Comma-separated relays used to publish the relay-owner identity and to discover
+    /// eligible accepted repository participants' NIP-65 relay lists.
     #[arg(
         long,
         env = "NGIT_USER_INDEX_RELAYS",

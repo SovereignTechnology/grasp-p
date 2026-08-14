@@ -72,6 +72,16 @@ runtime:
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
 - Set up shared storage (LMDB or Memory), purgatory, sync manager, and
   background maintenance tasks
+- Seed the relay owner's minimal kind-0 bot profile and single-relay
+  kind-10002 read/write list when absent — stored identity events are never
+  overwritten, and a kind with no local copy is seeded only once a
+  configured user-index relay is reachable and confirms it holds no identity
+  of that kind — then publish in the background: no identity event, stored
+  or generated, is sent before at least one user-index relay has been
+  checked for its kind, every send is preceded by a per-relay re-check, and
+  an identity found on an index is adopted locally instead of overwritten.
+  Transient failures retry with a capped backoff, and in private mode the
+  identity stays local so the relay's existence is never advertised
 - Atomically checkpoint purgatory and rejected-event recovery state every 60
   seconds without consuming the checkpoint during restore
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
@@ -117,6 +127,22 @@ fn add_cors_headers(builder: http::response::Builder) -> http::response::Builder
 ```
 
 See [`src/http/mod.rs:29-84`](src/http/mod.rs:29-84) for the full CORS implementation.
+
+The relay-owner key is also a trusted service author in `Nip34WritePolicy`,
+with deliberately narrow scope. Owner-signed events skip the event blacklist
+but still pass the NIP-09/NIP-62 deletion gate, so a replayed copy of a
+retracted owner event cannot undo its tombstone, and every kind with a
+dedicated admission policy takes its normal path: owner-signed NIP-34
+announcements, state events, and PRs are validated, ref-aligned, and routed
+through purgatory exactly like anyone else's, while the relay's own kind
+0/10002 identity is always accepted. Trust applies only to owner-signed
+kinds that would otherwise fall through to the generic related-event
+rejection — `ngit-ci` coordinator advertisements, for example, intentionally
+have no repository root tag. Owner-authored NIP-09/NIP-62 requests still run
+through their normal lifecycle handlers so CI status retractions and other
+deletions retain their protocol effects. Because the blacklist cannot block
+the owner key, the only remediation for a compromised relay-owner nsec is
+rotating the key.
 
 ### 3. Git Module ([`src/git/`](src/git/))
 
@@ -723,7 +749,10 @@ preventing unauthenticated repository enumeration.
 
 Private mode advertises GRASP-08 plus NIP-42 and NIP-98 in NIP-11. It is
 incompatible with GRASP-06 because that extension deliberately exposes an
-unauthenticated contributor write surface.
+unauthenticated contributor write surface. It also suppresses relay-owner
+identity publication: the kind 0/10002 events are seeded and served locally
+but never sent to the configured user-index relays, so a private relay does
+not advertise its existence.
 
 One process currently represents one private collaborator service. Operators
 can run several independently configured instances for different groups. Fleet

@@ -36,11 +36,7 @@ pub struct AnnouncementPolicy {
 }
 
 impl AnnouncementPolicy {
-    pub fn new(
-        ctx: PolicyContext,
-        config: Config,
-        private_access: Option<PrivateAccess>,
-    ) -> Self {
+    pub fn new(ctx: PolicyContext, config: Config, private_access: Option<PrivateAccess>) -> Self {
         Self {
             ctx,
             config,

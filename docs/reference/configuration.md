@@ -150,6 +150,18 @@ NGIT_RELAY_OWNER_NSEC=nsec1...
 
 - Deriving the `_@domain` NIP-05 identity served from `/.well-known/nostr.json`
   when the relay itself is available at the domain root (`/`)
+- Signing a minimal kind-0 profile containing only the scheme-less public URL
+  as `name`, `nip05: "_@domain"`, and `bot: true`, plus a kind-10002 list
+  naming this relay as its sole read/write relay; a kind with a stored local
+  event keeps the stored version, and nothing is published to
+  `NGIT_USER_INDEX_RELAYS` before at least one of them has been checked for
+  the kind (and never when `NGIT_PRIVATE_MODE` is enabled)
+- Trusted admission of valid events authored by this identity for kinds
+  without a dedicated admission policy, such as `ngit-ci` coordinator and
+  result events that do not reference a repository. Owner-signed NIP-34
+  repository events pass the normal admission policies, NIP-09/NIP-62
+  tombstones still apply, and because the event blacklist cannot block this
+  key, rotating it is the only remediation if it is compromised
 - Deriving the operator pubkey in the NIP-11 relay information document
 - NIP-42 authentication when synchronizing from other relays
 
@@ -421,7 +433,7 @@ NGIT_SYNC_BOOTSTRAP_RELAY_URL=ws://127.0.0.1:8081
 
 #### `NGIT_USER_INDEX_RELAYS`
 
-**Description:** Comma-separated relay URLs used to discover eligible accepted repository participants' NIP-65 relay lists
+**Description:** Comma-separated relay URLs receiving the relay-owner kind 0/10002 identity events and used to discover eligible accepted repository participants' NIP-65 relay lists
 **Type:** String list (comma-separated WebSocket URLs)
 **Default:** `wss://purplepag.es,wss://index.hzrd149.com,wss://indexer.coracle.social`
 **Required:** No
@@ -432,6 +444,20 @@ NGIT_USER_INDEX_RELAYS=wss://purplepag.es,wss://index.example.com
 
 The corresponding NixOS option is `userIndexRelays`, expressed as a list of
 strings. Empty comma-separated entries and surrounding whitespace are ignored.
+On startup, ngit-grasp publishes the owner's kind-0 and kind-10002 identity
+events to the valid configured user-index relays, gap-filling only: no
+identity event — locally stored or freshly generated — is published before
+at least one user-index relay has been successfully checked for that kind,
+and every send is preceded by a per-relay re-check. An identity found on an
+index relay (for example after a local database wipe) is adopted locally and
+never overwritten, so events reach only index relays that individually
+confirm they hold no identity of that kind. For a kind with no local copy,
+nothing is even seeded until a reachable user-index relay confirms it holds
+none. Transient failures are retried with a capped backoff; terminal
+protocol rejections are logged without retrying. Neither remote outages nor
+local rejections block relay startup. With no user-index relays configured —
+or when `NGIT_PRIVATE_MODE` is enabled — missing identity events are seeded
+locally right away and published nowhere.
 
 ---
 
@@ -1010,7 +1036,10 @@ Operators should review the design tradeoffs in [`docs/explanation/grasp-06-cont
 When enabled, the relay requires successful NIP-42 authentication by a
 whitelisted member before accepting or serving any Nostr events. Standard Git
 repository root, `info/refs`, `git-upload-pack`, and `git-receive-pack`
-requests require the GRASP-08 repository-scoped NIP-98 credential.
+requests require the GRASP-08 repository-scoped NIP-98 credential. The
+relay-owner identity events (kind 0/10002) are still seeded and served
+locally but are never published to `NGIT_USER_INDEX_RELAYS`, so a private
+relay does not advertise its existence.
 
 ```bash
 NGIT_PRIVATE_MODE=true

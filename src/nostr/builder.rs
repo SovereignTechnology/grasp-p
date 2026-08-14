@@ -67,9 +67,18 @@ const MAX_SUBSCRIPTION_STATE_BYTES: usize = 5 * 1024 * 1024;
 /// NIP-34 Write Policy — admission and routing for GRASP-01 events
 ///
 /// Acts as the top-level admission gate and router.  Each incoming event is:
-/// 1. Checked against the event blacklist.
-/// 2. Passed through the deletion gate (`DeletionService::gate`).
-/// 3. Dispatched to the appropriate sub-policy:
+/// 1. Checked against the event blacklist (skipped for the trusted
+///    relay-owner key).
+/// 2. Passed through the deletion gate (`DeletionService::gate`), which
+///    applies to every author — including the relay owner — so replaying a
+///    retracted event cannot undo its NIP-09/NIP-62 tombstone.
+/// 3. Dispatched to the appropriate sub-policy. Relay-owner trust is scoped:
+///    owner-signed events of kinds with a dedicated sub-policy below (NIP-34
+///    repository kinds, deletion/vanish requests) take the same validation
+///    paths as any other author, while the relay's own kind 0/10002 identity
+///    and owner-signed kinds with no dedicated policy (e.g. `ngit-ci`
+///    coordinator advertisements) are accepted instead of falling through to
+///    the generic related-event rejection.
 ///    - `AnnouncementPolicy` — repository announcement validation
 ///    - `StatePolicy`        — state event validation + ref alignment
 ///    - `PrEventPolicy`      — PR / PR-Update validation
@@ -82,6 +91,7 @@ const MAX_SUBSCRIPTION_STATE_BYTES: usize = 5 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Nip34WritePolicy {
     ctx: PolicyContext,
+    relay_owner_pubkey: Option<PublicKey>,
     announcement_policy: AnnouncementPolicy,
     state_policy: StatePolicy,
     pr_event_policy: PrEventPolicy,
@@ -132,7 +142,16 @@ impl Nip34WritePolicy {
 
         let ctx = PolicyContext::new(domain, database, git_data_path, purgatory, config.clone());
         Self {
-            announcement_policy: AnnouncementPolicy::new(ctx.clone(), config.clone(), private_access),
+            // RelayServer validates and always supplies this key. Keeping it
+            // optional here preserves library/test callers that construct a
+            // standalone policy without running the server configuration
+            // loader first.
+            relay_owner_pubkey: config.relay_owner_keys().ok().map(|keys| keys.public_key()),
+            announcement_policy: AnnouncementPolicy::new(
+                ctx.clone(),
+                config.clone(),
+                private_access,
+            ),
             state_policy: StatePolicy::new(ctx.clone()),
             pr_event_policy: PrEventPolicy::new(ctx.clone(), repo_init_locks),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
@@ -849,15 +868,29 @@ impl WritePolicy for Nip34WritePolicy {
         addr: &'a SocketAddr,
     ) -> Pin<Box<dyn Future<Output = WritePolicyResult> + Send + 'a>> {
         Box::pin(async move {
-            // Check event blacklist FIRST - it overrides everything
-            if let Some(reason) = self.check_event_blacklist(event) {
-                tracing::debug!(
-                    event_id = %event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex()),
-                    author = %event.pubkey.to_hex(),
-                    reason = %reason,
-                    "Rejected event from blacklisted author"
-                );
-                return WritePolicyResult::reject(MachineReadablePrefix::Blocked, reason);
+            // The operator may reuse this service identity with trusted
+            // automation such as ngit-ci, so owner-signed events skip the
+            // blacklist — if the key is ever compromised, rotating it is the
+            // only remediation. They do NOT skip the deletion gate (signed
+            // events are public, so replaying a retracted CI status event
+            // must not undo its NIP-09/NIP-62 tombstone) and they do NOT
+            // skip the dedicated admission policies in the dispatch below:
+            // owner-signed NIP-34 repository events are validated, aligned,
+            // and routed through purgatory exactly like anyone else's.
+            let is_relay_owner = self.relay_owner_pubkey == Some(event.pubkey);
+
+            // For all non-owner authors, the event blacklist overrides every
+            // repository and event-kind policy below.
+            if !is_relay_owner {
+                if let Some(reason) = self.check_event_blacklist(event) {
+                    tracing::debug!(
+                        event_id = %event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex()),
+                        author = %event.pubkey.to_hex(),
+                        reason = %reason,
+                        "Rejected event from blacklisted author"
+                    );
+                    return WritePolicyResult::reject(MachineReadablePrefix::Blocked, reason);
+                }
             }
 
             // Deletion / vanish gate.
@@ -879,6 +912,19 @@ impl WritePolicy for Nip34WritePolicy {
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
             let result = match event.kind {
+                // The relay's own identity events are always welcome: the
+                // startup seeding path stores them directly, and the
+                // operator may customize them through an ordinary client.
+                // Everyone else's kind 0/10002 goes through the
+                // proactive-identity policy.
+                Kind::Metadata | Kind::RelayList if is_relay_owner => {
+                    tracing::debug!(
+                        event_id = %event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex()),
+                        kind = event.kind.as_u16(),
+                        "Accepted relay-owner identity event"
+                    );
+                    WritePolicyResult::Accept
+                }
                 Kind::Metadata | Kind::RelayList => self.handle_proactive_identity(event).await,
                 Kind::GitRepoAnnouncement => self.handle_announcement(event).await,
                 Kind::RepoState => self.handle_state(event, is_synced).await,
@@ -897,6 +943,22 @@ impl WritePolicy for Nip34WritePolicy {
                 }
                 Kind::EventDeletion => self.deletion.handle_nip09(event).await,
                 Kind::RequestToVanish => self.deletion.handle_vanish(event).await,
+                // Owner trust is scoped to kinds with no dedicated policy
+                // above: valid owner-signed events that would otherwise fall
+                // through to the generic related-event rejection — such as
+                // `ngit-ci` coordinator advertisements with no repository
+                // root tag — are accepted. NIP-34 repository kinds never
+                // reach this arm, so owner events cannot bypass announcement
+                // validation, state ref alignment, or purgatory git-data
+                // handling.
+                _ if is_relay_owner => {
+                    tracing::debug!(
+                        event_id = %event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex()),
+                        kind = event.kind.as_u16(),
+                        "Accepted event from relay-owner identity"
+                    );
+                    WritePolicyResult::Accept
+                }
                 _ => self.handle_related_event(event, "Event").await,
             };
 

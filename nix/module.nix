@@ -87,7 +87,8 @@ let
         description = ''
           Runtime secret file containing the relay owner's nsec (private key),
           used for the NIP-05 root identity when served at the domain root,
-          NIP-11 relay information, and relay authentication.
+          startup kind-0/kind-10002 seeding, trusted service-event
+          admission, NIP-11 relay information, and relay authentication.
           The service receives it as a systemd credential named
           `${relayOwnerNsecCredential}`, so the secret is never placed in the
           process command line.
@@ -106,8 +107,9 @@ let
         example = "nsec1...";
         description = ''
           Relay owner's nsec (private key) for the NIP-05 root identity when
-          served at the domain root, NIP-11 relay information, signing, and
-          authentication.
+          served at the domain root, startup kind-0/kind-10002 seeding,
+          trusted service-event admission, NIP-11 relay information, signing,
+          and authentication.
           Less secure than relayOwnerNsecFile as it ends up in nix store.
           Only used if relayOwnerNsecFile is not set.
         '';
@@ -137,8 +139,11 @@ let
           "wss://index.hzrd149.com"
           "wss://indexer.coracle.social"
         ];
-        description =
-          "Relays used to discover eligible accepted repository participants' NIP-65 relay lists";
+        description = ''
+          Relays receiving the relay-owner kind-0/kind-10002 identity events
+          and used to discover eligible accepted repository participants'
+          NIP-65 relay lists.
+        '';
       };
 
       syncPlusFallbackRelays = mkOption {

@@ -28,7 +28,10 @@ use crate::{
     config::{Config, DatabaseBackend},
     git, grasp06, http,
     metrics::Metrics,
-    nostr::{self, builder::Nip34WritePolicy, lifecycle::RepositoryLifecycle, SharedDatabase},
+    nostr::{
+        self, builder::Nip34WritePolicy, lifecycle::RepositoryLifecycle, relay_identity,
+        SharedDatabase,
+    },
     outbound::OutboundTargetPolicy,
     private::PrivateAccess,
     purgatory::{sync::RealSyncContext, sync::ThrottleManager, Purgatory},
@@ -214,6 +217,31 @@ impl RelayServer {
             .await
             .context("failed deletion lifecycle startup reconciliation")?;
 
+        // Make the operator identity discoverable on this relay without
+        // overwriting identity events the owner already published — locally
+        // or on the configured user-index relays. Runs after deletion startup
+        // reconciliation so seeding sees settled tombstones. Kinds with no
+        // local copy are handed to the background publication task below,
+        // which seeds them only once a user-index relay is reachable and
+        // confirms no existing identity. Stored kinds pass the same gate:
+        // nothing is published before at least one user-index relay has been
+        // checked for the kind, and an identity found there is adopted
+        // locally instead of overwritten, so transient network failure never
+        // blocks relay startup and a wiped database cannot displace a
+        // customized profile surviving on the indexes. In private mode the
+        // identity stays local and is never published.
+        let generated_identity = relay_identity::build(&config)
+            .context("failed to build relay-owner identity events")?;
+        let relay_identity_plan = relay_identity::prepare(
+            &relay_runtime.relay,
+            &relay_runtime.stores.database,
+            &relay_runtime.deletion,
+            &config,
+            &generated_identity,
+        )
+        .await
+        .context("failed to prepare relay-owner identity publication")?;
+
         // Wire the GRASP-06 `/prs/` filesystem cleanup context into
         // purgatory so the standard expiry sweep can delete dangling
         // refs/nostr/<event-id> refs (and zero-ref bare repos) when a
@@ -269,6 +297,15 @@ impl RelayServer {
             .set_rejected_events_index(rejected_events_index.clone());
 
         let mut background_tasks = Vec::new();
+
+        if let Some(task) = relay_identity::spawn_user_index_publication(
+            &config,
+            relay_identity_plan,
+            relay_runtime.relay.clone(),
+            relay_runtime.deletion.clone(),
+        ) {
+            background_tasks.push(task);
+        }
 
         background_tasks.push(tokio::spawn(async move {
             sync_manager.run().await;
