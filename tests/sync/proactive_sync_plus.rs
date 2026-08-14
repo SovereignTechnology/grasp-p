@@ -1,5 +1,6 @@
 //! Minimal GRASP-03 mailbox discovery scenario.
 
+use std::path::Path;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -8,6 +9,23 @@ use crate::common::{
     build_layer2_issue_event, repo_coord, reserve_port, send_to_relay_url,
     setup_announcement_on_relay, wait_for_event_on_relay, MockRelay, TestClient, TestRelay,
 };
+
+async fn wait_for_log_line<F>(path: &Path, timeout: Duration, predicate: F) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let log = std::fs::read_to_string(path).unwrap_or_default();
+        if log.lines().any(&predicate) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 #[tokio::test]
 async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
@@ -208,6 +226,91 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
 }
 
 #[tokio::test]
+async fn participant_write_mailbox_fetches_child_of_direct_reaction() {
+    let index = MockRelay::start().await;
+    let mailbox = MockRelay::start().await;
+    let owner = Keys::generate();
+    let root_author = Keys::generate();
+    let participant = Keys::generate();
+    let child_author = Keys::generate();
+    let identifier = "participant-write-mailbox";
+
+    let relay_list = EventBuilder::new(Kind::RelayList, "")
+        .tag(Tag::custom("r", vec![mailbox.url(), "write"]))
+        .finalize(&participant)
+        .expect("build participant relay list");
+    send_to_relay_url(index.url(), &relay_list)
+        .await
+        .expect("seed participant relay list");
+
+    let syncing_git_dir = tempfile::tempdir().expect("create persistent git directory");
+    let syncing_relay_dir = tempfile::tempdir().expect("create persistent relay directory");
+    let syncing = TestRelay::start_on_reservation_persistent_sync(
+        reserve_port(),
+        Some(index.url().to_string()),
+        false,
+        syncing_git_dir.path().to_path_buf(),
+        syncing_relay_dir.path().to_path_buf(),
+    )
+    .await;
+    let syncing_domain = syncing.domain();
+    let (_announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &owner, &[&syncing_domain], identifier).await;
+    let issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root with a reaction whose child is mailbox-only",
+    )
+    .expect("build accepted root");
+    let root_client = TestClient::new(syncing.url(), root_author)
+        .await
+        .expect("connect root author");
+    root_client.send_event(&issue).await.expect("publish root");
+
+    let reaction = EventBuilder::new(Kind::Reaction, "+")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .finalize(&participant)
+        .expect("build direct participant reaction");
+    let participant_client = TestClient::new(syncing.url(), participant)
+        .await
+        .expect("connect participant");
+    participant_client
+        .send_event(&reaction)
+        .await
+        .expect("publish direct reaction");
+
+    let child = EventBuilder::new(Kind::TextNote, "reply to a reaction")
+        .tag(Tag::custom("e", vec![reaction.id.to_hex()]))
+        .finalize(&child_author)
+        .expect("build mailbox-only child");
+    send_to_relay_url(mailbox.url(), &child)
+        .await
+        .expect("seed participant write mailbox");
+
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(child.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "history probing should fetch a child that only names the participant's direct reaction"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Started bounded participant mailbox fetch")
+                && line.contains(mailbox.url())
+        }),
+        "participant mailbox transport should remain observable"
+    );
+
+    syncing.stop().await;
+    mailbox.stop().await;
+    index.stop().await;
+}
+
+#[tokio::test]
 async fn missing_relay_list_uses_bounded_fallback_coverage() {
     let index = MockRelay::start().await;
     let fallback = MockRelay::start().await;
@@ -259,7 +362,7 @@ async fn missing_relay_list_uses_bounded_fallback_coverage() {
     let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
     assert!(
         sync_log.lines().any(|line| {
-            line.contains("Updated proactive inbox coverage from NIP-65")
+            line.contains("Updated proactive participant mailbox coverage from NIP-65")
                 && line.contains("fallback_authors=1")
         }),
         "fallback activation should remain observable"
@@ -288,12 +391,11 @@ async fn missing_relay_list_uses_bounded_fallback_coverage() {
         .await,
         "a later accepted relay list should replace desired fallback coverage"
     );
-    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read updated relay log");
     assert!(
-        sync_log.lines().any(|line| {
-            line.contains("Updated proactive inbox coverage from NIP-65")
-                && line.contains("fallback_authors=0")
-        }),
+        wait_for_log_line(&syncing.log_path(), Duration::from_secs(20), |line| {
+            line.contains("proactive participant mailbox") && line.contains("fallback_authors=0")
+        })
+        .await,
         "accepted NIP-65 ownership should retire the author from desired fallback coverage"
     );
 

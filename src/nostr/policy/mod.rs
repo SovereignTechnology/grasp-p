@@ -18,7 +18,9 @@ pub(crate) use result::{
 };
 
 pub use announcement::{AnnouncementPolicy, AnnouncementResult};
-pub use identity::{IdentityAdmission, ProactiveRootAuthorIndex, SharedProactiveRootAuthorIndex};
+pub use identity::{
+    IdentityAdmission, ProactiveParticipantAuthorIndex, SharedProactiveParticipantAuthorIndex,
+};
 pub use pr_event::PrEventPolicy;
 pub use related::{ReferenceResult, RelatedEventPolicy};
 pub use state::{StatePolicy, StateResult};

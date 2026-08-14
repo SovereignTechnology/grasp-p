@@ -175,6 +175,25 @@ pub fn accepted_repository_authors<'a>(
     authors
 }
 
+/// Associate each accepted root author with their own roots and each accepted
+/// descendant author with the root provenance derived for their events.
+pub fn mailbox_author_roots(
+    roots: &[AcceptedRoot],
+    participant_roots: impl IntoIterator<Item = (PublicKey, HashSet<EventId>)>,
+) -> HashMap<PublicKey, HashSet<EventId>> {
+    let mut author_roots: HashMap<PublicKey, HashSet<EventId>> = HashMap::new();
+    for root in roots {
+        author_roots.entry(root.author).or_default().insert(root.id);
+    }
+    for (author, accepted_roots) in participant_roots {
+        author_roots
+            .entry(author)
+            .or_default()
+            .extend(accepted_roots);
+    }
+    author_roots
+}
+
 pub fn merge_inbox_roots(
     targets: &mut HashMap<String, RelaySyncNeeds>,
     inbox_roots: &HashMap<String, HashSet<EventId>>,
@@ -218,6 +237,15 @@ pub fn build_inbox_root_overlay(
         }
     }
     overlay
+}
+
+/// Relays on which an author may receive or publish conversation events.
+/// Unmarked entries serve both roles under NIP-65.
+pub fn mailbox_relays(event: &Event) -> HashSet<String> {
+    inbox_relays(event)
+        .into_iter()
+        .chain(outbox_relays(event))
+        .collect()
 }
 
 #[cfg(test)]
@@ -313,6 +341,29 @@ mod tests {
     }
 
     #[test]
+    fn relay_list_maps_read_write_and_unmarked_participant_mailboxes() {
+        let keys = Keys::generate();
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://read.example", "read"]),
+                Tag::custom("r", ["wss://write.example", "write"]),
+                Tag::custom("r", ["wss://both.example"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            mailbox_relays(&relay_list),
+            HashSet::from([
+                "wss://read.example".to_string(),
+                "wss://write.example".to_string(),
+                "wss://both.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn identity_authors_are_bounded_to_full_repo_owners_and_maintainers() {
         let owner = Keys::generate();
         let maintainer = Keys::generate();
@@ -354,6 +405,40 @@ mod tests {
             accepted_repository_authors([&accepted, &state_only], &repositories),
             HashSet::from([owner.public_key(), maintainer.public_key()])
         );
+    }
+
+    #[test]
+    fn descendant_authors_receive_only_their_derived_root_provenance() {
+        let first_root_author = Keys::generate().public_key();
+        let second_root_author = Keys::generate().public_key();
+        let participant = Keys::generate().public_key();
+        let first_root = EventId::from_byte_array([12; 32]);
+        let second_root = EventId::from_byte_array([13; 32]);
+        let roots = vec![
+            AcceptedRoot {
+                id: first_root,
+                author: first_root_author,
+                repository: "30617:owner:first".to_string(),
+            },
+            AcceptedRoot {
+                id: second_root,
+                author: second_root_author,
+                repository: "30617:owner:second".to_string(),
+            },
+        ];
+
+        let author_roots =
+            mailbox_author_roots(&roots, [(participant, HashSet::from([second_root]))]);
+
+        assert_eq!(
+            author_roots[&first_root_author],
+            HashSet::from([first_root])
+        );
+        assert_eq!(
+            author_roots[&second_root_author],
+            HashSet::from([second_root])
+        );
+        assert_eq!(author_roots[&participant], HashSet::from([second_root]));
     }
 
     #[test]

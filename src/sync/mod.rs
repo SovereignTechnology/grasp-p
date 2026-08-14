@@ -68,6 +68,123 @@ const DESCENDANT_FALLBACK_OVERLAP_SECS: u64 = 15 * 60;
 /// Maximum number of locally known parent/child generations expanded into a
 /// relay's related-event query frontier.
 const MAX_DESCENDANT_FRONTIER_DEPTH: usize = 8;
+
+fn mailbox_probe_refresh_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(24 * 60 * 60)
+    }
+}
+
+fn mailbox_probe_retry_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(5 * 60)
+    }
+}
+
+fn due_mailbox_relays(
+    mailbox_roots: &HashMap<String, HashSet<EventId>>,
+    next_at: &HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<String> {
+    let mut relays: Vec<String> = mailbox_roots
+        .keys()
+        .filter(|relay| next_at.get(*relay).is_none_or(|due| *due <= now))
+        .cloned()
+        .collect();
+    relays.sort_by(|left, right| {
+        next_at
+            .get(left)
+            .copied()
+            .unwrap_or(now)
+            .cmp(&next_at.get(right).copied().unwrap_or(now))
+            .then_with(|| mailbox_roots[right].len().cmp(&mailbox_roots[left].len()))
+            .then_with(|| left.cmp(right))
+    });
+    relays
+}
+
+fn mailbox_probe_connection_ready(
+    connection_status: Option<ConnectionStatus>,
+    socket_connected: bool,
+) -> bool {
+    socket_connected && connection_status.is_some_and(|status| status.is_live_sync_active())
+}
+
+fn select_due_mailbox_relay(
+    due_relays: &[String],
+    active_relays: &HashSet<String>,
+) -> Option<String> {
+    due_relays
+        .iter()
+        .find(|relay| active_relays.contains(*relay))
+        .or_else(|| due_relays.first())
+        .cloned()
+}
+
+fn mailbox_probe_completion(
+    filter_index: usize,
+    filter_count: usize,
+    succeeded: bool,
+) -> (usize, bool, Duration) {
+    let next_filter = (filter_index + 1) % filter_count.max(1);
+    let completed_cycle = next_filter == 0;
+    let next_probe_in = if succeeded && completed_cycle {
+        mailbox_probe_refresh_interval()
+    } else if succeeded {
+        Duration::ZERO
+    } else {
+        mailbox_probe_retry_interval()
+    };
+    (next_filter, completed_cycle, next_probe_in)
+}
+
+async fn fetch_mailbox_filter(
+    connection: RelayConnection,
+    filter: Filter,
+) -> Result<Vec<Event>, String> {
+    let mut pagination = PaginationState::new(vec![filter]);
+    let mut session = RelayPaginationSession::default();
+    let mut events = HashMap::<EventId, Event>::new();
+
+    loop {
+        let filter = pagination
+            .filters()
+            .into_iter()
+            .next()
+            .expect("mailbox pagination always owns one filter");
+        let page = connection
+            .fetch_events(filter, Duration::from_secs(30))
+            .await?;
+        let previous_count = events.len();
+        for event in page {
+            pagination.record_event(&event);
+            events.insert(event.id, event);
+        }
+        // Inclusive `until` cursors can repeat a relay's oldest timestamp.
+        // Stop when a page contributes nothing instead of retaining the only
+        // mailbox worker forever on a deterministic repeated page.
+        if events.len() == previous_count {
+            break;
+        }
+        let Some(next) = pagination.next_page(&mut session) else {
+            break;
+        };
+        pagination = next;
+    }
+
+    let mut events: Vec<_> = events.into_values().collect();
+    events.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(events)
+}
+
 fn should_use_semantic_fallback(requested_count: usize, received_count: usize) -> bool {
     requested_count >= SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS
         && received_count.saturating_mul(100)
@@ -860,6 +977,9 @@ pub enum PendingBatchPurpose {
 struct DescendantFrontier {
     event_ids: HashSet<EventId>,
     coordinates: HashSet<String>,
+    /// Accepted participant authors and the exact repository roots reached by
+    /// their retained direct or recursive events.
+    author_roots: HashMap<PublicKey, HashSet<EventId>>,
 }
 
 #[derive(Debug, Default)]
@@ -1006,6 +1126,32 @@ fn descendant_event_coordinate(event: &Event) -> Option<String> {
     ))
 }
 
+fn descendant_reference_roots(
+    event: &Event,
+    root_events: &HashSet<EventId>,
+    event_root_owners: &HashMap<EventId, HashSet<EventId>>,
+    coordinate_root_owners: &HashMap<String, HashSet<EventId>>,
+) -> HashSet<EventId> {
+    let (coordinates, event_ids) =
+        crate::nostr::policy::RelatedEventPolicy::extract_reference_tags(event);
+    let mut roots: HashSet<EventId> = event_ids
+        .iter()
+        .filter(|event_id| root_events.contains(event_id))
+        .copied()
+        .collect();
+    for event_id in event_ids {
+        if let Some(owners) = event_root_owners.get(&event_id) {
+            roots.extend(owners.iter().copied());
+        }
+    }
+    for coordinate in coordinates {
+        if let Some(owners) = coordinate_root_owners.get(&coordinate) {
+            roots.extend(owners.iter().copied());
+        }
+    }
+    roots
+}
+
 /// Derive a bounded transitive frontier from related events already accepted
 /// into the local database.
 ///
@@ -1039,8 +1185,13 @@ async fn recursive_descendant_frontier_with_limits(
     }
 
     // Every event directly tagging a root owns an independent recursive
-    // subtree. The direct event itself remains complete core coverage.
-    let mut direct_events = HashMap::<EventId, Event>::new();
+    // subtree. This keeps a popular tangential branch from consuming the
+    // compatibility coverage of unrelated issues, patches, or repositories.
+    // Retain exact root provenance at the same time so participant mailbox
+    // probes cannot leak one repository's roots into another author's scope.
+    let mut direct_events = HashMap::<EventId, (Event, HashSet<EventId>)>::new();
+    let mut event_root_owners = HashMap::<EventId, HashSet<EventId>>::new();
+    let mut coordinate_root_owners = HashMap::<String, HashSet<EventId>>::new();
     for filter in filters::tagged_one_of_our_root_event_filters(root_events, None) {
         match database.query(filter).await {
             Ok(events) => {
@@ -1048,9 +1199,21 @@ async fn recursive_descendant_frontier_with_limits(
                     .iter()
                     .filter(|event| !root_events.contains(&event.id))
                 {
+                    let roots = descendant_reference_roots(
+                        event,
+                        root_events,
+                        &event_root_owners,
+                        &coordinate_root_owners,
+                    );
+                    if roots.is_empty() {
+                        continue;
+                    }
                     direct_events
                         .entry(event.id)
-                        .or_insert_with(|| event.clone());
+                        .and_modify(|(_, known_roots)| {
+                            known_roots.extend(roots.iter().copied());
+                        })
+                        .or_insert_with(|| (event.clone(), roots));
                 }
             }
             Err(error) => {
@@ -1065,7 +1228,7 @@ async fn recursive_descendant_frontier_with_limits(
     }
 
     let mut direct_events: Vec<_> = direct_events.into_iter().collect();
-    direct_events.sort_by(|(left_id, left), (right_id, right)| {
+    direct_events.sort_by(|(left_id, (left, _)), (right_id, (right, _))| {
         left.created_at
             .cmp(&right.created_at)
             .then_with(|| left_id.cmp(right_id))
@@ -1076,9 +1239,15 @@ async fn recursive_descendant_frontier_with_limits(
     let mut coordinate_branches = HashMap::<String, HashSet<EventId>>::new();
     let mut event_seeds = HashMap::<EventId, HashSet<EventId>>::new();
     let mut coordinate_seeds = HashMap::<String, HashSet<EventId>>::new();
-    for (event_id, event) in direct_events {
+    for (event_id, (event, roots)) in direct_events {
         branch_member_counts.insert(event_id, 0);
         event_branches.entry(event_id).or_default().insert(event_id);
+        frontier
+            .author_roots
+            .entry(event.pubkey)
+            .or_default()
+            .extend(roots.iter().copied());
+        event_root_owners.insert(event_id, roots.clone());
         event_seeds.entry(event_id).or_default().insert(event_id);
         if let Some(coordinate) = descendant_event_coordinate(&event) {
             coordinate_branches
@@ -1086,9 +1255,13 @@ async fn recursive_descendant_frontier_with_limits(
                 .or_default()
                 .insert(event_id);
             coordinate_seeds
-                .entry(coordinate)
+                .entry(coordinate.clone())
                 .or_default()
                 .insert(event_id);
+            coordinate_root_owners
+                .entry(coordinate)
+                .or_default()
+                .extend(roots);
         }
     }
 
@@ -1099,7 +1272,7 @@ async fn recursive_descendant_frontier_with_limits(
     }
 
     for depth in 2..=max_depth {
-        let mut layer_events = HashMap::<EventId, Event>::new();
+        let mut layer_events = HashMap::<EventId, (Event, HashSet<EventId>)>::new();
         let event_seed_ids: HashSet<_> = event_seeds.keys().copied().collect();
         let coordinate_seed_ids: HashSet<_> = coordinate_seeds.keys().cloned().collect();
         let mut layer_filters =
@@ -1113,13 +1286,24 @@ async fn recursive_descendant_frontier_with_limits(
             match database.query(filter).await {
                 Ok(events) => {
                     for event in events.iter() {
-                        if root_events.contains(&event.id)
-                            || direct_event_ids.contains(&event.id)
-                            || layer_events.contains_key(&event.id)
-                        {
+                        if root_events.contains(&event.id) || direct_event_ids.contains(&event.id) {
                             continue;
                         }
-                        layer_events.insert(event.id, event.clone());
+                        let roots = descendant_reference_roots(
+                            event,
+                            root_events,
+                            &event_root_owners,
+                            &coordinate_root_owners,
+                        );
+                        if roots.is_empty() {
+                            continue;
+                        }
+                        layer_events
+                            .entry(event.id)
+                            .and_modify(|(_, known_roots)| {
+                                known_roots.extend(roots.iter().copied());
+                            })
+                            .or_insert_with(|| (event.clone(), roots));
                     }
                 }
                 Err(error) => {
@@ -1137,7 +1321,7 @@ async fn recursive_descendant_frontier_with_limits(
         }
 
         let mut layer_events: Vec<_> = layer_events.into_iter().collect();
-        layer_events.sort_by(|(left_id, left), (right_id, right)| {
+        layer_events.sort_by(|(left_id, (left, _)), (right_id, (right, _))| {
             left.created_at
                 .cmp(&right.created_at)
                 .then_with(|| left_id.cmp(right_id))
@@ -1145,7 +1329,7 @@ async fn recursive_descendant_frontier_with_limits(
 
         let mut next_event_seeds = HashMap::<EventId, HashSet<EventId>>::new();
         let mut next_coordinate_seeds = HashMap::<String, HashSet<EventId>>::new();
-        for (event_id, event) in layer_events {
+        for (event_id, (event, roots)) in layer_events {
             let (addressable_refs, event_refs) =
                 crate::nostr::policy::RelatedEventPolicy::extract_reference_tags(&event);
             let mut inherited_branches = HashSet::new();
@@ -1174,15 +1358,29 @@ async fn recursive_descendant_frontier_with_limits(
             if admitted_branches.is_empty() {
                 continue;
             }
+            frontier
+                .author_roots
+                .entry(event.pubkey)
+                .or_default()
+                .extend(roots.iter().copied());
+            event_root_owners
+                .entry(event_id)
+                .or_default()
+                .extend(roots.iter().copied());
             event_branches
                 .entry(event_id)
                 .or_default()
                 .extend(admitted_branches.iter().copied());
-            if let Some(coordinate) = descendant_event_coordinate(&event) {
+            let coordinate = descendant_event_coordinate(&event);
+            if let Some(coordinate) = &coordinate {
                 coordinate_branches
-                    .entry(coordinate)
+                    .entry(coordinate.clone())
                     .or_default()
                     .extend(admitted_branches.iter().copied());
+                coordinate_root_owners
+                    .entry(coordinate.clone())
+                    .or_default()
+                    .extend(roots.iter().copied());
             }
 
             let expandable_branches: HashSet<_> = admitted_branches
@@ -1193,7 +1391,7 @@ async fn recursive_descendant_frontier_with_limits(
                 continue;
             }
             next_event_seeds.insert(event_id, expandable_branches.clone());
-            if let Some(coordinate) = descendant_event_coordinate(&event) {
+            if let Some(coordinate) = coordinate {
                 next_coordinate_seeds.insert(coordinate, expandable_branches);
             }
         }
@@ -1247,6 +1445,22 @@ fn descendant_frontier_filters(
     filters.extend(filters::tagged_one_of_our_repo_event_filters(
         &frontier.coordinates,
         since,
+    ));
+    filters
+}
+
+fn mailbox_probe_filters(
+    repositories: &HashSet<String>,
+    root_events: &HashSet<EventId>,
+    frontier: &DescendantFrontier,
+) -> Vec<Filter> {
+    let coordinate_values: HashSet<_> =
+        repositories.union(&frontier.coordinates).cloned().collect();
+    let event_values: HashSet<_> = root_events.union(&frontier.event_ids).copied().collect();
+    let mut filters = filters::tagged_one_of_our_repo_event_filters(&coordinate_values, None);
+    filters.extend(filters::tagged_one_of_our_root_event_filters(
+        &event_values,
+        None,
     ));
     filters
 }
@@ -1609,21 +1823,66 @@ struct Nip65DiscoveryResult {
     outcome: Result<Vec<Event>, String>,
 }
 
+#[derive(Debug)]
+struct MailboxProbeResult {
+    source_relay: String,
+    filter_index: usize,
+    filter_count: usize,
+    outcome: Result<Vec<Event>, String>,
+}
+
 #[derive(Debug, Default)]
 struct Nip65DiscoveryState {
+    /// Roots authored by each accepted root author. These preserve the
+    /// existing GRASP-03 live inbox overlay; non-root participants remain on
+    /// the paced history-only mailbox path below.
+    root_author_roots: HashMap<PublicKey, HashSet<EventId>>,
     author_roots: HashMap<PublicKey, HashSet<EventId>>,
+    root_repositories: HashMap<EventId, String>,
     eligible_authors: HashSet<PublicKey>,
     author_sources: HashMap<PublicKey, HashSet<String>>,
     relay_lists: HashMap<PublicKey, Event>,
     author_inboxes: HashMap<PublicKey, HashSet<String>>,
+    author_mailboxes: HashMap<PublicKey, HashSet<String>>,
     /// Eligible authors for whom at least one successful index query returned
     /// no accepted relay list. They use the operator's bounded fallback set
     /// until an accepted kind 10002 arrives.
     fallback_authors: HashSet<PublicKey>,
     inbox_roots: HashMap<String, HashSet<EventId>>,
+    mailbox_roots: HashMap<String, HashSet<EventId>>,
+    mailbox_probe_next_at: HashMap<String, Instant>,
+    mailbox_probe_next_filter: HashMap<String, usize>,
+    /// At most one ordinary fetch runs per mailbox relay. Different relays
+    /// remain independent and use their own connection capacity.
+    mailbox_probes_in_flight: HashSet<String>,
     in_flight: HashSet<(String, PublicKey)>,
     next_attempt_at: HashMap<(String, PublicKey), Instant>,
     next_inventory_at: Option<Instant>,
+}
+
+impl Nip65DiscoveryState {
+    fn install_mailbox_overlay(
+        &mut self,
+        new_overlay: HashMap<String, HashSet<EventId>>,
+        now: Instant,
+    ) {
+        let old_overlay = std::mem::replace(&mut self.mailbox_roots, new_overlay);
+        if old_overlay == self.mailbox_roots {
+            return;
+        }
+        self.mailbox_probe_next_at
+            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
+        self.mailbox_probe_next_filter
+            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
+        for (relay, roots) in &self.mailbox_roots {
+            if old_overlay.get(relay) != Some(roots) {
+                self.mailbox_probe_next_at.insert(relay.clone(), now);
+                self.mailbox_probe_next_filter
+                    .entry(relay.clone())
+                    .or_default();
+            }
+        }
+    }
 }
 
 /// Quick reconnect window in seconds (15 minutes)
@@ -2050,12 +2309,17 @@ async fn run_health_and_metrics_checker(
                 // persistent set.
                 manager.sync_due_byte_limited_relay().await;
 
-                // 5. Discover one bounded batch of root-author NIP-65 inboxes.
+                // 5. Discover one bounded batch of participant NIP-65 mailboxes.
                 // The query uses an ordinary transient ledger slot and yields
                 // to historic work when no slot is immediately available.
                 manager.schedule_nip65_discovery().await;
 
-                // 6. Check for naughty list expiration
+                // 6. Start at most one participant mailbox history filter.
+                // Mailbox coverage is history-only: it does not turn every
+                // participant relay into a permanent live source.
+                manager.schedule_mailbox_probe().await;
+
+                // 7. Check for naughty list expiration
                 if let Some(naughty_list) = manager.health_tracker.naughty_list() {
                     let recovered = naughty_list.expire_old_entries();
                     for url in recovered {
@@ -2066,7 +2330,7 @@ async fn run_health_and_metrics_checker(
                     }
                 }
 
-                // 7. Update metrics with current health states and naughty list
+                // 8. Update metrics with current health states and naughty list
                 if let Some(ref metrics) = manager.metrics {
                     // Get all tracked relay URLs
                     let relay_urls: Vec<String> = {
@@ -2107,6 +2371,22 @@ async fn run_health_and_metrics_checker(
                         ("related_dependency_events", manager.rejected_events_index.related_len()),
                         ("deferred_consolidations", manager.deferred_consolidations.relays.len()),
                         ("descendant_rotations", manager.descendant_sync_rotations.len()),
+                        (
+                            "nip65_eligible_authors",
+                            manager.nip65_discovery.eligible_authors.len(),
+                        ),
+                        (
+                            "mailbox_probe_relays",
+                            manager.nip65_discovery.mailbox_roots.len(),
+                        ),
+                        (
+                            "mailbox_probe_cursors",
+                            manager.nip65_discovery.mailbox_probe_next_filter.len(),
+                        ),
+                        (
+                            "mailbox_probe_active",
+                            manager.nip65_discovery.mailbox_probes_in_flight.len(),
+                        ),
                     ] {
                         metrics.set_retained_state(class, count);
                     }
@@ -2143,7 +2423,7 @@ pub struct SyncManager {
     /// What we want to sync (source of truth)
     repo_sync_index: RepoSyncIndex,
     root_candidate_index: RootCandidateIndex,
-    proactive_root_authors: crate::nostr::policy::SharedProactiveRootAuthorIndex,
+    proactive_participant_authors: crate::nostr::policy::SharedProactiveParticipantAuthorIndex,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
     /// In-flight subscription batches
@@ -2205,8 +2485,7 @@ pub struct SyncManager {
     /// Round-robin cursor so only one relay performs descendant live-mode
     /// derivation and admission work per maintenance tick.
     descendant_relay_cursor: usize,
-    /// Narrow GRASP-03 control-plane state. Event transport remains in the
-    /// ordinary GRASP-02 relay targets after inbox roots are overlaid.
+    /// Narrow GRASP-03 identity discovery and paced mailbox-probe state.
     nip65_discovery: Nip65DiscoveryState,
     /// Channel for disconnect notifications (set during run)
     disconnect_tx: Option<tokio::sync::mpsc::Sender<DisconnectNotification>>,
@@ -2217,6 +2496,7 @@ pub struct SyncManager {
     /// Returns connection outcomes to the sync actor for serialized state changes.
     connect_attempt_result_tx: Option<tokio::sync::mpsc::Sender<ConnectAttemptResult>>,
     nip65_discovery_result_tx: Option<tokio::sync::mpsc::Sender<Nip65DiscoveryResult>>,
+    mailbox_probe_result_tx: Option<tokio::sync::mpsc::Sender<MailboxProbeResult>>,
     /// Channel for broadcasting shutdown signal to all background tasks
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
@@ -2279,7 +2559,7 @@ impl SyncManager {
             }
         }
 
-        let proactive_root_authors = write_policy.proactive_root_authors();
+        let proactive_participant_authors = write_policy.proactive_participant_authors();
         Self {
             bootstrap_relay_url,
             service_domain,
@@ -2290,7 +2570,7 @@ impl SyncManager {
             config: config.clone(),
             repo_sync_index: Arc::new(RwLock::new(HashMap::new())),
             root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
-            proactive_root_authors,
+            proactive_participant_authors,
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
             pending_sync_index: Arc::new(RwLock::new(HashMap::new())),
             rejected_events_index,
@@ -2321,6 +2601,7 @@ impl SyncManager {
             subscription_closed_tx: None,
             connect_attempt_result_tx: None,
             nip65_discovery_result_tx: None,
+            mailbox_probe_result_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
         }
@@ -3736,6 +4017,8 @@ impl SyncManager {
 
         let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
             mpsc::channel::<Nip65DiscoveryResult>(1);
+        let (mailbox_probe_result_tx, mut mailbox_probe_result_rx) =
+            mpsc::channel::<MailboxProbeResult>(1);
 
         // 4b. Create shutdown broadcast channel for graceful shutdown
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
@@ -3758,6 +4041,7 @@ impl SyncManager {
         self.subscription_closed_tx = Some(subscription_closed_tx);
         self.connect_attempt_result_tx = Some(connect_attempt_result_tx);
         self.nip65_discovery_result_tx = Some(nip65_discovery_result_tx);
+        self.mailbox_probe_result_tx = Some(mailbox_probe_result_tx);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
         // 6. Connect to bootstrap relay if configured
@@ -3860,6 +4144,12 @@ impl SyncManager {
                         ).await;
                     }
                 }
+                result = mailbox_probe_result_rx.recv() => {
+                    if let Some(result) = result {
+                        let mut manager = sync_manager.lock().await;
+                        manager.handle_mailbox_probe_result(result).await;
+                    }
+                }
                 result = connect_attempt_result_rx.recv() => {
                     match result {
                         Some(result) => {
@@ -3886,9 +4176,15 @@ impl SyncManager {
                             // state instead of trusting a queued full-index
                             // snapshot that may already be stale.
                             let mut manager = sync_manager.lock().await;
+                            // A dirty relay can contain a newly accepted root
+                            // or participant. Refresh the local inventory now;
+                            // the per-author retry deadlines still bound remote
+                            // NIP-65 queries when only repository state changed.
+                            manager.nip65_discovery.next_inventory_at = None;
                             manager
                                 .recompute_new_sync_filters_for_relay(&add_filters.relay_url)
                                 .await;
+                            manager.schedule_nip65_discovery().await;
                         }
                         None => break,
                     }
@@ -5157,7 +5453,7 @@ impl SyncManager {
     async fn schedule_nip65_discovery(&mut self) {
         // GRASP-03 is an optional overlay on the always-running GRASP-02
         // manager. When disabled, do not inventory authors, retain identity
-        // authority, open discovery connections, or add inbox roots.
+        // authority, open discovery connections, or add mailbox roots.
         if !self.config.sync_plus_enabled {
             return;
         }
@@ -5168,32 +5464,48 @@ impl SyncManager {
             .next_inventory_at
             .is_none_or(|due| due <= now)
         {
-            let candidates = self.root_candidate_index.read().await;
-            let repo_index = self.repo_sync_index.read().await;
-            let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
-            drop(candidates);
-            let mut author_roots: HashMap<PublicKey, HashSet<EventId>> = HashMap::new();
-            for root in roots {
-                author_roots.entry(root.author).or_default().insert(root.id);
-            }
-
             let announcements = self
                 .database
                 .query(Filter::new().kind(Kind::GitRepoAnnouncement))
                 .await
                 .unwrap_or_default();
+            let candidates = self.root_candidate_index.read().await;
+            let repo_index = self.repo_sync_index.read().await;
+            let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
             let mut eligible_authors =
                 discovery::accepted_repository_authors(announcements.iter(), &repo_index);
-            eligible_authors.extend(author_roots.keys().copied());
+            drop(candidates);
             drop(repo_index);
+            let root_ids: HashSet<EventId> = roots.iter().map(|root| root.id).collect();
+            self.nip65_discovery.root_repositories = roots
+                .iter()
+                .map(|root| (root.id, root.repository.clone()))
+                .collect();
+            self.nip65_discovery.root_author_roots =
+                discovery::mailbox_author_roots(&roots, std::iter::empty());
+
+            // A root may be absent from the author's write relays while a
+            // participant's reaction, zap or reply is present there. Carry
+            // root provenance through indirect event/address descendants so
+            // each mailbox probe stays scoped to accepted threads in which
+            // that author actually participated.
+            let frontier = recursive_descendant_frontier(
+                &self.database,
+                &root_ids,
+                self.config.sync_recursive_descendant_limit,
+            )
+            .await;
+            let participant_author_count = frontier.author_roots.len();
+            let author_roots = discovery::mailbox_author_roots(&roots, frontier.author_roots);
+            eligible_authors.extend(author_roots.keys().copied());
             self.nip65_discovery.author_roots = author_roots;
             self.nip65_discovery.eligible_authors = eligible_authors;
-            self.proactive_root_authors
+            self.proactive_participant_authors
                 .replace(self.nip65_discovery.eligible_authors.clone())
                 .await;
             let current_authors = self.nip65_discovery.eligible_authors.clone();
 
-            // Rebuild inbox ownership from already accepted local state before
+            // Rebuild mailbox ownership from already accepted local state before
             // attempting a network refresh. GRASP-03 retains kind 10002 so a
             // restart must not make conversation coverage depend on the index
             // source still being reachable.
@@ -5222,6 +5534,12 @@ impl SyncManager {
                     .relay_lists
                     .iter()
                     .map(|(author, event)| (*author, discovery::inbox_relays(event)))
+                    .collect();
+                self.nip65_discovery.author_mailboxes = self
+                    .nip65_discovery
+                    .relay_lists
+                    .iter()
+                    .map(|(author, event)| (*author, discovery::mailbox_relays(event)))
                     .collect();
             }
 
@@ -5264,6 +5582,9 @@ impl SyncManager {
             self.nip65_discovery
                 .author_inboxes
                 .retain(|author, _| current_authors.contains(author));
+            self.nip65_discovery
+                .author_mailboxes
+                .retain(|author, _| current_authors.contains(author));
             self.nip65_discovery.fallback_authors.retain(|author| {
                 current_authors.contains(author)
                     && !self.nip65_discovery.relay_lists.contains_key(author)
@@ -5277,13 +5598,29 @@ impl SyncManager {
                         .is_some_and(|sources| sources.contains(relay))
                 });
             self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
-            let overlay = discovery::build_inbox_root_overlay(
-                &self.nip65_discovery.author_roots,
+            let fallback_relays = self.configured_nip65_fallback_relays();
+            let inbox_overlay = discovery::build_inbox_root_overlay(
+                &self.nip65_discovery.root_author_roots,
                 &self.nip65_discovery.author_inboxes,
                 &self.nip65_discovery.fallback_authors,
-                &self.configured_nip65_fallback_relays(),
+                &fallback_relays,
             );
-            self.install_nip65_overlay(overlay).await;
+            let mailbox_overlay = discovery::build_inbox_root_overlay(
+                &self.nip65_discovery.author_roots,
+                &self.nip65_discovery.author_mailboxes,
+                &self.nip65_discovery.fallback_authors,
+                &fallback_relays,
+            );
+            self.install_nip65_inbox_overlay(inbox_overlay).await;
+            self.install_nip65_mailbox_overlay(mailbox_overlay);
+            tracing::info!(
+                root_count = root_ids.len(),
+                participant_author_count,
+                eligible_author_count = self.nip65_discovery.eligible_authors.len(),
+                mailbox_relay_count = self.nip65_discovery.mailbox_roots.len(),
+                fallback_authors = self.nip65_discovery.fallback_authors.len(),
+                "Reconciled proactive participant mailbox inventory"
+            );
         }
 
         // Discovery is deliberately single-flight. The immediate-capacity
@@ -5370,7 +5707,10 @@ impl SyncManager {
         }
     }
 
-    async fn install_nip65_overlay(&mut self, new_overlay: HashMap<String, HashSet<EventId>>) {
+    async fn install_nip65_inbox_overlay(
+        &mut self,
+        new_overlay: HashMap<String, HashSet<EventId>>,
+    ) {
         let old_overlay = std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_overlay);
         if old_overlay == self.nip65_discovery.inbox_roots {
             return;
@@ -5379,12 +5719,211 @@ impl SyncManager {
         dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
 
         for relay in dirty_relays {
-            // Desired ownership changes immediately, but existing descendant
-            // work retires only at its natural EOSE/CLOSED/disconnect or a
-            // later ordinary consolidation. Closing shared batches here can
-            // interrupt unrelated roots and churn otherwise healthy live REQs.
+            // Preserve the established root-author inbox behavior: additions
+            // enter ordinary live/rotating descendant coverage, while
+            // removal-only changes drain through that coverage's normal
+            // lifecycle instead of churning shared subscriptions.
             self.recompute_new_sync_filters_for_relay(&relay).await;
         }
+    }
+
+    fn install_nip65_mailbox_overlay(&mut self, new_overlay: HashMap<String, HashSet<EventId>>) {
+        self.nip65_discovery
+            .install_mailbox_overlay(new_overlay, Instant::now());
+    }
+
+    async fn schedule_mailbox_probe(&mut self) {
+        if !self.config.sync_plus_enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        let due_relays: Vec<String> = due_mailbox_relays(
+            &self.nip65_discovery.mailbox_roots,
+            &self.nip65_discovery.mailbox_probe_next_at,
+            now,
+        )
+        .into_iter()
+        .filter(|relay| {
+            !self
+                .nip65_discovery
+                .mailbox_probes_in_flight
+                .contains(relay)
+        })
+        .collect();
+        let active_relays: HashSet<String> = self
+            .relay_sync_index
+            .read()
+            .await
+            .iter()
+            .filter(|(_, state)| state.connection_status.is_live_sync_active())
+            .map(|(relay, _)| relay.clone())
+            .collect();
+        let Some(relay) = select_due_mailbox_relay(&due_relays, &active_relays) else {
+            return;
+        };
+        if is_own_sync_target(&relay, &self.service_domain)
+            || self.rejected_relay_targets.contains(&relay)
+        {
+            self.nip65_discovery
+                .mailbox_probe_next_at
+                .insert(relay, now + mailbox_probe_refresh_interval());
+            return;
+        }
+
+        if !self.connections.contains_key(&relay) {
+            if self.register_relay(relay.clone(), false, true).await {
+                self.schedule_connect_relay(&relay).await;
+            }
+            self.defer_mailbox_relay(&relay);
+            return;
+        }
+
+        let Some(connection) = self.connections.get(&relay).cloned() else {
+            self.defer_mailbox_relay(&relay);
+            return;
+        };
+        let socket_connected = connection.is_connected().await;
+        let connection_status = self
+            .relay_sync_index
+            .read()
+            .await
+            .get(&relay)
+            .map(|state| state.connection_status);
+        if !mailbox_probe_connection_ready(connection_status, socket_connected) {
+            if !socket_connected && self.health_tracker.should_attempt_connection(&relay) {
+                self.schedule_connect_relay(&relay).await;
+            } else if !socket_connected {
+                self.retire_idle_nip65_discovery_source(&relay).await;
+            }
+            self.defer_mailbox_relay(&relay);
+            return;
+        }
+
+        let roots = self.nip65_discovery.mailbox_roots[&relay].clone();
+        let repositories: HashSet<String> = roots
+            .iter()
+            .filter_map(|root| self.nip65_discovery.root_repositories.get(root).cloned())
+            .collect();
+        let frontier = recursive_descendant_frontier(
+            &self.database,
+            &roots,
+            self.config.sync_recursive_descendant_limit,
+        )
+        .await;
+        let mut filters = mailbox_probe_filters(&repositories, &roots, &frontier);
+        filters.sort_by_key(Filter::as_json);
+        let Some(filter_count) = (!filters.is_empty()).then_some(filters.len()) else {
+            self.nip65_discovery
+                .mailbox_probe_next_at
+                .insert(relay.clone(), now + mailbox_probe_refresh_interval());
+            self.retire_idle_nip65_discovery_source(&relay).await;
+            return;
+        };
+        let filter_index = self
+            .nip65_discovery
+            .mailbox_probe_next_filter
+            .get(&relay)
+            .copied()
+            .unwrap_or_default()
+            % filter_count;
+        let filter = filters.swap_remove(filter_index);
+        let Some(result_tx) = self.mailbox_probe_result_tx.clone() else {
+            self.defer_mailbox_relay(&relay);
+            return;
+        };
+        self.nip65_discovery
+            .mailbox_probes_in_flight
+            .insert(relay.clone());
+        let source_relay = relay.clone();
+        tokio::spawn(async move {
+            let outcome = fetch_mailbox_filter(connection, filter).await;
+            let _ = result_tx
+                .send(MailboxProbeResult {
+                    source_relay,
+                    filter_index,
+                    filter_count,
+                    outcome,
+                })
+                .await;
+        });
+        tracing::info!(
+            relay = %relay,
+            filter_index,
+            filter_count,
+            "Started bounded participant mailbox fetch"
+        );
+    }
+
+    fn defer_mailbox_relay(&mut self, relay: &str) {
+        if self.nip65_discovery.mailbox_roots.contains_key(relay) {
+            self.nip65_discovery.mailbox_probe_next_at.insert(
+                relay.to_string(),
+                Instant::now() + mailbox_probe_retry_interval(),
+            );
+        }
+    }
+
+    async fn handle_mailbox_probe_result(&mut self, result: MailboxProbeResult) {
+        if !self
+            .nip65_discovery
+            .mailbox_probes_in_flight
+            .remove(&result.source_relay)
+        {
+            tracing::debug!(
+                relay = %result.source_relay,
+                "Ignoring stale participant mailbox result"
+            );
+            return;
+        }
+
+        let (events, succeeded) = match result.outcome {
+            Ok(events) => (events, true),
+            Err(error) => {
+                tracing::debug!(relay = %result.source_relay, %error, "Participant mailbox fetch failed");
+                (Vec::new(), false)
+            }
+        };
+        let event_count = events.len();
+        for event in events {
+            let _ = Self::process_event_static(
+                &event,
+                &result.source_relay,
+                &self.database,
+                &self.write_policy,
+                &self.local_relay,
+                &self.rejected_events_index,
+                crate::nostr::persistence::SaveContext::RelaySync,
+            )
+            .await;
+        }
+
+        let (next_filter, completed_cycle, next_probe_in) =
+            mailbox_probe_completion(result.filter_index, result.filter_count, succeeded);
+        self.nip65_discovery
+            .mailbox_probe_next_filter
+            .insert(result.source_relay.clone(), next_filter);
+        if self
+            .nip65_discovery
+            .mailbox_roots
+            .contains_key(&result.source_relay)
+        {
+            self.nip65_discovery
+                .mailbox_probe_next_at
+                .insert(result.source_relay.clone(), Instant::now() + next_probe_in);
+        }
+        tracing::info!(
+            relay = %result.source_relay,
+            filter_index = result.filter_index,
+            filter_count = result.filter_count,
+            event_count,
+            succeeded,
+            completed_cycle,
+            next_probe_in_secs = next_probe_in.as_secs_f64(),
+            "Participant mailbox fetch reached terminal state"
+        );
+        self.retire_idle_nip65_discovery_source(&result.source_relay)
+            .await;
     }
 
     async fn handle_nip65_discovery_result(&mut self, result: Nip65DiscoveryResult) {
@@ -5469,6 +6008,9 @@ impl SyncManager {
                 self.nip65_discovery
                     .author_inboxes
                     .insert(author, discovery::inbox_relays(&candidate));
+                self.nip65_discovery
+                    .author_mailboxes
+                    .insert(author, discovery::mailbox_relays(&candidate));
                 let mut index_relays: HashSet<String> = self
                     .config
                     .parse_user_index_relays()
@@ -5503,19 +6045,27 @@ impl SyncManager {
             self.schedule_nip65_discovery().await;
             return;
         }
-        let overlay = discovery::build_inbox_root_overlay(
-            &self.nip65_discovery.author_roots,
+        let fallback_relays = self.configured_nip65_fallback_relays();
+        let inbox_overlay = discovery::build_inbox_root_overlay(
+            &self.nip65_discovery.root_author_roots,
             &self.nip65_discovery.author_inboxes,
             &self.nip65_discovery.fallback_authors,
-            &self.configured_nip65_fallback_relays(),
+            &fallback_relays,
         );
-        self.install_nip65_overlay(overlay).await;
+        let mailbox_overlay = discovery::build_inbox_root_overlay(
+            &self.nip65_discovery.author_roots,
+            &self.nip65_discovery.author_mailboxes,
+            &self.nip65_discovery.fallback_authors,
+            &fallback_relays,
+        );
+        self.install_nip65_inbox_overlay(inbox_overlay).await;
+        self.install_nip65_mailbox_overlay(mailbox_overlay);
         tracing::info!(
             source = %result.source_relay,
             authors = result.authors.len(),
-            inbox_relays = self.nip65_discovery.inbox_roots.len(),
+            mailbox_relays = self.nip65_discovery.mailbox_roots.len(),
             fallback_authors = self.nip65_discovery.fallback_authors.len(),
-            "Updated proactive inbox coverage from NIP-65"
+            "Updated proactive participant mailbox coverage from NIP-65"
         );
 
         self.retire_idle_nip65_discovery_source(&result.source_relay)
@@ -5532,26 +6082,36 @@ impl SyncManager {
             return;
         }
         let now = Instant::now();
-        let has_due_author = self
+        let has_author_work =
+            self.nip65_discovery
+                .author_sources
+                .iter()
+                .any(|(author, sources)| {
+                    sources.contains(source)
+                        && (self
+                            .nip65_discovery
+                            .in_flight
+                            .contains(&(source.to_string(), *author))
+                            || self
+                                .nip65_discovery
+                                .next_attempt_at
+                                .get(&(source.to_string(), *author))
+                                .is_none_or(|due| *due <= now))
+                });
+        let has_mailbox_work = self
             .nip65_discovery
-            .author_sources
-            .iter()
-            .any(|(author, sources)| {
-                sources.contains(source)
-                    && !self
-                        .nip65_discovery
-                        .in_flight
-                        .contains(&(source.to_string(), *author))
-                    && self
-                        .nip65_discovery
-                        .next_attempt_at
-                        .get(&(source.to_string(), *author))
-                        .is_none_or(|due| *due <= now)
-            });
-        if !has_due_author {
+            .mailbox_probes_in_flight
+            .contains(source)
+            || (self.nip65_discovery.mailbox_roots.contains_key(source)
+                && self
+                    .nip65_discovery
+                    .mailbox_probe_next_at
+                    .get(source)
+                    .is_none_or(|due| *due <= now));
+        if !has_author_work && !has_mailbox_work && !self.has_pending_batches(source).await {
             tracing::debug!(
                 relay = %source,
-                "Retiring idle NIP-65 discovery connection"
+                "Retiring idle NIP-65 control-plane connection"
             );
             self.disconnect_relay(source).await;
         }
@@ -5626,6 +6186,15 @@ impl SyncManager {
                 self.health_tracker.record_success(&result.relay_url);
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_connection_attempt(&result.relay_url, true);
+                }
+                if self
+                    .nip65_discovery
+                    .mailbox_roots
+                    .contains_key(&result.relay_url)
+                {
+                    self.nip65_discovery
+                        .mailbox_probe_next_at
+                        .insert(result.relay_url.clone(), Instant::now());
                 }
                 self.handle_connect_or_reconnect(&result.relay_url).await;
             }
@@ -8492,6 +9061,8 @@ mod tests {
     #[tokio::test]
     async fn descendant_frontier_recurses_through_event_and_coordinate_references() {
         let keys = Keys::generate();
+        let participant = Keys::generate();
+        let reactor = Keys::generate();
         let root = EventBuilder::new(Kind::GitIssue, "root")
             .finalize(&keys)
             .expect("build root");
@@ -8502,11 +9073,11 @@ mod tests {
         let coordinate = descendant_event_coordinate(&addressable).unwrap();
         let coordinate_child = EventBuilder::new(Kind::TextNote, "coordinate child")
             .tag(Tag::custom("a", [coordinate.clone()]))
-            .finalize(&keys)
+            .finalize(&participant)
             .expect("build coordinate child");
         let grandchild = EventBuilder::new(Kind::TextNote, "grandchild")
             .tag(Tag::event(coordinate_child.id))
-            .finalize(&keys)
+            .finalize(&reactor)
             .expect("build grandchild");
         let unrelated = EventBuilder::new(Kind::TextNote, "unrelated")
             .finalize(&keys)
@@ -8530,7 +9101,71 @@ mod tests {
             HashSet::from([addressable.id, coordinate_child.id, grandchild.id])
         );
         assert_eq!(frontier.coordinates, HashSet::from([coordinate]));
+        assert_eq!(
+            frontier.author_roots,
+            HashMap::from([
+                (keys.public_key(), HashSet::from([root.id])),
+                (participant.public_key(), HashSet::from([root.id])),
+                (reactor.public_key(), HashSet::from([root.id])),
+            ])
+        );
         assert!(!frontier.event_ids.contains(&unrelated.id));
+    }
+
+    #[tokio::test]
+    async fn descendant_frontier_preserves_exact_root_provenance() {
+        let owner = Keys::generate();
+        let first_participant = Keys::generate();
+        let second_participant = Keys::generate();
+        let shared_participant = Keys::generate();
+        let first_root = EventBuilder::new(Kind::GitIssue, "first root")
+            .finalize(&owner)
+            .expect("build first root");
+        let second_root = EventBuilder::new(Kind::GitIssue, "second root")
+            .finalize(&owner)
+            .expect("build second root");
+        let first_reply = EventBuilder::new(Kind::TextNote, "first reply")
+            .tag(Tag::event(first_root.id))
+            .finalize(&first_participant)
+            .expect("build first reply");
+        let second_reply = EventBuilder::new(Kind::TextNote, "second reply")
+            .tag(Tag::event(second_root.id))
+            .finalize(&second_participant)
+            .expect("build second reply");
+        let shared_reply = EventBuilder::new(Kind::TextNote, "shared reply")
+            .tags([Tag::event(first_reply.id), Tag::event(second_reply.id)])
+            .finalize(&shared_participant)
+            .expect("build shared reply");
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        for event in [
+            &first_root,
+            &second_root,
+            &first_reply,
+            &second_reply,
+            &shared_reply,
+        ] {
+            database.save_event(event).await.expect("save test event");
+        }
+
+        let frontier = recursive_descendant_frontier(
+            &database,
+            &HashSet::from([first_root.id, second_root.id]),
+            500,
+        )
+        .await;
+
+        assert_eq!(
+            frontier.author_roots[&first_participant.public_key()],
+            HashSet::from([first_root.id])
+        );
+        assert_eq!(
+            frontier.author_roots[&second_participant.public_key()],
+            HashSet::from([second_root.id])
+        );
+        assert_eq!(
+            frontier.author_roots[&shared_participant.public_key()],
+            HashSet::from([first_root.id, second_root.id])
+        );
     }
 
     #[tokio::test]
@@ -8636,6 +9271,7 @@ mod tests {
         let frontier = DescendantFrontier {
             event_ids: HashSet::from([EventId::from_byte_array([7; 32])]),
             coordinates: HashSet::from([format!("30023:{}:article", "a".repeat(64))]),
+            ..DescendantFrontier::default()
         };
         let filters = descendant_frontier_filters(&frontier, Some(since));
 
@@ -8658,6 +9294,138 @@ mod tests {
             2,
             "event IDs and coordinates each require quote coverage"
         );
+    }
+
+    #[test]
+    fn mailbox_probe_filters_cover_repository_roots_and_descendants() {
+        let root = EventId::from_byte_array([21; 32]);
+        let descendant = EventId::from_byte_array([22; 32]);
+        let repository = "30617:owner:repo".to_string();
+        let coordinate = "30023:participant:thread".to_string();
+        let frontier = DescendantFrontier {
+            event_ids: HashSet::from([descendant]),
+            coordinates: HashSet::from([coordinate.clone()]),
+            ..Default::default()
+        };
+
+        let filters = mailbox_probe_filters(
+            &HashSet::from([repository.clone()]),
+            &HashSet::from([root]),
+            &frontier,
+        );
+        let serialized = filters.iter().map(Filter::as_json).collect::<Vec<_>>();
+
+        assert_eq!(filters.len(), 6, "a/A/q and e/E/q must be probed");
+        for value in [repository, coordinate, root.to_hex(), descendant.to_hex()] {
+            assert!(serialized.iter().any(|filter| filter.contains(&value)));
+        }
+    }
+
+    #[test]
+    fn mailbox_probe_order_prioritizes_longest_waiting_due_source() {
+        let now = Instant::now();
+        let root = EventId::from_byte_array([23; 32]);
+        let roots = HashMap::from([
+            ("wss://old.example".to_string(), HashSet::from([root])),
+            (
+                "wss://large.example".to_string(),
+                HashSet::from([
+                    root,
+                    EventId::from_byte_array([24; 32]),
+                    EventId::from_byte_array([25; 32]),
+                ]),
+            ),
+            ("wss://future.example".to_string(), HashSet::from([root])),
+        ]);
+        let next_at = HashMap::from([
+            (
+                "wss://old.example".to_string(),
+                now - Duration::from_secs(10),
+            ),
+            (
+                "wss://large.example".to_string(),
+                now - Duration::from_secs(1),
+            ),
+            (
+                "wss://future.example".to_string(),
+                now + Duration::from_secs(1),
+            ),
+        ]);
+
+        assert_eq!(
+            due_mailbox_relays(&roots, &next_at, now),
+            vec![
+                "wss://old.example".to_string(),
+                "wss://large.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mailbox_probe_waits_for_committed_connection_lifecycle() {
+        assert!(!mailbox_probe_connection_ready(
+            Some(ConnectionStatus::Connecting),
+            true,
+        ));
+        assert!(mailbox_probe_connection_ready(
+            Some(ConnectionStatus::Syncing),
+            true,
+        ));
+        assert!(!mailbox_probe_connection_ready(
+            Some(ConnectionStatus::Connected),
+            false,
+        ));
+    }
+
+    #[test]
+    fn mailbox_probe_prefers_ready_relay_over_older_unavailable_relay() {
+        let unavailable = "wss://unavailable.example".to_string();
+        let ready = "wss://ready.example".to_string();
+        let due = vec![unavailable.clone(), ready.clone()];
+
+        assert_eq!(
+            select_due_mailbox_relay(&due, &HashSet::from([ready.clone()])),
+            Some(ready),
+        );
+        assert_eq!(
+            select_due_mailbox_relay(&due, &HashSet::new()),
+            Some(unavailable),
+        );
+    }
+
+    #[test]
+    fn mailbox_cursor_survives_inventory_growth_and_retires_with_source() {
+        let relay = "wss://mailbox.example".to_string();
+        let first_root = EventId::from_byte_array([31; 32]);
+        let second_root = EventId::from_byte_array([32; 32]);
+        let mut discovery = Nip65DiscoveryState::default();
+        discovery
+            .mailbox_roots
+            .insert(relay.clone(), HashSet::from([first_root]));
+        discovery.mailbox_probe_next_filter.insert(relay.clone(), 3);
+
+        discovery.install_mailbox_overlay(
+            HashMap::from([(relay.clone(), HashSet::from([first_root, second_root]))]),
+            Instant::now(),
+        );
+        assert_eq!(discovery.mailbox_probe_next_filter[&relay], 3);
+
+        discovery.install_mailbox_overlay(HashMap::new(), Instant::now());
+        assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
+        assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
+    }
+
+    #[test]
+    fn mailbox_completion_advances_after_failure_without_ending_cycle() {
+        let (next_filter, completed_cycle, retry_after) = mailbox_probe_completion(0, 2, false);
+        assert_eq!(next_filter, 1);
+        assert!(!completed_cycle);
+        assert_eq!(retry_after, mailbox_probe_retry_interval());
+
+        let (next_filter, completed_cycle, refresh_after) = mailbox_probe_completion(1, 2, true);
+        assert_eq!(next_filter, 0);
+        assert!(completed_cycle);
+        assert_eq!(refresh_after, mailbox_probe_refresh_interval());
     }
 
     #[test]
@@ -8694,6 +9462,7 @@ mod tests {
         let frontier = DescendantFrontier {
             event_ids: HashSet::from([member]),
             coordinates: HashSet::new(),
+            ..DescendantFrontier::default()
         };
         let now = Timestamp::from_secs(200_000);
         let mut rotation = DescendantSyncRotation::default();
@@ -8786,6 +9555,7 @@ mod tests {
         let frontier = DescendantFrontier {
             event_ids: HashSet::from([descendant]),
             coordinates: HashSet::from(["1621:author:patch".to_string()]),
+            ..DescendantFrontier::default()
         };
 
         let packed = packed_historic_filters(&items, &frontier);
@@ -8816,6 +9586,7 @@ mod tests {
             &DescendantFrontier {
                 event_ids: members,
                 coordinates: HashSet::new(),
+                ..DescendantFrontier::default()
             },
             None,
         );
