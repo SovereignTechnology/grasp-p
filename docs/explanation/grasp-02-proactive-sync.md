@@ -800,12 +800,13 @@ live in
 - **Function**: `build_root_event_tag_filters(root_events, since)`
 - **Only for `SyncLevel::Full` repos** — purgatory announcements (`StateOnly`) skip this layer
 
-### Direct-Member Descendants
+### Recursive Descendant Frontier
 
 Some collaboration events reference only their immediate parent. Once the
 ordinary Layer 3 filters have discovered an event which directly tags a
-repository root, each source relay is also queried for events whose `e`, `E`,
-or `q` tags reference that direct member.
+repository root, the accepted local graph is traversed through `e`, `E`, `q`,
+`a`, and `A` references. Each source relay is queried for events that reference
+every known member, not only the original root or its direct children.
 
 - complete descendant filters are retained live when they fit after core live
   coverage while preserving the two control-plane slots and at least one
@@ -816,20 +817,34 @@ or `q` tags reference that direct member.
   each constrained relay on the existing five-second maintenance cadence,
   through the ordinary historic queue, pagination, shared ledger, and request
   pacing;
-- ordinary historic batches include the currently known direct-member filters;
+- ordinary historic batches include the complete currently known frontier;
 - fallback filters keep an in-memory cursor, advance it only after successful
   EOSE, and query from the preceding successful upper bound with 15 minutes of
-  overlap; and
-- recovered descendants never enter the frontier, so this is deliberately one
-  additional generation rather than recursive thread traversal.
+  overlap;
+- an event recovered from a source relay is accepted into the ordinary local
+  database, then becomes a parent seed on the next five-second reconciliation
+  tick; and
+- each event which directly tags a repository root owns an independent
+  recursive subtree allowance, configured by
+  `NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT` and defaulting to 500. The direct
+  event itself is unmetered. Once its deterministic breadth-first frontier
+  fills, every member of that branch is removed from future child-query seeds;
+  unrelated direct events continue with their own allowances;
+- already active requests can store events beyond the configured number, but
+  those events do not extend a full branch. Accepting this soft overshoot avoids
+  receive-path accounting and leaves source-relay connections independent; and
+- startup and periodic reconciliation rebuild branch membership in stable
+  breadth-first creation-time/event-ID order from the local database. A branch
+  already full after restart therefore issues no further child queries and
+  does not receive a fresh allowance.
 
 An unexpected auxiliary CLOSED retires the remaining descendant subscriptions
 without rebuilding core coverage and falls back to history. A filter already
 queued or active blocks another fallback filter for that relay; failure leaves
 the same filter and cursor at the head. Reconnect and daily reconciliation
-reconstruct the mode from current session capacity. This keeps the feature
-complete without durable cursors, another capacity ledger, request-class
-priority, or multi-connection sharding.
+reconstruct the mode from current session capacity. The local database is the
+frontier checkpoint, so recursion needs no additional durable cursor, capacity
+coordinator, request-class priority, or multi-connection sharding.
 
 ### Combined Layer 2+3 (SyncLevel-Aware)
 

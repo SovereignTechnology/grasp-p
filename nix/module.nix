@@ -151,6 +151,16 @@ let
         '';
       };
 
+      syncRecursiveDescendantLimit = mkOption {
+        type = types.ints.positive;
+        default = 500;
+        description = ''
+          Soft limit on recursive query-frontier members below each event
+          which directly tags a repository root. Direct root-tagging events
+          do not consume the limit.
+        '';
+      };
+
       databaseBackend = mkOption {
         type = types.enum [ "lmdb" "memory" ];
         default = "lmdb";
@@ -524,6 +534,8 @@ let
       NGIT_METRICS_TOP_N_REPOS = toString cfg.metricsTopNRepos;
       NGIT_SYNC_MAX_BACKOFF_SECS = toString cfg.syncMaxBackoffSecs;
       NGIT_SYNC_PLUS_ENABLED = if cfg.syncPlusEnabled then "true" else "false";
+      NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT =
+        toString cfg.syncRecursiveDescendantLimit;
       NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS =
         toString cfg.syncDisconnectCheckIntervalSecs;
       NGIT_SYNC_BASE_BACKOFF_SECS = toString cfg.syncBaseBackoffSecs;
