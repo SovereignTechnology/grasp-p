@@ -670,11 +670,9 @@ impl SelfSubscriber {
         // state, avoiding an O(all repositories × all relays) rebuild for
         // every historic batch.
         for relay_url in dirty_relays {
-            // Skip our own relay URL (we're subscribed to ourselves via self-subscription)
-            if relay_url.contains(&self.relay_domain) {
-                continue;
-            }
-
+            // Keep our own relay's dirty signal: SyncManager rejects it as a
+            // sync target, but uses the signal to refresh participant mailbox
+            // inventory after a newly accepted local root arrives.
             let action = AddFilters {
                 relay_url: relay_url.clone(),
                 items: crate::sync::PendingItems::default(),

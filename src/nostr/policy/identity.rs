@@ -1,4 +1,4 @@
-//! Narrow GRASP-03 identity admission for accepted root authors.
+//! Narrow GRASP-03 identity admission for accepted repository participants.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use nostr_sdk::prelude::{Event, Kind, PublicKey};
 use tokio::sync::RwLock;
 
-pub type SharedProactiveRootAuthorIndex = Arc<ProactiveRootAuthorIndex>;
+pub type SharedProactiveParticipantAuthorIndex = Arc<ProactiveParticipantAuthorIndex>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityAdmission {
@@ -15,15 +15,15 @@ pub enum IdentityAdmission {
     NotIdentity,
 }
 
-/// Derived admission set. Accepted repository roots remain authoritative; an
-/// identity event can never add its own author here.
+/// Derived admission set. Accepted repository threads remain authoritative;
+/// an identity event can never add its own author here.
 #[derive(Debug, Default)]
-pub struct ProactiveRootAuthorIndex {
+pub struct ProactiveParticipantAuthorIndex {
     authors: RwLock<HashSet<PublicKey>>,
 }
 
-impl ProactiveRootAuthorIndex {
-    pub fn shared() -> SharedProactiveRootAuthorIndex {
+impl ProactiveParticipantAuthorIndex {
+    pub fn shared() -> SharedProactiveParticipantAuthorIndex {
         Arc::new(Self::default())
     }
 
@@ -52,7 +52,7 @@ mod tests {
     async fn identity_cannot_make_its_own_author_relevant() {
         let author = Keys::generate();
         let other = Keys::generate();
-        let index = ProactiveRootAuthorIndex::shared();
+        let index = ProactiveParticipantAuthorIndex::shared();
         let metadata = EventBuilder::new(Kind::Metadata, "{}")
             .finalize(&author)
             .unwrap();
