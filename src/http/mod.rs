@@ -3,6 +3,7 @@
 //! Provides hyper HTTP server with WebSocket upgrade support for the Nostr relay.
 mod client_ip;
 pub mod landing;
+pub mod nip05;
 pub mod nip11;
 
 use std::future::Future;
@@ -190,6 +191,43 @@ impl Service<Request<Incoming>> for HttpService {
                         .body(empty_body())
                         .unwrap(),
                 )
+            });
+        }
+
+        // NIP-05 root identity: `_@domain` resolves to the relay operator's
+        // public key. This exact-path route must remain ahead of generic NIP-11
+        // content negotiation so clients receive the well-known document even
+        // if they send a broad or unusual Accept header.
+        if path == "/.well-known/nostr.json" && (method == Method::GET || method == Method::HEAD) {
+            let method = method.clone();
+            let document = nip05::Nip05Document::from_config(&self.config);
+
+            return Box::pin(async move {
+                match document.and_then(|document| document.to_json()) {
+                    Ok(json) => {
+                        let body = if method == Method::HEAD {
+                            empty_body()
+                        } else {
+                            full_body(json)
+                        };
+                        Ok(
+                            add_cors_headers(Response::builder().header("server", "ngit-grasp"))
+                                .status(200)
+                                .header("content-type", "application/json; charset=utf-8")
+                                .body(body)
+                                .unwrap(),
+                        )
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Failed to build NIP-05 root identity document");
+                        Ok(
+                            add_cors_headers(Response::builder().header("server", "ngit-grasp"))
+                                .status(500)
+                                .body(full_body("Failed to build NIP-05 document"))
+                                .unwrap(),
+                        )
+                    }
+                }
             });
         }
 
@@ -644,7 +682,7 @@ impl Service<Request<Incoming>> for HttpService {
                 .map(|s| s.contains("application/nostr+json"))
                 .unwrap_or(false)
             {
-                let doc = nip11::RelayInformationDocument::from_config(&self.config);
+                let doc = nip11::RelayInformationDocument::from_config_at_path(&self.config, &path);
                 let json = doc.to_json().unwrap_or_else(|e| {
                     tracing::error!("Failed to serialize NIP-11 document: {}", e);
                     "{}".to_string()

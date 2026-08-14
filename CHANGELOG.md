@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Serve the relay owner's public key as the NIP-05 `_@domain` identity from
+  `/.well-known/nostr.json`. NIP-11 advertises NIP-05 only when requested at
+  the domain root (`/`); relays mounted below a path do not claim support.
 - Add fixed-cardinality aggregate metrics for important long-lived sync state
   and document the producer, cleanup owner, bound, and terminal behavior of
   every peer-influenced transient subsystem.

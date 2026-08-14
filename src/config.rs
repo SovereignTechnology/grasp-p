@@ -328,6 +328,7 @@ pub struct Config {
     /// Relay operator's nsec (private key) for signing and authentication.
     ///
     /// Used for:
+    /// - NIP-05 `_@domain` well-known identity when served at the domain root
     /// - NIP-11 relay information document (pubkey field derived from this nsec)
     /// - NIP-42 authentication when syncing from other relays
     /// - Future: signing events, WoT-based rate limiting of syncing relays
