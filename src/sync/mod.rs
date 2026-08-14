@@ -1883,6 +1883,25 @@ impl Nip65DiscoveryState {
             }
         }
     }
+
+    fn record_probe_completion(
+        &mut self,
+        relay: &str,
+        next_filter: usize,
+        next_probe_in: Duration,
+        now: Instant,
+    ) {
+        // A relay removed from the overlay while its probe was in flight must
+        // not leave orphan cursor or due-time entries; re-addition is reseeded
+        // by `install_mailbox_overlay`.
+        if !self.mailbox_roots.contains_key(relay) {
+            return;
+        }
+        self.mailbox_probe_next_filter
+            .insert(relay.to_string(), next_filter);
+        self.mailbox_probe_next_at
+            .insert(relay.to_string(), now + next_probe_in);
+    }
 }
 
 /// Quick reconnect window in seconds (15 minutes)
@@ -5900,18 +5919,12 @@ impl SyncManager {
 
         let (next_filter, completed_cycle, next_probe_in) =
             mailbox_probe_completion(result.filter_index, result.filter_count, succeeded);
-        self.nip65_discovery
-            .mailbox_probe_next_filter
-            .insert(result.source_relay.clone(), next_filter);
-        if self
-            .nip65_discovery
-            .mailbox_roots
-            .contains_key(&result.source_relay)
-        {
-            self.nip65_discovery
-                .mailbox_probe_next_at
-                .insert(result.source_relay.clone(), Instant::now() + next_probe_in);
-        }
+        self.nip65_discovery.record_probe_completion(
+            &result.source_relay,
+            next_filter,
+            next_probe_in,
+            Instant::now(),
+        );
         tracing::info!(
             relay = %result.source_relay,
             filter_index = result.filter_index,
@@ -9411,6 +9424,29 @@ mod tests {
         assert_eq!(discovery.mailbox_probe_next_filter[&relay], 3);
 
         discovery.install_mailbox_overlay(HashMap::new(), Instant::now());
+        assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
+        assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
+    }
+
+    #[test]
+    fn mailbox_completion_for_removed_relay_leaves_no_cursor_state() {
+        let relay = "wss://mailbox.example".to_string();
+        let root = EventId::from_byte_array([33; 32]);
+        let now = Instant::now();
+        let mut discovery = Nip65DiscoveryState::default();
+        discovery
+            .mailbox_roots
+            .insert(relay.clone(), HashSet::from([root]));
+
+        discovery.record_probe_completion(&relay, 1, Duration::from_secs(60), now);
+        assert_eq!(discovery.mailbox_probe_next_filter[&relay], 1);
+        assert_eq!(
+            discovery.mailbox_probe_next_at[&relay],
+            now + Duration::from_secs(60)
+        );
+
+        discovery.install_mailbox_overlay(HashMap::new(), now);
+        discovery.record_probe_completion(&relay, 2, Duration::from_secs(60), now);
         assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
         assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
     }
