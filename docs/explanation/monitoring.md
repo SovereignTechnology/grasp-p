@@ -121,6 +121,7 @@ When GRASP-02 proactive sync is implemented, the following metrics will be added
 | `ngit_sync_policy_refusals_total` | Counter | relay, category | Subscription policy refusals using bounded categories; raw reasons remain in logs |
 | `ngit_sync_relay_failures` | Gauge | relay | Current consecutive failure count |
 | `ngit_sync_events_synced_total` | Counter | - | Events synced (newly saved events only) |
+| `ngit_sync_hydration_events_total` | Counter | relay, phase, outcome | Remote hydration requests, deliveries, and bounded persistence/admission outcomes; phase is `stream` or `recovery` |
 | `ngit_sync_relays_tracked_total` | Gauge | - | Total relays discovered |
 | `ngit_sync_relays_connected_total` | Gauge | - | Currently connected relay count |
 | `ngit_sync_relays_dead_total` | Gauge | - | Relays marked as dead |
@@ -180,6 +181,14 @@ sum(rate(ngit_sync_connection_attempts_total{result="success"}[1h]))
 
 # Event sync rate (newly saved events)
 rate(ngit_sync_events_synced_total[5m])
+
+# Exact-ID responses that a source did not deliver
+sum by (relay) (rate(ngit_sync_hydration_events_total{phase="recovery",outcome="not_delivered"}[15m]))
+
+# Delivered events that were not made servable
+sum by (relay, outcome) (
+  rate(ngit_sync_hydration_events_total{outcome=~"purgatory|rejected_.*|persistence_error"}[15m])
+)
 
 # Relays with high failure counts (potential issues)
 topk(10, ngit_sync_relay_failures)

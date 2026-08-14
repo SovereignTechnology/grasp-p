@@ -898,9 +898,12 @@ maintenance timer:
   (30s base doubling up to 15min; sub-second in `NGIT_TEST`), one in-flight
   attempt per relay, at most 300 IDs per fetch. One persistently incomplete
   relay cannot starve other relays or later batches.
-- **Progress-aware**: a successful attempt clears only the IDs actually
-  recovered and resets the backoff; duplicate incomplete responses merge into
-  the existing pending set. IDs that arrive by other means (live sync, user
+- **Outcome-aware**: a successful attempt clears only IDs with a durable
+  terminal explanation: saved, already stored, in purgatory, validly
+  tombstoned, blocked, or permanently invalid. Restricted, policy-error,
+  unknown, and persistence-error outcomes remain pending because a dependency
+  or transient fault may clear. Duplicate incomplete responses merge into the
+  existing pending set. IDs that arrive by other means (live sync, user
   submission) are cleared on the next tick without consuming attempt budget.
 - **Explicit expiry**: after 12 consecutive zero-progress attempts the relay's
   pending IDs are dropped with a warning, and the relay stays in
@@ -1182,6 +1185,10 @@ The [`SyncMetrics`](src/sync/metrics.rs:18) module provides comprehensive monito
 ### Event Metrics
 
 - `ngit_sync_events_synced_total`: Total events synced (newly saved events only, not duplicates or rejected)
+- `ngit_sync_hydration_events_total{relay,phase,outcome}`: Remote hydration
+  work by fixed phase and outcome. Outcomes distinguish requests, deliveries, source
+  non-delivery, saved/duplicate/purgatory/tombstone states, bounded policy
+  rejection classes, and persistence failures.
 
 ### Summary Metrics
 

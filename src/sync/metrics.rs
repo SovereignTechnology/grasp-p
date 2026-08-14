@@ -34,6 +34,8 @@ pub struct SyncMetrics {
     // === Event metrics ===
     /// Total events synced (newly saved events only)
     events_synced_total: IntCounter,
+    /// Historic/live hydration deliveries and terminal processing outcomes.
+    hydration_events_total: IntCounterVec,
 
     // === Summary metrics ===
     /// Total relays discovered and tracked
@@ -126,6 +128,15 @@ impl SyncMetrics {
             "Total events synced (newly saved events only)",
         ))?;
         registry.register(Box::new(events_synced_total.clone()))?;
+
+        let hydration_events_total = IntCounterVec::new(
+            Opts::new(
+                "ngit_sync_hydration_events_total",
+                "Hydration events by relay, phase, and bounded delivery or persistence outcome",
+            ),
+            &["relay", "phase", "outcome"],
+        )?;
+        registry.register(Box::new(hydration_events_total.clone()))?;
 
         // Summary metrics
         let relays_tracked_total = IntGauge::with_opts(Opts::new(
@@ -236,6 +247,7 @@ impl SyncMetrics {
             relay_failures,
             policy_refusals_total,
             events_synced_total,
+            hydration_events_total,
             relays_tracked_total,
             relays_connected_total,
             relays_dead_total,
@@ -400,6 +412,18 @@ impl SyncMetrics {
     /// Duplicates and rejected events are not counted.
     pub fn record_synced_event(&self) {
         self.events_synced_total.inc();
+    }
+
+    /// Record hydration work using a fixed outcome vocabulary supplied by the
+    /// sync manager. `count` allows exact-ID attempts to account for a batch
+    /// without performing one Prometheus update per absent response.
+    pub fn record_hydration_events(&self, relay: &str, phase: &str, outcome: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.hydration_events_total
+            .with_label_values(&[relay, phase, outcome])
+            .inc_by(count as u64);
     }
 
     // === Summary Recording Methods ===
@@ -643,6 +667,25 @@ mod tests {
         metrics.record_synced_event();
         metrics.record_synced_event();
         metrics.record_synced_event();
+
+        metrics.record_hydration_events("wss://relay.example", "recovery", "requested", 3);
+        metrics.record_hydration_events("wss://relay.example", "recovery", "saved", 2);
+        metrics.record_hydration_events("wss://relay.example", "recovery", "not_delivered", 1);
+
+        let hydration = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "ngit_sync_hydration_events_total")
+            .expect("hydration outcome metric must be exported");
+        assert_eq!(hydration.get_metric().len(), 3);
+        assert_eq!(
+            hydration
+                .get_metric()
+                .iter()
+                .map(|metric| metric.get_counter().value() as u64)
+                .sum::<u64>(),
+            6
+        );
     }
 
     #[test]
