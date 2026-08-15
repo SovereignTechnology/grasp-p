@@ -201,6 +201,30 @@ repositories it mirrors. Only relays advertising `GRASP-08` in their NIP-11
 `supported_grasps` mint derived members; configured `NGIT_PRIVATE_MEMBERS`
 are unaffected.
 
+## Disclosure and outside contributions
+
+Teams running a private service still receive security reports (CVEs,
+vulnerability disclosures) from people outside the member set. GRASP-08 keeps
+that path open without weakening the access boundary:
+
+- **Finding the contact**: the service's existence and operator identity are
+  deliberately public. The security contact is discoverable through the
+  NIP-11 `contact` field and the NIP-05 root identity (`_@domain`), both
+  served unauthenticated.
+- **Sending a report**: reports arrive as NIP-17 encrypted direct messages on
+  the maintainers' public mailbox relays. Nothing about a private repository
+  needs to be readable for a reporter to reach its maintainers privately.
+- **Granting collaboration access**: when a report leads to joint work, the
+  operator adds the reporter to `NGIT_PRIVATE_MEMBERS`. Membership grants
+  read access to the whole trust domain (see "Why membership is
+  service-wide"), which is the intended granularity: triaging a
+  vulnerability together means trusting the reporter with the codebase.
+- **No non-member submission lane**: a dedicated unauthenticated inbox for
+  outside patches or PR events is deliberately not implemented. It would
+  reopen exactly the unauthenticated write surface GRASP-08 exists to close —
+  the same reasoning that makes private mode refuse to combine with
+  GRASP-06.
+
 ## Follow-up scope
 
 Deliberately excluded from the initial single-service implementation:
