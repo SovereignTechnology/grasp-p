@@ -5332,11 +5332,20 @@ impl SyncManager {
                 }
             }
 
-            // Get relay owner keys for NIP-42 authentication
-            let keys = self
-                .config
-                .relay_owner_keys()
-                .expect("relay_owner_keys should be available");
+            // The relay owner key answers outbound NIP-42 challenges. Sync
+            // must keep working without it, so a missing key degrades to an
+            // unauthenticated connection instead of aborting registration.
+            let keys = match self.config.relay_owner_keys() {
+                Ok(keys) => Some(keys),
+                Err(error) => {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        error = %error,
+                        "Relay owner key unavailable; outbound NIP-42 authentication disabled for this connection"
+                    );
+                    None
+                }
+            };
 
             let connection = RelayConnection::new_with_database(
                 relay_url.clone(),
@@ -7852,11 +7861,17 @@ impl SyncManager {
                 );
                 return;
             }
-            if reserve_authentication_retry(
-                &mut self.auth_required_attempts,
-                relay_url,
-                &subscription_id,
-            ) {
+            // A retry is only worth reserving when the SDK will actually
+            // answer the challenge and resubscribe; without an authenticator
+            // the subscription is already gone and a reserved retry would
+            // dangle until disconnect cleanup.
+            if connection.answers_auth_challenges()
+                && reserve_authentication_retry(
+                    &mut self.auth_required_attempts,
+                    relay_url,
+                    &subscription_id,
+                )
+            {
                 tracing::info!(
                     relay = %relay_url,
                     sub_id = %subscription_id,

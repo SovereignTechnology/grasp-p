@@ -229,6 +229,26 @@ impl TestRelay {
         .await
     }
 
+    /// Start a syncing relay on a caller-reserved port with user-index
+    /// identity publication disabled. See
+    /// [`Self::start_with_sync_without_user_index`] and
+    /// [`Self::start_on_reservation_with_options`] for the two concerns
+    /// this combines.
+    pub async fn start_on_reservation_with_sync_without_user_index(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                user_index_relays: Some(String::new()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a syncing relay with a caller-chosen relay-owner identity.
     ///
     /// Lets tests stage owner-signed events on other relays before this

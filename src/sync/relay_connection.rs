@@ -588,6 +588,10 @@ pub struct RelayConnection {
     policy: OutboundTargetPolicy,
     /// The underlying nostr-sdk client
     client: Client,
+    /// Whether a NIP-42 authenticator was attached to the client. Without
+    /// one the SDK never answers AUTH challenges and never retains
+    /// auth-refused subscriptions for a post-authentication retry.
+    has_authenticator: bool,
     /// Local database for negentropy comparison (used for NIP-77 sync)
     database: Option<SharedDatabase>,
     /// Whether we've logged NIP-77 not supported for this relay (log once)
@@ -712,24 +716,29 @@ impl RelayConnection {
     ///
     /// # Arguments
     /// * `url` - The relay URL to connect to (with or without scheme, e.g., "relay.example.com" or "wss://relay.example.com")
-    /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
+    /// * `keys` - Keys for answering NIP-42 challenges (typically the relay
+    ///   operator's keys); `None` disables outbound authentication entirely
     /// * `source` - Whether the URL is operator-configured or event-directed
     /// * `policy` - Outbound target policy enforced before event-directed dials
     pub fn new(
         url: String,
-        keys: Keys,
+        keys: Option<Keys>,
         source: RelayTargetSource,
         policy: OutboundTargetPolicy,
     ) -> Self {
         let normalized_url = Self::normalize_url(&url);
-        let client = Client::builder()
-            .authenticator(SignerAuthenticator::new(keys))
-            .build();
+        let has_authenticator = keys.is_some();
+        let mut builder = Client::builder();
+        if let Some(keys) = keys {
+            builder = builder.authenticator(SignerAuthenticator::new(keys));
+        }
+        let client = builder.build();
         Self {
             url: normalized_url,
             source,
             policy,
             client,
+            has_authenticator,
             database: None,
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -778,25 +787,30 @@ impl RelayConnection {
     /// # Arguments
     /// * `url` - The relay URL to connect to (with or without scheme, e.g., "relay.example.com" or "wss://relay.example.com")
     /// * `database` - Shared database for local event comparison during negentropy sync
-    /// * `keys` - Cryptographic keys for NIP-42 authentication (typically the relay operator's keys)
+    /// * `keys` - Keys for answering NIP-42 challenges (typically the relay
+    ///   operator's keys); `None` disables outbound authentication entirely
     /// * `source` - Whether the URL is operator-configured or event-directed
     /// * `policy` - Outbound target policy enforced before event-directed dials
     pub fn new_with_database(
         url: String,
         database: SharedDatabase,
-        keys: Keys,
+        keys: Option<Keys>,
         source: RelayTargetSource,
         policy: OutboundTargetPolicy,
     ) -> Self {
         let normalized_url = Self::normalize_url(&url);
-        let client = Client::builder()
-            .authenticator(SignerAuthenticator::new(keys))
-            .build();
+        let has_authenticator = keys.is_some();
+        let mut builder = Client::builder();
+        if let Some(keys) = keys {
+            builder = builder.authenticator(SignerAuthenticator::new(keys));
+        }
+        let client = builder.build();
         Self {
             url: normalized_url,
             source,
             policy,
             client,
+            has_authenticator,
             database: Some(database),
             nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -1700,7 +1714,13 @@ impl RelayConnection {
                             message,
                         } => {
                             let subscription_id = subscription_id.into_owned();
-                            if !is_auth_required_message(&message) {
+                            // An auth-required CLOSED is only a retry signal
+                            // when an authenticator can actually answer the
+                            // challenge; otherwise it is terminal like any
+                            // other CLOSED.
+                            if !terminal_connection.has_authenticator
+                                || !is_auth_required_message(&message)
+                            {
                                 terminal_connection
                                     .retire_peer_closed_subscription(&subscription_id)
                                     .await;
@@ -1801,19 +1821,22 @@ impl RelayConnection {
                         // this processor-facing path retains live restoration.
                         let subscription_id = subscription_id.into_owned();
                         // rust-nostr needs the same subscription and ledger
-                        // slot alive while it answers a first NIP-42 challenge.
-                        let released_live = if is_auth_required_message(&msg) {
-                            self.live_req_permits_held
-                                .lock()
-                                .expect("live permit map poisoned")
-                                .get(&subscription_id)
-                                .map(|held| ReleasedLiveSubscription {
-                                    generation: held.generation,
-                                    filter_count: held.filters.len(),
-                                })
-                        } else {
-                            self.release_live_req_permit(&subscription_id)
-                        };
+                        // slot alive while it answers a first NIP-42
+                        // challenge. Without an authenticator there is no
+                        // challenge to answer, so release like any CLOSED.
+                        let released_live =
+                            if self.has_authenticator && is_auth_required_message(&msg) {
+                                self.live_req_permits_held
+                                    .lock()
+                                    .expect("live permit map poisoned")
+                                    .get(&subscription_id)
+                                    .map(|held| ReleasedLiveSubscription {
+                                        generation: held.generation,
+                                        filter_count: held.filters.len(),
+                                    })
+                            } else {
+                                self.release_live_req_permit(&subscription_id)
+                            };
                         if is_query_rate_limit_message(&msg) {
                             self.record_query_rate_limit();
                         }
@@ -2209,6 +2232,15 @@ impl RelayConnection {
     /// Get the relay URL
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Whether this connection can answer NIP-42 AUTH challenges.
+    ///
+    /// Without an authenticator the SDK removes auth-refused subscriptions
+    /// instead of retaining them, so no post-authentication retry can ever
+    /// happen and callers must treat auth-required CLOSED as terminal.
+    pub fn answers_auth_challenges(&self) -> bool {
+        self.has_authenticator
     }
 
     /// Get the number of active subscriptions on this connection
@@ -2819,7 +2851,7 @@ mod tests {
     fn permissive_connection(url: &str, keys: Keys) -> RelayConnection {
         RelayConnection::new(
             url.to_string(),
-            keys,
+            Some(keys),
             RelayTargetSource::EventDirected,
             OutboundTargetPolicy {
                 allow_non_global: true,
@@ -3067,7 +3099,7 @@ mod tests {
         // the strict default policy, mirroring the bootstrap-relay exception.
         let connection = RelayConnection::new(
             configured.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3125,7 +3157,7 @@ mod tests {
 
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3172,7 +3204,7 @@ mod tests {
         relay.run().await.expect("start empty relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3219,7 +3251,7 @@ mod tests {
         relay.run().await.expect("start registry relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3254,7 +3286,7 @@ mod tests {
         relay.run().await.expect("start query-limited relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3417,7 +3449,7 @@ mod tests {
     async fn event_directed_connect_rejects_loopback_before_dialling() {
         let connection = RelayConnection::new(
             "ws://127.0.0.1:1".to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::EventDirected,
             OutboundTargetPolicy::default(),
         );
@@ -3759,7 +3791,7 @@ mod tests {
         relay.run().await.expect("start local relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3822,7 +3854,7 @@ mod tests {
         relay.run().await.expect("start local relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
@@ -3914,7 +3946,7 @@ mod tests {
         relay.run().await.expect("start local relay");
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
-            Keys::generate(),
+            Some(Keys::generate()),
             RelayTargetSource::OperatorConfigured,
             OutboundTargetPolicy::default(),
         );
