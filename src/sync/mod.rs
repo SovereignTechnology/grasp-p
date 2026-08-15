@@ -8932,6 +8932,7 @@ mod tests {
             &config,
             purgatory,
             crate::grasp06::receive::RepoInitLocks::default(),
+            None,
         )
         .await
         .expect("create test relay runtime");

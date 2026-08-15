@@ -686,14 +686,23 @@ Optional endpoint at `/prs/<npub>/<identifier>.git`, gated on `NGIT_GRASP06_ENAB
 ## Private Service Authentication (GRASP-08)
 
 Private mode is an optional access layer around the normal GRASP runtime. A
-single `PrivateAccess` set is shared by the HTTP and WebSocket services.
-Repository admission and push authorization remain the GRASP-01 policies; a
-private credential proves service membership but never grants push rights.
-The effective set combines operator-configured members with NIP-11 owner
-pubkeys learned for relays referenced by accepted announcements. Purgatory-only
-announcements are excluded. Reconciliation reuses the accepted repository index
-and the NIP-11 fetch already performed once per connection session, so private
-mode adds neither outbound connections nor subscriptions.
+single `PrivateAccess` set is shared by the HTTP and WebSocket services and
+the announcement admission policy. Push authorization remains the GRASP-01
+policy; a private credential proves service membership but never grants push
+rights. The effective set combines operator-configured members with NIP-11
+owner pubkeys learned for relays referenced by accepted announcements.
+Purgatory-only announcements are excluded. Reconciliation reuses the accepted
+repository index and the NIP-11 fetch already performed once per connection
+session, so private mode adds neither outbound connections nor subscriptions.
+
+Because accepted announcements drive membership, announcement admission is
+itself membership-gated in private mode: a kind-30617 event is only admitted
+when its author is a current effective member at admission time, on every
+arrival path (direct publish, sync import, purgatory promotion). Non-member
+announcements are rejected through the normal announcement rejection
+machinery. State events (kind 30618) keep the GRASP-01 maintainer rules, and
+removal is non-retroactive — repositories admitted while their author was a
+member remain hosted until the operator curates them.
 
 For Nostr, Hyper completes the public WebSocket upgrade and a message-level
 proxy sends and validates NIP-42 authentication before a connection reaches

@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::PolicyContext;
 use crate::config::Config;
 use crate::nostr::events::{validate_announcement, RepositoryAnnouncement};
+use crate::private::PrivateAccess;
 
 /// Result of announcement policy evaluation
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +31,21 @@ pub enum AnnouncementResult {
 pub struct AnnouncementPolicy {
     ctx: PolicyContext,
     config: Config,
+    /// GRASP-08 live effective member set; `Some` only in private mode.
+    private_access: Option<PrivateAccess>,
 }
 
 impl AnnouncementPolicy {
-    pub fn new(ctx: PolicyContext, config: Config) -> Self {
-        Self { ctx, config }
+    pub fn new(
+        ctx: PolicyContext,
+        config: Config,
+        private_access: Option<PrivateAccess>,
+    ) -> Self {
+        Self {
+            ctx,
+            config,
+            private_access,
+        }
     }
 
     /// Validate a repository announcement event
@@ -47,6 +58,21 @@ impl AnnouncementPolicy {
     /// - `AcceptArchive` if accepted via GRASP-05 archive config
     /// - `Reject` with reason if validation fails
     pub async fn validate(&self, event: &Event) -> AnnouncementResult {
+        // GRASP-08: on a private service, admitting an announcement expands
+        // hosting and — via its referenced relays' NIP-11 owners — the member
+        // set itself. Only a current effective member may therefore introduce
+        // one; the check runs against the live member set at admission time
+        // and covers every arrival path, since all announcement admission
+        // funnels through this method. Removal is not retroactive:
+        // repositories admitted while their author was a member stay hosted.
+        if let Some(access) = &self.private_access {
+            if !access.contains(&event.pubkey) {
+                return AnnouncementResult::Reject(
+                    "Announcement author is not authorized on this private service".to_string(),
+                );
+            }
+        }
+
         // First, try validation (GRASP-01 + GRASP-05)
         let validation_result = validate_announcement(event, &self.config);
 
@@ -477,5 +503,87 @@ impl AnnouncementPolicy {
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, ToBech32};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn policy(private_access: Option<PrivateAccess>) -> AnnouncementPolicy {
+        let config = Config::for_testing();
+        let ctx = PolicyContext::new_for_test(
+            config.domain.clone(),
+            Arc::new(nostr_memory::MemoryDatabase::unbounded()),
+            PathBuf::new(),
+            Arc::new(crate::purgatory::Purgatory::new(PathBuf::new())),
+            config.clone(),
+        );
+        AnnouncementPolicy::new(ctx, config, private_access)
+    }
+
+    /// A GRASP-01-valid announcement listing the test service in both the
+    /// `clone` and `relays` tags.
+    fn service_announcement(keys: &Keys, domain: &str) -> Event {
+        let npub = keys.public_key().to_bech32().expect("author npub");
+        EventBuilder::new(Kind::GitRepoAnnouncement, "")
+            .tags(vec![
+                Tag::identifier("membership-gate-repo"),
+                Tag::custom(
+                    "clone",
+                    [format!("https://{domain}/{npub}/membership-gate-repo.git")],
+                ),
+                Tag::custom("relays", [format!("wss://{domain}")]),
+            ])
+            .finalize(keys)
+            .expect("signed announcement")
+    }
+
+    #[tokio::test]
+    async fn private_mode_rejects_announcement_from_nonmember_author() {
+        let member = Keys::generate();
+        let outsider = Keys::generate();
+        let policy = policy(Some(PrivateAccess::new([member.public_key()])));
+
+        let event = service_announcement(&outsider, &policy.config.domain);
+        let result = policy.validate(&event).await;
+
+        assert!(
+            matches!(result, AnnouncementResult::Reject(_)),
+            "non-member author must be rejected in private mode: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_mode_accepts_announcement_from_member_author() {
+        let member = Keys::generate();
+        let policy = policy(Some(PrivateAccess::new([member.public_key()])));
+
+        let event = service_announcement(&member, &policy.config.domain);
+        let result = policy.validate(&event).await;
+
+        assert_eq!(
+            result,
+            AnnouncementResult::AcceptPurgatory,
+            "member-authored announcement must pass the membership gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_mode_ignores_the_membership_gate() {
+        let author = Keys::generate();
+        let policy = policy(None);
+
+        let event = service_announcement(&author, &policy.config.domain);
+        let result = policy.validate(&event).await;
+
+        assert_eq!(
+            result,
+            AnnouncementResult::AcceptPurgatory,
+            "public mode admission must be unchanged"
+        );
     }
 }

@@ -133,6 +133,7 @@ fn build_policy_for_history_regression(
         purgatory,
         config,
         new_repo_init_locks(),
+        None,
     )
 }
 

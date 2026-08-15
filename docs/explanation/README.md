@@ -201,6 +201,20 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
+### [GRASP-08 Private Service Authentication](grasp-08-private-service.md)
+**Service-wide NIP-42/NIP-98 authentication for private repositories**
+
+**Topics:**
+- Fail-closed private mode and indistinguishable 401 responses
+- The GRASP-08 repository-scoped NIP-98 profile vs generic NIP-98
+- NIP-42 authentication outside the embedded relay
+- Service-wide membership and dynamic accepted-relay-owner admission
+- Trust model and follow-up scope
+
+**Read when:** You want to understand how a private GRASP instance authenticates clients and peers
+
+---
+
 ### [Repository Lifecycle](repository-lifecycle.md)
 **Handling repository removal, holding, archive, recovery, and purgatory**
 
