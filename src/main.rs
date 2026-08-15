@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::Parser;
 use tokio::signal;
@@ -70,8 +72,13 @@ async fn main() -> Result<()> {
 async fn run_relay(config: Config) -> Result<()> {
     // Initialize tracing with configured log level
     let filter = EnvFilter::new(&config.log_level).and(SuppressRoutineDisconnects);
-    let subscriber =
-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+    // Only colorize when stdout is a terminal: ANSI escape codes in redirected
+    // logs corrupt journald/file output and break log-scraping consumers.
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(std::io::stdout().is_terminal())
+            .with_filter(filter),
+    );
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting ngit-grasp with log level: {}", config.log_level);
