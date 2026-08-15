@@ -679,7 +679,8 @@ pub struct Config {
     #[arg(long, env = "NGIT_RELAY_FILTER_LIMIT", default_value_t = 500)]
     pub relay_filter_limit: usize,
 
-    /// Log level for application logging
+    /// Application log level or an explicit tracing filter expression.
+    /// Bare levels keep dependency logging at warn.
     #[arg(long, env = "NGIT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 }
