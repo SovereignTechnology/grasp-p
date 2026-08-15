@@ -91,6 +91,9 @@ struct RelayOptions {
     relay_data_path: Option<PathBuf>,
     deletion_lifecycle: Option<DeletionLifecycleOptions>,
     rejected_hot_cache_duration_secs: Option<u64>,
+    /// Application log level for tests that observe a diagnostic as an
+    /// ordering barrier. Other fixtures retain the production `info` default.
+    log_level: Option<String>,
     relay_max_subscriptions: Option<usize>,
     sync_recursive_descendant_limit: Option<usize>,
     private_members: Option<String>,
@@ -182,6 +185,23 @@ impl TestRelay {
         .await
     }
 
+    /// Start a syncing relay with application debug diagnostics enabled.
+    ///
+    /// Most integration tests use the production `info` default. This focused
+    /// fixture supports tests that wait on a debug record as an observable
+    /// ordering condition before changing remote state.
+    pub async fn start_with_sync_debug(bootstrap_relay_url: Option<String>) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                log_level: Some("debug".to_string()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a syncing relay with a caller-chosen relay-owner identity.
     ///
     /// Lets tests stage owner-signed events on other relays before this
@@ -263,6 +283,7 @@ impl TestRelay {
             RelayOptions {
                 bootstrap_relay_url,
                 rejected_hot_cache_duration_secs: Some(rejected_hot_cache_duration_secs),
+                log_level: Some("debug".to_string()),
                 ..RelayOptions::default()
             },
         )
@@ -762,6 +783,10 @@ impl TestRelay {
                 "NGIT_REJECTED_HOT_CACHE_DURATION_SECS",
                 duration_secs.to_string(),
             );
+        }
+
+        if let Some(log_level) = &options.log_level {
+            cmd.env("NGIT_LOG_LEVEL", log_level);
         }
 
         if let Some(limit) = options.relay_max_subscriptions {

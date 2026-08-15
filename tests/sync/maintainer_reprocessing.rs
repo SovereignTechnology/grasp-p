@@ -912,7 +912,7 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
     use crate::common::{create_test_repo_with_commit, CommitVariant};
 
     let owner_relay = TestRelay::start_with_sync(None).await;
-    let invitee_relay = TestRelay::start_with_sync(None).await;
+    let invitee_relay = TestRelay::start_with_sync_debug(None).await;
     let shared_relay = TestRelay::start_with_sync(None).await;
     let owner_keys = Keys::generate();
     let invitee_keys = Keys::generate();
