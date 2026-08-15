@@ -113,6 +113,22 @@ connection, and reconciliation rides the existing five-second maintenance
 pass, so dynamic membership adds no polling, subscriptions, connections, or
 background tasks.
 
+### Why announcement admission is membership-gated
+
+Accepted announcements are not just hosting decisions: the NIP-11 owners of
+their referenced relays become members. Left ungated, a member could submit a
+third-party-signed kind-30617 announcement — or sync could import one from an
+operator-configured source — and thereby mint membership for pubkeys no
+member ever chose, which those pubkeys' relays could amplify further with
+announcements of their own. In private mode an announcement is therefore only
+admitted when its author (the event pubkey) is a current effective member,
+evaluated against the live member set at admission time; every arrival path
+(direct publish, sync import, purgatory promotion) funnels through the same
+admission policy. This closes the loop: hosting and derived membership can
+only expand through member action. State events (kind 30618) stay governed by
+GRASP-01 maintainer rules, and removal remains non-retroactive — an admitted
+repository is not evicted when its author later leaves the member set.
+
 ### Why purgatory announcements grant nothing
 
 Purgatory holds announcements that have *not* passed repository admission.
@@ -147,7 +163,8 @@ lock a user out.
   provide, without an extra fetch or format).
 - **Membership grants read access only.** Push authorization remains
   GRASP-01's maintainer model; repository admission remains announcement
-  policy.
+  policy, which in private mode additionally requires the announcement
+  author to be a current effective member.
 - **Removal is not retroactive.** Removing a member closes their sessions and
   invalidates future credentials, but repositories admitted while they were a
   member remain hosted until the operator curates them.
@@ -156,11 +173,6 @@ lock a user out.
 
 Deliberately excluded from the initial single-service implementation:
 
-- **Membership-gated announcement admission**: requiring announcement authors
-  to be members, so hosting and derived membership can only expand through
-  member action. (Non-members cannot reach the relay to publish, but members
-  can currently submit third-party-signed announcements, and sync can import
-  them from operator-configured sources.)
 - **Outbound authentication**: presenting NIP-42 and GRASP-08 NIP-98
   credentials when syncing *from* other private services, using a service
   identity key. This is the missing half of zero-configuration private

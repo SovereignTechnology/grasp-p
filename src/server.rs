@@ -188,10 +188,14 @@ impl RelayServer {
         }
 
         // Create Nostr relay runtime with NIP-34 validation and shared stores.
-        let relay_runtime =
-            nostr::builder::create_relay(&config, purgatory.clone(), repo_init_locks.clone())
-                .await
-                .context("failed to create relay runtime")?;
+        let relay_runtime = nostr::builder::create_relay(
+            &config,
+            purgatory.clone(),
+            repo_init_locks.clone(),
+            private_access.clone(),
+        )
+        .await
+        .context("failed to create relay runtime")?;
 
         info!(
             "Relay created with NIP-34 validation for domain: {}",

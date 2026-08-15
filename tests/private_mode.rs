@@ -335,6 +335,85 @@ async fn private_websocket_rejects_valid_nonmember_auth_and_closes() {
     relay.stop().await;
 }
 
+/// Build a GRASP-01-valid repository announcement listing this relay in
+/// both the `clone` and `relays` tags.
+fn announcement(keys: &Keys, relay_domain: &str) -> nostr_sdk::prelude::Event {
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .expect("announcement author npub");
+    let clone_url = format!("https://{relay_domain}/{npub}/private-membership-repo.git");
+    let relay_url = format!("ws://{relay_domain}");
+    EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::parse(["d", "private-membership-repo"]).expect("d tag"),
+            Tag::parse(["clone", clone_url.as_str()]).expect("clone tag"),
+            Tag::parse(["relays", relay_url.as_str()]).expect("relays tag"),
+        ])
+        .finalize(keys)
+        .expect("signed announcement")
+}
+
+/// Bare-repository path an admitted announcement by `keys` would create.
+fn bare_repo_path(relay: &TestRelay, keys: &Keys) -> std::path::PathBuf {
+    relay
+        .git_data_path()
+        .join(keys.public_key().to_bech32().expect("owner npub"))
+        .join("private-membership-repo.git")
+}
+
+#[tokio::test]
+async fn private_announcement_admission_requires_member_author() {
+    let member = Keys::generate();
+    let outsider = Keys::generate();
+    let relay = TestRelay::start_private(&member.public_key()).await;
+    let (mut stream, challenge) = connect_and_challenge(&relay).await;
+
+    send_text(
+        &mut stream,
+        auth_message(&member, &relay.domain(), &challenge),
+    )
+    .await;
+    let ok: serde_json::Value =
+        serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
+    assert_eq!(ok[2], true, "member NIP-42 authentication must succeed: {ok}");
+
+    // A member-authored announcement is admitted (OK true, parked in
+    // purgatory awaiting git data) and its bare repository is created.
+    let admitted = announcement(&member, &relay.domain());
+    send_text(&mut stream, format!("[\"EVENT\",{}]", admitted.as_json())).await;
+    let ok: serde_json::Value =
+        serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
+    assert_eq!(ok[1].as_str(), Some(admitted.id.to_hex().as_str()));
+    assert_eq!(
+        ok[2], true,
+        "member-authored announcement must be admitted: {ok}"
+    );
+    assert!(
+        bare_repo_path(&relay, &member).exists(),
+        "admitted announcement must create its bare repository"
+    );
+
+    // The same authenticated member session cannot introduce a valid
+    // announcement signed by a non-member author: membership gates the
+    // announcement's author, not the publishing session.
+    let rejected = announcement(&outsider, &relay.domain());
+    send_text(&mut stream, format!("[\"EVENT\",{}]", rejected.as_json())).await;
+    let ok: serde_json::Value =
+        serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
+    assert_eq!(ok[1].as_str(), Some(rejected.id.to_hex().as_str()));
+    assert_eq!(
+        ok[2], false,
+        "non-member-authored announcement must be rejected: {ok}"
+    );
+    assert!(
+        !bare_repo_path(&relay, &outsider).exists(),
+        "rejected announcement must not admit a repository"
+    );
+
+    relay.stop().await;
+}
+
 #[tokio::test]
 async fn private_websocket_bounds_invalid_authentication_attempts() {
     let member = Keys::generate();

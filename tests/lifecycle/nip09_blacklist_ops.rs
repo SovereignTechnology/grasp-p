@@ -111,6 +111,7 @@ fn make_policy(
         purgatory,
         config,
         new_repo_init_locks(),
+        None,
     )
 }
 

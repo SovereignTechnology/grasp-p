@@ -32,6 +32,7 @@ use crate::nostr::policy::{
     StateResult,
 };
 use crate::nostr::SharedDatabase;
+use crate::private::PrivateAccess;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
@@ -112,6 +113,7 @@ impl Nip34WritePolicy {
         purgatory: std::sync::Arc<crate::purgatory::Purgatory>,
         config: crate::config::Config,
         repo_init_locks: crate::grasp06::receive::RepoInitLocks,
+        private_access: Option<PrivateAccess>,
     ) -> Self {
         let git_data_path = git_data_path.into();
         let domain = config.domain.clone();
@@ -130,7 +132,7 @@ impl Nip34WritePolicy {
 
         let ctx = PolicyContext::new(domain, database, git_data_path, purgatory, config.clone());
         Self {
-            announcement_policy: AnnouncementPolicy::new(ctx.clone(), config.clone()),
+            announcement_policy: AnnouncementPolicy::new(ctx.clone(), config.clone(), private_access),
             state_policy: StatePolicy::new(ctx.clone()),
             pr_event_policy: PrEventPolicy::new(ctx.clone(), repo_init_locks),
             related_event_policy: RelatedEventPolicy::new(ctx.clone()),
@@ -939,6 +941,7 @@ pub async fn create_relay(
     config: &Config,
     purgatory: Arc<crate::purgatory::Purgatory>,
     repo_init_locks: crate::grasp06::receive::RepoInitLocks,
+    private_access: Option<PrivateAccess>,
 ) -> Result<RelayRuntime> {
     tracing::info!("Configuring nostr relay with GRASP-01 validation...");
 
@@ -1052,6 +1055,7 @@ pub async fn create_relay(
         purgatory,
         config.clone(),
         repo_init_locks,
+        private_access,
     );
 
     let mut builder = LocalRelayBuilder::default()

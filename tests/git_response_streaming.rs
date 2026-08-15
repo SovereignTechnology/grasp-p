@@ -433,6 +433,7 @@ fn test_write_policy(
         purgatory,
         config,
         repo_init_locks,
+        None,
     )
 }
 
