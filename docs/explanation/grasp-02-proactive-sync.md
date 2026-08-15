@@ -402,6 +402,15 @@ The sync system uses three background tasks that run continuously:
 
 **Purpose**: Monitor own relay for repository announcements and root events
 
+**Attachment**: in-process. The client runs on a custom `WebSocketTransport`
+([`InProcessRelayTransport`](src/sync/in_process_transport.rs)) that hands
+`LocalRelay` one end of an in-memory duplex pair instead of opening a socket
+to our own listener. The session is otherwise an ordinary relay session. This
+removes a network round trip and a self-directed reconnect loop, and it is
+what lets the live feed work under GRASP-08 private mode, where the NIP-42
+gate in the HTTP layer refuses a self-dial (see
+[GRASP-08 design](grasp-08-private-service.md))
+
 **Subscribed kinds**: 30617, 1617, 1618, 1621 (NOT 30618)
 
 **Batching**: 5-second window (configurable via `NGIT_SYNC_BATCH_WINDOW_MS`)
@@ -1128,6 +1137,7 @@ src/sync/
 ├── health.rs           # RelayHealthTracker with exponential backoff
 ├── relay_connection.rs # RelayConnection, RelayEvent handling
 ├── self_subscriber.rs  # SelfSubscriber with batching
+├── in_process_transport.rs # In-memory WebSocket transport to our own LocalRelay
 └── metrics.rs          # SyncMetrics for Prometheus
 ```
 

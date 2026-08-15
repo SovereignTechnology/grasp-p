@@ -34,6 +34,11 @@ nostr-memory = "0.45.0"
 bitcoin_hashes = "0.14"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.28", default-features = false }
+# Message type in `nostr-sdk`'s `WebSocketTransport` signatures, which the
+# in-process self-subscription transport implements. `nostr-sdk` does not
+# re-export it. No features requested: the build keeps whatever `nostr-sdk`
+# already selects.
+async-wsocket = { version = "0.17", default-features = false }
 base64 = "0.22"
 flate2 = "1.0"
 tar = "0.4"

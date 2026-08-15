@@ -12,11 +12,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use nostr_sdk::local_relay::LocalRelay;
 use nostr_sdk::prelude::Timestamp;
 use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::nostr::SharedDatabase;
+use crate::sync::in_process_transport::InProcessRelayTransport;
 
 use super::{AddFilters, RepoSyncIndex, RepoSyncNeeds, RootCandidateIndex, SyncLevel};
 
@@ -122,7 +124,8 @@ fn dirty_relays(updates: &HashMap<String, RepoSyncNeeds>) -> HashSet<String> {
 
 /// Subscribes to own relay's events to discover repos needing sync
 ///
-/// The SelfSubscriber connects to our own relay and monitors for:
+/// The SelfSubscriber attaches to our own embedded relay in-process (see
+/// [`InProcessRelayTransport`]) and monitors for:
 /// - 30617 (Repository Announcements) - to discover repos listing our relay
 /// - 1617 (Patches) - root events referencing repos
 /// - 1618 (Issues) - root events referencing repos
@@ -130,7 +133,10 @@ fn dirty_relays(updates: &HashMap<String, RepoSyncNeeds>) -> HashSet<String> {
 ///
 /// Note: 30618 is NOT subscribed to here (per v4 spec - only synced from remote relays)
 pub struct SelfSubscriber {
-    /// Our own relay URL (to connect to)
+    /// Our own relay URL
+    ///
+    /// Identifies the relay within the client's pool and appears in logs. The
+    /// in-process transport never dials it.
     own_relay_url: String,
     /// Our service domain (for filtering relevant repos)
     relay_domain: String,
@@ -143,6 +149,8 @@ pub struct SelfSubscriber {
     last_connected: Option<Timestamp>,
     /// Database for querying existing events on startup
     database: SharedDatabase,
+    /// Our own embedded relay, attached to in-process for the live feed
+    local_relay: LocalRelay,
 }
 
 impl SelfSubscriber {
@@ -154,6 +162,7 @@ impl SelfSubscriber {
     /// * `repo_sync_index` - Shared index to update with discovered repos
     /// * `action_tx` - Channel to send AddFilters actions to the SyncManager
     /// * `database` - Database for querying existing events on startup
+    /// * `local_relay` - Our own embedded relay, attached to in-process
     pub fn new(
         own_relay_url: String,
         relay_domain: String,
@@ -161,6 +170,7 @@ impl SelfSubscriber {
         root_candidate_index: RootCandidateIndex,
         action_tx: mpsc::Sender<AddFilters>,
         database: SharedDatabase,
+        local_relay: LocalRelay,
     ) -> Self {
         Self {
             own_relay_url,
@@ -170,6 +180,7 @@ impl SelfSubscriber {
             action_tx,
             last_connected: None,
             database,
+            local_relay,
         }
     }
 
@@ -398,13 +409,20 @@ impl SelfSubscriber {
 
     /// Main run loop
     ///
-    /// Connects to own relay, subscribes to relevant event kinds,
-    /// and batches updates before processing them.
+    /// Attaches to our own relay in-process, subscribes to relevant event
+    /// kinds, and batches updates before processing them.
     ///
     /// The optional shutdown receiver allows graceful termination when
     /// received via the broadcast channel.
     pub async fn run(mut self, mut shutdown_rx: Option<broadcast::Receiver<()>>) {
-        let client = Client::default();
+        // Attach to the embedded relay directly rather than dialling our own
+        // public listener. A private instance's NIP-42 gate would refuse that
+        // dial, stalling every runtime discovery until the next restart; the
+        // in-process attachment also removes a network round trip and a
+        // reconnect loop against ourselves in public mode.
+        let client = Client::builder()
+            .websocket_transport(InProcessRelayTransport::new(self.local_relay.clone()))
+            .build();
 
         // Add own relay
         if let Err(e) = client.add_relay(&self.own_relay_url).await {
@@ -755,6 +773,7 @@ mod tests {
             Arc::clone(&root_candidate_index),
             action_tx,
             database,
+            LocalRelay::new(),
         );
 
         let mut pending = subscriber.load_existing_events().await;

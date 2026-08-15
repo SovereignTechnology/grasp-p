@@ -16,6 +16,7 @@ pub mod algorithms;
 pub mod discovery;
 pub mod filters;
 pub mod health;
+pub mod in_process_transport;
 pub mod metrics;
 pub mod missing_events;
 pub mod naughty_list;
@@ -4109,6 +4110,7 @@ impl SyncManager {
             Arc::clone(&self.root_candidate_index),
             action_tx,
             self.database.clone(),
+            self.local_relay.clone(),
         );
         let subscriber_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move { self_subscriber.run(Some(subscriber_shutdown)).await });

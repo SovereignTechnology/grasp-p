@@ -107,7 +107,10 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     //    announcement's relays tag lists the proxy (so the syncing relay
     //    targets the proxied connection), not the source itself, so the
     //    source runs in archive-all mode to accept it.
-    let source = TestRelay::start_with_archive_config(true, false).await;
+    // The source applies the production outbound target policy so it does
+    // not itself sync through the proxy that fronts it: the proxy's REQ
+    // budget belongs to the syncing relay under test.
+    let source = TestRelay::start_archive_source_behind_proxy().await;
     let proxy = ReqLimitingProxy::start(source.url(), PROXY_REQ_LIMIT).await;
 
     // 3. One hosted repository: announcement + state event + git data. The

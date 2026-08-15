@@ -1323,6 +1323,7 @@ version = "2.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "async-wsocket",
  "base64",
  "bitcoin_hashes 0.14.100",
  "clap",
