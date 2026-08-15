@@ -1507,6 +1507,20 @@ mod tests {
         keys.sign_event(unsigned).unwrap()
     }
 
+    fn simulate_checkpoint_downtime(path: &Path, downtime: Duration) {
+        let json = std::fs::read_to_string(path).expect("read rejected-event checkpoint");
+        let mut state: RejectedCacheState =
+            serde_json::from_str(&json).expect("parse rejected-event checkpoint");
+        state.saved_at = SystemTime::now()
+            .checked_sub(downtime)
+            .expect("simulated downtime must fit in SystemTime");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&state).expect("serialize rejected-event checkpoint"),
+        )
+        .expect("write rejected-event checkpoint");
+    }
+
     #[tokio::test]
     async fn test_hot_cache_stores_and_retrieves_events() {
         let cache = HotCache::new(Duration::from_secs(120));
@@ -2282,8 +2296,7 @@ mod tests {
         // Save to disk
         index.save_to_disk(&state_path).unwrap();
 
-        // Simulate downtime by sleeping
-        std::thread::sleep(Duration::from_millis(100));
+        simulate_checkpoint_downtime(&state_path, Duration::from_secs(1));
 
         // Restore
         let index2 =
@@ -2301,11 +2314,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let state_path = temp_dir.path().join("rejected_cache.json");
 
-        // Create index with very short expiry
-        let index = RejectedEventsIndex::new(
-            Duration::from_millis(100), // Hot cache: 100ms
-            Duration::from_millis(200), // Cold index: 200ms
-        );
+        // Keep a wide boundary around the simulated downtime so scheduler
+        // delays cannot also expire the cold entry under test.
+        let index = RejectedEventsIndex::new(Duration::from_secs(1), Duration::from_secs(60));
         let event = create_test_event().await;
 
         index.add_announcement(
@@ -2318,16 +2329,14 @@ mod tests {
         // Save to disk
         index.save_to_disk(&state_path).unwrap();
 
-        // Simulate downtime longer than hot cache expiry
-        std::thread::sleep(Duration::from_millis(150));
+        simulate_checkpoint_downtime(&state_path, Duration::from_secs(10));
 
         // Restore
-        let index2 =
-            RejectedEventsIndex::new(Duration::from_millis(100), Duration::from_millis(200));
+        let index2 = RejectedEventsIndex::new(Duration::from_secs(1), Duration::from_secs(60));
         index2.restore_from_disk(&state_path).unwrap();
 
         // Hot cache entry should have expired during downtime
-        // Cold index should still have it (200ms expiry)
+        // Cold index should still have it (60s expiry)
         assert_eq!(index2.hot_cache_len(), 1);
         assert_eq!(index2.cold_index_len(), 1);
 
