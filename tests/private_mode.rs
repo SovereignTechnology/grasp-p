@@ -643,6 +643,110 @@ async fn derived_membership_requires_grasp08_advertising_relay() {
     private_peer.stop().await;
 }
 
+/// End-to-end private-to-private mirroring: the mirroring instance must
+/// authenticate its WebSocket session with NIP-42 AND attach the GRASP-08
+/// repository credential to its purgatory Git fetches. The state event is
+/// only promoted (and served) once the git data arrived, which requires both
+/// credentials to have worked against the private source.
+#[tokio::test]
+async fn private_instance_syncs_from_private_peer_with_outbound_credentials() {
+    let member = Keys::generate();
+    let a_owner = Keys::generate();
+
+    // Source service B admits the member and A's owner identity.
+    let relay_b = TestRelay::start_private_with_sync_owner_keys_and_members(
+        None,
+        Keys::generate(),
+        &[member.public_key(), a_owner.public_key()],
+    )
+    .await;
+    // Mirroring service A bootstraps from B with its own owner identity.
+    let relay_a = TestRelay::start_private_with_sync_owner_keys_and_members(
+        Some(relay_b.url().to_string()),
+        a_owner.clone(),
+        &[member.public_key()],
+    )
+    .await;
+
+    let identifier = "private-peer-sync";
+    let npub = member.public_key().to_bech32().expect("member npub");
+    let b_clone_url = format!("http://{}/{npub}/{identifier}.git", relay_b.domain());
+    // Both services must appear in clone AND relays tags for admission;
+    // each instance excludes its own domain from fetch targets, so A only
+    // ever fetches git data from B.
+    let clone_urls = vec![
+        b_clone_url.clone(),
+        format!("http://{}/{npub}/{identifier}.git", relay_a.domain()),
+    ];
+    let relay_urls = vec![
+        format!("ws://{}", relay_b.domain()),
+        format!("ws://{}", relay_a.domain()),
+    ];
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom("clone", clone_urls.clone()),
+            Tag::custom("relays", relay_urls.clone()),
+        ])
+        .finalize(&member)
+        .expect("signed announcement");
+
+    let git_dir = tempfile::tempdir().expect("git temp dir");
+    let commit = create_test_repo_with_commit(git_dir.path(), CommitVariant::StateTest)
+        .expect("test repository");
+    let clone_url_refs: Vec<&str> = clone_urls.iter().map(String::as_str).collect();
+    let relay_url_refs: Vec<&str> = relay_urls.iter().map(String::as_str).collect();
+    let state_event = create_state_event(
+        &member,
+        identifier,
+        &[("main", &commit)],
+        &[],
+        &clone_url_refs,
+        &relay_url_refs,
+    )
+    .expect("state event");
+
+    // Publish to B through the member's authenticated session and push the
+    // git data with the member's inbound GRASP-08 credential.
+    let client = TestClient::new(relay_b.url(), member.clone())
+        .await
+        .expect("authenticated member client");
+    client
+        .send_event(&announcement)
+        .await
+        .expect("announcement admitted on B");
+    client
+        .send_event(&state_event)
+        .await
+        .expect("state event admitted on B");
+    push_to_relay_with_auth_header(
+        git_dir.path(),
+        &relay_b.domain(),
+        &npub,
+        identifier,
+        Some(&credential(&member, &b_clone_url)),
+    )
+    .expect("authenticated git push to B");
+    client.disconnect().await;
+
+    // Promotion on A requires the git fetch from B to have succeeded, which
+    // in turn requires the outbound NIP-98 credential; a generous deadline
+    // covers connect, sync, and the purgatory fetch pass.
+    assert!(
+        wait_for_event_as(
+            relay_a.url(),
+            &member,
+            state_event.id,
+            Duration::from_secs(120)
+        )
+        .await,
+        "state event must be promoted on the mirroring private instance"
+    );
+
+    relay_a.stop().await;
+    relay_b.stop().await;
+}
+
 #[tokio::test]
 async fn private_websocket_bounds_invalid_authentication_attempts() {
     let member = Keys::generate();

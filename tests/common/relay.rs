@@ -269,6 +269,38 @@ impl TestRelay {
         .await
     }
 
+    /// Start a GRASP-08 private service with an explicit member list, an
+    /// optional sync bootstrap, and a caller-chosen relay-owner identity.
+    ///
+    /// Lets private-to-private sync tests model two services whose member
+    /// sets deliberately differ (e.g. the source service admits the
+    /// mirroring service's owner identity).
+    pub async fn start_private_with_sync_owner_keys_and_members(
+        bootstrap_relay_url: Option<String>,
+        owner_keys: Keys,
+        members: &[nostr_sdk::prelude::PublicKey],
+    ) -> Self {
+        let members = members
+            .iter()
+            .map(|member| {
+                member
+                    .to_bech32()
+                    .expect("Failed to encode private test member")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                owner_keys: Some(owner_keys),
+                private_members: Some(members),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a GRASP-08 private relay whose sole configured member is also
     /// the relay-owner identity, with user-index relays configured.
     ///

@@ -2469,6 +2469,12 @@ pub struct SyncManager {
     proactive_participant_authors: crate::nostr::policy::SharedProactiveParticipantAuthorIndex,
     /// GRASP-08 access shared with the inbound HTTP/WebSocket boundary.
     private_access: Option<PrivateAccess>,
+    /// Confirmed GRASP-08 peers shared with the purgatory Git fetch path.
+    ///
+    /// Only populated on private instances (the server passes `Some`): a
+    /// public mirror never presents credentials, and its GRASP-08 targets are
+    /// parked pre-dial instead.
+    grasp08_peers: Option<crate::private::Grasp08Peers>,
     /// Operator-configured members form the permanent base of private access.
     configured_private_members: HashSet<PublicKey>,
     /// Latest NIP-11 owner learned for each connected repository relay whose
@@ -2586,6 +2592,7 @@ impl SyncManager {
         data_path: PathBuf,
         sync_metrics: Option<SyncMetrics>,
         private_access: Option<PrivateAccess>,
+        grasp08_peers: Option<crate::private::Grasp08Peers>,
     ) -> Self {
         // Extract purgatory from write_policy for read-only access
         let purgatory = write_policy.purgatory().clone();
@@ -2638,6 +2645,7 @@ impl SyncManager {
             root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
             proactive_participant_authors,
             private_access,
+            grasp08_peers,
             configured_private_members,
             relay_owners: HashMap::new(),
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
@@ -6321,6 +6329,23 @@ impl SyncManager {
                     }
                     None => {
                         self.relay_owners.remove(&result.relay_url);
+                    }
+                }
+                // On a private instance, remember which hosts are GRASP-08
+                // peers so purgatory Git fetches from them carry the outbound
+                // NIP-98 credential.
+                if let Some(peers) = &self.grasp08_peers {
+                    if let Some(key) = crate::private::Grasp08Peers::peer_key(&result.relay_url) {
+                        if advertised_grasp08 {
+                            if peers.insert(key) {
+                                tracing::info!(
+                                    relay = %result.relay_url,
+                                    "Confirmed GRASP-08 peer; Git fetches will carry credentials"
+                                );
+                            }
+                        } else {
+                            peers.remove(&key);
+                        }
                     }
                 }
                 self.reconcile_private_membership().await;

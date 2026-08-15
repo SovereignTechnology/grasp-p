@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use hyper::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use hyper::{Request, Response, StatusCode};
-use nostr_sdk::prelude::{Event, Kind};
+use nostr_sdk::prelude::{Event, EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
 use crate::config::Config;
 use crate::git::{empty_body, GitResponseBody};
@@ -76,6 +76,38 @@ pub fn validate_request<B>(
     }
 
     Ok(())
+}
+
+/// Build the outbound Authorization header for a GRASP-08 peer fetch.
+///
+/// Signs exactly the profile [`validate_request`] checks: kind 27235 with one
+/// `u` tag naming the repository root, one `method` tag of `GET`, and a fresh
+/// timestamp (the peer allows 60 seconds of skew, so callers generate a new
+/// header per subprocess invocation rather than caching one).
+pub fn repository_credential_header(
+    keys: &Keys,
+    repository_root_url: &str,
+) -> anyhow::Result<String> {
+    let event = EventBuilder::new(Kind::HttpAuth, "")
+        .tags([
+            Tag::parse(["u", repository_root_url])?,
+            Tag::parse(["method", "GET"])?,
+        ])
+        .finalize(keys)?;
+    Ok(format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(event.as_json())
+    ))
+}
+
+/// Truncate a Smart HTTP fetch URL at the repository root the GRASP-08
+/// credential must sign.
+///
+/// Identifiers may themselves contain `.git`, so like
+/// [`canonical_repository_url`] the root ends at the LAST occurrence.
+pub fn repository_root_from_fetch_url(url: &str) -> Option<String> {
+    let end = url.rfind(".git")?.checked_add(4)?;
+    url.get(..end).map(str::to_string)
 }
 
 /// Build the canonical absolute root URL signed by Git credentials.
@@ -202,6 +234,33 @@ mod tests {
                 .unwrap();
             assert!(validate_request(&request, url, &access).is_err());
         }
+    }
+
+    #[test]
+    fn outbound_credential_round_trips_through_validation() {
+        let keys = Keys::generate();
+        let access = PrivateAccess::new([keys.public_key()]);
+        let root = repository_root_from_fetch_url(
+            "http://127.0.0.1:7334/npub/repo.git/info/refs?service=git-upload-pack",
+        )
+        .expect("repository root");
+        assert_eq!(root, "http://127.0.0.1:7334/npub/repo.git");
+        assert_eq!(
+            repository_root_from_fetch_url("https://h.example/npub/repo.git-tools.git/info/refs")
+                .as_deref(),
+            Some("https://h.example/npub/repo.git-tools.git")
+        );
+
+        let header = repository_credential_header(&keys, &root).expect("credential header");
+        let request = Request::get("/npub/repo.git/info/refs")
+            .header(AUTHORIZATION, header)
+            .body(())
+            .unwrap();
+        assert_eq!(validate_request(&request, &root, &access), Ok(()));
+        // The same credential must not authorize a different repository root.
+        assert!(
+            validate_request(&request, "http://127.0.0.1:7334/npub/other.git", &access).is_err()
+        );
     }
 
     #[test]
