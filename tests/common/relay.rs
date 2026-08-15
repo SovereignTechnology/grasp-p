@@ -155,6 +155,36 @@ impl TestRelay {
         .await
     }
 
+    /// Start a GRASP-08 private service with persistent LMDB storage in
+    /// caller-owned directories, so [`Self::restart`] resumes from the same
+    /// events and git data.
+    ///
+    /// The private NIP-42 gate applies to the relay's own internal
+    /// self-subscription, so sync targets for locally published
+    /// announcements are derived from the database at startup; tests
+    /// exercising that pipeline publish, then restart.
+    pub async fn start_private_with_lmdb_paths(
+        member: &nostr_sdk::prelude::PublicKey,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                private_members: Some(
+                    member
+                        .to_bech32()
+                        .expect("Failed to encode private test member"),
+                ),
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start relay with sync from another relay (bootstrap relay)
     ///
     /// # Example
@@ -182,6 +212,43 @@ impl TestRelay {
         .await
     }
 
+    /// Start a syncing relay with user-index identity publication disabled.
+    ///
+    /// `start_with_sync` points identity publication at the bootstrap relay.
+    /// Tests making log-based assertions about the bootstrap connection use
+    /// this variant so identity-publication traffic cannot confound them.
+    pub async fn start_with_sync_without_user_index(bootstrap_relay_url: Option<String>) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                user_index_relays: Some(String::new()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a syncing relay on a caller-reserved port with user-index
+    /// identity publication disabled. See
+    /// [`Self::start_with_sync_without_user_index`] and
+    /// [`Self::start_on_reservation_with_options`] for the two concerns
+    /// this combines.
+    pub async fn start_on_reservation_with_sync_without_user_index(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                bootstrap_relay_url,
+                user_index_relays: Some(String::new()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a syncing relay with a caller-chosen relay-owner identity.
     ///
     /// Lets tests stage owner-signed events on other relays before this
@@ -196,6 +263,38 @@ impl TestRelay {
             RelayOptions {
                 bootstrap_relay_url,
                 owner_keys: Some(owner_keys),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a GRASP-08 private service with an explicit member list, an
+    /// optional sync bootstrap, and a caller-chosen relay-owner identity.
+    ///
+    /// Lets private-to-private sync tests model two services whose member
+    /// sets deliberately differ (e.g. the source service admits the
+    /// mirroring service's owner identity).
+    pub async fn start_private_with_sync_owner_keys_and_members(
+        bootstrap_relay_url: Option<String>,
+        owner_keys: Keys,
+        members: &[nostr_sdk::prelude::PublicKey],
+    ) -> Self {
+        let members = members
+            .iter()
+            .map(|member| {
+                member
+                    .to_bech32()
+                    .expect("Failed to encode private test member")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                owner_keys: Some(owner_keys),
+                private_members: Some(members),
                 ..RelayOptions::default()
             },
         )

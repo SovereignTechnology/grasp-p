@@ -3,7 +3,10 @@ mod common;
 use std::time::Duration;
 
 use base64::Engine;
-use common::TestRelay;
+use common::{
+    create_state_event, create_test_repo_with_commit, push_to_relay_with_auth_header,
+    wait_for_sync_connection, CommitVariant, MockRelay, TestClient, TestRelay,
+};
 use futures_util::{SinkExt, StreamExt};
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp, ToBech32};
 use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
@@ -426,6 +429,322 @@ async fn private_announcement_admission_requires_member_author() {
     );
 
     relay.stop().await;
+}
+
+/// Poll until `event_id` is served to an authenticated session using `keys`.
+async fn wait_for_event_as(
+    relay_url: &str,
+    keys: &Keys,
+    event_id: nostr_sdk::prelude::EventId,
+    timeout: Duration,
+) -> bool {
+    use nostr_sdk::prelude::{Client, Filter, SignerAuthenticator};
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
+        if client.add_relay(relay_url).await.is_ok() {
+            client.connect().await;
+            let result = client
+                .fetch_events(Filter::new().id(event_id))
+                .timeout(Duration::from_secs(2))
+                .await;
+            client.disconnect().await;
+            if let Ok(events) = result {
+                if !events.is_empty() {
+                    return true;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// One bounded probe of whether `keys` is currently an effective member:
+/// authenticate over a fresh WebSocket session and, when admitted, prove the
+/// session is bridged by seeing a REQ answered with EOSE.
+async fn membership_admitted(relay: &TestRelay, keys: &Keys) -> bool {
+    let (mut stream, challenge) = connect_and_challenge(relay).await;
+    send_text(&mut stream, auth_message(keys, &relay.domain(), &challenge)).await;
+    let ok: serde_json::Value =
+        serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
+    assert_eq!(ok[0], "OK");
+    if ok[2] != true {
+        return false;
+    }
+    send_text(
+        &mut stream,
+        r#"["REQ","bridge",{"kinds":[1],"limit":1}]"#.to_string(),
+    )
+    .await;
+    loop {
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut stream).await).expect("relay JSON");
+        if frame[0] == "EOSE" && frame[1] == "bridge" {
+            return true;
+        }
+        assert_ne!(
+            frame[0], "CLOSED",
+            "admitted member REQ was rejected: {frame}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn derived_membership_requires_grasp08_advertising_relay() {
+    let member = Keys::generate();
+    let owner_plain = Keys::generate();
+    let owner_private = Keys::generate();
+    let git_data_dir = tempfile::tempdir().expect("git data dir");
+    let relay_data_dir = tempfile::tempdir().expect("relay data dir");
+    let relay = TestRelay::start_private_with_lmdb_paths(
+        &member.public_key(),
+        git_data_dir.path().to_path_buf(),
+        relay_data_dir.path().to_path_buf(),
+    )
+    .await;
+
+    // Two referenced relays that differ only in whether their NIP-11
+    // advertises the GRASP-08 private-service extension.
+    let plain = MockRelay::start_with_nip11_document(serde_json::json!({
+        "name": "public mirror",
+        "pubkey": owner_plain.public_key().to_hex(),
+        "supported_nips": [1, 11],
+        "supported_grasps": ["GRASP-01"],
+    }))
+    .await;
+    let private_peer = MockRelay::start_with_nip11_document(serde_json::json!({
+        "name": "private peer",
+        "pubkey": owner_private.public_key().to_hex(),
+        "supported_nips": [1, 11],
+        "supported_grasps": ["GRASP-01", "GRASP-08"],
+    }))
+    .await;
+
+    // Member-authored announcement listing our own service (so it is
+    // admitted) plus both mock relays; the state event and git push promote
+    // it out of purgatory so it can mint derived membership.
+    let identifier = "grasp08-derived-membership";
+    let npub = member.public_key().to_bech32().expect("member npub");
+    let clone_url = format!("http://{}/{npub}/{identifier}.git", relay.domain());
+    let relay_urls = vec![
+        format!("ws://{}", relay.domain()),
+        plain.url().to_string(),
+        private_peer.url().to_string(),
+    ];
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom("clone", vec![clone_url.clone()]),
+            Tag::custom("relays", relay_urls.clone()),
+        ])
+        .finalize(&member)
+        .expect("signed announcement");
+
+    let git_dir = tempfile::tempdir().expect("git temp dir");
+    let commit = create_test_repo_with_commit(git_dir.path(), CommitVariant::StateTest)
+        .expect("test repository");
+    let relay_url_refs: Vec<&str> = relay_urls.iter().map(String::as_str).collect();
+    let state_event = create_state_event(
+        &member,
+        identifier,
+        &[("main", &commit)],
+        &[],
+        &[clone_url.as_str()],
+        &relay_url_refs,
+    )
+    .expect("state event");
+
+    // The member passes the inbound NIP-42 gate via the client authenticator
+    // and the inbound NIP-98 gate via the repository-root credential.
+    let client = TestClient::new(relay.url(), member.clone())
+        .await
+        .expect("authenticated member client");
+    client
+        .send_event(&announcement)
+        .await
+        .expect("announcement admitted");
+    client
+        .send_event(&state_event)
+        .await
+        .expect("state event admitted");
+    push_to_relay_with_auth_header(
+        git_dir.path(),
+        &relay.domain(),
+        &npub,
+        identifier,
+        Some(&credential(&member, &clone_url)),
+    )
+    .expect("authenticated git push");
+    client.disconnect().await;
+
+    assert!(
+        wait_for_event_as(
+            relay.url(),
+            &member,
+            announcement.id,
+            Duration::from_secs(30)
+        )
+        .await,
+        "announcement must be promoted out of purgatory"
+    );
+
+    // The internal live self-subscription cannot pass the private NIP-42
+    // gate, so sync targets for locally promoted announcements are derived
+    // from the database at startup; restart to exercise that path.
+    let relay = relay.restart().await;
+
+    wait_for_sync_connection(relay.url(), 2, Duration::from_secs(60))
+        .await
+        .expect("sync connections to both referenced relays");
+
+    // The GRASP-08-advertising relay's owner becomes an effective member.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if membership_admitted(&relay, &owner_private).await {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "GRASP-08 relay owner was not admitted before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The plain relay's owner authenticates validly but is never minted.
+    let (mut stream, challenge) = connect_and_challenge(&relay).await;
+    send_text(
+        &mut stream,
+        auth_message(&owner_plain, &relay.domain(), &challenge),
+    )
+    .await;
+    let ok: serde_json::Value =
+        serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
+    assert_eq!(ok[0], "OK");
+    assert_eq!(
+        ok[2], false,
+        "non-GRASP-08 relay owner must not gain membership: {ok}"
+    );
+    assert!(
+        ok[3]
+            .as_str()
+            .expect("OK message")
+            .starts_with("restricted:"),
+        "{ok}"
+    );
+    expect_closed(&mut stream).await;
+
+    relay.stop().await;
+    plain.stop().await;
+    private_peer.stop().await;
+}
+
+/// End-to-end private-to-private mirroring: the mirroring instance must
+/// authenticate its WebSocket session with NIP-42 AND attach the GRASP-08
+/// repository credential to its purgatory Git fetches. The state event is
+/// only promoted (and served) once the git data arrived, which requires both
+/// credentials to have worked against the private source.
+#[tokio::test]
+async fn private_instance_syncs_from_private_peer_with_outbound_credentials() {
+    let member = Keys::generate();
+    let a_owner = Keys::generate();
+
+    // Source service B admits the member and A's owner identity.
+    let relay_b = TestRelay::start_private_with_sync_owner_keys_and_members(
+        None,
+        Keys::generate(),
+        &[member.public_key(), a_owner.public_key()],
+    )
+    .await;
+    // Mirroring service A bootstraps from B with its own owner identity.
+    let relay_a = TestRelay::start_private_with_sync_owner_keys_and_members(
+        Some(relay_b.url().to_string()),
+        a_owner.clone(),
+        &[member.public_key()],
+    )
+    .await;
+
+    let identifier = "private-peer-sync";
+    let npub = member.public_key().to_bech32().expect("member npub");
+    let b_clone_url = format!("http://{}/{npub}/{identifier}.git", relay_b.domain());
+    // Both services must appear in clone AND relays tags for admission;
+    // each instance excludes its own domain from fetch targets, so A only
+    // ever fetches git data from B.
+    let clone_urls = vec![
+        b_clone_url.clone(),
+        format!("http://{}/{npub}/{identifier}.git", relay_a.domain()),
+    ];
+    let relay_urls = vec![
+        format!("ws://{}", relay_b.domain()),
+        format!("ws://{}", relay_a.domain()),
+    ];
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom("clone", clone_urls.clone()),
+            Tag::custom("relays", relay_urls.clone()),
+        ])
+        .finalize(&member)
+        .expect("signed announcement");
+
+    let git_dir = tempfile::tempdir().expect("git temp dir");
+    let commit = create_test_repo_with_commit(git_dir.path(), CommitVariant::StateTest)
+        .expect("test repository");
+    let clone_url_refs: Vec<&str> = clone_urls.iter().map(String::as_str).collect();
+    let relay_url_refs: Vec<&str> = relay_urls.iter().map(String::as_str).collect();
+    let state_event = create_state_event(
+        &member,
+        identifier,
+        &[("main", &commit)],
+        &[],
+        &clone_url_refs,
+        &relay_url_refs,
+    )
+    .expect("state event");
+
+    // Publish to B through the member's authenticated session and push the
+    // git data with the member's inbound GRASP-08 credential.
+    let client = TestClient::new(relay_b.url(), member.clone())
+        .await
+        .expect("authenticated member client");
+    client
+        .send_event(&announcement)
+        .await
+        .expect("announcement admitted on B");
+    client
+        .send_event(&state_event)
+        .await
+        .expect("state event admitted on B");
+    push_to_relay_with_auth_header(
+        git_dir.path(),
+        &relay_b.domain(),
+        &npub,
+        identifier,
+        Some(&credential(&member, &b_clone_url)),
+    )
+    .expect("authenticated git push to B");
+    client.disconnect().await;
+
+    // Promotion on A requires the git fetch from B to have succeeded, which
+    // in turn requires the outbound NIP-98 credential; a generous deadline
+    // covers connect, sync, and the purgatory fetch pass.
+    assert!(
+        wait_for_event_as(
+            relay_a.url(),
+            &member,
+            state_event.id,
+            Duration::from_secs(120)
+        )
+        .await,
+        "state event must be promoted on the mirroring private instance"
+    );
+
+    relay_a.stop().await;
+    relay_b.stop().await;
 }
 
 #[tokio::test]

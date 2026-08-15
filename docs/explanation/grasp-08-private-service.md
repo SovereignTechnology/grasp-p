@@ -100,10 +100,11 @@ hints** (who to connect to), while the service-wide member set is the **ACL**
 ### Why accepted-relay owners are admitted dynamically
 
 Two private services mirroring the same repository must be able to read from
-each other. When an accepted announcement references another relay, that
-relay's NIP-11 `pubkey` is added to the member set, so a peer service (or the
-operator of an ordinary relay the team uses) can authenticate without manual
-whitelisting on both sides. The consequence — accepting one announcement
+each other. When an accepted announcement references another relay whose
+NIP-11 also advertises `GRASP-08`, that relay's NIP-11 `pubkey` is added to
+the member set, so a peer service can authenticate without manual
+whitelisting on both sides. Owners of referenced *public* relays are not
+admitted (see "Outbound authentication and sync policy" below). The consequence — accepting one announcement
 grants its referenced relay operators read access to the whole service —
 follows directly from the one-trust-domain model and is the operator's
 opt-in via announcement admission.
@@ -160,7 +161,8 @@ lock a user out.
 - **Accepted-relay owners** are derived members, trusted transitively via
   announcement admission plus the referenced relay's NIP-11 self-assertion
   (the same HTTPS-from-domain trust anchor a `_@domain` NIP-05 lookup would
-  provide, without an extra fetch or format).
+  provide, without an extra fetch or format). Only relays whose NIP-11 also
+  advertises `GRASP-08` qualify.
 - **Membership grants read access only.** Push authorization remains
   GRASP-01's maintainer model; repository admission remains announcement
   policy, which in private mode additionally requires the announcement
@@ -169,13 +171,63 @@ lock a user out.
   invalidates future credentials, but repositories admitted while they were a
   member remain hosted until the operator curates them.
 
+## Outbound authentication and sync policy
+
+The outbound half of private-service support decides how this instance, as a
+*client*, treats the relays it syncs from:
+
+| Situation | Behavior |
+| --- | --- |
+| Any relay issues a NIP-42 challenge | Answer with the relay owner key (public and private instances alike). The SDK retries the refused subscription once after authenticating. Without an owner key, authentication is skipped and auth-demanding subscriptions park immediately. |
+| A relay answers `restricted:` after valid authentication | Terminal: the subscription parks through the policy-refusal machinery (24-hour probe), no retry storm. |
+| Peer NIP-11 advertises `GRASP-08`, this instance is **public** | Not a sync target at all: detected by a pre-dial NIP-11 fetch and parked without ever opening the WebSocket, so no AUTH exchange happens and no credential could leak. |
+| Peer NIP-11 advertises `GRASP-08`, this instance is **private** | A peer: NIP-42 on the WebSocket *plus* the GRASP-08 repository-root NIP-98 credential attached to purgatory Git fetches from that peer's host, both signed with the relay owner key. |
+| NIP-11 missing, unreadable, or without `supported_grasps` | An ordinary relay. |
+
+The pre-dial NIP-11 fetch re-runs the outbound target policy for
+event-directed URLs first, so the SSRF gate covers it like the dial itself.
+
+**Why NIP-42 everywhere?** NIP-42 is identification, not confidentiality. A
+gated relay admitting our pubkey grants a *known* service read access — our
+pubkey is already published via NIP-11 and the NIP-05 root identity. A
+private instance authenticating outbound discloses its identity to the relays
+it syncs from, which is consistent with GRASP-08's public-discovery stance:
+private mode hides repository content, not the service.
+
+**Why derived membership requires GRASP-08 (see above)?** For the same
+asymmetry: a public relay's owner gains nothing legitimate from private
+membership, because their relay enforces no confidentiality for the
+repositories it mirrors. Only relays advertising `GRASP-08` in their NIP-11
+`supported_grasps` mint derived members; configured `NGIT_PRIVATE_MEMBERS`
+are unaffected.
+
+## Disclosure and outside contributions
+
+Teams running a private service still receive security reports (CVEs,
+vulnerability disclosures) from people outside the member set. GRASP-08 keeps
+that path open without weakening the access boundary:
+
+- **Finding the contact**: the service's existence and operator identity are
+  deliberately public. The security contact is discoverable through the
+  NIP-11 `contact` field and the NIP-05 root identity (`_@domain`), both
+  served unauthenticated.
+- **Sending a report**: reports arrive as NIP-17 encrypted direct messages on
+  the maintainers' public mailbox relays. Nothing about a private repository
+  needs to be readable for a reporter to reach its maintainers privately.
+- **Granting collaboration access**: when a report leads to joint work, the
+  operator adds the reporter to `NGIT_PRIVATE_MEMBERS`. Membership grants
+  read access to the whole trust domain (see "Why membership is
+  service-wide"), which is the intended granularity: triaging a
+  vulnerability together means trusting the reporter with the codebase.
+- **No non-member submission lane**: a dedicated unauthenticated inbox for
+  outside patches or PR events is deliberately not implemented. It would
+  reopen exactly the unauthenticated write surface GRASP-08 exists to close —
+  the same reasoning that makes private mode refuse to combine with
+  GRASP-06.
+
 ## Follow-up scope
 
 Deliberately excluded from the initial single-service implementation:
 
-- **Outbound authentication**: presenting NIP-42 and GRASP-08 NIP-98
-  credentials when syncing *from* other private services, using a service
-  identity key. This is the missing half of zero-configuration private
-  mirroring.
 - **Multi-service fleet orchestration** and **encrypted kind-10318 client
   discovery**, which belong to future GRASP proposals.

@@ -20,12 +20,11 @@
 
 mod common;
 
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{create_state_event, MockRelay, TestClient, TestRelay};
+use common::{create_state_event, wait_for_log_line, MockRelay, TestClient, TestRelay};
 use nostr_sdk::prelude::*;
 
 /// A commit hash that exists nowhere, keeping state events in purgatory so
@@ -54,25 +53,6 @@ async fn start_counting_listener() -> (u16, Arc<AtomicUsize>) {
         }
     });
     (port, count)
-}
-
-/// Wait until some line of the relay subprocess log satisfies the predicate.
-async fn wait_for_log_line<F>(log_path: &Path, timeout: Duration, predicate: F) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
-            if content.lines().any(&predicate) {
-                return true;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// Build a repository announcement with explicit clone and relay URL lists.

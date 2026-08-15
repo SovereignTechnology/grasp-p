@@ -273,6 +273,14 @@ pub struct RealSyncContext {
 
     /// Outbound target policy applied before every event-directed git fetch
     outbound_policy: OutboundTargetPolicy,
+
+    /// Confirmed GRASP-08 peers (by canonical `host:port`), fed by the sync
+    /// manager's NIP-11 fetches. Only set for private instances.
+    grasp08_peers: Option<crate::private::Grasp08Peers>,
+
+    /// Keys signing outbound GRASP-08 repository credentials. Only set for
+    /// private instances; fetches stay unauthenticated without them.
+    credential_keys: Option<nostr_sdk::prelude::Keys>,
 }
 
 impl RealSyncContext {
@@ -287,6 +295,9 @@ impl RealSyncContext {
     /// * `write_policy` - Write policy for promotion-time recovery hooks
     /// * `git_naughty_list` - Naughty list tracker for git remote domains
     /// * `outbound_policy` - Policy vetting event-directed git fetch targets
+    /// * `grasp08_peers` - Confirmed GRASP-08 peer registry (private mode only)
+    /// * `credential_keys` - Keys signing outbound GRASP-08 credentials
+    ///   (private mode only)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         purgatory: Arc<Purgatory>,
@@ -297,6 +308,8 @@ impl RealSyncContext {
         write_policy: Option<Nip34WritePolicy>,
         git_naughty_list: Arc<NaughtyListTracker>,
         outbound_policy: OutboundTargetPolicy,
+        grasp08_peers: Option<crate::private::Grasp08Peers>,
+        credential_keys: Option<nostr_sdk::prelude::Keys>,
     ) -> Self {
         Self {
             purgatory,
@@ -308,6 +321,8 @@ impl RealSyncContext {
             git_naughty_list,
             miss_memo: Arc::new(Mutex::new(HashMap::new())),
             outbound_policy,
+            grasp08_peers,
+            credential_keys,
         }
     }
 
@@ -410,7 +425,19 @@ fn resolve_pin_entry(resolved: &ResolvedTarget) -> Option<String> {
 ///   of requests to event-directed servers;
 /// - `http.curloptResolve` pins the vetted DNS answers so the fetch cannot be
 ///   re-bound to a different address between authorization and connection.
-fn hardened_git_command(repo_path: &Path, resolve_pin: Option<&str>, args: &[String]) -> Command {
+///
+/// `auth_header` attaches an explicit `Authorization` header (the GRASP-08
+/// repository credential for a confirmed private peer). This deliberately
+/// does not conflict with the `credential.helper=` hardening: that control
+/// keeps *ambient operator* credentials away from event-directed servers,
+/// while this header is a peer-scoped credential minted for exactly this
+/// fetch target.
+fn hardened_git_command(
+    repo_path: &Path,
+    resolve_pin: Option<&str>,
+    auth_header: Option<&str>,
+    args: &[String],
+) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -421,6 +448,11 @@ fn hardened_git_command(repo_path: &Path, resolve_pin: Option<&str>, args: &[Str
         .arg("credential.helper=");
     if let Some(pin) = resolve_pin {
         command.arg("-c").arg(format!("http.curloptResolve={pin}"));
+    }
+    if let Some(header) = auth_header {
+        command
+            .arg("-c")
+            .arg(format!("http.extraHeader=Authorization: {header}"));
     }
     command
         .args(args)
@@ -949,6 +981,41 @@ impl SyncContext for RealSyncContext {
         let naughty_list = self.git_naughty_list.clone();
         let miss_memo = self.miss_memo.clone();
 
+        // GRASP-08: fetches from a confirmed private peer carry the
+        // repository-root credential. The registry key is host:port derived
+        // from the URL itself (`extract_domain` drops the port, which would
+        // collide loopback services). Headers are minted fresh before each
+        // subprocess: the peer's 60-second validity window must not expire
+        // mid-pass on a long batch fetch.
+        let credential_signer = self.credential_keys.clone().filter(|_| {
+            self.grasp08_peers.as_ref().is_some_and(|peers| {
+                crate::private::Grasp08Peers::peer_key(&url).is_some_and(|key| peers.contains(&key))
+            })
+        });
+        let repository_root = credential_signer
+            .as_ref()
+            .and_then(|_| crate::private::nip98::repository_root_from_fetch_url(&url));
+        let mut credential_warning_logged = false;
+        let credential_url = url.clone();
+        let mut fresh_auth_header = move || -> Option<String> {
+            let keys = credential_signer.as_ref()?;
+            let root = repository_root.as_deref()?;
+            match crate::private::nip98::repository_credential_header(keys, root) {
+                Ok(header) => Some(header),
+                Err(error) => {
+                    if !credential_warning_logged {
+                        credential_warning_logged = true;
+                        tracing::warn!(
+                            url = %credential_url,
+                            error = %error,
+                            "Failed to sign GRASP-08 credential; fetching unauthenticated"
+                        );
+                    }
+                    None
+                }
+            }
+        };
+
         // Phase 1: compare the remote's advertised refs against our
         // needs. Most needed OIDs are ref tips declared by state events
         // (PR tips appear under `refs/nostr/<event-id>`), so the
@@ -957,7 +1024,12 @@ impl SyncContext for RealSyncContext {
         // failed "not our ref" upload-pack round trip.
         let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
         let advertised = match run_observed_git_command(
-            hardened_git_command(&repo_path, resolve_pin.as_deref(), &ls_remote_args),
+            hardened_git_command(
+                &repo_path,
+                resolve_pin.as_deref(),
+                fresh_auth_header().as_deref(),
+                &ls_remote_args,
+            ),
             &domain,
             "ls_remote",
             role,
@@ -1022,7 +1094,12 @@ impl SyncContext for RealSyncContext {
             args.extend(advertised_tips.iter().cloned());
 
             match run_observed_git_command(
-                hardened_git_command(&repo_path, resolve_pin.as_deref(), &args),
+                hardened_git_command(
+                    &repo_path,
+                    resolve_pin.as_deref(),
+                    fresh_auth_header().as_deref(),
+                    &args,
+                ),
                 &domain,
                 "fetch_batch",
                 role,
@@ -1087,7 +1164,12 @@ impl SyncContext for RealSyncContext {
                 oid.clone(),
             ];
             match run_observed_git_command(
-                hardened_git_command(&repo_path, resolve_pin.as_deref(), &args),
+                hardened_git_command(
+                    &repo_path,
+                    resolve_pin.as_deref(),
+                    fresh_auth_header().as_deref(),
+                    &args,
+                ),
                 &domain,
                 "fetch_residual",
                 role,

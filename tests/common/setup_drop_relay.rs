@@ -1,5 +1,11 @@
 //! Relay fixture that disconnects the WebSocket during its NIP-11 setup fetch.
+//!
+//! Public syncing instances also probe NIP-11 *before* dialing (to detect
+//! GRASP-08 private services); that pre-dial probe is answered immediately.
+//! Only a NIP-11 request arriving while a WebSocket session is live triggers
+//! the drop-during-setup choreography under test.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +30,7 @@ impl SetupDropRelay {
         let (dropped_tx, dropped_rx) = watch::channel(false);
         let nip11_tx = Arc::new(nip11_tx);
         let dropped_tx = Arc::new(dropped_tx);
+        let active_websockets = Arc::new(AtomicUsize::new(0));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(async move {
@@ -35,6 +42,7 @@ impl SetupDropRelay {
                         let nip11_rx = nip11_rx.clone();
                         let dropped_tx = dropped_tx.clone();
                         let dropped_rx = dropped_rx.clone();
+                        let active_websockets = active_websockets.clone();
                         tokio::spawn(async move {
                             handle_connection(
                                 stream,
@@ -42,6 +50,7 @@ impl SetupDropRelay {
                                 nip11_rx,
                                 dropped_tx,
                                 dropped_rx,
+                                active_websockets,
                             )
                             .await;
                         });
@@ -78,6 +87,7 @@ async fn handle_connection(
     mut nip11_rx: watch::Receiver<bool>,
     dropped_tx: Arc<watch::Sender<bool>>,
     mut dropped_rx: watch::Receiver<bool>,
+    active_websockets: Arc<AtomicUsize>,
 ) {
     let mut header = [0_u8; 4096];
     let header_len = loop {
@@ -101,19 +111,25 @@ async fn handle_connection(
         let Ok(_websocket) = tokio_tungstenite::accept_async(stream).await else {
             return;
         };
+        active_websockets.fetch_add(1, Ordering::SeqCst);
         while !*nip11_rx.borrow() && nip11_rx.changed().await.is_ok() {}
         // Dropping the live socket is the behavior under test. Give the SDK a
         // bounded propagation window before allowing the HTTP setup to finish.
         drop(_websocket);
+        active_websockets.fetch_sub(1, Ordering::SeqCst);
         let _ = dropped_tx.send(true);
     } else {
         let mut request_bytes = vec![0_u8; header_len];
         if stream.read_exact(&mut request_bytes).await.is_err() {
             return;
         }
-        let _ = nip11_tx.send(true);
-        while !*dropped_rx.borrow() && dropped_rx.changed().await.is_ok() {}
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Pre-dial NIP-11 probes (no live WebSocket) are answered without
+        // choreography; only a fetch during a live session drops it.
+        if active_websockets.load(Ordering::SeqCst) > 0 {
+            let _ = nip11_tx.send(true);
+            while !*dropped_rx.borrow() && dropped_rx.changed().await.is_ok() {}
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let body = r#"{"limitation":{"max_subscriptions":20}}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

@@ -716,7 +716,9 @@ single `PrivateAccess` set is shared by the HTTP and WebSocket services and
 the announcement admission policy. Push authorization remains the GRASP-01
 policy; a private credential proves service membership but never grants push
 rights. The effective set combines operator-configured members with NIP-11
-owner pubkeys learned for relays referenced by accepted announcements.
+owner pubkeys learned for relays referenced by accepted announcements,
+provided those relays' NIP-11 also advertises GRASP-08 (a public relay's
+owner gains nothing legitimate from private membership).
 Purgatory-only announcements are excluded. Reconciliation reuses the accepted
 repository index and the NIP-11 fetch already performed once per connection
 session, so private mode adds neither outbound connections nor subscriptions.
@@ -753,6 +755,18 @@ unauthenticated contributor write surface. It also suppresses relay-owner
 identity publication: the kind 0/10002 events are seeded and served locally
 but never sent to the configured user-index relays, so a private relay does
 not advertise its existence.
+
+Outbound, every sync connection (public or private instance) answers NIP-42
+challenges with the relay owner key when available; a `restricted:` refusal
+after authentication parks the subscription via the existing policy-refusal
+machinery. Peers advertising GRASP-08 in NIP-11 split by our own mode: a
+public instance detects them with a pre-dial NIP-11 fetch and parks them
+without ever opening the WebSocket, while a private instance treats them as
+peers — NIP-42 on the WebSocket plus the GRASP-08 repository-root NIP-98
+credential on purgatory Git fetches from that peer's host, both signed with
+the relay owner key. Relays without a readable `supported_grasps` are
+ordinary sync targets. See
+[GRASP-08 design](grasp-08-private-service.md#outbound-authentication-and-sync-policy).
 
 One process currently represents one private collaborator service. Operators
 can run several independently configured instances for different groups. Fleet

@@ -2,6 +2,7 @@
 #![allow(dead_code)] // Test helpers may not be used in all test configurations
 #![allow(unused_imports)] // Re-exports may not be used in all test configurations
 
+pub mod auth_gating_relay;
 pub mod censoring_proxy;
 pub mod flapping_relay;
 pub mod git_server;
@@ -16,6 +17,7 @@ pub mod setup_drop_relay;
 pub mod sync_helpers;
 pub mod upload_pack_counting_proxy;
 
+pub use auth_gating_relay::{AuthGatingRelay, GateMode};
 pub use git_server::{SimpleGitServer, SmartGitServer};
 pub use mock_relay::MockRelay;
 pub use nip09_helpers::*;

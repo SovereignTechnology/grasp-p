@@ -256,6 +256,26 @@ impl RelayServer {
         // Start SyncManager for proactive sync (Phase 2: multi-relay support, Phase 3: health tracking)
         // Even without bootstrap relay, SyncManager discovers relays from stored announcements
         // Pass the already-registered sync metrics from Metrics to avoid duplicate registration
+        // GRASP-08 peer registry and credential signer exist only on private
+        // instances: a public mirror never authenticates its Git fetches.
+        let grasp08_peers = config
+            .private_mode
+            .then(crate::private::Grasp08Peers::default);
+        let outbound_credential_keys = if config.private_mode {
+            match config.relay_owner_keys() {
+                Ok(keys) => Some(keys),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "Relay owner key unavailable; outbound GRASP-08 credentials disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let sync_manager = SyncManager::new(
             config.sync_bootstrap_relay_url.clone(),
             config.domain.clone(),
@@ -266,6 +286,7 @@ impl RelayServer {
             PathBuf::from(config.effective_git_data_path()),
             metrics.as_ref().and_then(|m| m.sync_metrics().cloned()),
             private_access.clone(),
+            grasp08_peers.clone(),
         );
 
         if config.sync_bootstrap_relay_url.is_some() {
@@ -397,6 +418,8 @@ impl RelayServer {
             OutboundTargetPolicy {
                 allow_non_global: config.sync_allow_non_global_targets,
             },
+            grasp08_peers,
+            outbound_credential_keys,
         ));
 
         // Create throttle manager for rate limiting remote git servers

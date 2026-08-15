@@ -1785,7 +1785,12 @@ enum ConnectAttemptOutcome {
         advertised_default_limit: Option<usize>,
         advertised_max_subscriptions: Option<usize>,
         advertised_owner: Option<PublicKey>,
+        advertised_grasp08: bool,
     },
+    /// The relay's NIP-11 advertises the GRASP-08 private-service extension
+    /// while this instance is public. Detected before the WebSocket dial, so
+    /// no connection or AUTH exchange ever happened.
+    PrivateService,
     Failed(String),
 }
 
@@ -2464,9 +2469,19 @@ pub struct SyncManager {
     proactive_participant_authors: crate::nostr::policy::SharedProactiveParticipantAuthorIndex,
     /// GRASP-08 access shared with the inbound HTTP/WebSocket boundary.
     private_access: Option<PrivateAccess>,
+    /// Confirmed GRASP-08 peers shared with the purgatory Git fetch path.
+    ///
+    /// Only populated on private instances (the server passes `Some`): a
+    /// public mirror never presents credentials, and its GRASP-08 targets are
+    /// parked pre-dial instead.
+    grasp08_peers: Option<crate::private::Grasp08Peers>,
     /// Operator-configured members form the permanent base of private access.
     configured_private_members: HashSet<PublicKey>,
-    /// Latest NIP-11 owner learned for each connected repository relay.
+    /// Latest NIP-11 owner learned for each connected repository relay whose
+    /// NIP-11 also advertises GRASP-08. Only private-service owners can mint
+    /// derived membership: the owner of a public relay gains nothing
+    /// legitimate from private membership, since their relay enforces no
+    /// confidentiality for the repositories it mirrors.
     relay_owners: HashMap<String, PublicKey>,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
@@ -2492,6 +2507,13 @@ pub struct SyncManager {
     /// re-log the same forbidden target. Bounded by the set of distinct relay
     /// URLs in stored/purgatory events, which the indexes already carry.
     rejected_relay_targets: HashSet<String>,
+    /// Relays whose NIP-11 advertises GRASP-08 while this instance is public.
+    ///
+    /// Laundering guard: a public mirror must not present private credentials
+    /// to such a relay nor hammer a service that will never admit it, so the
+    /// target is parked before the dial (no WebSocket, no AUTH exchange).
+    /// Held in memory only, re-probed at most once per process lifetime.
+    private_service_relays: HashSet<String>,
     /// Last exact-ID dependency recovery attempt, used to bound retries.
     dependency_refetch_attempts: Arc<std::sync::Mutex<HashMap<EventId, Instant>>>,
     /// Events relays reported during negentropy reconciliation but failed to
@@ -2570,6 +2592,7 @@ impl SyncManager {
         data_path: PathBuf,
         sync_metrics: Option<SyncMetrics>,
         private_access: Option<PrivateAccess>,
+        grasp08_peers: Option<crate::private::Grasp08Peers>,
     ) -> Self {
         // Extract purgatory from write_policy for read-only access
         let purgatory = write_policy.purgatory().clone();
@@ -2622,6 +2645,7 @@ impl SyncManager {
             root_candidate_index: Arc::new(RwLock::new(HashMap::new())),
             proactive_participant_authors,
             private_access,
+            grasp08_peers,
             configured_private_members,
             relay_owners: HashMap::new(),
             relay_sync_index: Arc::new(RwLock::new(HashMap::new())),
@@ -2631,6 +2655,7 @@ impl SyncManager {
             nip65_discovery_only_relays: HashSet::new(),
             pagination_sessions: HashMap::new(),
             rejected_relay_targets: HashSet::new(),
+            private_service_relays: HashSet::new(),
             dependency_refetch_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             missing_event_recovery: Arc::new(std::sync::Mutex::new(
                 missing_events::MissingEventRecoveryIndex::default(),
@@ -5271,6 +5296,16 @@ impl SyncManager {
             }
         };
 
+        // A GRASP-08 private service is not a sync target for a public
+        // instance; never re-enter the connection lifecycle for it.
+        if !self.config.private_mode && self.private_service_relays.contains(&relay_url) {
+            tracing::trace!(
+                relay = %relay_url,
+                "Skipping registration of GRASP-08 private-service relay"
+            );
+            return false;
+        }
+
         // An ordinary sync registration upgrades a connection that was first
         // opened only for NIP-65 discovery. Discovery must never downgrade an
         // existing repository source.
@@ -5305,11 +5340,20 @@ impl SyncManager {
                 }
             }
 
-            // Get relay owner keys for NIP-42 authentication
-            let keys = self
-                .config
-                .relay_owner_keys()
-                .expect("relay_owner_keys should be available");
+            // The relay owner key answers outbound NIP-42 challenges. Sync
+            // must keep working without it, so a missing key degrades to an
+            // unauthenticated connection instead of aborting registration.
+            let keys = match self.config.relay_owner_keys() {
+                Ok(keys) => Some(keys),
+                Err(error) => {
+                    tracing::warn!(
+                        relay = %relay_url,
+                        error = %error,
+                        "Relay owner key unavailable; outbound NIP-42 authentication disabled for this connection"
+                    );
+                    None
+                }
+            };
 
             let connection = RelayConnection::new_with_database(
                 relay_url.clone(),
@@ -5399,6 +5443,13 @@ impl SyncManager {
             );
             return;
         }
+        if !self.config.private_mode && self.private_service_relays.contains(&relay_url) {
+            tracing::debug!(
+                relay = %relay_url,
+                "Suppressing connection attempt for GRASP-08 private-service relay"
+            );
+            return;
+        }
         let Some(result_tx) = self.connect_attempt_result_tx.clone() else {
             tracing::error!(relay = %relay_url, "Connection scheduler is not running");
             return;
@@ -5445,6 +5496,7 @@ impl SyncManager {
         let health_tracker = Arc::clone(&self.health_tracker);
         let semaphore = Arc::clone(&self.connect_attempt_semaphore);
         let timeout = self.health_tracker.base_backoff_secs();
+        let private_mode = self.config.private_mode;
         let Some(mut shutdown_rx) = self.shutdown_tx.as_ref().map(|sender| sender.subscribe())
         else {
             tracing::error!(relay = %relay_url, "Connection scheduler has no shutdown signal");
@@ -5459,17 +5511,29 @@ impl SyncManager {
                 return;
             };
             let outcome = tokio::select! {
-                result = connection.connect(timeout) => match result {
-                    Ok(()) => {
-                        let hints = connection.fetch_limit_hints().await;
-                        ConnectAttemptOutcome::Connected {
-                            advertised_default_limit: hints.default_limit,
-                            advertised_max_subscriptions: hints.max_subscriptions,
-                            advertised_owner: hints.owner,
+                outcome = async {
+                    // A GRASP-08 private service must be recognized before
+                    // the dial so no WebSocket or AUTH exchange ever reaches
+                    // it. Only public instances park, so only they pay the
+                    // extra pre-dial probe; session hints still come from
+                    // the post-connect fetch below, which runs on every
+                    // attempt so they stay per-session.
+                    if !private_mode && connection.preflight_limit_hints().await.grasp08 {
+                        return ConnectAttemptOutcome::PrivateService;
+                    }
+                    match connection.connect(timeout).await {
+                        Ok(()) => {
+                            let hints = connection.fetch_limit_hints().await;
+                            ConnectAttemptOutcome::Connected {
+                                advertised_default_limit: hints.default_limit,
+                                advertised_max_subscriptions: hints.max_subscriptions,
+                                advertised_owner: hints.owner,
+                                advertised_grasp08: hints.grasp08,
+                            }
                         }
-                    },
-                    Err(error) => ConnectAttemptOutcome::Failed(error),
-                },
+                        Err(error) => ConnectAttemptOutcome::Failed(error),
+                    }
+                } => outcome,
                 _ = shutdown_rx.recv() => {
                     connection.disconnect().await;
                     return;
@@ -6253,13 +6317,35 @@ impl SyncManager {
                 advertised_default_limit,
                 advertised_max_subscriptions,
                 advertised_owner,
+                advertised_grasp08,
             } => {
-                match advertised_owner {
+                // Only GRASP-08-advertising relays mint derived private
+                // membership: a public relay's owner gains nothing legitimate
+                // from private membership because their relay enforces no
+                // confidentiality for the mirrored repositories.
+                match advertised_owner.filter(|_| advertised_grasp08) {
                     Some(owner) => {
                         self.relay_owners.insert(result.relay_url.clone(), owner);
                     }
                     None => {
                         self.relay_owners.remove(&result.relay_url);
+                    }
+                }
+                // On a private instance, remember which hosts are GRASP-08
+                // peers so purgatory Git fetches from them carry the outbound
+                // NIP-98 credential.
+                if let Some(peers) = &self.grasp08_peers {
+                    if let Some(key) = crate::private::Grasp08Peers::peer_key(&result.relay_url) {
+                        if advertised_grasp08 {
+                            if peers.insert(key) {
+                                tracing::info!(
+                                    relay = %result.relay_url,
+                                    "Confirmed GRASP-08 peer; Git fetches will carry credentials"
+                                );
+                            }
+                        } else {
+                            peers.remove(&key);
+                        }
                     }
                 }
                 self.reconcile_private_membership().await;
@@ -6287,6 +6373,31 @@ impl SyncManager {
                         .insert(result.relay_url.clone(), Instant::now());
                 }
                 self.handle_connect_or_reconnect(&result.relay_url).await;
+            }
+            ConnectAttemptOutcome::PrivateService => {
+                if self.private_service_relays.insert(result.relay_url.clone()) {
+                    tracing::warn!(
+                        relay = %result.relay_url,
+                        "Relay advertises GRASP-08 private service; excluding it from public sync"
+                    );
+                }
+                // Retire the target like `complete_ended_session`, but without
+                // the re-registration path: the park is permanent for this
+                // process. No connected gauge to decrement - we never dialed.
+                self.relay_sync_index
+                    .write()
+                    .await
+                    .remove(&result.relay_url);
+                self.pending_sync_index
+                    .write()
+                    .await
+                    .remove(&result.relay_url);
+                self.connections.remove(&result.relay_url);
+                self.nip65_discovery_only_relays.remove(&result.relay_url);
+                self.health_tracker.forget_relay(&result.relay_url);
+                if let Some(ref metrics) = self.metrics {
+                    metrics.forget_relay(&result.relay_url);
+                }
             }
             ConnectAttemptOutcome::Failed(error) => {
                 if let Some(category) = naughty_list::NaughtyListTracker::classify_error(&error) {
@@ -7775,11 +7886,17 @@ impl SyncManager {
                 );
                 return;
             }
-            if reserve_authentication_retry(
-                &mut self.auth_required_attempts,
-                relay_url,
-                &subscription_id,
-            ) {
+            // A retry is only worth reserving when the SDK will actually
+            // answer the challenge and resubscribe; without an authenticator
+            // the subscription is already gone and a reserved retry would
+            // dangle until disconnect cleanup.
+            if connection.answers_auth_challenges()
+                && reserve_authentication_retry(
+                    &mut self.auth_required_attempts,
+                    relay_url,
+                    &subscription_id,
+                )
+            {
                 tracing::info!(
                     relay = %relay_url,
                     sub_id = %subscription_id,

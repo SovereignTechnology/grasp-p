@@ -5,6 +5,8 @@
 
 pub mod access;
 pub mod nip98;
+pub mod peers;
 pub mod ws_auth;
 
 pub use access::PrivateAccess;
+pub use peers::Grasp08Peers;
