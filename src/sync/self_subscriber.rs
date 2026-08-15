@@ -310,7 +310,7 @@ impl SelfSubscriber {
                         // the 1617/1618/1621 event IDs that get added when we receive
                         // root events via handle_root_event. See mod.rs:71 for details.
                         pending.replace_announcement_relays(repo_id.clone(), relays.clone());
-                        tracing::info!(
+                        tracing::debug!(
                             event_id = %event.id,
                             repo_id = %repo_id,
                             relay_count = relays.len(),
@@ -529,33 +529,12 @@ impl SelfSubscriber {
     /// then updates the RepoSyncIndex with the event ID AND adds to pending
     /// so that Layer 3 filters will be created in the next batch.
     async fn handle_root_event(&self, event: &Event, pending: &mut PendingUpdates) {
-        // Extract 'a' tag to find the repo addressable reference
-        let repo_a_tag = event.tags.iter().find(|tag| {
-            let tag_vec = tag.as_slice();
-            !tag_vec.is_empty() && tag_vec[0] == "a"
-        });
-
-        let repo_ref = match repo_a_tag {
-            Some(tag) => {
-                let tag_vec = tag.as_slice();
-                // Get first value from tag (the 'a' tag value at index 1)
-                if tag_vec.len() >= 2 {
-                    tag_vec[1].clone()
-                } else {
-                    tracing::warn!(
-                        event_id = %event.id,
-                        "Root event has 'a' tag but no content"
-                    );
-                    return;
-                }
-            }
-            None => {
-                tracing::warn!(
-                    event_id = %event.id,
-                    "Root event missing 'a' tag"
-                );
-                return;
-            }
+        let Some(repo_ref) = root_event_repo_ref(event) else {
+            tracing::debug!(
+                event_id = %event.id,
+                "Ignoring root event without a usable 'a' tag"
+            );
+            return;
         };
 
         // Look up repo in repo_sync_index - add root event directly and also to pending
@@ -619,9 +598,10 @@ impl SelfSubscriber {
             "Processing batch of repo updates"
         );
 
-        // Log what repos and relays we discovered
+        // Preserve per-repository details for diagnosis without flooding the
+        // default operational stream; the complete batch count remains info.
         for (repo_id, needs) in &updates {
-            tracing::info!(
+            tracing::debug!(
                 repo_id = %repo_id,
                 relay_count = needs.relays.len(),
                 relay_sample = ?needs.relays.iter().take(LOG_COLLECTION_SAMPLE_SIZE).collect::<Vec<_>>(),
@@ -686,7 +666,7 @@ impl SelfSubscriber {
                     "Failed to send AddFilters action"
                 );
             } else {
-                tracing::info!(
+                tracing::debug!(
                     relay = %relay_url,
                     "Marked relay dirty for SyncManager recomputation"
                 );
@@ -698,6 +678,16 @@ impl SelfSubscriber {
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+fn root_event_repo_ref(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.as_slice();
+        (values.first().is_some_and(|name| name == "a"))
+            .then(|| values.get(1).cloned())
+            .flatten()
+            .filter(|coordinate| !coordinate.is_empty())
+    })
+}
 
 /// Convert clone URL to relay URL
 ///
@@ -724,6 +714,33 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn root_event_repo_ref_requires_a_non_empty_coordinate() {
+        let keys = Keys::generate();
+        let missing = EventBuilder::new(Kind::GitIssue, "")
+            .finalize(&keys)
+            .expect("build event without repository tag");
+        let empty = EventBuilder::new(Kind::GitIssue, "")
+            .tag(Tag::custom("a", [""]))
+            .finalize(&keys)
+            .expect("build event with empty repository tag");
+
+        assert_eq!(root_event_repo_ref(&missing), None);
+        assert_eq!(root_event_repo_ref(&empty), None);
+    }
+
+    #[test]
+    fn root_event_repo_ref_returns_the_repository_coordinate() {
+        let keys = Keys::generate();
+        let coordinate = format!("30617:{}:logging", keys.public_key());
+        let event = EventBuilder::new(Kind::GitIssue, "")
+            .tag(Tag::custom("a", [coordinate.clone()]))
+            .finalize(&keys)
+            .expect("build event with repository tag");
+
+        assert_eq!(root_event_repo_ref(&event), Some(coordinate));
+    }
 
     #[tokio::test]
     async fn startup_reconstruction_promotes_candidates_only_after_batch_completion() {

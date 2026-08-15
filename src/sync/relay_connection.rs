@@ -576,7 +576,7 @@ pub struct RelayConnection {
     /// Local database for negentropy comparison (used for NIP-77 sync)
     database: Option<SharedDatabase>,
     /// Whether we've logged NIP-77 not supported for this relay (log once)
-    nip77_warning_logged: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    nip77_unsupported_logged: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether this relay supports NIP-77 negentropy (0 = unknown, 2 = confirmed not supported)
     nip77_supported: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Whether an in-session NIP-77 round exhausted the relay's query-rate
@@ -716,7 +716,9 @@ impl RelayConnection {
             policy,
             client,
             database: None,
-            nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            nip77_unsupported_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_query_rate_limited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -783,7 +785,9 @@ impl RelayConnection {
             policy,
             client,
             database: Some(database),
-            nip77_warning_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            nip77_unsupported_logged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             nip77_supported: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             nip77_query_rate_limited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -1744,13 +1748,19 @@ impl RelayConnection {
                             || msg.contains("negentropy");
 
                         if is_negentropy_notice {
-                            self.mark_negentropy_unsupported();
-
-                            tracing::info!(
-                                relay = %url,
-                                notice = %msg,
-                                "Relay does not support NIP-77 (negentropy)"
-                            );
+                            if self.mark_negentropy_unsupported_and_should_log() {
+                                tracing::info!(
+                                    relay = %url,
+                                    notice = %msg,
+                                    "Relay does not support NIP-77; using REQ+EOSE"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    relay = %url,
+                                    notice = %msg,
+                                    "Relay repeated its NIP-77 unsupported notice"
+                                );
+                            }
                         } else {
                             tracing::debug!(relay = %url, message = %msg, "Received NOTICE");
                         }
@@ -2506,6 +2516,15 @@ impl RelayConnection {
             .store(2, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Mark NIP-77 unsupported and return whether this is the first diagnostic
+    /// emitted by any clone of this connection.
+    fn mark_negentropy_unsupported_and_should_log(&self) -> bool {
+        self.mark_negentropy_unsupported();
+        !self
+            .nip77_unsupported_logged
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Fall back to paced REQs for the rest of this connection session.
     ///
     /// rust-nostr owns the messages within a NIP-77 round, while relays can
@@ -2703,17 +2722,17 @@ impl RelayConnection {
                 }
                 match classify_negentropy_failure(&e) {
                     NegentropyFailure::Unsupported => {
-                        self.mark_negentropy_unsupported();
-
-                        // Log warning only once per relay to avoid spam
-                        if !self
-                            .nip77_warning_logged
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                        {
-                            tracing::warn!(
+                        if self.mark_negentropy_unsupported_and_should_log() {
+                            tracing::info!(
                                 relay = %self.url,
                                 error = %e,
-                                "Relay does not support NIP-77, will fall back to REQ+EOSE"
+                                "Relay does not support NIP-77; using REQ+EOSE"
+                            );
+                        } else {
+                            tracing::debug!(
+                                relay = %self.url,
+                                error = %e,
+                                "Relay repeated its NIP-77 unsupported response"
                             );
                         }
                     }
@@ -2995,6 +3014,16 @@ mod tests {
             !error.contains("NOTICE"),
             "abort reason must not fabricate a NOTICE-based detection: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_capability_is_logged_once_across_connection_clones() {
+        let connection = permissive_connection("ws://127.0.0.1:1", Keys::generate());
+        let clone = connection.clone();
+
+        assert!(connection.mark_negentropy_unsupported_and_should_log());
+        assert!(!clone.mark_negentropy_unsupported_and_should_log());
+        assert!(!connection.supports_negentropy().await);
     }
 
     #[tokio::test]

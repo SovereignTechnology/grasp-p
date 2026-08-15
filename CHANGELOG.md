@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scope bare log levels to ngit-grasp while keeping dependencies at warnings;
   explicit tracing filter expressions remain unchanged.
+- Keep per-event discovery and validation details at debug, retain aggregate
+  sync outcomes at info, and report unsupported NIP-77 once per connection
+  instead of warning once per filter.
 - Metrics compatibility: removed the
   `ngit_sync_naughty_relay_info{relay,category,reason}` metric because its relay
   and raw reason labels were peer-controlled and unbounded. Use the unchanged

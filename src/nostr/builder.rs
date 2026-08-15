@@ -468,10 +468,10 @@ impl Nip34WritePolicy {
                 }
             }
             AnnouncementResult::Reject(reason) => {
-                tracing::warn!(
-                    "Rejected repository announcement {}: {}",
-                    event_id_str,
-                    reason
+                tracing::debug!(
+                    event_id = %event_id_str,
+                    reason = %reason,
+                    "Rejected repository announcement"
                 );
                 reject_invalid(reason)
             }
