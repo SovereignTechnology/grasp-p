@@ -1,4 +1,15 @@
-on: [push, pull_request]
+# Docs-only pushes are skipped: a push runs only when at least one changed
+# file falls outside the ignore list, so mixed code+docs pushes still run.
+# Tag pushes always run regardless of path filters, and pull_request stays
+# unfiltered because ngit-ci does not evaluate PR path filters yet (filtered
+# PR triggers would run unconditionally anyway).
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "work/**"
+  pull_request:
 
 name: Rust CI
 
