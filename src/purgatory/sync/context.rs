@@ -1232,39 +1232,62 @@ impl SyncContext for RealSyncContext {
 mod fetch_helper_tests {
     use super::*;
 
+    /// Hermetic git for these tests, immune to ambient git configuration
+    /// such as hooks, signing, and templates.
+    fn fixture_git() -> std::process::Command {
+        grasp_audit::git_command()
+    }
+
+    /// True once the descendant with this pid no longer runs. A process-group
+    /// kill leaves the orphaned descendant as an unreaped zombie whenever no
+    /// reaping ancestor is present (CI containers lack a reaping PID 1), and
+    /// `kill(pid, 0)` still succeeds for zombies, so an unreaped zombie must
+    /// also count as terminated.
+    fn descendant_terminated(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // The state field follows the parenthesised, possibly
+            // space-containing command name.
+            Ok(stat) => match stat.rsplit_once(") ") {
+                Some((_, rest)) => rest.starts_with('Z'),
+                None => false,
+            },
+        }
+    }
+
     fn create_source_repo(root: &Path, name: &str, contents: &str) -> (PathBuf, String) {
         let path = root.join(name);
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .args(["init", "--quiet", path.to_str().unwrap()])
             .status()
             .unwrap()
             .success());
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .current_dir(&path)
             .args(["config", "user.name", "Test"])
             .status()
             .unwrap()
             .success());
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .current_dir(&path)
             .args(["config", "user.email", "test@example.com"])
             .status()
             .unwrap()
             .success());
         std::fs::write(path.join("payload"), contents).unwrap();
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .current_dir(&path)
             .args(["add", "payload"])
             .status()
             .unwrap()
             .success());
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .current_dir(&path)
             .args(["commit", "--quiet", "-m", "fixture"])
             .status()
             .unwrap()
             .success());
-        let oid = std::process::Command::new("git")
+        let oid = fixture_git()
             .current_dir(&path)
             .args(["rev-parse", "HEAD"])
             .output()
@@ -1389,9 +1412,7 @@ mod fetch_helper_tests {
         let pid: i32 = pid.parse().unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
-            // Signal zero observes existence without changing process state.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            if !alive {
+            if descendant_terminated(pid) {
                 break;
             }
             assert!(
@@ -1444,7 +1465,7 @@ mod fetch_helper_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if unsafe { libc::kill(pid, 0) } != 0 {
+                if descendant_terminated(pid) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1477,14 +1498,14 @@ mod fetch_helper_tests {
         let (first_source, first_oid) = create_source_repo(temp.path(), "first", "first");
         let (second_source, second_oid) = create_source_repo(temp.path(), "second", "second");
         let target = temp.path().join("target.git");
-        assert!(std::process::Command::new("git")
+        assert!(fixture_git()
             .args(["init", "--bare", "--quiet", target.to_str().unwrap()])
             .status()
             .unwrap()
             .success());
 
         let fetch = |source: PathBuf, oid: String, role| {
-            let mut command = Command::new("git");
+            let mut command = Command::from(fixture_git());
             command
                 .current_dir(&target)
                 .args(["fetch", "--no-write-fetch-head", "--no-auto-maintenance"])
@@ -1502,7 +1523,7 @@ mod fetch_helper_tests {
         assert!(first.unwrap().status.success());
         assert!(second.unwrap().status.success());
         assert!(!target.join("FETCH_HEAD").exists());
-        let refs = std::process::Command::new("git")
+        let refs = fixture_git()
             .current_dir(&target)
             .args(["for-each-ref", "--format=%(refname)"])
             .output()
@@ -1511,14 +1532,14 @@ mod fetch_helper_tests {
         assert!(refs.stdout.is_empty(), "object fetch must not update refs");
 
         for oid in [first_oid, second_oid] {
-            assert!(std::process::Command::new("git")
+            assert!(fixture_git()
                 .current_dir(&target)
                 .args(["cat-file", "-e", &format!("{oid}^{{commit}}")])
                 .status()
                 .unwrap()
                 .success());
         }
-        let fsck = std::process::Command::new("git")
+        let fsck = fixture_git()
             .current_dir(&target)
             .args(["fsck", "--no-dangling"])
             .output()
