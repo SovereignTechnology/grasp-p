@@ -135,52 +135,58 @@ impl TestClient {
         Err("Connection loop exited unexpectedly".to_string())
     }
 
-    /// Send an event with retry logic.
+    /// Send an event with bounded retry for transient transport failures.
     ///
-    /// Attempts to send up to 3 times with exponential backoff:
-    /// - Attempt 1: immediate
-    /// - Attempt 2: after 200ms
-    /// - Attempt 3: after 400ms
+    /// Attempts to send up to 3 times with short backoff (200ms, then 400ms),
+    /// reconnecting between attempts. Only errors that leave delivery in doubt
+    /// (disconnection, transport failure, OK timeout) are retried; a relay
+    /// `OK false` rejection is deterministic and fails immediately so tests
+    /// cannot mask write-policy regressions.
     ///
     /// # Arguments
     /// * `event` - The signed event to send
     ///
     /// # Returns
     /// * `Ok(EventId)` on successful send
-    /// * `Err(String)` if all attempts fail
+    /// * `Err(String)` on relay rejection or after all attempts fail
     pub async fn send_event(&self, event: &Event) -> Result<EventId, String> {
-        let delays = [0, 200, 400]; // Exponential backoff in ms
+        let delays = [0, 200, 400]; // Backoff in ms
+        let mut last_error = String::new();
 
         for (attempt, delay_ms) in delays.iter().enumerate() {
             if *delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
             }
 
-            match self.client.send_event(event).await {
-                Ok(output) => {
-                    if !output.success.is_empty() {
-                        return Ok(output.value);
-                    }
-                    // Log failures for debugging
-                    if !output.failed.is_empty() {
-                        eprintln!(
-                            "  Send attempt {} - failures: {:?}",
-                            attempt + 1,
-                            output.failed
-                        );
-                        // Try reconnecting if relay disconnected
-                        self.client.connect().await;
-                    }
+            // Send through the single tracked relay rather than the pool so
+            // the SDK error kind survives and OK-false can be told apart from
+            // transport failures.
+            let relay = self
+                .client
+                .relay(self.relay_url.as_str())
+                .await
+                .map_err(|e| format!("Failed to look up relay {}: {}", self.relay_url, e))?
+                .ok_or_else(|| format!("Relay {} missing from client pool", self.relay_url))?;
+
+            match relay.send_event(event).await {
+                Ok(output) => return Ok(*output.id()),
+                Err(e) if e.kind() == ErrorKind::Rejected => {
+                    return Err(format!("Relay rejected event {}: {}", event.id, e));
                 }
                 Err(e) => {
-                    eprintln!("  Send attempt {} - error: {}", attempt + 1, e);
+                    eprintln!("  Send attempt {} - transient error: {}", attempt + 1, e);
+                    last_error = e.to_string();
+                    // Re-establish the connection before the next attempt.
+                    let _ = self.connect().await;
                 }
             }
         }
 
         Err(format!(
-            "Failed to send event {} after 3 attempts",
-            event.id
+            "Failed to send event {} after {} attempts: {}",
+            event.id,
+            delays.len(),
+            last_error
         ))
     }
 

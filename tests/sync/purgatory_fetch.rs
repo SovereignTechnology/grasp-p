@@ -158,8 +158,10 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .add_relay(source.url())
         .await
         .expect("add source relay");
-    source_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    source_client
+        .connect()
+        .and_wait(Duration::from_secs(30))
+        .await;
     source_client
         .send_event(&source_announcement)
         .await
@@ -236,8 +238,10 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .add_relay(mock.url())
         .await
         .expect("add mock relay");
-    mock_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    mock_client
+        .connect()
+        .and_wait(Duration::from_secs(30))
+        .await;
     mock_client
         .send_event(&syncing_announcement)
         .await
