@@ -69,8 +69,12 @@ async fn test_layer2_sync_with_lowercase_a_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue with lowercase 'a' tag
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -103,7 +107,7 @@ async fn test_layer2_sync_with_lowercase_a_tag() {
         .author(keys.public_key())
         .id(issue_id);
 
-    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(5)).await;
+    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(30)).await;
 
     println!("Issue {} synced to relay_b: {}", issue_id, synced);
 
@@ -156,8 +160,12 @@ async fn test_layer2_sync_with_uppercase_a_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue with uppercase 'A' tag
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -193,7 +201,7 @@ async fn test_layer2_sync_with_uppercase_a_tag() {
         .author(keys.public_key())
         .id(issue_id);
 
-    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(5)).await;
+    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(30)).await;
 
     println!("Issue {} synced to relay_b: {}", issue_id, synced);
 
@@ -245,8 +253,12 @@ async fn test_layer2_sync_with_q_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue with 'q' tag
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -278,7 +290,7 @@ async fn test_layer2_sync_with_q_tag() {
         .author(keys.public_key())
         .id(issue_id);
 
-    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(5)).await;
+    let synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(30)).await;
 
     println!("Issue {} synced to relay_b: {}", issue_id, synced);
 
@@ -340,8 +352,12 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue (parent event)
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -363,7 +379,7 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
     // 5. Wait for issue to sync to relay_b
     let issue_filter = Filter::new().kind(Kind::GitIssue).id(issue_id);
     let issue_synced =
-        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(30)).await;
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
@@ -400,7 +416,7 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
         .id(reply_id);
 
     let reply_synced =
-        wait_for_event_on_relay(relay_b.url(), reply_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), reply_filter, Duration::from_secs(30)).await;
 
     println!("Reply {} synced to relay_b: {}", reply_id, reply_synced);
 
@@ -452,8 +468,12 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue (parent event)
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -475,7 +495,7 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
     // 5. Wait for issue to sync to relay_b
     let issue_filter = Filter::new().kind(Kind::GitIssue).id(issue_id);
     let issue_synced =
-        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(30)).await;
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
@@ -513,7 +533,7 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
         .id(comment_id);
 
     let comment_synced =
-        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), comment_filter, Duration::from_secs(30)).await;
 
     println!(
         "Comment {} synced to relay_b: {}",
@@ -568,8 +588,12 @@ async fn test_layer3_sync_with_q_tag() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
-    // 3. Wait for discovery
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. Wait for discovery: events published before the syncing relay has
+    // connected to its peer can only be picked up by later recovery passes,
+    // so wait on the observable connection rather than a fixed sleep.
+    wait_for_sync_connection(relay_b.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("relay_b should establish a sync connection after discovery");
 
     // 4. Create and send Layer 2 issue (parent event)
     let repo_coordinate = repo_coord(&keys, repo_id);
@@ -591,7 +615,7 @@ async fn test_layer3_sync_with_q_tag() {
     // 5. Wait for issue to sync to relay_b
     let issue_filter = Filter::new().kind(Kind::GitIssue).id(issue_id);
     let issue_synced =
-        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(30)).await;
     println!("Issue synced to relay_b: {}", issue_synced);
     assert!(issue_synced, "Layer 2 issue should sync first");
 
@@ -628,7 +652,7 @@ async fn test_layer3_sync_with_q_tag() {
         .id(quote_id);
 
     let quote_synced =
-        wait_for_event_on_relay(relay_b.url(), quote_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), quote_filter, Duration::from_secs(30)).await;
 
     println!("Quote {} synced to relay_b: {}", quote_id, quote_synced);
 
