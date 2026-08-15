@@ -28,15 +28,31 @@ use crate::common::{
 // Format and Availability Tests (Keepers)
 // ============================================================================
 
+/// Poll the metrics endpoint until it responds, returning the first scrape.
+///
+/// The HTTP endpoint can come up slightly after the relay's WebSocket
+/// listener, so a bounded poll replaces the fixed startup sleeps these tests
+/// used to rely on.
+async fn wait_for_metrics_ready(relay_url: &str, timeout: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(metrics) = fetch_metrics(relay_url).await {
+            return metrics;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "metrics endpoint at {relay_url} did not become ready before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Test that Prometheus text format is valid
 #[tokio::test]
 async fn test_prometheus_format_valid() {
     let relay = TestRelay::start().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let metrics = fetch_metrics(relay.url())
-        .await
-        .expect("Failed to fetch metrics");
+    let metrics = wait_for_metrics_ready(relay.url(), Duration::from_secs(30)).await;
 
     relay.stop().await;
 
@@ -65,9 +81,10 @@ async fn test_metrics_availability_during_sync() {
     let source_relay = TestRelay::start().await;
     let sync_relay = TestRelay::start_with_sync(Some(source_relay.url().into())).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_metrics_ready(sync_relay.url(), Duration::from_secs(30)).await;
 
-    // Make multiple metrics requests while sync is active
+    // Make multiple metrics requests while sync is active. The 200ms gap is
+    // deliberate scrape spacing, not a wait for a condition.
     for i in 0..3 {
         let metrics = fetch_metrics(sync_relay.url()).await;
         assert!(
@@ -91,7 +108,7 @@ async fn test_concurrent_metrics_requests() {
     let source_relay = TestRelay::start().await;
     let sync_relay = TestRelay::start_with_sync(Some(source_relay.url().into())).await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_for_metrics_ready(sync_relay.url(), Duration::from_secs(30)).await;
 
     // Clone the URL string so we have an owned value for spawned tasks
     let sync_url: String = sync_relay.url().to_string();
@@ -135,11 +152,8 @@ async fn test_concurrent_metrics_requests() {
 #[tokio::test]
 async fn test_metric_values_are_numeric() {
     let relay = TestRelay::start().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let metrics = fetch_metrics(relay.url())
-        .await
-        .expect("Should fetch metrics");
+    let metrics = wait_for_metrics_ready(relay.url(), Duration::from_secs(30)).await;
 
     relay.stop().await;
 
@@ -276,9 +290,18 @@ async fn test_startup_sync_event_count() {
         setup_announcement_on_relay(&syncing_relay, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on syncing relay (triggers discovery of source)");
 
-    // 9. Wait for discovery + sync to complete
-    println!("Waiting 5s for discovery and sync...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // 9. Wait for discovery + sync on the observable condition the test
+    // cares about: the patches arriving on the syncing relay.
+    let patches_filter = Filter::new()
+        .kind(Kind::Custom(Kind::GitPatch.as_u16()))
+        .author(keys.public_key());
+    let patches_synced = crate::common::sync_helpers::wait_for_event_on_relay(
+        syncing_relay.url(),
+        patches_filter,
+        Duration::from_secs(30),
+    )
+    .await;
+    println!("Patches synced to syncing relay: {}", patches_synced);
 
     // 10. Fetch and parse metrics
     let raw_metrics = fetch_metrics(syncing_relay.url())
@@ -304,19 +327,6 @@ async fn test_startup_sync_event_count() {
     println!("Relays tracked: {:?}", tracked);
     println!("Relays connected: {:?}", connected);
     println!("Events synced total: {:?}", events_synced);
-
-    // 12. Verify patches actually synced (functional check)
-    let filter = Filter::new()
-        .kind(Kind::Custom(Kind::GitPatch.as_u16()))
-        .author(keys.public_key());
-
-    let patches_synced = crate::common::sync_helpers::wait_for_event_on_relay(
-        syncing_relay.url(),
-        filter,
-        Duration::from_secs(2),
-    )
-    .await;
-    println!("Patches synced to syncing relay: {}", patches_synced);
 
     // Cleanup
     syncing_relay.stop().await;
@@ -364,26 +374,29 @@ async fn test_connection_failure_increments_counter() {
     let mut harness = MetricsTestHarness::with_sources(0).await; // No sources
     harness.start_syncing_relay_to_nowhere().await;
 
-    // Wait for initial connection attempt to the unreachable bootstrap relay
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let metrics = harness.get_metrics().await.unwrap();
-
-    // Failure counter should be recorded when connecting to unreachable relay
-    let failures = metrics
-        .counter(
-            "ngit_sync_connection_attempts_total",
-            &[("result", "failure")],
-        )
-        .unwrap_or(0);
+    // Poll for the failure counter recorded by the connection attempt to the
+    // unreachable bootstrap relay, bounded rather than sleeping a fixed time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let failures = loop {
+        let metrics = harness.get_metrics().await.unwrap();
+        let failures = metrics
+            .counter(
+                "ngit_sync_connection_attempts_total",
+                &[("result", "failure")],
+            )
+            .unwrap_or(0);
+        if failures >= 1 {
+            break failures;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Expected at least 1 connection failure to be recorded, got {}",
+            failures
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
 
     println!("Connection failures recorded: {}", failures);
-
-    assert!(
-        failures >= 1,
-        "Expected at least 1 connection failure to be recorded, got {}",
-        failures
-    );
 
     harness.stop_all().await;
 }
@@ -473,16 +486,19 @@ async fn test_live_sync_event_count() {
     client.disconnect().await;
     println!("Two patches sent to source relay (live mode)");
 
-    // Wait for live events to be processed and metrics updated
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    // Fetch metrics from syncing relay
-    let raw_metrics = fetch_metrics(&sync_url)
-        .await
-        .expect("Failed to fetch metrics");
-    let metrics = ParsedMetrics::parse(&raw_metrics);
-
-    let synced_count = metrics.events_synced_total();
+    // Poll for the live events being processed and counted in metrics,
+    // bounded rather than sleeping a fixed time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let synced_count = loop {
+        let raw_metrics = fetch_metrics(&sync_url)
+            .await
+            .expect("Failed to fetch metrics");
+        let synced_count = ParsedMetrics::parse(&raw_metrics).events_synced_total();
+        if synced_count.is_some_and(|count| count >= 2) || tokio::time::Instant::now() >= deadline {
+            break synced_count;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     println!("Events synced total: {:?}", synced_count);
 
     // Cleanup
@@ -521,7 +537,7 @@ async fn test_relay_connected_status() {
 
     // Stop the source
     harness.stop_source(0).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let metrics = loop {
         let metrics = harness.get_metrics().await.unwrap();
         if metrics.relay_connected(&source_url).is_none() {
@@ -559,28 +575,24 @@ async fn test_health_state_degrades_on_failure() {
     let mut harness = MetricsTestHarness::with_sources(0).await;
     harness.start_syncing_relay_to_nowhere().await;
 
-    // Initially might be trying to connect
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let initial = harness.get_metrics().await.unwrap();
-
-    // After several failures, should degrade (status = 2 or 3)
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let later = harness.get_metrics().await.unwrap();
-
-    // Get the relay status (1=healthy, 2=degraded, 3=dead)
-    let status = later.gauge("ngit_sync_relay_status", &[]).unwrap_or(0);
-
-    println!(
-        "Initial metrics: {:?}",
-        initial.gauge("ngit_sync_relay_status", &[])
-    );
-    println!("Later status: {}", status);
-
-    assert!(
-        status >= 2,
-        "Health should degrade to 2 (degraded) or 3 (dead), got {}",
-        status
-    );
+    // Poll the relay status gauge (1=healthy, 2=degraded, 3=dead) until it
+    // reflects the repeated connection failures, bounded rather than sleeping
+    // a fixed time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let metrics = harness.get_metrics().await.unwrap();
+        let status = metrics.gauge("ngit_sync_relay_status", &[]).unwrap_or(0);
+        if status >= 2 {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Health should degrade to 2 (degraded) or 3 (dead), got {}",
+            status
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    println!("Degraded status: {}", status);
 
     harness.stop_all().await;
 }
@@ -617,13 +629,14 @@ async fn test_multi_source_aggregate_counts() {
     );
     harness.submit_events(0, &[announcement]).await.unwrap();
 
-    // Now start syncing relay - it should sync the existing announcement
+    // Now start syncing relay - it should sync the existing announcement.
+    // The loop below already polls for the connected state, so no fixed
+    // settling sleep is needed first.
     harness
         .start_syncing_relay_on_reservation(0, sync_reservation)
         .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let metrics = loop {
         let metrics = harness.get_metrics().await.unwrap();
         if metrics.relays_tracked_total() == Some(1) && metrics.relays_connected_total() == Some(1)

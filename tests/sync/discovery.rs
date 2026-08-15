@@ -106,14 +106,13 @@ async fn test_discovers_layer3_via_layer2() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b (should trigger discovery of relay_a)");
 
-    // 9. Wait for relay_b to discover relay_a and sync the patch
-    println!("Waiting 3s for relay_b to discover relay_a and sync patch...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // 10. Verify patch was synced to relay_b
+    // 9/10. Verify the patch syncs to relay_b. The bounded poll on the synced
+    // event replaces a fixed discovery sleep, which is not a reliable proxy
+    // under CI load.
     let filter = Filter::new().kind(Kind::GitPatch).author(keys.public_key());
 
-    let patch_synced = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(5)).await;
+    let patch_synced =
+        wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(30)).await;
 
     if patch_synced {
         println!(
@@ -212,14 +211,12 @@ async fn test_relay_discovery_via_announcements_with_historic_sync() {
         setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_b (should trigger discovery of relay_a)");
 
-    // 7. Wait for sync
-    println!("Waiting 3s for Layer 2 sync...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // 8. Verify Layer 2 event synced to relay_b
+    // 7/8. Verify the Layer 2 event syncs to relay_b. The bounded poll on the
+    // synced event replaces a fixed discovery sleep, which is not a reliable
+    // proxy under CI load.
     let issue_filter = Filter::new().kind(Kind::GitIssue).author(keys.public_key());
     let issue_synced =
-        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(relay_b.url(), issue_filter, Duration::from_secs(30)).await;
 
     println!("Sync result:");
     println!("  Issue {} synced: {}", issue_id, issue_synced);

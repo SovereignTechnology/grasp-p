@@ -33,7 +33,7 @@ async fn test_bootstrap_syncs_existing_layer2_events() {
         .author(result.maintainer_keys.public_key());
 
     let synced =
-        wait_for_event_on_relay(result.syncing_relay.url(), filter, Duration::from_secs(5)).await;
+        wait_for_event_on_relay(result.syncing_relay.url(), filter, Duration::from_secs(30)).await;
 
     // Cleanup
     result.syncing_relay.stop().await;
@@ -70,15 +70,15 @@ async fn test_relay_replays_events_after_restart() {
     let synced_first = wait_for_event_on_relay(
         result.syncing_relay.url(),
         filter.clone(),
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await;
 
     println!("First sync check: {}", synced_first);
 
-    // Stop syncing relay (simulates restart)
+    // Stop syncing relay (simulates restart). `stop` waits on the process, so
+    // the replacement instance can start immediately.
     result.syncing_relay.stop().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Restart syncing relay (new instance with same bootstrap config)
     // Note: The new syncing relay will have a different domain, so it may not
@@ -90,10 +90,10 @@ async fn test_relay_replays_events_after_restart() {
         syncing_new.domain()
     );
 
-    // Wait for re-sync
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify announcement is available on restarted syncing relay
+    // Check whether the announcement re-syncs to the restarted relay. The
+    // bounded poll is kept short because this outcome is informational only:
+    // the new instance has a different domain, so the announcement may
+    // legitimately never be accepted (see the note below).
     let synced_after_restart =
         wait_for_event_on_relay(syncing_new.url(), filter, Duration::from_secs(5)).await;
 
@@ -135,7 +135,7 @@ async fn test_announcement_not_listing_relay_is_not_synced() {
     let keys = Keys::generate();
 
     // Wait for sync connection to establish
-    match wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(5)).await {
+    match wait_for_sync_connection(syncing.url(), 1, Duration::from_secs(30)).await {
         Ok(()) => println!("Sync connection established (verified via metrics)"),
         Err(e) => println!("Sync connection check: {} (continuing with test)", e),
     }
@@ -168,15 +168,14 @@ async fn test_announcement_not_listing_relay_is_not_synced() {
 
     client.disconnect().await;
 
-    // Wait for potential sync attempt
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify announcement did NOT sync to syncing relay
+    // Verify announcement did NOT sync to syncing relay. The bounded wait is
+    // the observation window for a wrongful sync; the sync connection was
+    // already confirmed above, so any policy failure has this long to appear.
     let filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
         .author(keys.public_key());
 
-    let synced = wait_for_event_on_relay(syncing.url(), filter, Duration::from_secs(2)).await;
+    let synced = wait_for_event_on_relay(syncing.url(), filter, Duration::from_secs(5)).await;
 
     // Cleanup
     syncing.stop().await;
@@ -246,8 +245,17 @@ async fn test_history_sync_without_negentropy() {
         announcement_id
     );
 
-    // Wait to ensure event is stored
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Confirm the announcement is stored and served by the source before the
+    // syncing relay ever connects, so this genuinely exercises history sync.
+    assert!(
+        wait_for_event_on_relay(
+            source.url(),
+            Filter::new().id(announcement.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "announcement should be served by the source before the syncing relay starts"
+    );
 
     // NOW start syncing relay on the reserved port, with negentropy DISABLED
     // This syncing relay has never connected before - it needs to do HISTORY sync
@@ -263,15 +271,13 @@ async fn test_history_sync_without_negentropy() {
         syncing.domain()
     );
 
-    // Wait for history sync to complete (using REQ+EOSE, not negentropy)
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify announcement synced to syncing relay via HISTORY sync
+    // Verify announcement syncs to the syncing relay via HISTORY sync. The
+    // bounded poll replaces a fixed sleep plus short deadline.
     let filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
         .author(keys.public_key());
 
-    let synced = wait_for_event_on_relay(syncing.url(), filter, Duration::from_secs(5)).await;
+    let synced = wait_for_event_on_relay(syncing.url(), filter, Duration::from_secs(30)).await;
 
     // Cleanup
     syncing.stop().await;
@@ -368,8 +374,17 @@ async fn test_pagination_for_large_historic_sync() {
         .expect("Failed to send announcement to source");
     println!("Announcement sent to source");
 
-    // Wait for announcement to be stored
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Confirm the announcement is stored before sending the issues that
+    // reference it.
+    assert!(
+        wait_for_event_on_relay(
+            source.url(),
+            Filter::new().id(announcement.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "announcement should be stored on the source relay"
+    );
 
     // Send all 40 issue events to source (before syncing relay starts)
     println!("Sending {} issues to source relay...", issue_events.len());
@@ -391,8 +406,18 @@ async fn test_pagination_for_large_historic_sync() {
 
     client.disconnect().await;
 
-    // Wait to ensure all events are stored
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Confirm the last-sent issue is stored so every event exists before the
+    // syncing relay connects.
+    let last_issue = issue_events.last().expect("at least one issue");
+    assert!(
+        wait_for_event_on_relay(
+            source.url(),
+            Filter::new().id(last_issue.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "all issues should be stored on the source relay"
+    );
 
     // NOW start syncing relay on the reserved port, with negentropy DISABLED
     // This forces it to use REQ+EOSE historic sync with pagination
@@ -408,17 +433,14 @@ async fn test_pagination_for_large_historic_sync() {
         syncing.domain()
     );
 
-    // Wait for historic sync with pagination to complete
-    println!("Waiting for historic sync with pagination to complete...");
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    // Verify announcement synced
+    // Verify announcement synced. The bounded poll replaces a fixed
+    // "wait for pagination" sleep plus short deadline.
     let announcement_filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
         .author(keys.public_key());
 
     let announcement_synced =
-        wait_for_event_on_relay(syncing.url(), announcement_filter, Duration::from_secs(3)).await;
+        wait_for_event_on_relay(syncing.url(), announcement_filter, Duration::from_secs(30)).await;
 
     // Verify ALL 40 issues synced
     let issues_filter = Filter::new().kind(Kind::GitIssue).author(keys.public_key());
@@ -432,18 +454,21 @@ async fn test_pagination_for_large_historic_sync() {
         .add_relay(syncing.url())
         .await
         .expect("Failed to add syncing relay to client");
-    client.connect().await;
+    client.connect().and_wait(Duration::from_secs(30)).await;
 
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let synced_issues = client
-        .fetch_events(issues_filter)
-        .timeout(Duration::from_secs(5))
-        .await
-        .expect("Failed to fetch issues from syncing relay");
-
-    let synced_count = synced_issues.len();
+    // Poll until every issue has paginated across, up to a bounded deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let synced_count = loop {
+        let synced_issues = client
+            .fetch_events(issues_filter.clone())
+            .timeout(Duration::from_secs(5))
+            .await
+            .expect("Failed to fetch issues from syncing relay");
+        if synced_issues.len() >= 40 || tokio::time::Instant::now() >= deadline {
+            break synced_issues.len();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     println!("Synced {} out of 40 expected issues", synced_count);
 
     client.disconnect().await;

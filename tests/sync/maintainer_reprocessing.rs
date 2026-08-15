@@ -508,6 +508,8 @@ async fn test_invitee_only_acceptance_recovers_cold_owner_invitation() {
         .await,
         "Invitee-only server should reject and index the owner invitation"
     );
+    // Passage of the configured one-second hot-cache TTL is required so the
+    // acceptance below exercises cold exact-ID recovery, not the hot copy.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let pushes_before_acceptance = [
@@ -767,6 +769,8 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_before_acceptance(
         .await;
     }
 
+    // Deliberate timestamp spacing: the invitee events below are dated one
+    // second after the owner state, so let wall-clock time pass that mark.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let invitee_git = tempfile::tempdir().expect("Failed to create invitee repository directory");
@@ -982,6 +986,8 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         .await;
     }
 
+    // Deliberate timestamp spacing: the owner events below are dated one
+    // second after the invitee state, so let wall-clock time pass that mark.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let owner_git = tempfile::tempdir().expect("Failed to create owner repository directory");
@@ -1062,6 +1068,8 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         .await,
         "Invitee-only server should process the unilateral invitation before acceptance"
     );
+    // Deliberate observation window: give a wrongful state replacement time
+    // to manifest before asserting the invitee state is still intact.
     tokio::time::sleep(Duration::from_millis(500)).await;
     for relay in invitee_servers {
         assert_exact_event_served(relay, &invitee_state, "Invitee state before acceptance").await;
@@ -1395,9 +1403,22 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
     let relay_b = TestRelay::start_with_sync(Some(relay_a.url().to_string())).await;
     println!("relay_b started at {}", relay_b.url());
 
-    // Give relay_b's SyncManager time to complete the initial negentropy sync with relay_a.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("✓ relay_b synced from relay_a (maintainer announcement should be in hot cache)");
+    // Wait for relay_b's initial negentropy sync on its observable outcome:
+    // the rejected maintainer announcement is logged by its note ID.
+    let maintainer_note = maintainer_announcement
+        .id
+        .to_bech32()
+        .expect("Failed to encode maintainer announcement ID");
+    assert!(
+        wait_for_log(
+            &relay_b.log_path(),
+            &maintainer_note,
+            Duration::from_secs(30),
+        )
+        .await,
+        "relay_b should sync, reject and index the maintainer announcement"
+    );
+    println!("✓ relay_b synced from relay_a (maintainer announcement in hot cache)");
 
     let start = std::time::Instant::now();
 
@@ -1441,19 +1462,15 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
         "✓ Owner git data pushed to relay_b (owner announcement promoted, hot cache re-processed)"
     );
 
-    // Step 5: Wait briefly for async processing to complete.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let elapsed = start.elapsed();
-
-    // Step 6: Verify both announcements are in relay_b's database.
+    // Step 5/6: Verify both announcements are in relay_b's database. Bounded
+    // polls on the served events replace a fixed post-push sleep.
     let owner_filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
         .author(owner_keys.public_key())
         .identifier(identifier);
 
     let owner_found =
-        wait_for_event_on_relay(relay_b.url(), owner_filter, Duration::from_secs(2)).await;
+        wait_for_event_on_relay(relay_b.url(), owner_filter, Duration::from_secs(30)).await;
     assert!(owner_found, "Owner announcement should be in relay_b");
 
     let maintainer_filter = Filter::new()
@@ -1462,12 +1479,14 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
         .identifier(identifier);
 
     let maintainer_found =
-        wait_for_event_on_relay(relay_b.url(), maintainer_filter, Duration::from_secs(2)).await;
+        wait_for_event_on_relay(relay_b.url(), maintainer_filter, Duration::from_secs(30)).await;
     assert!(
         maintainer_found,
         "Maintainer announcement should be re-processed and accepted in relay_b"
     );
 
+    // Immediate hot-cache re-processing must beat the scheduled retry path.
+    let elapsed = start.elapsed();
     assert!(
         elapsed.as_secs() < 15,
         "Re-processing should happen in <15 seconds, took {:?}",
@@ -1514,6 +1533,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
     // land in relay_a's DB.  Each announcement lists relay_a only, so relay_b will reject
     // them when syncing (no owner announcement in relay_b's DB yet).
     let mut git_dirs = Vec::new();
+    let mut maintainer_notes = Vec::new();
     for (idx, maintainer_keys) in [&maintainer1_keys, &maintainer2_keys, &maintainer3_keys]
         .iter()
         .enumerate()
@@ -1541,6 +1561,12 @@ async fn test_multiple_maintainers_all_reprocessed() {
         ])
         .finalize(*maintainer_keys)
         .unwrap();
+        maintainer_notes.push(
+            announcement
+                .id
+                .to_bech32()
+                .expect("Failed to encode maintainer announcement ID"),
+        );
         send_to_relay(&relay_a, &announcement).await.unwrap();
         // Use push_unique_git_data_to_relay so each maintainer gets a distinct commit
         // hash.  Identical hashes cause git to skip pack transfer when the object
@@ -1584,11 +1610,15 @@ async fn test_multiple_maintainers_all_reprocessed() {
     let relay_b = TestRelay::start_with_sync(Some(relay_a.url().to_string())).await;
     println!("relay_b started at {}", relay_b.url());
 
-    // Give relay_b's SyncManager time to complete the initial negentropy sync with relay_a.
-    // The negentropy sync completes within ~200ms (NGIT_TEST=1 sets batch window to 200ms), but we
-    // allow extra time for slow CI environments.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    println!("✓ relay_b synced from relay_a (maintainer announcements should be in hot cache)");
+    // Wait for relay_b's initial negentropy sync on its observable outcome:
+    // every rejected maintainer announcement is logged by its note ID.
+    for note in &maintainer_notes {
+        assert!(
+            wait_for_log(&relay_b.log_path(), note, Duration::from_secs(30)).await,
+            "relay_b should sync, reject and index maintainer announcement {note}"
+        );
+    }
+    println!("✓ relay_b synced from relay_a (maintainer announcements in hot cache)");
 
     // Step 3: Send owner announcement to relay_b → goes to purgatory.
     let owner_npub = owner_keys
@@ -1634,10 +1664,8 @@ async fn test_multiple_maintainers_all_reprocessed() {
         push_git_data_to_relay(&relay_b, &owner_keys, identifier, &[&relay_b.domain()]).await;
     println!("✓ Owner git data pushed to relay_b (hot-cache re-processing should fire)");
 
-    // Step 5: Wait briefly for async processing to complete.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Step 6: Verify all four announcements are in relay_b's database.
+    // Step 5/6: Verify all four announcements are in relay_b's database.
+    // Bounded polls on the served events replace a fixed post-push sleep.
     for (name, keys) in [
         ("owner", &owner_keys),
         ("maintainer1", &maintainer1_keys),
@@ -1649,7 +1677,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
             .author(keys.public_key())
             .identifier(identifier);
 
-        let found = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(2)).await;
+        let found = wait_for_event_on_relay(relay_b.url(), filter, Duration::from_secs(30)).await;
         assert!(found, "{} announcement should be in relay_b", name);
     }
 
@@ -1695,9 +1723,10 @@ async fn test_invalid_maintainer_pubkey_handled_gracefully() {
             .finalize(&maintainer_keys)
             .unwrap();
 
-    // Send maintainer announcement - expect it to be rejected
+    // Send maintainer announcement - expect it to be rejected. `send_event`
+    // waits for the relay's OK response, so the rejection has already been
+    // processed when it returns.
     let _ = client.send_event(&maintainer_announcement).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 2: Send owner announcement with INVALID maintainer hex, then push git data.
     // The announcement goes to purgatory first; the git push promotes it.
@@ -1728,16 +1757,16 @@ async fn test_invalid_maintainer_pubkey_handled_gracefully() {
     send_to_relay(&relay, &owner_announcement).await.unwrap();
     let _git_dir =
         push_git_data_to_relay(&relay, &owner_keys, identifier, &[&relay.domain()]).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Step 3: Verify owner announcement accepted, maintainer not re-processed
+    // Step 3: Verify owner announcement accepted, maintainer not re-processed.
+    // The bounded poll on the served announcement replaces a fixed sleep.
     let owner_filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
         .author(owner_keys.public_key())
         .identifier(identifier);
 
     let owner_found =
-        wait_for_event_on_relay(relay.url(), owner_filter, Duration::from_secs(2)).await;
+        wait_for_event_on_relay(relay.url(), owner_filter, Duration::from_secs(30)).await;
     assert!(
         owner_found,
         "Owner announcement should be accepted despite invalid maintainer"
