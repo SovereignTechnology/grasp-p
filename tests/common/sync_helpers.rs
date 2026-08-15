@@ -63,6 +63,29 @@ pub async fn wait_for_full_repo_live_coverage(relay: &TestRelay, timeout: Durati
     }
 }
 
+/// Wait until some line of a relay subprocess log satisfies the predicate.
+pub async fn wait_for_log_line<F>(
+    log_path: &std::path::Path,
+    timeout: Duration,
+    predicate: F,
+) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
+            if content.lines().any(&predicate) {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // NOTE: Using rust-nostr Kind variants:
 // - Kind::GitIssue.as_u16() -> Kind::GitIssue (1621)
 // - Kind::Comment.as_u16() -> Kind::Comment (1111)

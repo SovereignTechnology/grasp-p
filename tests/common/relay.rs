@@ -212,6 +212,23 @@ impl TestRelay {
         .await
     }
 
+    /// Start a syncing relay with user-index identity publication disabled.
+    ///
+    /// `start_with_sync` points identity publication at the bootstrap relay.
+    /// Tests making log-based assertions about the bootstrap connection use
+    /// this variant so identity-publication traffic cannot confound them.
+    pub async fn start_with_sync_without_user_index(bootstrap_relay_url: Option<String>) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                user_index_relays: Some(String::new()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a syncing relay with a caller-chosen relay-owner identity.
     ///
     /// Lets tests stage owner-signed events on other relays before this

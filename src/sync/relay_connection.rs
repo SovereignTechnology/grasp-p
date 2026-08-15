@@ -981,6 +981,26 @@ impl RelayConnection {
         parse_relay_limit_hints(&body)
     }
 
+    /// Fetch NIP-11 hints before the WebSocket dial.
+    ///
+    /// The pre-dial NIP-11 fetch is itself an outbound TCP connection, so it
+    /// must not bypass the SSRF gate: event-directed targets are authorized
+    /// first, and on rejection default hints are returned without any HTTP
+    /// request — the subsequent `connect()` then fails with the same policy
+    /// rejection through its own pre-dial check.
+    pub async fn preflight_limit_hints(&self) -> RelayLimitHints {
+        if self.source == RelayTargetSource::EventDirected
+            && self
+                .policy
+                .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
+                .await
+                .is_err()
+        {
+            return RelayLimitHints::default();
+        }
+        self.fetch_limit_hints().await
+    }
+
     /// Whether the SDK still considers this relay's WebSocket established.
     ///
     /// Connection setup performs bounded HTTP work after the handshake. The

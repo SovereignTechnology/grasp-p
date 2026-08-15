@@ -42,6 +42,7 @@ mod sync {
     pub mod metrics;
     pub mod naughty_list_scheduling;
     pub mod neg_concurrency;
+    pub mod outbound_auth;
     pub mod proactive_sync_plus;
     pub mod purgatory_fetch;
     pub mod reconnect_backoff;
