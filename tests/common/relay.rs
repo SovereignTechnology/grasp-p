@@ -12,7 +12,7 @@
 //! `start_on_reservation_*` constructors — the listener stays bound for
 //! the duration of the reservation, eliminating the same-process race.
 
-use nostr_sdk::prelude::ToBech32;
+use nostr_sdk::prelude::{Keys, ToBech32};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,6 +53,8 @@ pub struct TestRelay {
     process: Child,
     url: String,
     port: u16,
+    /// Relay-owner identity configured in the subprocess.
+    owner_keys: Keys,
     /// Temporary directory for git repositories
     /// Kept alive for the lifetime of the relay
     _git_data_dir: Option<tempfile::TempDir>,
@@ -72,6 +74,10 @@ pub struct TestRelay {
 /// parameters so the call-site changes are mechanical.
 #[derive(Default, Clone)]
 struct RelayOptions {
+    /// Owner identity for the subprocess. `try_start_once` fills this in
+    /// when unset so [`TestRelay::restart`] keeps the same identity, as a
+    /// production restart would.
+    owner_keys: Option<Keys>,
     bootstrap_relay_url: Option<String>,
     sync_plus_fallback_relays: Option<String>,
     disable_negentropy: bool,
@@ -88,6 +94,9 @@ struct RelayOptions {
     relay_max_subscriptions: Option<usize>,
     sync_recursive_descendant_limit: Option<usize>,
     private_members: Option<String>,
+    /// Explicit NGIT_USER_INDEX_RELAYS value (comma-separated), overriding
+    /// the bootstrap relay's double duty as the sole user-index target.
+    user_index_relays: Option<String>,
     /// Run with the production outbound target policy (reject non-global
     /// event-directed sync targets). The fixture default is permissive
     /// because the entire test infrastructure lives on loopback.
@@ -167,6 +176,52 @@ impl TestRelay {
             port::reserve_port(),
             RelayOptions {
                 bootstrap_relay_url,
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a syncing relay with a caller-chosen relay-owner identity.
+    ///
+    /// Lets tests stage owner-signed events on other relays before this
+    /// relay boots, e.g. to model an identity that survives on a user-index
+    /// relay after the local database was wiped.
+    pub async fn start_with_sync_and_owner_keys(
+        bootstrap_relay_url: Option<String>,
+        owner_keys: Keys,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                owner_keys: Some(owner_keys),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Start a GRASP-08 private relay whose sole configured member is also
+    /// the relay-owner identity, with user-index relays configured.
+    ///
+    /// Lets tests observe that a private relay seeds its identity locally
+    /// (queryable by the authenticated owner) without ever publishing it to
+    /// the configured user-index relays.
+    pub async fn start_private_with_sync_and_owner_keys(
+        bootstrap_relay_url: Option<String>,
+        owner_keys: Keys,
+    ) -> Self {
+        let member = owner_keys
+            .public_key()
+            .to_bech32()
+            .expect("Failed to encode private test member");
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                bootstrap_relay_url,
+                owner_keys: Some(owner_keys),
+                private_members: Some(member),
                 ..RelayOptions::default()
             },
         )
@@ -446,6 +501,28 @@ impl TestRelay {
         .await
     }
 
+    /// Start a persistent relay with an explicit user-index relay list and
+    /// no sync bootstrap, so identity-publication targets can differ from
+    /// the sync topology and survive [`Self::restart`].
+    pub async fn start_on_reservation_persistent_user_index_relays(
+        reservation: PortReservation,
+        user_index_relays: String,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            reservation,
+            RelayOptions {
+                user_index_relays: Some(user_index_relays),
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a persistent syncing relay with a small recursive-descendant
     /// allowance so saturation and restart reconstruction can be exercised.
     pub async fn start_on_reservation_persistent_sync_with_recursive_limit(
@@ -598,8 +675,12 @@ impl TestRelay {
             .expect("Failed to get grandparent dir")
             .join("ngit-grasp");
 
-        // Give the relay a stable signing identity for NIP-11 and NIP-42.
-        let test_keys = nostr_sdk::prelude::Keys::generate();
+        // Give the relay a stable signing identity for NIP-11 and NIP-42,
+        // reusing the caller-provided identity across restarts.
+        let test_keys = options
+            .owner_keys
+            .clone()
+            .unwrap_or_else(nostr_sdk::prelude::Keys::generate);
         let test_nsec = test_keys
             .secret_key()
             .to_bech32()
@@ -655,6 +736,9 @@ impl TestRelay {
         }
         if let Some(ref fallback_relays) = options.sync_plus_fallback_relays {
             cmd.env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", fallback_relays);
+        }
+        if let Some(ref user_index_relays) = options.user_index_relays {
+            cmd.env("NGIT_USER_INDEX_RELAYS", user_index_relays);
         }
         if let Some(ref private_members) = options.private_members {
             cmd.env("NGIT_PRIVATE_MODE", "true")
@@ -751,11 +835,15 @@ impl TestRelay {
             process,
             url,
             port,
+            owner_keys: test_keys.clone(),
             _git_data_dir: git_data_dir,
             git_data_path,
             _relay_data_dir: relay_data_dir,
             relay_data_path,
-            options: options.clone(),
+            options: RelayOptions {
+                owner_keys: Some(test_keys),
+                ..options.clone()
+            },
         };
 
         match relay.wait_for_ready_or_early_exit().await {
@@ -778,6 +866,11 @@ impl TestRelay {
     /// Get the relay domain (host:port)
     pub fn domain(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    /// Keys configured as this test relay's operator identity.
+    pub fn owner_keys(&self) -> &Keys {
+        &self.owner_keys
     }
 
     /// Get the subprocess log captured by the test harness.

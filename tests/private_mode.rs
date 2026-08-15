@@ -67,7 +67,10 @@ async fn connect_and_challenge(relay: &TestRelay) -> (WsStream, String) {
         .expect("connect to private relay");
     let frame: serde_json::Value =
         serde_json::from_str(&next_text(&mut stream).await).expect("relay JSON message");
-    assert_eq!(frame[0], "AUTH", "first relay message must be the challenge");
+    assert_eq!(
+        frame[0], "AUTH",
+        "first relay message must be the challenge"
+    );
     let challenge = frame[1].as_str().expect("challenge string").to_owned();
     (stream, challenge)
 }
@@ -255,7 +258,8 @@ async fn private_websocket_rejects_messages_before_authentication() {
     assert_eq!(ok[1].as_str(), Some(note.id.to_hex().as_str()));
     assert_eq!(ok[2], false);
     assert!(
-        ok[3].as_str()
+        ok[3]
+            .as_str()
             .expect("OK message")
             .starts_with("auth-required:"),
         "{ok}"
@@ -283,7 +287,10 @@ async fn private_websocket_admits_member_and_bridges_to_relay() {
     let ok: serde_json::Value =
         serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
     assert_eq!(ok[0], "OK");
-    assert_eq!(ok[2], true, "member NIP-42 authentication must succeed: {ok}");
+    assert_eq!(
+        ok[2], true,
+        "member NIP-42 authentication must succeed: {ok}"
+    );
 
     // The authenticated session reaches the inner relay: a subscription is
     // answered with EOSE instead of an auth-required rejection.
@@ -299,7 +306,10 @@ async fn private_websocket_admits_member_and_bridges_to_relay() {
             if frame[0] == "EOSE" && frame[1] == "after-auth" {
                 return;
             }
-            assert_ne!(frame[0], "CLOSED", "authenticated REQ was rejected: {frame}");
+            assert_ne!(
+                frame[0], "CLOSED",
+                "authenticated REQ was rejected: {frame}"
+            );
         }
     })
     .await;
@@ -325,7 +335,8 @@ async fn private_websocket_rejects_valid_nonmember_auth_and_closes() {
     assert_eq!(ok[0], "OK");
     assert_eq!(ok[2], false);
     assert!(
-        ok[3].as_str()
+        ok[3]
+            .as_str()
             .expect("OK message")
             .starts_with("restricted:"),
         "valid non-member auth must be restricted: {ok}"
@@ -376,7 +387,10 @@ async fn private_announcement_admission_requires_member_author() {
     .await;
     let ok: serde_json::Value =
         serde_json::from_str(&next_text(&mut stream).await).expect("OK JSON");
-    assert_eq!(ok[2], true, "member NIP-42 authentication must succeed: {ok}");
+    assert_eq!(
+        ok[2], true,
+        "member NIP-42 authentication must succeed: {ok}"
+    );
 
     // A member-authored announcement is admitted (OK true, parked in
     // purgatory awaiting git data) and its bare repository is created.
@@ -434,7 +448,8 @@ async fn private_websocket_bounds_invalid_authentication_attempts() {
         assert_eq!(ok[0], "OK");
         assert_eq!(ok[2], false);
         assert!(
-            ok[3].as_str()
+            ok[3]
+                .as_str()
                 .expect("OK message")
                 .starts_with("auth-required:"),
             "{ok}"

@@ -138,16 +138,33 @@ impl MockRelay {
         let listener =
             TcpListener::from_std(std_listener).expect("Failed to convert to tokio listener");
 
-        Self::start_with_listener(listener, port, rate_limit, pagination, max_filters).await
+        Self::start_with_listener(
+            listener,
+            port,
+            rate_limit,
+            pagination,
+            max_filters,
+            Vec::new(),
+        )
+        .await
     }
 
     /// Start a mock relay on a specific port.
     pub async fn start_on_port(port: u16) -> Self {
+        Self::start_on_port_with_events(port, Vec::new()).await
+    }
+
+    /// Start a mock relay on a specific port with events already stored.
+    ///
+    /// The events are stored before the accept loop starts, so a client
+    /// reaching the freshly (re)bound port deterministically sees them —
+    /// modelling an index relay recovering with prior state.
+    pub async fn start_on_port_with_events(port: u16, events: Vec<Event>) -> Self {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let listener = TcpListener::bind(addr)
             .await
             .expect("Failed to bind to address");
-        Self::start_with_listener(listener, port, RateLimit::default(), None, None).await
+        Self::start_with_listener(listener, port, RateLimit::default(), None, None, events).await
     }
 
     /// Internal method to start the relay with an existing listener.
@@ -157,6 +174,7 @@ impl MockRelay {
         rate_limit: RateLimit,
         pagination: Option<PaginationConfig>,
         max_filters: Option<usize>,
+        initial_events: Vec<Event>,
     ) -> Self {
         // Create a simple relay with no write policy (accepts all events)
         let mut builder = LocalRelayBuilder::default().rate_limit(rate_limit);
@@ -170,6 +188,12 @@ impl MockRelay {
             builder = builder.max_filters_per_req(max_filters);
         }
         let relay = builder.build();
+        for event in initial_events {
+            relay
+                .add_event(event)
+                .await
+                .expect("Failed to seed initial mock relay event");
+        }
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();

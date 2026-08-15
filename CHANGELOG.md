@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Publish the relay-owner identity on startup as a minimal kind-0 profile with
+  the scheme-less public URL as `name`, `_@domain` NIP-05, and `bot: true`,
+  plus a kind-10002 list naming this relay as its sole read/write relay. An
+  operator-customized profile survives restarts, and no identity event —
+  stored or generated — is published before the local database and at least
+  one user-index relay have been checked for that kind. Every send is
+  preceded by a per-relay re-check: an identity found on a user-index relay
+  (for example after a local database wipe) is adopted locally and never
+  overwritten, so the relay only fills identity gaps on the indexes,
+  retrying transient failures with a capped backoff. In private mode the
+  identity is seeded locally but never published, so a private relay's
+  existence is not advertised. The relay also trusts events signed by its
+  own key so that key can operate an `ngit-ci` coordinator, but only for
+  kinds without a dedicated admission policy: owner-signed NIP-34 repository
+  events pass the normal announcement, state, and PR policies, and
+  NIP-09/NIP-62 tombstones still prevent replaying retracted owner events.
 - Serve the relay owner's public key as the NIP-05 `_@domain` identity from
   `/.well-known/nostr.json`. NIP-11 advertises NIP-05 only when requested at
   the domain root (`/`); relays mounted below a path do not claim support.
