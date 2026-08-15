@@ -28,9 +28,11 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ::nostr::nips::nip19::FromBech32;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
+use nostr_sdk::prelude::{PublicKey, ToBech32};
 use tracing::{debug, info};
 
 /// Unified HTTP response body for every route served by ngit-grasp.
@@ -64,14 +66,13 @@ pub fn empty_body() -> GitResponseBody {
 /// * `identifier` - The repository identifier
 ///
 /// # Returns
-/// Path to the bare Git repository
-pub fn resolve_repo_path(git_data_path: &str, npub: &str, identifier: &str) -> PathBuf {
-    // Remove .git suffix if present
-    let identifier = identifier.strip_suffix(".git").unwrap_or(identifier);
-
-    PathBuf::from(git_data_path)
-        .join(npub)
-        .join(format!("{}.git", identifier))
+/// Path to the bare Git repository, or `None` when either URL component is
+/// non-canonical or could escape the configured Git data root.
+pub fn resolve_repo_path(git_data_path: &str, npub: &str, identifier: &str) -> Option<PathBuf> {
+    validate_repository_coordinate(npub, identifier)?;
+    let root = PathBuf::from(git_data_path);
+    let candidate = root.join(npub).join(format!("{identifier}.git"));
+    candidate.starts_with(&root).then_some(candidate)
 }
 
 /// Check if a commit exists in the repository
@@ -554,24 +555,67 @@ pub fn parse_git_url(path: &str) -> Option<(String, String, String)> {
         return None;
     }
 
-    let npub = parts[0].to_string();
+    let npub = parts[0];
     let repo_part = percent_decode(parts[1]);
     let subpath = parts[2].to_string();
 
-    // Extract identifier (remove .git suffix if present for the middle part)
-    let identifier = repo_part
-        .strip_suffix(".git")
-        .unwrap_or(&repo_part)
-        .to_string();
+    // `.git` is part of the HTTP route, not part of the NIP-34 identifier.
+    let identifier = repo_part.strip_suffix(".git")?;
+    validate_repository_coordinate(npub, identifier)?;
 
-    Some((npub, identifier, subpath))
+    Some((npub.to_owned(), identifier.to_owned(), subpath))
+}
+
+/// Extract a validated repository coordinate from its canonical HTTP root.
+pub fn parse_repository_root_url(path: &str) -> Option<(String, String)> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let mut parts = path.split('/');
+    let npub = parts.next()?;
+    let repo_part = percent_decode(parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let identifier = repo_part.strip_suffix(".git")?;
+    validate_repository_coordinate(npub, identifier)?;
+    Some((npub.to_owned(), identifier.to_owned()))
+}
+
+fn validate_repository_coordinate(npub: &str, identifier: &str) -> Option<()> {
+    let public_key = PublicKey::from_bech32(npub).ok()?;
+    if public_key.to_bech32().ok()?.as_str() != npub {
+        return None;
+    }
+    if identifier.is_empty()
+        || identifier == "."
+        || identifier == ".."
+        || identifier.contains('/')
+        || identifier.contains('\\')
+        || identifier.contains('\0')
+    {
+        return None;
+    }
+
+    let mut components = Path::new(identifier).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None)
+            if component == std::ffi::OsStr::new(identifier) =>
+        {
+            Some(())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::prelude::Keys;
     use std::fs;
     use tempfile::TempDir;
+
+    fn test_npub() -> String {
+        Keys::generate().public_key().to_bech32().unwrap()
+    }
 
     /// Create a test bare repository with optional commits
     fn create_test_repo() -> (TempDir, PathBuf) {
@@ -670,28 +714,42 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_path() {
-        let path = resolve_repo_path("/data/git", "npub1abc123", "my-repo");
-        assert_eq!(path, PathBuf::from("/data/git/npub1abc123/my-repo.git"));
+        let npub = test_npub();
+        let path = resolve_repo_path("/data/git", &npub, "my-repo").unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/data/git").join(npub).join("my-repo.git")
+        );
     }
 
     #[test]
-    fn test_resolve_repo_path_with_git_suffix() {
-        let path = resolve_repo_path("/data/git", "npub1abc123", "my-repo.git");
-        assert_eq!(path, PathBuf::from("/data/git/npub1abc123/my-repo.git"));
+    fn test_resolve_repo_path_preserves_identifier_git_suffix() {
+        let npub = test_npub();
+        let path = resolve_repo_path("/data/git", &npub, "my-repo.git").unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/data/git")
+                .join(npub)
+                .join("my-repo.git.git")
+        );
     }
 
     #[test]
     fn test_parse_git_url_info_refs() {
-        let (npub, id, subpath) = parse_git_url("/npub1abc/repo.git/info/refs").unwrap();
-        assert_eq!(npub, "npub1abc");
+        let npub = test_npub();
+        let path = format!("/{npub}/repo.git/info/refs");
+        let (parsed_npub, id, subpath) = parse_git_url(&path).unwrap();
+        assert_eq!(parsed_npub, npub);
         assert_eq!(id, "repo");
         assert_eq!(subpath, "info/refs");
     }
 
     #[test]
     fn test_parse_git_url_upload_pack() {
-        let (npub, id, subpath) = parse_git_url("/npub1abc/repo.git/git-upload-pack").unwrap();
-        assert_eq!(npub, "npub1abc");
+        let npub = test_npub();
+        let path = format!("/{npub}/repo.git/git-upload-pack");
+        let (parsed_npub, id, subpath) = parse_git_url(&path).unwrap();
+        assert_eq!(parsed_npub, npub);
         assert_eq!(id, "repo");
         assert_eq!(subpath, "git-upload-pack");
     }
@@ -700,17 +758,39 @@ mod tests {
     fn test_parse_git_url_invalid() {
         assert!(parse_git_url("/npub1abc").is_none());
         assert!(parse_git_url("/npub1abc/repo").is_none());
+        assert!(parse_git_url("/npub1abc/repo.git/info/refs").is_none());
     }
 
     #[test]
     fn test_parse_git_url_percent_encoded_identifier() {
         // Identifiers with spaces encoded as %20 must be decoded so the
         // filesystem path lookup finds the correct directory.
-        let (npub, id, subpath) =
-            parse_git_url("/npub17plqk/kuboslopp%20by%20Shakespeare.git/info/refs").unwrap();
-        assert_eq!(npub, "npub17plqk");
+        let npub = test_npub();
+        let path = format!("/{npub}/kuboslopp%20by%20Shakespeare.git/info/refs");
+        let (parsed_npub, id, subpath) = parse_git_url(&path).unwrap();
+        assert_eq!(parsed_npub, npub);
         assert_eq!(id, "kuboslopp by Shakespeare");
         assert_eq!(subpath, "info/refs");
+    }
+
+    #[test]
+    fn repository_urls_reject_encoded_traversal_and_noncanonical_npubs() {
+        let npub = test_npub();
+        for identifier in [
+            "..",
+            "%2E%2E",
+            "%2E%2E%2Fother",
+            "nested%2Frepo",
+            r"nested%5Crepo",
+        ] {
+            let smart = format!("/{npub}/{identifier}.git/info/refs");
+            let root = format!("/{npub}/{identifier}.git");
+            assert!(parse_git_url(&smart).is_none(), "{smart}");
+            assert!(parse_repository_root_url(&root).is_none(), "{root}");
+        }
+        assert!(parse_git_url("/../repo.git/info/refs").is_none());
+        assert!(resolve_repo_path("/data/git", "..", "repo").is_none());
+        assert!(resolve_repo_path("/data/git", &npub, "../repo").is_none());
     }
 
     #[test]

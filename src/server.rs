@@ -30,6 +30,7 @@ use crate::{
     metrics::Metrics,
     nostr::{self, builder::Nip34WritePolicy, lifecycle::RepositoryLifecycle, SharedDatabase},
     outbound::OutboundTargetPolicy,
+    private::PrivateAccess,
     purgatory::{sync::RealSyncContext, sync::ThrottleManager, Purgatory},
     sync::{naughty_list::NaughtyListTracker, rejected_index::RejectedEventsIndex, SyncManager},
 };
@@ -56,6 +57,7 @@ pub struct RelayServer {
     lifecycle: Arc<RepositoryLifecycle>,
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: crate::grasp06::receive::RepoInitLocks,
+    private_access: Option<PrivateAccess>,
     deletion_cleanup: nostr::lifecycle::DeletionCleanupTask,
     /// Detached background loops (sync manager, purgatory cleanup, audit
     /// cleanup, purgatory sync loop). Aborted on shutdown so the host
@@ -97,6 +99,16 @@ impl RelayServer {
         // Recoverable issues (e.g., malformed whitelist entries) are logged
         // as warnings.
         config.validate()?;
+        let private_access = if config.private_mode {
+            let access = PrivateAccess::new(config.parse_private_members()?);
+            info!(
+                "GRASP-08 private mode enabled for {} configured member(s)",
+                access.len()
+            );
+            Some(access)
+        } else {
+            None
+        };
 
         info!(
             "Configuration loaded and validated: {}",
@@ -221,6 +233,7 @@ impl RelayServer {
             &config,
             PathBuf::from(config.effective_git_data_path()),
             metrics.as_ref().and_then(|m| m.sync_metrics().cloned()),
+            private_access.clone(),
         );
 
         if config.sync_bootstrap_relay_url.is_some() {
@@ -375,6 +388,7 @@ impl RelayServer {
             purgatory,
             rejected_events_index,
             repo_init_locks,
+            private_access,
             deletion_cleanup,
             background_tasks,
             git_data_path,
@@ -414,6 +428,7 @@ impl RelayServer {
             self.lifecycle,
             self.rejected_events_index.clone(),
             self.repo_init_locks,
+            self.private_access,
         );
 
         let result = tokio::select! {

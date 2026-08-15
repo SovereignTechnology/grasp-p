@@ -87,6 +87,7 @@ struct RelayOptions {
     rejected_hot_cache_duration_secs: Option<u64>,
     relay_max_subscriptions: Option<usize>,
     sync_recursive_descendant_limit: Option<usize>,
+    private_members: Option<String>,
     /// Run with the production outbound target policy (reject non-global
     /// event-directed sync targets). The fixture default is permissive
     /// because the entire test infrastructure lives on loopback.
@@ -126,6 +127,23 @@ impl TestRelay {
     /// ```
     pub async fn start() -> Self {
         Self::start_internal(port::reserve_port(), RelayOptions::default()).await
+    }
+
+    /// Start one GRASP-08 private service whose static membership contains
+    /// `member`.
+    pub async fn start_private(member: &nostr_sdk::prelude::PublicKey) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                private_members: Some(
+                    member
+                        .to_bech32()
+                        .expect("Failed to encode private test member"),
+                ),
+                ..RelayOptions::default()
+            },
+        )
+        .await
     }
 
     /// Start relay with sync from another relay (bootstrap relay)
@@ -637,6 +655,14 @@ impl TestRelay {
         }
         if let Some(ref fallback_relays) = options.sync_plus_fallback_relays {
             cmd.env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", fallback_relays);
+        }
+        if let Some(ref private_members) = options.private_members {
+            cmd.env("NGIT_PRIVATE_MODE", "true")
+                .env("NGIT_PRIVATE_MEMBERS", private_members)
+                .env(
+                    "NGIT_PRIVATE_PUBLIC_ORIGIN",
+                    format!("http://{bind_address}"),
+                );
         }
 
         // The test infrastructure runs entirely on loopback, which the

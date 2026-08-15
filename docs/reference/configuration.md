@@ -998,6 +998,59 @@ Operators should review the design tradeoffs in [`docs/explanation/grasp-06-cont
 
 ---
 
+### GRASP-08 Private Service
+
+#### `NGIT_PRIVATE_MODE`
+
+**Description:** Enable authenticated, read-restricted GRASP-08 service mode
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+When enabled, the relay requires successful NIP-42 authentication by a
+whitelisted member before accepting or serving any Nostr events. Standard Git
+repository root, `info/refs`, `git-upload-pack`, and `git-receive-pack`
+requests require the GRASP-08 repository-scoped NIP-98 credential.
+
+```bash
+NGIT_PRIVATE_MODE=true
+```
+
+Private mode cannot be combined with `NGIT_GRASP06_ENABLE=true`, because the
+GRASP-06 contributor endpoint is intentionally unauthenticated.
+
+#### `NGIT_PRIVATE_MEMBERS`
+
+**Description:** Permanently configured members of the service-wide private-service whitelist
+**Type:** Comma-separated npubs
+**Default:** Empty
+**Required:** Yes when `NGIT_PRIVATE_MODE=true`
+
+```bash
+NGIT_PRIVATE_MEMBERS=npub1alice...,npub1bob...
+```
+
+The effective GRASP-08 whitelist is the union of these configured members and
+the NIP-11 owner pubkeys of relays referenced by accepted repository
+announcements. Relay owners are learned by the NIP-11 request already made for
+sync limits; this does not open another connection or subscription. A relay
+listed only by an unpromoted purgatory announcement cannot grant access.
+
+#### `NGIT_PRIVATE_PUBLIC_ORIGIN`
+
+Optional canonical external HTTP origin for private Git authentication, such
+as `https://private.example`. Configure it when TLS terminates at a reverse
+proxy or when a non-loopback deployment intentionally uses plain HTTP. The
+value must not include a path, query, or fragment. If omitted, the service
+retains the legacy inference of HTTP for loopback domains and HTTPS otherwise.
+
+Whitespace and empty comma-separated elements are ignored. Every non-empty
+entry must be a valid npub. Invalid entries fail startup rather than being
+silently skipped because this setting controls access, not repository
+curation. Changing the environment setting requires a service restart.
+
+---
+
 ### Repository Whitelist
 
 #### `NGIT_REPOSITORY_WHITELIST`

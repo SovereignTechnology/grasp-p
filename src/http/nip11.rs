@@ -95,6 +95,9 @@ impl RelayInformationDocument {
         if config.grasp06_enable {
             supported_grasps.push("GRASP-06".to_string());
         }
+        if config.private_mode {
+            supported_grasps.push("GRASP-08".to_string());
+        }
 
         // Build curation field for archive read-only mode or repository whitelist
         let repository_config = config.repository_config();
@@ -149,6 +152,10 @@ impl RelayInformationDocument {
                 if !config.deletion_request_disrespector {
                     nips.push(9); // NIP-09: Event deletion requests
                     nips.push(62); // NIP-62: Request to vanish
+                }
+                if config.private_mode {
+                    nips.push(42); // NIP-42: relay client authentication
+                    nips.push(98); // NIP-98: HTTP authentication
                 }
                 nips.sort_unstable();
                 nips

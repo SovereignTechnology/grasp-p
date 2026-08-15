@@ -683,6 +683,45 @@ Optional endpoint at `/prs/<npub>/<identifier>.git`, gated on `NGIT_GRASP06_ENAB
 
 `/prs/` repos are intentionally isolated from other subsystems: empty-repo cleanup skips the `/prs/` subtree, the proactive-sync subsystem never discovers them because subscriptions are built from DB-resident announcements, and the standard repo landing page guards against ever matching a `/prs/` path. Full design: [GRASP-06 Contributor Pull Request Submission](grasp-06-contributor-pr-submission.md). Operator how-to: [Enable GRASP-06](../how-to/enable-grasp-06.md).
 
+## Private Service Authentication (GRASP-08)
+
+Private mode is an optional access layer around the normal GRASP runtime. A
+single `PrivateAccess` set is shared by the HTTP and WebSocket services.
+Repository admission and push authorization remain the GRASP-01 policies; a
+private credential proves service membership but never grants push rights.
+The effective set combines operator-configured members with NIP-11 owner
+pubkeys learned for relays referenced by accepted announcements. Purgatory-only
+announcements are excluded. Reconciliation reuses the accepted repository index
+and the NIP-11 fetch already performed once per connection session, so private
+mode adds neither outbound connections nor subscriptions.
+
+For Nostr, Hyper completes the public WebSocket upgrade and a message-level
+proxy sends and validates NIP-42 authentication before a connection reaches
+`LocalRelay`. Missing authentication uses the `auth-required:` prefix and a
+valid authentication by a nonmember uses `restricted:`. Once authenticated,
+the proxy bridges messages through an in-memory WebSocket pair to
+`LocalRelay`. Keeping the access check outside `nostr-relay-builder` is
+necessary because its query and write policies do not receive the
+authenticated session pubkey.
+
+For Git, authentication runs before repository existence checks or request
+body collection. The signed NIP-98 event names the canonical repository root
+and method `GET`; that credential is reusable for GET, HEAD, and POST requests
+to the repository root and Smart HTTP subpaths for its 60-second validity
+window. Payload tags and replay protection are intentionally not applied.
+Every authentication failure is the same empty `401 Unauthorized` response,
+preventing unauthenticated repository enumeration.
+
+Private mode advertises GRASP-08 plus NIP-42 and NIP-98 in NIP-11. It is
+incompatible with GRASP-06 because that extension deliberately exposes an
+unauthenticated contributor write surface.
+
+One process currently represents one private collaborator service. Operators
+can run several independently configured instances for different groups. Fleet
+provisioning and lifecycle automation are deliberately left to a later change;
+they are deployment conveniences rather than part of the authentication
+boundary implemented here.
+
 ## Future Extensions
 
 ### GRASP-02: Proactive Sync

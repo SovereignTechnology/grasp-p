@@ -33,6 +33,7 @@ nostr-memory = "0.45.0"
 # so depend on it directly rather than pulling in a second hash implementation.
 bitcoin_hashes = "0.14"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", default-features = false }
 base64 = "0.22"
 flate2 = "1.0"
 tar = "0.4"
