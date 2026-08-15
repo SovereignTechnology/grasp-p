@@ -611,99 +611,61 @@ mod tests {
     // can_apply_state tests
     // =========================================================================
 
+    /// Run one fixture git step hermetically (immune to ambient git
+    /// configuration such as hooks, signing, and templates) and fail loudly
+    /// on error instead of letting a later assertion fail obscurely.
+    fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = grasp_audit::git_command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     /// Helper to create a temporary bare git repository with a commit.
     /// Returns (temp_dir, commit_hash) where commit_hash is Some if a commit was created.
     fn create_test_repo_with_commit() -> (tempfile::TempDir, Option<String>) {
-        use std::process::Command;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let bare_path = temp_dir.path();
 
         // Initialize bare repo
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(bare_path)
-            .output()
-            .expect("Failed to init bare git repo");
+        run_git(bare_path, &["init", "--bare"]);
 
         // Create a working repo to generate a commit
         let work_dir = tempfile::tempdir().unwrap();
 
-        Command::new("git")
-            .args(["init"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to init work repo");
-
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to set email");
-
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to set name");
-
-        // Disable GPG signing for tests (prevents yubikey prompts)
-        Command::new("git")
-            .args(["config", "commit.gpgsign", "false"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to disable commit.gpgsign");
-
-        Command::new("git")
-            .args(["config", "tag.gpgsign", "false"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to disable tag.gpgsign");
+        run_git(work_dir.path(), &["init"]);
+        run_git(work_dir.path(), &["config", "user.email", "test@test.com"]);
+        run_git(work_dir.path(), &["config", "user.name", "Test"]);
 
         // Create a commit
         std::fs::write(work_dir.path().join("file.txt"), "content").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to add");
-
-        Command::new("git")
-            .args(["commit", "-m", "test"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to commit");
+        run_git(work_dir.path(), &["add", "."]);
+        run_git(work_dir.path(), &["commit", "-m", "test"]);
 
         // Get the commit hash from the working repo
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to get commit hash");
-
-        let commit_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let commit_hash = run_git(work_dir.path(), &["rev-parse", "HEAD"]);
 
         // Push to bare repo
-        Command::new("git")
-            .args(["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/main"])
-            .current_dir(work_dir.path())
-            .output()
-            .expect("Failed to push");
+        run_git(
+            work_dir.path(),
+            &["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/main"],
+        );
 
         (temp_dir, Some(commit_hash))
     }
 
     /// Helper to create an empty bare git repository (no commits).
     fn create_empty_test_repo() -> tempfile::TempDir {
-        use std::process::Command;
-
         let temp_dir = tempfile::tempdir().unwrap();
 
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(temp_dir.path())
-            .output()
-            .expect("Failed to init bare git repo");
+        run_git(temp_dir.path(), &["init", "--bare"]);
 
         temp_dir
     }

@@ -573,16 +573,30 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Run one fixture git step hermetically (immune to ambient git
+    /// configuration such as hooks, signing, and templates) and fail loudly
+    /// on error instead of letting a later assertion fail obscurely.
+    fn run_git(dir: Option<&Path>, args: &[&str]) -> String {
+        let mut command = grasp_audit::git_command();
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        let output = command.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     /// Create a test bare repository with optional commits
     fn create_test_repo() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let repo_path = temp_dir.path().join("test.git");
 
         // Initialize bare repository
-        Command::new("git")
-            .args(["init", "--bare", repo_path.to_str().unwrap()])
-            .output()
-            .unwrap();
+        run_git(None, &["init", "--bare", repo_path.to_str().unwrap()]);
 
         (temp_dir, repo_path)
     }
@@ -594,76 +608,40 @@ mod tests {
         let bare_repo = temp_dir.path().join("test.git");
 
         // Initialize bare repository
-        Command::new("git")
-            .args([
+        run_git(
+            None,
+            &[
                 "init",
                 "--bare",
                 "--initial-branch=main",
                 bare_repo.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+            ],
+        );
 
         // Clone to working directory
-        Command::new("git")
-            .args([
+        run_git(
+            None,
+            &[
                 "clone",
                 bare_repo.to_str().unwrap(),
                 work_dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+            ],
+        );
 
         // Configure git for commits
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
-        // Disable GPG signing for tests (prevents yubikey prompts)
-        Command::new("git")
-            .args(["config", "commit.gpgsign", "false"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "tag.gpgsign", "false"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
+        run_git(Some(&work_dir), &["config", "user.email", "test@test.com"]);
+        run_git(Some(&work_dir), &["config", "user.name", "Test"]);
 
         // Create a file and commit
         fs::write(work_dir.join("README.md"), "# Test").unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
+        run_git(Some(&work_dir), &["add", "README.md"]);
+        run_git(Some(&work_dir), &["commit", "-m", "Initial commit"]);
 
         // Get commit hash
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
-        let commit_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let commit_hash = run_git(Some(&work_dir), &["rev-parse", "HEAD"]);
 
         // Push to bare repo
-        Command::new("git")
-            .args(["push", "origin", "main"])
-            .current_dir(&work_dir)
-            .output()
-            .unwrap();
+        run_git(Some(&work_dir), &["push", "origin", "main"]);
 
         (temp_dir, bare_repo, commit_hash)
     }
