@@ -155,6 +155,36 @@ impl TestRelay {
         .await
     }
 
+    /// Start a GRASP-08 private service with persistent LMDB storage in
+    /// caller-owned directories, so [`Self::restart`] resumes from the same
+    /// events and git data.
+    ///
+    /// The private NIP-42 gate applies to the relay's own internal
+    /// self-subscription, so sync targets for locally published
+    /// announcements are derived from the database at startup; tests
+    /// exercising that pipeline publish, then restart.
+    pub async fn start_private_with_lmdb_paths(
+        member: &nostr_sdk::prelude::PublicKey,
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                private_members: Some(
+                    member
+                        .to_bech32()
+                        .expect("Failed to encode private test member"),
+                ),
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start relay with sync from another relay (bootstrap relay)
     ///
     /// # Example

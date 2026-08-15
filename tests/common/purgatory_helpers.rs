@@ -588,6 +588,21 @@ pub fn push_to_relay(
     npub: &str,
     repo_id: &str,
 ) -> Result<(), String> {
+    push_to_relay_with_auth_header(local_path, relay_domain, npub, repo_id, None)
+}
+
+/// Push a local repository to a relay with an optional `Authorization` header.
+///
+/// GRASP-08 private relays require every Smart HTTP request to carry the
+/// repository-scoped NIP-98 credential, which git can attach via
+/// `http.extraHeader`. Pass the full header value (e.g. `Nostr <base64>`).
+pub fn push_to_relay_with_auth_header(
+    local_path: &Path,
+    relay_domain: &str,
+    npub: &str,
+    repo_id: &str,
+    auth_header: Option<&str>,
+) -> Result<(), String> {
     let remote_url = format!("http://{}/{}/{}.git", relay_domain, npub, repo_id);
 
     // Check if origin already exists
@@ -606,7 +621,13 @@ pub fn push_to_relay(
     }
 
     // Push all refs
-    let output = git_command()
+    let mut command = git_command();
+    if let Some(header) = auth_header {
+        command
+            .arg("-c")
+            .arg(format!("http.extraHeader=Authorization: {header}"));
+    }
+    let output = command
         .args(["push", "-u", "origin", "--all"])
         .current_dir(local_path)
         .output()

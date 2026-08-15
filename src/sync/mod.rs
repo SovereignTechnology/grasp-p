@@ -1785,6 +1785,7 @@ enum ConnectAttemptOutcome {
         advertised_default_limit: Option<usize>,
         advertised_max_subscriptions: Option<usize>,
         advertised_owner: Option<PublicKey>,
+        advertised_grasp08: bool,
     },
     Failed(String),
 }
@@ -2466,7 +2467,11 @@ pub struct SyncManager {
     private_access: Option<PrivateAccess>,
     /// Operator-configured members form the permanent base of private access.
     configured_private_members: HashSet<PublicKey>,
-    /// Latest NIP-11 owner learned for each connected repository relay.
+    /// Latest NIP-11 owner learned for each connected repository relay whose
+    /// NIP-11 also advertises GRASP-08. Only private-service owners can mint
+    /// derived membership: the owner of a public relay gains nothing
+    /// legitimate from private membership, since their relay enforces no
+    /// confidentiality for the repositories it mirrors.
     relay_owners: HashMap<String, PublicKey>,
     /// What we've confirmed syncing + connection state
     relay_sync_index: RelaySyncIndex,
@@ -5466,6 +5471,7 @@ impl SyncManager {
                             advertised_default_limit: hints.default_limit,
                             advertised_max_subscriptions: hints.max_subscriptions,
                             advertised_owner: hints.owner,
+                            advertised_grasp08: hints.grasp08,
                         }
                     },
                     Err(error) => ConnectAttemptOutcome::Failed(error),
@@ -6253,8 +6259,13 @@ impl SyncManager {
                 advertised_default_limit,
                 advertised_max_subscriptions,
                 advertised_owner,
+                advertised_grasp08,
             } => {
-                match advertised_owner {
+                // Only GRASP-08-advertising relays mint derived private
+                // membership: a public relay's owner gains nothing legitimate
+                // from private membership because their relay enforces no
+                // confidentiality for the mirrored repositories.
+                match advertised_owner.filter(|_| advertised_grasp08) {
                     Some(owner) => {
                         self.relay_owners.insert(result.relay_url.clone(), owner);
                     }

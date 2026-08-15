@@ -123,6 +123,24 @@ impl MockRelay {
         pagination: Option<PaginationConfig>,
         max_filters: Option<usize>,
     ) -> Self {
+        Self::start_with_options_and_nip11(rate_limit, pagination, max_filters, None).await
+    }
+
+    /// Start a mock relay that serves a caller-provided NIP-11 document for
+    /// `Accept: application/nostr+json` requests.
+    ///
+    /// This lets tests control fields the default document never emits, such
+    /// as the GRASP `supported_grasps` extension array or the `pubkey` owner.
+    pub async fn start_with_nip11_document(document: serde_json::Value) -> Self {
+        Self::start_with_options_and_nip11(RateLimit::default(), None, None, Some(document)).await
+    }
+
+    async fn start_with_options_and_nip11(
+        rate_limit: RateLimit,
+        pagination: Option<PaginationConfig>,
+        max_filters: Option<usize>,
+        custom_nip11: Option<serde_json::Value>,
+    ) -> Self {
         // Create and bind listener (eliminates port race condition)
         let std_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
@@ -145,6 +163,7 @@ impl MockRelay {
             pagination,
             max_filters,
             Vec::new(),
+            custom_nip11,
         )
         .await
     }
@@ -164,10 +183,20 @@ impl MockRelay {
         let listener = TcpListener::bind(addr)
             .await
             .expect("Failed to bind to address");
-        Self::start_with_listener(listener, port, RateLimit::default(), None, None, events).await
+        Self::start_with_listener(
+            listener,
+            port,
+            RateLimit::default(),
+            None,
+            None,
+            events,
+            None,
+        )
+        .await
     }
 
     /// Internal method to start the relay with an existing listener.
+    #[allow(clippy::too_many_arguments)]
     async fn start_with_listener(
         listener: TcpListener,
         port: u16,
@@ -175,6 +204,7 @@ impl MockRelay {
         pagination: Option<PaginationConfig>,
         max_filters: Option<usize>,
         initial_events: Vec<Event>,
+        custom_nip11: Option<serde_json::Value>,
     ) -> Self {
         // Create a simple relay with no write policy (accepts all events)
         let mut builder = LocalRelayBuilder::default().rate_limit(rate_limit);
@@ -209,13 +239,22 @@ impl MockRelay {
                             Ok((stream, remote_addr)) => {
                                 let relay = server_relay.clone();
                                 let pagination = pagination;
+                                let custom_nip11 = custom_nip11.clone();
                                 let io = TokioIo::new(stream);
 
                                 tokio::spawn(async move {
                                     let service = service_fn(move |req| {
                                         let relay = relay.clone();
+                                        let custom_nip11 = custom_nip11.clone();
                                         async move {
-                                            handle_request(req, relay, remote_addr, pagination).await
+                                            handle_request(
+                                                req,
+                                                relay,
+                                                remote_addr,
+                                                pagination,
+                                                custom_nip11,
+                                            )
+                                            .await
                                         }
                                     });
 
@@ -302,6 +341,7 @@ async fn handle_request(
     relay: LocalRelay,
     addr: SocketAddr,
     pagination: Option<PaginationConfig>,
+    custom_nip11: Option<serde_json::Value>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check for WebSocket upgrade request
     let is_websocket = req
@@ -350,6 +390,13 @@ async fn handle_request(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("application/nostr+json"))
     {
+        if let Some(document) = custom_nip11 {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/nostr+json")
+                .body(Full::new(Bytes::from(document.to_string())))
+                .unwrap());
+        }
         let limitation = pagination.map(|config| {
             serde_json::json!({
                 "default_limit": config.advertised_default_limit,

@@ -442,12 +442,26 @@ pub struct RelayLimitHints {
     /// grant this identity access only when the relay is referenced by an
     /// accepted repository announcement.
     pub owner: Option<PublicKey>,
+    /// Whether the document's `supported_grasps` array (a GRASP extension
+    /// field, parsed from the raw JSON because the SDK's NIP-11 type does not
+    /// carry it) advertises the "GRASP-08" private-service extension.
+    pub grasp08: bool,
 }
 
 fn parse_relay_limit_hints(body: &str) -> RelayLimitHints {
     let Some(document) = nostr::nips::nip11::RelayInformationDocument::from_json(body).ok() else {
         return RelayLimitHints::default();
     };
+    let grasp08 = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value.get("supported_grasps")?.as_array().map(|grasps| {
+                grasps
+                    .iter()
+                    .any(|grasp| grasp.as_str() == Some("GRASP-08"))
+            })
+        })
+        .unwrap_or(false);
     let limitation = document.limitation.unwrap_or_default();
     RelayLimitHints {
         default_limit: limitation
@@ -459,6 +473,7 @@ fn parse_relay_limit_hints(body: &str) -> RelayLimitHints {
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0),
         owner: document.pubkey,
+        grasp08,
     }
 }
 
@@ -2761,6 +2776,22 @@ mod tests {
         assert_eq!(hints.owner, Some(owner));
         assert_eq!(hints.default_limit, None);
         assert_eq!(hints.max_subscriptions, None);
+    }
+
+    #[test]
+    fn grasp08_flag_requires_supported_grasps_entry() {
+        assert!(parse_relay_limit_hints(r#"{"supported_grasps":["GRASP-01","GRASP-08"]}"#).grasp08);
+        assert!(!parse_relay_limit_hints(r#"{"supported_grasps":["GRASP-01"]}"#).grasp08);
+        assert!(!parse_relay_limit_hints(r#"{"name":"relay without grasps"}"#).grasp08);
+    }
+
+    #[test]
+    fn grasp08_flag_defaults_to_false_for_malformed_documents() {
+        // Non-array supported_grasps and unparseable bodies both mean "not a
+        // known private service", never an error.
+        assert!(!parse_relay_limit_hints(r#"{"supported_grasps":"GRASP-08"}"#).grasp08);
+        assert!(!parse_relay_limit_hints(r#"{"supported_grasps":8}"#).grasp08);
+        assert!(!parse_relay_limit_hints("not json at all").grasp08);
     }
 
     /// Event-directed connection with the permissive policy used by tests
