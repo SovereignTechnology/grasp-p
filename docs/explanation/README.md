@@ -229,6 +229,20 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
+### [Identifier-family Git Object Storage](git-family-object-storage.md)
+**Deduplicating Git objects across related owner and contributor views**
+
+**Topics:**
+- Identifier-scoped object families and thin repository views
+- Anonymous receive-pack negotiation through Git alternates
+- Local-first storage with an opt-in S3 backend and bounded cache
+- No-GC rollback preservation
+- Crash-safe launch-time migration from legacy bare repositories
+
+**Read when:** You are changing Git storage, `/prs/` delivery, rollback retention, or server startup migration
+
+---
+
 ## Planned Explanation Documentation
 
 ### GRASP Protocol Design
@@ -239,17 +253,6 @@ Explanation documentation helps you **understand concepts** and design decisions
 - Authorization model
 - Trust and verification
 - Decentralization benefits
-
----
-
-### Storage Architecture
-**Status:** 🔜 Planned
-
-**Topics:**
-- Why separate Git and Nostr storage?
-- Indexing strategy
-- Performance considerations
-- Scaling approach
 
 ---
 

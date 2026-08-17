@@ -1,0 +1,361 @@
+# Identifier-family Git object storage
+
+**Status:** Accepted for implementation
+
+**Date:** 2026-08-17
+
+## Decision
+
+ngit-grasp will store Git objects once per repository identifier and object
+format, while continuing to expose a separate bare repository view for every
+owner and every GRASP-06 contributor route.
+
+The shared object inventory is always enabled. Its default durable backend is
+the local filesystem. An S3-compatible backend is an explicit operator opt-in
+that keeps repository views and metadata local, stores immutable packs in
+object storage, and hydrates a bounded local cache on demand.
+
+We deliberately do not garbage-collect Git objects in this change. Deleting or
+rolling back a Nostr state changes which refs a view exposes; it does not remove
+objects from the identifier family. This preserves the current ability to
+recover from deletion-state mistakes and late rollback decisions.
+
+## Context
+
+The current layout creates a complete bare repository at both
+`<npub>/<identifier>.git` and, when GRASP-06 is enabled,
+`prs/<submitter>/<identifier>.git`. State and PR synchronization copy missing
+objects between those repositories. Repositories with the same NIP-34 `d` tag
+therefore store the same large blobs and history repeatedly.
+
+That duplication has two costs:
+
+- local installations consume space for every owner and contributor copy;
+- the first push to an apparently empty `/prs/` or related owner route uploads
+  history the service already possesses.
+
+Buzz's Git-on-object-storage implementation demonstrates useful S3 mechanics:
+create-only content-addressed packs, verified hydration, a local pack cache,
+and publication only after durable writes. Its manifest is repository-scoped,
+however, so byte-identical pack files deduplicate globally but independently
+packed copies of the same Git objects do not. ngit-grasp instead needs a shared
+semantic inventory at the identifier boundary.
+
+## Goals
+
+- Deduplicate objects across all local owner and `/prs/` views that share an
+  identifier.
+- Let receive-pack advertise already stored family history anonymously so a
+  client does not resend it.
+- Preserve the existing URL, authorization, ref, HEAD, purgatory, deletion,
+  archive, and rollback semantics.
+- Keep local storage as the zero-configuration default.
+- Make S3-compatible storage opt-in and make a cache miss affect latency, not
+  correctness.
+- Upgrade existing installations automatically, idempotently, and before the
+  server accepts traffic.
+
+## Non-goals
+
+- Reclaiming unreachable objects or old packs.
+- Changing NIP-34 identifiers, repository URLs, or public ref names.
+- Making one Git object family span independent ngit-grasp installations.
+- Introducing a distributed writer lock or claiming multi-instance S3 writes
+  in the first implementation.
+- Converting archives and holding snapshots to S3 in the first implementation.
+  Restores import their objects back into the family through the same write
+  path.
+
+## Model and terminology
+
+A **coordinate** is an owner plus identifier, such as
+`30617:<owner>:<identifier>`. A **view** is the small bare repository served at
+that coordinate. A view owns only refs, `HEAD`, configuration, hooks if any,
+and an alternate link; it does not own the shared object inventory.
+
+A **family** is:
+
+```text
+(service storage root, Git object format, NIP-34 identifier)
+```
+
+The service storage root is an implicit tenant boundary. Object-format
+separation prevents a future SHA-256 repository from being mixed with SHA-1
+objects. Owner is intentionally absent: related owner announcements and
+contributor submissions for the same identifier share objects.
+
+An identifier collision means the service may reveal that it already has a
+reachable object ID for another repository with that identifier. This is an
+accepted GRASP storage and delivery trade-off. Authorization still determines
+which named refs a client can see or update.
+
+## Local layout
+
+Existing public paths remain stable. Internal state lives below `.grasp`, which
+normal repository scans must ignore:
+
+```text
+<git-data>/
+  .grasp/
+    storage-version
+    migration/
+    families/
+      sha1/
+        <identifier>.git/       # bare family inventory and internal refs
+    s3-cache/                   # present only for the S3 backend
+  <owner-npub>/
+    <identifier>.git/           # thin view: refs + HEAD + alternate
+  prs/
+    <submitter-hex>/
+      <identifier>.git/         # thin view: refs + HEAD + alternate
+```
+
+Identifiers are already constrained to one safe filesystem component. Family
+path construction must reuse the same validation and must never accept an
+unvalidated event tag as a path.
+
+Each view's `objects/info/alternates` names its family's object directory. The
+view config sets:
+
+```ini
+[core]
+    alternateRefsPrefixes = refs/grasp/bases/
+```
+
+This limits anonymous receive-pack negotiation to current family base tips.
+The family can retain additional history without advertising every retained
+tip on every push.
+
+## Ref ownership
+
+Views keep all client-visible refs:
+
+- `refs/heads/*` and `refs/tags/*` follow the authorized repository state;
+- `refs/nostr/*` follows accepted or purgatory PR state;
+- `HEAD` follows the authorized state for that owner.
+
+The family repository uses internal refs only:
+
+- `refs/grasp/bases/<digest>` records tips useful for receive negotiation;
+- `refs/grasp/retained/<digest>` is append-only and records every accepted tip
+  that must remain recoverable.
+
+The suffix is derived from the ref name and object ID rather than user input.
+Updating or deleting a view ref may update the base set, but must never delete
+a retained ref in this phase.
+
+## Why Git alternates solve the upload problem
+
+Git receive-pack includes tips from alternate repositories as anonymous
+`.have` entries. With a view's alternate pointing at the family repository, an
+empty `/prs/` view can say “this object graph is already here” without
+advertising another owner's `refs/heads/main`.
+
+The service already opts into `uploadpack.allowReachableSHA1InWant` and the
+related tip capability. Fetching a known reachable object from the family is
+therefore also an accepted behavior. Named-ref visibility and push
+authorization remain view-specific.
+
+For local writes, receive-pack writes its quarantine and final objects into the
+family object directory while it updates refs in the selected view. Other Git
+commands that can create objects, including proactive fetch and archive
+restore, must use the same family object directory. Read-only commands can use
+the view normally because its alternate resolves the inventory.
+
+## Durability and the success fence
+
+The invariant is:
+
+> When a client observes a successful push, every Git object needed by the
+> accepted ref updates is durable in the configured family backend.
+
+The local backend satisfies the fence when Git has atomically installed the
+objects in the family object directory and receive-pack has completed.
+
+The S3 backend cannot release receive-pack's terminal success immediately.
+The handler must retain the final protocol status until it has:
+
+1. indexed and verified the received objects;
+2. written new immutable packs to S3 using create-only, content-addressed keys;
+3. durably published the updated family manifest;
+4. installed append-only retained roots and the intended view refs; and
+5. fsynced the small local metadata needed to reconstruct the views.
+
+Only then may the terminal success reach the client. A failure before the
+fence returns a push error and leaves the previously published family manifest
+and view refs authoritative. Staged packs may become harmless orphans; no old
+pack is deleted.
+
+## S3 backend
+
+S3 stores immutable data; local disk remains the execution surface for Git:
+
+```text
+packs/<object-format>/<sha256(pack-bytes)>
+indexes/<object-format>/<sha256(pack-bytes)>
+manifests/<object-format>/<sha256(canonical-manifest)>
+families/<object-format>/<encoded-identifier>/pointer
+```
+
+A canonical manifest contains its schema version, object format, identifier,
+complete pack-key set, and parent manifest digest. The mutable family pointer
+names the current immutable manifest. Initial implementation permits one
+ngit-grasp writer per storage root; conditional pointer writes are still used
+to detect an accidental second writer rather than silently losing an update.
+
+Hydration resolves pointer to manifest, verifies every downloaded pack against
+its key digest, installs or regenerates its index, and links the pack/index
+pair into the local family object directory. Cache entries are immutable,
+byte-bounded, and pinned for the lifetime of the Git request. Eviction may make
+the next request slower but cannot remove durable data.
+
+S3 lifecycle rules must not expire `packs/`, `indexes/`, `manifests/`, or
+family pointers. Garbage collection requires a separate design that accounts
+for rollback roots, old manifests, in-flight hydrations, and archives.
+
+## No-GC recovery invariant
+
+Until explicit garbage collection is designed and approved:
+
+> A family's durable inventory contains every Git object ever accepted for
+> that family by this service.
+
+Consequences:
+
+- disable automatic Git maintenance and pruning for family repositories;
+- create retained roots for every accepted branch, tag, and PR tip;
+- do not use S3 lifecycle deletion on family objects;
+- never compact by packing only the current visible ref closure;
+- if pack-count compaction becomes necessary, repack the union of every object
+  in all selected packs, publish the replacement in addition to the old
+  immutable packs, and leave physical deletion to future GC work.
+
+This intentionally spends storage to preserve rollback choices. Deduplication
+still removes the much larger multiplier caused by owner and `/prs/` copies.
+
+## `/prs/` behavior
+
+A missing `/prs/<submitter>/<identifier>.git` route is no longer synthesized
+from a truly empty temporary repository. It is synthesized as an empty thin
+view whose alternate is the identifier family. Therefore:
+
+- upload-pack still advertises no named refs for a missing route;
+- receive-pack may advertise family base tips as anonymous `.have` lines;
+- the first contributor push sends only objects the family does not have;
+- pushes remain restricted to `refs/nostr/<event-id>`;
+- placeholder and expiry cleanup removes view refs or an empty view, never
+  family objects or retained roots.
+
+Mirroring a PR into an owner view becomes a ref update after an object
+availability check. It no longer copies the object graph.
+
+## Startup migration
+
+Migration runs after configuration validation and before purgatory restoration,
+deletion reconciliation, background sync, or accepting HTTP connections. It is
+versioned, exclusive, crash-safe, and idempotent.
+
+For each legacy bare repository:
+
+1. Classify the path as an owner view, `/prs/` view, archive/holding data, or
+   internal data. Only owner and `/prs/` views migrate in this version.
+2. Discover the object format and identifier; create the family inventory if
+   absent with automatic maintenance disabled.
+3. Copy every legacy object—including objects not currently reachable from a
+   visible ref—into a staging family inventory. Copying the entire object
+   database, not only `rev-list --all`, preserves rollback material.
+4. Record every legacy ref tip as an append-only retained root and useful tips
+   as base roots.
+5. Verify with `git fsck`, verify every legacy object ID exists in the family,
+   and verify the proposed view's refs and `HEAD` exactly match the legacy
+   repository.
+6. Write and fsync a per-repository migration journal entry.
+7. Atomically rename the legacy repository to a migration backup, atomically
+   install the thin view, then mark that journal entry complete.
+
+On restart, the journal determines whether to resume copying, finish a rename,
+or restore the legacy directory. Every state transition is safe to repeat.
+The original repository backup remains until the entire storage-version
+migration has been verified. The first implementation does not delete those
+backups automatically; an operator-visible later cleanup process can do so
+after an appropriate rollback window.
+
+The global `storage-version` advances only after every eligible repository is
+complete. A server must fail startup on an unrepairable mismatch rather than
+serve a partially converted storage root.
+
+Fresh installations create the current version marker and family layout on
+their first launch. Switching from local to S3 is a separate backend migration:
+upload and verify all local family inventories first, then change the backend
+marker. It must never reinterpret an absent S3 pointer as an empty family when
+local objects exist.
+
+## Concurrency
+
+Operations that mutate one family are serialized by a per-family lock. This
+covers pushes to different owner or `/prs/` views with the same identifier,
+proactive fetches, archive restores, retained/base ref updates, and S3 manifest
+publication. Read requests take a hydrated family lease; they do not hold the
+writer lock after their pack set has been pinned.
+
+View lifecycle locks remain responsible for “may this path be removed?” The
+family lock is responsible for “is this object inventory and manifest update
+atomic?” Neither lock grants authorization.
+
+## Security and privacy trade-offs
+
+- Sharing is restricted to one validated identifier, object format, and
+  service storage root. It is not a process-global object pool.
+- Anonymous `.have` entries disclose object IDs already useful to the family.
+  The user has explicitly accepted this in exchange for avoiding duplicate
+  uploads.
+- `allowReachableSHA1InWant` can deliver a known object reachable through a
+  related repository's family inventory. This is also explicitly accepted.
+- Clients still cannot enumerate another view's named refs through their own
+  URL. Upload-pack materializes only the selected view's refs and HEAD.
+- S3 credentials and bucket details are operator secrets/configuration and
+  must not be written into manifests, logs, or Nostr events.
+
+## Rejected alternatives
+
+### Keep full per-owner repositories and run periodic repack
+
+Alternates would still be absent during the first push, so bandwidth remains
+duplicated. Cross-repository repack also has no natural safe deletion rule while
+rollback recovery is open.
+
+### One global object pool
+
+This maximizes deduplication but turns any known object ID on the service into
+a cross-repository reachability surface. Identifier families give the desired
+related-repository behavior with a smaller disclosure and failure domain.
+
+### Repository-scoped S3 manifests only
+
+This follows Buzz closely but deduplicates only byte-identical packs. Two packs
+containing the same large blob may have different bytes and keys, so the main
+ngit-grasp duplication remains.
+
+### Partial clone or LFS
+
+Both require client/repository participation and change repository semantics.
+The service must deduplicate ordinary Git repositories transparently.
+
+### Garbage-collect unreachable objects during migration
+
+This would reduce the migration footprint but discard exactly the history used
+for rollback after delete-state events. It is deferred until rollback retention
+and physical deletion have an explicit policy.
+
+## Delivery sequence
+
+The implementation is intentionally reviewable as a stack:
+
+1. this decision and its invariants;
+2. family paths, local inventory, thin-view construction, and Git-level tests;
+3. standard and `/prs/` handler integration plus ref-only synchronization;
+4. opt-in S3 manifests, verified hydration, cache, and the durability fence;
+5. launch-time legacy migration, restart recovery, and operator documentation.
+
+Each layer retains the public repository layout and can be reviewed against the
+invariants above. The S3 layer never changes the default from local storage.

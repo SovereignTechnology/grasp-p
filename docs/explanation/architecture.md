@@ -8,6 +8,12 @@ ownership and cleanup invariants in
 
 `ngit-grasp` implements the GRASP protocol in Rust with **inline authorization** rather than Git hooks. Git push operations are intercepted and validated at the HTTP handler level before reaching the Git repository, eliminating the need for pre-receive hooks.
 
+Git object storage is organized into identifier families shared by the
+owner-specific and GRASP-06 repository views. The local filesystem remains the
+default durable backend; S3-compatible storage is opt-in. See
+[Identifier-family Git object storage](git-family-object-storage.md) for the
+storage, durability, no-GC, and startup-migration invariants.
+
 ## System Architecture
 
 ```
