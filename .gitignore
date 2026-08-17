@@ -8,6 +8,9 @@ target/
 work/*
 !work/README.md
 
+# Agent-managed linked worktrees nested beneath this checkout
+/worktrees/
+
 # Test runs (production sync testing data and logs)
 tmp/
 
