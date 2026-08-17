@@ -401,12 +401,11 @@ impl TestRelay {
     /// URL in the announcement so the relay under test targets the proxied
     /// connection. Under the permissive test policy the source itself also
     /// treats that URL as an event-directed sync target — it is a distinct
-    /// host:port that happens to front the source — and opens its own REQ
-    /// traffic through the proxy, contending with the relay under test for a
-    /// budget the scenario means to measure alone. The production policy
-    /// rejects non-global event-directed targets, so the source stays
-    /// scenery. Its own hosting, admission, and serving behavior is
-    /// unchanged.
+    /// host:port that happens to front the source — and opens its own sync
+    /// traffic through the proxy, contaminating measurements the scenario
+    /// means to attribute to the relay under test alone. The production
+    /// policy rejects non-global event-directed targets, so the source stays
+    /// scenery. Its own hosting, admission, and serving behavior is unchanged.
     pub async fn start_archive_source_behind_proxy() -> Self {
         Self::start_internal(
             port::reserve_port(),
