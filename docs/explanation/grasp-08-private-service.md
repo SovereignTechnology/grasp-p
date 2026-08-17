@@ -83,6 +83,27 @@ in-memory WebSocket pair to `LocalRelay`. The bridge subscribes to a
 membership generation channel; revoking a member closes their live sessions
 instead of letting them ride out an old connection.
 
+### Why self-subscription attaches in-process
+
+Proactive sync discovers what to sync by subscribing to the service's own
+accepted events (see [GRASP-02](grasp-02-proactive-sync.md)). Routing that
+feed over the public listener would make the service dial itself, and the
+NIP-42 gate above would correctly refuse: it runs in the HTTP layer, ahead of
+`LocalRelay`, and cannot tell its own process from any other anonymous
+dialler. The subscriber would then see nothing accepted at runtime, so
+proactive sync and the dynamic membership that rides on it would stall until
+the next restart rebuilt the index from the database — worst on exactly the
+private-to-private mirroring GRASP-08 exists to enable.
+
+The subscriber therefore attaches to the embedded relay through an in-memory
+duplex pair instead of a socket, in private and public mode alike. It is the
+same `LocalRelay` session a network client gets — same framing, same
+subscription handling, same post-save broadcast — without the listener, the
+auth gate, or the round trip. This is not an authentication exemption: there
+is no remote party to authenticate, and nothing reaches the subscriber that
+the relay did not already accept and persist. Membership is unchanged; the
+service's own key needs no entry in the member set.
+
 ### Why membership is service-wide
 
 Relays are referenced per repository in NIP-34 announcements, but access here

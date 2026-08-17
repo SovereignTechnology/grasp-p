@@ -499,14 +499,7 @@ async fn derived_membership_requires_grasp08_advertising_relay() {
     let member = Keys::generate();
     let owner_plain = Keys::generate();
     let owner_private = Keys::generate();
-    let git_data_dir = tempfile::tempdir().expect("git data dir");
-    let relay_data_dir = tempfile::tempdir().expect("relay data dir");
-    let relay = TestRelay::start_private_with_lmdb_paths(
-        &member.public_key(),
-        git_data_dir.path().to_path_buf(),
-        relay_data_dir.path().to_path_buf(),
-    )
-    .await;
+    let relay = TestRelay::start_private(&member.public_key()).await;
 
     // Two referenced relays that differ only in whether their NIP-11
     // advertises the GRASP-08 private-service extension.
@@ -593,11 +586,11 @@ async fn derived_membership_requires_grasp08_advertising_relay() {
         "announcement must be promoted out of purgatory"
     );
 
-    // The internal live self-subscription cannot pass the private NIP-42
-    // gate, so sync targets for locally promoted announcements are derived
-    // from the database at startup; restart to exercise that path.
-    let relay = relay.restart().await;
-
+    // No restart: the announcement was accepted at runtime, and the
+    // in-process self-subscription feeds the sync index live even though the
+    // private NIP-42 gate refuses external diallers. Connections to both
+    // referenced relays therefore prove the live path, not startup
+    // reconstruction from the database.
     wait_for_sync_connection(relay.url(), 2, Duration::from_secs(60))
         .await
         .expect("sync connections to both referenced relays");

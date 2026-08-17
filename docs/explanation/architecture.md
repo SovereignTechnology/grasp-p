@@ -561,7 +561,10 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 
 **Key Features:**
 
-- **Self-subscription** discovery - monitors own relay for announcements and root events to follow
+- **Self-subscription** discovery - monitors own relay for announcements and
+  root events to follow, attached in-process to the embedded relay rather than
+  dialling the public listener (works identically under GRASP-08 private mode,
+  whose auth gate would refuse a self-dial)
 - **Three-way diff** (`compute_actions`) determines new subscriptions needed
 - **Smart reconnection** - uses `since` filter for quick reconnects (<15 min), fresh sync otherwise
 - **Health tracking** with exponential backoff for failing relays
