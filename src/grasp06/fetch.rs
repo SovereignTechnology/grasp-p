@@ -5,10 +5,11 @@
 //! > MUST respond to upload-pack requests for any well-formed path as if
 //! > serving an empty bare repository.
 //!
-//! When a real `/prs/<submitter>/<identifier>.git` repo exists on disk
-//! we delegate to the standard handlers in [`crate::git::handlers`].
-//! Otherwise we synthesise a brand-new empty bare repo in a per-request
-//! temporary directory and run the standard upload-pack against that.
+//! When a real `/prs/<submitter>/<identifier>.git` repo exists on disk we
+//! delegate to the standard handlers in [`crate::git::handlers`]. Otherwise we
+//! synthesize an empty thin view in a per-request temporary directory. If the
+//! identifier family exists, receive-pack discovery can advertise its bases as
+//! anonymous `.have` entries without exposing any named refs.
 //!
 //! Receive-pack lives in [`crate::grasp06::receive`].
 
@@ -22,6 +23,7 @@ use tracing::{debug, warn};
 
 use crate::git::handlers::{handle_info_refs, handle_upload_pack, GitError};
 use crate::git::protocol::GitService;
+use crate::git::storage::{FamilyKey, LocalGitStorage};
 use crate::git::GitResponseBody;
 use crate::grasp06::endpoint::PrsUrl;
 use crate::grasp06::paths::prs_repo_path;
@@ -60,7 +62,9 @@ pub async fn handle_prs_info_refs(
         prs.submitter.to_hex(),
         prs.identifier
     );
-    let temp = init_empty_bare_repo()?;
+    let storage = LocalGitStorage::new(git_data_path);
+    let key = FamilyKey::sha1(&prs.identifier).map_err(|e| GitError::Storage(e.to_string()))?;
+    let temp = init_empty_bare_repo(&storage, &key)?;
     let repo_path = temp.path().to_path_buf();
     let response = handle_info_refs(repo_path, service, git_protocol).await;
     // `temp` is dropped here, deleting the directory. Git has already
@@ -98,7 +102,9 @@ pub async fn handle_prs_upload_pack(
         prs.submitter.to_hex(),
         prs.identifier
     );
-    let temp = init_empty_bare_repo()?;
+    let storage = LocalGitStorage::new(git_data_path);
+    let key = FamilyKey::sha1(&prs.identifier).map_err(|e| GitError::Storage(e.to_string()))?;
+    let temp = init_empty_bare_repo(&storage, &key)?;
     handle_prs_upload_pack_buffered(temp, body, git_protocol).await
 }
 
@@ -169,7 +175,7 @@ async fn handle_prs_upload_pack_buffered(
         .unwrap())
 }
 
-/// Create a fresh empty bare repo in a temp directory.
+/// Create a fresh empty thin view in a temp directory.
 ///
 /// Per-request temp dirs are deliberate. They are cheap on
 /// any reasonable filesystem (one `mkdir`, one `git init --bare`) and
@@ -177,7 +183,10 @@ async fn handle_prs_upload_pack_buffered(
 /// profiling shows this is a bottleneck we can switch to a shared
 /// `<git_data_path>/prs/.empty-template.git`; do not optimise until
 /// measurable.
-fn init_empty_bare_repo() -> Result<TempDir, GitError> {
+fn init_empty_bare_repo(
+    storage: &LocalGitStorage,
+    family_key: &FamilyKey,
+) -> Result<TempDir, GitError> {
     let temp = TempDir::new().map_err(GitError::IoError)?;
     let path = temp.path();
     let output = Command::new("git")
@@ -193,6 +202,11 @@ fn init_empty_bare_repo() -> Result<TempDir, GitError> {
             stderr.trim()
         );
         return Err(GitError::GitFailed(output.status.code()));
+    }
+    if storage.family_exists(family_key) {
+        storage
+            .configure_thin_view(family_key, path)
+            .map_err(|error| GitError::Storage(error.to_string()))?;
     }
     Ok(temp)
 }

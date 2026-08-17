@@ -411,26 +411,14 @@ impl AnnouncementPolicy {
             return Ok(());
         }
 
-        // Create parent directory (npub directory)
-        let parent = repo_path
-            .parent()
-            .ok_or_else(|| format!("Invalid repository path: {}", repo_path.display()))?;
+        let storage = crate::git::storage::LocalGitStorage::new(&self.ctx.git_data_path);
+        let key = crate::git::storage::FamilyKey::sha1(&announcement.identifier)
+            .map_err(|error| error.to_string())?;
+        storage
+            .create_thin_view(&key, &repo_path)
+            .map_err(|error| error.to_string())?;
 
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
-
-        // Initialize bare repository using git command
-        let output = std::process::Command::new("git")
-            .args(["init", "--bare", repo_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("Failed to execute git init: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("git init failed: {}", stderr));
-        }
-
-        tracing::info!("Created bare repository at {}", repo_path.display());
+        tracing::info!("Created thin repository view at {}", repo_path.display());
         Ok(())
     }
 

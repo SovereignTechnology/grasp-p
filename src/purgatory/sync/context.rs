@@ -229,6 +229,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tracing::debug;
 
+use crate::git::storage::{FamilyKey, LocalGitStorage};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::SharedDatabase;
@@ -436,6 +437,7 @@ fn hardened_git_command(
     repo_path: &Path,
     resolve_pin: Option<&str>,
     auth_header: Option<&str>,
+    object_directory: Option<&Path>,
     args: &[String],
 ) -> Command {
     let mut command = Command::new("git");
@@ -469,6 +471,9 @@ fn hardened_git_command(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .current_dir(repo_path);
+    if let Some(object_directory) = object_directory {
+        command.env("GIT_OBJECT_DIRECTORY", object_directory);
+    }
     command
 }
 
@@ -974,6 +979,23 @@ impl SyncContext for RealSyncContext {
         };
         let resolve_pin = resolve_pin_entry(&resolved);
 
+        let storage = LocalGitStorage::new(&self.git_data_path);
+        let family_key =
+            crate::git::sync::extract_identifier_from_repo_path(repo_path, &self.git_data_path)
+                .and_then(|identifier| FamilyKey::sha1(identifier).ok());
+        let family_lease = match family_key.as_ref() {
+            Some(key) if storage.is_thin_view(key, repo_path) => Some(
+                storage
+                    .write_lease(key)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("open family for git fetch: {error}"))?,
+            ),
+            _ => None,
+        };
+        let family_objects = family_lease
+            .as_ref()
+            .map(|lease| lease.family_objects_path.as_path());
+
         let repo_path = repo_path.to_path_buf();
         let url = url.to_string();
         let domain = extract_domain(&url).unwrap_or_else(|| "unknown".to_string());
@@ -1028,6 +1050,7 @@ impl SyncContext for RealSyncContext {
                 &repo_path,
                 resolve_pin.as_deref(),
                 fresh_auth_header().as_deref(),
+                None,
                 &ls_remote_args,
             ),
             &domain,
@@ -1098,6 +1121,7 @@ impl SyncContext for RealSyncContext {
                     &repo_path,
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
+                    family_objects,
                     &args,
                 ),
                 &domain,
@@ -1168,6 +1192,7 @@ impl SyncContext for RealSyncContext {
                     &repo_path,
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
+                    family_objects,
                     &args,
                 ),
                 &domain,
@@ -1218,6 +1243,27 @@ impl SyncContext for RealSyncContext {
             .filter(|oid| crate::git::oid_exists(&repo_path, oid))
             .cloned()
             .collect();
+
+        if let Some(key) = family_key.as_ref().filter(|_| family_lease.is_some()) {
+            for oid in &fetched {
+                if let Err(error) = storage.retain_tip(key, "purgatory-fetch", oid) {
+                    tracing::warn!(
+                        identifier = %key.identifier,
+                        %oid,
+                        %error,
+                        "Failed to retain proactively fetched family tip"
+                    );
+                }
+                if let Err(error) = storage.advertise_base_tip(key, "purgatory-fetch", oid) {
+                    tracing::warn!(
+                        identifier = %key.identifier,
+                        %oid,
+                        %error,
+                        "Failed to advertise proactively fetched family tip"
+                    );
+                }
+            }
+        }
 
         // One summary line per outbound fetch pass: this is the
         // client-side visibility the drop-one-and-retry loop lacked

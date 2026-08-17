@@ -29,6 +29,27 @@ impl GitSubprocess {
         advertise: bool,
         git_protocol: Option<&str>,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_object_directory(
+            service,
+            repo_path,
+            advertise,
+            git_protocol,
+            None::<&Path>,
+        )
+    }
+
+    /// Spawn Git with an optional writable object database override.
+    ///
+    /// Thin views normally read through `objects/info/alternates`. Commands
+    /// that create objects use this override so receive-pack quarantine output
+    /// and fetched objects land directly in the identifier family.
+    pub fn spawn_with_object_directory(
+        service: GitService,
+        repo_path: impl AsRef<Path>,
+        advertise: bool,
+        git_protocol: Option<&str>,
+        object_directory: Option<impl AsRef<Path>>,
+    ) -> std::io::Result<Self> {
         let repo_path = repo_path.as_ref();
 
         let mut cmd = Command::new("git");
@@ -61,6 +82,9 @@ impl GitSubprocess {
         // This enables Git protocol v2 support for modern git clients
         if let Some(protocol) = git_protocol {
             cmd.env("GIT_PROTOCOL", protocol);
+        }
+        if let Some(object_directory) = object_directory {
+            cmd.env("GIT_OBJECT_DIRECTORY", object_directory.as_ref());
         }
 
         let child = cmd.spawn()?;
