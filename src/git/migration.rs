@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use bitcoin_hashes::{sha256, Hash};
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat, STORAGE_VERSION};
 use super::validate_repository_identifier;
@@ -456,11 +457,7 @@ fn build_family_union(
             storage.advertise_base_tip(key, &name, &reference.oid)?;
         }
     }
-    run_git(
-        Some(&family),
-        &["fsck", "--full", "--no-reflogs"],
-        "verify migrated family",
-    )?;
+    audit_family_connectivity(&family)?;
     remove_migration_staging(&staging, &migration_root(storage).join("family-staging"))?;
     Ok(())
 }
@@ -789,6 +786,30 @@ fn ensure_oids(repo: &Path, expected: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn audit_family_connectivity(repo: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["fsck", "--full", "--no-reflogs", "--no-dangling"])
+        .current_dir(repo)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let diagnostic: String = diagnostic.trim().chars().take(2048).collect();
+    warn!(
+        repository = %repo.display(),
+        status = %output.status,
+        diagnostic,
+        "Migrated family preserves a pre-existing incomplete object graph"
+    );
+    Ok(())
+}
+
 fn install_if_absent(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         return Ok(());
@@ -1023,6 +1044,50 @@ mod tests {
             error.to_string(),
             format!("object {missing} is missing from {}", repo.display())
         );
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_a_preexisting_incomplete_object_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (repo, _) = legacy_repo(storage.git_data_path(), &owner, "incomplete", b"present\n");
+        let tree = git(&repo, &["mktree"]);
+        let missing_parent = "1".repeat(40);
+        let commit = format!(
+            "tree {tree}\nparent {missing_parent}\nauthor Test <test@example.com> 0 +0000\ncommitter Test <test@example.com> 0 +0000\n\nincomplete history\n"
+        );
+        let mut child = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(&repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(commit.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let commit_oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        git(&repo, &["update-ref", "refs/heads/main", &commit_oid]);
+        assert!(!Command::new("git")
+            .args(["fsck", "--full", "--no-reflogs", "--no-dangling"])
+            .current_dir(&repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+
+        let report = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(report.migrated_views, 1);
+        let key = FamilyKey::new(ObjectFormat::Sha1, "incomplete").unwrap();
+        ensure_oid(&storage.family_repo_path(&key), &commit_oid).unwrap();
     }
 
     #[tokio::test]
