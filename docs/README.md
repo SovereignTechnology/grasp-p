@@ -58,6 +58,8 @@ WORKING       │  How-To        │    Reference     │
 
 - **[Architecture Overview](explanation/architecture.md)** - System design and components
 - **[Inline Authorization](explanation/inline-authorization.md)** - Why we chose this approach
+- **[Administration Vision](explanation/administration-vision.md)** -
+  Nostr-authenticated management, embedded UI, and runtime configuration
 - **[Comparison with ngit-relay](explanation/comparison.md)** - How we differ from reference
 - **[Design Decisions](explanation/decisions.md)** - Key architectural choices
 

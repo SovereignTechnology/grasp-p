@@ -172,6 +172,21 @@ Explanation documentation helps you **understand concepts** and design decisions
 
 ---
 
+### [Administration, Private Analytics, and Runtime Configuration Vision](administration-vision.md)
+**Nostr-authenticated management API, embedded UI, and layered configuration**
+
+**Topics:**
+- NIP-98 authentication and NIP-86-compatible methods
+- Scoped private analytics and future quota accounting
+- Embedded static administration application
+- Provenance-aware configuration and database overrides
+- Incremental live reconfiguration
+
+**Read when:** You are designing administration APIs, operator tooling,
+runtime settings, or quota features
+
+---
+
 ### [Defensive Measures & Rate Limiting](defensive-measures.md)
 **Protection against abuse, spam, and denial-of-service attacks**
 
