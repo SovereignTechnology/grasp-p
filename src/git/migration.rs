@@ -711,7 +711,11 @@ fn copy_object_database(source: &Path, target: &Path, format: ObjectFormat) -> R
             }
             let index = pack.path().with_extension("idx");
             if !index.is_file() {
-                return Err(anyhow!("pack {} has no index", pack.path().display()));
+                warn!(
+                    pack = %pack.path().display(),
+                    "Skipping Git-invisible pack without an index; the migration backup retains it"
+                );
+                continue;
             }
             install_if_absent(&pack.path(), &target_packs.join(&name))?;
             install_if_absent(&index, &target_packs.join(index.file_name().unwrap()))?;
@@ -1088,6 +1092,35 @@ mod tests {
         assert_eq!(report.migrated_views, 1);
         let key = FamilyKey::new(ObjectFormat::Sha1, "incomplete").unwrap();
         ensure_oid(&storage.family_repo_path(&key), &commit_oid).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_archives_a_pack_without_an_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (repo, oid) = legacy_repo(storage.git_data_path(), &owner, "orphan-pack", b"present\n");
+        let relative = repo.strip_prefix(storage.git_data_path()).unwrap();
+        let orphan_name = "pack-0000000000000000000000000000000000000000.pack";
+        let orphan = repo.join("objects/pack").join(orphan_name);
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"not a readable Git pack\n").unwrap();
+
+        let report = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(report.migrated_views, 1);
+        let archived = backup_root(&storage)
+            .join(relative)
+            .join("objects/pack")
+            .join(orphan_name);
+        assert_eq!(
+            std::fs::read(archived).unwrap(),
+            b"not a readable Git pack\n"
+        );
+        let key = FamilyKey::new(ObjectFormat::Sha1, "orphan-pack").unwrap();
+        let family = storage.family_repo_path(&key);
+        assert!(!family.join("objects/pack").join(orphan_name).exists());
+        ensure_oid(&family, &oid).unwrap();
     }
 
     #[tokio::test]
