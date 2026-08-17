@@ -901,6 +901,11 @@ async fn stream_receive_pack_output<S, E>(
         retain_accepted_tips(&storage, &family_key, &repo_path, &pushed_refs);
     }
 
+    // Received objects and their retention roots are complete. Release the
+    // family writer before post-push processing: purgatory promotion and
+    // archive recovery may need to re-enter this same identifier family.
+    drop(family_lease);
+
     // Release the repository lifecycle read lock once git-receive-pack itself
     // has finished. The lock's purpose is to keep deletion/archive/restore from
     // removing or replacing the bare repository while Git is actively reading or

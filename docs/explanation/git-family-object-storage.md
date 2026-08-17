@@ -349,13 +349,16 @@ and physical deletion have an explicit policy.
 
 ## Delivery sequence
 
-The implementation is intentionally reviewable as a stack:
+The implementation is intentionally reviewable as a local-first stack:
 
 1. this decision and its invariants;
 2. family paths, local inventory, thin-view construction, and Git-level tests;
 3. standard and `/prs/` handler integration plus ref-only synchronization;
-4. opt-in S3 manifests, verified hydration, cache, and the durability fence;
-5. launch-time legacy migration, restart recovery, and operator documentation.
+4. launch-time legacy migration, restart recovery, and operator documentation;
+5. one optional S3 layer containing manifests, verified hydration, cache,
+   local-family adoption, configuration, and the durability fence.
 
-Each layer retains the public repository layout and can be reviewed against the
-invariants above. The S3 layer never changes the default from local storage.
+Steps 3 and 4 ship together as the first deployable local-storage milestone.
+It can be operated and observed before the S3 layer is considered. Every layer
+retains the public repository layout, and S3 never changes the default from
+local storage.

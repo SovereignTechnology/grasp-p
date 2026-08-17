@@ -18,6 +18,7 @@ use nostr_sdk::prelude::{Event, Kind, PublicKey, Timestamp};
 use tar::Archive as TarArchive;
 
 use super::DeletionService;
+use crate::git::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 use crate::nostr::lifecycle::RecoveryMetadataRecord;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ impl DeletionService {
 // ---------------------------------------------------------------------------
 
 impl DeletionService {
-    pub(crate) fn restore_git_archive_to_repo(
+    pub(crate) async fn restore_git_archive_to_repo(
         &self,
         archive_path: &Path,
         owner_path_component: &str,
@@ -82,7 +83,7 @@ impl DeletionService {
             )
         })?;
 
-        let result = (|| -> anyhow::Result<bool> {
+        let result: anyhow::Result<bool> = async {
             let archive_file = File::open(archive_path).map_err(|e| {
                 anyhow::anyhow!("failed to open archive {}: {}", archive_path.display(), e)
             })?;
@@ -106,10 +107,36 @@ impl DeletionService {
                 ));
             }
 
+            let storage = LocalGitStorage::new(&self.ctx.git_data_path);
+            let key = FamilyKey::new(ObjectFormat::detect(&extracted_repo)?, identifier)?;
+            let _family_lease = storage.write_lease(&key).await?;
+            crate::git::migration::import_archived_repository(&storage, &key, &extracted_repo)?;
+
             if target_repo.is_dir() {
+                if !storage.is_thin_view(&key, &target_repo) {
+                    return Err(anyhow::anyhow!(
+                        "active repository {} is not an identifier-family view; restart to migrate it before recovery",
+                        target_repo.display()
+                    ));
+                }
                 return Self::restore_archived_nostr_refs(&extracted_repo, &target_repo);
             }
 
+            std::fs::remove_dir_all(extracted_repo.join("objects")).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to remove imported object database from {}: {}",
+                    extracted_repo.display(),
+                    e
+                )
+            })?;
+            std::fs::create_dir_all(extracted_repo.join("objects")).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create thin object directory in {}: {}",
+                    extracted_repo.display(),
+                    e
+                )
+            })?;
+            storage.configure_thin_view(&key, &extracted_repo)?;
             std::fs::rename(&extracted_repo, &target_repo)
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -120,7 +147,8 @@ impl DeletionService {
                     )
                 })
                 .map(|_| true)
-        })();
+        }
+        .await;
 
         let _ = std::fs::remove_dir_all(&staging_dir);
         result
@@ -551,11 +579,10 @@ impl DeletionService {
                         );
                         git_ready = false;
                     } else {
-                        match self.restore_git_archive_to_repo(
-                            &abs_path,
-                            &owner_component,
-                            identifier,
-                        ) {
+                        match self
+                            .restore_git_archive_to_repo(&abs_path, &owner_component, identifier)
+                            .await
+                        {
                             Ok(restored) => {
                                 archive_restored = restored;
                             }

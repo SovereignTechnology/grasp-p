@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::process::Command;
 
 use nostr_sdk::prelude::{Event, Kind, Timestamp};
 
@@ -57,7 +56,7 @@ impl DeletionPolicy {
             }
         }
 
-        if let Err(e) = Self::replace_live_repo_with_empty_purgatory_repo(&repo_path) {
+        if let Err(e) = self.replace_live_repo_with_empty_purgatory_repo(&repo_path, &identifier) {
             tracing::warn!(
                 owner = %owner.to_hex(),
                 identifier = %identifier,
@@ -84,7 +83,9 @@ impl DeletionPolicy {
     }
 
     fn replace_live_repo_with_empty_purgatory_repo(
+        &self,
         repo_path: &std::path::Path,
+        identifier: &str,
     ) -> anyhow::Result<()> {
         if repo_path.exists() {
             std::fs::remove_dir_all(repo_path).map_err(|e| {
@@ -96,37 +97,9 @@ impl DeletionPolicy {
             })?;
         }
 
-        let parent = repo_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid repository path {}", repo_path.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create repository parent {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-
-        let output = Command::new("git")
-            .args([
-                "init",
-                "--bare",
-                repo_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("non-utf8 repository path {}", repo_path.display())
-                })?,
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to execute git init: {}", e))?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "git init failed for {}: {}",
-                repo_path.display(),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        Ok(())
+        let storage = crate::git::storage::LocalGitStorage::new(&self.ctx.git_data_path);
+        let family = crate::git::storage::FamilyKey::sha1(identifier)?;
+        storage.create_thin_view(&family, repo_path)
     }
 
     /// Remove any purgatory entries targeted by this deletion event.

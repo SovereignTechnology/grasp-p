@@ -964,56 +964,32 @@ impl Purgatory {
             }
         }
 
-        // If the entry was soft-expired, recreate the bare repo outside the
+        // If the entry was soft-expired, recreate the thin view outside the
         // mutable borrow so we don't hold the DashMap lock during I/O.
         if let Some((repo_path, was_soft_expired)) = revival_info {
             if was_soft_expired {
                 if !repo_path.exists() {
-                    match std::fs::create_dir_all(&repo_path) {
-                        Ok(()) => {
-                            // Initialise as a bare git repository
-                            let status = std::process::Command::new("git")
-                                .args(["init", "--bare"])
-                                .arg(&repo_path)
-                                .status();
-                            match status {
-                                Ok(s) if s.success() => {
-                                    tracing::info!(
-                                        path = %repo_path.display(),
-                                        owner = %owner,
-                                        identifier = %identifier,
-                                        "Recreated bare repository for revived soft-expired announcement"
-                                    );
-                                }
-                                Ok(s) => {
-                                    tracing::warn!(
-                                        path = %repo_path.display(),
-                                        exit_code = ?s.code(),
-                                        "git init --bare failed when reviving soft-expired announcement"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        path = %repo_path.display(),
-                                        error = %e,
-                                        "Failed to run git init --bare when reviving soft-expired announcement"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %repo_path.display(),
-                                error = %e,
-                                "Failed to create directory when reviving soft-expired announcement"
-                            );
-                        }
+                    let storage = crate::git::storage::LocalGitStorage::new(&self._git_data_path);
+                    let result = crate::git::storage::FamilyKey::sha1(identifier)
+                        .and_then(|family| storage.create_thin_view(&family, &repo_path));
+                    match result {
+                        Ok(()) => tracing::info!(
+                            path = %repo_path.display(),
+                            owner = %owner,
+                            identifier = %identifier,
+                            "Recreated thin repository view for revived soft-expired announcement"
+                        ),
+                        Err(e) => tracing::warn!(
+                            path = %repo_path.display(),
+                            error = %e,
+                            "Failed to recreate thin repository view for revived soft-expired announcement"
+                        ),
                     }
                 }
                 tracing::info!(
                     owner = %owner,
                     identifier = %identifier,
-                    "Revived soft-expired announcement (bare repo recreated, expiry extended)"
+                    "Revived soft-expired announcement (thin view recreated, expiry extended)"
                 );
             }
         }
@@ -2260,6 +2236,44 @@ fn cleanup_defers_expiry_only_while_repository_sync_is_active() {
             .soft_expired
     );
     assert_eq!(purgatory.expired_count(), 2);
+}
+
+#[test]
+fn extending_soft_expired_announcement_recreates_a_thin_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let git_data_path = directory.path().join("git");
+    let repo_path = git_data_path.join("owner").join("revived.git");
+    let purgatory = Purgatory::new(&git_data_path);
+    let keys = Keys::generate();
+    let identifier = "revived";
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .finalize(&keys)
+        .unwrap();
+
+    purgatory.add_announcement(
+        announcement,
+        identifier.to_string(),
+        keys.public_key(),
+        repo_path.clone(),
+        HashSet::new(),
+    );
+    purgatory
+        .announcement_purgatory
+        .get_mut(&(keys.public_key(), identifier.to_string()))
+        .unwrap()
+        .soft_expired = true;
+
+    purgatory.extend_announcement_expiry(&keys.public_key(), identifier, Duration::from_secs(60));
+
+    let storage = crate::git::storage::LocalGitStorage::new(&git_data_path);
+    let family = crate::git::storage::FamilyKey::sha1(identifier).unwrap();
+    assert!(storage.is_thin_view(&family, &repo_path));
+    assert!(
+        !purgatory
+            .find_announcement(&keys.public_key(), identifier)
+            .unwrap()
+            .soft_expired
+    );
 }
 
 #[test]

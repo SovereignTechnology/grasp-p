@@ -380,7 +380,10 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
         .expect("second /prs/ frame should not be an HTTP body error");
     streamed.extend_from_slice(&frame_data(second));
 
-    let terminal = timeout(Duration::from_secs(1), body.frame())
+    // Family ref retention happens behind this boundary. Keep the deadline
+    // bounded but allow finalization the same scheduling headroom as the
+    // subprocess wake above.
+    let terminal = timeout(Duration::from_secs(3), body.frame())
         .await
         .expect("/prs/ terminal flush should arrive after cleanup")
         .expect("/prs/ body should contain the terminal flush")

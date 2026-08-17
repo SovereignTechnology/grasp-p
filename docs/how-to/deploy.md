@@ -282,6 +282,9 @@ git ls-remote https://ngit.example.com/<npub>/<repo>.git
 - `dataDir` - Base directory for data (default: /var/lib/ngit-grasp-{name})
 - `databaseBackend` - "lmdb" | "memory" (default: "lmdb")
 
+See [Upgrade Git family storage](upgrade-git-family-storage.md) before updating
+an existing instance to a release that enables identifier-family storage.
+
 ### Identity
 - `relayName` - Relay name for NIP-11 (default: "{domain} grasp relay")
 - `relayDescription` - Relay description

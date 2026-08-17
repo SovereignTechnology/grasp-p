@@ -19,6 +19,7 @@
 
 pub mod authorization;
 pub mod handlers;
+pub mod migration;
 pub mod process;
 pub mod protocol;
 pub mod storage;
