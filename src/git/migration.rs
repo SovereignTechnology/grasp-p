@@ -188,8 +188,7 @@ pub(crate) fn import_archived_repository(
     copy_object_database(source, &family, key.object_format)?;
     ensure_oids(&family, &expected_oids)?;
     for (name, reference) in snapshot_refs(source)? {
-        storage.retain_tip(key, &name, &reference.oid)?;
-        storage.advertise_base_tip(key, &name, &reference.oid)?;
+        retain_family_tip(storage, key, &family, &name, &reference.oid)?;
     }
     Ok(())
 }
@@ -453,8 +452,7 @@ fn build_family_union(
     ensure_oids(&family, &expected_oids)?;
     for candidate in candidates {
         for (name, reference) in snapshot_refs(&candidate.source_path)? {
-            storage.retain_tip(key, &name, &reference.oid)?;
-            storage.advertise_base_tip(key, &name, &reference.oid)?;
+            retain_family_tip(storage, key, &family, &name, &reference.oid)?;
         }
     }
     audit_family_connectivity(&family)?;
@@ -623,12 +621,32 @@ fn install_refs(repo: &Path, refs: &BTreeMap<String, RefSnapshot>) -> Result<()>
                 &["symbolic-ref", name, target],
                 "install migrated symbolic ref",
             )?;
-        } else {
+        } else if oid_is_available(repo, &reference.oid)? {
             run_git(
                 Some(repo),
                 &["update-ref", name, &reference.oid],
                 "install migrated ref",
             )?;
+        } else {
+            let relative = Path::new(name);
+            if !name.starts_with("refs/")
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(anyhow!("unsafe migrated ref name {name:?}"));
+            }
+            write_atomic(
+                &repo.join(relative),
+                format!("{}\n", reference.oid).as_bytes(),
+            )?;
+            warn!(
+                repository = %repo.display(),
+                reference = %name,
+                oid = %reference.oid,
+                "Preserving a pre-existing ref whose target object is missing"
+            );
         }
     }
     Ok(())
@@ -645,8 +663,15 @@ fn verify_view(
     if std::fs::read(view.join("HEAD"))? != expected_head {
         return Err(anyhow!("migrated HEAD differs in {}", view.display()));
     }
-    for reference in expected_refs.values() {
-        ensure_oid(view, &reference.oid)?;
+    for (name, reference) in expected_refs {
+        if !oid_is_available(view, &reference.oid)? {
+            warn!(
+                repository = %view.display(),
+                reference = %name,
+                oid = %reference.oid,
+                "Verified a preserved ref whose target object is missing"
+            );
+        }
     }
     Ok(())
 }
@@ -765,15 +790,12 @@ fn verify_pack(index: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_oid(repo: &Path, oid: &str) -> Result<()> {
-    let status = Command::new("git")
+fn oid_is_available(repo: &Path, oid: &str) -> Result<bool> {
+    let output = Command::new("git")
         .args(["cat-file", "-e", oid])
         .current_dir(repo)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("object {oid} is missing from {}", repo.display()));
-    }
-    Ok(())
+        .output()?;
+    Ok(output.status.success())
 }
 
 fn ensure_oids(repo: &Path, expected: &[String]) -> Result<()> {
@@ -811,6 +833,27 @@ fn audit_family_connectivity(repo: &Path) -> Result<()> {
         diagnostic,
         "Migrated family preserves a pre-existing incomplete object graph"
     );
+    Ok(())
+}
+
+fn retain_family_tip(
+    storage: &LocalGitStorage,
+    key: &FamilyKey,
+    family: &Path,
+    name: &str,
+    oid: &str,
+) -> Result<()> {
+    if oid_is_available(family, oid)? {
+        storage.retain_tip(key, name, oid)?;
+        storage.advertise_base_tip(key, name, oid)?;
+    } else {
+        warn!(
+            repository = %family.display(),
+            reference = %name,
+            oid = %oid,
+            "Not advertising a pre-existing ref whose target object is missing"
+        );
+    }
     Ok(())
 }
 
@@ -1091,7 +1134,7 @@ mod tests {
 
         assert_eq!(report.migrated_views, 1);
         let key = FamilyKey::new(ObjectFormat::Sha1, "incomplete").unwrap();
-        ensure_oid(&storage.family_repo_path(&key), &commit_oid).unwrap();
+        assert!(oid_is_available(&storage.family_repo_path(&key), &commit_oid).unwrap());
     }
 
     #[tokio::test]
@@ -1120,7 +1163,44 @@ mod tests {
         let key = FamilyKey::new(ObjectFormat::Sha1, "orphan-pack").unwrap();
         let family = storage.family_repo_path(&key);
         assert!(!family.join("objects/pack").join(orphan_name).exists());
-        ensure_oid(&family, &oid).unwrap();
+        assert!(oid_is_available(&family, &oid).unwrap());
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_a_ref_with_a_missing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (repo, _) = legacy_repo(storage.git_data_path(), &owner, "missing-ref", b"present\n");
+        let missing = "2".repeat(40);
+        let broken_ref = repo.join("refs/heads/broken");
+        std::fs::create_dir_all(broken_ref.parent().unwrap()).unwrap();
+        std::fs::write(&broken_ref, format!("{missing}\n")).unwrap();
+        assert_eq!(
+            snapshot_refs(&repo).unwrap()["refs/heads/broken"].oid,
+            missing
+        );
+
+        let report = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(report.migrated_views, 1);
+        assert_eq!(
+            std::fs::read_to_string(&broken_ref).unwrap(),
+            format!("{missing}\n")
+        );
+        assert_eq!(
+            snapshot_refs(&repo).unwrap()["refs/heads/broken"].oid,
+            missing
+        );
+        let key = FamilyKey::new(ObjectFormat::Sha1, "missing-ref").unwrap();
+        let family = storage.family_repo_path(&key);
+        assert!(!oid_is_available(&family, &missing).unwrap());
+        assert!(!git(
+            &family,
+            &["for-each-ref", "--format=%(objectname)", "refs/grasp/"]
+        )
+        .lines()
+        .any(|oid| oid == missing));
     }
 
     #[tokio::test]
@@ -1171,7 +1251,7 @@ mod tests {
             super::super::get_ref_commit(&second, "refs/test/data"),
             Some(second_oid)
         );
-        ensure_oid(&storage.family_repo_path(&key), &unreachable).unwrap();
+        assert!(oid_is_available(&storage.family_repo_path(&key), &unreachable).unwrap());
         assert!(backup_root(&storage)
             .join(&owner_one)
             .join("example.git")
@@ -1249,8 +1329,8 @@ mod tests {
         import_archived_repository(&storage, &key, &archive).unwrap();
 
         let family = storage.family_repo_path(&key);
-        ensure_oid(&family, &referenced).unwrap();
-        ensure_oid(&family, &unreachable).unwrap();
+        assert!(oid_is_available(&family, &referenced).unwrap());
+        assert!(oid_is_available(&family, &unreachable).unwrap());
         assert!(!git(&family, &["for-each-ref", "refs/grasp/retained/"]).is_empty());
     }
 }
