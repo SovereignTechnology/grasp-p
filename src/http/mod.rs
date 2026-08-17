@@ -21,6 +21,7 @@ use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
+use nostr_sdk::error::ErrorKind as RelayErrorKind;
 use nostr_sdk::local_relay::LocalRelay;
 use nostr_sdk::prelude::PublicKey;
 use tokio::net::TcpListener;
@@ -39,6 +40,27 @@ use crate::purgatory::Purgatory;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
 type HttpBody = GitResponseBody;
+
+fn is_peer_scoped_relay_error(kind: RelayErrorKind) -> bool {
+    matches!(
+        kind,
+        RelayErrorKind::Protocol
+            | RelayErrorKind::IO
+            | RelayErrorKind::Transport
+            | RelayErrorKind::Timeout
+            | RelayErrorKind::Rejected
+            | RelayErrorKind::LimitExceeded
+            | RelayErrorKind::Other
+    )
+}
+
+fn is_peer_scoped_http_error(error: &hyper::Error) -> bool {
+    error.is_parse()
+        || error.is_canceled()
+        || error.is_closed()
+        || error.is_incomplete_message()
+        || error.is_body_write_aborted()
+}
 
 /// CORS headers required by GRASP-01 specification (lines 48-51)
 const CORS_ALLOW_ORIGIN: &str = "*";
@@ -784,7 +806,7 @@ impl Service<Request<Incoming>> for HttpService {
                 tokio::spawn(async move {
                     match hyper::upgrade::on(req).await {
                         Ok(upgraded) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 client_ip = %addr.ip(),
                                 peer = %peer,
                                 "WebSocket connection established"
@@ -815,14 +837,25 @@ impl Service<Request<Incoming>> for HttpService {
                             } else if let Err(e) =
                                 relay.take_connection(TokioIo::new(upgraded), addr).await
                             {
-                                tracing::error!(
-                                    client_ip = %addr.ip(),
-                                    peer = %peer,
-                                    error = %e,
-                                    "Relay connection failed"
-                                );
+                                if is_peer_scoped_relay_error(e.kind()) {
+                                    tracing::debug!(
+                                        client_ip = %addr.ip(),
+                                        peer = %peer,
+                                        error_kind = ?e.kind(),
+                                        error = %e,
+                                        "Relay client session ended with an error"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        client_ip = %addr.ip(),
+                                        peer = %peer,
+                                        error_kind = ?e.kind(),
+                                        error = %e,
+                                        "Relay connection failed"
+                                    );
+                                }
                             }
-                            tracing::info!(
+                            tracing::debug!(
                                 client_ip = %addr.ip(),
                                 peer = %peer,
                                 "WebSocket connection closed"
@@ -832,7 +865,23 @@ impl Service<Request<Incoming>> for HttpService {
                                 m.connection_tracker().on_disconnect(addr.ip());
                             }
                         }
-                        Err(e) => tracing::error!("Upgrade error: {}", e),
+                        Err(e) => {
+                            if is_peer_scoped_http_error(&e) {
+                                tracing::debug!(
+                                    client_ip = %addr.ip(),
+                                    peer = %peer,
+                                    error = %e,
+                                    "WebSocket upgrade ended before completion"
+                                );
+                            } else {
+                                tracing::error!(
+                                    client_ip = %addr.ip(),
+                                    peer = %peer,
+                                    error = %e,
+                                    "WebSocket upgrade failed"
+                                );
+                            }
+                        }
                     }
                 });
 
@@ -1024,8 +1073,61 @@ pub async fn run_server_on_listener(
                 .with_upgrades()
                 .await
             {
-                tracing::error!("Failed to handle request from {}: {}", addr, e);
+                if is_peer_scoped_http_error(&e) {
+                    tracing::debug!(
+                        peer = %addr,
+                        error = %e,
+                        "HTTP client connection ended before completion"
+                    );
+                } else {
+                    tracing::error!(
+                        peer = %addr,
+                        error = %e,
+                        "Failed to handle HTTP request"
+                    );
+                }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_client_failures_are_peer_scoped() {
+        for kind in [
+            RelayErrorKind::Protocol,
+            RelayErrorKind::IO,
+            RelayErrorKind::Transport,
+            RelayErrorKind::Timeout,
+            RelayErrorKind::Rejected,
+            RelayErrorKind::LimitExceeded,
+            RelayErrorKind::Other,
+        ] {
+            assert!(
+                is_peer_scoped_relay_error(kind),
+                "unexpected kind: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_internal_failures_remain_operator_actionable() {
+        for kind in [
+            RelayErrorKind::Database,
+            RelayErrorKind::Gossip,
+            RelayErrorKind::Policy,
+            RelayErrorKind::NotFound,
+            RelayErrorKind::Invalid,
+            RelayErrorKind::State,
+            RelayErrorKind::Unsupported,
+        ] {
+            assert!(
+                !is_peer_scoped_relay_error(kind),
+                "unexpected kind: {kind:?}"
+            );
+        }
     }
 }

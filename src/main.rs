@@ -7,7 +7,10 @@ use tracing::info;
 use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, EnvFilter, Layer};
 
 use ngit_grasp::{
-    cleanup_empty_repos, config::Config, logging::SuppressRoutineDisconnects, nostr,
+    cleanup_empty_repos,
+    config::Config,
+    logging::{effective_log_filter, SuppressRoutineDisconnects},
+    nostr,
     server::RelayServer,
 };
 
@@ -70,8 +73,8 @@ async fn main() -> Result<()> {
 /// this function only owns concerns specific to the standalone binary:
 /// the global tracing subscriber and signal handling.
 async fn run_relay(config: Config) -> Result<()> {
-    // Initialize tracing with configured log level
-    let filter = EnvFilter::new(&config.log_level).and(SuppressRoutineDisconnects);
+    let effective_filter = effective_log_filter(&config.log_level);
+    let filter = EnvFilter::new(&effective_filter).and(SuppressRoutineDisconnects);
     // Only colorize when stdout is a terminal: ANSI escape codes in redirected
     // logs corrupt journald/file output and break log-scraping consumers.
     let subscriber = tracing_subscriber::registry().with(
@@ -81,7 +84,11 @@ async fn run_relay(config: Config) -> Result<()> {
     );
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Starting ngit-grasp with log level: {}", config.log_level);
+    info!(
+        configured_log_level = %config.log_level,
+        effective_log_filter = %effective_filter,
+        "Starting ngit-grasp"
+    );
 
     let server = RelayServer::start(config).await?;
 

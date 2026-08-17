@@ -1586,7 +1586,7 @@ equivalent standard NIP-11 field, so it remains documented configuration only.
 
 #### `NGIT_LOG_LEVEL`
 
-**Description:** Logging level and filters for application logging  
+**Description:** Application logging level or explicit tracing filter expression
 **Type:** String (log level or filter expression)  
 **Default:** `info`  
 **Required:** No
@@ -1595,11 +1595,11 @@ equivalent standard NIP-11 field, so it remains documented configuration only.
 
 ```bash
 # Simple levels
-NGIT_LOG_LEVEL=error    # Errors only
-NGIT_LOG_LEVEL=warn     # Warnings and errors
-NGIT_LOG_LEVEL=info     # Info, warnings, errors (default)
-NGIT_LOG_LEVEL=debug    # Debug and above
-NGIT_LOG_LEVEL=trace    # Everything (very verbose)
+NGIT_LOG_LEVEL=error    # ngit-grasp errors; dependency warnings and errors
+NGIT_LOG_LEVEL=warn     # ngit-grasp warnings and errors; dependency warnings and errors
+NGIT_LOG_LEVEL=info     # ngit-grasp info and above; dependency warnings and errors (default)
+NGIT_LOG_LEVEL=debug    # ngit-grasp debug and above; dependency warnings and errors
+NGIT_LOG_LEVEL=trace    # ngit-grasp trace and above; dependency warnings and errors
 
 # Module-specific filtering
 NGIT_LOG_LEVEL=ngit_grasp=debug,actix_web=info
@@ -1607,6 +1607,11 @@ NGIT_LOG_LEVEL=ngit_grasp=debug,actix_web=info
 # Complex filters
 NGIT_LOG_LEVEL=debug,hyper=info,tokio=warn
 ```
+
+Bare levels are expanded to `warn,ngit_grasp=<level>` so application
+diagnostics do not also enable verbose internals from every dependency.
+Expressions containing target directives or commas are passed through
+unchanged, leaving dependency verbosity under explicit operator control.
 
 **Log levels (most to least verbose):**
 
@@ -1631,6 +1636,7 @@ NGIT_LOG_LEVEL=info
 **Notes:**
 
 - Uses Rust's `tracing` crate filter syntax
+- Bare levels apply to ngit-grasp while dependencies remain at `warn`
 - Supports module-level filtering (e.g., `ngit_grasp=debug,hyper=info`)
 - `trace` level can significantly impact performance
 - For production, `info` or `warn` is recommended

@@ -50,6 +50,24 @@ flowchart TB
 | Abuse threshold | `--abuse-threshold` | `NGIT_ABUSE_THRESHOLD` | `10` | Max connections per IP before flagging |
 | Top N repos | `--top-n-repos` | `NGIT_TOP_N_REPOS` | `10` | Number of top bandwidth repos to track |
 
+## Logging severity policy
+
+Operational logging classifies records by who can act on them:
+
+- `error` identifies an internal, persistence, or process failure that may
+  require an operator response.
+- `warn` identifies a degraded application path, bounded retry, or cooldown
+  that affects service behavior but remains recoverable.
+- `info` records application lifecycle, aggregate batch outcomes, and durable
+  state transitions.
+- `debug` carries individual client, peer, event, filter, and capability
+  negotiation details. Invalid or unsupported remote input is expected on a
+  public relay and is not operator-actionable by itself.
+
+For a bare `NGIT_LOG_LEVEL`, dependencies remain at `warn` while the selected
+level applies to ngit-grasp. Use an explicit tracing filter expression when a
+dependency needs temporary diagnostics.
+
 ## Privacy Model
 
 IP addresses are **never exposed in Prometheus metrics**. The connection tracker maintains per-IP counts internally only for abuse detection:

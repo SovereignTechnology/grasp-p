@@ -8773,7 +8773,7 @@ impl SyncManager {
                     }
                     Err(e) => {
                         failed_count += 1;
-                        tracing::warn!(
+                        tracing::debug!(
                             relay = %relay_url,
                             filter_idx = idx,
                             error = %e,

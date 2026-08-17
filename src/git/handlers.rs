@@ -253,6 +253,12 @@ pub(crate) fn is_git_protocol_error(exit_code: Option<i32>, stderr: &[u8]) -> bo
     exit_code == Some(128) && !stderr.is_empty()
 }
 
+fn is_routine_missing_object_error(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("not our ref")
+        || stderr.contains("Server does not allow request for unadvertised object")
+}
+
 /// Build the common channel-backed Git response used by streaming handlers.
 ///
 /// The handler returns this response before the Git child has necessarily
@@ -556,7 +562,13 @@ async fn stream_upload_pack_output<S, E>(
             stderr_str.to_string()
         };
 
-        if is_git_protocol_error(status.code(), &stderr_output) {
+        if is_routine_missing_object_error(&stderr_output) {
+            debug!(
+                exit_code = ?status.code(),
+                stderr = %stderr_str.trim(),
+                "Git upload-pack request referenced an unavailable object"
+            );
+        } else if is_git_protocol_error(status.code(), &stderr_output) {
             warn!(
                 "Git upload-pack protocol error (returning ERR pkt-line): {}",
                 stderr_str
@@ -574,10 +586,23 @@ async fn stream_upload_pack_output<S, E>(
     } else if !status.success() {
         record_git_operation(&metrics, "clone", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
-        error!(
-            "Git upload-pack failed after streaming stdout: {}",
-            stderr_str
-        );
+        if is_routine_missing_object_error(&stderr_output) {
+            debug!(
+                exit_code = ?status.code(),
+                stderr = %stderr_str.trim(),
+                "Git upload-pack stream referenced an unavailable object"
+            );
+        } else if is_git_protocol_error(status.code(), &stderr_output) {
+            warn!(
+                "Git upload-pack protocol error after streaming stdout: {}",
+                stderr_str
+            );
+        } else {
+            error!(
+                "Git upload-pack failed after streaming stdout: {}",
+                stderr_str
+            );
+        }
     } else if matches!(pump_result, PumpResult::Eof { .. }) {
         debug!("Git upload-pack stream completed successfully");
         record_git_operation(&metrics, "clone", "success");
@@ -970,6 +995,19 @@ impl GitError {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn missing_object_probe_errors_are_routine_client_diagnostics() {
+        assert!(is_routine_missing_object_error(
+            b"fatal: git upload-pack: not our ref deadbeef"
+        ));
+        assert!(is_routine_missing_object_error(
+            b"error: Server does not allow request for unadvertised object deadbeef"
+        ));
+        assert!(!is_routine_missing_object_error(
+            b"fatal: unable to read repository data"
+        ));
+    }
 
     /// Build a single-update receive-pack request body pkt-line for tests.
     ///

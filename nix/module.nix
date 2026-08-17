@@ -204,7 +204,8 @@ let
         default = "info";
         example = "debug";
         description = ''
-          Logging level for application logging.
+          Application logging level or explicit tracing filter expression.
+          Bare levels keep dependency logging at warn.
           Can be a simple level (trace, debug, info, warn, error) or a filter expression.
           Examples: "info", "debug", "ngit_grasp=debug,actix_web=info"
         '';
