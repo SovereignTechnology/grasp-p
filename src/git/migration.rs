@@ -6,7 +6,7 @@
 //! --batch-all-objects`, including unreachable objects, is copied into a
 //! verified union pack before a view can be replaced.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -185,9 +185,7 @@ pub(crate) fn import_archived_repository(
     let family = storage.ensure_family(key)?;
     let expected_oids = list_all_objects(source)?;
     copy_object_database(source, &family, key.object_format)?;
-    for oid in &expected_oids {
-        ensure_oid(&family, oid)?;
-    }
+    ensure_oids(&family, &expected_oids)?;
     for (name, reference) in snapshot_refs(source)? {
         storage.retain_tip(key, &name, &reference.oid)?;
         storage.advertise_base_tip(key, &name, &reference.oid)?;
@@ -430,9 +428,7 @@ fn build_family_union(
     }
     expected_oids.sort();
     expected_oids.dedup();
-    for oid in &expected_oids {
-        ensure_oid(&staging, oid)?;
-    }
+    ensure_oids(&staging, &expected_oids)?;
 
     if !expected_oids.is_empty() {
         let union_dir = migration_root(storage)
@@ -453,9 +449,7 @@ fn build_family_union(
         fsync_directory(&family_pack_dir)?;
     }
 
-    for oid in &expected_oids {
-        ensure_oid(&family, oid)?;
-    }
+    ensure_oids(&family, &expected_oids)?;
     for candidate in candidates {
         for (name, reference) in snapshot_refs(&candidate.source_path)? {
             storage.retain_tip(key, &name, &reference.oid)?;
@@ -781,6 +775,20 @@ fn ensure_oid(repo: &Path, oid: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_oids(repo: &Path, expected: &[String]) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let available: HashSet<_> = list_all_objects(repo)?.into_iter().collect();
+    if let Some(missing) = expected.iter().find(|oid| !available.contains(*oid)) {
+        return Err(anyhow!(
+            "object {missing} is missing from {}",
+            repo.display()
+        ));
+    }
+    Ok(())
+}
+
 fn install_if_absent(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
         return Ok(());
@@ -999,6 +1007,22 @@ mod tests {
         let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         git(&repo, &["update-ref", "refs/test/data", &oid]);
         (repo, oid)
+    }
+
+    #[test]
+    fn batch_object_verification_reports_missing_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (repo, oid) = legacy_repo(temp.path(), &owner, "example", b"present\n");
+
+        ensure_oids(&repo, std::slice::from_ref(&oid)).unwrap();
+
+        let missing = "0".repeat(40);
+        let error = ensure_oids(&repo, std::slice::from_ref(&missing)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("object {missing} is missing from {}", repo.display())
+        );
     }
 
     #[tokio::test]
