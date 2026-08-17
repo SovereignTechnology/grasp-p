@@ -1400,7 +1400,7 @@ async fn test_maintainer_announcement_reprocessed_immediately() {
     // Step 2: Start relay_b with relay_a as bootstrap so its SyncManager connects immediately.
     // relay_b's initial negentropy sync will pick up the maintainer announcement and reject it
     // (no owner announcement in relay_b's DB yet), storing it in the hot cache.
-    let relay_b = TestRelay::start_with_sync(Some(relay_a.url().to_string())).await;
+    let relay_b = TestRelay::start_with_sync_debug(Some(relay_a.url().to_string())).await;
     println!("relay_b started at {}", relay_b.url());
 
     // Wait for relay_b's initial negentropy sync on its observable outcome:
@@ -1607,7 +1607,7 @@ async fn test_multiple_maintainers_all_reprocessed() {
     // Because all three maintainer announcements are confirmed in relay_a's DB, relay_b's
     // initial negentropy sync will pick them all up and reject them (no owner announcement
     // in relay_b's DB yet), storing them in the hot cache.
-    let relay_b = TestRelay::start_with_sync(Some(relay_a.url().to_string())).await;
+    let relay_b = TestRelay::start_with_sync_debug(Some(relay_a.url().to_string())).await;
     println!("relay_b started at {}", relay_b.url());
 
     // Wait for relay_b's initial negentropy sync on its observable outcome:
