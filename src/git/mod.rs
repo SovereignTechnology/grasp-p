@@ -21,6 +21,7 @@ pub mod authorization;
 pub mod handlers;
 pub mod process;
 pub mod protocol;
+pub mod storage;
 pub mod subprocess;
 pub mod sync;
 
@@ -585,6 +586,15 @@ fn validate_repository_coordinate(npub: &str, identifier: &str) -> Option<()> {
     if public_key.to_bech32().ok()?.as_str() != npub {
         return None;
     }
+    validate_repository_identifier(identifier).then_some(())
+}
+
+/// Return whether a NIP-34 identifier is safe as one filesystem component.
+///
+/// Family storage and public repository paths must share this predicate so an
+/// event identifier can never select a different internal path than its HTTP
+/// route.
+pub fn validate_repository_identifier(identifier: &str) -> bool {
     if identifier.is_empty()
         || identifier == "."
         || identifier == ".."
@@ -592,18 +602,15 @@ fn validate_repository_coordinate(npub: &str, identifier: &str) -> Option<()> {
         || identifier.contains('\\')
         || identifier.contains('\0')
     {
-        return None;
+        return false;
     }
 
     let mut components = Path::new(identifier).components();
-    match (components.next(), components.next()) {
+    matches!(
+        (components.next(), components.next()),
         (Some(std::path::Component::Normal(component)), None)
-            if component == std::ffi::OsStr::new(identifier) =>
-        {
-            Some(())
-        }
-        _ => None,
-    }
+            if component == std::ffi::OsStr::new(identifier)
+    )
 }
 
 #[cfg(test)]
