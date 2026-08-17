@@ -13,7 +13,7 @@
 
 use nostr_sdk::prelude::*;
 
-use crate::git::percent_decode;
+use crate::git::{percent_decode, validate_repository_identifier};
 use crate::grasp06::paths::PRS_URL_PREFIX;
 
 /// A parsed `/prs/<npub>/<id>.git/<subpath>` URL.
@@ -63,7 +63,7 @@ pub fn parse_prs_url(path: &str) -> Option<PrsUrl> {
     // `<identifier>.git` (URL-encoded). Decode then strip the suffix.
     let decoded = percent_decode(repo_segment);
     let identifier = decoded.strip_suffix(".git")?.to_string();
-    if identifier.is_empty() {
+    if !validate_repository_identifier(&identifier) {
         return None;
     }
 
@@ -130,5 +130,16 @@ mod tests {
         let path = format!("/prs/{}/my%20repo.git/info/refs", npub);
         let parsed = parse_prs_url(&path).expect("should parse");
         assert_eq!(parsed.identifier, "my repo");
+    }
+
+    #[test]
+    fn rejects_unsafe_identifier_components() {
+        let npub = sample_npub();
+        for identifier in ["..", "%2E%2E", "a%2Fb", "a%5Cb"] {
+            assert!(
+                parse_prs_url(&format!("/prs/{npub}/{identifier}.git/info/refs")).is_none(),
+                "accepted unsafe identifier {identifier:?}"
+            );
+        }
     }
 }
