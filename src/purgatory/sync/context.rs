@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub enum GitFetchRole {
     Primary,
     Hedge,
+    Integrity,
 }
 
 impl GitFetchRole {
@@ -28,6 +29,7 @@ impl GitFetchRole {
         match self {
             Self::Primary => "primary",
             Self::Hedge => "hedge",
+            Self::Integrity => "integrity",
         }
     }
 }
@@ -465,6 +467,7 @@ fn hardened_git_command(
     resolve_pin: Option<&str>,
     auth_header: Option<&str>,
     object_directory: Option<&Path>,
+    negotiation_algorithm: Option<&str>,
     args: &[String],
 ) -> Command {
     let mut command = Command::new("git");
@@ -475,6 +478,11 @@ fn hardened_git_command(
         .arg("http.proxy=")
         .arg("-c")
         .arg("credential.helper=");
+    if let Some(algorithm) = negotiation_algorithm {
+        command
+            .arg("-c")
+            .arg(format!("fetch.negotiationAlgorithm={algorithm}"));
+    }
     if let Some(pin) = resolve_pin {
         command.arg("-c").arg(format!("http.curloptResolve={pin}"));
     }
@@ -831,6 +839,15 @@ fn is_object_missing_error(stderr: &str) -> bool {
         || stderr.contains("Server does not allow request for unadvertised object")
 }
 
+/// Integrity repair starts from a repository whose refs may name objects that
+/// are already missing. Normal fetch negotiation walks those refs as local
+/// "have" tips, which can make Git request no pack and then fail its own
+/// connectivity check. Repair fetches therefore advertise no local haves and
+/// ask the source for the complete requested object closure.
+fn fetch_negotiation_algorithm(role: GitFetchRole) -> Option<&'static str> {
+    (role == GitFetchRole::Integrity).then_some("noop")
+}
+
 /// Record a remote failure with the naughty list tracker (only error
 /// categories the tracker classifies as persistent are recorded).
 fn record_remote_failure(
@@ -1076,6 +1093,7 @@ impl SyncContext for RealSyncContext {
                 resolve_pin.as_deref(),
                 fresh_auth_header().as_deref(),
                 None,
+                None,
                 &ls_remote_args,
             ),
             &domain,
@@ -1147,6 +1165,7 @@ impl SyncContext for RealSyncContext {
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
                     family_objects,
+                    fetch_negotiation_algorithm(role),
                     &args,
                 ),
                 &domain,
@@ -1218,6 +1237,7 @@ impl SyncContext for RealSyncContext {
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
                     family_objects,
+                    fetch_negotiation_algorithm(role),
                     &args,
                 ),
                 &domain,
@@ -1752,6 +1772,17 @@ mod fetch_helper_tests {
         assert!(!is_object_missing_error(
             "fatal: unable to access 'https://x/': SSL certificate problem"
         ));
+    }
+
+    #[test]
+    fn integrity_fetches_disable_local_have_negotiation() {
+        assert_eq!(fetch_negotiation_algorithm(GitFetchRole::Primary), None);
+        assert_eq!(fetch_negotiation_algorithm(GitFetchRole::Hedge), None);
+        assert_eq!(
+            fetch_negotiation_algorithm(GitFetchRole::Integrity),
+            Some("noop")
+        );
+        assert_eq!(GitFetchRole::Integrity.as_str(), "integrity");
     }
 
     #[test]

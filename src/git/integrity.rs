@@ -446,7 +446,14 @@ impl FamilyRepairSource for crate::purgatory::sync::RealSyncContext {
         url: &str,
         oids: &[String],
     ) -> Result<Vec<String>> {
-        crate::purgatory::sync::SyncContext::fetch_oids(self, target_view, url, oids).await
+        crate::purgatory::sync::SyncContext::fetch_oids_with_role(
+            self,
+            target_view,
+            url,
+            oids,
+            crate::purgatory::sync::GitFetchRole::Integrity,
+        )
+        .await
     }
 }
 

@@ -13,7 +13,7 @@ mod r#loop;
 mod queue;
 mod throttle;
 
-pub use context::{ProcessResult, RealSyncContext, SyncContext};
+pub use context::{GitFetchRole, ProcessResult, RealSyncContext, SyncContext};
 pub use functions::{
     get_throttled_domains_with_untried_urls, sync_identifier, sync_identifier_from_url,
     sync_identifier_next_url, ThrottledDomainInfo,
