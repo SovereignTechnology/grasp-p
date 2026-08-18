@@ -229,7 +229,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tracing::debug;
 
-use crate::git::storage::{FamilyKey, LocalGitStorage};
+use crate::git::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::SharedDatabase;
@@ -330,6 +330,33 @@ impl RealSyncContext {
     /// Get reference to the git naughty list tracker
     pub fn git_naughty_list(&self) -> &Arc<NaughtyListTracker> {
         &self.git_naughty_list
+    }
+
+    /// Clone URLs from accepted repository announcements for one identifier.
+    ///
+    /// Integrity repair deliberately excludes purgatory URLs: it heals
+    /// durable families only from repository sources already accepted into
+    /// the relay database. The normal outbound policy is still applied at the
+    /// point of each fetch.
+    pub async fn accepted_repository_clone_urls(&self, identifier: &str) -> Result<Vec<String>> {
+        let data = crate::git::authorization::fetch_repository_data_excluding_purgatory(
+            &self.database,
+            identifier,
+        )
+        .await?;
+        let mut urls: Vec<_> = data
+            .announcements
+            .into_iter()
+            .flat_map(|announcement| announcement.clone_urls)
+            .filter(|url| {
+                self.our_domain_value
+                    .as_deref()
+                    .is_none_or(|domain| !crate::outbound::url_matches_service_domain(url, domain))
+            })
+            .collect();
+        urls.sort();
+        urls.dedup();
+        Ok(urls)
     }
 }
 
@@ -980,9 +1007,7 @@ impl SyncContext for RealSyncContext {
         let resolve_pin = resolve_pin_entry(&resolved);
 
         let storage = LocalGitStorage::new(&self.git_data_path);
-        let family_key =
-            crate::git::sync::extract_identifier_from_repo_path(repo_path, &self.git_data_path)
-                .and_then(|identifier| FamilyKey::sha1(identifier).ok());
+        let family_key = family_key_for_view(repo_path, &self.git_data_path);
         let family_lease = match family_key.as_ref() {
             Some(key) if storage.is_thin_view(key, repo_path) => Some(
                 storage
@@ -1356,9 +1381,27 @@ impl SyncContext for RealSyncContext {
     }
 }
 
+fn family_key_for_view(repo_path: &Path, git_data_path: &Path) -> Option<FamilyKey> {
+    let identifier = crate::git::sync::extract_identifier_from_repo_path(repo_path, git_data_path)?;
+    let object_format = ObjectFormat::detect(repo_path).ok()?;
+    FamilyKey::new(object_format, identifier).ok()
+}
+
 #[cfg(test)]
 mod fetch_helper_tests {
     use super::*;
+
+    #[test]
+    fn family_key_for_view_preserves_the_repository_object_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let git_data_path = temp.path().join("git");
+        let storage = LocalGitStorage::new(&git_data_path);
+        let expected = FamilyKey::new(ObjectFormat::Sha256, "shared").unwrap();
+        let view = git_data_path.join("owner").join("shared.git");
+        storage.create_thin_view(&expected, &view).unwrap();
+
+        assert_eq!(family_key_for_view(&view, &git_data_path), Some(expected));
+    }
 
     /// Hermetic git for these tests, immune to ambient git configuration
     /// such as hooks, signing, and templates.
