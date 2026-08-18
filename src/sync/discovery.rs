@@ -230,6 +230,22 @@ pub fn merge_inbox_roots(
     }
 }
 
+/// Add accepted owner/maintainer inbox repositories to ordinary Full sync.
+/// These targets receive canonical live coverage before auxiliary descendant
+/// fan-out, while write-only mailboxes remain absent from this overlay.
+pub fn merge_inbox_repositories(
+    targets: &mut HashMap<String, RelaySyncNeeds>,
+    inbox_repositories: &HashMap<String, HashSet<String>>,
+) {
+    for (relay, repositories) in inbox_repositories {
+        targets
+            .entry(relay.clone())
+            .or_default()
+            .repos
+            .extend(repositories.iter().cloned());
+    }
+}
+
 pub fn build_inbox_root_overlay(
     author_roots: &HashMap<PublicKey, HashSet<EventId>>,
     author_inboxes: &HashMap<PublicKey, HashSet<String>>,
@@ -540,6 +556,23 @@ mod tests {
         let target = &targets["wss://inbox.example/"];
         assert_eq!(target.root_events, HashSet::from([root]));
         assert!(target.repos.is_empty());
+        assert!(target.state_only_repos.is_empty());
+    }
+
+    #[test]
+    fn repository_inbox_overlay_adds_full_repository_work() {
+        let repository = "30617:owner:repo".to_string();
+        let mut targets = HashMap::new();
+        merge_inbox_repositories(
+            &mut targets,
+            &HashMap::from([(
+                "wss://inbox.example/".to_string(),
+                HashSet::from([repository.clone()]),
+            )]),
+        );
+        let target = &targets["wss://inbox.example/"];
+        assert_eq!(target.repos, HashSet::from([repository]));
+        assert!(target.root_events.is_empty());
         assert!(target.state_only_repos.is_empty());
     }
 

@@ -685,11 +685,14 @@ participant mailboxes use independent, history-only `fetch_events` workers:
 at most one per relay and one new start per maintenance pass. They reuse the
 connection's ordinary pacing, subscription ledger, pagination and 30-second
 per-page terminal timeout without installing permanent participant
-subscriptions or coupling progress between relays. On public instances, those
-workers also query each accepted repository owner's and declared maintainer's
-mailboxes for their exact Full repository coordinates and all locally known
-roots in those repositories. This discovers previously unknown roots and
-descendants that exist only on a maintainer mailbox without broadening an
+subscriptions or coupling progress between relays. On public instances, each
+accepted repository owner's and declared maintainer's NIP-65 read/unmarked
+inboxes also become ordinary full repository sources for their exact
+repositories and all locally known roots. Their canonical repository/root
+filters are essential live coverage—equal to root-author canonical inbox
+coverage and above recursive descendant fan-out—while their wider mailbox set
+continues through the history workers. This discovers previously unknown roots
+and descendants that exist only on a maintainer mailbox without broadening an
 ordinary participant mailbox. Private instances omit repository-coordinate
 mailbox expansion.
 

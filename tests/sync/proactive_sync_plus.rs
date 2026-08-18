@@ -311,7 +311,7 @@ async fn participant_write_mailbox_fetches_child_of_direct_reaction() {
 }
 
 #[tokio::test]
-async fn owner_mailbox_discovers_unknown_root_and_root_only_status() {
+async fn owner_inbox_live_sync_discovers_unknown_root_and_root_only_status() {
     let index = MockRelay::start().await;
     let mailbox = MockRelay::start().await;
     let owner = Keys::generate();
@@ -319,7 +319,7 @@ async fn owner_mailbox_discovers_unknown_root_and_root_only_status() {
     let identifier = "owner-repository-mailbox";
 
     let relay_list = EventBuilder::new(Kind::RelayList, "")
-        .tag(Tag::custom("r", vec![mailbox.url(), "write"]))
+        .tag(Tag::custom("r", vec![mailbox.url(), "read"]))
         .finalize(&owner)
         .expect("build owner relay list");
     send_to_relay_url(index.url(), &relay_list)
@@ -383,10 +383,29 @@ async fn owner_mailbox_discovers_unknown_root_and_root_only_status() {
         "repository mailbox ownership should remain observable without public-key labels"
     );
     assert!(
-        !sync_log
+        sync_log
             .lines()
             .any(|line| { line.contains("Starting fresh_start") && line.contains(mailbox.url()) }),
-        "an owner mailbox must remain history-only rather than becoming a repository source"
+        "an owner inbox should enter ordinary repository live sync"
+    );
+
+    let live_issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root published after owner-inbox live coverage was installed",
+    )
+    .expect("build live mailbox root");
+    send_to_relay_url(mailbox.url(), &live_issue)
+        .await
+        .expect("publish root after live coverage");
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(live_issue.id),
+            Duration::from_secs(5),
+        )
+        .await,
+        "owner inbox repository coverage should remain live after initial history"
     );
 
     syncing.stop().await;

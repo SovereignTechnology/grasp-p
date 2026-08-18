@@ -137,12 +137,14 @@ Performance and Security fixes - along with other improvements; immediate upgrad
 
 ### Fixed
 
-- Discover historical repository roots and descendants from the NIP-65
-  mailboxes of accepted repository owners and maintainers. Public Sync+
-  instances query exact repository coordinates and every known root for that
-  repository through the existing paced, byte-bounded history workers, while
-  private instances continue to withhold repository coordinates and the
-  ordinary write policy and persistent deletion tombstones remain authoritative.
+- Discover historical and live repository roots and descendants from the
+  NIP-65 mailboxes of accepted repository owners and maintainers. Public Sync+
+  instances make exact repository coordinates and every known root essential
+  live coverage on read/unmarked inboxes, above recursive descendant fan-out,
+  while their wider mailbox set continues through paced, byte-bounded history
+  workers. Private instances continue to withhold repository coordinates, and
+  the ordinary write policy and persistent deletion tombstones remain
+  authoritative.
 
 - Retire peer-closed outbound subscriptions from rust-nostr's desired registry
   without interrupting NIP-42: the first `auth-required` response keeps the
