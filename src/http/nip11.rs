@@ -67,17 +67,8 @@ pub struct RelayLimitation {
 }
 
 impl RelayInformationDocument {
-    /// Create a NIP-11 document for a relay served at the domain root.
+    /// Create a NIP-11 document for the configured public mount path.
     pub fn from_config(config: &Config) -> Self {
-        Self::from_config_at_path(config, "/")
-    }
-
-    /// Create a NIP-11 document for the path where the relay was requested.
-    ///
-    /// NIP-05 `_@domain` can only resolve a relay served at the domain root,
-    /// because clients always request `/.well-known/nostr.json`. A relay
-    /// mounted below any other path must therefore not advertise NIP-05.
-    pub fn from_config_at_path(config: &Config, relay_path: &str) -> Self {
         // Get validated configuration (config.validate() must be called at startup)
         let archive_config = config.archive_config();
         let archive_enabled = archive_config.enabled();
@@ -140,7 +131,7 @@ impl RelayInformationDocument {
                     34, // NIP-34: Git repository announcements
                     77, // NIP-77: Negentropy sync (reconciliation protocol)
                 ];
-                if relay_path == "/" {
+                if config.is_domain_root() {
                     nips.push(5); // NIP-05: Root-domain identity
                 }
                 // NIP-09 (deletion) and NIP-62 (request to vanish) are honoured
@@ -165,7 +156,7 @@ impl RelayInformationDocument {
                 Some(commit) => format!("{}-{}", env!("CARGO_PKG_VERSION"), commit),
                 None => env!("CARGO_PKG_VERSION").to_string(),
             },
-            icon: Some(format!("https://{}/icon.png", config.domain)),
+            icon: Some(format!("https://{}/icon.png", config.service_address())),
             limitation: RelayLimitation {
                 max_message_length: 5 * 1024 * 1024,
                 max_subscriptions: config.relay_max_subscriptions,
@@ -422,13 +413,21 @@ mod tests {
 
     #[test]
     fn test_nip11_advertises_nip05_only_at_domain_root() {
-        let config = Config::for_testing();
+        let root_config = Config::for_testing();
+        let nested_config = Config {
+            base_path: "/relay".to_string(),
+            ..Config::for_testing()
+        };
 
-        let root_doc = RelayInformationDocument::from_config_at_path(&config, "/");
-        let nested_doc = RelayInformationDocument::from_config_at_path(&config, "/relay");
+        let root_doc = RelayInformationDocument::from_config(&root_config);
+        let nested_doc = RelayInformationDocument::from_config(&nested_config);
 
         assert!(root_doc.supported_nips.contains(&5));
         assert!(!nested_doc.supported_nips.contains(&5));
+        assert_eq!(
+            nested_doc.icon.as_deref(),
+            Some("https://localhost:7334/relay/icon.png")
+        );
     }
 
     #[test]

@@ -163,7 +163,24 @@ impl Service<Request<Incoming>> for HttpService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let base = add_cors_headers(Response::builder().header("server", "ngit-grasp"));
-        let path = req.uri().path().to_string();
+        let request_path = req.uri().path().to_string();
+        let Some(path) = self
+            .config
+            .strip_base_path(&request_path)
+            .map(str::to_string)
+        else {
+            let config = self.config.clone();
+            return Box::pin(async move {
+                let html = landing::get_generic_404_html(&config, &request_path);
+                Ok(
+                    add_cors_headers(Response::builder().header("server", "ngit-grasp"))
+                        .status(404)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(full_body(html))
+                        .unwrap(),
+                )
+            });
+        };
         let query = req.uri().query().map(|s| s.to_string());
         let method = req.method().clone();
         let git_data_path = self.config.effective_git_data_path();
@@ -191,7 +208,10 @@ impl Service<Request<Incoming>> for HttpService {
         // public key. This exact-path route must remain ahead of generic NIP-11
         // content negotiation so clients receive the well-known document even
         // if they send a broad or unusual Accept header.
-        if path == "/.well-known/nostr.json" && (method == Method::GET || method == Method::HEAD) {
+        if self.config.is_domain_root()
+            && path == "/.well-known/nostr.json"
+            && (method == Method::GET || method == Method::HEAD)
+        {
             let method = method.clone();
             let document = nip05::Nip05Document::from_config(&self.config);
 
@@ -370,7 +390,7 @@ impl Service<Request<Incoming>> for HttpService {
                                     &git_data_path,
                                     git_protocol.as_deref(),
                                     repo_init_locks.clone(),
-                                    &config_clone.domain,
+                                    &config_clone.service_address(),
                                     metrics_clone.clone(),
                                 )
                                 .await;
@@ -425,7 +445,7 @@ impl Service<Request<Incoming>> for HttpService {
         // Check for Git HTTP requests first
         if let Some((npub, identifier, subpath)) = git::parse_git_url(&path) {
             if let Some(access) = &self.private_access {
-                let authorized = nip98::canonical_repository_url(&self.config, &path)
+                let authorized = nip98::canonical_repository_url(&self.config, &request_path)
                     .is_some_and(|url| nip98::validate_request(&req, &url, access).is_ok());
                 if !authorized {
                     let response = nip98::unauthorized_response(&self.config);
@@ -688,13 +708,13 @@ impl Service<Request<Incoming>> for HttpService {
         }
 
         // Check for NIP-11 relay information request (Accept: application/nostr+json)
-        if let Some(accept) = req.headers().get("accept") {
+        if let ("/", Some(accept)) = (path.as_str(), req.headers().get("accept")) {
             if accept
                 .to_str()
                 .map(|s| s.contains("application/nostr+json"))
                 .unwrap_or(false)
             {
-                let doc = nip11::RelayInformationDocument::from_config_at_path(&self.config, &path);
+                let doc = nip11::RelayInformationDocument::from_config(&self.config);
                 let json = doc.to_json().unwrap_or_else(|e| {
                     tracing::error!("Failed to serialize NIP-11 document: {}", e);
                     "{}".to_string()
@@ -722,7 +742,7 @@ impl Service<Request<Incoming>> for HttpService {
         // to browse the repository and a 404 page for repositories it doesn't host"
         if let Some((npub, identifier)) = parse_repo_url(&path) {
             if let Some(access) = &self.private_access {
-                let authorized = nip98::canonical_repository_url(&self.config, &path)
+                let authorized = nip98::canonical_repository_url(&self.config, &request_path)
                     .is_some_and(|url| nip98::validate_request(&req, &url, access).is_ok());
                 if !authorized {
                     let response = nip98::unauthorized_response(&self.config);
@@ -778,7 +798,8 @@ impl Service<Request<Incoming>> for HttpService {
         }
 
         // Check if this is a WebSocket upgrade request
-        if let (Some(c), Some(w)) = (
+        if let ("/", Some(c), Some(w)) = (
+            path.as_str(),
             req.headers().get("connection"),
             req.headers().get("upgrade"),
         ) {
@@ -801,7 +822,7 @@ impl Service<Request<Incoming>> for HttpService {
                 let relay = self.relay.clone();
                 let metrics_clone = self.metrics.clone();
                 let private_access = self.private_access.clone();
-                let relay_domain = self.config.domain.clone();
+                let relay_domain = self.config.service_address();
 
                 tokio::spawn(async move {
                     match hyper::upgrade::on(req).await {
@@ -953,7 +974,7 @@ impl Service<Request<Incoming>> for HttpService {
                 )
             } else {
                 // Serve generic 404 for unknown paths
-                let html = landing::get_generic_404_html(&config, &path);
+                let html = landing::get_generic_404_html(&config, &request_path);
                 Ok(
                     add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                         .status(404)
@@ -1042,7 +1063,7 @@ pub async fn run_server_on_listener(
 ) -> anyhow::Result<()> {
     tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
-    tracing::info!("Domain: {}", config.domain);
+    tracing::info!("Public service: {}", config.service_address());
     if !config.trusted_proxy_cidrs.is_empty() {
         tracing::info!(
             trusted_proxy_cidrs = ?config.trusted_proxy_cidrs,

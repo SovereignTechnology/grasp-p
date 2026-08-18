@@ -55,9 +55,7 @@ use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use crate::config::Config;
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::SharedDatabase;
-use crate::outbound::{
-    url_matches_service_domain, OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource,
-};
+use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 use crate::private::PrivateAccess;
 use nostr_sdk::prelude::LocalRelay;
 
@@ -300,7 +298,7 @@ pub(crate) fn canonical_relay_key(relay_url: &str) -> Result<String, String> {
 }
 
 fn is_own_sync_target(relay_url: &str, service_domain: &str) -> bool {
-    url_matches_service_domain(relay_url, service_domain)
+    crate::outbound::relay_url_matches_service(relay_url, service_domain)
 }
 
 #[cfg(test)]
@@ -4104,7 +4102,11 @@ impl SyncManager {
 
         // 5. Spawn self-subscriber with shutdown receiver
         let self_subscriber = SelfSubscriber::new(
-            format!("ws://{}", self.config.bind_address),
+            format!(
+                "ws://{}{}",
+                self.config.bind_address,
+                self.config.public_path("/")
+            ),
             self.service_domain.clone(),
             Arc::clone(&self.repo_sync_index),
             Arc::clone(&self.root_candidate_index),
@@ -9683,12 +9685,24 @@ mod tests {
         assert!(is_own_sync_target("wss://gitnostr.com", "gitnostr.com"));
         assert!(is_own_sync_target("ws://gitnostr.com", "gitnostr.com"));
         assert!(is_own_sync_target("ws://127.0.0.1:7334", "127.0.0.1:7334"));
+        assert!(is_own_sync_target(
+            "wss://gitnostr.com/grasp",
+            "gitnostr.com/grasp"
+        ));
 
         assert!(!is_own_sync_target(
             "wss://gitnostr.com.attacker.example",
             "gitnostr.com"
         ));
         assert!(!is_own_sync_target("ws://127.0.0.1:7335", "127.0.0.1:7334"));
+        assert!(!is_own_sync_target(
+            "wss://gitnostr.com",
+            "gitnostr.com/grasp"
+        ));
+        assert!(!is_own_sync_target(
+            "wss://gitnostr.com/grasp/other",
+            "gitnostr.com/grasp"
+        ));
     }
 
     #[test]

@@ -80,7 +80,7 @@ impl DeletionPolicy {
     ) -> BTreeSet<PathBuf> {
         crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
             event,
-            &self.ctx.config.domain,
+            &self.ctx.config.service_address(),
         )
         .into_iter()
         .map(|identifier| {

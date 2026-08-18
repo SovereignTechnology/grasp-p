@@ -325,6 +325,13 @@ pub struct Config {
     #[arg(long, env = "NGIT_DOMAIN")]
     pub domain: String,
 
+    /// Public URL path where this instance is mounted.
+    ///
+    /// Use `/` for a domain-root deployment or an absolute path such as
+    /// `/grasp` when sharing a domain with another service.
+    #[arg(long, env = "NGIT_BASE_PATH", default_value = "/")]
+    pub base_path: String,
+
     /// Relay operator's nsec (private key) for signing and authentication.
     ///
     /// Used for:
@@ -871,6 +878,59 @@ impl Config {
             .unwrap_or_else(|| format!("{} grasp relay", self.domain))
     }
 
+    /// Whether the public relay endpoint is mounted at the domain root.
+    pub fn is_domain_root(&self) -> bool {
+        self.base_path == "/"
+    }
+
+    /// Scheme-less public service address used in GRASP event matching.
+    ///
+    /// Root deployments return just the configured authority. Path-mounted
+    /// deployments append their canonical base path.
+    pub fn service_address(&self) -> String {
+        let domain = self.domain.trim().trim_end_matches('/');
+        if self.is_domain_root() {
+            domain.to_string()
+        } else {
+            format!("{domain}{}", self.base_path)
+        }
+    }
+
+    /// Remove the configured public mount prefix from an incoming URL path.
+    ///
+    /// The returned path always starts with `/`. The exact non-root mount
+    /// path and its trailing-slash form both map to `/`; sibling prefixes do
+    /// not match.
+    pub fn strip_base_path<'a>(&self, request_path: &'a str) -> Option<&'a str> {
+        if self.is_domain_root() {
+            return Some(request_path);
+        }
+        if request_path == self.base_path
+            || request_path.strip_suffix('/') == Some(self.base_path.as_str())
+        {
+            return Some("/");
+        }
+        request_path.strip_prefix(&self.base_path).and_then(|rest| {
+            if rest.starts_with('/') {
+                Some(rest)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Prefix one root-relative application route with the public mount path.
+    pub fn public_path(&self, route: &str) -> String {
+        debug_assert!(route.starts_with('/'));
+        if self.is_domain_root() {
+            route.to_string()
+        } else if route == "/" {
+            self.base_path.clone()
+        } else {
+            format!("{}{route}", self.base_path)
+        }
+    }
+
     /// Get effective git data path
     /// Returns a temp directory when using memory backend with default path, otherwise the configured path
     pub fn effective_git_data_path(&self) -> String {
@@ -896,6 +956,27 @@ impl Config {
             .as_ref()
             .context("relay_owner_nsec not set (should be set by Config::load())")?;
         Keys::parse(nsec).context("Invalid relay_owner_nsec format")?;
+
+        let normalized_base_path = Url::parse(&format!(
+            "https://base-path-validation.invalid{}",
+            self.base_path
+        ))
+        .ok()
+        .map(|url| url.path().to_string());
+        if !self.base_path.starts_with('/')
+            || (self.base_path.len() > 1 && self.base_path.ends_with('/'))
+            || self.base_path.contains("//")
+            || self.base_path.contains(['?', '#'])
+            || self
+                .base_path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+            || normalized_base_path.as_deref() != Some(self.base_path.as_str())
+        {
+            return Err(anyhow!(
+                "NGIT_BASE_PATH must be '/' or a normalized absolute URL path without a trailing slash, empty segment, query, fragment, '.' or '..'"
+            ));
+        }
 
         // Validate archive configuration
         let archive_whitelist = WhitelistEntry::parse_whitelist(&self.archive_whitelist);
@@ -1222,6 +1303,7 @@ impl Config {
 
         Self {
             domain: "localhost:7334".to_string(),
+            base_path: "/".to_string(),
             relay_owner_nsec: Some(nsec),
             relay_name_override: Some("test relay".to_string()),
             relay_description: "test description".to_string(),
@@ -1330,10 +1412,59 @@ mod tests {
     fn test_default_values() {
         let config = Config::for_testing();
         assert_eq!(config.domain, "localhost:7334");
+        assert_eq!(config.base_path, "/");
         assert_eq!(config.bind_address, "127.0.0.1:7334");
         assert!(config.trusted_proxy_cidrs.is_empty());
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    #[test]
+    fn base_path_parses_and_builds_public_routes() {
+        let config = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--base-path",
+            "/services/grasp",
+        ])
+        .expect("base path should parse");
+
+        assert_eq!(config.base_path, "/services/grasp");
+        assert_eq!(config.service_address(), "example.com/services/grasp");
+        assert_eq!(config.public_path("/"), "/services/grasp");
+        assert_eq!(
+            config.public_path("/npub/repo.git"),
+            "/services/grasp/npub/repo.git"
+        );
+        assert_eq!(config.strip_base_path("/services/grasp"), Some("/"));
+        assert_eq!(
+            config.strip_base_path("/services/grasp/npub/repo.git"),
+            Some("/npub/repo.git")
+        );
+        assert_eq!(config.strip_base_path("/services/graspy"), None);
+    }
+
+    #[test]
+    fn base_path_validation_rejects_ambiguous_paths() {
+        for base_path in [
+            "grasp",
+            "/grasp/",
+            "/grasp//relay",
+            "/grasp/../relay",
+            "/grasp/%2e%2e/relay",
+            "/grasp?mode=relay",
+            "/grasp#relay",
+        ] {
+            let config = Config {
+                base_path: base_path.to_string(),
+                ..Config::for_testing()
+            };
+            let error = config
+                .validate()
+                .expect_err("ambiguous base path must fail validation");
+            assert!(error.to_string().contains("NGIT_BASE_PATH"), "{base_path}");
+        }
     }
 
     #[test]

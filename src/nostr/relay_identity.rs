@@ -100,16 +100,20 @@ impl IdentityPublicationPlan {
 pub fn build(config: &Config) -> Result<RelayIdentityEvents> {
     let keys = config.relay_owner_keys()?;
     let domain = config.domain.trim().trim_end_matches('/');
-    let relay_url = public_relay_url(domain)?;
+    let service = config.service_address();
+    let relay_url = public_relay_url(domain, &config.base_path)?;
     let created_at = Timestamp::now();
 
-    let profile = Metadata::new()
+    let mut metadata = Metadata::new()
         // The scheme-less public URL (authority plus any mount path) so
         // clients that ignore the NIP-05 fallback still display something
         // meaningful. NIP-24 expects `name` to always be set.
-        .name(domain)
-        .nip05(format!("_@{domain}"))
-        .custom_field("bot", true)
+        .name(service)
+        .custom_field("bot", true);
+    if config.is_domain_root() {
+        metadata = metadata.nip05(format!("_@{domain}"));
+    }
+    let profile = metadata
         .into_event_builder()
         .custom_created_at(created_at)
         .finalize(&keys)
@@ -623,7 +627,7 @@ fn publication_failure_disposition(message: &str) -> PublicationFailureDispositi
     }
 }
 
-fn public_relay_url(domain: &str) -> Result<RelayUrl> {
+fn public_relay_url(domain: &str, base_path: &str) -> Result<RelayUrl> {
     let scheme = if is_loopback_authority(domain) {
         "ws"
     } else {
@@ -635,8 +639,10 @@ fn public_relay_url(domain: &str) -> Result<RelayUrl> {
     } else {
         domain.to_string()
     };
-    RelayUrl::parse(&format!("{scheme}://{authority}"))
-        .with_context(|| format!("derive public relay URL from NGIT_DOMAIN={domain}"))
+    let path = if base_path == "/" { "" } else { base_path };
+    RelayUrl::parse(&format!("{scheme}://{authority}{path}")).with_context(|| {
+        format!("derive public relay URL from NGIT_DOMAIN={domain} and NGIT_BASE_PATH={base_path}")
+    })
 }
 
 fn is_loopback_authority(domain: &str) -> bool {
@@ -690,9 +696,30 @@ mod tests {
     }
 
     #[test]
+    fn path_mounted_identity_omits_nip05_and_lists_path_relay() {
+        let config = Config {
+            domain: "relay.example.com".to_string(),
+            base_path: "/grasp".to_string(),
+            ..Config::for_testing()
+        };
+        let events = build(&config).expect("build path-mounted relay identity");
+        let profile: serde_json::Value =
+            serde_json::from_str(&events.profile.content).expect("parse profile metadata");
+
+        assert_eq!(profile["name"], "relay.example.com/grasp");
+        assert!(profile.get("nip05").is_none());
+
+        let relays: Vec<_> = nip65::extract_relay_list(&events.relay_list).collect();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].0.as_str(), "wss://relay.example.com/grasp");
+    }
+
+    #[test]
     fn production_domain_defaults_to_secure_websocket_url() {
         assert_eq!(
-            public_relay_url("relay.example.com").unwrap().to_string(),
+            public_relay_url("relay.example.com", "/")
+                .unwrap()
+                .to_string(),
             "wss://relay.example.com"
         );
     }
@@ -700,7 +727,7 @@ mod tests {
     #[test]
     fn loopback_authorities_use_plain_websocket_urls() {
         for domain in ["localhost:7334", "127.0.0.1:8080", "[::1]:7334", "::1"] {
-            let url = public_relay_url(domain).unwrap().to_string();
+            let url = public_relay_url(domain, "/").unwrap().to_string();
             assert!(url.starts_with("ws://"), "{domain} -> {url}");
         }
     }

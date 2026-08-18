@@ -273,6 +273,7 @@ git ls-remote https://ngit.example.com/<npub>/<repo>.git
 - `domain` - Domain where relay is hosted
 
 ### Network
+- `basePath` - Public URL mount path (default: `/`)
 - `bindAddress` - IP to bind to (default: "127.0.0.1")
 - `port` - Port to listen on (default: 7334)
 - `trustedProxyCidrs` - Proxy networks allowed to provide the WebSocket client
@@ -296,7 +297,7 @@ git ls-remote https://ngit.example.com/<npub>/<repo>.git
 - `syncBaseBackoffSecs` - Base backoff time (default: 5)
 
 ### Metrics
-- `metricsEnabled` - Enable /metrics endpoint (default: true)
+- `metricsEnabled` - Enable `/metrics` below the configured base path (default: true)
 - `metricsConnectionPerIpAbuseThreshold` - Abuse threshold (default: 10)
 - `metricsTopNRepos` - Number of top repos to track (default: 10)
 

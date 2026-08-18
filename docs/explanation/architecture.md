@@ -109,10 +109,12 @@ nostr-lmdb = "0.45.0-alpha.3"
 **Responsibilities:**
 
 - Route HTTP requests to appropriate handlers
-- WebSocket upgrade for Nostr relay at `/`
-- Git Smart HTTP endpoints at `/<npub>/<identifier>.git/*`
-- Landing pages, the root-path-only NIP-05 `_@domain` well-known mapping, and
-  path-aware NIP-11 document serving that omits NIP-05 below the domain root
+- WebSocket upgrade for the Nostr relay at the configured `NGIT_BASE_PATH`
+- Git Smart HTTP endpoints below
+  `<base-path>/<npub>/<identifier>.git/*`
+- Prefix-scoped landing, metrics, icon, Git, GRASP-06, NIP-11, and WebSocket
+  routing. The NIP-05 `_@domain` mapping is served and advertised only when
+  `NGIT_BASE_PATH=/`; path-mounted owner profiles also omit `nip05`.
 - CORS headers on all responses (GRASP-01 requirement)
 
 **Key Implementation Details:**

@@ -136,7 +136,10 @@ pub fn unauthorized_response(config: &Config) -> Response<GitResponseBody> {
         .status(StatusCode::UNAUTHORIZED)
         .header(
             WWW_AUTHENTICATE,
-            format!("Nostr realm=\"{}\", method=\"GET\"", config.domain),
+            format!(
+                "Nostr realm=\"{}\", method=\"GET\"",
+                config.service_address()
+            ),
         )
         .body(empty_body())
         .expect("static unauthorized response")

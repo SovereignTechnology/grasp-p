@@ -58,19 +58,13 @@ async fn well_known_root_identity_matches_relay_pubkey() {
         .expect("supported_nips should be an array")
         .contains(&serde_json::json!(5)));
 
-    let nested_nip11: serde_json::Value = client
+    let nested_nip11 = client
         .get(format!("http://{}/relay", relay.domain()))
         .header("Accept", "application/nostr+json")
         .send()
         .await
-        .expect("request NIP-11 document at a non-root relay path")
-        .json()
-        .await
-        .expect("parse nested-path NIP-11 document");
-    assert!(!nested_nip11["supported_nips"]
-        .as_array()
-        .expect("nested-path supported_nips should be an array")
-        .contains(&serde_json::json!(5)));
+        .expect("request NIP-11 document at an unconfigured relay path");
+    assert_eq!(nested_nip11.status(), reqwest::StatusCode::NOT_FOUND);
 
     let nested_response = client
         .get(format!(

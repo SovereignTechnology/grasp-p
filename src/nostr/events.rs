@@ -150,7 +150,7 @@ impl RepositoryAnnouncement {
     pub fn has_relay(&self, relay: &str) -> bool {
         self.relays
             .iter()
-            .any(|r| crate::outbound::url_matches_service_domain(r, relay))
+            .any(|r| crate::outbound::relay_url_matches_service(r, relay))
     }
 
     /// Check if this announcement lists the service (both clone and relay)
@@ -427,7 +427,7 @@ pub fn validate_announcement(
     let blacklist_config = config.blacklist_config();
 
     let npub = announcement.owner_npub();
-    let lists_service = announcement.lists_service(&config.domain);
+    let lists_service = announcement.lists_service(&config.service_address());
 
     // Check blacklist FIRST - it overrides everything
     if let Some(reason) = blacklist_config.check(&npub, &announcement.identifier) {
@@ -626,6 +626,40 @@ mod tests {
         };
         let result = validate_announcement(&event, &config);
         assert!(matches!(result, AnnouncementResult::Accept));
+    }
+
+    #[test]
+    fn path_mounted_service_requires_path_in_clone_and_relay_urls() {
+        use crate::config::Config;
+        use crate::nostr::policy::AnnouncementResult;
+
+        let keys = create_test_keys();
+        let config = Config {
+            domain: "gitnostr.com".to_string(),
+            base_path: "/grasp".to_string(),
+            ..Config::for_testing()
+        };
+        let matching = create_announcement_event(
+            &keys,
+            "test-repo",
+            vec!["https://gitnostr.com/grasp/alice/test-repo.git"],
+            vec!["wss://gitnostr.com/grasp"],
+        );
+        let root_only = create_announcement_event(
+            &keys,
+            "test-repo",
+            vec!["https://gitnostr.com/alice/test-repo.git"],
+            vec!["wss://gitnostr.com"],
+        );
+
+        assert!(matches!(
+            validate_announcement(&matching, &config),
+            AnnouncementResult::Accept
+        ));
+        assert!(matches!(
+            validate_announcement(&root_only, &config),
+            AnnouncementResult::Reject(_)
+        ));
     }
 
     #[test]

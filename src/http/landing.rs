@@ -577,6 +577,7 @@ pub fn get_html(config: &Config) -> String {
 ///
 /// Used for any path that doesn't match a known route
 pub fn get_generic_404_html(config: &Config, path: &str) -> String {
+    let home_path = config.public_path("/");
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -631,7 +632,7 @@ pub fn get_generic_404_html(config: &Config, path: &str) -> String {
             <div class="path-label">Requested Path</div>
             <code>{path}</code>
         </div>
-        <a href="/">&larr; Back to {relay_name}</a>
+        <a href="{home_path}">&larr; Back to {relay_name}</a>
         <div class="footer"><span id="footer-domain"></span><span class="footer-separator">•</span>powered by <a href="https://gitworkshop.dev/danconwaydev.com/ngit-grasp"><strong>ngit-grasp</strong></a><span class="footer-separator">•</span>{version}<span class="footer-separator">•</span>MIT Licensed</div>
     </div>
     {footer_script}
@@ -640,6 +641,7 @@ pub fn get_generic_404_html(config: &Config, path: &str) -> String {
 </html>"##,
         base_css = get_base_css(),
         relay_name = config.relay_name(),
+        home_path = escape_html(&home_path),
         path = path,
         version = get_version(),
         footer_script = get_footer_script(),
@@ -652,6 +654,7 @@ pub fn get_generic_404_html(config: &Config, path: &str) -> String {
 ///
 /// GRASP-01: "...and a 404 page for repositories it doesn't host"
 pub fn get_404_html(config: &Config, npub: &str, identifier: &str) -> String {
+    let home_path = config.public_path("/");
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -730,7 +733,7 @@ pub fn get_404_html(config: &Config, npub: &str, identifier: &str) -> String {
             </div>
         </div>
         <div class="hint">The repository may not have been announced to this server, or the URL may be incorrect.</div>
-        <a href="/">&larr; Back to {relay_name}</a>
+        <a href="{home_path}">&larr; Back to {relay_name}</a>
         <div class="footer"><span id="footer-domain"></span><span class="footer-separator">•</span>powered by <a href="https://gitworkshop.dev/danconwaydev.com/ngit-grasp"><strong>ngit-grasp</strong></a><span class="footer-separator">•</span>{version}<span class="footer-separator">•</span>MIT Licensed</div>
     </div>
     {footer_script}
@@ -739,6 +742,7 @@ pub fn get_404_html(config: &Config, npub: &str, identifier: &str) -> String {
 </html>"##,
         base_css = get_base_css(),
         relay_name = config.relay_name(),
+        home_path = escape_html(&home_path),
         npub = npub,
         identifier = identifier,
         version = get_version(),
@@ -753,6 +757,8 @@ pub fn get_404_html(config: &Config, npub: &str, identifier: &str) -> String {
 /// GRASP-01: "SHOULD serve a webpage at the same endpoint linking to git nostr client(s)
 /// to browse the repository"
 pub fn get_repo_html(config: &Config, npub: &str, identifier: &str) -> String {
+    let home_path = config.public_path("/");
+    let relay_path = serde_json::to_string(&home_path).expect("serialize configured base path");
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -830,7 +836,7 @@ pub fn get_repo_html(config: &Config, npub: &str, identifier: &str) -> String {
     {theme_toggle}
     <div class="container">
         <div class="back-link">
-            <a href="/">&larr; {relay_name}</a>
+            <a href="{home_path}">&larr; {relay_name}</a>
         </div>
         <div class="header">
             <h1>{identifier}</h1>
@@ -858,10 +864,16 @@ pub fn get_repo_html(config: &Config, npub: &str, identifier: &str) -> String {
         // Detect protocol and construct relayref
         const protocol = window.location.protocol; // 'http:' or 'https:'
         const host = window.location.host; // 'domain.com' or 'domain.com:port'
+        const relayPath = {relay_path};
+        const websocketPath = relayPath === '/' ? '' : relayPath;
         
-        // For http, use ws:// prefix and URL encode; for https, just use host (implies wss://)
+        // A path relay hint must carry the complete WebSocket URL. Root HTTPS
+        // deployments retain the compact host-only relay hint.
         let relayref = host;
-        if (protocol === 'http:') relayref = encodeURIComponent("ws://" + host);
+        if (protocol === 'http:' || websocketPath) {{
+            const websocketProtocol = protocol === 'http:' ? 'ws://' : 'wss://';
+            relayref = encodeURIComponent(websocketProtocol + host + websocketPath);
+        }}
         
         // Update the relayref in the clone URL
         document.getElementById('relayref').textContent = relayref;
@@ -881,6 +893,8 @@ pub fn get_repo_html(config: &Config, npub: &str, identifier: &str) -> String {
 </html>"##,
         base_css = get_base_css(),
         relay_name = config.relay_name(),
+        home_path = escape_html(&home_path),
+        relay_path = relay_path,
         npub = npub,
         identifier = identifier,
         encoded_identifier = percent_encode(identifier),

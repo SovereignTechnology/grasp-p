@@ -4,6 +4,10 @@ GRASP-06 adds an opt-in endpoint at `/prs/<npub>/<identifier>.git` that any cont
 
 This page covers the operator-facing steps to turn it on and verify it.
 
+All paths below are relative to `NGIT_BASE_PATH`. For a relay mounted at
+`/grasp`, use `/grasp`, `/grasp/prs/...`, and matching path-prefixed `clone`
+tags in the examples.
+
 ## 1. Flip the feature flag
 
 Set `NGIT_GRASP06_ENABLE=true` for the relay process. The flag is off by default; everything below is a no-op without it.

@@ -8,7 +8,7 @@ A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized
 
 - **Git Smart HTTP Backend**: Serves Git repositories over HTTP
 - **Nostr Relay**: Stores and validates repository announcements and state events
-- **Root Nostr Identity**: Serves `_@domain` through NIP-05, seeds a minimal bot profile and single-relay NIP-65 list, and trusts service events signed by the relay owner
+- **Relay Owner Identity**: Root-mounted relays serve `_@domain` through NIP-05; every deployment seeds a minimal bot profile and single-relay NIP-65 list and trusts service events signed by the relay owner
 - **Integrated Authorization**: Validates Git pushes against Nostr state events without requiring external hooks
 
 Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-relay)) which uses nginx + git-http-backend + pre-receive hooks + Khatru (Go), `ngit-grasp` provides a unified Rust service that handles both Git and Nostr protocols natively.
@@ -401,6 +401,7 @@ nix develop -c cargo build --release
 cp .env.example .env
 # Edit .env with your settings
 # Required: NGIT_DOMAIN=your-domain.com
+# Optional: NGIT_BASE_PATH=/grasp  # Share a domain at wss://your-domain.com/grasp
 # Optional: NGIT_SYNC_BOOTSTRAP_RELAY_URL=wss://relay.example.com
 
 # Run
@@ -416,7 +417,7 @@ nix develop -c cargo test --lib
 - Nostr relay begins accepting WebSocket connections
 - If bootstrap relay configured, sync system connects and discovers repositories
 - Purgatory system activates, ready to hunt for missing git data
-- Prometheus metrics exposed at `/metrics`
+- Prometheus metrics exposed at `<base-path>/metrics`
 
 **Don't have Nix?** See [Getting Started Tutorial](docs/tutorials/getting-started.md) for alternative setup methods.
 
@@ -456,6 +457,7 @@ passes the key through a protected systemd credential.
 | Option              | CLI Flag                 | Environment Variable        | Default                                      |
 | ------------------- | ------------------------ | --------------------------- | -------------------------------------------- |
 | Domain              | `--domain`               | `NGIT_DOMAIN`               | (required)                                   |
+| Base path           | `--base-path`            | `NGIT_BASE_PATH`            | `/`                                          |
 | Relay owner nsec    | —                        | `NGIT_RELAY_OWNER_NSEC`     | systemd credential, then `.relay-owner.nsec` |
 | Relay name          | `--relay-name`           | `NGIT_RELAY_NAME`           | `${domain} grasp relay`                      |
 | Relay description   | `--relay-description`    | `NGIT_RELAY_DESCRIPTION`    | `Git Nostr Relay - a grasp implementation`   |
