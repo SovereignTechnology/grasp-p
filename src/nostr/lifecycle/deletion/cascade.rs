@@ -161,7 +161,7 @@ impl DeletionPolicy {
         let plan = match plan_deleted_announcement_cascade(
             &self.ctx.database,
             &deletable_announcements,
-            &self.ctx.config.domain,
+            &self.ctx.config.service_address(),
         )
         .await
         {

@@ -264,7 +264,7 @@ impl DeletionService {
 
         for identifier in crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
             event,
-            &self.ctx.config.domain,
+            &self.ctx.config.service_address(),
         ) {
             paths.insert(crate::grasp06::paths::prs_repo_path(
                 &self.ctx.git_data_path,

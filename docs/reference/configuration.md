@@ -127,7 +127,37 @@ NGIT_DOMAIN=localhost:7334  # Development only
 
 - Must be accessible from the internet for production
 - Include port if non-standard (e.g., `localhost:7334`)
-- Used in repository clone URLs: `https://{NGIT_DOMAIN}/{npub}/{repo}.git`
+- Combined with `NGIT_BASE_PATH` in repository clone and relay URLs
+
+---
+
+#### `NGIT_BASE_PATH`
+
+**Description:** Public URL path where this GRASP instance is mounted
+**Type:** String (normalized absolute URL path)
+**Default:** `/`
+**Required:** No
+
+**Examples:**
+
+```bash
+NGIT_BASE_PATH=/
+NGIT_BASE_PATH=/grasp
+NGIT_BASE_PATH=/services/git
+```
+
+When set to a non-root path, every service endpoint is scoped below it. For
+example, `NGIT_DOMAIN=example.org` with `NGIT_BASE_PATH=/grasp` exposes the
+Nostr relay at `wss://example.org/grasp`, Git repositories below
+`https://example.org/grasp/<npub>/<repo>.git`, and metrics at
+`https://example.org/grasp/metrics`. Requests outside the prefix are rejected.
+
+The value must start with `/`, must not end with `/` unless it is exactly `/`,
+and must not contain empty, `.` or `..` segments, a query, or a fragment.
+Path-mounted relays do not serve or advertise the root-domain `_@domain`
+NIP-05 identity. Their generated owner profile omits its `nip05` field.
+
+The corresponding NixOS option is `basePath`.
 
 ---
 
@@ -981,7 +1011,7 @@ NGIT_ARCHIVE_READ_ONLY=true  # Default
 
 ### GRASP-06 Contributor PR Submission
 
-These options control the optional `/prs/<npub>/<identifier>.git` contributor pull-request submission endpoint per the [GRASP-06 specification](https://github.com/DanConwayDev/grasp/blob/main/06.md).
+These options control the optional `/prs/<npub>/<identifier>.git` contributor pull-request submission endpoint per the [GRASP-06 specification](https://github.com/DanConwayDev/grasp/blob/main/06.md). The route is below `NGIT_BASE_PATH` when a non-root mount is configured.
 
 #### `NGIT_GRASP06_ENABLE`
 

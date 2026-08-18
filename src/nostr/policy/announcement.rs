@@ -105,7 +105,8 @@ impl AnnouncementPolicy {
                         // announcement never listed this service, so its
                         // replacement must remain eligible for the maintainer
                         // exception instead of being mistaken for a de-list.
-                        let lists_service = announcement.lists_service(&self.config.domain);
+                        let service = self.config.service_address();
+                        let lists_service = announcement.lists_service(&service);
                         if !lists_service {
                             match self
                                 .db_announcement(&event.pubkey, &announcement.identifier)
@@ -117,7 +118,7 @@ impl AnnouncementPolicy {
                                             Ok(current) => current,
                                             Err(_) => return AnnouncementResult::Reject(reason),
                                         };
-                                    if current.lists_service(&self.config.domain) {
+                                    if current.lists_service(&service) {
                                         return AnnouncementResult::Reject(reason);
                                     }
                                 }

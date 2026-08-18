@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `trusted_proxy_cidrs` to the public `Config` struct. Rust consumers
   that construct `Config` with a struct literal must provide it.
+- Added `base_path` to the public `Config` struct. Rust consumers that
+  construct `Config` with a struct literal must provide it.
 
 ### Security
 
@@ -24,8 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `NGIT_BASE_PATH` / `--base-path` (NixOS `basePath`) so one GRASP server
+  can be mounted below a shared domain path. WebSocket, Git Smart HTTP,
+  GRASP-06, NIP-11, metrics, icons, landing pages, service matching, generated
+  NIP-65 identity, and self-sync all use the configured prefix. Requests
+  outside it are rejected. Path-mounted servers neither serve nor advertise
+  the root-domain NIP-05 identity, and their generated kind-0 profile omits
+  the `nip05` field.
+
 - Publish the relay-owner identity on startup as a minimal kind-0 profile with
-  the scheme-less public URL as `name`, `_@domain` NIP-05, and `bot: true`,
+  the scheme-less public URL as `name`, `bot: true`, and `_@domain` NIP-05 for
+  domain-root deployments,
   plus a kind-10002 list naming this relay as its sole read/write relay. An
   operator-customized profile survives restarts, and no identity event —
   stored or generated — is published before the local database and at least

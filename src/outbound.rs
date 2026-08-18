@@ -311,21 +311,35 @@ fn is_ipv6_globally_reachable(address: Ipv6Addr) -> bool {
         || (segments[..6].iter().all(|segment| *segment == 0)))
 }
 
-/// Whether a URL's authority is exactly the given service domain.
+/// Whether a URL belongs to the given GRASP service.
 ///
-/// `service` is a bare authority such as `gitnostr.com` or `127.0.0.1:7334`
-/// (an optional scheme prefix and trailing slash are tolerated). The URL
-/// matches only when its parsed host equals the service host and its
-/// effective port agrees: an explicit service port must match the URL's
-/// effective port, while a service without a port requires the URL to use its
-/// scheme's default port.
+/// `service` is a bare authority with an optional mount path, such as
+/// `gitnostr.com`, `127.0.0.1:7334`, or `example.com/grasp` (an optional
+/// scheme prefix and trailing slash are tolerated). The authority must match
+/// exactly. A configured mount path must equal the URL path or be its
+/// segment-delimited prefix, allowing repository URLs below that mount while
+/// preventing sibling mounts from being mistaken for this service.
 ///
 /// Substring tricks - `gitnostr.com.attacker.example`,
 /// `https://evil.example/gitnostr.com/x.git`, `user@gitnostr.com` credentials
 /// pointing elsewhere - do not match, unlike the `contains()` checks this
 /// replaces.
 pub fn url_matches_service_domain(url: &str, service: &str) -> bool {
-    let Some((service_host, service_port)) = parse_service_authority(service) else {
+    url_matches_service(url, service, false)
+}
+
+/// Whether a relay URL names the exact configured GRASP relay endpoint.
+///
+/// Unlike [`url_matches_service_domain`], child paths do not match. This is
+/// used for Nostr relay tags and own-relay suppression; Git clone URLs use the
+/// prefix-aware matcher above because their repository coordinates are below
+/// the service mount.
+pub fn relay_url_matches_service(url: &str, service: &str) -> bool {
+    url_matches_service(url, service, true)
+}
+
+fn url_matches_service(url: &str, service: &str, exact_path: bool) -> bool {
+    let Some((service_host, service_port, service_path)) = parse_service_location(service) else {
         return false;
     };
     let Ok(parsed) = parse_lenient_url(url) else {
@@ -337,28 +351,42 @@ pub fn url_matches_service_domain(url: &str, service: &str) -> bool {
     if normalize_host(host) != service_host {
         return false;
     }
-    match service_port {
+    let authority_matches = match service_port {
         Some(port) => parsed.port_or_known_default() == Some(port),
         // url::Url normalizes an explicit default port to None, so a bare
         // service domain matches exactly the scheme-default port.
         None => parsed.port().is_none(),
+    };
+    if !authority_matches {
+        return false;
     }
+
+    let url_path = parsed.path().trim_end_matches('/');
+    if exact_path {
+        return url_path == service_path;
+    }
+    service_path.is_empty()
+        || url_path == service_path
+        || url_path
+            .strip_prefix(&service_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Parse a configured service authority into (host, optional port).
-fn parse_service_authority(service: &str) -> Option<(String, Option<u16>)> {
+/// Parse a configured service into normalized host, optional port, and path.
+fn parse_service_location(service: &str) -> Option<(String, Option<u16>, String)> {
     let trimmed = service.trim().trim_end_matches('/');
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
-    if without_scheme.is_empty() {
+    let normalized = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    if trimmed.is_empty() {
         return None;
     }
-    // Borrow the url parser for authority handling (IPv6 brackets, ports).
-    let parsed = Url::parse(&format!("http://{without_scheme}")).ok()?;
+    let parsed = Url::parse(&normalized).ok()?;
     let host = normalize_host(parsed.host_str()?);
-    Some((host, parsed.port()))
+    let path = parsed.path().trim_end_matches('/').to_string();
+    Some((host, parsed.port(), path))
 }
 
 /// Parse a URL, assuming `https://` when no scheme is present.
@@ -663,6 +691,37 @@ mod tests {
         assert!(!url_matches_service_domain("ws://127.0.0.1", service));
         assert!(!url_matches_service_domain(
             "http://evil.example/127.0.0.1:7334/x.git",
+            service
+        ));
+    }
+
+    #[test]
+    fn service_matching_respects_mount_path_boundaries() {
+        let service = "git.example/grasp";
+
+        assert!(url_matches_service_domain(
+            "https://git.example/grasp/npub/repo.git",
+            service
+        ));
+        assert!(relay_url_matches_service(
+            "wss://git.example/grasp",
+            service
+        ));
+        assert!(relay_url_matches_service(
+            "wss://git.example/grasp/",
+            service
+        ));
+
+        assert!(!url_matches_service_domain(
+            "https://git.example/npub/repo.git",
+            service
+        ));
+        assert!(!url_matches_service_domain(
+            "https://git.example/graspy/npub/repo.git",
+            service
+        ));
+        assert!(!relay_url_matches_service(
+            "wss://git.example/grasp/another-relay",
             service
         ));
     }

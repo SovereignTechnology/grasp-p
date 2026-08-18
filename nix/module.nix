@@ -35,6 +35,16 @@ let
           "Domain where this relay is hosted (used in GRASP validation)";
       };
 
+      basePath = mkOption {
+        type = types.str;
+        default = "/";
+        example = "/grasp";
+        description = ''
+          Public URL path where this relay is mounted. Use "/" for a
+          domain-root deployment or a normalized path such as "/grasp".
+        '';
+      };
+
       bindAddress = mkOption {
         type = types.str;
         default = "127.0.0.1";
@@ -565,6 +575,7 @@ let
 
     environment = {
       NGIT_DOMAIN = cfg.domain;
+      NGIT_BASE_PATH = cfg.basePath;
       NGIT_BIND_ADDRESS = "${cfg.bindAddress}:${toString cfg.port}";
       NGIT_GIT_DATA_PATH = "${cfg.dataDir}/git";
       NGIT_RELAY_DATA_PATH = "${cfg.dataDir}/relay";

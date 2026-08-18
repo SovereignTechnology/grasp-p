@@ -117,7 +117,7 @@ impl RelayServer {
             "Configuration loaded and validated: {}",
             config.bind_address
         );
-        info!("Domain: {}", config.domain);
+        info!("Public service: {}", config.service_address());
         info!("Relay name: {}", config.relay_name());
         info!("Git data directory: {}", config.effective_git_data_path());
         if config.database_backend != DatabaseBackend::Memory {
@@ -202,7 +202,7 @@ impl RelayServer {
 
         info!(
             "Relay created with NIP-34 validation for domain: {}",
-            config.domain
+            config.service_address()
         );
 
         // Set the local relay on the write policy for purgatory notifications
@@ -278,7 +278,7 @@ impl RelayServer {
 
         let sync_manager = SyncManager::new(
             config.sync_bootstrap_relay_url.clone(),
-            config.domain.clone(),
+            config.service_address(),
             relay_runtime.stores.database.clone(),
             relay_runtime.write_policy.clone(),
             relay_runtime.relay.clone(),
@@ -411,7 +411,7 @@ impl RelayServer {
             purgatory.clone(),
             relay_runtime.stores.database.clone(),
             PathBuf::from(config.effective_git_data_path()),
-            Some(config.domain.clone()),
+            Some(config.service_address()),
             Some(relay_runtime.relay.clone()),
             Some(relay_runtime.write_policy.clone()),
             git_naughty_list.clone(),

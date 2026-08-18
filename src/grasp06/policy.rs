@@ -41,7 +41,7 @@ pub fn event_qualifies_for_pr_relaxation(event: &Event, config: &Config) -> bool
         return false;
     }
 
-    event_names_relays_prs_endpoint(event, &config.domain)
+    event_names_relays_prs_endpoint(event, &config.service_address())
 }
 
 /// Returns true when `event` is a PR/PR-Update event whose `clone` tag names
@@ -202,13 +202,23 @@ fn clone_url_prs_identifier_for_relay(
     let authority = &rest[..slash_idx];
     let path = &rest[slash_idx..]; // includes leading `/`.
 
-    if !authority.eq_ignore_ascii_case(domain) {
+    let configured = domain
+        .strip_prefix("https://")
+        .or_else(|| domain.strip_prefix("http://"))
+        .unwrap_or(domain)
+        .trim_end_matches('/');
+    let (configured_authority, configured_path) = configured
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((configured, String::new()));
+
+    if !authority.eq_ignore_ascii_case(configured_authority) {
         return None;
     }
 
     let path = path.trim_end_matches('/');
 
-    let inner = path.strip_prefix(&format!("/{}/", PRS_URL_PREFIX))?;
+    let inner = path.strip_prefix(&format!("{configured_path}/{}/", PRS_URL_PREFIX))?;
 
     // Exactly two segments: `<npub>` and `<repo>.git`.
     let segments: Vec<&str> = inner.split('/').collect();
@@ -315,6 +325,36 @@ mod tests {
         );
         let cfg = config_with_domain("relay.example", true);
         assert!(event_qualifies_for_pr_relaxation(&event, &cfg));
+    }
+
+    #[test]
+    fn path_mounted_service_requires_base_path_before_prs_endpoint() {
+        let signer = Keys::generate();
+        let target_hex = Keys::generate().public_key().to_hex();
+        let npub = signer.public_key().to_bech32().unwrap();
+        let matching_url = format!("http://relay.example/grasp/prs/{npub}/my-repo.git");
+        let root_url = format!("http://relay.example/prs/{npub}/my-repo.git");
+        let matching = pr_event(
+            &signer,
+            &[(&target_hex, "my-repo")],
+            &[&matching_url],
+            Kind::GitPullRequest,
+        );
+        let root_only = pr_event(
+            &signer,
+            &[(&target_hex, "my-repo")],
+            &[&root_url],
+            Kind::GitPullRequest,
+        );
+        let cfg = Config {
+            domain: "relay.example".to_string(),
+            base_path: "/grasp".to_string(),
+            grasp06_enable: true,
+            ..Config::for_testing()
+        };
+
+        assert!(event_qualifies_for_pr_relaxation(&matching, &cfg));
+        assert!(!event_qualifies_for_pr_relaxation(&root_only, &cfg));
     }
 
     #[test]

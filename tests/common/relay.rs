@@ -78,6 +78,7 @@ struct RelayOptions {
     /// when unset so [`TestRelay::restart`] keeps the same identity, as a
     /// production restart would.
     owner_keys: Option<Keys>,
+    base_path: Option<String>,
     bootstrap_relay_url: Option<String>,
     sync_plus_fallback_relays: Option<String>,
     disable_negentropy: bool,
@@ -139,6 +140,18 @@ impl TestRelay {
     /// ```
     pub async fn start() -> Self {
         Self::start_internal(port::reserve_port(), RelayOptions::default()).await
+    }
+
+    /// Start a relay mounted at an explicit public URL path.
+    pub async fn start_at_base_path(base_path: &str) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                base_path: Some(base_path.to_string()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
     }
 
     /// Start one GRASP-08 private service whose static membership contains
@@ -758,7 +771,9 @@ impl TestRelay {
     async fn try_start_once(reservation: PortReservation, options: &RelayOptions) -> StartOutcome {
         let port = reservation.port();
         let bind_address = format!("127.0.0.1:{}", port);
-        let url = format!("ws://127.0.0.1:{}", port);
+        let base_path = options.base_path.as_deref().unwrap_or("/");
+        let url_path = if base_path == "/" { "" } else { base_path };
+        let url = format!("ws://127.0.0.1:{port}{url_path}");
 
         // Create temporary directories unless caller provided explicit paths.
         let (git_data_dir, git_data_path) = if let Some(path) = options.git_data_path.clone() {
@@ -833,6 +848,10 @@ impl TestRelay {
                     .unwrap_or(Stdio::null()),
             )
             .stderr(Stdio::inherit()); // Inherit stderr for test output
+
+        if let Some(base_path) = &options.base_path {
+            cmd.env("NGIT_BASE_PATH", base_path);
+        }
 
         cmd.env(
             "NGIT_DATABASE_BACKEND",
@@ -986,6 +1005,16 @@ impl TestRelay {
         format!("127.0.0.1:{}", self.port)
     }
 
+    /// Get the scheme-less public service address, including any mount path.
+    pub fn service_address(&self) -> String {
+        let base_path = self.options.base_path.as_deref().unwrap_or("/");
+        if base_path == "/" {
+            self.domain()
+        } else {
+            format!("{}{base_path}", self.domain())
+        }
+    }
+
     /// Keys configured as this test relay's operator identity.
     pub fn owner_keys(&self) -> &Keys {
         &self.owner_keys
@@ -1095,8 +1124,9 @@ impl TestRelay {
             // Use the relay's HTTP handler rather than a bare TCP connect:
             // this verifies the accept loop and Hyper service are both live,
             // which is what the immediately-following WebSocket tests need.
+            let base_path = self.options.base_path.as_deref().unwrap_or("/");
             let request = format!(
-                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                "GET {base_path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
                 self.port
             );
             stream.write_all(request.as_bytes()).await?;

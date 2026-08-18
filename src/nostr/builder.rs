@@ -126,7 +126,7 @@ impl Nip34WritePolicy {
         private_access: Option<PrivateAccess>,
     ) -> Self {
         let git_data_path = git_data_path.into();
-        let domain = config.domain.clone();
+        let domain = config.service_address();
         let deletion_ctx = DeletionContext::new(
             domain.clone(),
             database.clone(),
