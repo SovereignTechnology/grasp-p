@@ -18,38 +18,61 @@ up the listening service or changes whether the structural migration commits.
 ## Before deploying
 
 1. Stop writes to the relay and take a filesystem snapshot of both the Git and
-   relay data directories. An older binary cannot serve the new thin views, so
-   this external snapshot is the clean release-level rollback boundary.
-2. Check free space on `NGIT_GIT_DATA_PATH`. During the first launch the server
-   retains every original repository and builds a verified family union. Plan
-   for at least the current owner and `/prs/` repository footprint again, plus
-   room for the largest identifier family. Deduplication reduces the final
-   family size but should not be assumed for preflight capacity planning.
+   relay data directories. An older binary cannot serve the new thin views,
+   and legacy backups are retired during migration, so this external snapshot
+   is the rollback boundary for the release.
+2. Check free space on `NGIT_GIT_DATA_PATH`. Migration processes one
+   identifier family at a time and retires that family's legacy backups after
+   verification before starting the next family. Plan for the current
+   footprint plus roughly one extra copy of the largest identifier family
+   (all owner and `/prs/` repositories sharing one identifier), not the whole
+   dataset. Deduplication reduces the final family size but should not be
+   assumed for preflight capacity planning.
 3. Keep Git and relay data on durable storage.
-4. Do not configure Git GC for this rollout. Unreachable objects and migration
-   backups intentionally preserve delete-state rollback material.
+4. Do not configure Git GC for this rollout. Unreachable objects intentionally
+   preserve delete-state rollback material inside each family.
 
 ## Perform the upgrade
 
 Deploy the new release with the existing configuration and start the relay.
 For every identifier, launch migration inventories all objects from all
 matching owner and `/prs/` paths, including unreachable objects, verifies the
-union, then atomically replaces each repository with a thin view. Original
-repositories move to:
+union, then atomically replaces each repository with a thin view. While a
+family converts, its original repositories are held under:
 
 ```text
 <git-data>/.grasp/migration/backups/
 ```
 
-Progress and restart state live under `.grasp/migration/journal/`. The global
+Once every view of a family is installed, each of that family's backups is
+verified — every Git-readable backup object present in the family, the thin
+views wired and matching their journal snapshot, and every family pack
+indexed and valid — and then deleted before the next family is migrated. Peak
+migration overhead is therefore bounded by the family currently in flight. A
+pack without an index is invisible to Git and cannot be vouched for by that
+verification; such packs are preserved under
+`.grasp/migration/unindexed-packs/` for manual `git index-pack` recovery.
+
+Progress and restart state live under `.grasp/migration/journal/`; each
+journal is removed after its backup retires. The global
 `.grasp/storage-version` marker is written only after every eligible view has
 been reconciled and verified. Do not edit these files while the service is
 running.
 
 Confirm the service reaches its normal listening state and exercise a clone,
 fetch, and push for both a normal repository and a `/prs/` route. Retain the
-external snapshot and `.grasp/migration/backups/` for the rollback window. The
-server never deletes those backups automatically.
+external pre-upgrade snapshot for the rollback window; the retired migration
+backups are gone once their family verifies.
+
+Installations that migrated under a release which kept backups indefinitely
+retire them on the next launch after the same verification, except that the
+stale journal ref snapshot is no longer enforced against views whose refs
+have legitimately changed in service. A backup that cannot be verified — for
+example its migrated view was later deleted by repository lifecycle, or the
+family cannot prove it contains every backup object — is kept with a warning
+and remains operator-managed. Installations whose backups were already
+verified and deleted manually start normally; their completed journals are
+compacted away.
 
 Watch for the terminal startup-pass summary:
 
@@ -90,8 +113,14 @@ Repeated requests for the same identifier and mode safely coalesce.
 
 ## Failure and rollback
 
-- A migration failure is fail-closed. Fix the reported filesystem or Git error
-  and restart; the journal resumes the safe transition.
+- A migration or backup-retirement failure during an active migration is
+  fail-closed: the family's legacy backup is kept, startup stops, and a
+  restart resumes from the fsynced journal. A backup is never deleted before
+  its family verifies.
+- Pre-existing damage does not block retirement. An object that was already
+  absent from the legacy repository cannot be preserved by keeping its backup,
+  so retirement proceeds; the condition stays visible through the integrity
+  startup pass and `integrity-check --repair`.
 - A post-migration integrity repair failure is fail-open because the damage
   predates conversion or arose after it. Inspect the identifier's `ERROR` log,
   repair or update its listed clone sources, and queue `integrity-check
@@ -100,7 +129,7 @@ Repeated requests for the same identifier and mode safely coalesce.
   pre-upgrade Git and relay-data snapshot together. Do not point an older
   binary at migrated thin views.
 
-There is deliberately no automatic cleanup step. Backup retirement and
-unreachable-object pruning remain deferred until rollback and delete-state
+Backup retirement only removes verified legacy copies. Unreachable-object
+pruning inside families remains deferred until rollback and delete-state
 retention have an explicit policy. S3 adoption is a separate optional rollout
 and is not required for this local storage model.

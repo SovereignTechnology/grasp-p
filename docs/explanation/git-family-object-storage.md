@@ -275,10 +275,34 @@ For each legacy bare repository:
 
 On restart, the journal determines whether to resume copying, finish a rename,
 or restore the legacy directory. Every state transition is safe to repeat.
-The original repository backup remains until the entire storage-version
-migration has been verified. The first implementation does not delete those
-backups automatically; an operator-visible later cleanup process can do so
-after an appropriate rollback window.
+
+Backups are retired family by family rather than accumulating until the whole
+migration finishes. After the last view of a family is installed, each of its
+backups must pass a retirement gate: the family contains every Git-readable
+object of the backup, every affected view is a correctly wired thin view whose
+refs and `HEAD` match its journal snapshot, and every family pack is indexed
+and passes `git verify-pack`. Only then is a durable `retired` journal state
+written, the backup deleted, and the journal removed, before the next family
+is migrated. Peak migration overhead is therefore bounded by the family
+currently in flight instead of a second copy of the entire legacy dataset.
+
+The retirement gate deliberately does not reuse the family integrity
+inspection: that check reports pre-existing missing objects and broken ref
+targets as unhealthy, but an object that was never in the backup cannot be
+preserved by keeping the backup. Retirement proceeds, and the pre-existing
+damage stays visible through the integrity worker and `integrity-check
+--repair`. Packs without an index are Git-invisible, so the superset proof
+cannot vouch for them; they are moved to `.grasp/migration/unindexed-packs/`
+before their backup is deleted.
+
+Retirement failures during an active migration are fail-closed and keep the
+backup. Journals from a migration that already committed are handled
+leniently on later launches: their ref snapshots are stale once the server
+has served traffic, so the gate skips snapshot equality, and an unverifiable
+backup (for example one whose migrated view was later deleted by repository
+lifecycle) is retained with a warning as operator-managed rollback material.
+Installations whose backups were verified and deleted manually simply have
+their completed journals removed.
 
 The global `storage-version` advances only after every eligible repository is
 complete. A server must fail startup on an unrepairable mismatch rather than
@@ -324,8 +348,9 @@ on remote servers.
 This is also the migration repair path. Migration remains a deterministic,
 offline conversion that preserves every Git-readable object and the exact
 legacy refs. Once those paths are thin family views, the ordinary family pass
-can heal pre-existing missing objects. Unindexed legacy packs remain in the
-migration backup; there is no separate legacy repair subsystem.
+can heal pre-existing missing objects. Unindexed legacy packs are preserved
+under `.grasp/migration/unindexed-packs/` when their backup is retired; there
+is no separate legacy repair subsystem.
 
 Operators can queue the same identifier-scoped check in the live process:
 

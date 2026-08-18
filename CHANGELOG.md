@@ -72,6 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Retire identifier-family migration backups family by family. Once every
+  view of a family is installed, each backup is verified (family contains
+  every Git-readable backup object, thin views match their journal snapshot,
+  family packs are indexed and valid) and then deleted before the next family
+  migrates, bounding peak migration disk overhead to the family in flight.
+  Unindexed legacy packs are quarantined under
+  `.grasp/migration/unindexed-packs/`, unverifiable backups are retained with
+  a warning, and completed installations whose backups were already removed
+  manually start unchanged.
 - Scope bare log levels to ngit-grasp while keeping dependencies at warnings;
   explicit tracing filter expressions remain unchanged.
 - Keep per-event discovery and validation details at debug, retain aggregate
