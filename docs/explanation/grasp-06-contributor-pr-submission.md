@@ -55,7 +55,9 @@ Two reasons:
 
 The contributor chose to publish to `/prs/`. Mirroring into any accepted repository on this relay makes the PR visible at the expected location for clients browsing that repo. Not mirroring the reverse direction preserves the maintainer's declared `clone` intent on their own pushes — we do not invent new hosting locations for their events.
 
-Until object-pool dedup lands, the mirror doubles storage for affected refs. We accept this cost as the simplest correct implementation; dedup lands later and makes the mirror effectively free.
+Identifier-family object storage makes the mirror a ref-only operation. Owner
+and contributor views for the same identifier resolve one shared object
+inventory, so accepting or mirroring a PR does not copy its object graph.
 
 ## Architecture
 
@@ -94,7 +96,7 @@ POST /prs/<npub>/<id>.git/git-receive-pack
       signer ≠ URL npub                   → reject ref
       identifier (d-tag) ≠ URL identifier → reject ref
       commit ≠ event's c tag              → delete ref
-      all match                           → ref locked; release event from purgatory;
+      all match                           → ref locked; retain family tip; release event from purgatory;
                                             mirror to matching standard repos
     event not yet seen:
       accept ref; create or update PR placeholder in purgatory
@@ -107,7 +109,14 @@ The flow mirrors the existing `refs/nostr/<event-id>` path at the standard endpo
 
 #### On-demand bare repo creation
 
-The first push to `/prs/<submitter>/<identifier>.git` creates the bare repo on disk. A per-`(submitter, identifier)` [`PrsPathState`](../../src/grasp06/receive.rs) (kept in a `DashMap` on the `HttpService`, see [`crate::grasp06::receive::RepoInitLocks`](../../src/grasp06/receive.rs)) provides a `tokio::sync::Mutex` and an `in_flight: AtomicUsize` counter. The mutex is held only briefly — for `git init --bare` plus the `in_flight` increment at the start of a push, and for the `in_flight` decrement plus end-of-push zero-ref cleanup at the end. The pack upload and per-ref validation run *without* the mutex held, so concurrent pushes to the same path proceed in parallel; git's own ref locking handles intra-push concurrency. Off-push cleanup paths (PR-event policy, purgatory expiry) take the same mutex briefly and only `rm -rf` the bare repo when they see `in_flight == 0` and `list_refs` is empty — so no off-push code path can delete the bare repo while a push is in flight, and no push is serialised behind another push to the same identity.
+The first push to `/prs/<submitter>/<identifier>.git` creates a thin bare view
+whose alternate is the identifier family. A per-`(submitter, identifier)`
+[`PrsPathState`](../../src/grasp06/receive.rs) still protects view creation and
+cleanup. A separate per-family write lease serializes object-producing work
+across all owner and contributor views for that identifier. `git-receive-pack`
+writes objects to the family while updating only the selected view's refs.
+Off-push cleanup may remove an empty contributor view, but never removes family
+objects or retained roots.
 
 ### Event acceptance relaxation
 
@@ -130,9 +139,10 @@ When a PR or PR Update's purgatory entry is released via a `/prs/` push:
 1. Save event to DB and remove from purgatory (as today).
 2. For each `a` tag in the event of the form `30617:<pubkey>:<d-tag>`:
    - Resolve to a local repo path `<git_data_path>/<pubkey-npub>/<d-tag>.git`.
-   - If that repo has an active (non-purgatory) announcement, copy objects + install `refs/nostr/<event-id>` into it (same mechanism as existing cross-owner sync in [`src/git/sync.rs`](../../src/git/sync.rs)).
+   - If that repo has an active (non-purgatory) announcement, install `refs/nostr/<event-id>` in its view after checking the commit resolves through the shared family.
 
-The mirror copies the same ref, same commits. No separate object store. Dedup can be added transparently later via git alternates keyed on d-tag.
+The mirror installs the same ref to the same commit. Git alternates keyed by
+identifier make the objects immediately available without a copy.
 
 The mirror is **one-directional**: pushes to `/<maintainer>/<id>.git` are not mirrored into `/prs/*`. Only the `/prs/` → `<maintainer>/` direction fires, and only when the source repo path is under `prs_base_path`.
 
@@ -250,9 +260,10 @@ This is the design rationale for the mirror being one-directional and the `/prs/
 
 Deletion of the contributor's own PR event (NIP-09) → the deletion-request branch will decide and implement the ref-lifecycle behaviour. GRASP-06 v1 does not add hooks or no-op scaffolding for this.
 
-### Object-pool deduplication (not yet specified)
+### Object-pool deduplication
 
-The mirror copies objects today. When object-pool dedup exists — likely as git alternates keyed on `(identifier, a-tag-coord-set)` — the mirror becomes a pointer operation with near-zero storage cost. No URL or spec change is required.
+The identifier family is the shared object inventory. Mirroring installs a view
+ref and does not copy objects; no URL or spec change is required.
 
 ## Anticipated failure modes and mitigations
 

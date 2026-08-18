@@ -300,7 +300,7 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
     let _env_lock = PATH_ENV_LOCK.lock().await;
 
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
-    write_fake_git(fake_bin.path());
+    write_fake_git_with_terminal_flush(fake_bin.path());
     let _path = PathOverride::prepend(fake_bin.path());
 
     let keys = Keys::generate();
@@ -355,7 +355,11 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
         .expect("first /prs/ stdout chunk should arrive before fake git exits")
         .expect("/prs/ body should still be open")
         .expect("first /prs/ frame should not be an HTTP body error");
-    assert_eq!(frame_data(first), Bytes::from_static(b"first-progress\n"));
+    let mut streamed = frame_data(first).to_vec();
+    assert!(
+        b"first-progress\n".starts_with(&streamed),
+        "the four-byte terminal look-behind may split the first progress chunk"
+    );
 
     assert!(
         repo_path.exists(),
@@ -374,7 +378,18 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
         .expect("second /prs/ stdout chunk should arrive after fake git wakes")
         .expect("/prs/ body should still be open for second chunk")
         .expect("second /prs/ frame should not be an HTTP body error");
-    assert_eq!(frame_data(second), Bytes::from_static(b"second-progress\n"));
+    streamed.extend_from_slice(&frame_data(second));
+
+    // Family ref retention happens behind this boundary. Keep the deadline
+    // bounded but allow finalization the same scheduling headroom as the
+    // subprocess wake above.
+    let terminal = timeout(Duration::from_secs(3), body.frame())
+        .await
+        .expect("/prs/ terminal flush should arrive after cleanup")
+        .expect("/prs/ body should contain the terminal flush")
+        .expect("/prs/ terminal frame should not be an HTTP body error");
+    streamed.extend_from_slice(&frame_data(terminal));
+    assert_eq!(streamed, b"first-progress\nsecond-progress\n0000");
 
     let eof = timeout(Duration::from_secs(1), body.frame())
         .await
@@ -474,15 +489,28 @@ fi
 
 if [ "$1" = "init" ]; then
   repo="${@: -1}"
-  mkdir -p "$repo"
+  mkdir -p "$repo/objects/info"
   exit 0
+fi
+
+if [ "$1" = "config" ]; then
+  exit 0
+fi
+
+if [ "$1" = "rev-parse" ] && [ "${2:-}" = "--show-object-format" ]; then
+  printf 'sha1\n'
+  exit 0
+fi
+
+if [ "$1" = "cat-file" ]; then
+  exit 1
 fi
 
 if [ "$1" = "for-each-ref" ]; then
   exit 0
 fi
 
-echo "fake git only supports init, for-each-ref, and receive-pack" >&2
+echo "unsupported fake git invocation: $*" >&2
 exit 1
 "#
         .replace("__TERMINAL_FLUSH__", terminal_flush),

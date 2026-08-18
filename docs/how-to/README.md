@@ -24,6 +24,19 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 
 ## Available How-To Guides
 
+### [Upgrade Git family storage](upgrade-git-family-storage.md)
+**Problem:** Deduplicate existing repository objects during a server upgrade
+**Difficulty:** Advanced
+
+**You'll learn:**
+- Prepare capacity and a release rollback point
+- Run the automatic crash-safe launch migration
+- Verify owner and `/prs/` repository views
+- Check or repair one identifier family on demand
+- Recover safely from an interrupted launch
+
+---
+
 ### [Configure Nix Flakes](nix-flakes.md)
 **Problem:** Set up reproducible development environment  
 **Difficulty:** Intermediate

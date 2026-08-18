@@ -125,6 +125,23 @@ impl RelayServer {
         }
         info!("Database backend: {}", config.database_backend);
 
+        // Upgrade Git storage before any runtime component can inspect or
+        // mutate repositories. Migration is resumable and retains original
+        // repositories as operator-managed rollback backups.
+        let git_storage = git::storage::LocalGitStorage::new(config.effective_git_data_path());
+        let migration = git::migration::migrate_on_startup(&git_storage)
+            .await
+            .context("upgrade Git repositories to identifier-family storage")?;
+        if !migration.already_current {
+            info!(
+                migrated_views = migration.migrated_views,
+                recovered_views = migration.recovered_views,
+                families_built = migration.families_built,
+                "Git identifier-family storage migration completed"
+            );
+        }
+        info!("Git object backend: local identifier families");
+
         // Initialize metrics if enabled
         let metrics = if config.metrics_enabled {
             info!("Metrics enabled on /metrics endpoint");
@@ -421,6 +438,17 @@ impl RelayServer {
             grasp08_peers,
             outbound_credential_keys,
         ));
+
+        // Check the permanent identifier-family model after migration and
+        // database initialization. The pass is intentionally non-blocking:
+        // remote repair must not make availability depend on listed clone
+        // servers. It also owns filesystem-queued operator requests so all
+        // repair work remains inside the process holding family write leases.
+        background_tasks.push(git::integrity::spawn_integrity_worker(
+            git_storage,
+            sync_ctx.clone(),
+        ));
+        info!("Git identifier-family integrity worker started");
 
         // Create throttle manager for rate limiting remote git servers
         // Default: 5 concurrent requests per domain, 60 requests per minute per domain

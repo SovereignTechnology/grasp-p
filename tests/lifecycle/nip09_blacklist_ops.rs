@@ -1,6 +1,7 @@
 //! Blacklist operations tests: startup parity, disrespector interaction,
 //! manual ejection, and operational metrics wiring.
 
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,6 +120,15 @@ fn base_config() -> Config {
     Config::parse_from(["ngit-grasp-test", "--domain", "test.example.com"])
 }
 
+fn init_bare_repo(path: &std::path::Path) {
+    let status = Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(path)
+        .status()
+        .expect("start git init --bare");
+    assert!(status.success(), "initialize bare repository");
+}
+
 #[tokio::test]
 async fn startup_blacklist_scan_deletes_matching_repositories_via_holding_archive_path() {
     let relay_dir = tempfile::tempdir().expect("relay tempdir");
@@ -141,7 +151,7 @@ async fn startup_blacklist_scan_deletes_matching_repositories_via_holding_archiv
     let owner_npub = owner.public_key().to_bech32().expect("npub");
     let owner_dir = owner_npub.clone();
     let repo_path = git_dir.path().join(&owner_dir).join("blacklisted-repo.git");
-    std::fs::create_dir_all(repo_path.join("refs")).expect("create bare repo dir");
+    init_bare_repo(&repo_path);
 
     let mut config = base_config();
     config.repository_blacklist = owner_npub;
@@ -394,7 +404,7 @@ async fn startup_whitelist_restore_recovers_now_whitelisted_scope_and_is_idempot
         .path()
         .join(owner_npub.clone())
         .join("whitelist-restore-repo.git");
-    std::fs::create_dir_all(repo_path.join("refs")).expect("create bare repo dir");
+    init_bare_repo(&repo_path);
 
     let deletion_policy = make_policy(
         Config {
@@ -626,7 +636,7 @@ async fn startup_blacklist_restore_recovers_unblacklisted_scope_and_is_idempoten
         .path()
         .join(owner_npub.clone())
         .join("blacklist-restore-repo.git");
-    std::fs::create_dir_all(repo_path.join("refs")).expect("create bare repo dir");
+    init_bare_repo(&repo_path);
 
     let deletion_policy = make_policy(
         Config {

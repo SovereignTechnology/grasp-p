@@ -36,6 +36,9 @@ enum Cli {
     ///
     /// This is an operator/admin maintenance command and is idempotent.
     HoldingEject(nostr::lifecycle::HoldingEjectArgs),
+
+    /// Queue an identifier-family integrity check in the running relay.
+    IntegrityCheck(ngit_grasp::git::integrity::IntegrityCheckArgs),
 }
 
 #[tokio::main]
@@ -47,7 +50,13 @@ async fn main() -> Result<()> {
     // If not, prepend the implicit "serve" subcommand so that clap routes to Cli::Serve
     // and all relay flags are parsed normally (preserving backward compatibility).
     let mut args: Vec<String> = std::env::args().collect();
-    let known_subcommands = ["serve", "cleanup-empty-repos", "holding-eject", "help"];
+    let known_subcommands = [
+        "serve",
+        "cleanup-empty-repos",
+        "holding-eject",
+        "integrity-check",
+        "help",
+    ];
     let has_subcommand = args.get(1).is_some_and(|a| {
         known_subcommands.contains(&a.as_str())
             || matches!(a.as_str(), "-h" | "--help" | "-V" | "--version")
@@ -59,6 +68,20 @@ async fn main() -> Result<()> {
     match Cli::parse_from(args) {
         Cli::CleanupEmptyRepos(cleanup_args) => cleanup_empty_repos::run(&cleanup_args).await,
         Cli::HoldingEject(eject_args) => nostr::lifecycle::run_holding_eject(eject_args).await,
+        Cli::IntegrityCheck(integrity_args) => {
+            let path = ngit_grasp::git::integrity::enqueue_manual_check(&integrity_args)?;
+            println!(
+                "Queued {} for identifier '{}' at {}",
+                if integrity_args.repair {
+                    "integrity check and repair"
+                } else {
+                    "integrity check"
+                },
+                integrity_args.identifier,
+                path.display()
+            );
+            Ok(())
+        }
         Cli::Serve(config) => {
             let mut config = *config;
             config.relay_owner_nsec = Some(Config::load_relay_owner_key()?);

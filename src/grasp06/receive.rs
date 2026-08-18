@@ -19,19 +19,21 @@
 //!    reject the whole push with an `ERR` pkt-line — matching the
 //!    standard-endpoint UX. Nothing on disk has been touched yet so failed
 //!    probes leave no state.
-//! 3. Acquires the per-path coordination state from [`RepoInitLocks`]
-//!    briefly: under its mutex it runs the on-demand `git init --bare`
+//! 3. Acquires the identifier-family write lease and the per-path coordination
+//!    state from [`RepoInitLocks`] briefly: under the path mutex it creates an
+//!    on-demand thin view
 //!    and increments the `in_flight` counter, then releases the mutex.
-//!    Steps 4 and 5 run *without* the per-path lock so concurrent pushes
-//!    to the same `(submitter, identifier)` proceed in parallel — git's
-//!    own ref locking handles intra-push concurrency, and the
-//!    `in_flight` counter is what off-push cleanup paths consult to know
-//!    a push is active.
-//! 4. Starts `git-receive-pack`, writes the full request body to the child, and
+//!    Steps 4 and 5 run *without* the per-path lock. The family write lease
+//!    serializes object-producing operations for the identifier, while the
+//!    `in_flight` counter is what off-push cleanup paths consult to know a push
+//!    is active.
+//! 4. Starts `git-receive-pack` with the family as its writable object database,
+//!    writes the full request body to the child, and
 //!    immediately returns an HTTP response whose body is backed by a bounded
 //!    channel. From this point on Hyper can stream stdout to the client while a
 //!    detached task owns the subprocess, stderr, and all post-push work.
-//! 5. In the detached task, each stdout chunk is forwarded as it is read. If Git
+//! 5. In the detached task, progress is forwarded while the terminal flush is
+//!    retained until family roots and GRASP post-processing are complete. If Git
 //!    exits with a protocol-level error before writing stdout, the task sends a
 //!    Git `ERR` pkt-line through the same stream so clients still see a normal
 //!    receive-pack failure. If stdout has already been sent, the task cannot
@@ -76,10 +78,12 @@ use crate::git::authorization::{
 };
 use crate::git::handlers::{
     build_git_protocol_error_response, err_pktline_frame, is_git_protocol_error,
-    pump_stdout_to_channel, read_stderr_to_end, record_git_operation, streaming_response, GitError,
-    PumpResult, STREAM_CHANNEL_DEPTH,
+    pump_receive_pack_stdout_to_channel, read_stderr_to_end, record_git_operation,
+    retain_accepted_tips, send_body_bytes, streaming_response, GitError, PumpResult,
+    STREAM_CHANNEL_DEPTH,
 };
 use crate::git::protocol::GitService;
+use crate::git::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
 use crate::git::subprocess::GitSubprocess;
 use crate::git::sync::process_newly_available_git_data;
 use crate::git::{delete_ref, list_refs, GitResponseBody};
@@ -107,9 +111,9 @@ use crate::sync::rejected_index::RejectedEventsIndex;
 ///   expiry) for the duration of one `delete_ref` + optional
 ///   `remove_dir_all`.
 ///
-/// `git-receive-pack` itself and per-ref validation run *without* the
-/// mutex held, so two pushes to the same path proceed in parallel; git's
-/// own ref locking handles intra-push concurrency.
+/// `git-receive-pack` itself and per-ref validation run *without* the path
+/// mutex held. A separate identifier-family lease serializes their shared
+/// object inventory.
 ///
 /// Off-push cleanup paths only `rm -rf` the bare repo when both
 /// `in_flight.load() == 0` *and* `list_refs` returns empty while they
@@ -258,20 +262,27 @@ pub async fn handle_prs_receive_pack(
     // 3. Acquire the per-path coordination state and, under its mutex,
     //    initialise the bare repo on demand and register this request as
     //    in-flight. The mutex is then released — `git-receive-pack` and
-    //    per-ref validation run WITHOUT the lock so concurrent pushes to
-    //    the same `(submitter, identifier)` proceed in parallel. Cleanup
-    //    paths consult `in_flight` (under the same mutex) before
+    //    per-ref validation run WITHOUT the path lock. The family lease above
+    //    serializes object-producing work for the identifier. Cleanup paths
+    //    consult `in_flight` (under the same mutex) before
     //    deleting the bare repo, so a repo can never vanish mid-receive.
     let repo_path = prs_repo_path(
         Path::new(git_data_path),
         &prs.submitter.to_hex(),
         &prs.identifier,
     );
+    let storage = LocalGitStorage::new(git_data_path);
+    let family_key =
+        FamilyKey::sha1(&prs.identifier).map_err(|e| GitError::Storage(e.to_string()))?;
+    let family_lease = storage
+        .write_lease(&family_key)
+        .await
+        .map_err(|e| GitError::Storage(e.to_string()))?;
     let state = path_state(&repo_init_locks, &repo_path);
 
     {
         let _g = state.mu.lock().expect("prs path mutex poisoned");
-        if let Err(e) = ensure_repo_initialised(&repo_path) {
+        if let Err(e) = ensure_repo_initialised(&storage, &family_key, &repo_path) {
             error!(
                 "/prs/ receive-pack: failed to initialise repo at {}: {}",
                 repo_path.display(),
@@ -289,17 +300,23 @@ pub async fn handle_prs_receive_pack(
     //    to the same streaming shape as the standard receive-pack endpoint:
     //    write stdin here, then hand stdout/stderr and all follow-up state to a
     //    detached task that feeds the response body channel.
-    let mut git =
-        match GitSubprocess::spawn(GitService::ReceivePack, &repo_path, false, git_protocol)
-            .map_err(GitError::ProcessSpawnFailed)
-        {
-            Ok(git) => git,
-            Err(e) => {
-                finish_prs_receive_pack(&state, &repo_path);
-                record_git_operation(&metrics, "push", "error");
-                return Err(e);
-            }
-        };
+    let use_family = storage.is_thin_view(&family_key, &repo_path);
+    let mut git = match GitSubprocess::spawn_with_object_directory(
+        GitService::ReceivePack,
+        &repo_path,
+        false,
+        git_protocol,
+        use_family.then_some(&family_lease.family_objects_path),
+    )
+    .map_err(GitError::ProcessSpawnFailed)
+    {
+        Ok(git) => git,
+        Err(e) => {
+            finish_prs_receive_pack(&state, &repo_path);
+            record_git_operation(&metrics, "push", "error");
+            return Err(e);
+        }
+    };
 
     if let Some(mut stdin) = git.take_stdin() {
         if let Err(e) = stdin.write_all(&request_body).await {
@@ -350,6 +367,9 @@ pub async fn handle_prs_receive_pack(
         prs.identifier.clone(),
         domain.to_string(),
         metrics,
+        storage,
+        family_key,
+        use_family.then_some(family_lease),
     ));
 
     Ok(streaming_response(GitService::ReceivePack, rx))
@@ -389,30 +409,18 @@ fn invalid_ref_reason(ref_name: &str) -> Option<String> {
 ///
 /// The caller must hold the per-path mutex from [`PrsPathState`] for
 /// `repo_path` before invoking this function.
-fn ensure_repo_initialised(repo_path: &Path) -> Result<(), GitError> {
+fn ensure_repo_initialised(
+    storage: &LocalGitStorage,
+    family_key: &FamilyKey,
+    repo_path: &Path,
+) -> Result<(), GitError> {
     if repo_path.exists() {
         return Ok(());
     }
 
-    if let Some(parent) = repo_path.parent() {
-        std::fs::create_dir_all(parent).map_err(GitError::IoError)?;
-    }
-
-    let output = std::process::Command::new("git")
-        .args(["init", "--bare", "--initial-branch=main", "--quiet"])
-        .arg(repo_path)
-        .output()
-        .map_err(GitError::ProcessSpawnFailed)?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!(
-            "/prs/ git init --bare failed at {}: {}",
-            repo_path.display(),
-            stderr.trim()
-        );
-        return Err(GitError::GitFailed(output.status.code()));
-    }
+    storage
+        .create_thin_view(family_key, repo_path)
+        .map_err(|error| GitError::Storage(error.to_string()))?;
 
     info!(
         "/prs/ initialised bare repo at {} on demand",
@@ -482,6 +490,9 @@ async fn stream_prs_receive_pack_output<S, E>(
     identifier: String,
     domain: String,
     metrics: Option<Arc<Metrics>>,
+    storage: LocalGitStorage,
+    family_key: FamilyKey,
+    family_lease: Option<FamilyWriteLease>,
 ) where
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -490,7 +501,7 @@ async fn stream_prs_receive_pack_output<S, E>(
     // fill its stderr pipe while still producing stdout; draining both prevents
     // child-process deadlock and preserves stderr for protocol-error reporting.
     let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
-    let pump_result = pump_stdout_to_channel(stdout, &tx).await;
+    let (pump_result, terminal_flush) = pump_receive_pack_stdout_to_channel(stdout, &tx).await;
 
     // If the client goes away or stdout read fails, stop Git rather than letting
     // it continue writing into a response nobody can receive. Cleanup below will
@@ -514,7 +525,7 @@ async fn stream_prs_receive_pack_output<S, E>(
         None => Vec::new(),
     };
 
-    let sent_stdout = match pump_result {
+    let mut sent_stdout = match pump_result {
         PumpResult::Eof { sent_stdout } => sent_stdout,
         PumpResult::ClientDisconnected | PumpResult::ReadError => {
             finish_prs_receive_pack(&state, &repo_path);
@@ -524,6 +535,14 @@ async fn stream_prs_receive_pack_output<S, E>(
     };
 
     if !status.success() {
+        if let Some(flush) = terminal_flush {
+            sent_stdout = true;
+            if send_body_bytes(&tx, flush).await.is_err() {
+                finish_prs_receive_pack(&state, &repo_path);
+                record_git_operation(&metrics, "push", "error");
+                return;
+            }
+        }
         record_git_operation(&metrics, "push", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
         if is_git_protocol_error(status.code(), &stderr_output) {
@@ -568,8 +587,6 @@ async fn stream_prs_receive_pack_output<S, E>(
     }
 
     debug!("/prs/ git-receive-pack stream completed successfully");
-    record_git_operation(&metrics, "push", "success");
-
     // Race safety net. The pre-validation in `handle_prs_receive_pack` was
     // performed before `git-receive-pack` ran, so an event with one of the
     // pushed ids may have arrived via WebSocket during the receive-pack window.
@@ -593,6 +610,10 @@ async fn stream_prs_receive_pack_output<S, E>(
             ref_name,
         )
         .await;
+    }
+
+    if family_lease.is_some() {
+        retain_accepted_tips(&storage, &family_key, &repo_path, &pushed_refs);
     }
 
     finish_prs_receive_pack(&state, &repo_path);
@@ -633,6 +654,14 @@ async fn stream_prs_receive_pack_output<S, E>(
             );
         }
     }
+
+    if let Some(flush) = terminal_flush {
+        if send_body_bytes(&tx, flush).await.is_err() {
+            record_git_operation(&metrics, "push", "error");
+            return;
+        }
+    }
+    record_git_operation(&metrics, "push", "success");
 }
 
 /// Race safety net for the `/prs/` receive-pack post-push phase.

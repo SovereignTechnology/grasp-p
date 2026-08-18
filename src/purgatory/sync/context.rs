@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub enum GitFetchRole {
     Primary,
     Hedge,
+    Integrity,
 }
 
 impl GitFetchRole {
@@ -28,6 +29,7 @@ impl GitFetchRole {
         match self {
             Self::Primary => "primary",
             Self::Hedge => "hedge",
+            Self::Integrity => "integrity",
         }
     }
 }
@@ -229,6 +231,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tracing::debug;
 
+use crate::git::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryState;
 use crate::nostr::SharedDatabase;
@@ -329,6 +332,33 @@ impl RealSyncContext {
     /// Get reference to the git naughty list tracker
     pub fn git_naughty_list(&self) -> &Arc<NaughtyListTracker> {
         &self.git_naughty_list
+    }
+
+    /// Clone URLs from accepted repository announcements for one identifier.
+    ///
+    /// Integrity repair deliberately excludes purgatory URLs: it heals
+    /// durable families only from repository sources already accepted into
+    /// the relay database. The normal outbound policy is still applied at the
+    /// point of each fetch.
+    pub async fn accepted_repository_clone_urls(&self, identifier: &str) -> Result<Vec<String>> {
+        let data = crate::git::authorization::fetch_repository_data_excluding_purgatory(
+            &self.database,
+            identifier,
+        )
+        .await?;
+        let mut urls: Vec<_> = data
+            .announcements
+            .into_iter()
+            .flat_map(|announcement| announcement.clone_urls)
+            .filter(|url| {
+                self.our_domain_value
+                    .as_deref()
+                    .is_none_or(|domain| !crate::outbound::url_matches_service_domain(url, domain))
+            })
+            .collect();
+        urls.sort();
+        urls.dedup();
+        Ok(urls)
     }
 }
 
@@ -436,6 +466,8 @@ fn hardened_git_command(
     repo_path: &Path,
     resolve_pin: Option<&str>,
     auth_header: Option<&str>,
+    object_directory: Option<&Path>,
+    negotiation_algorithm: Option<&str>,
     args: &[String],
 ) -> Command {
     let mut command = Command::new("git");
@@ -446,6 +478,11 @@ fn hardened_git_command(
         .arg("http.proxy=")
         .arg("-c")
         .arg("credential.helper=");
+    if let Some(algorithm) = negotiation_algorithm {
+        command
+            .arg("-c")
+            .arg(format!("fetch.negotiationAlgorithm={algorithm}"));
+    }
     if let Some(pin) = resolve_pin {
         command.arg("-c").arg(format!("http.curloptResolve={pin}"));
     }
@@ -469,6 +506,9 @@ fn hardened_git_command(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .current_dir(repo_path);
+    if let Some(object_directory) = object_directory {
+        command.env("GIT_OBJECT_DIRECTORY", object_directory);
+    }
     command
 }
 
@@ -799,6 +839,15 @@ fn is_object_missing_error(stderr: &str) -> bool {
         || stderr.contains("Server does not allow request for unadvertised object")
 }
 
+/// Integrity repair starts from a repository whose refs may name objects that
+/// are already missing. Normal fetch negotiation walks those refs as local
+/// "have" tips, which can make Git request no pack and then fail its own
+/// connectivity check. Repair fetches therefore advertise no local haves and
+/// ask the source for the complete requested object closure.
+fn fetch_negotiation_algorithm(role: GitFetchRole) -> Option<&'static str> {
+    (role == GitFetchRole::Integrity).then_some("noop")
+}
+
 /// Record a remote failure with the naughty list tracker (only error
 /// categories the tracker classifies as persistent are recorded).
 fn record_remote_failure(
@@ -974,6 +1023,21 @@ impl SyncContext for RealSyncContext {
         };
         let resolve_pin = resolve_pin_entry(&resolved);
 
+        let storage = LocalGitStorage::new(&self.git_data_path);
+        let family_key = family_key_for_view(repo_path, &self.git_data_path);
+        let family_lease = match family_key.as_ref() {
+            Some(key) if storage.is_thin_view(key, repo_path) => Some(
+                storage
+                    .write_lease(key)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("open family for git fetch: {error}"))?,
+            ),
+            _ => None,
+        };
+        let family_objects = family_lease
+            .as_ref()
+            .map(|lease| lease.family_objects_path.as_path());
+
         let repo_path = repo_path.to_path_buf();
         let url = url.to_string();
         let domain = extract_domain(&url).unwrap_or_else(|| "unknown".to_string());
@@ -1028,6 +1092,8 @@ impl SyncContext for RealSyncContext {
                 &repo_path,
                 resolve_pin.as_deref(),
                 fresh_auth_header().as_deref(),
+                None,
+                None,
                 &ls_remote_args,
             ),
             &domain,
@@ -1098,6 +1164,8 @@ impl SyncContext for RealSyncContext {
                     &repo_path,
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
+                    family_objects,
+                    fetch_negotiation_algorithm(role),
                     &args,
                 ),
                 &domain,
@@ -1168,6 +1236,8 @@ impl SyncContext for RealSyncContext {
                     &repo_path,
                     resolve_pin.as_deref(),
                     fresh_auth_header().as_deref(),
+                    family_objects,
+                    fetch_negotiation_algorithm(role),
                     &args,
                 ),
                 &domain,
@@ -1218,6 +1288,27 @@ impl SyncContext for RealSyncContext {
             .filter(|oid| crate::git::oid_exists(&repo_path, oid))
             .cloned()
             .collect();
+
+        if let Some(key) = family_key.as_ref().filter(|_| family_lease.is_some()) {
+            for oid in &fetched {
+                if let Err(error) = storage.retain_tip(key, "purgatory-fetch", oid) {
+                    tracing::warn!(
+                        identifier = %key.identifier,
+                        %oid,
+                        %error,
+                        "Failed to retain proactively fetched family tip"
+                    );
+                }
+                if let Err(error) = storage.advertise_base_tip(key, "purgatory-fetch", oid) {
+                    tracing::warn!(
+                        identifier = %key.identifier,
+                        %oid,
+                        %error,
+                        "Failed to advertise proactively fetched family tip"
+                    );
+                }
+            }
+        }
 
         // One summary line per outbound fetch pass: this is the
         // client-side visibility the drop-one-and-retry loop lacked
@@ -1310,9 +1401,27 @@ impl SyncContext for RealSyncContext {
     }
 }
 
+fn family_key_for_view(repo_path: &Path, git_data_path: &Path) -> Option<FamilyKey> {
+    let identifier = crate::git::sync::extract_identifier_from_repo_path(repo_path, git_data_path)?;
+    let object_format = ObjectFormat::detect(repo_path).ok()?;
+    FamilyKey::new(object_format, identifier).ok()
+}
+
 #[cfg(test)]
 mod fetch_helper_tests {
     use super::*;
+
+    #[test]
+    fn family_key_for_view_preserves_the_repository_object_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let git_data_path = temp.path().join("git");
+        let storage = LocalGitStorage::new(&git_data_path);
+        let expected = FamilyKey::new(ObjectFormat::Sha256, "shared").unwrap();
+        let view = git_data_path.join("owner").join("shared.git");
+        storage.create_thin_view(&expected, &view).unwrap();
+
+        assert_eq!(family_key_for_view(&view, &git_data_path), Some(expected));
+    }
 
     /// Hermetic git for these tests, immune to ambient git configuration
     /// such as hooks, signing, and templates.
@@ -1663,6 +1772,17 @@ mod fetch_helper_tests {
         assert!(!is_object_missing_error(
             "fatal: unable to access 'https://x/': SSL certificate problem"
         ));
+    }
+
+    #[test]
+    fn integrity_fetches_disable_local_have_negotiation() {
+        assert_eq!(fetch_negotiation_algorithm(GitFetchRole::Primary), None);
+        assert_eq!(fetch_negotiation_algorithm(GitFetchRole::Hedge), None);
+        assert_eq!(
+            fetch_negotiation_algorithm(GitFetchRole::Integrity),
+            Some("noop")
+        );
+        assert_eq!(GitFetchRole::Integrity.as_str(), "integrity");
     }
 
     #[test]

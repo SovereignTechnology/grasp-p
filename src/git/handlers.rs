@@ -17,6 +17,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use super::protocol::{GitService, PktLine};
+use super::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
 use super::subprocess::GitSubprocess;
 use super::{full_body, GitResponseBody};
 
@@ -343,7 +344,7 @@ where
 /// caller finish GRASP post-push processing before making success visible,
 /// without buffering the progress stream that keeps clients alive during
 /// expensive pack processing.
-async fn pump_receive_pack_stdout_to_channel<R>(
+pub(crate) async fn pump_receive_pack_stdout_to_channel<R>(
     mut stdout: R,
     tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
 ) -> (PumpResult, Option<Vec<u8>>)
@@ -701,9 +702,34 @@ pub async fn handle_receive_pack(
         }
     };
 
-    // Spawn git receive-pack
-    let mut git = GitSubprocess::spawn(GitService::ReceivePack, &repo_path, false, git_protocol)
-        .map_err(GitError::ProcessSpawnFailed)?;
+    let storage = LocalGitStorage::new(git_data_path);
+    let family_key = FamilyKey::sha1(identifier).map_err(|e| GitError::Storage(e.to_string()))?;
+    let family_lease = if storage.is_thin_view(&family_key, &repo_path) {
+        Some(
+            storage
+                .write_lease(&family_key)
+                .await
+                .map_err(|e| GitError::Storage(e.to_string()))?,
+        )
+    } else {
+        // Legacy repositories remain self-contained until startup migration.
+        // This fallback also keeps direct library callers safe: never point a
+        // ref at a family object database the view cannot read.
+        None
+    };
+
+    // Ref updates remain in the selected view; receive-pack's quarantine and
+    // final objects are installed directly in the shared family inventory.
+    let mut git = GitSubprocess::spawn_with_object_directory(
+        GitService::ReceivePack,
+        &repo_path,
+        false,
+        git_protocol,
+        family_lease
+            .as_ref()
+            .map(|lease| lease.family_objects_path.as_path()),
+    )
+    .map_err(GitError::ProcessSpawnFailed)?;
 
     // Write request to git's stdin
     if let Some(mut stdin) = git.take_stdin() {
@@ -754,6 +780,10 @@ pub async fn handle_receive_pack(
             repo_lifecycle_guard,
             promotion_hooks,
             metrics,
+            storage,
+            family_key,
+            family_lease,
+            pushed_refs,
         )
         .await;
     });
@@ -778,6 +808,10 @@ async fn stream_receive_pack_output<S, E>(
     repo_lifecycle_guard: Option<LifecycleReadGuard>,
     promotion_hooks: Option<Arc<dyn PurgatoryPromotionHooks>>,
     metrics: Option<Arc<Metrics>>,
+    storage: LocalGitStorage,
+    family_key: FamilyKey,
+    family_lease: Option<FamilyWriteLease>,
+    pushed_refs: Vec<(String, String, String)>,
 ) where
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -862,6 +896,15 @@ async fn stream_receive_pack_output<S, E>(
     }
 
     debug!("Git receive-pack stream completed successfully");
+
+    if family_lease.is_some() {
+        retain_accepted_tips(&storage, &family_key, &repo_path, &pushed_refs);
+    }
+
+    // Received objects and their retention roots are complete. Release the
+    // family writer before post-push processing: purgatory promotion and
+    // archive recovery may need to re-enter this same identifier family.
+    drop(family_lease);
 
     // Release the repository lifecycle read lock once git-receive-pack itself
     // has finished. The lock's purpose is to keep deletion/archive/restore from
@@ -948,7 +991,7 @@ async fn stream_receive_pack_output<S, E>(
     record_git_operation(&metrics, "push", "success");
 }
 
-async fn send_body_bytes(
+pub(crate) async fn send_body_bytes(
     tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
     bytes: Vec<u8>,
 ) -> Result<(), mpsc::error::SendError<Result<Frame<Bytes>, io::Error>>> {
@@ -966,6 +1009,7 @@ pub enum GitError {
     ProcessSpawnFailed(std::io::Error),
     IoError(std::io::Error),
     GitFailed(Option<i32>),
+    Storage(String),
 }
 
 impl std::fmt::Display for GitError {
@@ -975,6 +1019,41 @@ impl std::fmt::Display for GitError {
             Self::ProcessSpawnFailed(e) => write!(f, "failed to spawn git process: {}", e),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::GitFailed(code) => write!(f, "git process failed with code: {:?}", code),
+            Self::Storage(error) => write!(f, "Git storage error: {error}"),
+        }
+    }
+}
+
+pub(crate) fn retain_accepted_tips(
+    storage: &LocalGitStorage,
+    family_key: &FamilyKey,
+    repo_path: &std::path::Path,
+    pushed_refs: &[(String, String, String)],
+) {
+    const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+    for (_, new_oid, ref_name) in pushed_refs {
+        if new_oid == ZERO_OID
+            || super::get_ref_commit(repo_path, ref_name).as_deref() != Some(new_oid.as_str())
+        {
+            continue;
+        }
+        if let Err(error) = storage.retain_tip(family_key, ref_name, new_oid) {
+            warn!(
+                family = %family_key.identifier,
+                %ref_name,
+                %new_oid,
+                %error,
+                "Failed to install family retention root"
+            );
+        }
+        if let Err(error) = storage.advertise_base_tip(family_key, ref_name, new_oid) {
+            warn!(
+                family = %family_key.identifier,
+                %ref_name,
+                %new_oid,
+                %error,
+                "Failed to install family negotiation root"
+            );
         }
     }
 }

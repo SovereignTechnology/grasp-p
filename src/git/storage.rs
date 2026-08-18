@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin_hashes::{sha256, Hash};
@@ -25,6 +25,9 @@ pub const STORAGE_VERSION: u32 = 1;
 const FAMILY_DIR: &str = "families";
 const BASE_REFS_PREFIX: &str = "refs/grasp/bases/";
 const RETAINED_REFS_PREFIX: &str = "refs/grasp/retained/";
+
+type FamilyLockId = (PathBuf, FamilyKey);
+static FAMILY_LOCKS: LazyLock<DashMap<FamilyLockId, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
 
 /// Git object hash algorithms are separate family namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,15 +103,19 @@ impl FamilyKey {
 #[derive(Clone)]
 pub struct LocalGitStorage {
     git_data_path: PathBuf,
-    family_locks: Arc<DashMap<FamilyKey, Arc<Mutex<()>>>>,
 }
 
 impl LocalGitStorage {
     pub fn new(git_data_path: impl Into<PathBuf>) -> Self {
-        Self {
-            git_data_path: git_data_path.into(),
-            family_locks: Arc::new(DashMap::new()),
-        }
+        let git_data_path = git_data_path.into();
+        let git_data_path = if git_data_path.is_absolute() {
+            git_data_path
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(git_data_path)
+        };
+        Self { git_data_path }
     }
 
     pub fn git_data_path(&self) -> &Path {
@@ -134,11 +141,26 @@ impl LocalGitStorage {
         self.family_repo_path(key).join("objects")
     }
 
+    pub fn family_exists(&self, key: &FamilyKey) -> bool {
+        self.family_repo_path(key).is_dir()
+    }
+
+    pub fn is_thin_view(&self, key: &FamilyKey, view_path: &Path) -> bool {
+        let alternate = view_path.join("objects/info/alternates");
+        let Ok(configured) = std::fs::read_to_string(alternate) else {
+            return false;
+        };
+        let Ok(expected) = std::fs::canonicalize(self.family_objects_path(key)) else {
+            return false;
+        };
+        configured.lines().any(|line| Path::new(line) == expected)
+    }
+
     /// Serialize mutations to one identifier family.
     pub async fn write_lease(&self, key: &FamilyKey) -> Result<FamilyWriteLease> {
-        let lock = self
-            .family_locks
-            .entry(key.clone())
+        let lock_id = (self.git_data_path.clone(), key.clone());
+        let lock = FAMILY_LOCKS
+            .entry(lock_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let guard = lock.lock_owned().await;
