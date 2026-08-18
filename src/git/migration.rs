@@ -97,6 +97,11 @@ struct ViewJournal {
     refs: BTreeMap<String, RefSnapshot>,
     head: Vec<u8>,
     state: JournalState,
+    /// The legacy repository carried a server-side `shallow` marker, so its
+    /// object set is a deliberate truncation. Its backup may only retire once
+    /// the family holds the complete closure of the backup's refs.
+    #[serde(default)]
+    shallow: bool,
 }
 
 /// Upgrade all eligible Git repositories under one storage root.
@@ -581,6 +586,7 @@ fn install_view(storage: &LocalGitStorage, candidate: &Candidate) -> Result<View
         refs: refs.clone(),
         head: head.clone(),
         state: JournalState::Prepared,
+        shallow: candidate.source_path.join("shallow").is_file(),
     };
     write_journal(&candidate.journal_path, &journal)?;
 
@@ -658,6 +664,13 @@ fn preserve_view_configuration(
     if source_description.is_file() {
         std::fs::copy(source_description, target.join("description"))?;
     }
+    // A legacy shallow marker keeps the view serving exactly what the
+    // legacy repository served until integrity repair recovers the full
+    // closure; the marker is removed when its family becomes complete.
+    let source_shallow = source.join("shallow");
+    if source_shallow.is_file() {
+        std::fs::copy(source_shallow, target.join("shallow"))?;
+    }
     copy_directory_contents(&source.join("hooks"), &target.join("hooks"))?;
     Ok(())
 }
@@ -714,6 +727,31 @@ fn retire_family_backups(
         match verified {
             Ok(()) => {
                 family_packs_verified = true;
+                let shallow = unit.journal.shallow || unit.backup_path.join("shallow").is_file();
+                if shallow {
+                    // A shallow legacy repository is a deliberate truncation:
+                    // its backup may only retire once the family holds the
+                    // complete closure of the backup's refs. Recovery needs
+                    // the network-based integrity repair that runs after
+                    // startup, so this never fails startup; the backup waits.
+                    if let Err(error) = super::integrity::family_contains_closure(
+                        &storage.family_repo_path(key),
+                        &unit.backup_path,
+                    ) {
+                        tracing::error!(
+                            identifier = %key.identifier,
+                            object_format = %key.object_format,
+                            backup = %unit.backup_path.display(),
+                            %error,
+                            "Family closure of a shallow legacy repository is unresolved; retaining its backup"
+                        );
+                        retained_journals.push(unit.journal_path);
+                        report.retained_backups += 1;
+                        all_retired = false;
+                        continue;
+                    }
+                    remove_shallow_marker(&unit.view_path)?;
+                }
                 quarantine_unindexed_packs(storage, &unit)?;
                 let mut journal = unit.journal;
                 journal.state = JournalState::Retired;
@@ -885,6 +923,25 @@ fn remove_retired_backup(storage: &LocalGitStorage, backup: &Path) -> Result<boo
         parent = directory.parent();
     }
     Ok(true)
+}
+
+/// Drop a view's server-side shallow marker once its family is complete.
+fn remove_shallow_marker(view: &Path) -> Result<()> {
+    let marker = view.join("shallow");
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            fsync_directory(view)?;
+            tracing::info!(
+                view = %view.display(),
+                "Removed server-side shallow marker; the family holds the complete closure"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove shallow marker {}", marker.display()))
+        }
+    }
 }
 
 fn remove_journal(path: &Path) -> Result<()> {
@@ -1617,6 +1674,7 @@ mod tests {
                 refs,
                 head,
                 state: JournalState::Prepared,
+                shallow: false,
             },
         )
         .unwrap();
@@ -1729,6 +1787,7 @@ mod tests {
                 refs,
                 head,
                 state,
+                shallow: false,
             },
         )
         .unwrap();
@@ -1893,6 +1952,124 @@ mod tests {
         let second = migrate_on_startup(&fixture.storage).await.unwrap();
         assert_eq!(second.retained_backups, 1);
         assert!(fixture.backup.is_dir());
+    }
+
+    fn write_commit_object(repo: &Path, parent: Option<&str>) -> String {
+        let tree = git(repo, &["mktree"]);
+        let mut contents = format!(
+            "tree {tree}\nauthor Test <test@example.com> 0 +0000\ncommitter Test <test@example.com> 0 +0000\n\nshallow fixture\n"
+        );
+        if let Some(parent) = parent {
+            contents.insert_str(
+                contents.find("author ").unwrap(),
+                &format!("parent {parent}\n"),
+            );
+        }
+        let mut child = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn shallow_legacy_backup_waits_for_family_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        std::fs::create_dir_all(storage.git_data_path()).unwrap();
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let origin = temp.path().join("origin.git");
+        git(
+            temp.path(),
+            &["init", "--bare", "--quiet", origin.to_str().unwrap()],
+        );
+        let parent = write_commit_object(&origin, None);
+        let child = write_commit_object(&origin, Some(&parent));
+        git(&origin, &["update-ref", "refs/heads/main", &child]);
+
+        let view = storage
+            .git_data_path()
+            .join(&owner)
+            .join("shallow-repo.git");
+        std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                "--depth",
+                "1",
+                &format!("file://{}", origin.display()),
+                view.to_str().unwrap(),
+            ],
+        );
+        assert!(view.join("shallow").is_file());
+
+        let report = migrate_on_startup(&storage).await.unwrap();
+
+        // The truncated backup waits for closure recovery; startup proceeds.
+        assert_eq!(report.migrated_views, 1);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 1);
+        let key = FamilyKey::sha1("shallow-repo").unwrap();
+        assert!(storage.is_thin_view(&key, &view));
+        assert!(view.join("shallow").is_file());
+        let backup = backup_root(&storage).join(&owner).join("shallow-repo.git");
+        assert!(backup.is_dir());
+        assert!(storage.storage_version_path().is_file());
+
+        // A client-requested shallow clone keeps working while recovery is
+        // pending.
+        let shallow_clone = temp.path().join("shallow-clone.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                "--depth",
+                "1",
+                &format!("file://{}", view.display()),
+                shallow_clone.to_str().unwrap(),
+            ],
+        );
+
+        // Model integrity repair recovering the full closure from an
+        // accepted clone source.
+        copy_object_database(&origin, &storage.family_repo_path(&key), ObjectFormat::Sha1).unwrap();
+
+        let second = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(second.retired_backups, 1);
+        assert_eq!(second.retained_backups, 0);
+        assert!(!backup.exists());
+        assert!(!view.join("shallow").exists());
+        assert!(load_journals(&storage).unwrap().is_empty());
+        // With the closure complete and the marker gone, a full clone works.
+        let full_clone = temp.path().join("full-clone.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &format!("file://{}", view.display()),
+                full_clone.to_str().unwrap(),
+            ],
+        );
+        assert!(oid_is_available(&full_clone, &parent).unwrap());
     }
 
     #[tokio::test]

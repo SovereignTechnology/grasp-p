@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.grasp/migration/unindexed-packs/`, unverifiable backups are retained with
   a warning, and completed installations whose backups were already removed
   manually start unchanged.
+- Stop treating server-side shallow repositories as valid family storage.
+  Migration preserves a legacy `shallow` marker on the installed thin view
+  and retains that backup until integrity repair recovers the complete
+  reachable closure from accepted clone sources; the family is reported as
+  unresolved until then, after which the marker is removed and the backup
+  retires. Client-requested shallow clones remain supported.
 - Scope bare log levels to ngit-grasp while keeping dependencies at warnings;
   explicit tracing filter expressions remain unchanged.
 - Keep per-event discovery and validation details at debug, retain aggregate

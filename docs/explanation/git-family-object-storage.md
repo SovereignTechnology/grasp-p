@@ -295,6 +295,20 @@ damage stays visible through the integrity worker and `integrity-check
 cannot vouch for them; they are moved to `.grasp/migration/unindexed-packs/`
 before their backup is deleted.
 
+A server-side `shallow` marker means the legacy repository is a deliberate
+truncation, and GRASP does not treat shallow repositories as valid family
+storage. Migration copies the marker onto the installed thin view so the view
+keeps serving what the legacy repository served, and its backup is excluded
+from retirement until the family holds the complete reachable closure of the
+backup's refs. Closure recovery is the ordinary integrity repair: the family
+reports the truncated parents as missing objects and the marked views as
+`shallow_views`, repair fetches the closure from accepted clone sources, and
+once complete the marker is removed and the backup retires on a later launch.
+An unrecoverable closure retains the backup and keeps the family reported as
+unresolved; this never blocks startup because recovery depends on remote
+servers. Client-requested shallow clones and fetches are a protocol feature
+of upload-pack and remain supported throughout.
+
 Retirement failures during an active migration are fail-closed and keep the
 backup. Journals from a migration that already committed are handled
 leniently on later launches: their ref snapshots are stale once the server

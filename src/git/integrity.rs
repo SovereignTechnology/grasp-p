@@ -6,6 +6,7 @@
 //! checks use the same report.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -94,6 +95,10 @@ pub struct FamilyIntegrityReport {
     pub missing_oids: BTreeSet<String>,
     pub missing_ref_targets: Vec<MissingRefTarget>,
     pub invalid_alternates: Vec<PathBuf>,
+    /// Views still carrying a server-side `shallow` marker. Shallow
+    /// repositories are not valid family storage; the marker is removed by
+    /// repair once the family holds the complete closure of the view's refs.
+    pub shallow_views: Vec<PathBuf>,
     pub pack_errors: Vec<String>,
     pub fsck_diagnostics: Vec<String>,
 }
@@ -104,6 +109,7 @@ impl FamilyIntegrityReport {
         self.missing_oids.is_empty()
             && self.missing_ref_targets.is_empty()
             && self.invalid_alternates.is_empty()
+            && self.shallow_views.is_empty()
             && self.pack_errors.is_empty()
             && self.fsck_diagnostics.is_empty()
     }
@@ -318,6 +324,7 @@ async fn run_one_family<S: FamilyRepairSource + ?Sized>(
         missing_sample,
         missing_ref_targets = outcome.final_report.missing_ref_targets.len(),
         invalid_alternates = outcome.final_report.invalid_alternates.len(),
+        shallow_views = outcome.final_report.shallow_views.len(),
         pack_errors = outcome.final_report.pack_errors.len(),
         fsck_diagnostics = outcome.final_report.fsck_diagnostics.len(),
         diagnostic,
@@ -425,6 +432,33 @@ pub async fn check_and_repair_family<S: FamilyRepairSource + ?Sized>(
             storage.advertise_base_tip(key, &source_ref, &target.oid)?;
         }
     }
+    // A server-side shallow marker stops being a truncation boundary the
+    // moment the family holds the full closure of the view's refs. Until
+    // then it stays in place so the view keeps serving what it always did.
+    for view in &initial.shallow_views {
+        match family_contains_closure(&storage.family_repo_path(key), view) {
+            Ok(()) => {
+                let marker = view.join("shallow");
+                match std::fs::remove_file(&marker) {
+                    Ok(()) => info!(
+                        view = %view.display(),
+                        "Removed server-side shallow marker after family closure recovery"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(view = %view.display(), %error, "Remove shallow marker");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    view = %view.display(),
+                    %error,
+                    "Keeping server-side shallow marker until the family closure is complete"
+                );
+            }
+        }
+    }
     let final_report = inspect_family(storage, key)?;
     Ok(FamilyRepairOutcome {
         initial,
@@ -515,11 +549,15 @@ pub fn inspect_family(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Fami
     let mut missing_oids = BTreeSet::new();
     let mut missing_ref_targets = Vec::new();
     let mut invalid_alternates = Vec::new();
+    let mut shallow_views = Vec::new();
     let mut refs_checked = 0;
 
     for view in &views {
         if !storage.is_thin_view(key, view) {
             invalid_alternates.push(view.clone());
+        }
+        if view.join("shallow").is_file() {
+            shallow_views.push(view.clone());
         }
         for (reference, oid) in list_refs(view)? {
             refs_checked += 1;
@@ -545,9 +583,72 @@ pub fn inspect_family(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Fami
         missing_oids,
         missing_ref_targets,
         invalid_alternates,
+        shallow_views,
         pack_errors,
         fsck_diagnostics,
     })
+}
+
+/// Verify the family contains the complete reachable closure of every ref in
+/// `refs_source` whose target object the family already has.
+///
+/// Tips absent from the family altogether are pre-existing missing objects
+/// and are reported separately; they cannot make a closure walk start.
+pub(crate) fn family_contains_closure(family: &Path, refs_source: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["for-each-ref", "--format=%(objectname) %(objecttype)"])
+        .current_dir(refs_source)
+        .output()
+        .with_context(|| format!("list refs in {}", refs_source.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "list refs in {}: {}",
+            refs_source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut tips = BTreeSet::new();
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(oid), Some(object_type)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // A ref directly naming a blob has no further closure to walk.
+        if matches!(object_type, "commit" | "tag" | "tree") && oid_exists(family, oid)? {
+            tips.insert(oid.to_owned());
+        }
+    }
+    if tips.is_empty() {
+        return Ok(());
+    }
+    let mut child = Command::new("git")
+        .args(["rev-list", "--objects", "--stdin"])
+        .current_dir(family)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("walk closure in {}", family.display()))?;
+    {
+        let stdin = child.stdin.as_mut().context("git rev-list stdin")?;
+        for tip in &tips {
+            writeln!(stdin, "{tip}")?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let diagnostic: String = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(2048)
+            .collect();
+        return Err(anyhow!(
+            "family {} is missing part of the closure reachable from {}: {diagnostic}",
+            family.display(),
+            refs_source.display()
+        ));
+    }
+    Ok(())
 }
 
 fn discover_views(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Vec<PathBuf>> {
@@ -884,6 +985,82 @@ mod tests {
 
         assert_eq!(report.invalid_alternates, vec![view]);
         assert!(!report.is_healthy());
+    }
+
+    #[test]
+    fn reports_a_view_with_a_shallow_marker() {
+        let (_temp, storage, key, view, commit) = fixture();
+        fs::write(view.join("shallow"), format!("{commit}\n")).unwrap();
+
+        let report = inspect_family(&storage, &key).unwrap();
+
+        assert_eq!(report.shallow_views, vec![view]);
+        assert!(!report.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn repair_removes_shallow_marker_after_closure_recovery() {
+        let (temp, storage, key, view, commit) = fixture();
+        let family = storage.family_repo_path(&key);
+        let child = write_commit(&family, Some(&commit));
+        git(&view, &["update-ref", "refs/heads/main", &child]);
+        storage.retain_tip(&key, "child", &child).unwrap();
+        let source_repo = temp.path().join("source.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                family.to_str().unwrap(),
+                source_repo.to_str().unwrap(),
+            ],
+        );
+        git(
+            &source_repo,
+            &["update-ref", "refs/heads/recovery", &commit],
+        );
+        // Truncate the family below the child commit and mark the view as a
+        // legacy server-side shallow repository.
+        let object = family.join("objects").join(&commit[..2]).join(&commit[2..]);
+        fs::remove_file(object).unwrap();
+        fs::write(view.join("shallow"), format!("{child}\n")).unwrap();
+        let before = inspect_family(&storage, &key).unwrap();
+        assert!(!before.is_healthy());
+        assert_eq!(before.shallow_views, vec![view.clone()]);
+        let source = LocalRepairSource {
+            url: source_repo.to_string_lossy().into_owned(),
+            family_objects: storage.family_objects_path(&key),
+        };
+
+        let outcome = check_and_repair_family(&storage, &key, &source, true)
+            .await
+            .unwrap();
+
+        assert!(outcome.repaired(), "{outcome:#?}");
+        assert!(!view.join("shallow").exists());
+        assert!(oid_exists(&family, &commit).unwrap());
+    }
+
+    #[tokio::test]
+    async fn repair_keeps_shallow_marker_while_closure_is_missing() {
+        let (_temp, storage, key, view, commit) = fixture();
+        let family = storage.family_repo_path(&key);
+        let child = write_commit(&family, Some(&commit));
+        git(&view, &["update-ref", "refs/heads/main", &child]);
+        let object = family.join("objects").join(&commit[..2]).join(&commit[2..]);
+        fs::remove_file(object).unwrap();
+        fs::write(view.join("shallow"), format!("{child}\n")).unwrap();
+        let source = LocalRepairSource {
+            url: String::new(),
+            family_objects: storage.family_objects_path(&key),
+        };
+
+        let outcome = check_and_repair_family(&storage, &key, &source, true)
+            .await
+            .unwrap();
+
+        assert!(!outcome.final_report.is_healthy());
+        assert!(view.join("shallow").is_file());
     }
 
     #[test]

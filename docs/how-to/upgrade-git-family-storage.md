@@ -64,6 +64,17 @@ fetch, and push for both a normal repository and a `/prs/` route. Retain the
 external pre-upgrade snapshot for the rollback window; the retired migration
 backups are gone once their family verifies.
 
+A legacy repository carrying a server-side `shallow` marker is a deliberate
+truncation and is not valid family storage. Migration installs its thin view
+with the marker intact, so clients keep seeing exactly what the legacy
+repository served, and retains its backup with an `ERROR` log naming the
+unresolved family. The integrity pass then tries to fetch the complete
+reachable closure from accepted clone sources; once the family is complete, a
+later launch removes the marker and retires the backup. If the closure cannot
+be recovered, the backup stays and the family keeps being reported as
+unresolved. Shallow clones and fetches requested by clients are unaffected
+and remain supported.
+
 Installations that migrated under a release which kept backups indefinitely
 retire them on the next launch after the same verification, except that the
 stale journal ref snapshot is no longer enforced against views whose refs
