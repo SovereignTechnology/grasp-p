@@ -303,6 +303,11 @@ async fn run_one_family<S: FamilyRepairSource + ?Sized>(
         .first()
         .map(String::as_str)
         .unwrap_or("");
+    let source_failure = outcome
+        .source_failures
+        .first()
+        .map(String::as_str)
+        .unwrap_or("");
     error!(
         identifier = %key.identifier,
         object_format = %key.object_format,
@@ -318,6 +323,7 @@ async fn run_one_family<S: FamilyRepairSource + ?Sized>(
         diagnostic,
         sources_tried = outcome.sources_tried.len(),
         source_failures = outcome.source_failures.len(),
+        source_failure,
         "Git identifier family remains unhealthy after integrity check"
     );
 }
