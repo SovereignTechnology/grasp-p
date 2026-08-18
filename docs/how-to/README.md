@@ -32,6 +32,7 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 - Prepare capacity and a release rollback point
 - Run the automatic crash-safe launch migration
 - Verify owner and `/prs/` repository views
+- Check or repair one identifier family on demand
 - Recover safely from an interrupted launch
 
 ---

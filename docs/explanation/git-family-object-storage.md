@@ -302,6 +302,42 @@ View lifecycle locks remain responsible for “may this path be removed?” The
 family lock is responsible for “is this object inventory and manifest update
 atomic?” Neither lock grants authorization.
 
+## Integrity and healing
+
+Integrity is defined for an object-format/identifier family, not for one
+owner path. A pass checks the family pack set and object graph, then checks
+every owner and `/prs/` view with the same identifier for the correct alternate
+and for refs whose targets are available in the family. Multiple independent
+histories in one identifier are valid, and unreachable objects are not an
+error: retained delete-state and rollback data intentionally remain present.
+
+The relay starts one non-blocking pass after migration, database
+initialization, and construction of the hardened outbound Git client. Broken
+alternate wiring is repaired locally. For missing OIDs, the pass tries clone
+URLs from accepted repository announcements, excluding this service and
+applying the same SSRF policy, DNS pinning, credentials, process containment,
+and missing-OID behavior used by proactive sync. It then runs the same
+integrity check again. An unresolved family produces an `ERROR` log containing
+bounded counts and OID/diagnostic samples; it does not make availability depend
+on remote servers.
+
+This is also the migration repair path. Migration remains a deterministic,
+offline conversion that preserves every Git-readable object and the exact
+legacy refs. Once those paths are thin family views, the ordinary family pass
+can heal pre-existing missing objects. Unindexed legacy packs remain in the
+migration backup; there is no separate legacy repair subsystem.
+
+Operators can queue the same identifier-scoped check in the live process:
+
+```console
+ngit-grasp integrity-check --identifier example
+ngit-grasp integrity-check --identifier example --repair
+```
+
+The command writes a durable request beneath `.grasp/integrity-requests/`.
+The server consumes it while holding its normal in-process family locks, so a
+manual repair cannot race an object-producing request in another view.
+
 ## Security and privacy trade-offs
 
 - Sharing is restricted to one validated identifier, object format, and

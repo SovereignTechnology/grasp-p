@@ -8,13 +8,74 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use bitcoin_hashes::{sha256, Hash};
+use clap::Args;
 use nostr_sdk::prelude::{FromBech32, PublicKey};
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 use super::validate_repository_identifier;
+
+const REQUEST_VERSION: u32 = 1;
+const REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Arguments for queueing an identifier-family integrity check in the live
+/// relay process.
+#[derive(Debug, Args)]
+pub struct IntegrityCheckArgs {
+    /// Repository identifier (`d` tag value). All object formats and views for
+    /// this identifier are checked together.
+    #[arg(long)]
+    pub identifier: String,
+
+    /// Attempt repair using accepted repository clone URLs.
+    #[arg(long, default_value_t = false)]
+    pub repair: bool,
+
+    /// Git data path containing the `.grasp` family storage directory.
+    #[arg(long, env = "NGIT_GIT_DATA_PATH", default_value = "./data/git")]
+    pub git_data_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IntegrityRequest {
+    version: u32,
+    identifier: String,
+    repair: bool,
+}
+
+/// Queue an integrity request for the running relay. Requests are durable and
+/// idempotent; if the service is stopped, the next launch consumes them.
+pub fn enqueue_manual_check(args: &IntegrityCheckArgs) -> Result<PathBuf> {
+    if !validate_repository_identifier(&args.identifier) {
+        return Err(anyhow!(
+            "invalid repository identifier {:?}",
+            args.identifier
+        ));
+    }
+    let storage = LocalGitStorage::new(&args.git_data_path);
+    let directory = request_directory(&storage);
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create integrity request directory {}", directory.display()))?;
+    let request = IntegrityRequest {
+        version: REQUEST_VERSION,
+        identifier: args.identifier.clone(),
+        repair: args.repair,
+    };
+    let digest =
+        sha256::Hash::hash(format!("{}\0{}", request.identifier, request.repair).as_bytes());
+    let path = directory.join(format!("{digest}.json"));
+    crate::atomic_file::write(&path, &serde_json::to_vec_pretty(&request)?)
+        .with_context(|| format!("write integrity request {}", path.display()))?;
+    Ok(path)
+}
 
 /// A view ref whose target is absent from the identifier family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +137,226 @@ pub struct FamilyRepairOutcome {
 impl FamilyRepairOutcome {
     pub fn repaired(&self) -> bool {
         !self.initial.is_healthy() && self.final_report.is_healthy()
+    }
+}
+
+#[derive(Default)]
+struct PassStats {
+    checked: usize,
+    healthy: usize,
+    repaired: usize,
+    unresolved: usize,
+    failed: usize,
+}
+
+/// Start the non-blocking integrity worker.
+///
+/// It checks and heals every installed family once after startup, then
+/// consumes identifier-scoped requests written by [`enqueue_manual_check`].
+pub fn spawn_integrity_worker(
+    storage: LocalGitStorage,
+    source: Arc<crate::purgatory::sync::RealSyncContext>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        run_startup_pass(&storage, source.as_ref()).await;
+        let first = tokio::time::Instant::now() + REQUEST_POLL_INTERVAL;
+        let mut interval = tokio::time::interval_at(first, REQUEST_POLL_INTERVAL);
+        loop {
+            interval.tick().await;
+            process_manual_requests(&storage, source.as_ref()).await;
+        }
+    })
+}
+
+async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(storage: &LocalGitStorage, source: &S) {
+    let families = match discover_families(storage) {
+        Ok(families) => families,
+        Err(error) => {
+            error!(%error, "Git identifier-family integrity startup discovery failed");
+            return;
+        }
+    };
+    info!(
+        families = families.len(),
+        "Git identifier-family integrity startup pass started"
+    );
+    let mut stats = PassStats::default();
+    for key in families {
+        run_one_family(storage, &key, source, true, "startup", &mut stats).await;
+        tokio::task::yield_now().await;
+    }
+    info!(
+        checked = stats.checked,
+        healthy = stats.healthy,
+        repaired = stats.repaired,
+        unresolved = stats.unresolved,
+        failed = stats.failed,
+        "Git identifier-family integrity startup pass completed"
+    );
+}
+
+async fn process_manual_requests<S: FamilyRepairSource + ?Sized>(
+    storage: &LocalGitStorage,
+    source: &S,
+) {
+    let requests = match load_requests(storage) {
+        Ok(requests) => requests,
+        Err(error) => {
+            error!(%error, "Read manual Git integrity requests");
+            return;
+        }
+    };
+    for (path, request) in requests {
+        let families = match discover_families(storage) {
+            Ok(families) => families
+                .into_iter()
+                .filter(|key| key.identifier == request.identifier)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                error!(
+                    identifier = %request.identifier,
+                    %error,
+                    "Manual Git integrity family discovery failed"
+                );
+                remove_consumed_request(&path);
+                continue;
+            }
+        };
+        if families.is_empty() {
+            error!(
+                identifier = %request.identifier,
+                "Manual Git integrity request matched no identifier family"
+            );
+            remove_consumed_request(&path);
+            continue;
+        }
+        let mut stats = PassStats::default();
+        for key in families {
+            run_one_family(storage, &key, source, request.repair, "manual", &mut stats).await;
+        }
+        info!(
+            identifier = %request.identifier,
+            repair = request.repair,
+            checked = stats.checked,
+            healthy = stats.healthy,
+            repaired = stats.repaired,
+            unresolved = stats.unresolved,
+            failed = stats.failed,
+            "Manual Git identifier-family integrity request completed"
+        );
+        remove_consumed_request(&path);
+    }
+}
+
+async fn run_one_family<S: FamilyRepairSource + ?Sized>(
+    storage: &LocalGitStorage,
+    key: &FamilyKey,
+    source: &S,
+    repair: bool,
+    trigger: &'static str,
+    stats: &mut PassStats,
+) {
+    stats.checked += 1;
+    let outcome = match check_and_repair_family(storage, key, source, repair).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            stats.failed += 1;
+            error!(
+                identifier = %key.identifier,
+                object_format = %key.object_format,
+                trigger,
+                repair,
+                %error,
+                "Git identifier-family integrity check failed"
+            );
+            return;
+        }
+    };
+    if outcome.final_report.is_healthy() {
+        if outcome.repaired() {
+            stats.repaired += 1;
+            info!(
+                identifier = %key.identifier,
+                object_format = %key.object_format,
+                trigger,
+                sources_tried = outcome.sources_tried.len(),
+                "Git identifier family repaired"
+            );
+        } else {
+            stats.healthy += 1;
+        }
+        return;
+    }
+
+    stats.unresolved += 1;
+    let missing_sample = outcome
+        .final_report
+        .missing_oids
+        .iter()
+        .take(16)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    let diagnostic = outcome
+        .final_report
+        .fsck_diagnostics
+        .first()
+        .map(String::as_str)
+        .unwrap_or("");
+    error!(
+        identifier = %key.identifier,
+        object_format = %key.object_format,
+        trigger,
+        repair,
+        views = outcome.final_report.views.len(),
+        missing_oids = outcome.final_report.missing_oids.len(),
+        missing_sample,
+        missing_ref_targets = outcome.final_report.missing_ref_targets.len(),
+        invalid_alternates = outcome.final_report.invalid_alternates.len(),
+        pack_errors = outcome.final_report.pack_errors.len(),
+        fsck_diagnostics = outcome.final_report.fsck_diagnostics.len(),
+        diagnostic,
+        sources_tried = outcome.sources_tried.len(),
+        source_failures = outcome.source_failures.len(),
+        "Git identifier family remains unhealthy after integrity check"
+    );
+}
+
+fn request_directory(storage: &LocalGitStorage) -> PathBuf {
+    storage.internal_path().join("integrity-requests")
+}
+
+fn load_requests(storage: &LocalGitStorage) -> Result<Vec<(PathBuf, IntegrityRequest)>> {
+    let directory = request_directory(storage);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut requests = Vec::new();
+    for path in paths {
+        let request: IntegrityRequest = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("parse integrity request {}", path.display()))?;
+        if request.version != REQUEST_VERSION
+            || !validate_repository_identifier(&request.identifier)
+        {
+            return Err(anyhow!("invalid integrity request {}", path.display()));
+        }
+        requests.push((path, request));
+    }
+    Ok(requests)
+}
+
+fn remove_consumed_request(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        warn!(request = %path.display(), %error, "Remove consumed Git integrity request");
     }
 }
 
@@ -425,12 +706,12 @@ fn inspect_connectivity(
 }
 
 fn oid_exists(repo: &Path, oid: &str) -> Result<bool> {
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(["cat-file", "-e", oid])
         .current_dir(repo)
-        .status()
+        .output()
         .with_context(|| format!("check object {oid} in {}", repo.display()))?;
-    Ok(status.success())
+    Ok(output.status.success())
 }
 
 #[cfg(test)]
@@ -604,6 +885,56 @@ mod tests {
 
         assert_eq!(report.pack_errors.len(), 1);
         assert!(report.pack_errors[0].contains("pack has no index"));
+    }
+
+    #[test]
+    fn manual_requests_are_durable_and_identifier_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = IntegrityCheckArgs {
+            identifier: "shared".to_owned(),
+            repair: true,
+            git_data_path: temp.path().join("git").to_string_lossy().into_owned(),
+        };
+
+        let path = enqueue_manual_check(&args).unwrap();
+        let storage = LocalGitStorage::new(&args.git_data_path);
+        let requests = load_requests(&storage).unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, path);
+        assert_eq!(requests[0].1.identifier, "shared");
+        assert!(requests[0].1.repair);
+    }
+
+    #[test]
+    fn manual_requests_reject_unsafe_identifiers() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = IntegrityCheckArgs {
+            identifier: "../escape".to_owned(),
+            repair: false,
+            git_data_path: temp.path().join("git").to_string_lossy().into_owned(),
+        };
+
+        assert!(enqueue_manual_check(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_requests_are_consumed_by_the_family_worker() {
+        let (temp, storage, _key, _view, _commit) = fixture();
+        let args = IntegrityCheckArgs {
+            identifier: "shared".to_owned(),
+            repair: false,
+            git_data_path: storage.git_data_path().to_string_lossy().into_owned(),
+        };
+        let request = enqueue_manual_check(&args).unwrap();
+        let source = LocalRepairSource {
+            url: String::new(),
+            family_objects: temp.path().join("unused"),
+        };
+
+        process_manual_requests(&storage, &source).await;
+
+        assert!(!request.exists());
     }
 
     #[tokio::test]

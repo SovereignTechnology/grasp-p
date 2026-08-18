@@ -439,6 +439,17 @@ impl RelayServer {
             outbound_credential_keys,
         ));
 
+        // Check the permanent identifier-family model after migration and
+        // database initialization. The pass is intentionally non-blocking:
+        // remote repair must not make availability depend on listed clone
+        // servers. It also owns filesystem-queued operator requests so all
+        // repair work remains inside the process holding family write leases.
+        background_tasks.push(git::integrity::spawn_integrity_worker(
+            git_storage,
+            sync_ctx.clone(),
+        ));
+        info!("Git identifier-family integrity worker started");
+
         // Create throttle manager for rate limiting remote git servers
         // Default: 5 concurrent requests per domain, 60 requests per minute per domain
         let throttle_manager = Arc::new(ThrottleManager::new(5, 60));

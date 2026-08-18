@@ -9,6 +9,12 @@ been validated and before purgatory restoration, background sync, or HTTP
 request handling. A failed migration stops startup; restarting resumes from its
 fsynced journal.
 
+After runtime database initialization, a non-blocking integrity pass checks
+the resulting identifier families and views. It attempts to fetch missing
+objects from clone URLs in accepted repository announcements and emits an
+`ERROR` log for any family that remains unhealthy. Network repair never holds
+up the listening service or changes whether the structural migration commits.
+
 ## Before deploying
 
 1. Stop writes to the relay and take a filesystem snapshot of both the Git and
@@ -45,10 +51,51 @@ fetch, and push for both a normal repository and a `/prs/` route. Retain the
 external snapshot and `.grasp/migration/backups/` for the rollback window. The
 server never deletes those backups automatically.
 
+Watch for the terminal startup-pass summary:
+
+```text
+Git identifier-family integrity startup pass completed
+```
+
+An `unresolved` or `failed` count above zero is accompanied by an `ERROR` log
+for each affected identifier. This reports pre-existing missing data without
+putting startup into a network-dependent restart loop.
+
+## Check or repair one identifier on demand
+
+Queue a read-only check for every object format and owner/`/prs/` view sharing
+an identifier:
+
+```console
+ngit-grasp integrity-check \
+  --git-data-path /var/lib/ngit-grasp/git \
+  --identifier example
+```
+
+Add `--repair` to repair alternate wiring and try accepted clone servers for
+missing OIDs:
+
+```console
+ngit-grasp integrity-check \
+  --git-data-path /var/lib/ngit-grasp/git \
+  --identifier example \
+  --repair
+```
+
+The command queues a durable request for the running relay rather than opening
+or mutating a family from a second process. The worker normally consumes it
+within five seconds and writes the result to the service log. A request queued
+while the relay is stopped is processed after its next startup integrity pass.
+Repeated requests for the same identifier and mode safely coalesce.
+
 ## Failure and rollback
 
 - A migration failure is fail-closed. Fix the reported filesystem or Git error
   and restart; the journal resumes the safe transition.
+- A post-migration integrity repair failure is fail-open because the damage
+  predates conversion or arose after it. Inspect the identifier's `ERROR` log,
+  repair or update its listed clone sources, and queue `integrity-check
+  --repair` again.
 - To roll the software release back, stop the service and restore the complete
   pre-upgrade Git and relay-data snapshot together. Do not point an older
   binary at migrated thin views.
