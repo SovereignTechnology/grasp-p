@@ -160,6 +160,14 @@ fn mailbox_probe_completion(
     (next_filter, completed_cycle, next_probe_in)
 }
 
+fn should_continue_mailbox_probe(succeeded: bool, completed_cycle: bool) -> bool {
+    succeeded && !completed_cycle
+}
+
+fn mailbox_worker_capacity_available(active_workers: usize) -> bool {
+    active_workers < MAX_CONCURRENT_MAILBOX_WORKERS
+}
+
 async fn fetch_mailbox_filter(
     connection: RelayConnection,
     filter: Filter,
@@ -2025,6 +2033,14 @@ const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
 
+/// Safety ceiling for independently progressing mailbox relays.
+///
+/// A relay owns at most one worker and drains its filter cursor without
+/// returning to the global relay rotation between slices. Keep a separate,
+/// generous process-wide ceiling so a peer-influenced NIP-65 inventory cannot
+/// create an unbounded number of simultaneous response accumulators.
+const MAX_CONCURRENT_MAILBOX_WORKERS: usize = 32;
+
 /// Maximum number of collection members rendered in an INFO-level log field.
 /// Counts remain authoritative; samples keep remotely influenced logs bounded.
 const LOG_COLLECTION_SAMPLE_SIZE: usize = 5;
@@ -2448,9 +2464,11 @@ async fn run_health_and_metrics_checker(
                 // to historic work when no slot is immediately available.
                 manager.schedule_nip65_discovery().await;
 
-                // 6. Start at most one participant mailbox history filter.
-                // Mailbox coverage is history-only: it does not turn every
-                // participant relay into a permanent live source.
+                // 6. Admit at most one new participant mailbox relay worker.
+                // Once admitted, that relay drains its own history-filter
+                // cursor independently, one request at a time. Mailbox
+                // coverage is history-only: it does not turn every participant
+                // relay into a permanent live source.
                 manager.schedule_mailbox_probe().await;
 
                 // 7. Check for naughty list expiration
@@ -6033,6 +6051,10 @@ impl SyncManager {
             return;
         }
 
+        if !mailbox_worker_capacity_available(self.nip65_discovery.mailbox_probes_in_flight.len()) {
+            return;
+        }
+
         let now = Instant::now();
         let due_relays: Vec<String> = due_mailbox_relays(
             &self.nip65_discovery.mailbox_roots,
@@ -6059,13 +6081,17 @@ impl SyncManager {
         let Some(relay) = select_due_mailbox_relay(&due_relays, &active_relays) else {
             return;
         };
+        self.start_mailbox_probe(relay, now).await;
+    }
+
+    async fn start_mailbox_probe(&mut self, relay: String, now: Instant) -> bool {
         if is_own_sync_target(&relay, &self.service_domain)
             || self.rejected_relay_targets.contains(&relay)
         {
             self.nip65_discovery
                 .mailbox_probe_next_at
                 .insert(relay, now + mailbox_probe_refresh_interval());
-            return;
+            return false;
         }
 
         if !self.connections.contains_key(&relay) {
@@ -6073,12 +6099,12 @@ impl SyncManager {
                 self.schedule_connect_relay(&relay).await;
             }
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         }
 
         let Some(connection) = self.connections.get(&relay).cloned() else {
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         };
         let socket_connected = connection.is_connected().await;
         let connection_status = self
@@ -6094,7 +6120,7 @@ impl SyncManager {
                 self.retire_idle_nip65_discovery_source(&relay).await;
             }
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         }
 
         let root_scope = self
@@ -6127,7 +6153,7 @@ impl SyncManager {
                 .mailbox_probe_next_at
                 .insert(relay.clone(), now + mailbox_probe_refresh_interval());
             self.retire_idle_nip65_discovery_source(&relay).await;
-            return;
+            return false;
         };
         let filter_index = self
             .nip65_discovery
@@ -6139,7 +6165,7 @@ impl SyncManager {
         let filter = filters.swap_remove(filter_index);
         let Some(result_tx) = self.mailbox_probe_result_tx.clone() else {
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         };
         self.nip65_discovery
             .mailbox_probes_in_flight
@@ -6162,6 +6188,7 @@ impl SyncManager {
             filter_count,
             "Started bounded participant mailbox fetch"
         );
+        true
     }
 
     fn defer_mailbox_relay(&mut self, relay: &str) {
@@ -6225,6 +6252,14 @@ impl SyncManager {
             next_probe_in_secs = next_probe_in.as_secs_f64(),
             "Participant mailbox fetch reached terminal state"
         );
+
+        if should_continue_mailbox_probe(succeeded, completed_cycle)
+            && self
+                .start_mailbox_probe(result.source_relay.clone(), Instant::now())
+                .await
+        {
+            return;
+        }
         self.retire_idle_nip65_discovery_source(&result.source_relay)
             .await;
     }
@@ -9939,11 +9974,32 @@ mod tests {
         assert_eq!(next_filter, 1);
         assert!(!completed_cycle);
         assert_eq!(retry_after, mailbox_probe_retry_interval());
+        assert!(!should_continue_mailbox_probe(false, completed_cycle));
 
         let (next_filter, completed_cycle, refresh_after) = mailbox_probe_completion(1, 2, true);
         assert_eq!(next_filter, 0);
         assert!(completed_cycle);
         assert_eq!(refresh_after, mailbox_probe_refresh_interval());
+        assert!(!should_continue_mailbox_probe(true, completed_cycle));
+    }
+
+    #[test]
+    fn mailbox_worker_continues_successful_partial_cycle() {
+        let (next_filter, completed_cycle, retry_after) = mailbox_probe_completion(0, 2, true);
+        assert_eq!(next_filter, 1);
+        assert!(!completed_cycle);
+        assert_eq!(retry_after, Duration::ZERO);
+        assert!(should_continue_mailbox_probe(true, completed_cycle));
+    }
+
+    #[test]
+    fn mailbox_worker_capacity_is_a_process_safety_ceiling() {
+        assert!(mailbox_worker_capacity_available(
+            MAX_CONCURRENT_MAILBOX_WORKERS - 1
+        ));
+        assert!(!mailbox_worker_capacity_available(
+            MAX_CONCURRENT_MAILBOX_WORKERS
+        ));
     }
 
     #[test]

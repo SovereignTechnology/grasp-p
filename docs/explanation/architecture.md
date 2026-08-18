@@ -682,7 +682,9 @@ advertises `GRASP-03` only while the overlay is enabled. Exact thread
 provenance scopes each mailbox to its accepted roots. Accepted root authors'
 read/unmarked inboxes retain ordinary live/rotating GRASP-02 coverage. Wider
 participant mailboxes use independent, history-only `fetch_events` workers:
-at most one per relay and one new start per maintenance pass. They reuse the
+at most one per relay, 32 process-wide, and one newly admitted relay per
+maintenance pass. Once admitted, a successful relay drains its own stable
+filter cursor without waiting for a global relay rotation. They reuse the
 connection's ordinary pacing, subscription ledger, pagination and 30-second
 per-page terminal timeout without installing permanent participant
 subscriptions or coupling progress between relays. On public instances, each

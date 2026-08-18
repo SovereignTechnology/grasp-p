@@ -88,10 +88,12 @@ that retained state on the normal cadence.
 
 Root-author and repository owner/maintainer read/unmarked inboxes use ordinary
 GRASP-02 coverage. Wider participant mailboxes and owner/maintainer write-only
-outboxes use history-only workers. A maintenance pass starts at most one due
-history relay, while each relay may have at most one worker in flight. Relays
-do not share a mailbox lane or terminal state: a slow or unavailable relay
-cannot prevent another relay from progressing on a later pass.
+outboxes use history-only workers. A maintenance pass admits at most one new
+due history relay, while each admitted relay may have at most one worker in
+flight and drains its own filter cursor without returning to a global
+round-robin between successful groups. Up to 32 relay workers may run at once
+as a process-safety ceiling. Relays do not share a mailbox lane or terminal
+state: a slow or unavailable relay consumes only its own worker slot.
 
 Each worker selects one stable-sorted, byte-bounded filter and delegates its
 REQ lifecycle to the existing `RelayConnection::fetch_events` path. That path
@@ -99,9 +101,11 @@ owns per-relay request pacing, background priority, subscription-ledger
 capacity, EOSE/CLOSED handling and a 30-second timeout. The worker reuses the
 ordinary pagination state to continue through full historic pages until the
 filter is exhausted or a page makes no new progress. It then passes events
-through the normal write policy and persistence pipeline. No mailbox-specific
-pending-batch kind, EOSE hook, close API, watchdog or cross-relay coordinator
-is added.
+through the normal write policy and persistence pipeline. A successful group
+immediately starts that relay's next group until the cycle completes; a failed
+group advances the cursor but releases the worker for the five-minute retry
+delay. No mailbox-specific pending-batch kind, EOSE hook, close API, watchdog
+or cross-relay coordinator is added.
 
 Coverage uses accepted repository coordinates, root IDs, bounded recursive
 descendant IDs, and descendant address coordinates with `a`/`A`/`q` and
@@ -125,10 +129,11 @@ roots assigned to every mailbox. Shared relays and duplicate repository scopes
 are unioned before filter construction. Canonical live filters consume normal
 GRASP-02 subscription-ledger capacity; compatibility variants and recursive
 descendants retain the existing priority cutoff and history fallback. History
-still starts at most one due relay per maintenance pass, remains single-flight
-per relay, and fetches one filter group through the background request pacer
-before yielding. More distinct maintainer relays can therefore increase both
-persistent connection/subscription load and active history workers; the
+still admits at most one new relay per maintenance pass and remains
+single-flight per relay, but an admitted relay keeps its worker while its
+successful filter groups drain. More distinct maintainer relays can therefore
+increase both persistent connection/subscription load and active history
+workers up to the process-wide safety ceiling; the
 fixed-cardinality relay, cursor, worker, connection, and subscription metrics
 must be watched during a production soak.
 
