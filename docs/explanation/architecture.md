@@ -685,7 +685,13 @@ participant mailboxes use independent, history-only `fetch_events` workers:
 at most one per relay and one new start per maintenance pass. They reuse the
 connection's ordinary pacing, subscription ledger, pagination and 30-second
 per-page terminal timeout without installing permanent participant
-subscriptions or coupling progress between relays.
+subscriptions or coupling progress between relays. On public instances, those
+workers also query each accepted repository owner's and declared maintainer's
+mailboxes for their exact Full repository coordinates and all locally known
+roots in those repositories. This discovers previously unknown roots and
+descendants that exist only on a maintainer mailbox without broadening an
+ordinary participant mailbox. Private instances omit repository-coordinate
+mailbox expansion.
 
 ### Rejected Events Index
 

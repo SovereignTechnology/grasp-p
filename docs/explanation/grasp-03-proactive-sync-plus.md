@@ -18,7 +18,10 @@ existing index set for each author's latest profile kind `0` and NIP-65 kind
 `10002`; retain those replaceable events locally; keep accepted root authors'
 `read` and unmarked inboxes in ordinary GRASP-02 coverage; and probe accepted
 participants' `read`, `write` and unmarked conversation mailboxes with
-repository and thread-reference filters.
+repository and thread-reference filters. On public instances, the same
+history-only probe associates accepted repository owners and declared
+maintainers with those repositories and queries their mailboxes by repository
+coordinate. This can discover a root which is not yet present locally.
 
 Mailbox work reuses GRASP-02's connection safety, filter byte packing,
 pagination, subscription ledger, request pacing, event pipeline and write
@@ -96,13 +99,29 @@ is added.
 
 The probe covers accepted repository coordinates, root IDs, bounded recursive
 descendant IDs, and descendant address coordinates using `a`/`A`/`q` and
-`e`/`E`/`q`. A numeric in-memory cursor gives each filter group a turn. A
-successful complete rotation refreshes after 24 hours; a failed group advances
-the cursor after a five-minute delay and is retried on a later rotation. This
-is deliberately best effort rather than a durable exactly-once schedule. A
-relay already needed for ordinary repository sync shares its connection; an
+`e`/`E`/`q`. A repository-scoped owner or maintainer mailbox also receives
+event-reference filters for every currently known root in that repository.
+This permits a status or other descendant stored only on that mailbox to be
+found even when the root author's current relay list does not name it. A
+participant-only mailbox remains constrained to its derived roots. A numeric
+in-memory cursor gives each byte-bounded filter group a turn. A successful
+complete rotation refreshes after 24 hours; a failed group advances the cursor
+after a five-minute delay and is retried on a later rotation. This is
+deliberately best effort rather than a durable exactly-once schedule. A relay
+already needed for ordinary repository sync shares its connection; an
 exclusively control-plane connection retires when its identity and mailbox
 work is idle.
+
+Owner/maintainer expansion can increase a relay's history rotation in
+proportion to the byte-packed repository coordinates and known roots assigned
+to it. Shared relays and duplicate repository scopes are unioned before filter
+construction. The expansion does not increase instantaneous worker
+concurrency on any one relay: the manager still starts at most one due relay
+per maintenance pass, each relay remains single-flight, and each worker fetches
+one filter group through the existing background request pacer before
+yielding. More distinct maintainer relays can nevertheless produce more active
+per-relay workers across successive passes; the fixed-cardinality relay,
+cursor, and active-worker metrics expose that growth for a production soak.
 
 On restart, accepted roots and retained kind `10002` events rebuild participant
 and mailbox ownership from LMDB. The in-memory group cursor is intentionally
@@ -127,8 +146,11 @@ events on restart; this change does not add a second deletion graph.
 ## Deliberately excluded
 
 - mailbox expansion for authors who have not produced locally accepted
-  repository-thread events;
-- maintainer mailbox expansion unrelated to an accepted root;
+  repository-thread events and are not an accepted repository owner or
+  maintainer;
+- repository mailbox expansion beyond an owner's or declared maintainer's
+  exact accepted Full repositories;
+- repository-coordinate mailbox expansion in private mode;
 - identity storage for authors outside accepted repositories and their
   locally accepted threads;
 - per-user fallback configuration knobs; and

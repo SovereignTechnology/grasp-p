@@ -311,6 +311,90 @@ async fn participant_write_mailbox_fetches_child_of_direct_reaction() {
 }
 
 #[tokio::test]
+async fn owner_mailbox_discovers_unknown_root_and_root_only_status() {
+    let index = MockRelay::start().await;
+    let mailbox = MockRelay::start().await;
+    let owner = Keys::generate();
+    let root_author = Keys::generate();
+    let identifier = "owner-repository-mailbox";
+
+    let relay_list = EventBuilder::new(Kind::RelayList, "")
+        .tag(Tag::custom("r", vec![mailbox.url(), "write"]))
+        .finalize(&owner)
+        .expect("build owner relay list");
+    send_to_relay_url(index.url(), &relay_list)
+        .await
+        .expect("seed owner relay list");
+
+    let syncing_git_dir = tempfile::tempdir().expect("create persistent git directory");
+    let syncing_relay_dir = tempfile::tempdir().expect("create persistent relay directory");
+    let syncing = TestRelay::start_on_reservation_persistent_sync(
+        reserve_port(),
+        Some(index.url().to_string()),
+        false,
+        syncing_git_dir.path().to_path_buf(),
+        syncing_relay_dir.path().to_path_buf(),
+    )
+    .await;
+    let syncing_domain = syncing.domain();
+    let (_announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &owner, &[&syncing_domain], identifier).await;
+    let issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root stored only on the repository owner's mailbox",
+    )
+    .expect("build mailbox-only root");
+    let closed = EventBuilder::new(Kind::from(1632), "closed")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .finalize(&owner)
+        .expect("build root-only closed status");
+    send_to_relay_url(mailbox.url(), &issue)
+        .await
+        .expect("seed unknown root on owner mailbox");
+    send_to_relay_url(mailbox.url(), &closed)
+        .await
+        .expect("seed root-only status on owner mailbox");
+
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(issue.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "the owner's repository-coordinate scope should discover an unknown root"
+    );
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(closed.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "the owner's mailbox should be queried for known root IDs after inventory growth"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Reconciled proactive participant mailbox inventory")
+                && line.contains("repository_mailbox_author_count=1")
+        }),
+        "repository mailbox ownership should remain observable without public-key labels"
+    );
+    assert!(
+        !sync_log
+            .lines()
+            .any(|line| { line.contains("Starting fresh_start") && line.contains(mailbox.url()) }),
+        "an owner mailbox must remain history-only rather than becoming a repository source"
+    );
+
+    syncing.stop().await;
+    mailbox.stop().await;
+    index.stop().await;
+}
+
+#[tokio::test]
 async fn missing_relay_list_uses_bounded_fallback_coverage() {
     let index = MockRelay::start().await;
     let fallback = MockRelay::start().await;

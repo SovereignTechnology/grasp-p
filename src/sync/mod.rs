@@ -87,21 +87,28 @@ fn mailbox_probe_retry_interval() -> Duration {
 
 fn due_mailbox_relays(
     mailbox_roots: &HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: &HashMap<String, HashSet<String>>,
     next_at: &HashMap<String, Instant>,
     now: Instant,
 ) -> Vec<String> {
-    let mut relays: Vec<String> = mailbox_roots
+    let mut relays: HashSet<String> = mailbox_roots
         .keys()
-        .filter(|relay| next_at.get(*relay).is_none_or(|due| *due <= now))
+        .chain(mailbox_repositories.keys())
         .cloned()
         .collect();
+    relays.retain(|relay| next_at.get(relay).is_none_or(|due| *due <= now));
+    let mut relays: Vec<String> = relays.into_iter().collect();
     relays.sort_by(|left, right| {
+        let workload = |relay: &String| {
+            mailbox_roots.get(relay).map_or(0, HashSet::len)
+                + mailbox_repositories.get(relay).map_or(0, HashSet::len)
+        };
         next_at
             .get(left)
             .copied()
             .unwrap_or(now)
             .cmp(&next_at.get(right).copied().unwrap_or(now))
-            .then_with(|| mailbox_roots[right].len().cmp(&mailbox_roots[left].len()))
+            .then_with(|| workload(right).cmp(&workload(left)))
             .then_with(|| left.cmp(right))
     });
     relays
@@ -123,6 +130,17 @@ fn select_due_mailbox_relay(
         .find(|relay| active_relays.contains(*relay))
         .or_else(|| due_relays.first())
         .cloned()
+}
+
+fn public_repository_mailbox_scope(
+    private_mode: bool,
+    author_repositories: HashMap<PublicKey, HashSet<String>>,
+) -> HashMap<PublicKey, HashSet<String>> {
+    if private_mode {
+        HashMap::new()
+    } else {
+        author_repositories
+    }
 }
 
 fn mailbox_probe_completion(
@@ -1481,6 +1499,46 @@ fn mailbox_probe_filters(
     filters
 }
 
+fn expand_mailbox_probe_scope(
+    repository_scope: &HashSet<String>,
+    root_scope: &HashSet<EventId>,
+    root_repositories: &HashMap<EventId, String>,
+) -> (HashSet<String>, HashSet<EventId>) {
+    let mut repositories = repository_scope.clone();
+    repositories.extend(
+        root_scope
+            .iter()
+            .filter_map(|root| root_repositories.get(root).cloned()),
+    );
+
+    let mut roots = root_scope.clone();
+    roots.extend(
+        root_repositories.iter().filter_map(|(root, repository)| {
+            repository_scope.contains(repository).then_some(*root)
+        }),
+    );
+    (repositories, roots)
+}
+
+fn merge_repository_roots_into_mailbox_overlay(
+    mailbox_roots: &mut HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: &HashMap<String, HashSet<String>>,
+    root_repositories: &HashMap<EventId, String>,
+) {
+    for (relay, repositories) in mailbox_repositories {
+        let roots: HashSet<EventId> = root_repositories
+            .iter()
+            .filter_map(|(root, repository)| repositories.contains(repository).then_some(*root))
+            .collect();
+        if !roots.is_empty() {
+            mailbox_roots
+                .entry(relay.clone())
+                .or_default()
+                .extend(roots);
+        }
+    }
+}
+
 fn packed_historic_filters(items: &PendingItems, frontier: &DescendantFrontier) -> Vec<Filter> {
     let all_repos: HashSet<_> = items
         .repos
@@ -1860,6 +1918,10 @@ struct Nip65DiscoveryState {
     /// the paced history-only mailbox path below.
     root_author_roots: HashMap<PublicKey, HashSet<EventId>>,
     author_roots: HashMap<PublicKey, HashSet<EventId>>,
+    /// Public accepted repositories owned or maintained by each author. This
+    /// remains empty in private mode so mailbox probes never disclose private
+    /// repository coordinates to a public NIP-65 relay.
+    author_repositories: HashMap<PublicKey, HashSet<String>>,
     root_repositories: HashMap<EventId, String>,
     eligible_authors: HashSet<PublicKey>,
     author_sources: HashMap<PublicKey, HashSet<String>>,
@@ -1872,6 +1934,7 @@ struct Nip65DiscoveryState {
     fallback_authors: HashSet<PublicKey>,
     inbox_roots: HashMap<String, HashSet<EventId>>,
     mailbox_roots: HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: HashMap<String, HashSet<String>>,
     mailbox_probe_next_at: HashMap<String, Instant>,
     mailbox_probe_next_filter: HashMap<String, usize>,
     /// At most one ordinary fetch runs per mailbox relay. Different relays
@@ -1883,25 +1946,49 @@ struct Nip65DiscoveryState {
 }
 
 impl Nip65DiscoveryState {
+    fn has_mailbox_scope(&self, relay: &str) -> bool {
+        self.mailbox_roots.contains_key(relay) || self.mailbox_repositories.contains_key(relay)
+    }
+
+    fn mailbox_relay_count(&self) -> usize {
+        self.mailbox_roots.len()
+            + self
+                .mailbox_repositories
+                .keys()
+                .filter(|relay| !self.mailbox_roots.contains_key(*relay))
+                .count()
+    }
+
     fn install_mailbox_overlay(
         &mut self,
-        new_overlay: HashMap<String, HashSet<EventId>>,
+        new_root_overlay: HashMap<String, HashSet<EventId>>,
+        new_repository_overlay: HashMap<String, HashSet<String>>,
         now: Instant,
     ) {
-        let old_overlay = std::mem::replace(&mut self.mailbox_roots, new_overlay);
-        if old_overlay == self.mailbox_roots {
+        let old_root_overlay = std::mem::replace(&mut self.mailbox_roots, new_root_overlay);
+        let old_repository_overlay =
+            std::mem::replace(&mut self.mailbox_repositories, new_repository_overlay);
+        if old_root_overlay == self.mailbox_roots
+            && old_repository_overlay == self.mailbox_repositories
+        {
             return;
         }
+        let current_relays: HashSet<String> = self
+            .mailbox_roots
+            .keys()
+            .chain(self.mailbox_repositories.keys())
+            .cloned()
+            .collect();
         self.mailbox_probe_next_at
-            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
+            .retain(|relay, _| current_relays.contains(relay));
         self.mailbox_probe_next_filter
-            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
-        for (relay, roots) in &self.mailbox_roots {
-            if old_overlay.get(relay) != Some(roots) {
+            .retain(|relay, _| current_relays.contains(relay));
+        for relay in current_relays {
+            if old_root_overlay.get(&relay) != self.mailbox_roots.get(&relay)
+                || old_repository_overlay.get(&relay) != self.mailbox_repositories.get(&relay)
+            {
                 self.mailbox_probe_next_at.insert(relay.clone(), now);
-                self.mailbox_probe_next_filter
-                    .entry(relay.clone())
-                    .or_default();
+                self.mailbox_probe_next_filter.entry(relay).or_default();
             }
         }
     }
@@ -1916,7 +2003,7 @@ impl Nip65DiscoveryState {
         // A relay removed from the overlay while its probe was in flight must
         // not leave orphan cursor or due-time entries; re-addition is reseeded
         // by `install_mailbox_overlay`.
-        if !self.mailbox_roots.contains_key(relay) {
+        if !self.has_mailbox_scope(relay) {
             return;
         }
         self.mailbox_probe_next_filter
@@ -2419,7 +2506,7 @@ async fn run_health_and_metrics_checker(
                         ),
                         (
                             "mailbox_probe_relays",
-                            manager.nip65_discovery.mailbox_roots.len(),
+                            manager.nip65_discovery.mailbox_relay_count(),
                         ),
                         (
                             "mailbox_probe_cursors",
@@ -5626,8 +5713,14 @@ impl SyncManager {
             let candidates = self.root_candidate_index.read().await;
             let repo_index = self.repo_sync_index.read().await;
             let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
-            let mut eligible_authors =
-                discovery::accepted_repository_authors(announcements.iter(), &repo_index);
+            let author_repositories = discovery::accepted_repository_author_repositories(
+                announcements.iter(),
+                &repo_index,
+            );
+            let mut eligible_authors: HashSet<PublicKey> =
+                author_repositories.keys().copied().collect();
+            let author_repositories =
+                public_repository_mailbox_scope(self.config.private_mode, author_repositories);
             drop(candidates);
             drop(repo_index);
             let root_ids: HashSet<EventId> = roots.iter().map(|root| root.id).collect();
@@ -5653,6 +5746,7 @@ impl SyncManager {
             let author_roots = discovery::mailbox_author_roots(&roots, frontier.author_roots);
             eligible_authors.extend(author_roots.keys().copied());
             self.nip65_discovery.author_roots = author_roots;
+            self.nip65_discovery.author_repositories = author_repositories;
             self.nip65_discovery.eligible_authors = eligible_authors;
             self.proactive_participant_authors
                 .replace(self.nip65_discovery.eligible_authors.clone())
@@ -5759,19 +5853,31 @@ impl SyncManager {
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
-            let mailbox_overlay = discovery::build_inbox_root_overlay(
+            let mut mailbox_overlay = discovery::build_inbox_root_overlay(
                 &self.nip65_discovery.author_roots,
                 &self.nip65_discovery.author_mailboxes,
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
+            let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
+                &self.nip65_discovery.author_repositories,
+                &self.nip65_discovery.author_mailboxes,
+                &self.nip65_discovery.fallback_authors,
+                &fallback_relays,
+            );
+            merge_repository_roots_into_mailbox_overlay(
+                &mut mailbox_overlay,
+                &mailbox_repository_overlay,
+                &self.nip65_discovery.root_repositories,
+            );
             self.install_nip65_inbox_overlay(inbox_overlay).await;
-            self.install_nip65_mailbox_overlay(mailbox_overlay);
+            self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
             tracing::info!(
                 root_count = root_ids.len(),
                 participant_author_count,
                 eligible_author_count = self.nip65_discovery.eligible_authors.len(),
-                mailbox_relay_count = self.nip65_discovery.mailbox_roots.len(),
+                repository_mailbox_author_count = self.nip65_discovery.author_repositories.len(),
+                mailbox_relay_count = self.nip65_discovery.mailbox_relay_count(),
                 fallback_authors = self.nip65_discovery.fallback_authors.len(),
                 "Reconciled proactive participant mailbox inventory"
             );
@@ -5881,9 +5987,16 @@ impl SyncManager {
         }
     }
 
-    fn install_nip65_mailbox_overlay(&mut self, new_overlay: HashMap<String, HashSet<EventId>>) {
-        self.nip65_discovery
-            .install_mailbox_overlay(new_overlay, Instant::now());
+    fn install_nip65_mailbox_overlay(
+        &mut self,
+        new_root_overlay: HashMap<String, HashSet<EventId>>,
+        new_repository_overlay: HashMap<String, HashSet<String>>,
+    ) {
+        self.nip65_discovery.install_mailbox_overlay(
+            new_root_overlay,
+            new_repository_overlay,
+            Instant::now(),
+        );
     }
 
     async fn schedule_mailbox_probe(&mut self) {
@@ -5894,6 +6007,7 @@ impl SyncManager {
         let now = Instant::now();
         let due_relays: Vec<String> = due_mailbox_relays(
             &self.nip65_discovery.mailbox_roots,
+            &self.nip65_discovery.mailbox_repositories,
             &self.nip65_discovery.mailbox_probe_next_at,
             now,
         )
@@ -5954,11 +6068,23 @@ impl SyncManager {
             return;
         }
 
-        let roots = self.nip65_discovery.mailbox_roots[&relay].clone();
-        let repositories: HashSet<String> = roots
-            .iter()
-            .filter_map(|root| self.nip65_discovery.root_repositories.get(root).cloned())
-            .collect();
+        let root_scope = self
+            .nip65_discovery
+            .mailbox_roots
+            .get(&relay)
+            .cloned()
+            .unwrap_or_default();
+        let repository_scope = self
+            .nip65_discovery
+            .mailbox_repositories
+            .get(&relay)
+            .cloned()
+            .unwrap_or_default();
+        let (repositories, roots) = expand_mailbox_probe_scope(
+            &repository_scope,
+            &root_scope,
+            &self.nip65_discovery.root_repositories,
+        );
         let frontier = recursive_descendant_frontier(
             &self.database,
             &roots,
@@ -6010,7 +6136,7 @@ impl SyncManager {
     }
 
     fn defer_mailbox_relay(&mut self, relay: &str) {
-        if self.nip65_discovery.mailbox_roots.contains_key(relay) {
+        if self.nip65_discovery.has_mailbox_scope(relay) {
             self.nip65_discovery.mailbox_probe_next_at.insert(
                 relay.to_string(),
                 Instant::now() + mailbox_probe_retry_interval(),
@@ -6134,7 +6260,13 @@ impl SyncManager {
                 .insert((result.source_relay.clone(), *author), now + retry_after);
             if authors_with_lists.contains(author) {
                 self.nip65_discovery.fallback_authors.remove(author);
-            } else if query_succeeded && self.nip65_discovery.author_roots.contains_key(author) {
+            } else if query_succeeded
+                && (self.nip65_discovery.author_roots.contains_key(author)
+                    || self
+                        .nip65_discovery
+                        .author_repositories
+                        .contains_key(author))
+            {
                 self.nip65_discovery.fallback_authors.insert(*author);
             }
         }
@@ -6200,18 +6332,29 @@ impl SyncManager {
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
-        let mailbox_overlay = discovery::build_inbox_root_overlay(
+        let mut mailbox_overlay = discovery::build_inbox_root_overlay(
             &self.nip65_discovery.author_roots,
             &self.nip65_discovery.author_mailboxes,
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
+        let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
+            &self.nip65_discovery.author_repositories,
+            &self.nip65_discovery.author_mailboxes,
+            &self.nip65_discovery.fallback_authors,
+            &fallback_relays,
+        );
+        merge_repository_roots_into_mailbox_overlay(
+            &mut mailbox_overlay,
+            &mailbox_repository_overlay,
+            &self.nip65_discovery.root_repositories,
+        );
         self.install_nip65_inbox_overlay(inbox_overlay).await;
-        self.install_nip65_mailbox_overlay(mailbox_overlay);
+        self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
         tracing::info!(
             source = %result.source_relay,
             authors = result.authors.len(),
-            mailbox_relays = self.nip65_discovery.mailbox_roots.len(),
+            mailbox_relays = self.nip65_discovery.mailbox_relay_count(),
             fallback_authors = self.nip65_discovery.fallback_authors.len(),
             "Updated proactive participant mailbox coverage from NIP-65"
         );
@@ -6250,7 +6393,7 @@ impl SyncManager {
             .nip65_discovery
             .mailbox_probes_in_flight
             .contains(source)
-            || (self.nip65_discovery.mailbox_roots.contains_key(source)
+            || (self.nip65_discovery.has_mailbox_scope(source)
                 && self
                     .nip65_discovery
                     .mailbox_probe_next_at
@@ -6367,11 +6510,7 @@ impl SyncManager {
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_connection_attempt(&result.relay_url, true);
                 }
-                if self
-                    .nip65_discovery
-                    .mailbox_roots
-                    .contains_key(&result.relay_url)
-                {
+                if self.nip65_discovery.has_mailbox_scope(&result.relay_url) {
                     self.nip65_discovery
                         .mailbox_probe_next_at
                         .insert(result.relay_url.clone(), Instant::now());
@@ -9556,6 +9695,60 @@ mod tests {
     }
 
     #[test]
+    fn repository_mailbox_scope_adds_every_known_root_without_broadening_participants() {
+        let first_root = EventId::from_byte_array([23; 32]);
+        let second_root = EventId::from_byte_array([24; 32]);
+        let participant_root = EventId::from_byte_array([25; 32]);
+        let repository = "30617:owner:maintained".to_string();
+        let participant_repository = "30617:owner:participant".to_string();
+        let root_repositories = HashMap::from([
+            (first_root, repository.clone()),
+            (second_root, repository.clone()),
+            (participant_root, participant_repository.clone()),
+        ]);
+
+        let (repositories, roots) = expand_mailbox_probe_scope(
+            &HashSet::from([repository.clone()]),
+            &HashSet::from([participant_root]),
+            &root_repositories,
+        );
+
+        assert_eq!(
+            repositories,
+            HashSet::from([repository, participant_repository])
+        );
+        assert_eq!(
+            roots,
+            HashSet::from([first_root, second_root, participant_root])
+        );
+
+        let (_, participant_only_roots) = expand_mailbox_probe_scope(
+            &HashSet::new(),
+            &HashSet::from([participant_root]),
+            &root_repositories,
+        );
+        assert_eq!(participant_only_roots, HashSet::from([participant_root]));
+    }
+
+    #[test]
+    fn repository_mailbox_root_overlay_tracks_inventory_growth() {
+        let relay = "wss://maintainer.example".to_string();
+        let repository = "30617:owner:maintained".to_string();
+        let root = EventId::from_byte_array([26; 32]);
+        let mailbox_repositories =
+            HashMap::from([(relay.clone(), HashSet::from([repository.clone()]))]);
+        let mut mailbox_roots = HashMap::new();
+
+        merge_repository_roots_into_mailbox_overlay(
+            &mut mailbox_roots,
+            &mailbox_repositories,
+            &HashMap::from([(root, repository)]),
+        );
+
+        assert_eq!(mailbox_roots[&relay], HashSet::from([root]));
+    }
+
+    #[test]
     fn mailbox_probe_order_prioritizes_longest_waiting_due_source() {
         let now = Instant::now();
         let root = EventId::from_byte_array([23; 32]);
@@ -9587,12 +9780,36 @@ mod tests {
         ]);
 
         assert_eq!(
-            due_mailbox_relays(&roots, &next_at, now),
+            due_mailbox_relays(&roots, &HashMap::new(), &next_at, now),
             vec![
                 "wss://old.example".to_string(),
                 "wss://large.example".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn repository_only_mailbox_scope_is_due() {
+        let now = Instant::now();
+        let relay = "wss://maintainer.example".to_string();
+        let repositories = HashMap::from([(
+            relay.clone(),
+            HashSet::from(["30617:owner:repo".to_string()]),
+        )]);
+
+        assert_eq!(
+            due_mailbox_relays(&HashMap::new(), &repositories, &HashMap::new(), now),
+            vec![relay]
+        );
+    }
+
+    #[test]
+    fn private_mode_does_not_export_repository_mailbox_scope() {
+        let author = Keys::generate().public_key();
+        let scope = HashMap::from([(author, HashSet::from(["30617:owner:private".to_string()]))]);
+
+        assert_eq!(public_repository_mailbox_scope(false, scope.clone()), scope);
+        assert!(public_repository_mailbox_scope(true, scope).is_empty());
     }
 
     #[test]
@@ -9637,14 +9854,17 @@ mod tests {
             .mailbox_roots
             .insert(relay.clone(), HashSet::from([first_root]));
         discovery.mailbox_probe_next_filter.insert(relay.clone(), 3);
+        let now = Instant::now();
 
         discovery.install_mailbox_overlay(
             HashMap::from([(relay.clone(), HashSet::from([first_root, second_root]))]),
-            Instant::now(),
+            HashMap::new(),
+            now,
         );
         assert_eq!(discovery.mailbox_probe_next_filter[&relay], 3);
+        assert_eq!(discovery.mailbox_probe_next_at[&relay], now);
 
-        discovery.install_mailbox_overlay(HashMap::new(), Instant::now());
+        discovery.install_mailbox_overlay(HashMap::new(), HashMap::new(), Instant::now());
         assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
         assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
     }
@@ -9666,7 +9886,7 @@ mod tests {
             now + Duration::from_secs(60)
         );
 
-        discovery.install_mailbox_overlay(HashMap::new(), now);
+        discovery.install_mailbox_overlay(HashMap::new(), HashMap::new(), now);
         discovery.record_probe_completion(&relay, 2, Duration::from_secs(60), now);
         assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
         assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));

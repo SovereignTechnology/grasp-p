@@ -140,7 +140,20 @@ pub fn accepted_repository_authors<'a>(
     announcements: impl IntoIterator<Item = &'a Event>,
     repositories: &HashMap<String, RepoSyncNeeds>,
 ) -> HashSet<PublicKey> {
-    let mut authors = HashSet::new();
+    accepted_repository_author_repositories(announcements, repositories)
+        .into_keys()
+        .collect()
+}
+
+/// Associate owners and declared maintainers with each accepted Full
+/// repository. The caller may use this for repository-scoped mailbox history;
+/// keeping the coordinate provenance here prevents one maintainer's relay list
+/// from broadening coverage to unrelated repositories.
+pub fn accepted_repository_author_repositories<'a>(
+    announcements: impl IntoIterator<Item = &'a Event>,
+    repositories: &HashMap<String, RepoSyncNeeds>,
+) -> HashMap<PublicKey, HashSet<String>> {
+    let mut author_repositories: HashMap<PublicKey, HashSet<String>> = HashMap::new();
     for event in announcements {
         if event.kind != Kind::GitRepoAnnouncement {
             continue;
@@ -159,7 +172,10 @@ pub fn accepted_repository_authors<'a>(
         {
             continue;
         }
-        authors.insert(event.pubkey);
+        author_repositories
+            .entry(event.pubkey)
+            .or_default()
+            .insert(repository.clone());
         // Include every currently-listed maintainer (active `M`/`m` role tags
         // or the deprecated maintainers fallback). Invited pubkeys are
         // included deliberately: their announcements must be fetched so we
@@ -167,15 +183,19 @@ pub fn accepted_repository_authors<'a>(
         if let Ok(announcement) =
             crate::nostr::events::RepositoryAnnouncement::from_event(event.clone())
         {
-            authors.extend(
-                announcement
-                    .listed_maintainers()
-                    .iter()
-                    .filter_map(|value| PublicKey::from_hex(value).ok()),
-            );
+            for author in announcement
+                .listed_maintainers()
+                .iter()
+                .filter_map(|value| PublicKey::from_hex(value).ok())
+            {
+                author_repositories
+                    .entry(author)
+                    .or_default()
+                    .insert(repository.clone());
+            }
         }
     }
-    authors
+    author_repositories
 }
 
 /// Associate each accepted root author with their own roots and each accepted
@@ -237,6 +257,42 @@ pub fn build_inbox_root_overlay(
                 .entry(relay.clone())
                 .or_default()
                 .extend(roots.iter().copied());
+        }
+    }
+    overlay
+}
+
+/// Build the history-only repository scope advertised by accepted repository
+/// owners and maintainers. This is deliberately separate from root provenance:
+/// repository scope may discover roots not yet present locally, while a thread
+/// participant remains constrained to roots in which they actually appeared.
+pub fn build_mailbox_repository_overlay(
+    author_repositories: &HashMap<PublicKey, HashSet<String>>,
+    author_mailboxes: &HashMap<PublicKey, HashSet<String>>,
+    fallback_authors: &HashSet<PublicKey>,
+    fallback_relays: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut overlay: HashMap<String, HashSet<String>> = HashMap::new();
+    for (author, mailboxes) in author_mailboxes {
+        let Some(repositories) = author_repositories.get(author) else {
+            continue;
+        };
+        for mailbox in mailboxes {
+            overlay
+                .entry(mailbox.clone())
+                .or_default()
+                .extend(repositories.iter().cloned());
+        }
+    }
+    for author in fallback_authors {
+        let Some(repositories) = author_repositories.get(author) else {
+            continue;
+        };
+        for relay in fallback_relays {
+            overlay
+                .entry(relay.clone())
+                .or_default()
+                .extend(repositories.iter().cloned());
         }
     }
     overlay
@@ -408,6 +464,22 @@ mod tests {
             accepted_repository_authors([&accepted, &state_only], &repositories),
             HashSet::from([owner.public_key(), maintainer.public_key()])
         );
+        let author_repositories =
+            accepted_repository_author_repositories([&accepted, &state_only], &repositories);
+        let accepted_repository = format!("30617:{}:{identifier}", owner.public_key());
+        assert_eq!(
+            author_repositories,
+            HashMap::from([
+                (
+                    owner.public_key(),
+                    HashSet::from([accepted_repository.clone()]),
+                ),
+                (
+                    maintainer.public_key(),
+                    HashSet::from([accepted_repository]),
+                ),
+            ])
+        );
     }
 
     #[test]
@@ -573,6 +645,56 @@ mod tests {
         assert!(overlay
             .values()
             .all(|roots| roots == &HashSet::from([root])));
+    }
+
+    #[test]
+    fn maintainer_mailboxes_receive_only_their_accepted_repositories() {
+        let maintainer = Keys::generate().public_key();
+        let unrelated = Keys::generate().public_key();
+        let repository = "30617:owner:accepted".to_string();
+        let overlay = build_mailbox_repository_overlay(
+            &HashMap::from([(maintainer, HashSet::from([repository.clone()]))]),
+            &HashMap::from([
+                (
+                    maintainer,
+                    HashSet::from(["wss://maintainer.example".to_string()]),
+                ),
+                (
+                    unrelated,
+                    HashSet::from(["wss://unrelated.example".to_string()]),
+                ),
+            ]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            overlay,
+            HashMap::from([(
+                "wss://maintainer.example".to_string(),
+                HashSet::from([repository]),
+            )])
+        );
+    }
+
+    #[test]
+    fn missing_maintainer_lists_use_the_bounded_fallback_scope() {
+        let maintainer = Keys::generate().public_key();
+        let repository = "30617:owner:accepted".to_string();
+        let overlay = build_mailbox_repository_overlay(
+            &HashMap::from([(maintainer, HashSet::from([repository.clone()]))]),
+            &HashMap::new(),
+            &HashSet::from([maintainer]),
+            &HashSet::from(["wss://fallback.example".to_string()]),
+        );
+
+        assert_eq!(
+            overlay,
+            HashMap::from([(
+                "wss://fallback.example".to_string(),
+                HashSet::from([repository]),
+            )])
+        );
     }
 
     #[test]
