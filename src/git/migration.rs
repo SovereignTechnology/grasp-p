@@ -1643,7 +1643,7 @@ mod tests {
         assert_eq!(report.retired_backups, 1);
         let quarantined = migration_root(&storage)
             .join("unindexed-packs")
-            .join(&relative)
+            .join(relative)
             .join(first_digest.to_string())
             .join(orphan_name);
         assert_eq!(
