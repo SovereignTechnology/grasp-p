@@ -138,8 +138,22 @@ fn canonical_relay_entries(
     }
     let mut positions: HashMap<String, usize> = HashMap::new();
     let mut entries: Vec<(String, Option<RelayMetadata>)> = Vec::new();
-    for (relay, marker) in nip65::extract_relay_list(event) {
-        if !target_hygiene::accepts(&relay, policy) {
+    for tag in event.tags.iter() {
+        // Parse with the same upstream semantics as
+        // `nip65::extract_relay_list`, but keep the tag's original URL
+        // string: the hygiene length rule measures the wire form, which
+        // normalization can shorten.
+        let Ok(nip65::Nip65Tag::RelayMetadata {
+            relay_url: relay,
+            metadata: marker,
+        }) = nip65::Nip65Tag::try_from(tag)
+        else {
+            continue;
+        };
+        let Some(original) = tag.as_slice().get(1) else {
+            continue;
+        };
+        if !target_hygiene::accepts(original, &relay, policy) {
             continue;
         }
         let Ok(key) = canonical_relay_key(relay.as_str()) else {
@@ -547,6 +561,32 @@ mod tests {
                 "wss://c.example".to_string(),
                 "wss://d.example".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn oversized_wire_urls_are_rejected_before_normalization_shrinks_them() {
+        let keys = Keys::generate();
+        // The explicit default port is stripped by parsing, so this URL
+        // serializes below the length ceiling while the tag's wire form
+        // exceeds it. Hygiene must see the wire form.
+        let base = "wss://big.example:443/";
+        let oversized = format!(
+            "{base}{}",
+            "a".repeat(target_hygiene::MAX_PEER_RELAY_URL_BYTES + 1 - base.len())
+        );
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", [oversized.as_str(), "read"]),
+                Tag::custom("r", ["wss://small.example", "read"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            inbox_relays(&relay_list, &OutboundTargetPolicy::default()),
+            HashSet::from(["wss://small.example".to_string()])
         );
     }
 

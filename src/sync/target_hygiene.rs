@@ -41,11 +41,14 @@ use nostr::types::url::{RelayUrl, Url};
 
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy};
 
-/// Ceiling on the serialized length of a peer-advertised relay URL.
+/// Ceiling on the length of a peer-advertised relay URL as originally
+/// written in the kind 10002 tag, before any parsing or normalization.
 ///
 /// ngit-grasp hardening: genuine relay URLs observed in production are two
 /// orders of magnitude shorter; anything near this bound is either garbage
-/// or an attempt to bloat per-relay state.
+/// or an attempt to bloat per-relay state. Measuring the wire form matters
+/// because normalization (for example stripping an explicit default port)
+/// can shorten a URL, and the rule is about what the peer sent.
 pub const MAX_PEER_RELAY_URL_BYTES: usize = 2048;
 
 /// nostr-watch's 52-word generated-path list, copied verbatim from
@@ -68,17 +71,25 @@ const NOSTR_WATCH_SPAM_WORDS: [&str; 52] = [
 /// Why a peer-advertised relay URL may not become an outbound sync target,
 /// or `None` when it is acceptable.
 ///
+/// `original` is the URL exactly as written in the kind 10002 tag; `relay`
+/// is its parsed form. The length rule measures `original`, so a bloated
+/// wire string cannot slip under the ceiling by normalizing shorter.
+///
 /// The static outbound checks honour the policy's test-only permissive
 /// mode; the remaining rules apply unconditionally because they describe
 /// hostile or unusable peer input, not network topology.
-pub fn rejection_reason(relay: &RelayUrl, policy: &OutboundTargetPolicy) -> Option<String> {
-    let serialized = relay.as_str();
-    if serialized.len() > MAX_PEER_RELAY_URL_BYTES {
+pub fn rejection_reason(
+    original: &str,
+    relay: &RelayUrl,
+    policy: &OutboundTargetPolicy,
+) -> Option<String> {
+    if original.len() > MAX_PEER_RELAY_URL_BYTES {
         return Some(format!(
             "URL length {} exceeds {MAX_PEER_RELAY_URL_BYTES} bytes",
-            serialized.len()
+            original.len()
         ));
     }
+    let serialized = relay.as_str();
 
     // Existing static outbound-target safety checks: scheme allowlist,
     // embedded credentials, usable port, local hostnames, non-globally
@@ -140,8 +151,8 @@ pub fn rejection_reason(relay: &RelayUrl, policy: &OutboundTargetPolicy) -> Opti
 ///
 /// Rejections log at debug level only: a hostile relay list controls how
 /// often this fires, so it must not amplify into INFO-level log volume.
-pub fn accepts(relay: &RelayUrl, policy: &OutboundTargetPolicy) -> bool {
-    match rejection_reason(relay, policy) {
+pub fn accepts(original: &str, relay: &RelayUrl, policy: &OutboundTargetPolicy) -> bool {
+    match rejection_reason(original, relay, policy) {
         Some(reason) => {
             tracing::debug!(relay = %relay, %reason, "rejected peer-advertised relay target");
             false
@@ -171,7 +182,7 @@ mod tests {
     }
 
     fn rejected(url: &str) -> bool {
-        rejection_reason(&relay(url), &strict()).is_some()
+        rejection_reason(url, &relay(url), &strict()).is_some()
     }
 
     #[test]
@@ -193,7 +204,7 @@ mod tests {
             "wss://filter.example.com/npub1aeh2zw4elewy5682lxc6xnlqzjnxksq303gwu2npfaxd49vmde6qcq4nwx?broadcast=true",
         ] {
             assert_eq!(
-                rejection_reason(&relay(url), &strict()),
+                rejection_reason(url, &relay(url), &strict()),
                 None,
                 "{url} must be accepted"
             );
@@ -233,7 +244,7 @@ mod tests {
             "wss://relay.example.com/alpha/real",
         ] {
             assert_eq!(
-                rejection_reason(&relay(url), &strict()),
+                rejection_reason(url, &relay(url), &strict()),
                 None,
                 "{url} must be accepted"
             );
@@ -281,6 +292,22 @@ mod tests {
     }
 
     #[test]
+    fn oversized_urls_are_measured_on_the_wire_form() {
+        // An explicit default port is stripped by normalization, so this URL
+        // serializes below the ceiling while the wire form exceeds it. The
+        // rule is about what the peer sent and must still reject it.
+        let base = "wss://relay.example.com:443/";
+        let oversized = format!(
+            "{base}{}",
+            "a".repeat(MAX_PEER_RELAY_URL_BYTES + 1 - base.len())
+        );
+        assert_eq!(oversized.len(), MAX_PEER_RELAY_URL_BYTES + 1);
+        let parsed = relay(&oversized);
+        assert!(parsed.as_str().len() <= MAX_PEER_RELAY_URL_BYTES);
+        assert!(rejection_reason(&oversized, &parsed, &strict()).is_some());
+    }
+
+    #[test]
     fn onion_targets_are_rejected_under_every_policy() {
         for url in [
             "ws://hidden.onion",
@@ -289,7 +316,7 @@ mod tests {
         ] {
             assert!(rejected(url), "{url} must be rejected");
             assert!(
-                rejection_reason(&relay(url), &permissive()).is_some(),
+                rejection_reason(url, &relay(url), &permissive()).is_some(),
                 "{url} must be rejected even by the permissive test policy"
             );
         }
@@ -308,12 +335,18 @@ mod tests {
         // Integration tests rely on loopback relays under the permissive
         // policy; credentials stay forbidden regardless.
         assert_eq!(
-            rejection_reason(&relay("ws://127.0.0.1:7334"), &permissive()),
+            rejection_reason(
+                "ws://127.0.0.1:7334",
+                &relay("ws://127.0.0.1:7334"),
+                &permissive()
+            ),
             None
         );
-        assert!(
-            rejection_reason(&relay("wss://user:secret@relay.example.com"), &permissive())
-                .is_some()
-        );
+        assert!(rejection_reason(
+            "wss://user:secret@relay.example.com",
+            &relay("wss://user:secret@relay.example.com"),
+            &permissive()
+        )
+        .is_some());
     }
 }
