@@ -55,9 +55,9 @@ impl<'a> EventPersistence<'a> {
 
         let outcome = match status {
             SaveEventStatus::Success => AcceptedEventSaveOutcome::Saved,
-            SaveEventStatus::Rejected(
-                RejectedReason::Duplicate | RejectedReason::Replaced,
-            ) => AcceptedEventSaveOutcome::Duplicate,
+            SaveEventStatus::Rejected(RejectedReason::Duplicate | RejectedReason::Replaced) => {
+                AcceptedEventSaveOutcome::Duplicate
+            }
             SaveEventStatus::Rejected(reason) => {
                 return Err(anyhow::anyhow!(
                     "Database rejected accepted event {}: {reason:?}",
