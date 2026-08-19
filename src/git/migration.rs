@@ -9,10 +9,11 @@
 //! Backups are retired family by family: once every view of one identifier
 //! family is installed, each backup is verified against the family (every
 //! Git-readable backup object present, thin views wired and matching their
-//! journal snapshot, family packs valid) and then deleted before the next
-//! family is migrated. Peak migration overhead is therefore bounded by the
-//! family currently in flight rather than the whole legacy dataset. Packs
-//! without an index are Git-invisible and are quarantined under
+//! journal snapshot, family packs valid) and the ordinary family integrity
+//! inspection must be healthy. It is then deleted before the next family is
+//! migrated. Peak migration overhead is therefore bounded by the family
+//! currently in flight rather than the whole legacy dataset. Packs without an
+//! index are Git-invisible and are quarantined under
 //! `.grasp/migration/unindexed-packs` instead of being destroyed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -711,6 +712,7 @@ fn retire_family_backups(
     }
     let mut family_packs_verified = false;
     let mut all_retired = true;
+    let mut ready = Vec::new();
     for unit in units {
         if !unit.backup_path.is_dir() {
             // Already retired out of band, for example by an operator who
@@ -752,13 +754,7 @@ fn retire_family_backups(
                     }
                     remove_shallow_marker(&unit.view_path)?;
                 }
-                quarantine_unindexed_packs(storage, &unit)?;
-                let mut journal = unit.journal;
-                journal.state = JournalState::Retired;
-                write_journal(&unit.journal_path, &journal)?;
-                remove_retired_backup(storage, &unit.backup_path)?;
-                remove_journal(&unit.journal_path)?;
-                report.retired_backups += 1;
+                ready.push(unit);
             }
             Err(error) if unit.strict => {
                 return Err(error.context(format!(
@@ -778,6 +774,60 @@ fn retire_family_backups(
             }
         }
     }
+
+    if !ready.is_empty() {
+        match super::integrity::inspect_family(storage, key) {
+            Ok(integrity) if integrity.is_healthy() => {
+                // Preserve every Git-invisible payload before committing any
+                // backup as retired. A later failure can therefore leave only
+                // complete backups or safely quarantined raw packs.
+                for unit in &ready {
+                    quarantine_unindexed_packs(storage, unit)?;
+                }
+                for unit in ready {
+                    let mut journal = unit.journal;
+                    journal.state = JournalState::Retired;
+                    write_journal(&unit.journal_path, &journal)?;
+                    remove_retired_backup(storage, &unit.backup_path)?;
+                    remove_journal(&unit.journal_path)?;
+                    report.retired_backups += 1;
+                }
+            }
+            Ok(integrity) => {
+                tracing::error!(
+                    identifier = %key.identifier,
+                    object_format = %key.object_format,
+                    missing_oids = integrity.missing_oids.len(),
+                    missing_ref_targets = integrity.missing_ref_targets.len(),
+                    invalid_alternates = integrity.invalid_alternates.len(),
+                    shallow_views = integrity.shallow_views.len(),
+                    pack_errors = integrity.pack_errors.len(),
+                    fsck_diagnostics = integrity.fsck_diagnostics.len(),
+                    "Identifier family is unhealthy after migration; retaining its backups for automatic integrity repair"
+                );
+                report.retained_backups += ready.len();
+                retained_journals.extend(ready.into_iter().map(|unit| unit.journal_path));
+                all_retired = false;
+            }
+            Err(error) if ready.iter().any(|unit| unit.strict) => {
+                return Err(error.context(format!(
+                    "inspect migrated identifier family {} before retiring backups",
+                    key.identifier
+                )));
+            }
+            Err(error) => {
+                warn!(
+                    identifier = %key.identifier,
+                    object_format = %key.object_format,
+                    %error,
+                    "Keeping migration backups because identifier-family integrity could not be inspected"
+                );
+                report.retained_backups += ready.len();
+                retained_journals.extend(ready.into_iter().map(|unit| unit.journal_path));
+                all_retired = false;
+            }
+        }
+    }
     if all_retired {
         // The union pack and index were hard-linked into the family during
         // migration; the staging copies are redundant once nothing can need
@@ -791,13 +841,9 @@ fn retire_family_backups(
     Ok(())
 }
 
-/// Prove that deleting a backup loses nothing the family cannot serve.
-///
-/// This deliberately does not reuse the integrity module's family inspection:
-/// that check treats pre-existing missing objects and broken ref targets as
-/// unhealthy, but an object that was never in the backup cannot be preserved
-/// by keeping the backup. Such damage stays visible through the integrity
-/// worker's own startup pass and `integrity-check --repair`.
+/// Prove the installed view and family contain everything readable in one
+/// backup. The caller separately requires the whole family's ordinary
+/// integrity report to be healthy before committing any deletion.
 fn verify_retirement(storage: &LocalGitStorage, unit: &RetirementUnit) -> Result<()> {
     if !unit.view_path.is_dir() || !storage.is_thin_view(&unit.key, &unit.view_path) {
         return Err(anyhow!(
@@ -1952,6 +1998,50 @@ mod tests {
         let second = migrate_on_startup(&fixture.storage).await.unwrap();
         assert_eq!(second.retained_backups, 1);
         assert!(fixture.backup.is_dir());
+    }
+
+    #[tokio::test]
+    async fn corrupt_family_object_keeps_healthy_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture =
+            committed_migration(temp.path(), "corrupt-family", JournalState::Complete).await;
+        mark_storage_current(&fixture.storage);
+        let key = FamilyKey::sha1("corrupt-family").unwrap();
+        let family_object = fixture
+            .storage
+            .family_repo_path(&key)
+            .join("objects")
+            .join(&fixture.oid[..2])
+            .join(&fixture.oid[2..]);
+        let backup_object = fixture
+            .backup
+            .join("objects")
+            .join(&fixture.oid[..2])
+            .join(&fixture.oid[2..]);
+        let expected = std::fs::read(&backup_object).unwrap();
+
+        // Break the hard link created by the fixture before corrupting only
+        // the family copy. OID enumeration still sees the loose filename, so
+        // the object-superset gate alone would incorrectly retire the backup.
+        std::fs::remove_file(&family_object).unwrap();
+        std::fs::write(&family_object, []).unwrap();
+        assert_eq!(std::fs::read(&backup_object).unwrap(), expected);
+        assert!(list_all_objects(&fixture.storage.family_repo_path(&key))
+            .unwrap()
+            .contains(&fixture.oid));
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 1);
+        assert!(fixture.backup.is_dir());
+        assert!(fixture.journal_path.is_file());
+        assert!(
+            !super::super::integrity::inspect_family(&fixture.storage, &key)
+                .unwrap()
+                .is_healthy()
+        );
     }
 
     fn write_commit_object(repo: &Path, parent: Option<&str>) -> String {

@@ -47,11 +47,13 @@ family converts, its original repositories are held under:
 Once every view of a family is installed, each of that family's backups is
 verified — every Git-readable backup object present in the family, the thin
 views wired and matching their journal snapshot, and every family pack
-indexed and valid — and then deleted before the next family is migrated. Peak
-migration overhead is therefore bounded by the family currently in flight. A
-pack without an index is invisible to Git and cannot be vouched for by that
-verification; such packs are preserved under
-`.grasp/migration/unindexed-packs/` for manual `git index-pack` recovery.
+indexed and valid — and the ordinary family integrity report must be healthy.
+Only then is the backup deleted before the next family is migrated. Peak
+migration overhead is therefore bounded by the family currently in flight,
+apart from families retained for automatic repair. A pack without an index is
+invisible to Git and cannot be vouched for by that verification; such packs
+are preserved under `.grasp/migration/unindexed-packs/` for manual `git
+index-pack` recovery.
 
 Progress and restart state live under `.grasp/migration/journal/`; each
 journal is removed after its backup retires. The global

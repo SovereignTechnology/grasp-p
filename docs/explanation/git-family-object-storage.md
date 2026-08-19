@@ -281,19 +281,19 @@ migration finishes. After the last view of a family is installed, each of its
 backups must pass a retirement gate: the family contains every Git-readable
 object of the backup, every affected view is a correctly wired thin view whose
 refs and `HEAD` match its journal snapshot, and every family pack is indexed
-and passes `git verify-pack`. Only then is a durable `retired` journal state
-written, the backup deleted, and the journal removed, before the next family
-is migrated. Peak migration overhead is therefore bounded by the family
-currently in flight instead of a second copy of the entire legacy dataset.
+and passes `git verify-pack`. The ordinary family integrity inspection must
+also report the family and all of its views healthy. This final check catches
+corrupt loose objects, missing history, broken ref targets, invalid alternates,
+and shallow views. An unhealthy family keeps its backups while the non-blocking
+integrity worker attempts repair after startup. Only a healthy family writes a
+durable `retired` journal state, deletes the backup, and removes the journal
+before the next family is migrated. Peak migration overhead is therefore
+bounded by the family currently in flight except for the small set of families
+still awaiting repair.
 
-The retirement gate deliberately does not reuse the family integrity
-inspection: that check reports pre-existing missing objects and broken ref
-targets as unhealthy, but an object that was never in the backup cannot be
-preserved by keeping the backup. Retirement proceeds, and the pre-existing
-damage stays visible through the integrity worker and `integrity-check
---repair`. Packs without an index are Git-invisible, so the superset proof
-cannot vouch for them; they are moved to `.grasp/migration/unindexed-packs/`
-before their backup is deleted.
+Packs without an index are Git-invisible, so the superset proof cannot vouch
+for them; they are moved to `.grasp/migration/unindexed-packs/` before their
+backup is deleted.
 
 A server-side `shallow` marker means the legacy repository is a deliberate
 truncation, and GRASP does not treat shallow repositories as valid family

@@ -75,9 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retire identifier-family migration backups family by family. Once every
   view of a family is installed, each backup is verified (family contains
   every Git-readable backup object, thin views match their journal snapshot,
-  family packs are indexed and valid) and then deleted before the next family
-  migrates, bounding peak migration disk overhead to the family in flight.
-  Unindexed legacy packs are quarantined under
+  family packs are indexed and valid), and the ordinary family integrity
+  report must be healthy before deletion. Unhealthy families retain their
+  backups for automatic repair. Healthy backups are deleted before the next
+  family migrates, bounding peak migration disk overhead to the family in
+  flight. Unindexed legacy packs are quarantined under
   `.grasp/migration/unindexed-packs/`, unverifiable backups are retained with
   a warning, and completed installations whose backups were already removed
   manually start unchanged.
