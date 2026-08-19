@@ -291,6 +291,11 @@ before the next family is migrated. Peak migration overhead is therefore
 bounded by the family currently in flight except for the small set of families
 still awaiting repair.
 
+Backup deletion is itself durable: every directory entry removed while
+deleting and pruning a backup is fsynced before its journal is removed. A
+power loss therefore leaves either a discoverable `retired` journal that
+finishes deletion or no backup entry to rediscover.
+
 Packs without an index are Git-invisible, so the superset proof cannot vouch
 for them; they are moved into content-addressed directories beneath
 `.grasp/migration/unindexed-packs/` before their backup is deleted. Repeated

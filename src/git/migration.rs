@@ -979,6 +979,7 @@ fn remove_retired_backup(storage: &LocalGitStorage, backup: &Path) -> Result<boo
             backup.display()
         ));
     }
+    let backup_parent = backup.parent().context("migration backup has no parent")?;
     match std::fs::remove_dir_all(backup) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -987,12 +988,38 @@ fn remove_retired_backup(storage: &LocalGitStorage, backup: &Path) -> Result<boo
                 .with_context(|| format!("remove retired backup {}", backup.display()));
         }
     }
-    let mut parent = backup.parent();
-    while let Some(directory) = parent {
-        if !directory.starts_with(&root) || std::fs::remove_dir(directory).is_err() {
+    // Commit removal of the backup entry before the durable journal is
+    // removed. Otherwise a power loss could restore the backup without its
+    // journal, leaving an orphan that no later launch discovers.
+    fsync_directory(backup_parent)?;
+
+    let mut directory = backup_parent;
+    while directory.starts_with(&root) {
+        let Some(parent) = directory.parent() else {
             break;
+        };
+        match std::fs::remove_dir(directory) {
+            Ok(()) => {
+                fsync_directory(parent)?;
+                directory = parent;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    directory = %directory.display(),
+                    %error,
+                    "Could not prune empty migration backup directory"
+                );
+                break;
+            }
         }
-        parent = directory.parent();
     }
     Ok(true)
 }

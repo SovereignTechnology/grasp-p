@@ -81,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family migrates, bounding peak migration disk overhead to the family in
   flight. Unindexed legacy packs are quarantined by content under
   `.grasp/migration/unindexed-packs/`, unverifiable backups are retained with
-  a warning, and completed installations whose backups were already removed
+  a warning, backup-directory removals are fsynced before their journals are
+  removed, and completed installations whose backups were already removed
   manually start unchanged.
 - Stop treating server-side shallow repositories as valid family storage.
   Migration preserves a legacy `shallow` marker on the installed thin view
