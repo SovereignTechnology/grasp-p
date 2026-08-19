@@ -28,6 +28,9 @@ jobs:
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
+          # cache-nix-action requires a token even with purge disabled;
+          # github.token is empty under ngit-ci, so any non-empty value works.
+          token: unused
       - name: Restore Rust build cache
         continue-on-error: true
         uses: actions/cache@v4
