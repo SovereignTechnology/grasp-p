@@ -175,13 +175,10 @@ impl AnnouncementPolicy {
                                     ))
                                 }
                             };
-                            let current_maintainers: HashSet<&str> =
-                                current.maintainers.iter().map(String::as_str).collect();
-                            let incoming_maintainers: HashSet<&str> = announcement
-                                .maintainers
-                                .iter()
-                                .map(String::as_str)
-                                .collect();
+                            let current_maintainers: HashSet<String> =
+                                current.listed_maintainers().into_iter().collect();
+                            let incoming_maintainers: HashSet<String> =
+                                announcement.listed_maintainers().into_iter().collect();
                             if current_maintainers != incoming_maintainers {
                                 tracing::debug!(
                                     identifier = %announcement.identifier,
@@ -423,14 +420,19 @@ impl AnnouncementPolicy {
         Ok(())
     }
 
-    /// Check if a pubkey is listed as a maintainer in any announcement for this identifier
+    /// Check if a pubkey is currently listed as a maintainer in any announcement
+    /// for this identifier
     ///
-    /// A pubkey is considered a maintainer if:
+    /// A pubkey qualifies if:
     /// 1. They are the owner (pubkey) of an accepted announcement with this identifier, OR
-    /// 2. They are listed in the maintainers tag of ANY announcement with this identifier
+    /// 2. ANY announcement with this identifier currently lists them as a maintainer
+    ///    (active `M`/`m` role tags or the deprecated `maintainers` tag)
     ///
     /// This enables accepting announcements from maintainers even when they don't list
-    /// this GRASP server, for maintainer chain discovery and GRASP-02 sync.
+    /// this GRASP server, for maintainer chain discovery and GRASP-02 sync. It
+    /// deliberately includes *invited* pubkeys - their announcement is exactly how we
+    /// learn they accepted the role - but excludes pubkeys whose role history shows
+    /// the role has ended.
     ///
     /// Checks both the database (promoted announcements) and purgatory (announcements
     /// waiting for git data). This is necessary because a maintainer's announcement
@@ -479,9 +481,9 @@ impl AnnouncementPolicy {
                 return Ok(true);
             }
 
-            // Check if author is listed in the maintainers tag
+            // Check if the announcement currently lists the author as a maintainer
             if let Ok(announcement) = RepositoryAnnouncement::from_event((*event).clone()) {
-                if announcement.maintainers.contains(&author_hex) {
+                if announcement.listed_maintainers().contains(&author_hex) {
                     return Ok(true);
                 }
             }

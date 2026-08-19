@@ -235,3 +235,28 @@ NIP-34 maintainers model refined in nips commit `781590b`).
    (`reapply_stored`) so a newly confirmed maintainer's latest state
    re-points the owner's repository without another push.
 
+### Indexed role tags (`M`/`m`)
+
+- `M` (lead) and `m` (co-maintainer) tags are the primary maintainer
+  listing (per the model clarified in nips commit `986edd1`); when present
+  the deprecated `maintainers` tag is ignored per NIP-34 (and parsed as
+  empty). The role distinction carries no meaning for this service: both
+  collapse into one maintainer set.
+- Role tags may record history as alternating start/end timestamps; a tag
+  is currently active when it has fewer than four elements or an odd number
+  of elements. Ended entries are ignored entirely: role history is only
+  used to conclude that a pubkey is *no longer* a maintainer, never to
+  grant time-scoped retroactive authority over historic events. The
+  NIP's owner-first precedence for conflicting past-role records is
+  therefore unused.
+- A pubkey may appear in one `M` and one `m` tag to record a role
+  transition and is a maintainer while either entry is active. A second
+  tag under the same letter is malformed and rejects the announcement.
+- An announcement using role tags acknowledges its author via an active
+  self-entry, or implicitly: an author who appears in no role tag is a
+  maintainer for the repository's entire history. Only an ended self-entry
+  means the member left, which takes precedence over assignments in other
+  announcements.
+- A `u` (subordinate fork) tag has no effect on maintainership: the author
+  of a role-less announcement asserts maintainership with or without it.
+

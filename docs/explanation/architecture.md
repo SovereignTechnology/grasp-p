@@ -283,6 +283,22 @@ pub struct RepositoryState { ... }
 
 #### Maintainer Membership Model
 
+Announcements carry maintainer listings in two formats:
+
+- **Indexed role tags** (`M` lead, `m` co-maintainer). A tag may record
+  history as alternating start/end timestamps; it is currently active when
+  it has fewer than four elements or an odd number of elements. Ended
+  entries are ignored entirely - the history is only used to conclude a
+  role has *ended*, never to grant authority for a past period. The lead /
+  co-maintainer distinction carries no meaning for this service. A pubkey
+  may appear in one `M` and one `m` tag to record a role transition and is
+  a maintainer while either entry is active; a second tag under the same
+  letter rejects the announcement. An author who appears in no role tag is
+  implicitly a maintainer for the repository's entire history.
+- **Deprecated `maintainers` tag** (fallback). Ignored when `M`/`m` tags
+  are present. Without any listing tags the author is the sole maintainer.
+  A `u` (subordinate fork) tag has no effect on maintainership.
+
 Authorization follows a reciprocal membership rule, computed per owner by
 [`compute_membership`](src/git/authorization.rs):
 
@@ -293,6 +309,10 @@ Authorization follows a reciprocal membership rule, computed per owner by
   authoritative.
 - Confirmation is a fixpoint, so maintainers listed by other confirmed
   maintainers are reached recursively.
+- The acknowledging announcement must assert an active role for its own
+  author: an ended `M`/`m` self-entry means the pubkey has left, which
+  takes precedence over assignments in other announcements. An author who
+  appears in no role tag implicitly asserts maintainership.
 - The owner is always a confirmed maintainer of their own repository:
   announcing a repository in their namespace is what creates it on this
   service.

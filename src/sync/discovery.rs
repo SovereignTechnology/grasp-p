@@ -160,13 +160,16 @@ pub fn accepted_repository_authors<'a>(
             continue;
         }
         authors.insert(event.pubkey);
-        for maintainer in event
-            .tags
-            .iter()
-            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("maintainers"))
+        // Include every currently-listed maintainer (active `M`/`m` role tags
+        // or the deprecated maintainers fallback). Invited pubkeys are
+        // included deliberately: their announcements must be fetched so we
+        // notice when they accept the role. Ended roles are excluded.
+        if let Ok(announcement) =
+            crate::nostr::events::RepositoryAnnouncement::from_event(event.clone())
         {
             authors.extend(
-                maintainer.as_slice()[1..]
+                announcement
+                    .listed_maintainers()
                     .iter()
                     .filter_map(|value| PublicKey::from_hex(value).ok()),
             );

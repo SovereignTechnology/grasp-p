@@ -150,14 +150,17 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
             return;
         };
 
+        // Every currently-listed maintainer, including invited ones whose
+        // announcements we still need to notice acceptance.
+        let listed_maintainers = announcement.listed_maintainers();
         debug!(
             identifier = %announcement.identifier,
             event_id = %event.id,
-            maintainer_count = announcement.maintainers.len(),
+            maintainer_count = listed_maintainers.len(),
             "Owner announcement promoted from purgatory, checking hot cache for rejected maintainer announcements"
         );
 
-        for maintainer_hex in &announcement.maintainers {
+        for maintainer_hex in &listed_maintainers {
             match PublicKey::from_hex(maintainer_hex) {
                 Ok(maintainer_pubkey) => {
                     let (event_ids, hot_events) = rejected_events_index.dependency_candidates(

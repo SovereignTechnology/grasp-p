@@ -331,7 +331,11 @@ pub struct RepoMembership {
 /// announcement for the same identifier lists back a pubkey that is already
 /// a confirmed maintainer (reciprocal acknowledgment). Confirmation is
 /// evaluated as a fixpoint, so maintainers listed by other confirmed
-/// maintainers are reached recursively.
+/// maintainers are reached recursively. The acknowledging announcement must
+/// also assert an active role for its own author: an ended `M`/`m`
+/// self-entry means the pubkey has left, which takes precedence over
+/// assignments in other announcements. An author who appears in no role tag
+/// implicitly asserts maintainership for the repository's entire history.
 ///
 /// The owner is always a confirmed maintainer of their own repository:
 /// announcing a repository in their namespace is what creates it on this
@@ -369,6 +373,9 @@ pub fn compute_membership(
             let Some(candidate_announcement) = find(candidate) else {
                 continue; // invited: no announcement of their own yet
             };
+            if !candidate_announcement.author_role_active() {
+                continue; // left: an ended self-role takes precedence
+            }
             let lists_back = candidate_announcement
                 .listed_maintainers()
                 .iter()
@@ -383,6 +390,9 @@ pub fn compute_membership(
             let invited = listed
                 .into_iter()
                 .filter(|pubkey| !confirmed.contains(pubkey))
+                // A pubkey whose own announcement shows it left is not
+                // invited.
+                .filter(|pubkey| !find(pubkey).is_some_and(|a| a.author_has_left()))
                 .collect();
             return RepoMembership {
                 state_maintainers: confirmed,
@@ -1399,6 +1409,183 @@ mod tests {
         let membership = compute_membership(&announcements, &hex(&alice), identifier);
         assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
         assert!(membership.invited.contains(&hex(&bob)));
+    }
+
+    /// Build an announcement using NIP-34 indexed role tags.
+    /// Each entry is (tag name, values) where values start with the pubkey
+    /// followed by optional history timestamps.
+    fn create_role_announcement(
+        keys: &Keys,
+        identifier: &str,
+        roles: &[(&str, Vec<String>)],
+    ) -> Event {
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
+        for (name, values) in roles {
+            tags.push(Tag::custom(*name, values.clone()));
+        }
+        tags.push(Tag::custom(
+            "clone",
+            vec!["https://example.com/test.git".to_string()],
+        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
+
+        EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
+            .tags(tags)
+            .finalize(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_role_tag_maintainer_confirmed_when_reciprocal() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_ended_role_is_no_longer_maintainer() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice's announcement records Bob's co-maintainer role as ended
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![hex(&bob), "0".to_string(), "1700000000".to_string()],
+                ),
+            ],
+        );
+        // Bob still lists himself and Alice as active
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(
+            !membership.invited.contains(&hex(&bob)),
+            "an ended role must not be treated as an open invitation"
+        );
+    }
+
+    #[test]
+    fn test_returning_maintainer_history_is_active() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Odd element count: added, removed, then added again
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![
+                        hex(&bob),
+                        "100".to_string(),
+                        "200".to_string(),
+                        "300".to_string(),
+                    ],
+                ),
+            ],
+        );
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_self_leave_takes_precedence() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice still lists Bob as active
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+        // Bob ended his own role: he has left
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![hex(&bob), "0".to_string(), "1700000000".to_string()],
+                ),
+            ],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(!membership.invited.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_subordinate_fork_marker_does_not_block_acceptance() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice invites Bob; Bob's announcement carries a `u` (subordinate
+        // fork) tag. Per NIP-34 `u` has no effect on maintainership, so
+        // Bob's listing of Alice still acknowledges the invitation.
+        let alice_announcement = create_announcement_event(&alice, identifier, &[&bob]);
+        let mut tags = vec![
+            Tag::custom("d", vec![identifier.to_string()]),
+            Tag::custom("maintainers", vec![hex(&alice)]),
+            Tag::custom("u", vec![format!("30617:{}:{}", hex(&alice), identifier)]),
+        ];
+        tags.push(Tag::custom(
+            "clone",
+            vec!["https://example.com/test.git".to_string()],
+        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
+        let bob_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
+            .tags(tags)
+            .finalize(&bob)
+            .unwrap();
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+        assert!(!membership.invited.contains(&hex(&bob)));
     }
 
     #[test]

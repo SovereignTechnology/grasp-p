@@ -26,7 +26,22 @@ pub struct RepositoryAnnouncement {
     pub clone_urls: Vec<String>,
     pub relays: Vec<String>,
     pub web_urls: Vec<String>,
+    /// Pubkeys from the deprecated `maintainers` tag. Empty when the
+    /// announcement uses `M`/`m` role tags, which take precedence per NIP-34.
     pub maintainers: Vec<String>,
+    /// Currently-active maintainer pubkeys from NIP-34 `M`/`m` role tags;
+    /// `None` when the announcement contains no `M`/`m` tags.
+    ///
+    /// The lead (`M`) / co-maintainer (`m`) distinction carries no meaning
+    /// for this service, so both collapse into one maintainer set. Entries
+    /// whose role history shows the role has ended are excluded entirely: an
+    /// ended role means the pubkey is no longer a maintainer, and historic
+    /// listing never grants authority for a past period.
+    pub role_maintainers: Option<Vec<String>>,
+    /// Whether any role tag names the author, active or ended. Per NIP-34 an
+    /// author without a self-entry is implicitly a maintainer for the
+    /// repository's entire history.
+    author_has_role_entry: bool,
 }
 
 impl RepositoryAnnouncement {
@@ -107,19 +122,63 @@ impl RepositoryAnnouncement {
             })
             .collect();
 
-        // Extract maintainers from "maintainers" tag per NIP-34
+        // Extract maintainer pubkeys from NIP-34 `M`/`m` role tags
+        // Format: ["M"|"m", "<pubkey-hex>", "<start>", "<end>", ...]
+        // A role tag lists a pubkey followed by optional alternating start/end
+        // history timestamps; it is currently active when it has fewer than
+        // four elements or an odd number of elements. Ended entries are
+        // ignored entirely. A pubkey may appear in one `M` and one `m` tag to
+        // record a transition between the roles and remains a maintainer
+        // while either entry is active; a second tag under the same letter is
+        // malformed and rejects the announcement.
+        let author_hex = event.pubkey.to_hex();
+        let mut role_tags_present = false;
+        let mut author_has_role_entry = false;
+        let mut role_active: Vec<String> = Vec::new();
+        let mut seen_role_entries: Vec<(String, String)> = Vec::new();
+        for tag in event.tags.iter() {
+            let slice = tag.as_slice();
+            let Some(kind) = slice.first() else { continue };
+            if kind != "M" && kind != "m" {
+                continue;
+            }
+            role_tags_present = true;
+            let Some(pubkey) = slice.get(1).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let entry = (kind.clone(), pubkey.clone());
+            if seen_role_entries.contains(&entry) {
+                return Err(anyhow!("duplicate `{kind}` role tag for pubkey {pubkey}"));
+            }
+            seen_role_entries.push(entry);
+            if *pubkey == author_hex {
+                author_has_role_entry = true;
+            }
+            let active = slice.len() < 4 || slice.len() % 2 == 1;
+            if active && !role_active.contains(pubkey) {
+                role_active.push(pubkey.clone());
+            }
+        }
+        let role_maintainers = role_tags_present.then_some(role_active);
+
+        // Extract maintainers from the deprecated "maintainers" tag per NIP-34
         // Format: ["maintainers", "<pubkey1-hex>", "<pubkey2-hex>", ...]
-        let maintainers = event
-            .tags
-            .iter()
-            .find(|tag| tag.as_slice().first().map(|s| s.as_str()) == Some("maintainers"))
-            .map(|tag| {
-                tag.as_slice()[1..] // Skip the "maintainers" tag name
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Ignored entirely when `M` or `m` role tags are present.
+        let maintainers = if role_tags_present {
+            Vec::new()
+        } else {
+            event
+                .tags
+                .iter()
+                .find(|tag| tag.as_slice().first().map(|s| s.as_str()) == Some("maintainers"))
+                .map(|tag| {
+                    tag.as_slice()[1..] // Skip the "maintainers" tag name
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
         Ok(RepositoryAnnouncement {
             event,
@@ -130,6 +189,8 @@ impl RepositoryAnnouncement {
             relays,
             web_urls,
             maintainers,
+            role_maintainers,
+            author_has_role_entry,
         })
     }
 
@@ -142,13 +203,45 @@ impl RepositoryAnnouncement {
     /// listing alone makes none of their events authoritative.
     pub fn listed_maintainers(&self) -> Vec<String> {
         let author = self.event.pubkey.to_hex();
+        let source = self
+            .role_maintainers
+            .as_deref()
+            .unwrap_or(&self.maintainers);
         let mut listed: Vec<String> = Vec::new();
-        for pubkey in &self.maintainers {
+        for pubkey in source {
             if *pubkey != author && !listed.contains(pubkey) {
                 listed.push(pubkey.clone());
             }
         }
         listed
+    }
+
+    /// Whether this announcement asserts an active maintainer role for its
+    /// own author.
+    ///
+    /// With `M`/`m` role tags the author is active via an active self-entry,
+    /// or implicitly: per NIP-34 an author who appears in no role tag is a
+    /// maintainer for the repository's entire history. Only an ended
+    /// self-entry means the author has left, which takes precedence over
+    /// assignments in other announcements. In the deprecated format the
+    /// author always asserts maintainership; a `u` (subordinate fork) tag
+    /// has no effect on maintainership.
+    pub fn author_role_active(&self) -> bool {
+        match &self.role_maintainers {
+            Some(active) => {
+                !self.author_has_role_entry || active.contains(&self.event.pubkey.to_hex())
+            }
+            None => true,
+        }
+    }
+
+    /// Whether this announcement shows its author has left: a role tag names
+    /// the author but none of their entries is active.
+    ///
+    /// An author absent from all role tags has *not* left - they are
+    /// implicitly a maintainer for the repository's entire history.
+    pub fn author_has_left(&self) -> bool {
+        self.role_maintainers.is_some() && !self.author_role_active()
     }
 
     /// Check if this announcement lists the given domain in clone URLs
@@ -806,6 +899,200 @@ mod tests {
             announcement.maintainers[0],
             maintainer_keys.public_key().to_hex()
         );
+    }
+
+    fn role_announcement(keys: &Keys, tags: Vec<(&str, Vec<String>)>) -> RepositoryAnnouncement {
+        use nostr_sdk::prelude::Tag;
+
+        let mut event_tags = vec![Tag::custom("d", vec!["test-repo".to_string()])];
+        for (name, values) in tags {
+            event_tags.push(Tag::custom(name, values));
+        }
+        let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
+            .tags(event_tags)
+            .finalize(keys)
+            .unwrap();
+        RepositoryAnnouncement::from_event(event).unwrap()
+    }
+
+    #[test]
+    fn test_role_tag_activeness_by_element_count() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let other = create_test_keys().public_key().to_hex();
+
+        // (history values after the pubkey, expected active)
+        // Tag element counts: 2 -> active, 3 -> active, 4 -> ended,
+        // 5 -> active, 6 -> ended.
+        let cases: Vec<(Vec<&str>, bool)> = vec![
+            (vec![], true),
+            (vec!["100"], true),
+            (vec!["100", "200"], false),
+            (vec!["100", "200", "300"], true),
+            (vec!["100", "200", "300", "400"], false),
+        ];
+
+        for (history, expected_active) in cases {
+            let mut values = vec![other.clone()];
+            values.extend(history.iter().map(|s| s.to_string()));
+            let announcement =
+                role_announcement(&keys, vec![("M", vec![author.clone()]), ("m", values)]);
+            assert_eq!(
+                announcement.listed_maintainers().contains(&other),
+                expected_active,
+                "history {history:?} expected active={expected_active}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lead_and_co_maintainer_roles_are_equivalent() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let listed_as_lead = create_test_keys().public_key().to_hex();
+        let listed_as_co = create_test_keys().public_key().to_hex();
+
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("M", vec![author.clone()]),
+                ("M", vec![listed_as_lead.clone()]),
+                ("m", vec![listed_as_co.clone()]),
+            ],
+        );
+
+        let listed = announcement.listed_maintainers();
+        assert!(listed.contains(&listed_as_lead));
+        assert!(listed.contains(&listed_as_co));
+        assert!(
+            !listed.contains(&author),
+            "author is excluded from the listed set"
+        );
+        assert!(announcement.author_role_active());
+    }
+
+    #[test]
+    fn test_maintainers_tag_ignored_when_role_tags_present() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let legacy_listed = create_test_keys().public_key().to_hex();
+
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("M", vec![author]),
+                ("maintainers", vec![legacy_listed.clone()]),
+            ],
+        );
+
+        assert!(announcement.maintainers.is_empty());
+        assert!(!announcement.listed_maintainers().contains(&legacy_listed));
+    }
+
+    #[test]
+    fn test_author_leave_via_ended_self_role() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let lead = create_test_keys().public_key().to_hex();
+
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("M", vec![lead.clone()]),
+                ("m", vec![author, "0".to_string(), "1700000000".to_string()]),
+            ],
+        );
+
+        assert!(!announcement.author_role_active());
+        assert!(announcement.listed_maintainers().contains(&lead));
+    }
+
+    #[test]
+    fn test_u_tag_has_no_effect_on_maintainership() {
+        let keys = create_test_keys();
+        let upstream = create_test_keys().public_key().to_hex();
+
+        // Deprecated format: the author implicitly asserts maintainership,
+        // with or without a `u` (subordinate fork) tag.
+        let plain = role_announcement(&keys, vec![("maintainers", vec![upstream.clone()])]);
+        assert!(plain.author_role_active());
+
+        let fork = role_announcement(
+            &keys,
+            vec![
+                ("maintainers", vec![upstream.clone()]),
+                ("u", vec![format!("30617:{upstream}:test-repo")]),
+            ],
+        );
+        assert!(fork.author_role_active());
+        assert!(!fork.author_has_left());
+    }
+
+    #[test]
+    fn test_author_without_self_role_entry_is_implicitly_active() {
+        let keys = create_test_keys();
+        let other = create_test_keys().public_key().to_hex();
+
+        // Role tags that do not name the author: the author is implicitly a
+        // maintainer for the repository's entire history.
+        let announcement = role_announcement(&keys, vec![("m", vec![other])]);
+        assert!(announcement.author_role_active());
+        assert!(!announcement.author_has_left());
+    }
+
+    #[test]
+    fn test_role_transition_across_letters_is_active_while_either_entry_active() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let demoted = create_test_keys().public_key().to_hex();
+        let gone = create_test_keys().public_key().to_hex();
+
+        // One `M` and one `m` tag for the same pubkey record a transition
+        // between the roles: the pubkey is a maintainer while either entry
+        // is active, and no longer one when both have ended.
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("M", vec![author.clone()]),
+                (
+                    "M",
+                    vec![demoted.clone(), "0".to_string(), "100".to_string()],
+                ),
+                ("m", vec![demoted.clone(), "100".to_string()]),
+                ("M", vec![gone.clone(), "0".to_string(), "100".to_string()]),
+                (
+                    "m",
+                    vec![gone.clone(), "100".to_string(), "200".to_string()],
+                ),
+            ],
+        );
+
+        let listed = announcement.listed_maintainers();
+        assert!(listed.contains(&demoted));
+        assert!(!listed.contains(&gone));
+    }
+
+    #[test]
+    fn test_duplicate_same_letter_role_tag_rejects_announcement() {
+        use nostr_sdk::prelude::Tag;
+
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let other = create_test_keys().public_key().to_hex();
+
+        let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
+            .tags(vec![
+                Tag::custom("d", vec!["test-repo".to_string()]),
+                Tag::custom("M", vec![author]),
+                Tag::custom("m", vec![other.clone(), "0".to_string(), "100".to_string()]),
+                Tag::custom("m", vec![other]),
+            ])
+            .finalize(&keys)
+            .unwrap();
+
+        let result = RepositoryAnnouncement::from_event(event);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
     }
 
     #[test]
