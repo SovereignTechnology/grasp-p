@@ -588,7 +588,7 @@ pub enum SyncMethod {
 pub enum ProcessResult {
     /// Event was new and saved to database
     Saved,
-    /// Event already existed in database
+    /// Event already existed or a newer replaceable event was retained
     Duplicate,
     /// Event added to Purgatory
     Purgatory,
@@ -7567,15 +7567,25 @@ impl SyncManager {
         match result {
             WritePolicyResult::Accept => {
                 // Save event to database
-
-                if let Err(e) = write_policy.save_accepted_event(event, save_context).await {
-                    tracing::error!(
-                        event_id = %event.id,
-                        relay = %relay_url,
-                        error = %e,
-                        "Failed to save synced event"
-                    );
-                    return ProcessResult::PersistenceError;
+                match write_policy.save_accepted_event(event, save_context).await {
+                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Saved) => {}
+                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Duplicate) => {
+                        tracing::trace!(
+                            event_id = %event.id,
+                            relay = %relay_url,
+                            "Database retained an existing event during sync"
+                        );
+                        return ProcessResult::Duplicate;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            event_id = %event.id,
+                            relay = %relay_url,
+                            error = %e,
+                            "Failed to save synced event"
+                        );
+                        return ProcessResult::PersistenceError;
+                    }
                 }
 
                 // Broadcast to WebSocket subscribers (enables recursive relay discovery)
@@ -9306,6 +9316,74 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(!rejected.contains(&child.id));
+    }
+
+    #[tokio::test]
+    async fn replaced_sync_event_is_reported_as_duplicate() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let git_data_path = directory.path().join("git");
+        let mut config = Config::for_testing();
+        config.git_data_path = git_data_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_data_path));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .expect("create test relay runtime");
+        let rejected = Arc::new(RejectedEventsIndex::new(
+            Duration::from_secs(120),
+            Duration::from_secs(604800),
+        ));
+        let keys = Keys::generate();
+        let older = EventBuilder::new(Kind::GitUserGraspList, "older")
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&keys)
+            .expect("build older replaceable event");
+        let newer = EventBuilder::new(Kind::GitUserGraspList, "newer")
+            .custom_created_at(Timestamp::from_secs(200))
+            .finalize(&keys)
+            .expect("build newer replaceable event");
+        runtime
+            .stores
+            .database
+            .save_event(&newer)
+            .await
+            .expect("save newer replaceable event");
+
+        let result = SyncManager::process_event_static(
+            &older,
+            "wss://source.example",
+            &runtime.stores.database,
+            &runtime.write_policy,
+            &runtime.relay,
+            &rejected,
+            crate::nostr::persistence::SaveContext::RelaySync,
+        )
+        .await;
+
+        assert_eq!(result, ProcessResult::Duplicate);
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&older.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&newer.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[test]

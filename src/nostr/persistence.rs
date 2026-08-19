@@ -5,7 +5,7 @@
 //! module provides the direct accepted-event save facade for paths outside the
 //! relay builder.
 
-use nostr_sdk::prelude::Event;
+use nostr_sdk::prelude::{Event, RejectedReason, SaveEventStatus};
 
 use crate::nostr::SharedDatabase;
 
@@ -19,6 +19,15 @@ pub enum SaveContext {
     RelaySync,
     /// Event accepted during rejected hot-cache reprocessing.
     HotCacheReprocess,
+}
+
+/// Durable outcome of saving an event that already passed write policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedEventSaveOutcome {
+    /// The database inserted the event.
+    Saved,
+    /// The database already had this event or retained a newer replaceable event.
+    Duplicate,
 }
 
 /// Nostr-owned facade for accepted-event persistence side effects.
@@ -37,20 +46,34 @@ impl<'a> EventPersistence<'a> {
         &self,
         event: &Event,
         context: SaveContext,
-    ) -> anyhow::Result<()> {
-        self.database
+    ) -> anyhow::Result<AcceptedEventSaveOutcome> {
+        let status = self
+            .database
             .save_event(event)
             .await
-            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to save accepted event {}: {e}", event.id))?;
+
+        let outcome = match status {
+            SaveEventStatus::Success => AcceptedEventSaveOutcome::Saved,
+            SaveEventStatus::Rejected(
+                RejectedReason::Duplicate | RejectedReason::Replaced,
+            ) => AcceptedEventSaveOutcome::Duplicate,
+            SaveEventStatus::Rejected(reason) => {
+                return Err(anyhow::anyhow!(
+                    "Database rejected accepted event {}: {reason:?}",
+                    event.id
+                ));
+            }
+        };
 
         tracing::trace!(
             event_id = %event.id,
             kind = event.kind.as_u16(),
             ?context,
-            "Saved accepted event to main database"
+            ?outcome,
+            "Applied accepted event to main database"
         );
 
-        Ok(())
+        Ok(outcome)
     }
 }
