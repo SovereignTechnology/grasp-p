@@ -7568,12 +7568,15 @@ impl SyncManager {
             WritePolicyResult::Accept => {
                 // Save event to database
                 match write_policy.save_accepted_event(event, save_context).await {
-                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Saved) => {}
-                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Duplicate) => {
+                    Ok(
+                        crate::nostr::persistence::AcceptedEventSaveOutcome::Saved
+                        | crate::nostr::persistence::AcceptedEventSaveOutcome::Duplicate,
+                    ) => {}
+                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Replaced) => {
                         tracing::trace!(
                             event_id = %event.id,
                             relay = %relay_url,
-                            "Database retained an existing event during sync"
+                            "Database retained a newer replaceable event during sync"
                         );
                         return ProcessResult::Duplicate;
                     }

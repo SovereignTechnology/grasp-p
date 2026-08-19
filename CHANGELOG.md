@@ -156,6 +156,13 @@ Performance and Security fixes - along with other improvements; immediate upgrad
 
 ### Fixed
 
+- Restore cold rejected-maintainer recovery after policy admission pre-saves
+  the newly authorized announcement for membership reconciliation. An exact
+  duplicate from that intentional pre-save now still broadcasts the
+  announcement and expands its state/Git dependencies, while a genuinely
+  superseded replaceable event remains classified as a duplicate without
+  downstream fan-out.
+
 - Discover historical repository roots and descendants from the NIP-65
   inboxes of accepted repository owners and maintainers. Public Sync+
   instances probe exact repository coordinates and every known root on those

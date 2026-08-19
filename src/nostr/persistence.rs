@@ -26,8 +26,14 @@ pub enum SaveContext {
 pub enum AcceptedEventSaveOutcome {
     /// The database inserted the event.
     Saved,
-    /// The database already had this event or retained a newer replaceable event.
+    /// The exact event is already stored.
+    ///
+    /// Write-policy admission may intentionally pre-save an event when
+    /// subsequent policy work needs to query it. Callers that established the
+    /// event was absent before admission must still run their post-save hooks.
     Duplicate,
+    /// The database retained a newer replaceable event instead.
+    Replaced,
 }
 
 /// Nostr-owned facade for accepted-event persistence side effects.
@@ -55,8 +61,11 @@ impl<'a> EventPersistence<'a> {
 
         let outcome = match status {
             SaveEventStatus::Success => AcceptedEventSaveOutcome::Saved,
-            SaveEventStatus::Rejected(RejectedReason::Duplicate | RejectedReason::Replaced) => {
+            SaveEventStatus::Rejected(RejectedReason::Duplicate) => {
                 AcceptedEventSaveOutcome::Duplicate
+            }
+            SaveEventStatus::Rejected(RejectedReason::Replaced) => {
+                AcceptedEventSaveOutcome::Replaced
             }
             SaveEventStatus::Rejected(reason) => {
                 return Err(anyhow::anyhow!(
