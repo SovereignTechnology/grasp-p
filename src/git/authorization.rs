@@ -10,16 +10,16 @@
 //! ## Authorization Flow (Efficient Single-Query Approach)
 //!
 //! 1. Fetch announcement and state events for the repository from the relay database
-//! 2. Collect all authorized publishers: announcement authors + listed maintainers
-//! 3. Find the latest state event authored by any authorized publisher
+//! 2. Compute the confirmed maintainer set for the owner's repository
+//! 3. Find the latest state event authored by a confirmed maintainer
 //! 4. Validate that the pushed refs match the state event
 //!
 //! ## Authorization Logic
 //!
-//! A pubkey is authorized to publish state events if, for ANY announcement with the
-//! same identifier:
-//! - They are the author of that announcement, OR
-//! - They are listed in the "maintainers" tag of that announcement
+//! Maintainership is reciprocal. A pubkey listed as a maintainer in an
+//! announcement is only *invited*: none of its events are authoritative until
+//! its own announcement for the same identifier lists back an existing
+//! confirmed maintainer. See [`compute_membership`].
 //!
 //! ## Shared Helper Functions
 //!
@@ -312,22 +312,104 @@ pub fn pubkey_authorised_for_repo_owners(
     repo_owners_authorising_pubkey.iter().cloned().collect()
 }
 
-/// Collect authorized maintainers grouped by owner from a set of announcements
+/// Confirmed membership of one owner's repository.
+#[derive(Debug, Default)]
+pub struct RepoMembership {
+    /// Pubkeys whose repository state events are authoritative for this
+    /// owner's repository: the owner plus every confirmed maintainer.
+    pub state_maintainers: HashSet<String>,
+    /// Pubkeys currently listed as maintainers whose own announcement does
+    /// not yet list back a confirmed maintainer. Their announcements must
+    /// still be fetched and accepted - that is how the relay notices an
+    /// invitation was accepted - but none of their events are authoritative.
+    pub invited: HashSet<String>,
+}
+
+/// Compute the confirmed maintainer set for `owner`'s repository.
 ///
-/// For each announcement, returns a map from owner pubkey to authorized maintainers:
-/// - The owner is always included in their own list
-/// - All pubkeys listed in the "maintainers" tag are also included
-/// - **Recursively**: if a maintainer also has an announcement for the same identifier,
-///   their maintainers are included too (transitive closure)
+/// A pubkey listed as a maintainer is only *invited* until its own
+/// announcement for the same identifier lists back a pubkey that is already
+/// a confirmed maintainer (reciprocal acknowledgment). Confirmation is
+/// evaluated as a fixpoint, so maintainers listed by other confirmed
+/// maintainers are reached recursively. The acknowledging announcement must
+/// also assert an active role for its own author: an ended `M`/`m`
+/// self-entry means the pubkey has left, which takes precedence over
+/// assignments in other announcements. An author who appears in no role tag
+/// implicitly asserts maintainership for the repository's entire history.
 ///
-/// This allows looking up who can publish state events for a specific owner's
-/// version of the repository.
+/// The owner is always a confirmed maintainer of their own repository:
+/// announcing a repository in their namespace is what creates it on this
+/// service.
+pub fn compute_membership(
+    announcements: &[RepositoryAnnouncement],
+    owner: &str,
+    identifier: &str,
+) -> RepoMembership {
+    let find = |pubkey: &str| {
+        announcements
+            .iter()
+            .find(|a| a.event.pubkey.to_hex() == pubkey && a.identifier == identifier)
+    };
+    if find(owner).is_none() {
+        return RepoMembership::default();
+    }
+
+    let mut confirmed: HashSet<String> = HashSet::from([owner.to_string()]);
+    // Fixpoint: keep confirming listed pubkeys whose own announcement lists
+    // back an already-confirmed maintainer. The confirmed set only grows, so
+    // the loop terminates.
+    loop {
+        let listed: HashSet<String> = confirmed
+            .iter()
+            .filter_map(|member| find(member))
+            .flat_map(|announcement| announcement.listed_maintainers())
+            .collect();
+
+        let mut progressed = false;
+        for candidate in &listed {
+            if confirmed.contains(candidate) {
+                continue;
+            }
+            let Some(candidate_announcement) = find(candidate) else {
+                continue; // invited: no announcement of their own yet
+            };
+            if !candidate_announcement.author_role_active() {
+                continue; // left: an ended self-role takes precedence
+            }
+            let lists_back = candidate_announcement
+                .listed_maintainers()
+                .iter()
+                .any(|pubkey| confirmed.contains(pubkey));
+            if lists_back {
+                confirmed.insert(candidate.clone());
+                progressed = true;
+            }
+        }
+
+        if !progressed {
+            let invited = listed
+                .into_iter()
+                .filter(|pubkey| !confirmed.contains(pubkey))
+                // A pubkey whose own announcement shows it left is not
+                // invited.
+                .filter(|pubkey| !find(pubkey).is_some_and(|a| a.author_has_left()))
+                .collect();
+            return RepoMembership {
+                state_maintainers: confirmed,
+                invited,
+            };
+        }
+    }
+}
+
+/// Collect authorized state publishers grouped by owner from a set of
+/// announcements.
 ///
-/// ## Example
-///
-/// If Alice's announcement lists Bob as maintainer, and Bob's announcement (for the
-/// same identifier) lists Charlie as maintainer, then Alice's authorized set will
-/// be {Alice, Bob, Charlie}.
+/// For each announcement, returns a map from owner pubkey to the pubkeys
+/// whose repository state events are authoritative for that owner's
+/// repository: the confirmed maintainer set computed by
+/// [`compute_membership`]. Invited pubkeys (listed but without a reciprocal
+/// announcement) are never included.
 pub fn collect_authorized_maintainers(
     announcements: &[RepositoryAnnouncement],
 ) -> HashMap<String, Vec<String>> {
@@ -335,119 +417,17 @@ pub fn collect_authorized_maintainers(
 
     for announcement in announcements {
         let owner = announcement.event.pubkey.to_hex();
-        let identifier = &announcement.identifier;
-
-        // Use recursive helper to get all maintainers
-        let mut checked: HashSet<String> = HashSet::new();
-        get_maintainers_recursive(announcements, &owner, identifier, &mut checked);
-
-        by_owner.insert(owner, checked.into_iter().collect());
+        let membership = compute_membership(announcements, &owner, &announcement.identifier);
+        by_owner.insert(owner, membership.state_maintainers.into_iter().collect());
     }
 
     debug!(
-        "Collected maintainers for {} owners from {} announcements (with recursive expansion)",
+        "Collected confirmed state maintainers for {} owners from {} announcements",
         by_owner.len(),
         announcements.len()
     );
 
     by_owner
-}
-
-/// Recursively find all maintainers starting from a pubkey
-///
-/// This follows the pattern from ngit-relay's GetMaintainers function:
-/// - If pubkey already checked, return early (cycle prevention)
-/// - Mark pubkey as checked
-/// - Find the announcement for this pubkey+identifier
-/// - Recursively call for each maintainer listed in that announcement
-/// - The `checked` set accumulates all visited pubkeys
-fn get_maintainers_recursive(
-    announcements: &[RepositoryAnnouncement],
-    pubkey: &str,
-    identifier: &str,
-    checked: &mut HashSet<String>,
-) {
-    // Check if this pubkey has already been processed
-    if checked.contains(pubkey) {
-        return; // Already checked - avoid cycles
-    }
-    checked.insert(pubkey.to_string()); // Mark as checked
-
-    // Find the announcement event for this pubkey+identifier
-    let announcement = announcements
-        .iter()
-        .find(|a| a.event.pubkey.to_hex() == pubkey && a.identifier == identifier);
-
-    let Some(announcement) = announcement else {
-        return; // No announcement found for this pubkey
-    };
-
-    // Recursively find maintainers for each listed maintainer
-    for maintainer_pubkey in &announcement.maintainers {
-        get_maintainers_recursive(announcements, maintainer_pubkey, identifier, checked);
-    }
-}
-
-/// Find the latest state event authored by an authorized maintainer
-///
-/// Returns the state with the highest created_at timestamp among those
-/// authored by pubkeys in the authorized set.
-pub fn find_latest_authorized_state<'a>(
-    states: &'a [RepositoryState],
-    authorized_pubkeys: &HashSet<String>,
-) -> Option<&'a RepositoryState> {
-    states
-        .iter()
-        .filter(|s| {
-            let pubkey_hex = s.event.pubkey.to_hex();
-            authorized_pubkeys.contains(&pubkey_hex)
-        })
-        .max_by_key(|s| s.event.created_at)
-}
-
-/// Find the latest authorized state for a specific announcement context
-///
-/// This is similar to `find_latest_authorized_state` but considers only
-/// the maintainers authorized for a specific announcement (owner + maintainers),
-/// not the global set across all announcements.
-pub fn find_latest_state_for_announcement<'a>(
-    states: &'a [RepositoryState],
-    announcement: &RepositoryAnnouncement,
-) -> Option<&'a RepositoryState> {
-    // Build the authorized set for this specific announcement
-    let mut authorized = HashSet::new();
-    authorized.insert(announcement.event.pubkey.to_hex());
-    for maintainer in &announcement.maintainers {
-        authorized.insert(maintainer.clone());
-    }
-
-    find_latest_authorized_state(states, &authorized)
-}
-
-/// Check if a state event is the latest for its identifier among given authorized authors
-///
-/// A state is considered "latest" if no other state in the provided list
-/// from an authorized author has a newer timestamp.
-pub fn is_latest_state(
-    state: &RepositoryState,
-    all_states: &[RepositoryState],
-    authorized_pubkeys: &HashSet<String>,
-) -> bool {
-    for other in all_states {
-        // Skip self
-        if other.event.id == state.event.id {
-            continue;
-        }
-        // Only compare against authorized authors
-        if !authorized_pubkeys.contains(&other.event.pubkey.to_hex()) {
-            continue;
-        }
-        // If any authorized state is newer, this is not the latest
-        if other.event.created_at > state.event.created_at {
-            return false;
-        }
-    }
-    true
 }
 
 /// Get the authorization result for a repository scoped to a specific owner
@@ -726,17 +706,6 @@ pub struct AuthorizationResult {
 }
 
 impl AuthorizationResult {
-    /// Create a successful authorization result
-    pub fn authorized(state: RepositoryState, maintainers: Vec<String>) -> Self {
-        Self {
-            authorized: true,
-            reason: "Push matches latest authorized state".to_string(),
-            state: Some(state),
-            maintainers,
-            purgatory_events: vec![],
-        }
-    }
-
     /// Create a denied authorization result
     pub fn denied(reason: impl Into<String>) -> Self {
         Self {
@@ -746,166 +715,6 @@ impl AuthorizationResult {
             maintainers: vec![],
             purgatory_events: vec![],
         }
-    }
-}
-
-/// Authorization context for push operations
-pub struct AuthorizationContext {
-    /// Events fetched from the relay (announcements and states)
-    events: Vec<Event>,
-}
-
-impl AuthorizationContext {
-    /// Create a new authorization context from fetched events
-    pub fn new(events: Vec<Event>) -> Self {
-        Self { events }
-    }
-
-    /// Create a filter to fetch announcement and state events for a repository
-    ///
-    /// This matches the reference implementation's filter logic
-    pub fn create_filter(identifier: &str) -> Filter {
-        Filter::new()
-            .kinds([Kind::GitRepoAnnouncement, Kind::RepoState])
-            .custom_tag(SingleLetterTag::LOWERCASE_D, identifier.to_string())
-    }
-
-    /// Get the latest authorized state for a repository
-    ///
-    /// This implements the GRASP-01 requirement using an efficient single-query approach:
-    /// - Collect all authorized publishers from announcements
-    /// - Find the latest state event from any authorized publisher
-    ///
-    /// No owner_pubkey needed - authorization is determined by announcements themselves.
-    pub fn get_authorized_state(&self, identifier: &str) -> Result<AuthorizationResult> {
-        // Collect all authorized publishers (single pass through announcements)
-        let authorized_publishers = self.get_authorized_publishers(identifier);
-
-        if authorized_publishers.is_empty() {
-            return Ok(AuthorizationResult::denied(
-                "No repository announcement found",
-            ));
-        }
-
-        debug!(
-            "Found {} authorized publishers for repository {}: {:?}",
-            authorized_publishers.len(),
-            identifier,
-            authorized_publishers
-        );
-
-        // Find the latest state event from any authorized publisher
-        let mut latest_state: Option<RepositoryState> = None;
-        let mut latest_timestamp = Timestamp::from(0);
-
-        for event in &self.events {
-            // Check if it's a repository state event
-            if event.kind != Kind::RepoState {
-                continue;
-            }
-
-            // Check if from an authorized publisher
-            let pubkey_hex = event.pubkey.to_hex();
-            if !authorized_publishers.contains(&pubkey_hex) {
-                debug!(
-                    "Skipping state event from unauthorized publisher: {}",
-                    pubkey_hex
-                );
-                continue;
-            }
-
-            // Try to parse the state
-            if let Ok(state) = RepositoryState::from_event(event.clone()) {
-                // Check identifier matches
-                if state.identifier != identifier {
-                    continue;
-                }
-
-                // Check if this is the latest
-                if event.created_at > latest_timestamp {
-                    latest_timestamp = event.created_at;
-                    latest_state = Some(state);
-                }
-            }
-        }
-
-        match latest_state {
-            Some(state) => Ok(AuthorizationResult::authorized(
-                state,
-                authorized_publishers.into_iter().collect(),
-            )),
-            None => Ok(AuthorizationResult::denied(
-                "No state event found from authorized publishers",
-            )),
-        }
-    }
-
-    /// Get all pubkeys authorized to publish state for an identifier
-    ///
-    /// A pubkey is authorized if for ANY announcement with the same identifier:
-    /// - They are the author of that announcement, OR
-    /// - They are listed in the "maintainers" tag of that announcement
-    ///
-    /// This is a simple O(n) single pass - no recursion needed.
-    fn get_authorized_publishers(&self, identifier: &str) -> HashSet<String> {
-        let mut authorized = HashSet::new();
-
-        for event in &self.events {
-            // Only look at announcements
-            if event.kind != Kind::GitRepoAnnouncement {
-                continue;
-            }
-
-            // Try to parse and check identifier
-            if let Ok(announcement) = RepositoryAnnouncement::from_event(event.clone()) {
-                if announcement.identifier != identifier {
-                    continue;
-                }
-
-                // Announcement author is authorized
-                authorized.insert(event.pubkey.to_hex());
-
-                // All listed maintainers are also authorized
-                for maintainer in &announcement.maintainers {
-                    authorized.insert(maintainer.clone());
-                }
-            }
-        }
-
-        authorized
-    }
-
-    /// Check if a specific pubkey is authorized to publish state for an identifier
-    ///
-    /// A pubkey is authorized if for ANY announcement with the same identifier:
-    /// - They are the author of that announcement, OR
-    /// - They are listed in the "maintainers" tag of that announcement
-    #[allow(dead_code)]
-    pub fn is_state_authorized(&self, state_pubkey: &str, identifier: &str) -> bool {
-        for event in &self.events {
-            // Only look at announcements
-            if event.kind != Kind::GitRepoAnnouncement {
-                continue;
-            }
-
-            // Try to parse and check identifier
-            if let Ok(announcement) = RepositoryAnnouncement::from_event(event.clone()) {
-                if announcement.identifier != identifier {
-                    continue;
-                }
-
-                // Check 1: Is state author the announcement author?
-                if event.pubkey.to_hex() == state_pubkey {
-                    return true;
-                }
-
-                // Check 2: Is state author in this announcement's maintainers?
-                if announcement.maintainers.contains(&state_pubkey.to_string()) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 
@@ -1452,126 +1261,358 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_authorized_publishers_single_owner() {
-        let alice = create_test_keys();
-        let identifier = "test-repo";
+    fn parse(event: Event) -> RepositoryAnnouncement {
+        RepositoryAnnouncement::from_event(event).unwrap()
+    }
 
-        let announcement = create_announcement_event(&alice, identifier, &[]);
-        let events = vec![announcement];
-
-        let ctx = AuthorizationContext::new(events);
-
-        // Alice should be authorized
-        assert!(ctx.is_state_authorized(&alice.public_key().to_hex(), identifier));
+    fn hex(keys: &Keys) -> String {
+        keys.public_key().to_hex()
     }
 
     #[test]
-    fn test_authorized_publishers_with_listed_maintainer() {
+    fn test_owner_is_sole_state_maintainer() {
+        let alice = create_test_keys();
+        let identifier = "test-repo";
+        let announcements = vec![parse(create_announcement_event(&alice, identifier, &[]))];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
+        assert!(membership.invited.is_empty());
+    }
+
+    #[test]
+    fn test_no_owner_announcement_means_no_membership() {
         let alice = create_test_keys();
         let bob = create_test_keys();
         let identifier = "test-repo";
 
-        // Alice lists Bob as maintainer
-        let alice_announcement = create_announcement_event(&alice, identifier, &[&bob]);
+        // Only Bob has announced; Alice's repository has no membership.
+        let announcements = vec![parse(create_announcement_event(&bob, identifier, &[]))];
 
-        let events = vec![alice_announcement];
-        let ctx = AuthorizationContext::new(events);
-
-        // Both Alice and Bob should be authorized
-        assert!(ctx.is_state_authorized(&alice.public_key().to_hex(), identifier));
-        assert!(ctx.is_state_authorized(&bob.public_key().to_hex(), identifier));
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.is_empty());
+        assert!(membership.invited.is_empty());
     }
 
     #[test]
-    fn test_authorized_publishers_multiple_announcements() {
+    fn test_listed_maintainer_without_announcement_is_invited() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice lists Bob, but Bob has published no announcement
+        let announcements = vec![parse(create_announcement_event(
+            &alice,
+            identifier,
+            &[&bob],
+        ))];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(membership.invited.contains(&hex(&bob)));
+
+        let by_owner = collect_authorized_maintainers(&announcements);
+        assert!(!by_owner[&hex(&alice)].contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_reciprocal_maintainer_is_confirmed() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        let announcements = vec![
+            parse(create_announcement_event(&alice, identifier, &[&bob])),
+            parse(create_announcement_event(&bob, identifier, &[&alice])),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&alice)));
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+        assert!(membership.invited.is_empty());
+    }
+
+    #[test]
+    fn test_non_reciprocal_announcement_stays_invited() {
         let alice = create_test_keys();
         let bob = create_test_keys();
         let charlie = create_test_keys();
         let identifier = "test-repo";
 
-        // Alice lists Bob, Bob lists Charlie
-        let alice_announcement = create_announcement_event(&alice, identifier, &[&bob]);
-        let bob_announcement = create_announcement_event(&bob, identifier, &[&charlie]);
+        // Bob announced the same identifier but does not list Alice back
+        let announcements = vec![
+            parse(create_announcement_event(&alice, identifier, &[&bob])),
+            parse(create_announcement_event(&bob, identifier, &[&charlie])),
+        ];
 
-        let events = vec![alice_announcement, bob_announcement];
-        let ctx = AuthorizationContext::new(events);
-
-        // All three should be authorized (Alice, Bob from announcements; Bob, Charlie from maintainers)
-        assert!(ctx.is_state_authorized(&alice.public_key().to_hex(), identifier));
-        assert!(ctx.is_state_authorized(&bob.public_key().to_hex(), identifier));
-        assert!(ctx.is_state_authorized(&charlie.public_key().to_hex(), identifier));
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(membership.invited.contains(&hex(&bob)));
     }
 
     #[test]
-    fn test_unauthorized_pubkey() {
-        let alice = create_test_keys();
-        let bob = create_test_keys();
-        let eve = create_test_keys(); // Not authorized
-        let identifier = "test-repo";
-
-        // Alice lists Bob as maintainer
-        let alice_announcement = create_announcement_event(&alice, identifier, &[&bob]);
-
-        let events = vec![alice_announcement];
-        let ctx = AuthorizationContext::new(events);
-
-        // Eve should NOT be authorized
-        assert!(!ctx.is_state_authorized(&eve.public_key().to_hex(), identifier));
-    }
-
-    #[test]
-    fn test_get_authorized_state_with_maintainer() {
+    fn test_reciprocal_announcement_for_other_identifier_stays_invited() {
         let alice = create_test_keys();
         let bob = create_test_keys();
         let identifier = "test-repo";
 
-        let announcement = create_announcement_event(&alice, identifier, &[&bob]);
+        // Bob lists Alice back, but under a different identifier
+        let announcements = vec![
+            parse(create_announcement_event(&alice, identifier, &[&bob])),
+            parse(create_announcement_event(&bob, "other-repo", &[&alice])),
+        ];
 
-        // Bob publishes a state event
-        let state = create_state_event(&bob, identifier, &[("main", "abc123")]);
-
-        let events = vec![announcement, state];
-        let ctx = AuthorizationContext::new(events);
-
-        let result = ctx.get_authorized_state(identifier).unwrap();
-
-        assert!(result.authorized);
-        assert!(result.state.is_some());
-        let state = result.state.unwrap();
-        assert_eq!(state.get_branch_commit("main"), Some("abc123"));
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(membership.invited.contains(&hex(&bob)));
     }
 
     #[test]
-    fn test_get_authorized_state_no_announcement() {
-        let identifier = "test-repo";
-
-        let events = vec![];
-        let ctx = AuthorizationContext::new(events);
-
-        let result = ctx.get_authorized_state(identifier).unwrap();
-
-        assert!(!result.authorized);
-        assert_eq!(result.reason, "No repository announcement found");
-    }
-
-    #[test]
-    fn test_get_authorized_state_no_state_event() {
+    fn test_recursive_reciprocal_chain_confirmed() {
         let alice = create_test_keys();
+        let bob = create_test_keys();
+        let charlie = create_test_keys();
         let identifier = "test-repo";
 
-        let announcement = create_announcement_event(&alice, identifier, &[]);
+        // Alice <-> Bob, Bob -> Charlie, Charlie -> Bob
+        let announcements = vec![
+            parse(create_announcement_event(&alice, identifier, &[&bob])),
+            parse(create_announcement_event(
+                &bob,
+                identifier,
+                &[&alice, &charlie],
+            )),
+            parse(create_announcement_event(&charlie, identifier, &[&bob])),
+        ];
 
-        let events = vec![announcement];
-        let ctx = AuthorizationContext::new(events);
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&alice)));
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+        assert!(membership.state_maintainers.contains(&hex(&charlie)));
+    }
 
-        let result = ctx.get_authorized_state(identifier).unwrap();
+    #[test]
+    fn test_mutual_listing_without_owner_link_stays_invited() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let charlie = create_test_keys();
+        let identifier = "test-repo";
 
-        assert!(!result.authorized);
-        assert_eq!(
-            result.reason,
-            "No state event found from authorized publishers"
+        // Bob and Charlie list each other but neither lists Alice: a mutual
+        // clique disconnected from the owner never becomes confirmed.
+        let announcements = vec![
+            parse(create_announcement_event(&alice, identifier, &[&bob])),
+            parse(create_announcement_event(&bob, identifier, &[&charlie])),
+            parse(create_announcement_event(&charlie, identifier, &[&bob])),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
+        assert!(membership.invited.contains(&hex(&bob)));
+    }
+
+    /// Build an announcement using NIP-34 indexed role tags.
+    /// Each entry is (tag name, values) where values start with the pubkey
+    /// followed by optional history timestamps.
+    fn create_role_announcement(
+        keys: &Keys,
+        identifier: &str,
+        roles: &[(&str, Vec<String>)],
+    ) -> Event {
+        let mut tags = vec![Tag::custom("d", vec![identifier.to_string()])];
+        for (name, values) in roles {
+            tags.push(Tag::custom(*name, values.clone()));
+        }
+        tags.push(Tag::custom(
+            "clone",
+            vec!["https://example.com/test.git".to_string()],
+        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
+
+        EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
+            .tags(tags)
+            .finalize(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_role_tag_maintainer_confirmed_when_reciprocal() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_ended_role_is_no_longer_maintainer() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice's announcement records Bob's co-maintainer role as ended
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![hex(&bob), "0".to_string(), "1700000000".to_string()],
+                ),
+            ],
         );
+        // Bob still lists himself and Alice as active
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(
+            !membership.invited.contains(&hex(&bob)),
+            "an ended role must not be treated as an open invitation"
+        );
+    }
+
+    #[test]
+    fn test_returning_maintainer_history_is_active() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Odd element count: added, removed, then added again
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![
+                        hex(&bob),
+                        "100".to_string(),
+                        "200".to_string(),
+                        "300".to_string(),
+                    ],
+                ),
+            ],
+        );
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_self_leave_takes_precedence() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice still lists Bob as active
+        let alice_announcement = create_role_announcement(
+            &alice,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        );
+        // Bob ended his own role: he has left
+        let bob_announcement = create_role_announcement(
+            &bob,
+            identifier,
+            &[
+                ("M", vec![hex(&alice)]),
+                (
+                    "m",
+                    vec![hex(&bob), "0".to_string(), "1700000000".to_string()],
+                ),
+            ],
+        );
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(!membership.state_maintainers.contains(&hex(&bob)));
+        assert!(!membership.invited.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn test_moderator_is_not_a_state_maintainer() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice lists Bob as moderator; Bob acknowledges with a matching
+        // self-`o` and lists the lead. Moderators are not maintainers: Bob
+        // is neither state-authorized nor treated as an open invitation.
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("o", vec![hex(&bob)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("o", vec![hex(&bob)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
+        assert!(membership.invited.is_empty());
+    }
+
+    #[test]
+    fn test_subordinate_fork_marker_does_not_block_acceptance() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice invites Bob; Bob's announcement carries a `u` (subordinate
+        // fork) tag. Per NIP-34 `u` has no effect on maintainership, so
+        // Bob's listing of Alice still acknowledges the invitation.
+        let alice_announcement = create_announcement_event(&alice, identifier, &[&bob]);
+        let mut tags = vec![
+            Tag::custom("d", vec![identifier.to_string()]),
+            Tag::custom("maintainers", vec![hex(&alice)]),
+            Tag::custom("u", vec![format!("30617:{}:{}", hex(&alice), identifier)]),
+        ];
+        tags.push(Tag::custom(
+            "clone",
+            vec!["https://example.com/test.git".to_string()],
+        ));
+        tags.push(Tag::custom("relays", vec!["wss://example.com".to_string()]));
+        let bob_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repo")
+            .tags(tags)
+            .finalize(&bob)
+            .unwrap();
+
+        let announcements = vec![parse(alice_announcement), parse(bob_announcement)];
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.contains(&hex(&bob)));
+        assert!(!membership.invited.contains(&hex(&bob)));
     }
 
     #[test]

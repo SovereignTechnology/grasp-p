@@ -483,6 +483,14 @@ impl EventAcceptancePolicyTests {
                     "relays",
                     vec!["wss://relay.damus.io"],
                 ))
+                // List the assigning maintainer back: this replaceable event
+                // supersedes the fixture's reciprocal announcement, and NIP-34
+                // demotes a member to invited if their announcement stops
+                // assigning a role to an existing member.
+                .tag(Tag::custom(
+                    "maintainers",
+                    vec![client.maintainer_pubkey_hex()],
+                ))
                 .build(client.recursive_maintainer_keys())
                 .map_err(|e| format!("Failed to build recursive maintainer announcement: {}", e))?;
 

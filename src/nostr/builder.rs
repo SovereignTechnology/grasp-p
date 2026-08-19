@@ -440,8 +440,26 @@ impl Nip34WritePolicy {
                         );
                         // Don't create bare repository for external announcements
 
+                        // Persist the announcement before re-evaluating state:
+                        // membership is computed from the database and this may
+                        // be an invited maintainer's acceptance. The relay
+                        // builder's later save is an idempotent duplicate.
+                        if let Err(e) = self.ctx.database.save_event(event).await {
+                            tracing::warn!(
+                                event_id = %event_id_str,
+                                error = %e,
+                                "Failed to pre-save maintainer announcement before reconciliation"
+                            );
+                        }
+
                         // Check purgatory for state events that might now be authorized
                         self.check_purgatory_state_events_for_identifier(&announcement.identifier)
+                            .await;
+
+                        // An acceptance can make already-stored state events
+                        // authoritative for additional owner repositories, so
+                        // reapply stored states with the updated member set.
+                        self.reconcile_stored_state_events_for_identifier(&announcement.identifier)
                             .await;
 
                         WritePolicyResult::Accept
@@ -491,7 +509,7 @@ impl Nip34WritePolicy {
                 // Process state alignment asynchronously
                 match self
                     .state_policy
-                    .process_state_event(event, is_synced, Some(&promotion_hooks))
+                    .process_state_event(event, is_synced, false, Some(&promotion_hooks))
                     .await
                 {
                     Ok(policy_result) => {
@@ -711,7 +729,7 @@ impl Nip34WritePolicy {
             // Re-evaluate authorization with the new announcement
             match self
                 .state_policy
-                .process_state_event(&entry.event, false, Some(&promotion_hooks))
+                .process_state_event(&entry.event, false, false, Some(&promotion_hooks))
                 .await
             {
                 Ok(WritePolicyResult::Accept) => {
@@ -787,7 +805,7 @@ impl Nip34WritePolicy {
             let promotion_hooks = NostrPurgatoryPromotionHooks::recovery_only(self);
             if let Err(error) = self
                 .state_policy
-                .process_state_event(&state, true, Some(&promotion_hooks))
+                .process_state_event(&state, true, true, Some(&promotion_hooks))
                 .await
             {
                 tracing::warn!(

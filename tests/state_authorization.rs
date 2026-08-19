@@ -216,15 +216,29 @@ async fn test_accept_state_from_maintainer() {
         .finalize(&owner_keys)
         .unwrap();
 
+    // The maintainer confirms membership with a reciprocal announcement that
+    // lists the owner back. Without it they are only invited and their state
+    // events are not authoritative.
+    let reciprocal_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("maintainers", [owner_keys.public_key().to_hex()]),
+        ])
+        .finalize(&maintainer_keys)
+        .unwrap();
+
     // Connect to relay
     let client = Client::default();
     client.add_relay(relay.url()).await.unwrap();
     client.connect().await;
 
-    // Send announcement
+    // Send announcements
     client.send_event(&announcement).await.unwrap();
+    client.send_event(&reciprocal_announcement).await.unwrap();
 
-    // Wait for announcement to be processed
+    // Wait for announcements to be processed
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Send state event from maintainer
@@ -259,6 +273,166 @@ async fn test_accept_state_from_maintainer() {
             );
         }
     }
+
+    relay.stop().await;
+}
+
+/// Send a state event for `test-repo` signed by `keys` and return whether the
+/// relay permanently rejected it as unauthorized.
+async fn state_event_rejected_as_unauthorized(client: &Client, keys: &Keys) -> bool {
+    let state_event = EventBuilder::new(Kind::RepoState, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("refs/heads/main", ["abc123"]),
+        ])
+        .finalize(keys)
+        .unwrap();
+
+    match client.send_event(&state_event).await {
+        Ok(output) => output
+            .failed
+            .values()
+            .any(|err| err.to_string().contains("not authorized")),
+        Err(e) => e.to_string().contains("not authorized"),
+    }
+}
+
+#[tokio::test]
+async fn test_reject_state_from_invited_maintainer() {
+    let relay = TestRelay::start().await;
+
+    let owner_keys = Keys::generate();
+    let maintainer_keys = Keys::generate();
+
+    // The owner lists the maintainer, but the maintainer never publishes a
+    // reciprocal announcement: they remain invited and unauthorized.
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("maintainers", [maintainer_keys.public_key().to_hex()]),
+        ])
+        .finalize(&owner_keys)
+        .unwrap();
+
+    let client = Client::default();
+    client.add_relay(relay.url()).await.unwrap();
+    client.connect().await;
+
+    client.send_event(&announcement).await.unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,
+        "state event from an invited maintainer must be rejected as unauthorized"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_accept_state_from_role_tag_maintainer() {
+    let relay = TestRelay::start().await;
+
+    let owner_keys = Keys::generate();
+    let maintainer_keys = Keys::generate();
+
+    // Owner uses NIP-34 indexed role tags: M for themselves, m for the
+    // co-maintainer.
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("M", [owner_keys.public_key().to_hex()]),
+            Tag::custom("m", [maintainer_keys.public_key().to_hex()]),
+        ])
+        .finalize(&owner_keys)
+        .unwrap();
+
+    // Reciprocal announcement acknowledging the role and listing the lead.
+    let reciprocal_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("M", [owner_keys.public_key().to_hex()]),
+            Tag::custom("m", [maintainer_keys.public_key().to_hex()]),
+        ])
+        .finalize(&maintainer_keys)
+        .unwrap();
+
+    let client = Client::default();
+    client.add_relay(relay.url()).await.unwrap();
+    client.connect().await;
+
+    client.send_event(&announcement).await.unwrap();
+    client.send_event(&reciprocal_announcement).await.unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        !state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,
+        "state event from a confirmed role-tag co-maintainer must not be rejected as unauthorized"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_reject_state_from_removed_maintainer() {
+    let relay = TestRelay::start().await;
+
+    let owner_keys = Keys::generate();
+    let maintainer_keys = Keys::generate();
+
+    // The owner's announcement records the co-maintainer role as ended
+    // (four elements: pubkey plus start/end boundary timestamps).
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("M", [owner_keys.public_key().to_hex()]),
+            Tag::custom(
+                "m",
+                [
+                    maintainer_keys.public_key().to_hex(),
+                    "0".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+        ])
+        .finalize(&owner_keys)
+        .unwrap();
+
+    // Even a reciprocal announcement cannot restore an ended role. It points
+    // at another host so it does not create the maintainer's own hosted repo
+    // here; with the role ended it also no longer qualifies for the
+    // maintainer exception, so the relay may reject it outright.
+    let reciprocal_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", ["https://elsewhere.example/test.git".to_string()]),
+            Tag::custom("relays", ["wss://elsewhere.example".to_string()]),
+            Tag::custom("M", [owner_keys.public_key().to_hex()]),
+            Tag::custom("m", [maintainer_keys.public_key().to_hex()]),
+        ])
+        .finalize(&maintainer_keys)
+        .unwrap();
+
+    let client = Client::default();
+    client.add_relay(relay.url()).await.unwrap();
+    client.connect().await;
+
+    client.send_event(&announcement).await.unwrap();
+    let _ = client.send_event(&reciprocal_announcement).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,
+        "state event from a maintainer whose role has ended must be rejected as unauthorized"
+    );
 
     relay.stop().await;
 }

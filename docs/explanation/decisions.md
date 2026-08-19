@@ -201,3 +201,87 @@ Implemented according to design specification in [`purgatory-design.md`](purgato
 - Design: [`purgatory-design.md`](purgatory-design.md)
 - Architecture: [`architecture.md`](architecture.md#5-purgatory-system-srcpurgatory)
 - Implementation Plan: [`../purgatory-implementation-plan.md`](../purgatory-implementation-plan.md)
+
+---
+
+## Question: Who may publish authoritative repository state?
+
+**Decision (2026-08): maintainer membership is reciprocal** (following the
+NIP-34 maintainers model refined in nips commit `781590b`).
+
+### The model
+
+- A pubkey listed as a maintainer in an announcement is only **invited**
+  until its own announcement for the same identifier lists back an existing
+  confirmed maintainer.
+- Only confirmed maintainers publish authoritative repository state.
+- The owner is always a confirmed maintainer of their own repository:
+  announcing a repository in their namespace is what creates it on this
+  service.
+
+### Implementation choices
+
+1. **State events from invited maintainers are rejected** as unauthorized
+   (previously any pubkey listed in a `maintainers` tag was authorized
+   recursively without reciprocity). The rejected-events index and purgatory
+   re-evaluation recover them automatically once the acceptance announcement
+   arrives.
+2. **Invited maintainers' announcements are still fetched, accepted and
+   synced** (maintainer exception, discovery author sets, dependency
+   walkers): the reciprocal announcement is precisely how the relay learns
+   an invitation was accepted.
+3. **Acceptance triggers reconciliation.** When an acceptance announcement is
+   stored via the maintainer exception, stored state events are re-applied
+   (`reapply_stored`) so a newly confirmed maintainer's latest state
+   re-points the owner's repository without another push.
+
+### Indexed role tags (`M`/`m`)
+
+- `M` (lead) and `m` (co-maintainer) tags are the primary maintainer
+  listing (per the model clarified in nips commit `986edd1`); when present
+  the deprecated `maintainers` tag is ignored per NIP-34 (and parsed as
+  empty). The role distinction carries no meaning for this service: both
+  collapse into one maintainer set.
+- Role tags may record history as alternating start/end timestamps; a tag
+  is currently active when it has fewer than four elements or an odd number
+  of elements. Ended entries are ignored entirely: role history is only
+  used to conclude that a pubkey is *no longer* a maintainer, never to
+  grant time-scoped retroactive authority over historic events. The
+  NIP's owner-first precedence for conflicting past-role records is
+  therefore unused.
+- A pubkey may appear in multiple role tags: one of each letter records a
+  role transition per the NIP, and out-of-spec duplicates under the same
+  letter are consolidated rather than rejected - rejecting them would drop
+  otherwise-valid membership data over a formatting slip. Since only
+  current activity matters here, consolidation reduces to: a pubkey is a
+  maintainer while any of its `M`/`m` entries is active.
+- An announcement using role tags acknowledges its author via an active
+  self-entry, or implicitly: an author who appears in no role tag is a
+  maintainer for the repository's entire history. Only an ended self-entry
+  means the member left, which takes precedence over assignments in other
+  announcements.
+- A `u` (subordinate fork) tag has no effect on maintainership: the author
+  of a role-less announcement asserts maintainership with or without it.
+
+### Moderator role (`o`) grants no maintainership
+
+NIP-34 also defines an `o` (moderator) tag whose members are empowered to
+have their status events (kinds 1630-1633) treated as authoritative. This
+relay does not reject status events from non-maintainers/non-moderators -
+status resolution is left to clients - so the role's own authority needs
+no enforcement here. Moderators never publish authoritative repository
+state, and `o` listings do not create maintainer invitations.
+
+The tag still participates in announcement parsing (per nips commit
+`986edd1`): its presence suppresses the deprecated `maintainers` fallback,
+and a self-`o` entry is a self-role, so a moderator-only author is not
+implicitly a maintainer and their state events are not authorized. Like
+`M`/`m`, duplicate `o` tags for one pubkey are consolidated rather than
+rejected.
+
+Deliberately deferred: announcements from moderators are not walked for
+the `M`/`m` assignments they might carry (the NIP says role combinations
+beyond self-plus-lead SHOULD be avoided unless the author is `M`), and
+moderator membership gets no reciprocal-confirmation treatment. Both only
+matter if status-event authority is ever enforced.
+

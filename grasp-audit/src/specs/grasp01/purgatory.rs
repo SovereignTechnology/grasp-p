@@ -872,6 +872,43 @@ impl PurgatoryTests {
 
             tokio::time::sleep(Duration::from_millis(200)).await;
 
+            // Stage 3b: the new maintainer publishes a reciprocal announcement
+            // listing the owner back. Per NIP-34 they are merely invited (and
+            // unauthorized) until their own announcement acknowledges the role
+            // and assigns a role to an existing member. It points at another
+            // host and is accepted via the maintainer exception.
+            let new_maintainer_npub = new_maintainer_keys
+                .public_key()
+                .to_bech32()
+                .map_err(|e| e.to_string())?;
+            let reciprocal_announcement = client
+                .event_builder(Kind::GitRepoAnnouncement, "")
+                .tag(Tag::identifier(&repo_id))
+                .tag(Tag::custom(
+                    "clone",
+                    vec![format!(
+                        "https://another-grasp-server.com/{}/{}.git",
+                        new_maintainer_npub, repo_id
+                    )],
+                ))
+                .tag(Tag::custom(
+                    "relays",
+                    vec!["wss://relay.damus.io".to_string()],
+                ))
+                .tag(Tag::custom(
+                    "maintainers",
+                    vec![client.public_key().to_hex()],
+                ))
+                .build(&new_maintainer_keys)
+                .map_err(|e| format!("Failed to build reciprocal announcement: {}", e))?;
+
+            client
+                .send_event(reciprocal_announcement)
+                .await
+                .map_err(|e| format!("Relay rejected reciprocal announcement: {}", e))?;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
             // Stage 4: clone the repo and create a unique commit (not pushed yet)
             let relay_domain = relay_url
                 .trim_start_matches("ws://")

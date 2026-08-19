@@ -281,6 +281,50 @@ pub struct RepositoryAnnouncement { ... }
 pub struct RepositoryState { ... }
 ```
 
+#### Maintainer Membership Model
+
+Announcements carry maintainer listings in two formats:
+
+- **Indexed role tags** (`M` lead, `m` co-maintainer). A tag may record
+  history as alternating start/end timestamps; it is currently active when
+  it has fewer than four elements or an odd number of elements. Ended
+  entries are ignored entirely - the history is only used to conclude a
+  role has *ended*, never to grant authority for a past period. The lead /
+  co-maintainer distinction carries no meaning for this service. A pubkey
+  may appear in multiple role tags: one of each letter records a role
+  transition, and out-of-spec duplicates under the same letter are
+  tolerated. Histories are consolidated - the pubkey is a maintainer while
+  any `M`/`m` entry is active. An author who appears in no role tag is
+  implicitly a maintainer for the repository's entire history.
+- **Deprecated `maintainers` tag** (fallback). Ignored when `M`/`m` tags
+  are present. Without any listing tags the author is the sole maintainer.
+  A `u` (subordinate fork) tag has no effect on maintainership.
+
+The moderator tag (`o`) grants no maintainership: moderators only affect
+status-event authority, which this relay does not enforce (see
+[decisions.md](decisions.md)). An `o` tag still counts as a role tag - it
+suppresses the deprecated `maintainers` fallback, and a self-`o` entry is
+a self-role, so a moderator-only author is not implicitly a maintainer.
+`o` listings do not create maintainer invitations.
+
+Authorization follows a reciprocal membership rule, computed per owner by
+[`compute_membership`](src/git/authorization.rs):
+
+- A pubkey listed as a maintainer is only **invited** until its own
+  announcement for the same identifier lists back an existing confirmed
+  maintainer. Invited pubkeys' announcements are still fetched and accepted
+  (that is how acceptance is noticed), but none of their events are
+  authoritative.
+- Confirmation is a fixpoint, so maintainers listed by other confirmed
+  maintainers are reached recursively.
+- The acknowledging announcement must assert an active role for its own
+  author: an ended `M`/`m` self-entry means the pubkey has left, which
+  takes precedence over assignments in other announcements. An author who
+  appears in no role tag implicitly asserts maintainership.
+- The owner is always a confirmed maintainer of their own repository:
+  announcing a repository in their namespace is what creates it on this
+  service.
+
 #### [`policy/state.rs`](src/nostr/policy/state.rs) - State Event Authorization
 
 State events undergo authorization checks at multiple points:
@@ -288,7 +332,8 @@ State events undergo authorization checks at multiple points:
 ```rust
 /// State event authorization checks:
 /// 1. Announcement must exist for the repository identifier
-/// 2. Author must be in maintainer set of accepted announcement
+/// 2. Author must be a confirmed maintainer of an accepted announcement -
+///    invited pubkeys are rejected
 /// 3. Validated on arrival, announcement acceptance, and git data arrival
 ```
 
@@ -439,7 +484,7 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
                 ↓
 5. authorization::get_authorization_for_owner()
    ├─ Query database for announcements
-   ├─ Build recursive maintainer set
+   ├─ Compute confirmed maintainer set (reciprocal membership)
    └─ Get latest authorized state
                 ↓
 6. authorization::validate_push_refs()
@@ -465,7 +510,8 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
 3. Nip34WritePolicy::admit_event()
    ├─ Check if instance in clone tags
    ├─ Check if instance in relays tags
-   ├─ OR: Check if recursive maintainer
+   ├─ OR: author is listed as a maintainer in a known announcement
+   │       (invited maintainers accepted for acceptance discovery)
    └─ Accept or reject
                 ↓
 4. If ACCEPTED:
@@ -498,7 +544,7 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
 2. Nostr relay receives event
                 ↓
 3. Nip34WritePolicy::admit_event()
-   ├─ Check author is in maintainer set (DB + purgatory announcements)
+   ├─ Check author is a confirmed maintainer (DB + purgatory announcements)
    ├─ Validate state structure
    └─ Accept or reject
                 ↓

@@ -6635,8 +6635,10 @@ impl SyncManager {
         let relay_url = format!("ws://{}", self.service_domain);
         let mut dependency_refetch_ids = HashSet::new();
         let mut hot_dependency_events = Vec::new();
+        // Walk every currently-listed maintainer, including invited ones:
+        // their announcements must be recovered so acceptance is noticed.
         let mut maintainer_queue: VecDeque<String> =
-            announcement.maintainers.iter().cloned().collect();
+            announcement.listed_maintainers().into_iter().collect();
         let mut visited_maintainers = HashSet::new();
         let mut dependency_relay_urls: HashSet<String> =
             announcement.relays.iter().cloned().collect();
@@ -6703,8 +6705,8 @@ impl SyncManager {
                         if let Ok(accepted_announcement) =
                             crate::nostr::events::RepositoryAnnouncement::from_event(accepted_event)
                         {
+                            maintainer_queue.extend(accepted_announcement.listed_maintainers());
                             dependency_relay_urls.extend(accepted_announcement.relays);
-                            maintainer_queue.extend(accepted_announcement.maintainers);
                         }
                     }
                 }
@@ -7409,16 +7411,19 @@ impl SyncManager {
                     match RepositoryAnnouncement::from_event(event.clone()) {
                         Ok(announcement) => {
                             // Re-process rejected maintainer announcements
-                            if !announcement.maintainers.is_empty() {
+                            // Re-process rejected announcements from every
+                            // currently-listed maintainer (invited included)
+                            let listed_maintainers = announcement.listed_maintainers();
+                            if !listed_maintainers.is_empty() {
                                 tracing::debug!(
                                     event_id = %event.id,
                                     identifier = %announcement.identifier,
-                                    maintainer_count = announcement.maintainers.len(),
+                                    maintainer_count = listed_maintainers.len(),
                                     "Owner announcement accepted, checking for rejected maintainer announcements"
                                 );
 
                                 // For each maintainer, invalidate and get their events
-                                for maintainer_hex in &announcement.maintainers {
+                                for maintainer_hex in &listed_maintainers {
                                     // Parse maintainer public key
                                     match PublicKey::from_hex(maintainer_hex) {
                                         Ok(maintainer_pubkey) => {
