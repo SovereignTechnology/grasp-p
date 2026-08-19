@@ -1941,12 +1941,12 @@ struct Nip65DiscoveryState {
     /// no accepted relay list. They use the operator's bounded fallback set
     /// until an accepted kind 10002 arrives.
     fallback_authors: HashSet<PublicKey>,
-    /// Essential live repository and root coverage on accepted owners' and
-    /// maintainers' read/unmarked NIP-65 inboxes. Root-author inbox roots are
-    /// unioned into the same live target map, while participant write/outbox
-    /// coverage remains on the history-only mailbox path below.
+    /// Essential live root coverage on accepted root authors' read/unmarked
+    /// NIP-65 inboxes. Owner/maintainer repository scope and participant
+    /// write/outbox coverage remain on the history-only mailbox path below:
+    /// owning or maintaining a repository never makes an author's inbox an
+    /// ordinary persistent live target.
     inbox_roots: HashMap<String, HashSet<EventId>>,
-    inbox_repositories: HashMap<String, HashSet<String>>,
     mailbox_roots: HashMap<String, HashSet<EventId>>,
     mailbox_repositories: HashMap<String, HashSet<String>>,
     mailbox_probe_next_at: HashMap<String, Instant>,
@@ -5671,7 +5671,6 @@ impl SyncManager {
     async fn derive_targets(&self) -> HashMap<String, RelaySyncNeeds> {
         let repo_index = self.repo_sync_index.read().await;
         let mut targets = algorithms::derive_relay_targets(&repo_index);
-        discovery::merge_inbox_repositories(&mut targets, &self.nip65_discovery.inbox_repositories);
         discovery::merge_inbox_roots(&mut targets, &self.nip65_discovery.inbox_roots);
         targets
     }
@@ -5873,22 +5872,11 @@ impl SyncManager {
                 });
             self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
             let fallback_relays = self.configured_nip65_fallback_relays();
-            let mut inbox_overlay = discovery::build_inbox_root_overlay(
+            let inbox_overlay = discovery::build_inbox_root_overlay(
                 &self.nip65_discovery.root_author_roots,
                 &self.nip65_discovery.author_inboxes,
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
-            );
-            let inbox_repository_overlay = discovery::build_mailbox_repository_overlay(
-                &self.nip65_discovery.author_repositories,
-                &self.nip65_discovery.author_inboxes,
-                &self.nip65_discovery.fallback_authors,
-                &fallback_relays,
-            );
-            merge_repository_roots_into_mailbox_overlay(
-                &mut inbox_overlay,
-                &inbox_repository_overlay,
-                &self.nip65_discovery.root_repositories,
             );
             let mut mailbox_overlay = discovery::build_inbox_root_overlay(
                 &self.nip65_discovery.author_roots,
@@ -5896,9 +5884,12 @@ impl SyncManager {
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
+            // Owner/maintainer repository scope is historical-only, on their
+            // bounded read/unmarked inbox selection: owning a repository must
+            // not add an author's inboxes to persistent live targets.
             let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
                 &self.nip65_discovery.author_repositories,
-                &self.nip65_discovery.author_mailboxes,
+                &self.nip65_discovery.author_inboxes,
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
@@ -5907,8 +5898,7 @@ impl SyncManager {
                 &mailbox_repository_overlay,
                 &self.nip65_discovery.root_repositories,
             );
-            self.install_nip65_inbox_overlay(inbox_overlay, inbox_repository_overlay)
-                .await;
+            self.install_nip65_inbox_overlay(inbox_overlay).await;
             self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
             tracing::info!(
                 root_count = root_ids.len(),
@@ -6008,30 +5998,20 @@ impl SyncManager {
     async fn install_nip65_inbox_overlay(
         &mut self,
         new_root_overlay: HashMap<String, HashSet<EventId>>,
-        new_repository_overlay: HashMap<String, HashSet<String>>,
     ) {
         let old_root_overlay =
             std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_root_overlay);
-        let old_repository_overlay = std::mem::replace(
-            &mut self.nip65_discovery.inbox_repositories,
-            new_repository_overlay,
-        );
-        if old_root_overlay == self.nip65_discovery.inbox_roots
-            && old_repository_overlay == self.nip65_discovery.inbox_repositories
-        {
+        if old_root_overlay == self.nip65_discovery.inbox_roots {
             return;
         }
         let mut dirty_relays: HashSet<String> = old_root_overlay.keys().cloned().collect();
         dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
-        dirty_relays.extend(old_repository_overlay.keys().cloned());
-        dirty_relays.extend(self.nip65_discovery.inbox_repositories.keys().cloned());
 
         for relay in dirty_relays {
-            // Repository owner/maintainer inboxes enter the same essential
-            // live target layer as root-author inboxes. Recursive descendant
-            // expansion remains auxiliary and may rotate under pressure.
-            // Removal-only changes drain through the ordinary coverage
-            // lifecycle instead of churning shared subscriptions.
+            // Root-author inbox roots are essential live coverage. Recursive
+            // descendant expansion remains auxiliary and may rotate under
+            // pressure. Removal-only changes drain through the ordinary
+            // coverage lifecycle instead of churning shared subscriptions.
             self.recompute_new_sync_filters_for_relay(&relay).await;
         }
     }
@@ -6393,22 +6373,11 @@ impl SyncManager {
             return;
         }
         let fallback_relays = self.configured_nip65_fallback_relays();
-        let mut inbox_overlay = discovery::build_inbox_root_overlay(
+        let inbox_overlay = discovery::build_inbox_root_overlay(
             &self.nip65_discovery.root_author_roots,
             &self.nip65_discovery.author_inboxes,
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
-        );
-        let inbox_repository_overlay = discovery::build_mailbox_repository_overlay(
-            &self.nip65_discovery.author_repositories,
-            &self.nip65_discovery.author_inboxes,
-            &self.nip65_discovery.fallback_authors,
-            &fallback_relays,
-        );
-        merge_repository_roots_into_mailbox_overlay(
-            &mut inbox_overlay,
-            &inbox_repository_overlay,
-            &self.nip65_discovery.root_repositories,
         );
         let mut mailbox_overlay = discovery::build_inbox_root_overlay(
             &self.nip65_discovery.author_roots,
@@ -6416,9 +6385,12 @@ impl SyncManager {
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
+        // Owner/maintainer repository scope is historical-only, on their
+        // bounded read/unmarked inbox selection: owning a repository must
+        // not add an author's inboxes to persistent live targets.
         let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
             &self.nip65_discovery.author_repositories,
-            &self.nip65_discovery.author_mailboxes,
+            &self.nip65_discovery.author_inboxes,
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
@@ -6427,8 +6399,7 @@ impl SyncManager {
             &mailbox_repository_overlay,
             &self.nip65_discovery.root_repositories,
         );
-        self.install_nip65_inbox_overlay(inbox_overlay, inbox_repository_overlay)
-            .await;
+        self.install_nip65_inbox_overlay(inbox_overlay).await;
         self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
         tracing::info!(
             source = %result.source_relay,

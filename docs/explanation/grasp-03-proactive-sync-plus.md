@@ -19,11 +19,11 @@ existing index set for each author's latest profile kind `0` and NIP-65 kind
 `read` and unmarked inboxes in ordinary GRASP-02 coverage; and probe accepted
 participants' `read`, `write` and unmarked conversation mailboxes with
 repository and thread-reference filters. On public instances, accepted
-repository owners' and declared maintainers' `read` and unmarked inboxes also
-enter ordinary GRASP-02 repository coverage for their exact repositories;
-their wider read/write mailbox set retains the history probe. Repository
-coordinates on those inboxes can therefore discover a root which is not yet
-present locally and continue receiving new roots live.
+repository owners' and declared maintainers' bounded `read` and unmarked
+inboxes additionally receive repository-scoped historical mailbox probes.
+Repository coordinates on those inboxes can therefore discover a root which is
+not yet present locally on the recurring history cycle; the inboxes do not
+enter ordinary GRASP-02 live repository coverage.
 
 Kind `10002` lists are untrusted peer input, so every relay URL they advertise
 passes single-URL target hygiene before it can occupy any selection slot,
@@ -45,13 +45,10 @@ not subject to peer-input hygiene.
 
 Mailbox work reuses GRASP-02's connection safety, filter byte packing,
 pagination, subscription ledger, request pacing, event pipeline and write
-policy. The participant expansion is history-only: a non-root participant
+policy. The participant and owner/maintainer expansions are history-only: a
 relay never becomes a permanent live source merely because an accepted author
-advertised it. Root-author inboxes retain the pre-existing live/rotating Sync+
-behavior. Owner/maintainer repository inbox filters are essential core
-coverage, equal to canonical root-author inbox filters and above recursive
-descendant fan-out; compatibility tag variants may rotate before canonical
-coverage is sacrificed.
+advertised it or because its author owns or maintains a repository.
+Root-author inboxes retain the pre-existing live/rotating Sync+ behavior.
 
 Authors without an accepted stored relay list are queried through the configured
 user-index set plus the bootstrap relay. Once a list is retained, discovery
@@ -104,9 +101,9 @@ database before any network refresh, so serving established coverage does not
 depend on an external index remaining available. Remote discovery then refreshes
 that retained state on the normal cadence.
 
-Root-author and repository owner/maintainer read/unmarked inboxes use ordinary
-GRASP-02 coverage. Wider participant mailboxes and owner/maintainer write-only
-outboxes use history-only workers. A maintenance pass admits at most one new
+Root-author read/unmarked inboxes use ordinary GRASP-02 coverage. Participant
+mailboxes and owner/maintainer repository-scoped inboxes use history-only
+workers. A maintenance pass admits at most one new
 due history relay, while each admitted relay may have at most one worker in
 flight and drains its own filter cursor without returning to a global
 round-robin between successful groups. Up to 32 relay workers may run at once
@@ -128,11 +125,11 @@ or cross-relay coordinator is added.
 Coverage uses accepted repository coordinates, root IDs, bounded recursive
 descendant IDs, and descendant address coordinates with `a`/`A`/`q` and
 `e`/`E`/`q`. A repository-scoped owner or maintainer inbox receives the exact
-repository and every currently known root in it as core live and historic
-work. This permits a status or other descendant stored only on that inbox to
-be found even when the root author's current relay list does not name it. The
-wider mailbox history probe covers the same references and a participant-only
-mailbox remains constrained to its derived roots. A numeric in-memory cursor
+repository and every currently known root in it as historical probe work. This
+permits a status or other descendant stored only on that inbox to be found on
+the recurring history cycle even when the root author's current relay list
+does not name it. A participant-only mailbox remains constrained to its
+derived roots. A numeric in-memory cursor
 gives each byte-bounded history filter group a turn. A successful complete
 rotation refreshes after 24 hours; a failed group advances the cursor after a
 five-minute delay and is retried on a later rotation. A relay already needed
@@ -140,20 +137,17 @@ for ordinary repository sync shares its connection; an exclusively
 history/control-plane connection retires when its identity and mailbox work is
 idle.
 
-Owner/maintainer expansion adds a persistent managed connection and essential
-live repository/root filters for each distinct read inbox, plus history
-rotation proportional to the byte-packed repository coordinates and known
-roots assigned to every mailbox. Shared relays and duplicate repository scopes
-are unioned before filter construction. Canonical live filters consume normal
-GRASP-02 subscription-ledger capacity; compatibility variants and recursive
-descendants retain the existing priority cutoff and history fallback. History
-still admits at most one new relay per maintenance pass and remains
-single-flight per relay, but an admitted relay keeps its worker while its
-successful filter groups drain. More distinct maintainer relays can therefore
-increase both persistent connection/subscription load and active history
-workers up to the process-wide safety ceiling; the
-fixed-cardinality relay, cursor, worker, connection, and subscription metrics
-must be watched during a production soak.
+Owner/maintainer expansion adds history rotation proportional to the
+byte-packed repository coordinates and known roots assigned to each of their
+bounded read/unmarked inboxes; it adds no persistent live filters or
+subscriptions. Shared relays and duplicate repository scopes are unioned
+before filter construction. History still admits at most one new relay per
+maintenance pass and remains single-flight per relay, but an admitted relay
+keeps its worker while its successful filter groups drain. With hygiene and
+the four-relay per-author bound applied before selection, distinct maintainer
+relays increase only active history workers up to the process-wide safety
+ceiling; the fixed-cardinality relay, cursor, worker, connection, and
+subscription metrics must be watched during a production soak.
 
 On restart, accepted roots and retained kind `10002` events rebuild participant
 and mailbox ownership from LMDB. The in-memory group cursor is intentionally
@@ -168,8 +162,8 @@ This makes a stuck worker or unexpected inventory expansion visible without
 putting peer URLs or public keys into metric labels.
 
 Mailbox replacement/removal changes desired ownership immediately. Root-author
-and owner/maintainer repository inbox additions use ordinary coverage, while
-removal-only changes let existing shared live subscriptions drain naturally.
+inbox additions use ordinary coverage, while removal-only changes let existing
+shared live subscriptions drain naturally.
 History-probe additions become due promptly; removals prevent future groups
 while an already in-flight `fetch_events` worker may finish naturally. Root
 deletion follows the existing GRASP-02 root-index lifecycle and is
@@ -187,4 +181,5 @@ add a second deletion graph.
 - identity storage for authors outside accepted repositories and their
   locally accepted threads;
 - per-user fallback configuration knobs; and
-- permanent non-root participant-mailbox live subscriptions.
+- permanent live subscriptions on non-root participant mailboxes or on
+  owner/maintainer inboxes discovered only through repository ownership.

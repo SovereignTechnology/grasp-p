@@ -693,15 +693,14 @@ filter cursor without waiting for a global relay rotation. They reuse the
 connection's ordinary pacing, subscription ledger, pagination and 30-second
 per-page terminal timeout without installing permanent participant
 subscriptions or coupling progress between relays. On public instances, each
-accepted repository owner's and declared maintainer's NIP-65 read/unmarked
-inboxes also become ordinary full repository sources for their exact
-repositories and all locally known roots. Their canonical repository/root
-filters are essential live coverage—equal to root-author canonical inbox
-coverage and above recursive descendant fan-out—while their wider mailbox set
-continues through the history workers. This discovers previously unknown roots
-and descendants that exist only on a maintainer mailbox without broadening an
-ordinary participant mailbox. Private instances omit repository-coordinate
-mailbox expansion.
+accepted repository owner's and declared maintainer's bounded, sanitized
+read/unmarked NIP-65 inboxes receive repository-scoped historical mailbox
+probes covering their exact repositories and all locally known roots. This
+discovers previously unknown roots and descendants that exist only on a
+maintainer mailbox without broadening an ordinary participant mailbox, and it
+is deliberately historical-only: owning or maintaining a repository never adds
+that author's inbox relays to ordinary persistent live repository targets.
+Private instances omit repository-coordinate mailbox expansion.
 
 ### Rejected Events Index
 

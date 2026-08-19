@@ -315,7 +315,7 @@ async fn participant_write_mailbox_fetches_child_of_direct_reaction() {
 }
 
 #[tokio::test]
-async fn owner_inbox_live_sync_discovers_unknown_root_and_root_only_status() {
+async fn owner_inbox_history_discovers_unknown_root_without_live_sync() {
     let index = MockRelay::start().await;
     let mailbox = MockRelay::start().await;
     let owner = Keys::generate();
@@ -387,29 +387,40 @@ async fn owner_inbox_live_sync_discovers_unknown_root_and_root_only_status() {
         "repository mailbox ownership should remain observable without public-key labels"
     );
     assert!(
-        sync_log
-            .lines()
-            .any(|line| { line.contains("Starting fresh_start") && line.contains(mailbox.url()) }),
-        "an owner inbox should enter ordinary repository live sync"
+        sync_log.lines().any(|line| {
+            line.contains("Started bounded participant mailbox fetch")
+                && line.contains(mailbox.url())
+        }),
+        "the owner inbox should be probed through the repository-scoped history path"
     );
 
-    let live_issue = build_layer2_issue_event(
+    // A root published later is still discovered, but only through the
+    // recurring historical probe cycle: the owner inbox never becomes an
+    // ordinary live repository source.
+    let later_issue = build_layer2_issue_event(
         &root_author,
         &repo_coord(&owner, identifier),
-        "root published after owner-inbox live coverage was installed",
+        "root published after initial owner-inbox history",
     )
-    .expect("build live mailbox root");
-    send_to_relay_url(mailbox.url(), &live_issue)
+    .expect("build later mailbox root");
+    send_to_relay_url(mailbox.url(), &later_issue)
         .await
-        .expect("publish root after live coverage");
+        .expect("publish root after initial history");
     assert!(
         wait_for_event_on_relay(
             syncing.url(),
-            Filter::new().id(live_issue.id),
-            Duration::from_secs(5),
+            Filter::new().id(later_issue.id),
+            Duration::from_secs(30),
         )
         .await,
-        "owner inbox repository coverage should remain live after initial history"
+        "owner inbox repository coverage should continue through historical refresh"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        !sync_log
+            .lines()
+            .any(|line| { line.contains("Starting fresh_start") && line.contains(mailbox.url()) }),
+        "an owner inbox must not enter ordinary repository live sync"
     );
 
     syncing.stop().await;
