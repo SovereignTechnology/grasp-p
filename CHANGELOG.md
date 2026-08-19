@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Summary
+
+Private Repos - via private grasp service (grasp-08) - initially self-hosted only but the intention is to allow providers to offer it as service.
+
+Proactive Sync Plus (GRASP-03) - a big enabler for maintainer based moderation and simplier and more performant git nostr clients.
+
+Performance and Security fixes - along with other improvements; immediate upgrade recommended; some breaking changes make v2-v3 a one way street!
+
 ### Breaking changes
 
 - Version 3 performs an automatic, one-way migration of `NGIT_GIT_DATA_PATH`
@@ -249,7 +257,6 @@ defensive limits explicit and operator-configurable.
   subscription IDs; 1 MiB retained subscription state; 10 active negentropy
   sessions and 50,000 negentropy items per connection; 5 MiB WebSocket
   messages; and a 10-second handshake deadline. ngit-grasp deliberately:
-
   - makes the discoverable subscription and filter-result limits configurable
     and advertises them in NIP-11;
   - raises rust-nostr's new 64 KiB event bound to a configurable 192 KiB
@@ -344,6 +351,7 @@ defensive limits explicit and operator-configurable.
   replacement is promoted when the locally available Git data cannot
   reconstruct them. Reconstructable rollback states and other maintainers'
   states are retained.
+
 ## [2.0.0] - 2026-07-27
 
 ### Breaking changes
