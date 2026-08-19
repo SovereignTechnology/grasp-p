@@ -249,6 +249,42 @@ view whose alternate is the identifier family. Therefore:
 Mirroring a PR into an owner view becomes a ref update after an object
 availability check. It no longer copies the object graph.
 
+## V2 to v3 migration boundary
+
+V3 changes the on-disk meaning of every served Git repository. Owner and
+`/prs/` paths become thin views whose objects and write serialization belong to
+the identifier family under `.grasp`. Migration happens automatically on the
+first v3 launch, but the result is not safe for v2: v2 has no family lock,
+retained-root, or shared-object write model. A software rollback therefore
+requires restoring the Git and relay-data snapshot taken before v3; changing
+only the binary is not supported.
+
+One pre-release development interval can leave server-side shallow
+repositories for v3 to reconcile. State Git-data fallback was introduced by
+commit `623cae5` on 2026-01-05 with `git fetch --depth=1`, carried into the
+rewritten purgatory sync path, and changed to a full fetch by commit `f25eea8`
+on 2026-01-12. The first tagged release was v1.0.0 on 2026-02-26 and already
+contained the fix, so no tagged v1 or v2 release shipped the shallow-fetch
+behavior. Only operators who deployed an untagged source revision from that
+seven-day interval can have repositories created by this bug.
+
+The affected path was the non-happy-path Git-data fallback. It ran only when a
+pending state or PR event named OIDs which had not arrived through an ordinary
+push, then fetched those OIDs into an existing local repository from another
+announcement or PR clone URL. A repository whose required data arrived through
+the normal push path did not invoke this fallback.
+
+V3 treats a legacy `shallow` marker as compatibility state rather than a reason
+to delete or disable the repository. Migration preserves the marker on the thin
+view so its shallow clones and current tree continue to work, and retains the
+legacy backup. After the listener starts, the ordinary integrity worker
+requests the complete closure from other accepted clone servers. On success it
+removes the marker; the next v3 launch retires the now-redundant backup. On
+failure the existing shallow clone and current tree remain available, the
+backup remains, and an `ERROR` log identifies the family with a non-zero
+`shallow_views` count. The operator does not need to take a separate action for
+the v3 upgrade.
+
 ## Startup migration
 
 Migration runs after configuration validation and before purgatory restoration,
@@ -275,10 +311,54 @@ For each legacy bare repository:
 
 On restart, the journal determines whether to resume copying, finish a rename,
 or restore the legacy directory. Every state transition is safe to repeat.
-The original repository backup remains until the entire storage-version
-migration has been verified. The first implementation does not delete those
-backups automatically; an operator-visible later cleanup process can do so
-after an appropriate rollback window.
+
+Backups are retired family by family rather than accumulating until the whole
+migration finishes. After the last view of a family is installed, each of its
+backups must pass a retirement gate: the family contains every Git-readable
+object of the backup, every affected view is a correctly wired thin view whose
+refs and `HEAD` match its journal snapshot, and every family pack is indexed
+and passes `git verify-pack`. The ordinary family integrity inspection must
+also report the family and all of its views healthy. This final check catches
+corrupt loose objects, missing history, broken ref targets, invalid alternates,
+and shallow views. An unhealthy family keeps its backups while the non-blocking
+integrity worker attempts repair after startup. Only a healthy family writes a
+durable `retired` journal state, deletes the backup, and removes the journal
+before the next family is migrated. Peak migration overhead is therefore
+bounded by the family currently in flight except for the small set of families
+still awaiting repair.
+
+Backup deletion is itself durable: every directory entry removed while
+deleting and pruning a backup is fsynced before its journal is removed. A
+power loss therefore leaves either a discoverable `retired` journal that
+finishes deletion or no backup entry to rediscover.
+
+Packs without an index are Git-invisible, so the superset proof cannot vouch
+for them; they are moved into content-addressed directories beneath
+`.grasp/migration/unindexed-packs/` before their backup is deleted. Repeated
+migrations preserve different payloads even when their original pack filenames
+match, while an identical payload converges on the same quarantine path.
+
+A server-side `shallow` marker is a compatibility boundary, not valid final
+family storage. Migration copies it onto the installed thin view so the view
+keeps serving exactly what the legacy repository served, and excludes its
+backup from retirement until the family holds the complete reachable closure
+of the backup's refs. Closure recovery is the ordinary integrity repair: the
+family reports truncated parents as missing objects and marked views as
+`shallow_views`, repair fetches the closure from accepted clone sources, and
+once complete removes the marker. The backup retires on the next launch. An
+unrecoverable closure retains both marker and backup and keeps the family
+reported as unresolved; it never blocks startup because recovery depends on
+remote servers. Client-requested shallow clones and fetches remain supported
+throughout.
+
+Retirement failures during an active migration are fail-closed and keep the
+backup. Journals from a migration that already committed are handled
+leniently on later launches: their ref snapshots are stale once the server
+has served traffic, so the gate skips snapshot equality, and an unverifiable
+backup (for example one whose migrated view was later deleted by repository
+lifecycle) is retained with a warning as operator-managed rollback material.
+Installations whose backups were verified and deleted manually simply have
+their completed journals removed.
 
 The global `storage-version` advances only after every eligible repository is
 complete. A server must fail startup on an unrepairable mismatch rather than
@@ -324,8 +404,9 @@ on remote servers.
 This is also the migration repair path. Migration remains a deterministic,
 offline conversion that preserves every Git-readable object and the exact
 legacy refs. Once those paths are thin family views, the ordinary family pass
-can heal pre-existing missing objects. Unindexed legacy packs remain in the
-migration backup; there is no separate legacy repair subsystem.
+can heal pre-existing missing objects. Unindexed legacy packs are preserved
+under `.grasp/migration/unindexed-packs/` when their backup is retired; there
+is no separate legacy repair subsystem.
 
 Operators can queue the same identifier-scoped check in the live process:
 

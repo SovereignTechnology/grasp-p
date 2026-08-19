@@ -126,17 +126,25 @@ impl RelayServer {
         info!("Database backend: {}", config.database_backend);
 
         // Upgrade Git storage before any runtime component can inspect or
-        // mutate repositories. Migration is resumable and retains original
-        // repositories as operator-managed rollback backups.
+        // mutate repositories. Migration is resumable; each identifier
+        // family's legacy backups are verified and retired before the next
+        // family converts, so peak disk overhead is bounded by the family
+        // currently in flight. Backups that cannot be verified are retained
+        // as operator-managed rollback material.
         let git_storage = git::storage::LocalGitStorage::new(config.effective_git_data_path());
         let migration = git::migration::migrate_on_startup(&git_storage)
             .await
             .context("upgrade Git repositories to identifier-family storage")?;
-        if !migration.already_current {
+        if !migration.already_current
+            || migration.retired_backups > 0
+            || migration.retained_backups > 0
+        {
             info!(
                 migrated_views = migration.migrated_views,
                 recovered_views = migration.recovered_views,
                 families_built = migration.families_built,
+                retired_backups = migration.retired_backups,
+                retained_backups = migration.retained_backups,
                 "Git identifier-family storage migration completed"
             );
         }

@@ -1,18 +1,28 @@
 //! Crash-safe launch migration from full bare repositories to thin family views.
 //!
 //! The migration runs before any relay task can access Git storage. Original
-//! repositories are moved under `.grasp/migration/backups` and are never
-//! deleted automatically. Every object reported by `cat-file
-//! --batch-all-objects`, including unreachable objects, is copied into a
-//! verified union pack before a view can be replaced.
+//! repositories are moved under `.grasp/migration/backups` while their family
+//! is converted. Every object reported by `cat-file --batch-all-objects`,
+//! including unreachable objects, is copied into a verified union pack before
+//! a view can be replaced.
+//!
+//! Backups are retired family by family: once every view of one identifier
+//! family is installed, each backup is verified against the family (every
+//! Git-readable backup object present, thin views wired and matching their
+//! journal snapshot, family packs valid) and the ordinary family integrity
+//! inspection must be healthy. It is then deleted before the next family is
+//! migrated. Peak migration overhead is therefore bounded by the family
+//! currently in flight rather than the whole legacy dataset. Packs without an
+//! index are Git-invisible and are quarantined by content under
+//! `.grasp/migration/unindexed-packs` instead of being destroyed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -27,6 +37,11 @@ pub struct MigrationReport {
     pub migrated_views: usize,
     pub recovered_views: usize,
     pub families_built: usize,
+    /// Legacy repository backups deleted after their family verified.
+    pub retired_backups: usize,
+    /// Backups kept because post-migration verification could not prove the
+    /// family supersedes them. They remain operator-managed.
+    pub retained_backups: usize,
     pub already_current: bool,
 }
 
@@ -54,6 +69,24 @@ enum JournalState {
     BackedUp,
     ViewInstalled,
     Complete,
+    /// Retirement verification passed and the backup is disposable. Written
+    /// before backup deletion starts so an interrupted deletion resumes
+    /// without re-verification.
+    Retired,
+}
+
+/// A completed view whose legacy backup is ready to be verified and retired.
+struct RetirementUnit {
+    journal_path: PathBuf,
+    journal: ViewJournal,
+    view_path: PathBuf,
+    backup_path: PathBuf,
+    key: FamilyKey,
+    /// Whether a verification failure must abort startup. True while the
+    /// journal snapshot is authoritative (an active migration run); false for
+    /// journals from a long-committed migration whose view refs have
+    /// legitimately drifted, where an unverifiable backup is retained instead.
+    strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +98,11 @@ struct ViewJournal {
     refs: BTreeMap<String, RefSnapshot>,
     head: Vec<u8>,
     state: JournalState,
+    /// The legacy repository carried a server-side `shallow` marker, so its
+    /// object set is a deliberate truncation. Its backup may only retire once
+    /// the family holds the complete closure of the backup's refs.
+    #[serde(default)]
+    shallow: bool,
 }
 
 /// Upgrade all eligible Git repositories under one storage root.
@@ -80,25 +118,35 @@ pub async fn migrate_on_startup(storage: &LocalGitStorage) -> Result<MigrationRe
     })?;
     let storage_is_current = validate_storage_version(storage)?;
     let mut candidates = scan_active_legacy_views(storage)?;
-    if storage_is_current && candidates.is_empty() {
+    let journals = load_journals(storage)?;
+    if storage_is_current && candidates.is_empty() && journals.is_empty() {
         return Ok(MigrationReport {
             already_current: true,
             ..MigrationReport::default()
         });
     }
 
-    let journals = load_journals(storage)?;
-    reconcile_journals(storage, journals, &mut candidates)?;
+    let mut report = MigrationReport::default();
+    let retirement = reconcile_journals(
+        storage,
+        storage_is_current,
+        journals,
+        &mut candidates,
+        &mut report,
+    )?;
     candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     candidates.dedup_by(|left, right| left.relative_path == right.relative_path);
 
-    let mut report = MigrationReport::default();
-    let mut by_family: HashMap<FamilyKey, Vec<Candidate>> = HashMap::new();
+    let mut by_family: HashMap<FamilyKey, (Vec<Candidate>, Vec<RetirementUnit>)> = HashMap::new();
     for candidate in candidates {
         by_family
             .entry(candidate.key.clone())
             .or_default()
+            .0
             .push(candidate);
+    }
+    for unit in retirement {
+        by_family.entry(unit.key.clone()).or_default().1.push(unit);
     }
     let mut families: Vec<_> = by_family.into_iter().collect();
     families.sort_by(|(left, _), (right, _)| {
@@ -108,20 +156,32 @@ pub async fn migrate_on_startup(storage: &LocalGitStorage) -> Result<MigrationRe
             .then(left.identifier.cmp(&right.identifier))
     });
 
-    for (key, candidates) in families {
-        build_family_union(storage, &key, &candidates)?;
-        report.families_built += 1;
-        for candidate in candidates {
-            install_view(storage, &candidate)?;
-            if candidate.recovered {
-                report.recovered_views += 1;
-            } else {
-                report.migrated_views += 1;
+    let mut retained_journals = Vec::new();
+    for (key, (candidates, mut units)) in families {
+        if !candidates.is_empty() {
+            build_family_union(storage, &key, &candidates)?;
+            report.families_built += 1;
+            for candidate in candidates {
+                let journal = install_view(storage, &candidate)?;
+                if candidate.recovered {
+                    report.recovered_views += 1;
+                } else {
+                    report.migrated_views += 1;
+                }
+                units.push(RetirementUnit {
+                    journal_path: candidate.journal_path.clone(),
+                    journal,
+                    view_path: candidate.view_path.clone(),
+                    backup_path: candidate.backup_path.clone(),
+                    key: key.clone(),
+                    strict: true,
+                });
             }
         }
+        retire_family_backups(storage, &key, units, &mut report, &mut retained_journals)?;
     }
 
-    verify_all_views(storage)?;
+    verify_all_views(storage, &retained_journals)?;
     write_atomic(
         &storage.storage_version_path(),
         format!("{STORAGE_VERSION}\n").as_bytes(),
@@ -312,9 +372,12 @@ fn candidate_for_active(
 
 fn reconcile_journals(
     storage: &LocalGitStorage,
+    storage_is_current: bool,
     journals: Vec<(PathBuf, ViewJournal)>,
     candidates: &mut Vec<Candidate>,
-) -> Result<()> {
+    report: &mut MigrationReport,
+) -> Result<Vec<RetirementUnit>> {
+    let mut units = Vec::new();
     for (journal_path, mut journal) in journals {
         if journal.version != MIGRATION_VERSION {
             return Err(anyhow!(
@@ -336,19 +399,70 @@ fn reconcile_journals(
         let view_path = storage.git_data_path().join(&journal.relative_path);
         let backup_path = backup_root(storage).join(&journal.relative_path);
 
+        if journal.state == JournalState::Retired {
+            // Verification already committed durably; only deletion remains.
+            // Finishing it here also frees space before new migration work.
+            if remove_retired_backup(storage, &backup_path)? {
+                report.retired_backups += 1;
+            }
+            remove_journal(&journal_path)?;
+            continue;
+        }
+
         if view_path.exists() && storage.is_thin_view(&key, &view_path) {
-            verify_view(&view_path, &journal.refs, &journal.head)?;
-            if !backup_path.is_dir() {
-                return Err(anyhow!(
-                    "migrated view {} has no rollback backup",
-                    view_path.display()
-                ));
+            if !storage_is_current {
+                // The snapshot from the interrupted run is still authoritative.
+                verify_view(&view_path, &journal.refs, &journal.head)?;
             }
             if journal.state != JournalState::Complete {
                 journal.state = JournalState::Complete;
                 write_journal(&journal_path, &journal)?;
             }
             candidates.retain(|candidate| candidate.relative_path != journal.relative_path);
+            units.push(RetirementUnit {
+                journal_path,
+                journal,
+                view_path,
+                backup_path,
+                key,
+                strict: !storage_is_current,
+            });
+            continue;
+        }
+
+        if storage_is_current && journal.state == JournalState::Complete {
+            // A journal from a migration that fully committed long ago. The
+            // view has since been rewritten, replaced, or removed by normal
+            // repository lifecycle, so the ref snapshot is stale.
+            if view_path.exists() {
+                if backup_path.is_dir() {
+                    return Err(anyhow!(
+                        "both legacy view and migration backup exist for {}",
+                        journal.relative_path.display()
+                    ));
+                }
+                // The path was replaced by a non-thin repository; the active
+                // scan migrates it afresh under a new journal.
+                remove_journal(&journal_path)?;
+                continue;
+            }
+            if backup_path.is_dir() {
+                // The migrated view was deleted after the migration committed
+                // (for example by a NIP-09 delete state). The relaxed
+                // retirement gate cannot verify a missing view, so this
+                // backup is retained as delete-state rollback material.
+                units.push(RetirementUnit {
+                    journal_path,
+                    journal,
+                    view_path,
+                    backup_path,
+                    key,
+                    strict: false,
+                });
+                continue;
+            }
+            // View and backup are both gone; nothing is left to protect.
+            remove_journal(&journal_path)?;
             continue;
         }
 
@@ -379,7 +493,7 @@ fn reconcile_journals(
             recovered: true,
         });
     }
-    Ok(())
+    Ok(units)
 }
 
 fn build_family_union(
@@ -460,7 +574,7 @@ fn build_family_union(
     Ok(())
 }
 
-fn install_view(storage: &LocalGitStorage, candidate: &Candidate) -> Result<()> {
+fn install_view(storage: &LocalGitStorage, candidate: &Candidate) -> Result<ViewJournal> {
     let refs = snapshot_refs(&candidate.source_path)?;
     let head = std::fs::read(candidate.source_path.join("HEAD"))
         .with_context(|| format!("read HEAD from {}", candidate.source_path.display()))?;
@@ -473,6 +587,7 @@ fn install_view(storage: &LocalGitStorage, candidate: &Candidate) -> Result<()> 
         refs: refs.clone(),
         head: head.clone(),
         state: JournalState::Prepared,
+        shallow: candidate.source_path.join("shallow").is_file(),
     };
     write_journal(&candidate.journal_path, &journal)?;
 
@@ -532,7 +647,7 @@ fn install_view(storage: &LocalGitStorage, candidate: &Candidate) -> Result<()> 
     verify_view(&candidate.view_path, &refs, &head)?;
     journal.state = JournalState::Complete;
     write_journal(&candidate.journal_path, &journal)?;
-    Ok(())
+    Ok(journal)
 }
 
 fn preserve_view_configuration(
@@ -550,25 +665,397 @@ fn preserve_view_configuration(
     if source_description.is_file() {
         std::fs::copy(source_description, target.join("description"))?;
     }
+    // A legacy shallow marker keeps the view serving exactly what the
+    // legacy repository served until integrity repair recovers the full
+    // closure; the marker is removed when its family becomes complete.
+    let source_shallow = source.join("shallow");
+    if source_shallow.is_file() {
+        std::fs::copy(source_shallow, target.join("shallow"))?;
+    }
     copy_directory_contents(&source.join("hooks"), &target.join("hooks"))?;
     Ok(())
 }
 
-fn verify_all_views(storage: &LocalGitStorage) -> Result<()> {
+fn verify_all_views(storage: &LocalGitStorage, retained_journals: &[PathBuf]) -> Result<()> {
     if !scan_active_legacy_views(storage)?.is_empty() {
         return Err(anyhow!(
             "legacy Git repositories remain after storage migration"
         ));
     }
-    for (_, journal) in load_journals(storage)? {
-        if journal.state != JournalState::Complete {
+    for (path, journal) in load_journals(storage)? {
+        if !retained_journals.contains(&path) {
             return Err(anyhow!(
-                "incomplete migration journal remains for {}",
+                "unretired migration journal remains for {}",
                 journal.relative_path.display()
             ));
         }
     }
     Ok(())
+}
+
+/// Retire one family's legacy backups after every view of that family is
+/// installed.
+///
+/// Each backup is deleted only after verification proves the family and its
+/// views supersede it. Verification failures abort startup for units created
+/// by an active migration run and retain the backup (with a warning) for
+/// units left over from a migration that already committed.
+fn retire_family_backups(
+    storage: &LocalGitStorage,
+    key: &FamilyKey,
+    units: Vec<RetirementUnit>,
+    report: &mut MigrationReport,
+    retained_journals: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if units.is_empty() {
+        return Ok(());
+    }
+    let mut family_packs_verified = false;
+    let mut all_retired = true;
+    let mut ready = Vec::new();
+    for unit in units {
+        if !unit.backup_path.is_dir() {
+            // Already retired out of band, for example by an operator who
+            // verified and deleted the backups manually.
+            remove_journal(&unit.journal_path)?;
+            continue;
+        }
+        let verified = (|| -> Result<()> {
+            if !family_packs_verified {
+                verify_family_packs(&storage.family_repo_path(key))?;
+            }
+            verify_retirement(storage, &unit)
+        })();
+        match verified {
+            Ok(()) => {
+                family_packs_verified = true;
+                let shallow = unit.journal.shallow || unit.backup_path.join("shallow").is_file();
+                if shallow {
+                    // A shallow legacy repository is a deliberate truncation:
+                    // its backup may only retire once the family holds the
+                    // complete closure of the backup's refs. Recovery needs
+                    // the network-based integrity repair that runs after
+                    // startup, so this never fails startup; the backup waits.
+                    if let Err(error) = super::integrity::family_contains_closure(
+                        &storage.family_repo_path(key),
+                        &unit.backup_path,
+                    ) {
+                        tracing::error!(
+                            identifier = %key.identifier,
+                            object_format = %key.object_format,
+                            backup = %unit.backup_path.display(),
+                            %error,
+                            "Family closure of a shallow legacy repository is unresolved; retaining its backup"
+                        );
+                        retained_journals.push(unit.journal_path);
+                        report.retained_backups += 1;
+                        all_retired = false;
+                        continue;
+                    }
+                    remove_shallow_marker(&unit.view_path)?;
+                }
+                ready.push(unit);
+            }
+            Err(error) if unit.strict => {
+                return Err(error.context(format!(
+                    "verify migrated family before retiring backup {}",
+                    unit.backup_path.display()
+                )));
+            }
+            Err(error) => {
+                warn!(
+                    backup = %unit.backup_path.display(),
+                    %error,
+                    "Keeping unverifiable migration backup as operator-managed rollback material"
+                );
+                retained_journals.push(unit.journal_path);
+                report.retained_backups += 1;
+                all_retired = false;
+            }
+        }
+    }
+
+    if !ready.is_empty() {
+        match super::integrity::inspect_family(storage, key) {
+            Ok(integrity) if integrity.is_healthy() => {
+                // Preserve every Git-invisible payload before committing any
+                // backup as retired. A later failure can therefore leave only
+                // complete backups or safely quarantined raw packs.
+                for unit in &ready {
+                    quarantine_unindexed_packs(storage, unit)?;
+                }
+                for unit in ready {
+                    let mut journal = unit.journal;
+                    journal.state = JournalState::Retired;
+                    write_journal(&unit.journal_path, &journal)?;
+                    remove_retired_backup(storage, &unit.backup_path)?;
+                    remove_journal(&unit.journal_path)?;
+                    report.retired_backups += 1;
+                }
+            }
+            Ok(integrity) => {
+                tracing::error!(
+                    identifier = %key.identifier,
+                    object_format = %key.object_format,
+                    missing_oids = integrity.missing_oids.len(),
+                    missing_ref_targets = integrity.missing_ref_targets.len(),
+                    invalid_alternates = integrity.invalid_alternates.len(),
+                    shallow_views = integrity.shallow_views.len(),
+                    pack_errors = integrity.pack_errors.len(),
+                    fsck_diagnostics = integrity.fsck_diagnostics.len(),
+                    "Identifier family is unhealthy after migration; retaining its backups for automatic integrity repair"
+                );
+                report.retained_backups += ready.len();
+                retained_journals.extend(ready.into_iter().map(|unit| unit.journal_path));
+                all_retired = false;
+            }
+            Err(error) if ready.iter().any(|unit| unit.strict) => {
+                return Err(error.context(format!(
+                    "inspect migrated identifier family {} before retiring backups",
+                    key.identifier
+                )));
+            }
+            Err(error) => {
+                warn!(
+                    identifier = %key.identifier,
+                    object_format = %key.object_format,
+                    %error,
+                    "Keeping migration backups because identifier-family integrity could not be inspected"
+                );
+                report.retained_backups += ready.len();
+                retained_journals.extend(ready.into_iter().map(|unit| unit.journal_path));
+                all_retired = false;
+            }
+        }
+    }
+    if all_retired {
+        // The union pack and index were hard-linked into the family during
+        // migration; the staging copies are redundant once nothing can need
+        // a rebuild of this family.
+        let union_root = migration_root(storage).join("union-packs");
+        let union_dir = union_root
+            .join(key.object_format.as_str())
+            .join(&key.identifier);
+        remove_migration_staging(&union_dir, &union_root)?;
+    }
+    Ok(())
+}
+
+/// Prove the installed view and family contain everything readable in one
+/// backup. The caller separately requires the whole family's ordinary
+/// integrity report to be healthy before committing any deletion.
+fn verify_retirement(storage: &LocalGitStorage, unit: &RetirementUnit) -> Result<()> {
+    if !unit.view_path.is_dir() || !storage.is_thin_view(&unit.key, &unit.view_path) {
+        return Err(anyhow!(
+            "migrated path {} is not an installed thin view",
+            unit.view_path.display()
+        ));
+    }
+    if unit.strict {
+        verify_view(&unit.view_path, &unit.journal.refs, &unit.journal.head)?;
+    }
+    let family = storage.family_repo_path(&unit.key);
+    let backup_objects = list_all_objects(&unit.backup_path)?;
+    ensure_oids(&family, &backup_objects).with_context(|| {
+        format!(
+            "family must contain every Git-readable object of backup {}",
+            unit.backup_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Require every family pack to be indexed and to pass `git verify-pack`.
+fn verify_family_packs(family: &Path) -> Result<()> {
+    let pack_dir = family.join("objects/pack");
+    let entries = match std::fs::read_dir(&pack_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut indexes = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("pack") if !path.with_extension("idx").is_file() => {
+                return Err(anyhow!("family pack has no index: {}", path.display()));
+            }
+            Some("idx") => indexes.push(path),
+            _ => {}
+        }
+    }
+    indexes.sort();
+    for index in indexes {
+        verify_pack(&index)?;
+    }
+    Ok(())
+}
+
+/// Preserve Git-invisible packs before their backup directory is deleted.
+///
+/// A pack without an index cannot be enumerated by `cat-file`, so the
+/// superset verification cannot vouch for it. Moving it aside keeps the raw
+/// bytes available for manual `git index-pack` recovery.
+fn quarantine_unindexed_packs(storage: &LocalGitStorage, unit: &RetirementUnit) -> Result<()> {
+    let source_packs = unit.backup_path.join("objects/pack");
+    let entries = match std::fs::read_dir(&source_packs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_file()
+            || !name.ends_with(".pack")
+            || entry.path().with_extension("idx").is_file()
+        {
+            continue;
+        }
+        let digest = sha256_file(&entry.path())?;
+        let destination = migration_root(storage)
+            .join("unindexed-packs")
+            .join(&unit.journal.relative_path)
+            .join(digest.to_string())
+            .join(&name);
+        if destination.exists() {
+            let existing_digest = sha256_file(&destination)?;
+            if existing_digest != digest {
+                return Err(anyhow!(
+                    "quarantined pack content does not match its digest path: {}",
+                    destination.display()
+                ));
+            }
+            continue;
+        }
+        let parent = destination.parent().context("quarantine has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::rename(entry.path(), &destination).with_context(|| {
+            format!(
+                "quarantine Git-invisible pack {} to {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
+        fsync_directory(parent)?;
+        warn!(
+            pack = %destination.display(),
+            "Quarantined a Git-invisible pack without an index before backup retirement"
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<sha256::Hash> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open file for SHA-256 digest: {}", path.display()))?;
+    let mut engine = sha256::Hash::engine();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read file for SHA-256 digest: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        engine.input(&buffer[..read]);
+    }
+    Ok(sha256::Hash::from_engine(engine))
+}
+
+/// Delete a retired backup directory and prune emptied parents.
+///
+/// Returns whether a backup directory existed. Only paths strictly below the
+/// migration backup root are ever removed.
+fn remove_retired_backup(storage: &LocalGitStorage, backup: &Path) -> Result<bool> {
+    let root = backup_root(storage);
+    if !backup.starts_with(&root) || backup == root {
+        return Err(anyhow!(
+            "refusing to remove path outside migration backup root: {}",
+            backup.display()
+        ));
+    }
+    let backup_parent = backup.parent().context("migration backup has no parent")?;
+    match std::fs::remove_dir_all(backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove retired backup {}", backup.display()));
+        }
+    }
+    // Commit removal of the backup entry before the durable journal is
+    // removed. Otherwise a power loss could restore the backup without its
+    // journal, leaving an orphan that no later launch discovers.
+    fsync_directory(backup_parent)?;
+
+    let mut directory = backup_parent;
+    while directory.starts_with(&root) {
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        match std::fs::remove_dir(directory) {
+            Ok(()) => {
+                fsync_directory(parent)?;
+                directory = parent;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                warn!(
+                    directory = %directory.display(),
+                    %error,
+                    "Could not prune empty migration backup directory"
+                );
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Drop a view's server-side shallow marker once its family is complete.
+fn remove_shallow_marker(view: &Path) -> Result<()> {
+    let marker = view.join("shallow");
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            fsync_directory(view)?;
+            tracing::info!(
+                view = %view.display(),
+                "Removed server-side shallow marker; the family holds the complete closure"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove shallow marker {}", marker.display()))
+        }
+    }
+}
+
+fn remove_journal(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                fsync_directory(parent)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove migration journal {}", path.display()))
+        }
+    }
 }
 
 fn snapshot_refs(repo: &Path) -> Result<BTreeMap<String, RefSnapshot>> {
@@ -1138,7 +1625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_archives_a_pack_without_an_index() {
+    async fn migration_quarantines_unindexed_packs_by_content() {
         let temp = tempfile::tempdir().unwrap();
         let storage = LocalGitStorage::new(temp.path().join("git"));
         let owner = Keys::generate().public_key().to_bech32().unwrap();
@@ -1148,22 +1635,61 @@ mod tests {
         let orphan = repo.join("objects/pack").join(orphan_name);
         std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
         std::fs::write(&orphan, b"not a readable Git pack\n").unwrap();
+        let first_digest = sha256_file(&orphan).unwrap();
 
         let report = migrate_on_startup(&storage).await.unwrap();
 
         assert_eq!(report.migrated_views, 1);
-        let archived = backup_root(&storage)
+        assert_eq!(report.retired_backups, 1);
+        let quarantined = migration_root(&storage)
+            .join("unindexed-packs")
             .join(relative)
-            .join("objects/pack")
+            .join(first_digest.to_string())
             .join(orphan_name);
         assert_eq!(
-            std::fs::read(archived).unwrap(),
+            std::fs::read(&quarantined).unwrap(),
             b"not a readable Git pack\n"
         );
+        assert!(!backup_root(&storage).exists());
         let key = FamilyKey::new(ObjectFormat::Sha1, "orphan-pack").unwrap();
         let family = storage.family_repo_path(&key);
         assert!(!family.join("objects/pack").join(orphan_name).exists());
         assert!(oid_is_available(&family, &oid).unwrap());
+
+        // Replacing the thin view with another legacy repository is a
+        // supported recovery path. A different damaged pack may reuse the
+        // same filename; content-addressed quarantine must preserve both.
+        std::fs::remove_dir_all(&repo).unwrap();
+        let (replacement, replacement_oid) = legacy_repo(
+            storage.git_data_path(),
+            &owner,
+            "orphan-pack",
+            b"replacement data\n",
+        );
+        let replacement_orphan = replacement.join("objects/pack").join(orphan_name);
+        std::fs::create_dir_all(replacement_orphan.parent().unwrap()).unwrap();
+        std::fs::write(&replacement_orphan, b"different unreadable pack\n").unwrap();
+        let second_digest = sha256_file(&replacement_orphan).unwrap();
+        assert_ne!(first_digest, second_digest);
+
+        let second_report = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(second_report.migrated_views, 1);
+        assert_eq!(second_report.retired_backups, 1);
+        let second_quarantined = migration_root(&storage)
+            .join("unindexed-packs")
+            .join(relative)
+            .join(second_digest.to_string())
+            .join(orphan_name);
+        assert_eq!(
+            std::fs::read(second_quarantined).unwrap(),
+            b"different unreadable pack\n"
+        );
+        assert_eq!(
+            std::fs::read(quarantined).unwrap(),
+            b"not a readable Git pack\n"
+        );
+        assert!(oid_is_available(&family, &replacement_oid).unwrap());
     }
 
     #[tokio::test]
@@ -1240,6 +1766,9 @@ mod tests {
         let report = migrate_on_startup(&storage).await.unwrap();
         assert_eq!(report.migrated_views, 2);
         assert_eq!(report.families_built, 1);
+        // Both backups of the single family were retired after verification.
+        assert_eq!(report.retired_backups, 2);
+        assert_eq!(report.retained_backups, 0);
         let key = FamilyKey::sha1("example").unwrap();
         assert!(storage.is_thin_view(&key, &first));
         assert!(storage.is_thin_view(&key, &second));
@@ -1252,18 +1781,13 @@ mod tests {
             Some(second_oid)
         );
         assert!(oid_is_available(&storage.family_repo_path(&key), &unreachable).unwrap());
-        assert!(backup_root(&storage)
-            .join(&owner_one)
-            .join("example.git")
-            .is_dir());
-        assert!(backup_root(&storage)
-            .join(&owner_two)
-            .join("example.git")
-            .is_dir());
+        assert!(!backup_root(&storage).exists());
+        assert!(load_journals(&storage).unwrap().is_empty());
 
         let second_report = migrate_on_startup(&storage).await.unwrap();
         assert!(second_report.already_current);
         assert_eq!(second_report.migrated_views, 0);
+        assert_eq!(second_report.retired_backups, 0);
     }
 
     #[tokio::test]
@@ -1286,6 +1810,7 @@ mod tests {
                 refs,
                 head,
                 state: JournalState::Prepared,
+                shallow: false,
             },
         )
         .unwrap();
@@ -1294,11 +1819,14 @@ mod tests {
 
         let report = migrate_on_startup(&storage).await.unwrap();
         assert_eq!(report.recovered_views, 1);
+        assert_eq!(report.retired_backups, 1);
         assert_eq!(
             super::super::get_ref_commit(&view, "refs/test/data"),
             Some(oid)
         );
         assert!(storage.is_thin_view(&FamilyKey::sha1("recovery").unwrap(), &view));
+        assert!(!candidate.backup_path.exists());
+        assert!(!candidate.journal_path.exists());
     }
 
     #[tokio::test]
@@ -1332,5 +1860,410 @@ mod tests {
         assert!(oid_is_available(&family, &referenced).unwrap());
         assert!(oid_is_available(&family, &unreachable).unwrap());
         assert!(!git(&family, &["for-each-ref", "refs/grasp/retained/"]).is_empty());
+    }
+
+    fn write_blob(repo: &Path, contents: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(contents).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    struct RetirementFixture {
+        storage: LocalGitStorage,
+        view: PathBuf,
+        backup: PathBuf,
+        journal_path: PathBuf,
+        oid: String,
+    }
+
+    /// Build the on-disk state of a migration whose view is installed and
+    /// journaled but whose backup has not been retired yet.
+    async fn committed_migration(
+        temp: &Path,
+        identifier: &str,
+        state: JournalState,
+    ) -> RetirementFixture {
+        let storage = LocalGitStorage::new(temp.join("git"));
+        std::fs::create_dir_all(storage.git_data_path()).unwrap();
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (legacy, oid) = legacy_repo(&temp.join("legacy"), &owner, identifier, b"retire me\n");
+        let key = FamilyKey::sha1(identifier).unwrap();
+        {
+            let _lease = storage.write_lease(&key).await.unwrap();
+            import_archived_repository(&storage, &key, &legacy).unwrap();
+        }
+        let view = storage
+            .git_data_path()
+            .join(&owner)
+            .join(format!("{identifier}.git"));
+        storage.create_thin_view(&key, &view).unwrap();
+        git(&view, &["update-ref", "refs/test/data", &oid]);
+        let refs = snapshot_refs(&view).unwrap();
+        let head = std::fs::read(view.join("HEAD")).unwrap();
+        let relative = view
+            .strip_prefix(storage.git_data_path())
+            .unwrap()
+            .to_path_buf();
+        let journal_path = journal_path(&storage, &relative);
+        write_journal(
+            &journal_path,
+            &ViewJournal {
+                version: MIGRATION_VERSION,
+                relative_path: relative.clone(),
+                object_format: "sha1".to_owned(),
+                identifier: identifier.to_owned(),
+                refs,
+                head,
+                state,
+                shallow: false,
+            },
+        )
+        .unwrap();
+        let backup = backup_root(&storage).join(&relative);
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::rename(&legacy, &backup).unwrap();
+        RetirementFixture {
+            storage,
+            view,
+            backup,
+            journal_path,
+            oid,
+        }
+    }
+
+    fn mark_storage_current(storage: &LocalGitStorage) {
+        write_atomic(
+            &storage.storage_version_path(),
+            format!("{STORAGE_VERSION}\n").as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_retirement_resumes_on_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "resume", JournalState::Complete).await;
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert_eq!(report.retired_backups, 1);
+        assert_eq!(report.retained_backups, 0);
+        assert!(!fixture.backup.exists());
+        assert!(!backup_root(&fixture.storage).exists());
+        assert!(!fixture.journal_path.exists());
+        assert_eq!(
+            super::super::get_ref_commit(&fixture.view, "refs/test/data"),
+            Some(fixture.oid.clone())
+        );
+        assert!(fixture.storage.storage_version_path().is_file());
+    }
+
+    #[tokio::test]
+    async fn retired_journal_deletes_backup_without_reverification() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "retired", JournalState::Retired).await;
+        // An object only the backup has would fail retirement verification,
+        // but a durable `retired` state means verification already happened.
+        let extra = write_blob(&fixture.backup, b"backup-only data\n");
+        assert!(!oid_is_available(
+            &fixture
+                .storage
+                .family_repo_path(&FamilyKey::sha1("retired").unwrap()),
+            &extra
+        )
+        .unwrap());
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert_eq!(report.retired_backups, 1);
+        assert!(!fixture.backup.exists());
+        assert!(!fixture.journal_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_family_verification_preserves_legacy_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let (repo, oid) = legacy_repo(storage.git_data_path(), &owner, "gate", b"keep me\n");
+        let relative = repo
+            .strip_prefix(storage.git_data_path())
+            .unwrap()
+            .to_path_buf();
+        let key = FamilyKey::sha1("gate").unwrap();
+        let family = storage.ensure_family(&key).unwrap();
+        let orphan = family.join("objects/pack/pack-1111111111111111111111111111111111111111.pack");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"garbage family pack\n").unwrap();
+
+        let error = migrate_on_startup(&storage).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("family pack has no index"),
+            "{error:#}"
+        );
+        let backup = backup_root(&storage).join(&relative);
+        assert!(backup.is_dir());
+        assert!(oid_is_available(&backup, &oid).unwrap());
+        assert!(journal_path(&storage, &relative).is_file());
+        assert!(!storage.storage_version_path().exists());
+
+        // After the operator fixes the family, restart finishes retirement.
+        std::fs::remove_file(&orphan).unwrap();
+        let report = migrate_on_startup(&storage).await.unwrap();
+        assert_eq!(report.migrated_views, 0);
+        assert_eq!(report.retired_backups, 1);
+        assert!(!backup.exists());
+        assert!(storage.storage_version_path().is_file());
+        assert_eq!(
+            super::super::get_ref_commit(&repo, "refs/test/data"),
+            Some(oid)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_installations_without_backups_start_normally() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "manual", JournalState::Complete).await;
+        std::fs::remove_dir_all(&fixture.backup).unwrap();
+        mark_storage_current(&fixture.storage);
+        // Refs drift during normal service after a committed migration; the
+        // stale journal snapshot must not be enforced against them.
+        git(
+            &fixture.view,
+            &["update-ref", "refs/test/drifted", &fixture.oid],
+        );
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 0);
+        assert!(!fixture.journal_path.exists());
+
+        let second = migrate_on_startup(&fixture.storage).await.unwrap();
+        assert!(second.already_current);
+    }
+
+    #[tokio::test]
+    async fn completed_journal_without_view_or_backup_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "deleted", JournalState::Complete).await;
+        std::fs::remove_dir_all(&fixture.backup).unwrap();
+        std::fs::remove_dir_all(&fixture.view).unwrap();
+        mark_storage_current(&fixture.storage);
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert!(!fixture.journal_path.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_backup_is_retained_when_family_cannot_prove_superset() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "stale", JournalState::Complete).await;
+        mark_storage_current(&fixture.storage);
+        // The backup holds an object the family does not; deleting it would
+        // lose data, so the relaxed gate keeps it and startup continues.
+        write_blob(&fixture.backup, b"only in backup\n");
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 1);
+        assert!(fixture.backup.is_dir());
+        assert!(fixture.journal_path.is_file());
+
+        // Idempotent across restarts.
+        let second = migrate_on_startup(&fixture.storage).await.unwrap();
+        assert_eq!(second.retained_backups, 1);
+        assert!(fixture.backup.is_dir());
+    }
+
+    #[tokio::test]
+    async fn corrupt_family_object_keeps_healthy_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture =
+            committed_migration(temp.path(), "corrupt-family", JournalState::Complete).await;
+        mark_storage_current(&fixture.storage);
+        let key = FamilyKey::sha1("corrupt-family").unwrap();
+        let family_object = fixture
+            .storage
+            .family_repo_path(&key)
+            .join("objects")
+            .join(&fixture.oid[..2])
+            .join(&fixture.oid[2..]);
+        let backup_object = fixture
+            .backup
+            .join("objects")
+            .join(&fixture.oid[..2])
+            .join(&fixture.oid[2..]);
+        let expected = std::fs::read(&backup_object).unwrap();
+
+        // Break the hard link created by the fixture before corrupting only
+        // the family copy. OID enumeration still sees the loose filename, so
+        // the object-superset gate alone would incorrectly retire the backup.
+        std::fs::remove_file(&family_object).unwrap();
+        std::fs::write(&family_object, []).unwrap();
+        assert_eq!(std::fs::read(&backup_object).unwrap(), expected);
+        assert!(list_all_objects(&fixture.storage.family_repo_path(&key))
+            .unwrap()
+            .contains(&fixture.oid));
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 1);
+        assert!(fixture.backup.is_dir());
+        assert!(fixture.journal_path.is_file());
+        assert!(
+            !super::super::integrity::inspect_family(&fixture.storage, &key)
+                .unwrap()
+                .is_healthy()
+        );
+    }
+
+    fn write_commit_object(repo: &Path, parent: Option<&str>) -> String {
+        let tree = git(repo, &["mktree"]);
+        let mut contents = format!(
+            "tree {tree}\nauthor Test <test@example.com> 0 +0000\ncommitter Test <test@example.com> 0 +0000\n\nshallow fixture\n"
+        );
+        if let Some(parent) = parent {
+            contents.insert_str(
+                contents.find("author ").unwrap(),
+                &format!("parent {parent}\n"),
+            );
+        }
+        let mut child = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn shallow_legacy_backup_waits_for_family_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path().join("git"));
+        std::fs::create_dir_all(storage.git_data_path()).unwrap();
+        let owner = Keys::generate().public_key().to_bech32().unwrap();
+        let origin = temp.path().join("origin.git");
+        git(
+            temp.path(),
+            &["init", "--bare", "--quiet", origin.to_str().unwrap()],
+        );
+        let parent = write_commit_object(&origin, None);
+        let child = write_commit_object(&origin, Some(&parent));
+        git(&origin, &["update-ref", "refs/heads/main", &child]);
+
+        let view = storage
+            .git_data_path()
+            .join(&owner)
+            .join("shallow-repo.git");
+        std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                "--depth",
+                "1",
+                &format!("file://{}", origin.display()),
+                view.to_str().unwrap(),
+            ],
+        );
+        assert!(view.join("shallow").is_file());
+
+        let report = migrate_on_startup(&storage).await.unwrap();
+
+        // The truncated backup waits for closure recovery; startup proceeds.
+        assert_eq!(report.migrated_views, 1);
+        assert_eq!(report.retired_backups, 0);
+        assert_eq!(report.retained_backups, 1);
+        let key = FamilyKey::sha1("shallow-repo").unwrap();
+        assert!(storage.is_thin_view(&key, &view));
+        assert!(view.join("shallow").is_file());
+        let backup = backup_root(&storage).join(&owner).join("shallow-repo.git");
+        assert!(backup.is_dir());
+        assert!(storage.storage_version_path().is_file());
+
+        // A client-requested shallow clone keeps working while recovery is
+        // pending.
+        let shallow_clone = temp.path().join("shallow-clone.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                "--depth",
+                "1",
+                &format!("file://{}", view.display()),
+                shallow_clone.to_str().unwrap(),
+            ],
+        );
+
+        // Model integrity repair recovering the full closure from an
+        // accepted clone source.
+        copy_object_database(&origin, &storage.family_repo_path(&key), ObjectFormat::Sha1).unwrap();
+
+        let second = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(second.retired_backups, 1);
+        assert_eq!(second.retained_backups, 0);
+        assert!(!backup.exists());
+        assert!(!view.join("shallow").exists());
+        assert!(load_journals(&storage).unwrap().is_empty());
+        // With the closure complete and the marker gone, a full clone works.
+        let full_clone = temp.path().join("full-clone.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &format!("file://{}", view.display()),
+                full_clone.to_str().unwrap(),
+            ],
+        );
+        assert!(oid_is_available(&full_clone, &parent).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_backup_without_view_is_retained_as_rollback_material() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = committed_migration(temp.path(), "unlinked", JournalState::Complete).await;
+        mark_storage_current(&fixture.storage);
+        std::fs::remove_dir_all(&fixture.view).unwrap();
+
+        let report = migrate_on_startup(&fixture.storage).await.unwrap();
+
+        assert!(report.already_current);
+        assert_eq!(report.retained_backups, 1);
+        assert!(fixture.backup.is_dir());
+        assert!(fixture.journal_path.is_file());
     }
 }

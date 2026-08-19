@@ -24,16 +24,17 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 
 ## Available How-To Guides
 
-### [Upgrade Git family storage](upgrade-git-family-storage.md)
-**Problem:** Deduplicate existing repository objects during a server upgrade
+### [Upgrade from v2 to v3 Git family storage](upgrade-git-family-storage.md)
+
+**Problem:** Perform the one-way identifier-family storage migration safely
 **Difficulty:** Advanced
 
 **You'll learn:**
-- Prepare capacity and a release rollback point
-- Run the automatic crash-safe launch migration
-- Verify owner and `/prs/` repository views
-- Check or repair one identifier family on demand
-- Recover safely from an interrupted launch
+
+- Prepare capacity and a snapshot-based rollback point
+- Run the automatic crash-safe v3 launch migration
+- Interpret migration and integrity summary logs
+- Restore v2 safely when a release rollback is required
 
 ---
 
