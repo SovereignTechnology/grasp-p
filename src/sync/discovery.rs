@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use nostr::nips::nip65::{self, RelayMetadata};
 use nostr_sdk::prelude::*;
 
-use super::{algorithms::RelaySyncNeeds, RepoSyncNeeds, SyncLevel};
+use super::{algorithms::RelaySyncNeeds, target_hygiene, RepoSyncNeeds, SyncLevel};
+use crate::outbound::OutboundTargetPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedRoot {
@@ -111,24 +112,28 @@ pub fn latest_identity_events(
     events
 }
 
-pub fn inbox_relays(event: &Event) -> HashSet<String> {
+pub fn inbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
     if event.kind != Kind::RelayList {
         return HashSet::new();
     }
     nip65::extract_relay_list(event)
         .filter_map(|(relay, marker)| {
-            matches!(marker, None | Some(RelayMetadata::Read)).then(|| relay.to_string())
+            (matches!(marker, None | Some(RelayMetadata::Read))
+                && target_hygiene::accepts(&relay, policy))
+            .then(|| relay.to_string())
         })
         .collect()
 }
 
-pub fn outbox_relays(event: &Event) -> HashSet<String> {
+pub fn outbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
     if event.kind != Kind::RelayList {
         return HashSet::new();
     }
     nip65::extract_relay_list(event)
         .filter_map(|(relay, marker)| {
-            matches!(marker, None | Some(RelayMetadata::Write)).then(|| relay.to_string())
+            (matches!(marker, None | Some(RelayMetadata::Write))
+                && target_hygiene::accepts(&relay, policy))
+            .then(|| relay.to_string())
         })
         .collect()
 }
@@ -316,10 +321,10 @@ pub fn build_mailbox_repository_overlay(
 
 /// Relays on which an author may receive or publish conversation events.
 /// Unmarked entries serve both roles under NIP-65.
-pub fn mailbox_relays(event: &Event) -> HashSet<String> {
-    inbox_relays(event)
+pub fn mailbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
+    inbox_relays(event, policy)
         .into_iter()
-        .chain(outbox_relays(event))
+        .chain(outbox_relays(event, policy))
         .collect()
 }
 
@@ -385,7 +390,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            inbox_relays(&relay_list),
+            inbox_relays(&relay_list, &OutboundTargetPolicy::default()),
             HashSet::from([
                 "wss://read.example".to_string(),
                 "wss://both.example".to_string()
@@ -407,7 +412,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            outbox_relays(&relay_list),
+            outbox_relays(&relay_list, &OutboundTargetPolicy::default()),
             HashSet::from([
                 "wss://write.example".to_string(),
                 "wss://both.example".to_string(),
@@ -429,11 +434,45 @@ mod tests {
             1,
         );
         assert_eq!(
-            mailbox_relays(&relay_list),
+            mailbox_relays(&relay_list, &OutboundTargetPolicy::default()),
             HashSet::from([
                 "wss://read.example".to_string(),
                 "wss://write.example".to_string(),
                 "wss://both.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn relay_extraction_applies_target_hygiene_to_every_role() {
+        let keys = Keys::generate();
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://read.example", "read"]),
+                Tag::custom("r", ["wss://write.example", "write"]),
+                Tag::custom("r", ["wss://spam.example/alpha-bravo", "read"]),
+                Tag::custom("r", ["wss://spam.example/foxtrot-yonder", "write"]),
+                Tag::custom("r", ["wss://hidden.onion"]),
+                Tag::custom("r", ["ws://127.0.0.1:7334"]),
+            ],
+            1,
+        );
+        let policy = OutboundTargetPolicy::default();
+        assert_eq!(
+            inbox_relays(&relay_list, &policy),
+            HashSet::from(["wss://read.example".to_string()])
+        );
+        assert_eq!(
+            outbox_relays(&relay_list, &policy),
+            HashSet::from(["wss://write.example".to_string()])
+        );
+        assert_eq!(
+            mailbox_relays(&relay_list, &policy),
+            HashSet::from([
+                "wss://read.example".to_string(),
+                "wss://write.example".to_string(),
             ])
         );
     }

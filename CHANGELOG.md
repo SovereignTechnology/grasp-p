@@ -30,6 +30,14 @@ Performance and Security fixes - along with other improvements; immediate upgrad
 
 ### Security
 
+- Reject unsuitable peer-advertised NIP-65 relay URLs before they can occupy
+  mailbox selection slots, overlays, probe queues, or metrics: URLs failing
+  the static outbound-target checks, `.onion` hosts (temporary mailbox
+  policy), URLs matching nostr-watch's 52-word generated-path rule, 64-hex
+  path segments, hostname-repeating path segments, and URLs over 2,048 bytes.
+  These are single-URL rules; relay lists are never rejected wholesale, and
+  legitimate path-based relays (`/inbox`, `/outbox`, language and versioned
+  paths, semantic queries) remain accepted.
 - Bound every sync-actor notification channel and require `auth-required`
   retry IDs to own a current subscription-ledger permit. Repeated terminals,
   forged subscription IDs, and delayed worker results can no longer create

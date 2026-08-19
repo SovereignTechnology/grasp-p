@@ -23,6 +23,7 @@ pub mod naughty_list;
 pub mod rejected_index;
 pub mod relay_connection;
 pub mod self_subscriber;
+pub mod target_hygiene;
 
 // Re-export core algorithm types
 pub use algorithms::{AddFilters, RelaySyncNeeds};
@@ -5776,6 +5777,7 @@ impl SyncManager {
                 .replace(self.nip65_discovery.eligible_authors.clone())
                 .await;
             let current_authors = self.nip65_discovery.eligible_authors.clone();
+            let policy = self.outbound_target_policy();
 
             // Rebuild mailbox ownership from already accepted local state before
             // attempting a network refresh. GRASP-03 retains kind 10002 so a
@@ -5805,13 +5807,13 @@ impl SyncManager {
                     .nip65_discovery
                     .relay_lists
                     .iter()
-                    .map(|(author, event)| (*author, discovery::inbox_relays(event)))
+                    .map(|(author, event)| (*author, discovery::inbox_relays(event, &policy)))
                     .collect();
                 self.nip65_discovery.author_mailboxes = self
                     .nip65_discovery
                     .relay_lists
                     .iter()
-                    .map(|(author, event)| (*author, discovery::mailbox_relays(event)))
+                    .map(|(author, event)| (*author, discovery::mailbox_relays(event, &policy)))
                     .collect();
             }
 
@@ -5837,7 +5839,7 @@ impl SyncManager {
                     .or_default();
                 if let Some(relay_list) = self.nip65_discovery.relay_lists.get(author) {
                     sources.extend(
-                        discovery::outbox_relays(relay_list)
+                        discovery::outbox_relays(relay_list, &policy)
                             .into_iter()
                             .filter_map(|url| canonical_relay_key(&url).ok()),
                     );
@@ -6336,6 +6338,7 @@ impl SyncManager {
         }
 
         let mut changed = previous_fallback_authors != self.nip65_discovery.fallback_authors;
+        let policy = self.outbound_target_policy();
         for (author, candidate) in latest {
             if !self.nip65_discovery.eligible_authors.contains(&author) {
                 continue;
@@ -6351,10 +6354,10 @@ impl SyncManager {
             if replace {
                 self.nip65_discovery
                     .author_inboxes
-                    .insert(author, discovery::inbox_relays(&candidate));
+                    .insert(author, discovery::inbox_relays(&candidate, &policy));
                 self.nip65_discovery
                     .author_mailboxes
-                    .insert(author, discovery::mailbox_relays(&candidate));
+                    .insert(author, discovery::mailbox_relays(&candidate, &policy));
                 let mut index_relays: HashSet<String> = self
                     .config
                     .parse_user_index_relays()
@@ -6375,7 +6378,7 @@ impl SyncManager {
                     .or_default();
                 sources.retain(|source| !index_relays.contains(source));
                 sources.extend(
-                    discovery::outbox_relays(&candidate)
+                    discovery::outbox_relays(&candidate, &policy)
                         .into_iter()
                         .filter_map(|url| canonical_relay_key(&url).ok()),
                 );
