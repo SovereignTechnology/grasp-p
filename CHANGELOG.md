@@ -30,6 +30,25 @@ Performance and Security fixes - along with other improvements; immediate upgrad
 
 ### Security
 
+- Reject unsuitable peer-advertised NIP-65 relay URLs before they can occupy
+  mailbox selection slots, overlays, probe queues, or metrics: URLs failing
+  the static outbound-target checks, `.onion` hosts (temporary mailbox
+  policy), URLs matching nostr-watch's 52-word generated-path rule, 64-hex
+  path segments, hostname-repeating path segments, and URLs over 2,048 bytes.
+  These are single-URL rules; relay lists are never rejected wholesale, and
+  legitimate path-based relays (`/inbox`, `/outbox`, language and versioned
+  paths, semantic queries) remain accepted.
+- Canonicalize accepted NIP-65 relay URLs and bound every per-author selection
+  to at most four relays per purpose, taken in published tag order after
+  deduplication so trailing-root-slash and default-port variants of one relay
+  consume a single slot. Live inbox coverage and owner/maintainer repository
+  inboxes select `read`/unmarked relays, identity refresh selects
+  `write`/unmarked relays, and participant history prefers `write`/unmarked
+  relays with read-only relays filling remaining slots. The bound is a hard
+  internal constant, so one hostile or machine-generated kind `10002` list
+  cannot inflate mailbox inventory. Canonical keys now match the connection
+  map, fixing trailing-root-slash mailbox relays that previously could never
+  start their history probe.
 - Bound every sync-actor notification channel and require `auth-required`
   retry IDs to own a current subscription-ledger permit. Repeated terminals,
   forged subscription IDs, and delayed worker results can no longer create
@@ -136,6 +155,17 @@ Performance and Security fixes - along with other improvements; immediate upgrad
   deterministic, and failed tail replacement restores the previous tail.
 
 ### Fixed
+
+- Discover historical repository roots and descendants from the NIP-65
+  inboxes of accepted repository owners and maintainers. Public Sync+
+  instances probe exact repository coordinates and every known root on those
+  authors' bounded, sanitized read/unmarked inboxes through paced,
+  byte-bounded history workers. This coverage is deliberately historical-only:
+  owning or maintaining a repository never adds an author's inbox relays to
+  ordinary persistent live repository targets, while accepted root authors
+  retain the pre-existing live inbox coverage. Private instances continue to
+  withhold repository coordinates, and the ordinary write policy and
+  persistent deletion tombstones remain authoritative.
 
 - Retire peer-closed outbound subscriptions from rust-nostr's desired registry
   without interrupting NIP-42: the first `auth-required` response keeps the

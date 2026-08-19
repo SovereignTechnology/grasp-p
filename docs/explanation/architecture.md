@@ -679,13 +679,28 @@ GRASP-03 Sync+ is a default-on mailbox-discovery overlay on this manager. Set
 `NGIT_SYNC_PLUS_ENABLED=false` to retain GRASP-02 sync without discovering
 accepted root and descendant participants' NIP-65 read/write mailboxes; NIP-11
 advertises `GRASP-03` only while the overlay is enabled. Exact thread
-provenance scopes each mailbox to its accepted roots. Accepted root authors'
+provenance scopes each mailbox to its accepted roots. Every peer-advertised
+NIP-65 relay URL passes single-URL target hygiene
+(`src/sync/target_hygiene.rs`), is canonicalized with the shared relay-key
+semantics, and is deduplicated before selection; each author then contributes
+at most four relays per purpose in published tag order, a hard internal
+constant. Accepted root authors'
 read/unmarked inboxes retain ordinary live/rotating GRASP-02 coverage. Wider
 participant mailboxes use independent, history-only `fetch_events` workers:
-at most one per relay and one new start per maintenance pass. They reuse the
+at most one per relay, 32 process-wide, and one newly admitted relay per
+maintenance pass. Once admitted, a successful relay drains its own stable
+filter cursor without waiting for a global relay rotation. They reuse the
 connection's ordinary pacing, subscription ledger, pagination and 30-second
 per-page terminal timeout without installing permanent participant
-subscriptions or coupling progress between relays.
+subscriptions or coupling progress between relays. On public instances, each
+accepted repository owner's and declared maintainer's bounded, sanitized
+read/unmarked NIP-65 inboxes receive repository-scoped historical mailbox
+probes covering their exact repositories and all locally known roots. This
+discovers previously unknown roots and descendants that exist only on a
+maintainer mailbox without broadening an ordinary participant mailbox, and it
+is deliberately historical-only: owning or maintaining a repository never adds
+that author's inbox relays to ordinary persistent live repository targets.
+Private instances omit repository-coordinate mailbox expansion.
 
 ### Rejected Events Index
 

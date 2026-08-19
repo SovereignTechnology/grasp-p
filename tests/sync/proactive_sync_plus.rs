@@ -38,9 +38,13 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     let unrelated = Keys::generate();
     let identifier = "minimal-proactive-sync-plus";
 
+    // The inbox is advertised in the root-trailing-slash form. Canonical
+    // selection must fold it onto the same connection key, so coverage works
+    // end to end for the variant that previously stalled mailbox probes.
+    let slashed_inbox = format!("{}/", inbox.url());
     let relay_list = EventBuilder::new(Kind::RelayList, "")
         .tags([
-            Tag::custom("r", vec![inbox.url(), "read"]),
+            Tag::custom("r", vec![slashed_inbox.as_str(), "read"]),
             Tag::custom("r", vec![outbox.url(), "write"]),
         ])
         .custom_created_at(Timestamp::from(Timestamp::now().as_secs() - 10))
@@ -303,6 +307,120 @@ async fn participant_write_mailbox_fetches_child_of_direct_reaction() {
                 && line.contains(mailbox.url())
         }),
         "participant mailbox transport should remain observable"
+    );
+
+    syncing.stop().await;
+    mailbox.stop().await;
+    index.stop().await;
+}
+
+#[tokio::test]
+async fn owner_inbox_history_discovers_unknown_root_without_live_sync() {
+    let index = MockRelay::start().await;
+    let mailbox = MockRelay::start().await;
+    let owner = Keys::generate();
+    let root_author = Keys::generate();
+    let identifier = "owner-repository-mailbox";
+
+    let relay_list = EventBuilder::new(Kind::RelayList, "")
+        .tag(Tag::custom("r", vec![mailbox.url(), "read"]))
+        .finalize(&owner)
+        .expect("build owner relay list");
+    send_to_relay_url(index.url(), &relay_list)
+        .await
+        .expect("seed owner relay list");
+
+    let syncing_git_dir = tempfile::tempdir().expect("create persistent git directory");
+    let syncing_relay_dir = tempfile::tempdir().expect("create persistent relay directory");
+    let syncing = TestRelay::start_on_reservation_persistent_sync(
+        reserve_port(),
+        Some(index.url().to_string()),
+        false,
+        syncing_git_dir.path().to_path_buf(),
+        syncing_relay_dir.path().to_path_buf(),
+    )
+    .await;
+    let syncing_domain = syncing.domain();
+    let (_announcement, _git_dir) =
+        setup_announcement_on_relay(&syncing, &owner, &[&syncing_domain], identifier).await;
+    let issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root stored only on the repository owner's mailbox",
+    )
+    .expect("build mailbox-only root");
+    let closed = EventBuilder::new(Kind::from(1632), "closed")
+        .tag(Tag::custom("e", vec![issue.id.to_hex()]))
+        .finalize(&owner)
+        .expect("build root-only closed status");
+    send_to_relay_url(mailbox.url(), &issue)
+        .await
+        .expect("seed unknown root on owner mailbox");
+    send_to_relay_url(mailbox.url(), &closed)
+        .await
+        .expect("seed root-only status on owner mailbox");
+
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(issue.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "the owner's repository-coordinate scope should discover an unknown root"
+    );
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(closed.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "the owner's mailbox should be queried for known root IDs after inventory growth"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Reconciled proactive participant mailbox inventory")
+                && line.contains("repository_mailbox_author_count=1")
+        }),
+        "repository mailbox ownership should remain observable without public-key labels"
+    );
+    assert!(
+        sync_log.lines().any(|line| {
+            line.contains("Started bounded participant mailbox fetch")
+                && line.contains(mailbox.url())
+        }),
+        "the owner inbox should be probed through the repository-scoped history path"
+    );
+
+    // A root published later is still discovered, but only through the
+    // recurring historical probe cycle: the owner inbox never becomes an
+    // ordinary live repository source.
+    let later_issue = build_layer2_issue_event(
+        &root_author,
+        &repo_coord(&owner, identifier),
+        "root published after initial owner-inbox history",
+    )
+    .expect("build later mailbox root");
+    send_to_relay_url(mailbox.url(), &later_issue)
+        .await
+        .expect("publish root after initial history");
+    assert!(
+        wait_for_event_on_relay(
+            syncing.url(),
+            Filter::new().id(later_issue.id),
+            Duration::from_secs(30),
+        )
+        .await,
+        "owner inbox repository coverage should continue through historical refresh"
+    );
+    let sync_log = std::fs::read_to_string(syncing.log_path()).expect("read syncing relay log");
+    assert!(
+        !sync_log
+            .lines()
+            .any(|line| { line.contains("Starting fresh_start") && line.contains(mailbox.url()) }),
+        "an owner inbox must not enter ordinary repository live sync"
     );
 
     syncing.stop().await;

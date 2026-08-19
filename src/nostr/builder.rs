@@ -24,7 +24,7 @@ use crate::nostr::lifecycle::{
     DeletionContext, DeletionRuntime, DeletionService, HoldingStore, ReplaceableHistoryStore,
     RepositoryLifecycle, Tombstones,
 };
-use crate::nostr::persistence::{EventPersistence, SaveContext};
+use crate::nostr::persistence::{AcceptedEventSaveOutcome, EventPersistence, SaveContext};
 use crate::nostr::policy::{
     accepted_purgatory, duplicate, reject_error, reject_invalid, reject_restricted,
     AnnouncementPolicy, AnnouncementResult, IdentityAdmission, PolicyContext, PrEventPolicy,
@@ -257,7 +257,7 @@ impl Nip34WritePolicy {
         &self,
         event: &Event,
         context: SaveContext,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AcceptedEventSaveOutcome> {
         self.event_persistence()
             .save_accepted_event(event, context)
             .await

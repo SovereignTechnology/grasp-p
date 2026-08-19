@@ -23,6 +23,7 @@ pub mod naughty_list;
 pub mod rejected_index;
 pub mod relay_connection;
 pub mod self_subscriber;
+pub mod target_hygiene;
 
 // Re-export core algorithm types
 pub use algorithms::{AddFilters, RelaySyncNeeds};
@@ -87,21 +88,28 @@ fn mailbox_probe_retry_interval() -> Duration {
 
 fn due_mailbox_relays(
     mailbox_roots: &HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: &HashMap<String, HashSet<String>>,
     next_at: &HashMap<String, Instant>,
     now: Instant,
 ) -> Vec<String> {
-    let mut relays: Vec<String> = mailbox_roots
+    let mut relays: HashSet<String> = mailbox_roots
         .keys()
-        .filter(|relay| next_at.get(*relay).is_none_or(|due| *due <= now))
+        .chain(mailbox_repositories.keys())
         .cloned()
         .collect();
+    relays.retain(|relay| next_at.get(relay).is_none_or(|due| *due <= now));
+    let mut relays: Vec<String> = relays.into_iter().collect();
     relays.sort_by(|left, right| {
+        let workload = |relay: &String| {
+            mailbox_roots.get(relay).map_or(0, HashSet::len)
+                + mailbox_repositories.get(relay).map_or(0, HashSet::len)
+        };
         next_at
             .get(left)
             .copied()
             .unwrap_or(now)
             .cmp(&next_at.get(right).copied().unwrap_or(now))
-            .then_with(|| mailbox_roots[right].len().cmp(&mailbox_roots[left].len()))
+            .then_with(|| workload(right).cmp(&workload(left)))
             .then_with(|| left.cmp(right))
     });
     relays
@@ -125,6 +133,17 @@ fn select_due_mailbox_relay(
         .cloned()
 }
 
+fn public_repository_mailbox_scope(
+    private_mode: bool,
+    author_repositories: HashMap<PublicKey, HashSet<String>>,
+) -> HashMap<PublicKey, HashSet<String>> {
+    if private_mode {
+        HashMap::new()
+    } else {
+        author_repositories
+    }
+}
+
 fn mailbox_probe_completion(
     filter_index: usize,
     filter_count: usize,
@@ -140,6 +159,14 @@ fn mailbox_probe_completion(
         mailbox_probe_retry_interval()
     };
     (next_filter, completed_cycle, next_probe_in)
+}
+
+fn should_continue_mailbox_probe(succeeded: bool, completed_cycle: bool) -> bool {
+    succeeded && !completed_cycle
+}
+
+fn mailbox_worker_capacity_available(active_workers: usize) -> bool {
+    active_workers < MAX_CONCURRENT_MAILBOX_WORKERS
 }
 
 async fn fetch_mailbox_filter(
@@ -561,7 +588,7 @@ pub enum SyncMethod {
 pub enum ProcessResult {
     /// Event was new and saved to database
     Saved,
-    /// Event already existed in database
+    /// Event already existed or a newer replaceable event was retained
     Duplicate,
     /// Event added to Purgatory
     Purgatory,
@@ -1481,6 +1508,46 @@ fn mailbox_probe_filters(
     filters
 }
 
+fn expand_mailbox_probe_scope(
+    repository_scope: &HashSet<String>,
+    root_scope: &HashSet<EventId>,
+    root_repositories: &HashMap<EventId, String>,
+) -> (HashSet<String>, HashSet<EventId>) {
+    let mut repositories = repository_scope.clone();
+    repositories.extend(
+        root_scope
+            .iter()
+            .filter_map(|root| root_repositories.get(root).cloned()),
+    );
+
+    let mut roots = root_scope.clone();
+    roots.extend(
+        root_repositories.iter().filter_map(|(root, repository)| {
+            repository_scope.contains(repository).then_some(*root)
+        }),
+    );
+    (repositories, roots)
+}
+
+fn merge_repository_roots_into_mailbox_overlay(
+    mailbox_roots: &mut HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: &HashMap<String, HashSet<String>>,
+    root_repositories: &HashMap<EventId, String>,
+) {
+    for (relay, repositories) in mailbox_repositories {
+        let roots: HashSet<EventId> = root_repositories
+            .iter()
+            .filter_map(|(root, repository)| repositories.contains(repository).then_some(*root))
+            .collect();
+        if !roots.is_empty() {
+            mailbox_roots
+                .entry(relay.clone())
+                .or_default()
+                .extend(roots);
+        }
+    }
+}
+
 fn packed_historic_filters(items: &PendingItems, frontier: &DescendantFrontier) -> Vec<Filter> {
     let all_repos: HashSet<_> = items
         .repos
@@ -1860,6 +1927,10 @@ struct Nip65DiscoveryState {
     /// the paced history-only mailbox path below.
     root_author_roots: HashMap<PublicKey, HashSet<EventId>>,
     author_roots: HashMap<PublicKey, HashSet<EventId>>,
+    /// Public accepted repositories owned or maintained by each author. This
+    /// remains empty in private mode so mailbox probes never disclose private
+    /// repository coordinates to a public NIP-65 relay.
+    author_repositories: HashMap<PublicKey, HashSet<String>>,
     root_repositories: HashMap<EventId, String>,
     eligible_authors: HashSet<PublicKey>,
     author_sources: HashMap<PublicKey, HashSet<String>>,
@@ -1870,8 +1941,14 @@ struct Nip65DiscoveryState {
     /// no accepted relay list. They use the operator's bounded fallback set
     /// until an accepted kind 10002 arrives.
     fallback_authors: HashSet<PublicKey>,
+    /// Essential live root coverage on accepted root authors' read/unmarked
+    /// NIP-65 inboxes. Owner/maintainer repository scope and participant
+    /// write/outbox coverage remain on the history-only mailbox path below:
+    /// owning or maintaining a repository never makes an author's inbox an
+    /// ordinary persistent live target.
     inbox_roots: HashMap<String, HashSet<EventId>>,
     mailbox_roots: HashMap<String, HashSet<EventId>>,
+    mailbox_repositories: HashMap<String, HashSet<String>>,
     mailbox_probe_next_at: HashMap<String, Instant>,
     mailbox_probe_next_filter: HashMap<String, usize>,
     /// At most one ordinary fetch runs per mailbox relay. Different relays
@@ -1883,25 +1960,49 @@ struct Nip65DiscoveryState {
 }
 
 impl Nip65DiscoveryState {
+    fn has_mailbox_scope(&self, relay: &str) -> bool {
+        self.mailbox_roots.contains_key(relay) || self.mailbox_repositories.contains_key(relay)
+    }
+
+    fn mailbox_relay_count(&self) -> usize {
+        self.mailbox_roots.len()
+            + self
+                .mailbox_repositories
+                .keys()
+                .filter(|relay| !self.mailbox_roots.contains_key(*relay))
+                .count()
+    }
+
     fn install_mailbox_overlay(
         &mut self,
-        new_overlay: HashMap<String, HashSet<EventId>>,
+        new_root_overlay: HashMap<String, HashSet<EventId>>,
+        new_repository_overlay: HashMap<String, HashSet<String>>,
         now: Instant,
     ) {
-        let old_overlay = std::mem::replace(&mut self.mailbox_roots, new_overlay);
-        if old_overlay == self.mailbox_roots {
+        let old_root_overlay = std::mem::replace(&mut self.mailbox_roots, new_root_overlay);
+        let old_repository_overlay =
+            std::mem::replace(&mut self.mailbox_repositories, new_repository_overlay);
+        if old_root_overlay == self.mailbox_roots
+            && old_repository_overlay == self.mailbox_repositories
+        {
             return;
         }
+        let current_relays: HashSet<String> = self
+            .mailbox_roots
+            .keys()
+            .chain(self.mailbox_repositories.keys())
+            .cloned()
+            .collect();
         self.mailbox_probe_next_at
-            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
+            .retain(|relay, _| current_relays.contains(relay));
         self.mailbox_probe_next_filter
-            .retain(|relay, _| self.mailbox_roots.contains_key(relay));
-        for (relay, roots) in &self.mailbox_roots {
-            if old_overlay.get(relay) != Some(roots) {
+            .retain(|relay, _| current_relays.contains(relay));
+        for relay in current_relays {
+            if old_root_overlay.get(&relay) != self.mailbox_roots.get(&relay)
+                || old_repository_overlay.get(&relay) != self.mailbox_repositories.get(&relay)
+            {
                 self.mailbox_probe_next_at.insert(relay.clone(), now);
-                self.mailbox_probe_next_filter
-                    .entry(relay.clone())
-                    .or_default();
+                self.mailbox_probe_next_filter.entry(relay).or_default();
             }
         }
     }
@@ -1916,7 +2017,7 @@ impl Nip65DiscoveryState {
         // A relay removed from the overlay while its probe was in flight must
         // not leave orphan cursor or due-time entries; re-addition is reseeded
         // by `install_mailbox_overlay`.
-        if !self.mailbox_roots.contains_key(relay) {
+        if !self.has_mailbox_scope(relay) {
             return;
         }
         self.mailbox_probe_next_filter
@@ -1932,6 +2033,14 @@ const QUICK_RECONNECT_WINDOW_SECS: u64 = 15 * 60;
 /// Bound concurrent DNS and websocket handshakes so a large relay list cannot
 /// exhaust network resources while keeping the sync actor responsive.
 const MAX_CONCURRENT_CONNECT_ATTEMPTS: usize = 8;
+
+/// Safety ceiling for independently progressing mailbox relays.
+///
+/// A relay owns at most one worker and drains its filter cursor without
+/// returning to the global relay rotation between slices. Keep a separate,
+/// generous process-wide ceiling so a peer-influenced NIP-65 inventory cannot
+/// create an unbounded number of simultaneous response accumulators.
+const MAX_CONCURRENT_MAILBOX_WORKERS: usize = 32;
 
 /// Maximum number of collection members rendered in an INFO-level log field.
 /// Counts remain authoritative; samples keep remotely influenced logs bounded.
@@ -2356,9 +2465,11 @@ async fn run_health_and_metrics_checker(
                 // to historic work when no slot is immediately available.
                 manager.schedule_nip65_discovery().await;
 
-                // 6. Start at most one participant mailbox history filter.
-                // Mailbox coverage is history-only: it does not turn every
-                // participant relay into a permanent live source.
+                // 6. Admit at most one new participant mailbox relay worker.
+                // Once admitted, that relay drains its own history-filter
+                // cursor independently, one request at a time. Mailbox
+                // coverage is history-only: it does not turn every participant
+                // relay into a permanent live source.
                 manager.schedule_mailbox_probe().await;
 
                 // 7. Check for naughty list expiration
@@ -2419,7 +2530,7 @@ async fn run_health_and_metrics_checker(
                         ),
                         (
                             "mailbox_probe_relays",
-                            manager.nip65_discovery.mailbox_roots.len(),
+                            manager.nip65_discovery.mailbox_relay_count(),
                         ),
                         (
                             "mailbox_probe_cursors",
@@ -5626,8 +5737,14 @@ impl SyncManager {
             let candidates = self.root_candidate_index.read().await;
             let repo_index = self.repo_sync_index.read().await;
             let roots = discovery::accepted_root_candidates(candidates.values(), &repo_index);
-            let mut eligible_authors =
-                discovery::accepted_repository_authors(announcements.iter(), &repo_index);
+            let author_repositories = discovery::accepted_repository_author_repositories(
+                announcements.iter(),
+                &repo_index,
+            );
+            let mut eligible_authors: HashSet<PublicKey> =
+                author_repositories.keys().copied().collect();
+            let author_repositories =
+                public_repository_mailbox_scope(self.config.private_mode, author_repositories);
             drop(candidates);
             drop(repo_index);
             let root_ids: HashSet<EventId> = roots.iter().map(|root| root.id).collect();
@@ -5653,11 +5770,13 @@ impl SyncManager {
             let author_roots = discovery::mailbox_author_roots(&roots, frontier.author_roots);
             eligible_authors.extend(author_roots.keys().copied());
             self.nip65_discovery.author_roots = author_roots;
+            self.nip65_discovery.author_repositories = author_repositories;
             self.nip65_discovery.eligible_authors = eligible_authors;
             self.proactive_participant_authors
                 .replace(self.nip65_discovery.eligible_authors.clone())
                 .await;
             let current_authors = self.nip65_discovery.eligible_authors.clone();
+            let policy = self.outbound_target_policy();
 
             // Rebuild mailbox ownership from already accepted local state before
             // attempting a network refresh. GRASP-03 retains kind 10002 so a
@@ -5687,13 +5806,13 @@ impl SyncManager {
                     .nip65_discovery
                     .relay_lists
                     .iter()
-                    .map(|(author, event)| (*author, discovery::inbox_relays(event)))
+                    .map(|(author, event)| (*author, discovery::inbox_relays(event, &policy)))
                     .collect();
                 self.nip65_discovery.author_mailboxes = self
                     .nip65_discovery
                     .relay_lists
                     .iter()
-                    .map(|(author, event)| (*author, discovery::mailbox_relays(event)))
+                    .map(|(author, event)| (*author, discovery::mailbox_relays(event, &policy)))
                     .collect();
             }
 
@@ -5719,7 +5838,7 @@ impl SyncManager {
                     .or_default();
                 if let Some(relay_list) = self.nip65_discovery.relay_lists.get(author) {
                     sources.extend(
-                        discovery::outbox_relays(relay_list)
+                        discovery::outbox_relays(relay_list, &policy)
                             .into_iter()
                             .filter_map(|url| canonical_relay_key(&url).ok()),
                     );
@@ -5759,19 +5878,34 @@ impl SyncManager {
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
-            let mailbox_overlay = discovery::build_inbox_root_overlay(
+            let mut mailbox_overlay = discovery::build_inbox_root_overlay(
                 &self.nip65_discovery.author_roots,
                 &self.nip65_discovery.author_mailboxes,
                 &self.nip65_discovery.fallback_authors,
                 &fallback_relays,
             );
+            // Owner/maintainer repository scope is historical-only, on their
+            // bounded read/unmarked inbox selection: owning a repository must
+            // not add an author's inboxes to persistent live targets.
+            let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
+                &self.nip65_discovery.author_repositories,
+                &self.nip65_discovery.author_inboxes,
+                &self.nip65_discovery.fallback_authors,
+                &fallback_relays,
+            );
+            merge_repository_roots_into_mailbox_overlay(
+                &mut mailbox_overlay,
+                &mailbox_repository_overlay,
+                &self.nip65_discovery.root_repositories,
+            );
             self.install_nip65_inbox_overlay(inbox_overlay).await;
-            self.install_nip65_mailbox_overlay(mailbox_overlay);
+            self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
             tracing::info!(
                 root_count = root_ids.len(),
                 participant_author_count,
                 eligible_author_count = self.nip65_discovery.eligible_authors.len(),
-                mailbox_relay_count = self.nip65_discovery.mailbox_roots.len(),
+                repository_mailbox_author_count = self.nip65_discovery.author_repositories.len(),
+                mailbox_relay_count = self.nip65_discovery.mailbox_relay_count(),
                 fallback_authors = self.nip65_discovery.fallback_authors.len(),
                 "Reconciled proactive participant mailbox inventory"
             );
@@ -5863,27 +5997,35 @@ impl SyncManager {
 
     async fn install_nip65_inbox_overlay(
         &mut self,
-        new_overlay: HashMap<String, HashSet<EventId>>,
+        new_root_overlay: HashMap<String, HashSet<EventId>>,
     ) {
-        let old_overlay = std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_overlay);
-        if old_overlay == self.nip65_discovery.inbox_roots {
+        let old_root_overlay =
+            std::mem::replace(&mut self.nip65_discovery.inbox_roots, new_root_overlay);
+        if old_root_overlay == self.nip65_discovery.inbox_roots {
             return;
         }
-        let mut dirty_relays: HashSet<String> = old_overlay.keys().cloned().collect();
+        let mut dirty_relays: HashSet<String> = old_root_overlay.keys().cloned().collect();
         dirty_relays.extend(self.nip65_discovery.inbox_roots.keys().cloned());
 
         for relay in dirty_relays {
-            // Preserve the established root-author inbox behavior: additions
-            // enter ordinary live/rotating descendant coverage, while
-            // removal-only changes drain through that coverage's normal
-            // lifecycle instead of churning shared subscriptions.
+            // Root-author inbox roots are essential live coverage. Recursive
+            // descendant expansion remains auxiliary and may rotate under
+            // pressure. Removal-only changes drain through the ordinary
+            // coverage lifecycle instead of churning shared subscriptions.
             self.recompute_new_sync_filters_for_relay(&relay).await;
         }
     }
 
-    fn install_nip65_mailbox_overlay(&mut self, new_overlay: HashMap<String, HashSet<EventId>>) {
-        self.nip65_discovery
-            .install_mailbox_overlay(new_overlay, Instant::now());
+    fn install_nip65_mailbox_overlay(
+        &mut self,
+        new_root_overlay: HashMap<String, HashSet<EventId>>,
+        new_repository_overlay: HashMap<String, HashSet<String>>,
+    ) {
+        self.nip65_discovery.install_mailbox_overlay(
+            new_root_overlay,
+            new_repository_overlay,
+            Instant::now(),
+        );
     }
 
     async fn schedule_mailbox_probe(&mut self) {
@@ -5891,9 +6033,14 @@ impl SyncManager {
             return;
         }
 
+        if !mailbox_worker_capacity_available(self.nip65_discovery.mailbox_probes_in_flight.len()) {
+            return;
+        }
+
         let now = Instant::now();
         let due_relays: Vec<String> = due_mailbox_relays(
             &self.nip65_discovery.mailbox_roots,
+            &self.nip65_discovery.mailbox_repositories,
             &self.nip65_discovery.mailbox_probe_next_at,
             now,
         )
@@ -5916,13 +6063,17 @@ impl SyncManager {
         let Some(relay) = select_due_mailbox_relay(&due_relays, &active_relays) else {
             return;
         };
+        self.start_mailbox_probe(relay, now).await;
+    }
+
+    async fn start_mailbox_probe(&mut self, relay: String, now: Instant) -> bool {
         if is_own_sync_target(&relay, &self.service_domain)
             || self.rejected_relay_targets.contains(&relay)
         {
             self.nip65_discovery
                 .mailbox_probe_next_at
                 .insert(relay, now + mailbox_probe_refresh_interval());
-            return;
+            return false;
         }
 
         if !self.connections.contains_key(&relay) {
@@ -5930,12 +6081,12 @@ impl SyncManager {
                 self.schedule_connect_relay(&relay).await;
             }
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         }
 
         let Some(connection) = self.connections.get(&relay).cloned() else {
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         };
         let socket_connected = connection.is_connected().await;
         let connection_status = self
@@ -5951,14 +6102,26 @@ impl SyncManager {
                 self.retire_idle_nip65_discovery_source(&relay).await;
             }
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         }
 
-        let roots = self.nip65_discovery.mailbox_roots[&relay].clone();
-        let repositories: HashSet<String> = roots
-            .iter()
-            .filter_map(|root| self.nip65_discovery.root_repositories.get(root).cloned())
-            .collect();
+        let root_scope = self
+            .nip65_discovery
+            .mailbox_roots
+            .get(&relay)
+            .cloned()
+            .unwrap_or_default();
+        let repository_scope = self
+            .nip65_discovery
+            .mailbox_repositories
+            .get(&relay)
+            .cloned()
+            .unwrap_or_default();
+        let (repositories, roots) = expand_mailbox_probe_scope(
+            &repository_scope,
+            &root_scope,
+            &self.nip65_discovery.root_repositories,
+        );
         let frontier = recursive_descendant_frontier(
             &self.database,
             &roots,
@@ -5972,7 +6135,7 @@ impl SyncManager {
                 .mailbox_probe_next_at
                 .insert(relay.clone(), now + mailbox_probe_refresh_interval());
             self.retire_idle_nip65_discovery_source(&relay).await;
-            return;
+            return false;
         };
         let filter_index = self
             .nip65_discovery
@@ -5984,7 +6147,7 @@ impl SyncManager {
         let filter = filters.swap_remove(filter_index);
         let Some(result_tx) = self.mailbox_probe_result_tx.clone() else {
             self.defer_mailbox_relay(&relay);
-            return;
+            return false;
         };
         self.nip65_discovery
             .mailbox_probes_in_flight
@@ -6007,10 +6170,11 @@ impl SyncManager {
             filter_count,
             "Started bounded participant mailbox fetch"
         );
+        true
     }
 
     fn defer_mailbox_relay(&mut self, relay: &str) {
-        if self.nip65_discovery.mailbox_roots.contains_key(relay) {
+        if self.nip65_discovery.has_mailbox_scope(relay) {
             self.nip65_discovery.mailbox_probe_next_at.insert(
                 relay.to_string(),
                 Instant::now() + mailbox_probe_retry_interval(),
@@ -6070,6 +6234,14 @@ impl SyncManager {
             next_probe_in_secs = next_probe_in.as_secs_f64(),
             "Participant mailbox fetch reached terminal state"
         );
+
+        if should_continue_mailbox_probe(succeeded, completed_cycle)
+            && self
+                .start_mailbox_probe(result.source_relay.clone(), Instant::now())
+                .await
+        {
+            return;
+        }
         self.retire_idle_nip65_discovery_source(&result.source_relay)
             .await;
     }
@@ -6134,12 +6306,19 @@ impl SyncManager {
                 .insert((result.source_relay.clone(), *author), now + retry_after);
             if authors_with_lists.contains(author) {
                 self.nip65_discovery.fallback_authors.remove(author);
-            } else if query_succeeded && self.nip65_discovery.author_roots.contains_key(author) {
+            } else if query_succeeded
+                && (self.nip65_discovery.author_roots.contains_key(author)
+                    || self
+                        .nip65_discovery
+                        .author_repositories
+                        .contains_key(author))
+            {
                 self.nip65_discovery.fallback_authors.insert(*author);
             }
         }
 
         let mut changed = previous_fallback_authors != self.nip65_discovery.fallback_authors;
+        let policy = self.outbound_target_policy();
         for (author, candidate) in latest {
             if !self.nip65_discovery.eligible_authors.contains(&author) {
                 continue;
@@ -6155,10 +6334,10 @@ impl SyncManager {
             if replace {
                 self.nip65_discovery
                     .author_inboxes
-                    .insert(author, discovery::inbox_relays(&candidate));
+                    .insert(author, discovery::inbox_relays(&candidate, &policy));
                 self.nip65_discovery
                     .author_mailboxes
-                    .insert(author, discovery::mailbox_relays(&candidate));
+                    .insert(author, discovery::mailbox_relays(&candidate, &policy));
                 let mut index_relays: HashSet<String> = self
                     .config
                     .parse_user_index_relays()
@@ -6179,7 +6358,7 @@ impl SyncManager {
                     .or_default();
                 sources.retain(|source| !index_relays.contains(source));
                 sources.extend(
-                    discovery::outbox_relays(&candidate)
+                    discovery::outbox_relays(&candidate, &policy)
                         .into_iter()
                         .filter_map(|url| canonical_relay_key(&url).ok()),
                 );
@@ -6200,18 +6379,32 @@ impl SyncManager {
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
-        let mailbox_overlay = discovery::build_inbox_root_overlay(
+        let mut mailbox_overlay = discovery::build_inbox_root_overlay(
             &self.nip65_discovery.author_roots,
             &self.nip65_discovery.author_mailboxes,
             &self.nip65_discovery.fallback_authors,
             &fallback_relays,
         );
+        // Owner/maintainer repository scope is historical-only, on their
+        // bounded read/unmarked inbox selection: owning a repository must
+        // not add an author's inboxes to persistent live targets.
+        let mailbox_repository_overlay = discovery::build_mailbox_repository_overlay(
+            &self.nip65_discovery.author_repositories,
+            &self.nip65_discovery.author_inboxes,
+            &self.nip65_discovery.fallback_authors,
+            &fallback_relays,
+        );
+        merge_repository_roots_into_mailbox_overlay(
+            &mut mailbox_overlay,
+            &mailbox_repository_overlay,
+            &self.nip65_discovery.root_repositories,
+        );
         self.install_nip65_inbox_overlay(inbox_overlay).await;
-        self.install_nip65_mailbox_overlay(mailbox_overlay);
+        self.install_nip65_mailbox_overlay(mailbox_overlay, mailbox_repository_overlay);
         tracing::info!(
             source = %result.source_relay,
             authors = result.authors.len(),
-            mailbox_relays = self.nip65_discovery.mailbox_roots.len(),
+            mailbox_relays = self.nip65_discovery.mailbox_relay_count(),
             fallback_authors = self.nip65_discovery.fallback_authors.len(),
             "Updated proactive participant mailbox coverage from NIP-65"
         );
@@ -6250,7 +6443,7 @@ impl SyncManager {
             .nip65_discovery
             .mailbox_probes_in_flight
             .contains(source)
-            || (self.nip65_discovery.mailbox_roots.contains_key(source)
+            || (self.nip65_discovery.has_mailbox_scope(source)
                 && self
                     .nip65_discovery
                     .mailbox_probe_next_at
@@ -6367,11 +6560,7 @@ impl SyncManager {
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_connection_attempt(&result.relay_url, true);
                 }
-                if self
-                    .nip65_discovery
-                    .mailbox_roots
-                    .contains_key(&result.relay_url)
-                {
+                if self.nip65_discovery.has_mailbox_scope(&result.relay_url) {
                     self.nip65_discovery
                         .mailbox_probe_next_at
                         .insert(result.relay_url.clone(), Instant::now());
@@ -7378,15 +7567,25 @@ impl SyncManager {
         match result {
             WritePolicyResult::Accept => {
                 // Save event to database
-
-                if let Err(e) = write_policy.save_accepted_event(event, save_context).await {
-                    tracing::error!(
-                        event_id = %event.id,
-                        relay = %relay_url,
-                        error = %e,
-                        "Failed to save synced event"
-                    );
-                    return ProcessResult::PersistenceError;
+                match write_policy.save_accepted_event(event, save_context).await {
+                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Saved) => {}
+                    Ok(crate::nostr::persistence::AcceptedEventSaveOutcome::Duplicate) => {
+                        tracing::trace!(
+                            event_id = %event.id,
+                            relay = %relay_url,
+                            "Database retained an existing event during sync"
+                        );
+                        return ProcessResult::Duplicate;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            event_id = %event.id,
+                            relay = %relay_url,
+                            error = %e,
+                            "Failed to save synced event"
+                        );
+                        return ProcessResult::PersistenceError;
+                    }
                 }
 
                 // Broadcast to WebSocket subscribers (enables recursive relay discovery)
@@ -9119,6 +9318,74 @@ mod tests {
         assert!(!rejected.contains(&child.id));
     }
 
+    #[tokio::test]
+    async fn replaced_sync_event_is_reported_as_duplicate() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let git_data_path = directory.path().join("git");
+        let mut config = Config::for_testing();
+        config.git_data_path = git_data_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_data_path));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .expect("create test relay runtime");
+        let rejected = Arc::new(RejectedEventsIndex::new(
+            Duration::from_secs(120),
+            Duration::from_secs(604800),
+        ));
+        let keys = Keys::generate();
+        let older = EventBuilder::new(Kind::GitUserGraspList, "older")
+            .custom_created_at(Timestamp::from_secs(100))
+            .finalize(&keys)
+            .expect("build older replaceable event");
+        let newer = EventBuilder::new(Kind::GitUserGraspList, "newer")
+            .custom_created_at(Timestamp::from_secs(200))
+            .finalize(&keys)
+            .expect("build newer replaceable event");
+        runtime
+            .stores
+            .database
+            .save_event(&newer)
+            .await
+            .expect("save newer replaceable event");
+
+        let result = SyncManager::process_event_static(
+            &older,
+            "wss://source.example",
+            &runtime.stores.database,
+            &runtime.write_policy,
+            &runtime.relay,
+            &rejected,
+            crate::nostr::persistence::SaveContext::RelaySync,
+        )
+        .await;
+
+        assert_eq!(result, ProcessResult::Duplicate);
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&older.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&newer.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn private_members_include_only_owners_of_accepted_relays() {
         let configured = Keys::generate().public_key();
@@ -9556,6 +9823,60 @@ mod tests {
     }
 
     #[test]
+    fn repository_mailbox_scope_adds_every_known_root_without_broadening_participants() {
+        let first_root = EventId::from_byte_array([23; 32]);
+        let second_root = EventId::from_byte_array([24; 32]);
+        let participant_root = EventId::from_byte_array([25; 32]);
+        let repository = "30617:owner:maintained".to_string();
+        let participant_repository = "30617:owner:participant".to_string();
+        let root_repositories = HashMap::from([
+            (first_root, repository.clone()),
+            (second_root, repository.clone()),
+            (participant_root, participant_repository.clone()),
+        ]);
+
+        let (repositories, roots) = expand_mailbox_probe_scope(
+            &HashSet::from([repository.clone()]),
+            &HashSet::from([participant_root]),
+            &root_repositories,
+        );
+
+        assert_eq!(
+            repositories,
+            HashSet::from([repository, participant_repository])
+        );
+        assert_eq!(
+            roots,
+            HashSet::from([first_root, second_root, participant_root])
+        );
+
+        let (_, participant_only_roots) = expand_mailbox_probe_scope(
+            &HashSet::new(),
+            &HashSet::from([participant_root]),
+            &root_repositories,
+        );
+        assert_eq!(participant_only_roots, HashSet::from([participant_root]));
+    }
+
+    #[test]
+    fn repository_mailbox_root_overlay_tracks_inventory_growth() {
+        let relay = "wss://maintainer.example".to_string();
+        let repository = "30617:owner:maintained".to_string();
+        let root = EventId::from_byte_array([26; 32]);
+        let mailbox_repositories =
+            HashMap::from([(relay.clone(), HashSet::from([repository.clone()]))]);
+        let mut mailbox_roots = HashMap::new();
+
+        merge_repository_roots_into_mailbox_overlay(
+            &mut mailbox_roots,
+            &mailbox_repositories,
+            &HashMap::from([(root, repository)]),
+        );
+
+        assert_eq!(mailbox_roots[&relay], HashSet::from([root]));
+    }
+
+    #[test]
     fn mailbox_probe_order_prioritizes_longest_waiting_due_source() {
         let now = Instant::now();
         let root = EventId::from_byte_array([23; 32]);
@@ -9587,12 +9908,36 @@ mod tests {
         ]);
 
         assert_eq!(
-            due_mailbox_relays(&roots, &next_at, now),
+            due_mailbox_relays(&roots, &HashMap::new(), &next_at, now),
             vec![
                 "wss://old.example".to_string(),
                 "wss://large.example".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn repository_only_mailbox_scope_is_due() {
+        let now = Instant::now();
+        let relay = "wss://maintainer.example".to_string();
+        let repositories = HashMap::from([(
+            relay.clone(),
+            HashSet::from(["30617:owner:repo".to_string()]),
+        )]);
+
+        assert_eq!(
+            due_mailbox_relays(&HashMap::new(), &repositories, &HashMap::new(), now),
+            vec![relay]
+        );
+    }
+
+    #[test]
+    fn private_mode_does_not_export_repository_mailbox_scope() {
+        let author = Keys::generate().public_key();
+        let scope = HashMap::from([(author, HashSet::from(["30617:owner:private".to_string()]))]);
+
+        assert_eq!(public_repository_mailbox_scope(false, scope.clone()), scope);
+        assert!(public_repository_mailbox_scope(true, scope).is_empty());
     }
 
     #[test]
@@ -9637,14 +9982,17 @@ mod tests {
             .mailbox_roots
             .insert(relay.clone(), HashSet::from([first_root]));
         discovery.mailbox_probe_next_filter.insert(relay.clone(), 3);
+        let now = Instant::now();
 
         discovery.install_mailbox_overlay(
             HashMap::from([(relay.clone(), HashSet::from([first_root, second_root]))]),
-            Instant::now(),
+            HashMap::new(),
+            now,
         );
         assert_eq!(discovery.mailbox_probe_next_filter[&relay], 3);
+        assert_eq!(discovery.mailbox_probe_next_at[&relay], now);
 
-        discovery.install_mailbox_overlay(HashMap::new(), Instant::now());
+        discovery.install_mailbox_overlay(HashMap::new(), HashMap::new(), Instant::now());
         assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
         assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
     }
@@ -9666,7 +10014,7 @@ mod tests {
             now + Duration::from_secs(60)
         );
 
-        discovery.install_mailbox_overlay(HashMap::new(), now);
+        discovery.install_mailbox_overlay(HashMap::new(), HashMap::new(), now);
         discovery.record_probe_completion(&relay, 2, Duration::from_secs(60), now);
         assert!(!discovery.mailbox_probe_next_filter.contains_key(&relay));
         assert!(!discovery.mailbox_probe_next_at.contains_key(&relay));
@@ -9678,11 +10026,32 @@ mod tests {
         assert_eq!(next_filter, 1);
         assert!(!completed_cycle);
         assert_eq!(retry_after, mailbox_probe_retry_interval());
+        assert!(!should_continue_mailbox_probe(false, completed_cycle));
 
         let (next_filter, completed_cycle, refresh_after) = mailbox_probe_completion(1, 2, true);
         assert_eq!(next_filter, 0);
         assert!(completed_cycle);
         assert_eq!(refresh_after, mailbox_probe_refresh_interval());
+        assert!(!should_continue_mailbox_probe(true, completed_cycle));
+    }
+
+    #[test]
+    fn mailbox_worker_continues_successful_partial_cycle() {
+        let (next_filter, completed_cycle, retry_after) = mailbox_probe_completion(0, 2, true);
+        assert_eq!(next_filter, 1);
+        assert!(!completed_cycle);
+        assert_eq!(retry_after, Duration::ZERO);
+        assert!(should_continue_mailbox_probe(true, completed_cycle));
+    }
+
+    #[test]
+    fn mailbox_worker_capacity_is_a_process_safety_ceiling() {
+        assert!(mailbox_worker_capacity_available(
+            MAX_CONCURRENT_MAILBOX_WORKERS - 1
+        ));
+        assert!(!mailbox_worker_capacity_available(
+            MAX_CONCURRENT_MAILBOX_WORKERS
+        ));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::git::sync::{PurgatoryPromotionHooks, PurgatorySaveContext};
 use crate::nostr::builder::Nip34WritePolicy;
 use crate::nostr::events::RepositoryAnnouncement;
 use crate::nostr::lifecycle::DeletionService;
-use crate::nostr::persistence::SaveContext;
+use crate::nostr::persistence::{AcceptedEventSaveOutcome, SaveContext};
 use crate::sync::rejected_index::{EventType, RejectedEventsIndex};
 
 pub struct NostrPurgatoryPromotionHooks {
@@ -88,9 +88,16 @@ impl NostrPurgatoryPromotionHooks {
                         .save_accepted_event(&state, SaveContext::HotCacheReprocess)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(AcceptedEventSaveOutcome::Saved) => {
                             rejected_events_index.remove(&state.id);
                             relay.notify_event(state.clone());
+                        }
+                        Ok(AcceptedEventSaveOutcome::Duplicate) => {
+                            rejected_events_index.remove(&state.id);
+                            debug!(
+                                event_id = %state.id,
+                                "Re-processed state event was already superseded or stored"
+                            );
                         }
                         Err(e) => {
                             warn!(
@@ -194,7 +201,7 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                                     .save_accepted_event(&hot_event, SaveContext::HotCacheReprocess)
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(AcceptedEventSaveOutcome::Saved) => {
                                         rejected_events_index.remove(&hot_event.id);
                                         relay.notify_event(hot_event.clone());
                                         self.reprocess_state_dependencies(
@@ -208,6 +215,21 @@ impl PurgatoryPromotionHooks for NostrPurgatoryPromotionHooks {
                                         info!(
                                             event_id = %hot_event.id,
                                             "Maintainer announcement accepted and saved on re-processing"
+                                        );
+                                    }
+                                    Ok(AcceptedEventSaveOutcome::Duplicate) => {
+                                        rejected_events_index.remove(&hot_event.id);
+                                        self.reprocess_state_dependencies(
+                                            write_policy,
+                                            rejected_events_index,
+                                            relay,
+                                            &hot_event.pubkey,
+                                            &announcement.identifier,
+                                        )
+                                        .await;
+                                        debug!(
+                                            event_id = %hot_event.id,
+                                            "Re-processed maintainer announcement was already superseded or stored"
                                         );
                                     }
                                     Err(e) => {
