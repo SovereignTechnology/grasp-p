@@ -13,16 +13,16 @@
 //! inspection must be healthy. It is then deleted before the next family is
 //! migrated. Peak migration overhead is therefore bounded by the family
 //! currently in flight rather than the whole legacy dataset. Packs without an
-//! index are Git-invisible and are quarantined under
+//! index are Git-invisible and are quarantined by content under
 //! `.grasp/migration/unindexed-packs` instead of being destroyed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -916,11 +916,20 @@ fn quarantine_unindexed_packs(storage: &LocalGitStorage, unit: &RetirementUnit) 
         {
             continue;
         }
+        let digest = sha256_file(&entry.path())?;
         let destination = migration_root(storage)
             .join("unindexed-packs")
             .join(&unit.journal.relative_path)
+            .join(digest.to_string())
             .join(&name);
         if destination.exists() {
+            let existing_digest = sha256_file(&destination)?;
+            if existing_digest != digest {
+                return Err(anyhow!(
+                    "quarantined pack content does not match its digest path: {}",
+                    destination.display()
+                ));
+            }
             continue;
         }
         let parent = destination.parent().context("quarantine has no parent")?;
@@ -939,6 +948,23 @@ fn quarantine_unindexed_packs(storage: &LocalGitStorage, unit: &RetirementUnit) 
         );
     }
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<sha256::Hash> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open file for SHA-256 digest: {}", path.display()))?;
+    let mut engine = sha256::Hash::engine();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read file for SHA-256 digest: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        engine.input(&buffer[..read]);
+    }
+    Ok(sha256::Hash::from_engine(engine))
 }
 
 /// Delete a retired backup directory and prune emptied parents.
@@ -1572,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_quarantines_a_pack_without_an_index() {
+    async fn migration_quarantines_unindexed_packs_by_content() {
         let temp = tempfile::tempdir().unwrap();
         let storage = LocalGitStorage::new(temp.path().join("git"));
         let owner = Keys::generate().public_key().to_bech32().unwrap();
@@ -1582,6 +1608,7 @@ mod tests {
         let orphan = repo.join("objects/pack").join(orphan_name);
         std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
         std::fs::write(&orphan, b"not a readable Git pack\n").unwrap();
+        let first_digest = sha256_file(&orphan).unwrap();
 
         let report = migrate_on_startup(&storage).await.unwrap();
 
@@ -1589,10 +1616,11 @@ mod tests {
         assert_eq!(report.retired_backups, 1);
         let quarantined = migration_root(&storage)
             .join("unindexed-packs")
-            .join(relative)
+            .join(&relative)
+            .join(first_digest.to_string())
             .join(orphan_name);
         assert_eq!(
-            std::fs::read(quarantined).unwrap(),
+            std::fs::read(&quarantined).unwrap(),
             b"not a readable Git pack\n"
         );
         assert!(!backup_root(&storage).exists());
@@ -1600,6 +1628,41 @@ mod tests {
         let family = storage.family_repo_path(&key);
         assert!(!family.join("objects/pack").join(orphan_name).exists());
         assert!(oid_is_available(&family, &oid).unwrap());
+
+        // Replacing the thin view with another legacy repository is a
+        // supported recovery path. A different damaged pack may reuse the
+        // same filename; content-addressed quarantine must preserve both.
+        std::fs::remove_dir_all(&repo).unwrap();
+        let (replacement, replacement_oid) = legacy_repo(
+            storage.git_data_path(),
+            &owner,
+            "orphan-pack",
+            b"replacement data\n",
+        );
+        let replacement_orphan = replacement.join("objects/pack").join(orphan_name);
+        std::fs::create_dir_all(replacement_orphan.parent().unwrap()).unwrap();
+        std::fs::write(&replacement_orphan, b"different unreadable pack\n").unwrap();
+        let second_digest = sha256_file(&replacement_orphan).unwrap();
+        assert_ne!(first_digest, second_digest);
+
+        let second_report = migrate_on_startup(&storage).await.unwrap();
+
+        assert_eq!(second_report.migrated_views, 1);
+        assert_eq!(second_report.retired_backups, 1);
+        let second_quarantined = migration_root(&storage)
+            .join("unindexed-packs")
+            .join(relative)
+            .join(second_digest.to_string())
+            .join(orphan_name);
+        assert_eq!(
+            std::fs::read(second_quarantined).unwrap(),
+            b"different unreadable pack\n"
+        );
+        assert_eq!(
+            std::fs::read(quarantined).unwrap(),
+            b"not a readable Git pack\n"
+        );
+        assert!(oid_is_available(&family, &replacement_oid).unwrap());
     }
 
     #[tokio::test]

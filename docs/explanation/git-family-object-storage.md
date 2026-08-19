@@ -292,8 +292,10 @@ bounded by the family currently in flight except for the small set of families
 still awaiting repair.
 
 Packs without an index are Git-invisible, so the superset proof cannot vouch
-for them; they are moved to `.grasp/migration/unindexed-packs/` before their
-backup is deleted.
+for them; they are moved into content-addressed directories beneath
+`.grasp/migration/unindexed-packs/` before their backup is deleted. Repeated
+migrations preserve different payloads even when their original pack filenames
+match, while an identical payload converges on the same quarantine path.
 
 A server-side `shallow` marker means the legacy repository is a deliberate
 truncation, and GRASP does not treat shallow repositories as valid family

@@ -79,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report must be healthy before deletion. Unhealthy families retain their
   backups for automatic repair. Healthy backups are deleted before the next
   family migrates, bounding peak migration disk overhead to the family in
-  flight. Unindexed legacy packs are quarantined under
+  flight. Unindexed legacy packs are quarantined by content under
   `.grasp/migration/unindexed-packs/`, unverifiable backups are retained with
   a warning, and completed installations whose backups were already removed
   manually start unchanged.
