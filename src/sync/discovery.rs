@@ -5,8 +5,17 @@ use std::collections::{HashMap, HashSet};
 use nostr::nips::nip65::{self, RelayMetadata};
 use nostr_sdk::prelude::*;
 
-use super::{algorithms::RelaySyncNeeds, target_hygiene, RepoSyncNeeds, SyncLevel};
+use super::{
+    algorithms::RelaySyncNeeds, canonical_relay_key, target_hygiene, RepoSyncNeeds, SyncLevel,
+};
 use crate::outbound::OutboundTargetPolicy;
+
+/// Hard ceiling on the relays selected per author and purpose from one kind
+/// 10002 list. NIP-65 already guides users toward two to four relays per
+/// category; this is a defensive resource boundary, deliberately not a
+/// configuration option, so one hostile list cannot inflate mailbox
+/// inventory regardless of its size.
+pub const MAX_RELAYS_PER_AUTHOR_PURPOSE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedRoot {
@@ -112,29 +121,64 @@ pub fn latest_identity_events(
     events
 }
 
-pub fn inbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
+/// Hygiene-filtered, canonicalized relay entries in published tag order,
+/// deduplicated by canonical key so trailing-root-slash and default-port
+/// variants cannot consume multiple selection slots. A duplicate keeps its
+/// first position; when duplicate listings disagree on markers, the entry
+/// widens to unmarked (both roles), matching NIP-65's union semantics.
+/// Non-root paths and query strings remain distinct targets. Tag order is
+/// preserved here so every bounded selection below is deterministic ("first
+/// four" in the author's published order).
+fn canonical_relay_entries(
+    event: &Event,
+    policy: &OutboundTargetPolicy,
+) -> Vec<(String, Option<RelayMetadata>)> {
     if event.kind != Kind::RelayList {
-        return HashSet::new();
+        return Vec::new();
     }
-    nip65::extract_relay_list(event)
-        .filter_map(|(relay, marker)| {
-            (matches!(marker, None | Some(RelayMetadata::Read))
-                && target_hygiene::accepts(&relay, policy))
-            .then(|| relay.to_string())
-        })
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut entries: Vec<(String, Option<RelayMetadata>)> = Vec::new();
+    for (relay, marker) in nip65::extract_relay_list(event) {
+        if !target_hygiene::accepts(&relay, policy) {
+            continue;
+        }
+        let Ok(key) = canonical_relay_key(relay.as_str()) else {
+            continue;
+        };
+        match positions.get(&key) {
+            None => {
+                positions.insert(key.clone(), entries.len());
+                entries.push((key, marker));
+            }
+            Some(&position) => {
+                if entries[position].1 != marker {
+                    entries[position].1 = None;
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Up to [`MAX_RELAYS_PER_AUTHOR_PURPOSE`] canonical `read`/unmarked relays
+/// in published tag order: the author's live inbox coverage.
+pub fn inbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
+    canonical_relay_entries(event, policy)
+        .into_iter()
+        .filter(|(_, marker)| matches!(marker, None | Some(RelayMetadata::Read)))
+        .map(|(relay, _)| relay)
+        .take(MAX_RELAYS_PER_AUTHOR_PURPOSE)
         .collect()
 }
 
+/// Up to [`MAX_RELAYS_PER_AUTHOR_PURPOSE`] canonical `write`/unmarked relays
+/// in published tag order: identity-refresh sources for the author.
 pub fn outbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
-    if event.kind != Kind::RelayList {
-        return HashSet::new();
-    }
-    nip65::extract_relay_list(event)
-        .filter_map(|(relay, marker)| {
-            (matches!(marker, None | Some(RelayMetadata::Write))
-                && target_hygiene::accepts(&relay, policy))
-            .then(|| relay.to_string())
-        })
+    canonical_relay_entries(event, policy)
+        .into_iter()
+        .filter(|(_, marker)| matches!(marker, None | Some(RelayMetadata::Write)))
+        .map(|(relay, _)| relay)
+        .take(MAX_RELAYS_PER_AUTHOR_PURPOSE)
         .collect()
 }
 
@@ -319,13 +363,29 @@ pub fn build_mailbox_repository_overlay(
     overlay
 }
 
-/// Relays on which an author may receive or publish conversation events.
-/// Unmarked entries serve both roles under NIP-65.
+/// Up to [`MAX_RELAYS_PER_AUTHOR_PURPOSE`] canonical relays on which an
+/// author's conversation history should be probed. `write` and unmarked
+/// relays are preferred in published tag order because authored contributions
+/// are downloaded from where the author publishes; any remaining slots are
+/// filled from read-only relays in published order. Deduplication by
+/// canonical key happens before selection, so an unmarked relay serving both
+/// roles consumes exactly one slot.
 pub fn mailbox_relays(event: &Event, policy: &OutboundTargetPolicy) -> HashSet<String> {
-    inbox_relays(event, policy)
-        .into_iter()
-        .chain(outbox_relays(event, policy))
-        .collect()
+    let entries = canonical_relay_entries(event, policy);
+    let mut selected: Vec<String> = entries
+        .iter()
+        .filter(|(_, marker)| matches!(marker, None | Some(RelayMetadata::Write)))
+        .map(|(relay, _)| relay.clone())
+        .take(MAX_RELAYS_PER_AUTHOR_PURPOSE)
+        .collect();
+    selected.extend(
+        entries
+            .iter()
+            .filter(|(_, marker)| matches!(marker, Some(RelayMetadata::Read)))
+            .map(|(relay, _)| relay.clone())
+            .take(MAX_RELAYS_PER_AUTHOR_PURPOSE - selected.len()),
+    );
+    selected.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -478,6 +538,185 @@ mod tests {
     }
 
     #[test]
+    fn canonical_duplicates_consume_one_selection_slot() {
+        let keys = Keys::generate();
+        // Three syntactic variants of one relay must occupy one slot, leaving
+        // the remaining three slots for later distinct relays.
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://a.example/", "read"]),
+                Tag::custom("r", ["wss://a.example", "read"]),
+                Tag::custom("r", ["wss://a.example:443", "read"]),
+                Tag::custom("r", ["wss://b.example", "read"]),
+                Tag::custom("r", ["wss://c.example", "read"]),
+                Tag::custom("r", ["wss://d.example", "read"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            inbox_relays(&relay_list, &OutboundTargetPolicy::default()),
+            HashSet::from([
+                "wss://a.example".to_string(),
+                "wss://b.example".to_string(),
+                "wss://c.example".to_string(),
+                "wss://d.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_listings_with_conflicting_markers_widen_to_both_roles() {
+        let keys = Keys::generate();
+        // One relay listed twice (as slash variants) with disagreeing markers
+        // serves both roles per NIP-65 union semantics, from one slot.
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://dual.example/", "read"]),
+                Tag::custom("r", ["wss://dual.example", "write"]),
+            ],
+            1,
+        );
+        let policy = OutboundTargetPolicy::default();
+        let expected = HashSet::from(["wss://dual.example".to_string()]);
+        assert_eq!(inbox_relays(&relay_list, &policy), expected);
+        assert_eq!(outbox_relays(&relay_list, &policy), expected);
+        assert_eq!(mailbox_relays(&relay_list, &policy), expected);
+    }
+
+    #[test]
+    fn selection_is_bounded_to_four_in_published_tag_order() {
+        let keys = Keys::generate();
+        let tags: Vec<Tag> = (1..=6)
+            .map(|n| {
+                Tag::custom(
+                    "r",
+                    [format!("wss://relay-{n}.example"), "read".to_string()],
+                )
+            })
+            .collect();
+        let relay_list = event(&keys, Kind::RelayList, tags, 1);
+        let policy = OutboundTargetPolicy::default();
+        let expected: HashSet<String> = (1..=4)
+            .map(|n| format!("wss://relay-{n}.example"))
+            .collect();
+        assert_eq!(inbox_relays(&relay_list, &policy), expected);
+        // Selection is deterministic across repeated evaluations.
+        assert_eq!(
+            inbox_relays(&relay_list, &policy),
+            inbox_relays(&relay_list, &policy)
+        );
+    }
+
+    #[test]
+    fn rejected_urls_do_not_consume_selection_slots() {
+        let keys = Keys::generate();
+        // Hygiene rejections precede selection, so hostile entries cannot
+        // crowd legitimate relays out of the four slots.
+        let relay_list = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://hidden.onion", "read"]),
+                Tag::custom("r", ["wss://spam.example/alpha-bravo", "read"]),
+                Tag::custom("r", ["wss://one.example", "read"]),
+                Tag::custom("r", ["wss://two.example", "read"]),
+                Tag::custom("r", ["wss://three.example", "read"]),
+                Tag::custom("r", ["wss://four.example", "read"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            inbox_relays(&relay_list, &OutboundTargetPolicy::default()),
+            HashSet::from([
+                "wss://one.example".to_string(),
+                "wss://two.example".to_string(),
+                "wss://three.example".to_string(),
+                "wss://four.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn participant_history_prefers_write_and_unmarked_relays() {
+        let keys = Keys::generate();
+        let policy = OutboundTargetPolicy::default();
+        // Enough write/unmarked relays: read-only relays are not selected.
+        let write_heavy = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://read-1.example", "read"]),
+                Tag::custom("r", ["wss://write-1.example", "write"]),
+                Tag::custom("r", ["wss://unmarked.example"]),
+                Tag::custom("r", ["wss://write-2.example", "write"]),
+                Tag::custom("r", ["wss://write-3.example", "write"]),
+                Tag::custom("r", ["wss://write-4.example", "write"]),
+            ],
+            1,
+        );
+        assert_eq!(
+            mailbox_relays(&write_heavy, &policy),
+            HashSet::from([
+                "wss://write-1.example".to_string(),
+                "wss://unmarked.example".to_string(),
+                "wss://write-2.example".to_string(),
+                "wss://write-3.example".to_string(),
+            ])
+        );
+        // Too few write/unmarked relays: read-only relays fill the remaining
+        // slots in published order.
+        let read_heavy = event(
+            &keys,
+            Kind::RelayList,
+            vec![
+                Tag::custom("r", ["wss://read-1.example", "read"]),
+                Tag::custom("r", ["wss://read-2.example", "read"]),
+                Tag::custom("r", ["wss://write-1.example", "write"]),
+                Tag::custom("r", ["wss://read-3.example", "read"]),
+                Tag::custom("r", ["wss://read-4.example", "read"]),
+            ],
+            2,
+        );
+        assert_eq!(
+            mailbox_relays(&read_heavy, &policy),
+            HashSet::from([
+                "wss://write-1.example".to_string(),
+                "wss://read-1.example".to_string(),
+                "wss://read-2.example".to_string(),
+                "wss://read-3.example".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn oversized_relay_list_contributes_bounded_targets_per_purpose() {
+        let keys = Keys::generate();
+        // The 983-relay corpus shape: one large, machine-generated, unmarked
+        // list. Every purpose stays within its four-slot ceiling.
+        let tags: Vec<Tag> = (1..=40)
+            .map(|n| Tag::custom("r", [format!("wss://generated-{n}.example")]))
+            .collect();
+        let relay_list = event(&keys, Kind::RelayList, tags, 1);
+        let policy = OutboundTargetPolicy::default();
+        assert_eq!(
+            inbox_relays(&relay_list, &policy).len(),
+            MAX_RELAYS_PER_AUTHOR_PURPOSE
+        );
+        assert_eq!(
+            outbox_relays(&relay_list, &policy).len(),
+            MAX_RELAYS_PER_AUTHOR_PURPOSE
+        );
+        assert_eq!(
+            mailbox_relays(&relay_list, &policy).len(),
+            MAX_RELAYS_PER_AUTHOR_PURPOSE
+        );
+    }
+
+    #[test]
     fn identity_authors_are_bounded_to_full_repo_owners_and_maintainers() {
         let owner = Keys::generate();
         let maintainer = Keys::generate();
@@ -590,9 +829,9 @@ mod tests {
         let mut targets = HashMap::new();
         merge_inbox_roots(
             &mut targets,
-            &HashMap::from([("wss://inbox.example/".to_string(), HashSet::from([root]))]),
+            &HashMap::from([("wss://inbox.example".to_string(), HashSet::from([root]))]),
         );
-        let target = &targets["wss://inbox.example/"];
+        let target = &targets["wss://inbox.example"];
         assert_eq!(target.root_events, HashSet::from([root]));
         assert!(target.repos.is_empty());
         assert!(target.state_only_repos.is_empty());
@@ -605,11 +844,11 @@ mod tests {
         merge_inbox_repositories(
             &mut targets,
             &HashMap::from([(
-                "wss://inbox.example/".to_string(),
+                "wss://inbox.example".to_string(),
                 HashSet::from([repository.clone()]),
             )]),
         );
-        let target = &targets["wss://inbox.example/"];
+        let target = &targets["wss://inbox.example"];
         assert_eq!(target.repos, HashSet::from([repository]));
         assert!(target.root_events.is_empty());
         assert!(target.state_only_repos.is_empty());

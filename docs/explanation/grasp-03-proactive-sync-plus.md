@@ -25,6 +25,24 @@ their wider read/write mailbox set retains the history probe. Repository
 coordinates on those inboxes can therefore discover a root which is not yet
 present locally and continue receiving new roots live.
 
+Kind `10002` lists are untrusted peer input, so every relay URL they advertise
+passes single-URL target hygiene before it can occupy any selection slot,
+overlay, queue, or metric (see `src/sync/target_hygiene.rs` for the rules and
+their provenance). Accepted URLs are then canonicalized with the same relay-key
+semantics as the connection map and deduplicated, so trailing-root-slash and
+default-port variants of one relay consume one slot and reach the matching
+connection. Each author contributes at most four relays per purpose, taken in
+published tag order: up to four `read`/unmarked relays for live inbox coverage,
+up to four `write`/unmarked relays as identity-refresh sources, up to four
+history mailboxes preferring `write`/unmarked relays (read-only relays fill any
+remaining slots), and up to four `read`/unmarked inboxes for owner/maintainer
+repository coverage. The four-relay ceiling is a hard internal constant, not a
+configuration option: NIP-65 already guides users toward two to four relays per
+category, and the bound keeps one hostile or machine-generated list from
+inflating mailbox inventory. Non-root paths and semantic query strings remain
+distinct targets; operator-configured fallback relays are trusted input and are
+not subject to peer-input hygiene.
+
 Mailbox work reuses GRASP-02's connection safety, filter byte packing,
 pagination, subscription ledger, request pacing, event pipeline and write
 policy. The participant expansion is history-only: a non-root participant

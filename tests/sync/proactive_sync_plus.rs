@@ -38,9 +38,13 @@ async fn root_author_inbox_reuses_existing_root_sync_pipeline() {
     let unrelated = Keys::generate();
     let identifier = "minimal-proactive-sync-plus";
 
+    // The inbox is advertised in the root-trailing-slash form. Canonical
+    // selection must fold it onto the same connection key, so coverage works
+    // end to end for the variant that previously stalled mailbox probes.
+    let slashed_inbox = format!("{}/", inbox.url());
     let relay_list = EventBuilder::new(Kind::RelayList, "")
         .tags([
-            Tag::custom("r", vec![inbox.url(), "read"]),
+            Tag::custom("r", vec![slashed_inbox.as_str(), "read"]),
             Tag::custom("r", vec![outbox.url(), "write"]),
         ])
         .custom_created_at(Timestamp::from(Timestamp::now().as_secs() - 10))

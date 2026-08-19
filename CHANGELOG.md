@@ -38,6 +38,17 @@ Performance and Security fixes - along with other improvements; immediate upgrad
   These are single-URL rules; relay lists are never rejected wholesale, and
   legitimate path-based relays (`/inbox`, `/outbox`, language and versioned
   paths, semantic queries) remain accepted.
+- Canonicalize accepted NIP-65 relay URLs and bound every per-author selection
+  to at most four relays per purpose, taken in published tag order after
+  deduplication so trailing-root-slash and default-port variants of one relay
+  consume a single slot. Live inbox coverage and owner/maintainer repository
+  inboxes select `read`/unmarked relays, identity refresh selects
+  `write`/unmarked relays, and participant history prefers `write`/unmarked
+  relays with read-only relays filling remaining slots. The bound is a hard
+  internal constant, so one hostile or machine-generated kind `10002` list
+  cannot inflate mailbox inventory. Canonical keys now match the connection
+  map, fixing trailing-root-slash mailbox relays that previously could never
+  start their history probe.
 - Bound every sync-actor notification channel and require `auth-required`
   retry IDs to own a current subscription-ledger permit. Repeated terminals,
   forged subscription IDs, and delayed worker results can no longer create
