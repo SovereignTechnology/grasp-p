@@ -27,10 +27,12 @@ pub struct RepositoryAnnouncement {
     pub relays: Vec<String>,
     pub web_urls: Vec<String>,
     /// Pubkeys from the deprecated `maintainers` tag. Empty when the
-    /// announcement uses `M`/`m` role tags, which take precedence per NIP-34.
+    /// announcement uses `M`/`m`/`o` role tags, which take precedence per
+    /// NIP-34.
     pub maintainers: Vec<String>,
     /// Currently-active maintainer pubkeys from NIP-34 `M`/`m` role tags;
-    /// `None` when the announcement contains no `M`/`m` tags.
+    /// `None` when the announcement contains no role tags. Moderator (`o`)
+    /// entries never contribute: moderators are not maintainers.
     ///
     /// The lead (`M`) / co-maintainer (`m`) distinction carries no meaning
     /// for this service, so both collapse into one maintainer set. Entries
@@ -122,15 +124,25 @@ impl RepositoryAnnouncement {
             })
             .collect();
 
-        // Extract maintainer pubkeys from NIP-34 `M`/`m` role tags
-        // Format: ["M"|"m", "<pubkey-hex>", "<start>", "<end>", ...]
+        // Extract maintainer pubkeys from NIP-34 `M`/`m`/`o` role tags
+        // Format: ["M"|"m"|"o", "<pubkey-hex>", "<start>", "<end>", ...]
         // A role tag lists a pubkey followed by optional alternating start/end
         // history timestamps; it is currently active when it has fewer than
         // four elements or an odd number of elements. Ended entries are
-        // ignored entirely. A pubkey may appear in one `M` and one `m` tag to
-        // record a transition between the roles and remains a maintainer
-        // while either entry is active; a second tag under the same letter is
-        // malformed and rejects the announcement.
+        // ignored entirely. A pubkey may appear in one tag of each letter to
+        // record transitions between the roles and is a maintainer while
+        // either its `M` or `m` entry is active; a second tag under the same
+        // letter is malformed and rejects the announcement.
+        //
+        // The moderator role (`o`) grants no maintainership: moderators are
+        // only empowered to have status events (kinds 1630-1633) treated as
+        // authoritative, and this relay does not reject status events from
+        // non-maintainers, so the role needs no handling of its own.
+        // Moderators never publish authoritative repository state, and `o`
+        // listings do not create maintainer invitations. An `o` tag still
+        // counts as a role tag: its presence suppresses the deprecated
+        // `maintainers` fallback, and a self-`o` entry is a self-role, so
+        // the author is not implicitly a maintainer.
         let author_hex = event.pubkey.to_hex();
         let mut role_tags_present = false;
         let mut author_has_role_entry = false;
@@ -139,7 +151,7 @@ impl RepositoryAnnouncement {
         for tag in event.tags.iter() {
             let slice = tag.as_slice();
             let Some(kind) = slice.first() else { continue };
-            if kind != "M" && kind != "m" {
+            if kind != "M" && kind != "m" && kind != "o" {
                 continue;
             }
             role_tags_present = true;
@@ -154,6 +166,9 @@ impl RepositoryAnnouncement {
             if *pubkey == author_hex {
                 author_has_role_entry = true;
             }
+            if kind == "o" {
+                continue;
+            }
             let active = slice.len() < 4 || slice.len() % 2 == 1;
             if active && !role_active.contains(pubkey) {
                 role_active.push(pubkey.clone());
@@ -163,7 +178,7 @@ impl RepositoryAnnouncement {
 
         // Extract maintainers from the deprecated "maintainers" tag per NIP-34
         // Format: ["maintainers", "<pubkey1-hex>", "<pubkey2-hex>", ...]
-        // Ignored entirely when `M` or `m` role tags are present.
+        // Ignored entirely when role tags (`M`/`m`/`o`) are present.
         let maintainers = if role_tags_present {
             Vec::new()
         } else {
@@ -219,13 +234,14 @@ impl RepositoryAnnouncement {
     /// Whether this announcement asserts an active maintainer role for its
     /// own author.
     ///
-    /// With `M`/`m` role tags the author is active via an active self-entry,
+    /// With role tags the author is active via an active `M`/`m` self-entry,
     /// or implicitly: per NIP-34 an author who appears in no role tag is a
-    /// maintainer for the repository's entire history. Only an ended
-    /// self-entry means the author has left, which takes precedence over
-    /// assignments in other announcements. In the deprecated format the
-    /// author always asserts maintainership; a `u` (subordinate fork) tag
-    /// has no effect on maintainership.
+    /// maintainer for the repository's entire history. Only a self-entry
+    /// that asserts no active maintainer role - an ended entry, or a
+    /// moderator-only (`o`) entry - means the author is not a maintainer,
+    /// which takes precedence over assignments in other announcements. In
+    /// the deprecated format the author always asserts maintainership; a
+    /// `u` (subordinate fork) tag has no effect on maintainership.
     pub fn author_role_active(&self) -> bool {
         match &self.role_maintainers {
             Some(active) => {
@@ -235,8 +251,9 @@ impl RepositoryAnnouncement {
         }
     }
 
-    /// Whether this announcement shows its author has left: a role tag names
-    /// the author but none of their entries is active.
+    /// Whether this announcement shows its author is not a maintainer: a
+    /// role tag names the author but no `M`/`m` entry of theirs is active -
+    /// they left, or hold only the moderator (`o`) role.
     ///
     /// An author absent from all role tags has *not* left - they are
     /// implicitly a maintainer for the repository's entire history.
@@ -1070,6 +1087,68 @@ mod tests {
         let listed = announcement.listed_maintainers();
         assert!(listed.contains(&demoted));
         assert!(!listed.contains(&gone));
+    }
+
+    #[test]
+    fn test_moderator_tag_suppresses_maintainers_and_grants_no_maintainership() {
+        let keys = create_test_keys();
+        let moderator = create_test_keys().public_key().to_hex();
+        let legacy_listed = create_test_keys().public_key().to_hex();
+
+        // An `o` tag is a role tag: the deprecated `maintainers` fallback is
+        // ignored, and the moderator is neither listed as a maintainer nor
+        // invited. The author, whom no role tag names, remains implicitly a
+        // maintainer.
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("o", vec![moderator.clone()]),
+                ("maintainers", vec![legacy_listed.clone()]),
+            ],
+        );
+
+        assert!(announcement.maintainers.is_empty());
+        assert!(announcement.listed_maintainers().is_empty());
+        assert!(!announcement.listed_maintainers().contains(&moderator));
+        assert!(announcement.author_role_active());
+    }
+
+    #[test]
+    fn test_moderator_only_self_role_is_not_maintainership() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+        let lead = create_test_keys().public_key().to_hex();
+
+        // A self-`o` entry is a self-role: the author is a moderator, not a
+        // maintainer, so the implicit-maintainer rule does not apply.
+        let announcement = role_announcement(&keys, vec![("M", vec![lead]), ("o", vec![author])]);
+
+        assert!(!announcement.author_role_active());
+        assert!(announcement.author_has_left());
+    }
+
+    #[test]
+    fn test_duplicate_moderator_tag_rejects_announcement() {
+        use nostr_sdk::prelude::Tag;
+
+        let keys = create_test_keys();
+        let moderator = create_test_keys().public_key().to_hex();
+
+        let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
+            .tags(vec![
+                Tag::custom("d", vec!["test-repo".to_string()]),
+                Tag::custom(
+                    "o",
+                    vec![moderator.clone(), "0".to_string(), "100".to_string()],
+                ),
+                Tag::custom("o", vec![moderator]),
+            ])
+            .finalize(&keys)
+            .unwrap();
+
+        let result = RepositoryAnnouncement::from_event(event);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
     }
 
     #[test]

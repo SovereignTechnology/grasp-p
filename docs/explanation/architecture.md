@@ -299,6 +299,13 @@ Announcements carry maintainer listings in two formats:
   are present. Without any listing tags the author is the sole maintainer.
   A `u` (subordinate fork) tag has no effect on maintainership.
 
+The moderator tag (`o`) grants no maintainership: moderators only affect
+status-event authority, which this relay does not enforce (see
+[decisions.md](decisions.md)). An `o` tag still counts as a role tag - it
+suppresses the deprecated `maintainers` fallback, and a self-`o` entry is
+a self-role, so a moderator-only author is not implicitly a maintainer.
+`o` listings do not create maintainer invitations.
+
 Authorization follows a reciprocal membership rule, computed per owner by
 [`compute_membership`](src/git/authorization.rs):
 

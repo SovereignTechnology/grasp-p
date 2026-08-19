@@ -260,3 +260,25 @@ NIP-34 maintainers model refined in nips commit `781590b`).
 - A `u` (subordinate fork) tag has no effect on maintainership: the author
   of a role-less announcement asserts maintainership with or without it.
 
+### Moderator role (`o`) grants no maintainership
+
+NIP-34 also defines an `o` (moderator) tag whose members are empowered to
+have their status events (kinds 1630-1633) treated as authoritative. This
+relay does not reject status events from non-maintainers/non-moderators -
+status resolution is left to clients - so the role's own authority needs
+no enforcement here. Moderators never publish authoritative repository
+state, and `o` listings do not create maintainer invitations.
+
+The tag still participates in announcement parsing (per nips commit
+`986edd1`): its presence suppresses the deprecated `maintainers` fallback,
+and a self-`o` entry is a self-role, so a moderator-only author is not
+implicitly a maintainer and their state events are not authorized. Like
+`M`/`m`, a pubkey may appear in at most one `o` tag; a duplicate rejects
+the announcement.
+
+Deliberately deferred: announcements from moderators are not walked for
+the `M`/`m` assignments they might carry (the NIP says role combinations
+beyond self-plus-lead SHOULD be avoided unless the author is `M`), and
+moderator membership gets no reciprocal-confirmation treatment. Both only
+matter if status-event authority is ever enforced.
+

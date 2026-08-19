@@ -1558,6 +1558,33 @@ mod tests {
     }
 
     #[test]
+    fn test_moderator_is_not_a_state_maintainer() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice lists Bob as moderator; Bob acknowledges with a matching
+        // self-`o` and lists the lead. Moderators are not maintainers: Bob
+        // is neither state-authorized nor treated as an open invitation.
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("o", vec![hex(&bob)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("o", vec![hex(&bob)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
+        assert!(membership.invited.is_empty());
+    }
+
+    #[test]
     fn test_subordinate_fork_marker_does_not_block_acceptance() {
         let alice = create_test_keys();
         let bob = create_test_keys();
