@@ -37,6 +37,14 @@ Performance and Security fixes - along with other improvements; immediate upgrad
 - Added opt-in trusted-proxy CIDRs so WebSocket connection policy, per-IP
   metrics, abuse indicators, and logs can use the real client address without
   trusting spoofable forwarding headers from arbitrary direct peers.
+- Reject non-canonical and path-traversing repository coordinates after URL
+  decoding across repository landing pages, Git Smart HTTP, and GRASP-06.
+  All tagged releases through v2.1.2 could resolve crafted requests outside
+  the requested repository namespace, allowing unauthenticated reads of Git
+  repositories accessible to the service. With GRASP-06 enabled, crafted PR
+  submissions could also write Git objects and PR refs into another hosted
+  repository without its maintainer authorization. Operators must upgrade
+  to v3.0.0; GRASP-06 operators should review hosted repository integrity.
 
 ### Added
 
