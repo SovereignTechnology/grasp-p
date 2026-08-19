@@ -249,6 +249,42 @@ view whose alternate is the identifier family. Therefore:
 Mirroring a PR into an owner view becomes a ref update after an object
 availability check. It no longer copies the object graph.
 
+## V2 to v3 migration boundary
+
+V3 changes the on-disk meaning of every served Git repository. Owner and
+`/prs/` paths become thin views whose objects and write serialization belong to
+the identifier family under `.grasp`. Migration happens automatically on the
+first v3 launch, but the result is not safe for v2: v2 has no family lock,
+retained-root, or shared-object write model. A software rollback therefore
+requires restoring the Git and relay-data snapshot taken before v3; changing
+only the binary is not supported.
+
+One pre-release development interval can leave server-side shallow
+repositories for v3 to reconcile. State Git-data fallback was introduced by
+commit `623cae5` on 2026-01-05 with `git fetch --depth=1`, carried into the
+rewritten purgatory sync path, and changed to a full fetch by commit `f25eea8`
+on 2026-01-12. The first tagged release was v1.0.0 on 2026-02-26 and already
+contained the fix, so no tagged v1 or v2 release shipped the shallow-fetch
+behavior. Only operators who deployed an untagged source revision from that
+seven-day interval can have repositories created by this bug.
+
+The affected path was the non-happy-path Git-data fallback. It ran only when a
+pending state or PR event named OIDs which had not arrived through an ordinary
+push, then fetched those OIDs into an existing local repository from another
+announcement or PR clone URL. A repository whose required data arrived through
+the normal push path did not invoke this fallback.
+
+V3 treats a legacy `shallow` marker as compatibility state rather than a reason
+to delete or disable the repository. Migration preserves the marker on the thin
+view so its shallow clones and current tree continue to work, and retains the
+legacy backup. After the listener starts, the ordinary integrity worker
+requests the complete closure from other accepted clone servers. On success it
+removes the marker; the next v3 launch retires the now-redundant backup. On
+failure the existing shallow clone and current tree remain available, the
+backup remains, and an `ERROR` log identifies the family with a non-zero
+`shallow_views` count. The operator does not need to take a separate action for
+the v3 upgrade.
+
 ## Startup migration
 
 Migration runs after configuration validation and before purgatory restoration,
@@ -302,19 +338,18 @@ for them; they are moved into content-addressed directories beneath
 migrations preserve different payloads even when their original pack filenames
 match, while an identical payload converges on the same quarantine path.
 
-A server-side `shallow` marker means the legacy repository is a deliberate
-truncation, and GRASP does not treat shallow repositories as valid family
-storage. Migration copies the marker onto the installed thin view so the view
-keeps serving what the legacy repository served, and its backup is excluded
-from retirement until the family holds the complete reachable closure of the
-backup's refs. Closure recovery is the ordinary integrity repair: the family
-reports the truncated parents as missing objects and the marked views as
+A server-side `shallow` marker is a compatibility boundary, not valid final
+family storage. Migration copies it onto the installed thin view so the view
+keeps serving exactly what the legacy repository served, and excludes its
+backup from retirement until the family holds the complete reachable closure
+of the backup's refs. Closure recovery is the ordinary integrity repair: the
+family reports truncated parents as missing objects and marked views as
 `shallow_views`, repair fetches the closure from accepted clone sources, and
-once complete the marker is removed and the backup retires on a later launch.
-An unrecoverable closure retains the backup and keeps the family reported as
-unresolved; this never blocks startup because recovery depends on remote
-servers. Client-requested shallow clones and fetches are a protocol feature
-of upload-pack and remain supported throughout.
+once complete removes the marker. The backup retires on the next launch. An
+unrecoverable closure retains both marker and backup and keeps the family
+reported as unresolved; it never blocks startup because recovery depends on
+remote servers. Client-requested shallow clones and fetches remain supported
+throughout.
 
 Retirement failures during an active migration are fail-closed and keep the
 backup. Journals from a migration that already committed are handled

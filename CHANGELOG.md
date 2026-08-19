@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- Version 3 performs an automatic, one-way migration of `NGIT_GIT_DATA_PATH`
+  from complete per-owner and `/prs/` repositories to thin views backed by
+  shared identifier families. Version 2 does not coordinate reads and writes
+  through this layout and must not be run against migrated Git data. Rollback
+  requires restoring the Git and relay-data snapshot taken before the v3
+  launch, not only downgrading the binary.
 - Added `trusted_proxy_cidrs` to the public `Config` struct. Rust consumers
   that construct `Config` with a struct literal must provide it.
 - Added `base_path` to the public `Config` struct. Rust consumers that
@@ -84,12 +90,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a warning, backup-directory removals are fsynced before their journals are
   removed, and completed installations whose backups were already removed
   manually start unchanged.
-- Stop treating server-side shallow repositories as valid family storage.
-  Migration preserves a legacy `shallow` marker on the installed thin view
-  and retains that backup until integrity repair recovers the complete
-  reachable closure from accepted clone sources; the family is reported as
-  unresolved until then, after which the marker is removed and the backup
-  retires. Client-requested shallow clones remain supported.
+- Reconcile server-side shallow repositories left by untagged development
+  builds between 2026-01-05 (`623cae5`) and 2026-01-12 (`f25eea8`). No tagged
+  v1 or v2 release shipped the depth-one fallback fetch. The affected
+  non-happy path fetched missing state or PR data from another listed Git
+  server when the objects had not arrived by push. V3 preserves existing
+  shallow clone behavior and the legacy backup, automatically requests the
+  complete closure from accepted clone sources, and logs any family that
+  remains shallow without making it less available.
 - Scope bare log levels to ngit-grasp while keeping dependencies at warnings;
   explicit tracing filter expressions remain unchanged.
 - Keep per-event discovery and validation details at debug, retain aggregate
