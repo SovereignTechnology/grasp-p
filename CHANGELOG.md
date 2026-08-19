@@ -15,6 +15,8 @@ Proactive Sync Plus (GRASP-03) - a big enabler for maintainer based moderation a
 
 Performance and Security fixes - along with other improvements; immediate upgrade recommended; some breaking changes make v2-v3 a one way street!
 
+Expect a bit of downtime as a git data migraiton is performed on startup. The largest grasp service relay.ngit.dev took 50mins.
+
 ### Breaking changes
 
 - Version 3 performs an automatic, one-way migration of `NGIT_GIT_DATA_PATH`
@@ -23,6 +25,10 @@ Performance and Security fixes - along with other improvements; immediate upgrad
   through this layout and must not be run against migrated Git data. Rollback
   requires restoring the Git and relay-data snapshot taken before the v3
   launch, not only downgrading the binary.
+- The v3 storage migration finishes before the HTTP server starts listening,
+  so operators must plan for relay downtime during the upgrade. The largest
+  GRASP service migrated so far spent 51 minutes migrating 2,294 repository views
+  into 2,014 identifier families, retired 2,291 backups, and retained three for automatic integrity repair.
 - Added `trusted_proxy_cidrs` to the public `Config` struct. Rust consumers
   that construct `Config` with a struct literal must provide it.
 - Added `base_path` to the public `Config` struct. Rust consumers that
