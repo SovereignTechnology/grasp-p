@@ -281,6 +281,22 @@ pub struct RepositoryAnnouncement { ... }
 pub struct RepositoryState { ... }
 ```
 
+#### Maintainer Membership Model
+
+Authorization follows a reciprocal membership rule, computed per owner by
+[`compute_membership`](src/git/authorization.rs):
+
+- A pubkey listed as a maintainer is only **invited** until its own
+  announcement for the same identifier lists back an existing confirmed
+  maintainer. Invited pubkeys' announcements are still fetched and accepted
+  (that is how acceptance is noticed), but none of their events are
+  authoritative.
+- Confirmation is a fixpoint, so maintainers listed by other confirmed
+  maintainers are reached recursively.
+- The owner is always a confirmed maintainer of their own repository:
+  announcing a repository in their namespace is what creates it on this
+  service.
+
 #### [`policy/state.rs`](src/nostr/policy/state.rs) - State Event Authorization
 
 State events undergo authorization checks at multiple points:
@@ -288,7 +304,8 @@ State events undergo authorization checks at multiple points:
 ```rust
 /// State event authorization checks:
 /// 1. Announcement must exist for the repository identifier
-/// 2. Author must be in maintainer set of accepted announcement
+/// 2. Author must be a confirmed maintainer of an accepted announcement -
+///    invited pubkeys are rejected
 /// 3. Validated on arrival, announcement acceptance, and git data arrival
 ```
 
@@ -439,7 +456,7 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
                 ↓
 5. authorization::get_authorization_for_owner()
    ├─ Query database for announcements
-   ├─ Build recursive maintainer set
+   ├─ Compute confirmed maintainer set (reciprocal membership)
    └─ Get latest authorized state
                 ↓
 6. authorization::validate_push_refs()
@@ -465,7 +482,8 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
 3. Nip34WritePolicy::admit_event()
    ├─ Check if instance in clone tags
    ├─ Check if instance in relays tags
-   ├─ OR: Check if recursive maintainer
+   ├─ OR: author is listed as a maintainer in a known announcement
+   │       (invited maintainers accepted for acceptance discovery)
    └─ Accept or reject
                 ↓
 4. If ACCEPTED:
@@ -498,7 +516,7 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
 2. Nostr relay receives event
                 ↓
 3. Nip34WritePolicy::admit_event()
-   ├─ Check author is in maintainer set (DB + purgatory announcements)
+   ├─ Check author is a confirmed maintainer (DB + purgatory announcements)
    ├─ Validate state structure
    └─ Accept or reject
                 ↓

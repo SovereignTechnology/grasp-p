@@ -1174,12 +1174,73 @@ impl<'a> TestContext<'a> {
                 vec![format!("{}/{}/{}.git", http_url, maintainer_npub, repo_id)],
             ))
             .tag(Tag::custom("relays", vec![relay_url]))
+            // List the owner back (reciprocal acknowledgment: NIP-34 treats a
+            // listed pubkey as invited until their own announcement assigns a
+            // role to an existing member) and assign the recursive maintainer.
             .tag(Tag::custom(
                 "maintainers",
-                vec![self.client.recursive_maintainer_pubkey_hex()],
+                vec![
+                    self.client.keys().public_key().to_hex(),
+                    self.client.recursive_maintainer_pubkey_hex(),
+                ],
             ))
             .build(self.client.maintainer_keys())
             .map_err(|e| anyhow::anyhow!("Failed to build maintainer repo announcement: {}", e))
+    }
+
+    /// Build the recursive maintainer's reciprocal announcement for the given repo_id
+    ///
+    /// NIP-34 requires an assigned pubkey to acknowledge the role and assign a
+    /// role to an existing member before their events become authoritative.
+    /// The recursive maintainer lists the maintainer (who assigned them) back.
+    ///
+    /// The announcement deliberately points at another host: it is accepted via
+    /// the maintainer exception, confirms membership, and leaves this relay
+    /// free of a hosted repo view for the recursive maintainer. Later specs
+    /// replace it with other external announcements, which would be treated as
+    /// a de-list request if this one listed the service.
+    async fn build_recursive_maintainer_reciprocal_announcement(
+        &self,
+        repo_id: &str,
+    ) -> Result<Event> {
+        use nostr_sdk::prelude::*;
+
+        let recursive_maintainer_npub = self
+            .client
+            .recursive_maintainer_keys()
+            .public_key()
+            .to_bech32()
+            .map_err(|e| anyhow::anyhow!("Failed to convert recursive maintainer pubkey: {}", e))?;
+
+        self.client
+            .event_builder(
+                Kind::GitRepoAnnouncement,
+                format!("Recursive maintainer announcement for {}", repo_id),
+            )
+            .tag(Tag::identifier(repo_id))
+            .tag(Tag::custom(
+                "name",
+                vec![format!("{} (recursive maintainer)", repo_id)],
+            ))
+            .tag(Tag::custom(
+                "clone",
+                vec![format!(
+                    "https://another-grasp-server.com/{}/{}.git",
+                    recursive_maintainer_npub, repo_id
+                )],
+            ))
+            .tag(Tag::custom("relays", vec!["wss://relay.damus.io"]))
+            .tag(Tag::custom(
+                "maintainers",
+                vec![self.client.maintainer_pubkey_hex()],
+            ))
+            .build(self.client.recursive_maintainer_keys())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to build recursive maintainer reciprocal announcement: {}",
+                    e
+                )
+            })
     }
 
     /// Extract repo_id from a repo announcement event
@@ -1471,15 +1532,18 @@ impl<'a> TestContext<'a> {
 
     /// Build MaintainerStateDataPushed fixture: full 5-stage fixture for maintainer push authorization
     ///
-    /// This tests that a maintainer can authorize pushes with ONLY a state event,
-    /// without publishing their own repo announcement.
+    /// This tests that a confirmed maintainer can authorize pushes with a state
+    /// event. Per NIP-34 a listed pubkey is only *invited* until their own
+    /// announcement acknowledges the role and lists back an existing member, so
+    /// the maintainer's reciprocal announcement is published before their state
+    /// event becomes authoritative.
     ///
     /// Depends on OwnerStateDataPushed - the owner's data has already been pushed.
     /// The maintainer force-pushes their commit on top.
     ///
     /// This handles all stages of the fixture:
     /// 1. **OwnerStateDataPushed dependency**: Owner's repo and state event already on relay, git data pushed
-    /// 2. **Sent**: Sends maintainer state event to relay (returns OK, accepted but 'purgatory:...' message)
+    /// 2. **Sent**: Sends maintainer reciprocal announcement + state event to relay
     /// 3. **Verify Not Served**: Confirms event is not served by relays
     /// 4. **DataPushed**: Clones repo, creates maintainer deterministic commit, force-pushes to relay
     /// 5. **Verified**: Confirms event is served by relay
@@ -1500,7 +1564,13 @@ impl<'a> TestContext<'a> {
         // Get the repo (ValidRepoSent, also cached) for the owner's npub
         let repo = self.get_cached_dependency(FixtureKind::ValidRepoSent)?;
 
-        // Build maintainer's state event (state event ONLY - no announcement)
+        // Publish the maintainer's reciprocal announcement first: without it
+        // the maintainer is merely invited and their state event would be
+        // rejected as unauthorized.
+        let maintainer_announcement = self.build_maintainer_announcement(&repo_id).await?;
+        self.client.send_event(maintainer_announcement).await?;
+
+        // Build maintainer's state event
         let base_time = Timestamp::now().as_secs();
         let maintainer_timestamp = Timestamp::from(base_time - 5); // 5 seconds ago (more recent than owner's state)
 
@@ -1611,10 +1681,10 @@ impl<'a> TestContext<'a> {
                 if !res {
                     return Err(anyhow::anyhow!(
                         "Push was rejected but should have been accepted. \
-                The maintainer published a state event with commit {}, \
-                and even without a separate announcement, the relay should \
-                authorize pushes matching this state event since the maintainer \
-                is listed in the owner's announcement.",
+                The maintainer published a reciprocal announcement and a state \
+                event with commit {}; as a confirmed member of the owner's \
+                maintainer set the relay should authorize pushes matching this \
+                state event.",
                         MAINTAINER_DETERMINISTIC_COMMIT_HASH
                     ));
                 }
@@ -1645,9 +1715,11 @@ impl<'a> TestContext<'a> {
     /// The recursive maintainer is listed in the maintainer's announcement, not the owner's announcement,
     /// so this tests the recursive maintainer traversal (Owner -> Maintainer -> RecursiveMaintainer).
     ///
-    /// Depends on MaintainerStateDataPushed - the maintainer's data has already been pushed.
-    /// We then send the MaintainerAnnouncement (which lists the recursive maintainer), and the
-    /// recursive maintainer force-pushes their commit on top.
+    /// Depends on MaintainerStateDataPushed - the maintainer's data has already been
+    /// pushed and the maintainer's announcement (which assigns the recursive
+    /// maintainer) is on the relay. We then send the recursive maintainer's
+    /// reciprocal announcement (confirming them as a member), and the recursive
+    /// maintainer force-pushes their commit on top.
     ///
     /// This handles all stages of the fixture:
     /// 1. **Generated**: (MaintainerStateDataPushed dependency includes ValidRepoSent + OwnerStateDataPushed)
@@ -1675,10 +1747,17 @@ impl<'a> TestContext<'a> {
         let repo = self.get_cached_dependency(FixtureKind::ValidRepoSent)?;
 
         // ============================================================
-        // Stage 1 (continued): Generate MaintainerAnnouncement and RecursiveMaintainerState
+        // Stage 1 (continued): Generate the recursive maintainer's reciprocal
+        // announcement and their state event. The maintainer's announcement
+        // (which assigns the recursive maintainer) was already published by the
+        // MaintainerStateDataPushed dependency; the reciprocal announcement
+        // confirms the recursive maintainer as a member so their state event
+        // becomes authoritative.
         // ============================================================
-        let maintainer_announcement = self.build_maintainer_announcement(&repo_id).await?;
-        self.client.send_event(maintainer_announcement).await?;
+        let reciprocal_announcement = self
+            .build_recursive_maintainer_reciprocal_announcement(&repo_id)
+            .await?;
+        self.client.send_event(reciprocal_announcement).await?;
 
         // Build recursive maintainer's state event
         let base_time = Timestamp::now().as_secs();

@@ -201,3 +201,37 @@ Implemented according to design specification in [`purgatory-design.md`](purgato
 - Design: [`purgatory-design.md`](purgatory-design.md)
 - Architecture: [`architecture.md`](architecture.md#5-purgatory-system-srcpurgatory)
 - Implementation Plan: [`../purgatory-implementation-plan.md`](../purgatory-implementation-plan.md)
+
+---
+
+## Question: Who may publish authoritative repository state?
+
+**Decision (2026-08): maintainer membership is reciprocal** (following the
+NIP-34 maintainers model refined in nips commit `781590b`).
+
+### The model
+
+- A pubkey listed as a maintainer in an announcement is only **invited**
+  until its own announcement for the same identifier lists back an existing
+  confirmed maintainer.
+- Only confirmed maintainers publish authoritative repository state.
+- The owner is always a confirmed maintainer of their own repository:
+  announcing a repository in their namespace is what creates it on this
+  service.
+
+### Implementation choices
+
+1. **State events from invited maintainers are rejected** as unauthorized
+   (previously any pubkey listed in a `maintainers` tag was authorized
+   recursively without reciprocity). The rejected-events index and purgatory
+   re-evaluation recover them automatically once the acceptance announcement
+   arrives.
+2. **Invited maintainers' announcements are still fetched, accepted and
+   synced** (maintainer exception, discovery author sets, dependency
+   walkers): the reciprocal announcement is precisely how the relay learns
+   an invitation was accepted.
+3. **Acceptance triggers reconciliation.** When an acceptance announcement is
+   stored via the maintainer exception, stored state events are re-applied
+   (`reapply_stored`) so a newly confirmed maintainer's latest state
+   re-points the owner's repository without another push.
+

@@ -699,11 +699,14 @@ async fn unresolved_repositories_share_one_dependency_poll_per_relay() {
 ///
 /// The owner first publishes an older state on an owner-only and shared server.
 /// The invitee later publishes a newer, different state on an invitee-only and
-/// shared server. When the owner lists the invitee, GRASP-02 must apply the
-/// invitee's newer state to both owner endpoints without changing the invitee's
-/// announcement or requiring another Git push.
+/// shared server. When the owner lists the invitee, the invitee is merely
+/// *invited*: their announcement must still be fetched (that is how acceptance
+/// is noticed) but their newer state must NOT become authoritative for the
+/// owner. Once the invitee accepts with a reciprocal announcement, GRASP-02
+/// must apply the invitee's newer state to both owner endpoints without
+/// requiring another Git push.
 #[tokio::test]
-async fn test_invitation_applies_newer_invitee_state_to_owner_before_acceptance() {
+async fn test_invitation_applies_newer_invitee_state_to_owner_after_acceptance() {
     use crate::common::{create_test_repo_with_commit, CommitVariant};
 
     let owner_relay = TestRelay::start_with_sync(None).await;
@@ -861,13 +864,52 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_before_acceptance(
 
     for relay in owner_servers {
         assert_exact_event_served(relay, &invitation, "Owner invitation announcement").await;
+        // The invited maintainer's announcement must still be fetched and
+        // served: it is how the relay notices their acceptance.
         assert_exact_event_served(
             relay,
             &invitee_announcement,
             "Invited maintainer announcement",
         )
         .await;
-        assert_exact_event_served(relay, &invitee_state, "Newer invited maintainer state").await;
+    }
+
+    // Deliberate observation window: give a wrongful state replacement time to
+    // manifest before asserting the owner state is intact. The invitee has not
+    // published a reciprocal announcement, so they are merely invited and their
+    // newer state must not become authoritative for the owner.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for clone_url in &owner_clone_urls {
+        assert_remote_refs(clone_url, &owner_refs, Duration::from_secs(5)).await;
+        assert_remote_default_branch(
+            clone_url,
+            &format!("refs/heads/{owner_branch}"),
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    // The invitee accepts by replacing their announcement with one that lists
+    // the owner back; only then do they become a confirmed member whose state
+    // is authoritative for the owner's repositories.
+    let acceptance = repository_announcement(
+        &invitee_keys,
+        &invitee_servers,
+        &[owner_keys.public_key()],
+        identifier,
+    )
+    .custom_created_at(Timestamp::from_secs(invitee_created_at.as_secs() + 2))
+    .finalize(&invitee_keys)
+    .expect("Failed to create invitee acceptance");
+    for relay in invitee_servers {
+        send_to_relay(relay, &acceptance)
+            .await
+            .expect("Failed to publish invitee acceptance");
+    }
+
+    for relay in owner_servers {
+        assert_exact_event_served(relay, &acceptance, "Invitee acceptance announcement").await;
+        assert_exact_event_served(relay, &invitee_state, "Newer confirmed maintainer state").await;
     }
     for clone_url in &owner_clone_urls {
         assert_remote_refs(clone_url, &invitee_refs, Duration::from_secs(20)).await;
@@ -888,14 +930,14 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_before_acceptance(
         .await;
     }
 
-    let pushes_after_invitation = [
+    let pushes_after_acceptance = [
         push_counts(&owner_relay).await,
         push_counts(&invitee_relay).await,
         push_counts(&shared_relay).await,
     ];
     assert_eq!(
-        pushes_after_invitation, pushes_before_invitation,
-        "One-way maintainer authorization must sync the owner without a client Git push"
+        pushes_after_acceptance, pushes_before_invitation,
+        "Invitation acceptance must sync the owner without a client Git push"
     );
 
     shared_relay.stop().await;
@@ -1174,6 +1216,10 @@ async fn test_purgatory_owner_uses_rejected_maintainer_clone_to_sync_git() {
                 Tag::identifier(identifier),
                 Tag::custom("clone", vec![maintainer_clone.clone()]),
                 Tag::custom("relays", vec![source_relay.url().to_string()]),
+                // List the future owner back: without this reciprocal listing
+                // the maintainer would remain invited on the target and their
+                // state could not authorize the owner's repository sync.
+                Tag::custom("maintainers", vec![owner_keys.public_key().to_hex()]),
             ])
             .finalize(&maintainer_keys)
             .expect("Failed to create maintainer announcement");

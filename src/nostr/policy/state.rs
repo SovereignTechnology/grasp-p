@@ -47,12 +47,16 @@ impl StatePolicy {
     /// # Arguments
     /// * `event` - The state event to process
     /// * `is_synced` - True if this event came from proactive sync (vs user-submitted)
+    /// * `reapply_stored` - True when reconciling after a membership change:
+    ///   a state already in the database is then re-applied to owner
+    ///   repositories instead of short-circuiting as a duplicate
     ///
     /// Returns the true if git data already availale or false if added to purgatory
     pub async fn process_state_event(
         &self,
         event: &Event,
         is_synced: bool,
+        reapply_stored: bool,
         promotion_hooks: Option<&dyn PurgatoryPromotionHooks>,
     ) -> Result<WritePolicyResult> {
         // Parse state to get HEAD and branch info
@@ -172,12 +176,14 @@ impl StatePolicy {
             }
         }
 
-        // A state already stored in the database may still need to be applied to
-        // a newly-created maintainer repository. This happens when an invitee
-        // publishes only their reciprocal announcement to a GRASP server that
-        // already serves the owner's state and Git data. Reconcile that state
-        // while the authorized invitee announcement is in purgatory instead of
-        // returning early as an ordinary duplicate.
+        // A state already stored in the database may still need to be applied
+        // to a maintainer repository after membership changes. This happens
+        // when an invitee publishes their reciprocal announcement to a GRASP
+        // server that already serves the owner's state and Git data: either
+        // while the invitee's announcement is in purgatory, or — for external
+        // acceptance announcements stored directly — during the explicit
+        // reconcile pass (`reapply_stored`). Reconcile instead of returning
+        // early as an ordinary duplicate.
         let state_already_in_db = db_repo_data.states.iter().any(|e| e.event.id.eq(&event.id));
         let has_authorized_purgatory_announcement = authorized_owners.iter().any(|owner_hex| {
             nostr_sdk::prelude::PublicKey::from_hex(owner_hex).is_ok_and(|owner| {
@@ -187,7 +193,7 @@ impl StatePolicy {
             })
         });
 
-        if state_already_in_db && !has_authorized_purgatory_announcement {
+        if state_already_in_db && !has_authorized_purgatory_announcement && !reapply_stored {
             tracing::debug!("processed state event duplicate (in db): {}", event.id);
             return Ok(duplicate("already have this event"));
         }

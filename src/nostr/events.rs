@@ -133,6 +133,24 @@ impl RepositoryAnnouncement {
         })
     }
 
+    /// Pubkeys this announcement currently lists as maintainers, excluding
+    /// the author (who implicitly asserts maintainership of their own
+    /// announcement).
+    ///
+    /// This is the invitation set for membership computation: listed pubkeys'
+    /// announcements must be fetched so their acceptance is noticed, but a
+    /// listing alone makes none of their events authoritative.
+    pub fn listed_maintainers(&self) -> Vec<String> {
+        let author = self.event.pubkey.to_hex();
+        let mut listed: Vec<String> = Vec::new();
+        for pubkey in &self.maintainers {
+            if *pubkey != author && !listed.contains(pubkey) {
+                listed.push(pubkey.clone());
+            }
+        }
+        listed
+    }
+
     /// Check if this announcement lists the given domain in clone URLs
     ///
     /// Compares parsed host and port semantics, not substrings, so a URL such
