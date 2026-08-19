@@ -129,10 +129,11 @@ impl RepositoryAnnouncement {
         // A role tag lists a pubkey followed by optional alternating start/end
         // history timestamps; it is currently active when it has fewer than
         // four elements or an odd number of elements. Ended entries are
-        // ignored entirely. A pubkey may appear in one tag of each letter to
-        // record transitions between the roles and is a maintainer while
-        // either its `M` or `m` entry is active; a second tag under the same
-        // letter is malformed and rejects the announcement.
+        // ignored entirely. A pubkey may appear in multiple role tags: one
+        // tag of each letter records transitions between roles, and
+        // out-of-spec duplicates under the same letter are tolerated. The
+        // histories are consolidated - the pubkey is a maintainer while any
+        // of its `M`/`m` entries is active.
         //
         // The moderator role (`o`) grants no maintainership: moderators are
         // only empowered to have status events (kinds 1630-1633) treated as
@@ -147,7 +148,6 @@ impl RepositoryAnnouncement {
         let mut role_tags_present = false;
         let mut author_has_role_entry = false;
         let mut role_active: Vec<String> = Vec::new();
-        let mut seen_role_entries: Vec<(String, String)> = Vec::new();
         for tag in event.tags.iter() {
             let slice = tag.as_slice();
             let Some(kind) = slice.first() else { continue };
@@ -158,11 +158,6 @@ impl RepositoryAnnouncement {
             let Some(pubkey) = slice.get(1).filter(|value| !value.is_empty()) else {
                 continue;
             };
-            let entry = (kind.clone(), pubkey.clone());
-            if seen_role_entries.contains(&entry) {
-                return Err(anyhow!("duplicate `{kind}` role tag for pubkey {pubkey}"));
-            }
-            seen_role_entries.push(entry);
             if *pubkey == author_hex {
                 author_has_role_entry = true;
             }
@@ -1128,12 +1123,14 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_moderator_tag_rejects_announcement() {
+    fn test_duplicate_moderator_tags_are_consolidated() {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
         let moderator = create_test_keys().public_key().to_hex();
 
+        // Out-of-spec duplicate `o` tags do not reject the announcement, and
+        // moderator entries still grant no maintainership.
         let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
             .tags(vec![
                 Tag::custom("d", vec!["test-repo".to_string()]),
@@ -1141,37 +1138,73 @@ mod tests {
                     "o",
                     vec![moderator.clone(), "0".to_string(), "100".to_string()],
                 ),
-                Tag::custom("o", vec![moderator]),
+                Tag::custom("o", vec![moderator.clone()]),
             ])
             .finalize(&keys)
             .unwrap();
 
-        let result = RepositoryAnnouncement::from_event(event);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate"));
+        let announcement = RepositoryAnnouncement::from_event(event).unwrap();
+        assert!(!announcement.listed_maintainers().contains(&moderator));
     }
 
     #[test]
-    fn test_duplicate_same_letter_role_tag_rejects_announcement() {
+    fn test_duplicate_same_letter_role_tags_are_consolidated() {
         use nostr_sdk::prelude::Tag;
 
         let keys = create_test_keys();
         let author = keys.public_key().to_hex();
-        let other = create_test_keys().public_key().to_hex();
+        let returned = create_test_keys().public_key().to_hex();
+        let gone = create_test_keys().public_key().to_hex();
 
+        // Out-of-spec duplicate tags under the same letter are consolidated
+        // instead of rejecting the announcement: a pubkey is a maintainer
+        // while any of its entries is active.
         let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
             .tags(vec![
                 Tag::custom("d", vec!["test-repo".to_string()]),
                 Tag::custom("M", vec![author]),
-                Tag::custom("m", vec![other.clone(), "0".to_string(), "100".to_string()]),
-                Tag::custom("m", vec![other]),
+                Tag::custom(
+                    "m",
+                    vec![returned.clone(), "0".to_string(), "100".to_string()],
+                ),
+                Tag::custom("m", vec![returned.clone(), "200".to_string()]),
+                Tag::custom("m", vec![gone.clone(), "0".to_string(), "100".to_string()]),
+                Tag::custom(
+                    "m",
+                    vec![gone.clone(), "200".to_string(), "300".to_string()],
+                ),
             ])
             .finalize(&keys)
             .unwrap();
 
-        let result = RepositoryAnnouncement::from_event(event);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate"));
+        let announcement = RepositoryAnnouncement::from_event(event).unwrap();
+        let listed = announcement.listed_maintainers();
+        assert!(listed.contains(&returned));
+        assert!(!listed.contains(&gone));
+    }
+
+    #[test]
+    fn test_author_duplicate_entries_consolidate_to_active() {
+        use nostr_sdk::prelude::Tag;
+
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+
+        let event = EventBuilder::new(Kind::GitRepoAnnouncement, "Test repository")
+            .tags(vec![
+                Tag::custom("d", vec!["test-repo".to_string()]),
+                Tag::custom(
+                    "m",
+                    vec![author.clone(), "0".to_string(), "100".to_string()],
+                ),
+                Tag::custom("m", vec![author]),
+            ])
+            .finalize(&keys)
+            .unwrap();
+
+        let announcement = RepositoryAnnouncement::from_event(event).unwrap();
+        assert!(announcement.author_role_active());
+        assert!(!announcement.author_has_left());
     }
 
     #[test]

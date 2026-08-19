@@ -249,9 +249,12 @@ NIP-34 maintainers model refined in nips commit `781590b`).
   grant time-scoped retroactive authority over historic events. The
   NIP's owner-first precedence for conflicting past-role records is
   therefore unused.
-- A pubkey may appear in one `M` and one `m` tag to record a role
-  transition and is a maintainer while either entry is active. A second
-  tag under the same letter is malformed and rejects the announcement.
+- A pubkey may appear in multiple role tags: one of each letter records a
+  role transition per the NIP, and out-of-spec duplicates under the same
+  letter are consolidated rather than rejected - rejecting them would drop
+  otherwise-valid membership data over a formatting slip. Since only
+  current activity matters here, consolidation reduces to: a pubkey is a
+  maintainer while any of its `M`/`m` entries is active.
 - An announcement using role tags acknowledges its author via an active
   self-entry, or implicitly: an author who appears in no role tag is a
   maintainer for the repository's entire history. Only an ended self-entry
@@ -273,8 +276,8 @@ The tag still participates in announcement parsing (per nips commit
 `986edd1`): its presence suppresses the deprecated `maintainers` fallback,
 and a self-`o` entry is a self-role, so a moderator-only author is not
 implicitly a maintainer and their state events are not authorized. Like
-`M`/`m`, a pubkey may appear in at most one `o` tag; a duplicate rejects
-the announcement.
+`M`/`m`, duplicate `o` tags for one pubkey are consolidated rather than
+rejected.
 
 Deliberately deferred: announcements from moderators are not walked for
 the `M`/`m` assignments they might carry (the NIP says role combinations

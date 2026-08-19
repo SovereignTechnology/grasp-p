@@ -291,9 +291,10 @@ Announcements carry maintainer listings in two formats:
   entries are ignored entirely - the history is only used to conclude a
   role has *ended*, never to grant authority for a past period. The lead /
   co-maintainer distinction carries no meaning for this service. A pubkey
-  may appear in one `M` and one `m` tag to record a role transition and is
-  a maintainer while either entry is active; a second tag under the same
-  letter rejects the announcement. An author who appears in no role tag is
+  may appear in multiple role tags: one of each letter records a role
+  transition, and out-of-spec duplicates under the same letter are
+  tolerated. Histories are consolidated - the pubkey is a maintainer while
+  any `M`/`m` entry is active. An author who appears in no role tag is
   implicitly a maintainer for the repository's entire history.
 - **Deprecated `maintainers` tag** (fallback). Ignored when `M`/`m` tags
   are present. Without any listing tags the author is the sole maintainer.
