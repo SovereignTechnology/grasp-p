@@ -1,9 +1,9 @@
 # ngit-grasp
 
-> **Note:** GitHub is only a mirror of this repository. `ngit-grasp` is primarily
-> hosted on GRASP, with collaboration powered by ngit and Nostr. Visit the
-> [primary repository on Git Workshop](https://gitworkshop.dev/danconwaydev.com/ngit-grasp)
-> to contribute.
+> **Canonical repository:** GitHub is a mirror only. `ngit-grasp` is hosted on
+> GRASP, with collaboration powered by ngit and Nostr. Pull requests and issues
+> are tracked exclusively through ngit and Nostr in the
+> [primary Git Workshop repository](https://gitworkshop.dev/danconwaydev.com/ngit-grasp).
 
 A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized via Signed-Nostr Proofs) implementation in Rust.
 
