@@ -37,6 +37,8 @@ WORKING       │  How-To        │    Reference     │
 **Style:** Practical recipes and solutions
 
 - **[Deploy ngit-grasp](how-to/deploy.md)** - Production deployment guide
+- **[Release ngit-grasp](how-to/release.md)** - Release publication and rollout
+  checklist
 - **[Configure Nix Flakes](how-to/nix-flakes.md)** - Nix development environment
 - **[Run Compliance Tests](how-to/test-compliance.md)** - GRASP compliance testing
 - **[Upgrade nostr-sdk](how-to/upgrade-nostr-sdk.md)** - Handling SDK upgrades
