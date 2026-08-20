@@ -14,7 +14,9 @@ use nostr_sdk::prelude::{Event, EventId, FromBech32, PublicKey, ToBech32};
 use tracing::{error, info, warn};
 
 use super::authorization::{compute_membership, extract_commit_tag, RepositoryData};
-use super::integrity::{discover_families, discover_views, list_refs, FamilyRepairSource};
+use super::integrity::{
+    discover_families, discover_views, list_refs, select_families, FamilyRepairSource,
+};
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 use crate::nostr::events::RepositoryState;
 use crate::purgatory::sync::RealSyncContext;
@@ -28,6 +30,7 @@ struct PassStats {
     views_checked: usize,
     healthy: usize,
     repaired: usize,
+    repair_needed: usize,
     manual_inspection: usize,
     failed: usize,
     refs_created: usize,
@@ -48,6 +51,18 @@ impl RepairCounts {
     fn any(&self) -> bool {
         self.created + self.updated + self.deleted + self.heads_set > 0
     }
+}
+
+#[derive(Clone, Copy)]
+struct PassMode {
+    repair: bool,
+    trigger: &'static str,
+}
+
+struct ReconcileAccumulator<'a> {
+    repair: bool,
+    repairs: &'a mut RepairCounts,
+    issues: &'a mut Vec<IntegrityIssue>,
 }
 
 #[derive(Debug)]
@@ -116,24 +131,37 @@ struct ViewExpectation {
 /// The relay is already serving traffic while this runs. Missing objects are
 /// fetched only through the hardened integrity-fetch path, and each family is
 /// leased only for the short local ref reconciliation phase.
-pub async fn run_startup_pass(storage: &LocalGitStorage, source: &RealSyncContext) {
+pub async fn run_startup_pass(
+    storage: &LocalGitStorage,
+    source: &RealSyncContext,
+    identifiers: &[String],
+) {
     let mut stats = PassStats::default();
-    let families = match discover_families(storage) {
-        Ok(families) => families,
-        Err(error) => {
-            error!(%error, "Git authorization-integrity startup discovery failed");
-            stats.failed = 1;
-            log_completion(&stats);
-            return;
-        }
-    };
+    let (families, missing) =
+        match discover_families(storage).map(|families| select_families(families, identifiers)) {
+            Ok(selection) => selection,
+            Err(error) => {
+                error!(%error, "Git authorization-integrity startup discovery failed");
+                stats.failed = 1;
+                log_startup_completion(&stats, !identifiers.is_empty(), identifiers.len());
+                return;
+            }
+        };
+    stats.failed = missing.len();
+    for identifier in missing {
+        error!(
+            %identifier,
+            manual_inspection = true,
+            "Configured startup authorization-integrity identifier matched no installed family"
+        );
+    }
     let accepted_prs = match source.accepted_pr_events_for_integrity().await {
         Ok(events) => events,
         Err(error) => {
             error!(%error, "Git authorization-integrity authoritative event query failed");
             stats.families = families.len();
-            stats.failed = 1;
-            log_completion(&stats);
+            stats.failed += 1;
+            log_startup_completion(&stats, !identifiers.is_empty(), identifiers.len());
             return;
         }
     };
@@ -143,18 +171,126 @@ pub async fn run_startup_pass(storage: &LocalGitStorage, source: &RealSyncContex
         families = families.len(),
         accepted_pr_events = accepted_prs.len(),
         pending_pr_entries = pending_prs.len(),
+        scoped = !identifiers.is_empty(),
+        requested_identifiers = identifiers.len(),
         "Git authorization-integrity startup pass started"
     );
 
+    run_families(
+        storage,
+        source,
+        families,
+        &accepted_prs,
+        &pending_prs,
+        PassMode {
+            repair: true,
+            trigger: "startup",
+        },
+        &mut stats,
+    )
+    .await;
+
+    log_startup_completion(&stats, !identifiers.is_empty(), identifiers.len());
+}
+
+/// Run the same authorization reconciliation for one operator-selected
+/// identifier. `repair = false` is a non-mutating comparison; `repair = true`
+/// applies the same safe automatic fixes as the startup pass.
+pub(crate) async fn run_identifier_pass(
+    storage: &LocalGitStorage,
+    source: &RealSyncContext,
+    identifier: &str,
+    repair: bool,
+) {
+    let scope = [identifier.to_owned()];
+    let mut stats = PassStats::default();
+    let (families, missing) =
+        match discover_families(storage).map(|families| select_families(families, &scope)) {
+            Ok(selection) => selection,
+            Err(error) => {
+                error!(%identifier, %error, "Manual Git authorization-integrity discovery failed");
+                stats.failed = 1;
+                log_manual_completion(&stats, identifier, repair);
+                return;
+            }
+        };
+    if !missing.is_empty() {
+        error!(
+            %identifier,
+            manual_inspection = true,
+            "Manual Git authorization-integrity request matched no installed family"
+        );
+        stats.failed = missing.len();
+        log_manual_completion(&stats, identifier, repair);
+        return;
+    }
+    let accepted_prs = match source.accepted_pr_events_for_integrity().await {
+        Ok(events) => events
+            .into_iter()
+            .filter(|event| {
+                event_relevant_to_identifier(
+                    event,
+                    identifier,
+                    source.service_address_for_integrity(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            error!(
+                %identifier,
+                %error,
+                "Manual Git authorization-integrity authoritative event query failed"
+            );
+            stats.families = families.len();
+            stats.failed = 1;
+            log_manual_completion(&stats, identifier, repair);
+            return;
+        }
+    };
+    let pending_prs = source.pending_pr_entries_for_integrity();
+    info!(
+        %identifier,
+        repair,
+        families = families.len(),
+        accepted_pr_events = accepted_prs.len(),
+        pending_pr_entries = pending_prs.len(),
+        "Manual Git authorization-integrity request started"
+    );
+    run_families(
+        storage,
+        source,
+        families,
+        &accepted_prs,
+        &pending_prs,
+        PassMode {
+            repair,
+            trigger: "manual",
+        },
+        &mut stats,
+    )
+    .await;
+    log_manual_completion(&stats, identifier, repair);
+}
+
+async fn run_families(
+    storage: &LocalGitStorage,
+    source: &RealSyncContext,
+    families: Vec<FamilyKey>,
+    accepted_prs: &[Event],
+    pending_prs: &[(String, PrPurgatoryEntry)],
+    mode: PassMode,
+    stats: &mut PassStats,
+) {
     for key in families {
         stats.families += 1;
         if let Err(error) = check_family(
             storage,
             source,
             &key,
-            &accepted_prs,
-            &pending_prs,
-            &mut stats,
+            accepted_prs,
+            pending_prs,
+            mode,
+            stats,
         )
         .await
         {
@@ -162,6 +298,8 @@ pub async fn run_startup_pass(storage: &LocalGitStorage, source: &RealSyncContex
             error!(
                 identifier = %key.identifier,
                 object_format = %key.object_format,
+                trigger = mode.trigger,
+                repair = mode.repair,
                 %error,
                 manual_inspection = true,
                 "Git authorization-integrity family check failed"
@@ -169,23 +307,43 @@ pub async fn run_startup_pass(storage: &LocalGitStorage, source: &RealSyncContex
         }
         tokio::task::yield_now().await;
     }
-
-    log_completion(&stats);
 }
 
-fn log_completion(stats: &PassStats) {
+fn log_startup_completion(stats: &PassStats, scoped: bool, requested_identifiers: usize) {
     info!(
         families = stats.families,
         views_checked = stats.views_checked,
         healthy = stats.healthy,
         repaired = stats.repaired,
+        repair_needed = stats.repair_needed,
         manual_inspection = stats.manual_inspection,
         failed = stats.failed,
         refs_created = stats.refs_created,
         refs_updated = stats.refs_updated,
         refs_deleted = stats.refs_deleted,
         heads_set = stats.heads_set,
+        scoped,
+        requested_identifiers,
         "Git authorization-integrity startup pass completed"
+    );
+}
+
+fn log_manual_completion(stats: &PassStats, identifier: &str, repair: bool) {
+    info!(
+        %identifier,
+        repair,
+        families = stats.families,
+        views_checked = stats.views_checked,
+        healthy = stats.healthy,
+        repaired = stats.repaired,
+        repair_needed = stats.repair_needed,
+        manual_inspection = stats.manual_inspection,
+        failed = stats.failed,
+        refs_created = stats.refs_created,
+        refs_updated = stats.refs_updated,
+        refs_deleted = stats.refs_deleted,
+        heads_set = stats.heads_set,
+        "Manual Git authorization-integrity request completed"
     );
 }
 
@@ -195,8 +353,10 @@ async fn check_family(
     key: &FamilyKey,
     accepted_prs: &[Event],
     pending_prs: &[(String, PrPurgatoryEntry)],
+    mode: PassMode,
     stats: &mut PassStats,
 ) -> Result<()> {
+    let PassMode { repair, trigger } = mode;
     let repo_data = source
         .accepted_repository_data_for_integrity(&key.identifier)
         .await
@@ -236,7 +396,7 @@ async fn check_family(
             }
         }
     }
-    if !missing.is_empty() {
+    if repair && !missing.is_empty() {
         if let Some((target_view, _, _, _, _)) = checks.first() {
             fetch_missing_expected_oids(source, &key.identifier, target_view, &missing).await;
         }
@@ -253,7 +413,13 @@ async fn check_family(
     let pending_states = source.pending_state_events_for_integrity(&key.identifier);
     let mut candidate_pr_ids: BTreeSet<EventId> = accepted_prs
         .iter()
-        .filter(|event| event_mentions_identifier(event, &key.identifier))
+        .filter(|event| {
+            event_relevant_to_identifier(
+                event,
+                &key.identifier,
+                source.service_address_for_integrity(),
+            )
+        })
         .map(|event| event.id)
         .collect();
     for (view, _, _, _, _) in &checks {
@@ -288,14 +454,15 @@ async fn check_family(
             expectation,
             &baseline_refs,
             baseline_head.as_deref(),
+            repair,
         ) {
             Ok((repairs, issues)) => {
                 stats.refs_created += repairs.created;
                 stats.refs_updated += repairs.updated;
                 stats.refs_deleted += repairs.deleted;
                 stats.heads_set += repairs.heads_set;
-                if issues.is_empty() {
-                    if repairs.any() {
+                if repairs.any() {
+                    if repair {
                         stats.repaired += 1;
                         info!(
                             identifier = %key.identifier,
@@ -303,6 +470,8 @@ async fn check_family(
                             view = %view.display(),
                             view_type = identity.kind(),
                             pubkey = %identity.pubkey_hex(),
+                            trigger,
+                            repair,
                             refs_created = repairs.created,
                             refs_updated = repairs.updated,
                             refs_deleted = repairs.deleted,
@@ -310,11 +479,28 @@ async fn check_family(
                             "Git authorization-integrity repaired repository view"
                         );
                     } else {
-                        stats.healthy += 1;
+                        stats.repair_needed += 1;
+                        warn!(
+                            identifier = %key.identifier,
+                            object_format = %key.object_format,
+                            view = %view.display(),
+                            view_type = identity.kind(),
+                            pubkey = %identity.pubkey_hex(),
+                            trigger,
+                            repair,
+                            refs_to_create = repairs.created,
+                            refs_to_update = repairs.updated,
+                            refs_to_delete = repairs.deleted,
+                            head_to_set = repairs.heads_set,
+                            "Git authorization-integrity repository view differs from authoritative events"
+                        );
                     }
-                } else {
+                } else if issues.is_empty() {
+                    stats.healthy += 1;
+                }
+                if !issues.is_empty() {
                     stats.manual_inspection += 1;
-                    log_issues(key, &view, &identity, &issues);
+                    log_issues(key, &view, &identity, &issues, trigger, repair);
                 }
             }
             Err(error) => {
@@ -325,6 +511,8 @@ async fn check_family(
                     view = %view.display(),
                     view_type = identity.kind(),
                     pubkey = %identity.pubkey_hex(),
+                    trigger,
+                    repair,
                     %error,
                     manual_inspection = true,
                     "Git authorization-integrity repository check failed"
@@ -560,6 +748,19 @@ fn event_mentions_identifier(event: &Event, identifier: &str) -> bool {
     !tagged_owners(event, identifier).is_empty()
 }
 
+fn event_relevant_to_identifier(
+    event: &Event,
+    identifier: &str,
+    service_address: Option<&str>,
+) -> bool {
+    event_mentions_identifier(event, identifier)
+        || service_address.is_some_and(|domain| {
+            crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(event, domain)
+                .iter()
+                .any(|candidate| candidate == identifier)
+        })
+}
+
 fn placeholder_applies_to_view(
     entry: &PrPurgatoryEntry,
     identity: &ViewIdentity,
@@ -577,6 +778,7 @@ fn reconcile_view(
     mut expected: ViewExpectation,
     baseline_refs: &BTreeMap<String, String>,
     baseline_head: Option<&str>,
+    repair: bool,
 ) -> Result<(RepairCounts, Vec<IntegrityIssue>)> {
     let current: BTreeMap<_, _> = list_refs(view)?.into_iter().collect();
     let mut repairs = RepairCounts::default();
@@ -604,15 +806,19 @@ fn reconcile_view(
                     ));
                     continue;
                 }
-                match delete_ref_cas(view, reference, actual) {
-                    Ok(()) => repairs.deleted += 1,
-                    Err(error) => expected.issues.push(IntegrityIssue::new(
-                        "stale_state_ref_repair_failed",
-                        reference,
-                        Some(actual.clone()),
-                        None,
-                        error.to_string(),
-                    )),
+                if repair {
+                    match delete_ref_cas(view, reference, actual) {
+                        Ok(()) => repairs.deleted += 1,
+                        Err(error) => expected.issues.push(IntegrityIssue::new(
+                            "stale_state_ref_repair_failed",
+                            reference,
+                            Some(actual.clone()),
+                            None,
+                            error.to_string(),
+                        )),
+                    }
+                } else {
+                    repairs.deleted += 1;
                 }
             }
         }
@@ -622,14 +828,18 @@ fn reconcile_view(
             &current,
             baseline_refs,
             &expected.state_refs,
-            &mut repairs,
-            &mut expected.issues,
+            &mut ReconcileAccumulator {
+                repair,
+                repairs: &mut repairs,
+                issues: &mut expected.issues,
+            },
         );
         reconcile_head(
             view,
             expected.state_head.as_deref(),
             &expected.state_refs,
             baseline_head,
+            repair,
             &mut repairs,
             &mut expected.issues,
         );
@@ -653,8 +863,11 @@ fn reconcile_view(
         &current,
         baseline_refs,
         &expected.pr_refs,
-        &mut repairs,
-        &mut expected.issues,
+        &mut ReconcileAccumulator {
+            repair,
+            repairs: &mut repairs,
+            issues: &mut expected.issues,
+        },
     );
 
     for (reference, actual) in current
@@ -711,8 +924,7 @@ fn reconcile_expected_refs(
     current: &BTreeMap<String, String>,
     baseline: &BTreeMap<String, String>,
     expected: &BTreeMap<String, String>,
-    repairs: &mut RepairCounts,
-    issues: &mut Vec<IntegrityIssue>,
+    accumulator: &mut ReconcileAccumulator<'_>,
 ) {
     for (reference, target) in expected {
         let actual = current.get(reference);
@@ -720,7 +932,7 @@ fn reconcile_expected_refs(
             continue;
         }
         if baseline.get(reference) != actual {
-            issues.push(IntegrityIssue::new(
+            accumulator.issues.push(IntegrityIssue::new(
                 "concurrent_ref_change",
                 reference,
                 actual.cloned(),
@@ -730,7 +942,7 @@ fn reconcile_expected_refs(
             continue;
         }
         if !valid_oid(object_format, target) {
-            issues.push(IntegrityIssue::new(
+            accumulator.issues.push(IntegrityIssue::new(
                 "invalid_authoritative_oid",
                 reference,
                 actual.cloned(),
@@ -740,13 +952,21 @@ fn reconcile_expected_refs(
             continue;
         }
         if !super::oid_exists(view, target) {
-            issues.push(IntegrityIssue::new(
+            accumulator.issues.push(IntegrityIssue::new(
                 "missing_authoritative_object",
                 reference,
                 actual.cloned(),
                 Some(target.clone()),
                 "the expected object remains unavailable after accepted-source repair attempts",
             ));
+            continue;
+        }
+        if !accumulator.repair {
+            if actual.is_some() {
+                accumulator.repairs.updated += 1;
+            } else {
+                accumulator.repairs.created += 1;
+            }
             continue;
         }
         match update_ref_cas(
@@ -756,9 +976,9 @@ fn reconcile_expected_refs(
             actual.map(String::as_str),
             object_format,
         ) {
-            Ok(()) if actual.is_some() => repairs.updated += 1,
-            Ok(()) => repairs.created += 1,
-            Err(error) => issues.push(IntegrityIssue::new(
+            Ok(()) if actual.is_some() => accumulator.repairs.updated += 1,
+            Ok(()) => accumulator.repairs.created += 1,
+            Err(error) => accumulator.issues.push(IntegrityIssue::new(
                 "authorized_ref_repair_failed",
                 reference,
                 actual.cloned(),
@@ -774,6 +994,7 @@ fn reconcile_head(
     expected_head: Option<&str>,
     state_refs: &BTreeMap<String, String>,
     baseline_head: Option<&str>,
+    repair: bool,
     repairs: &mut RepairCounts,
     issues: &mut Vec<IntegrityIssue>,
 ) {
@@ -814,6 +1035,10 @@ fn reconcile_head(
             Some(expected_head.to_owned()),
             "preserved because HEAD changed while the online integrity pass was running",
         ));
+        return;
+    }
+    if !repair {
+        repairs.heads_set += 1;
         return;
     }
     match super::set_repository_head(view, expected_head) {
@@ -935,7 +1160,14 @@ fn symbolic_head(repo: &Path) -> Result<Option<String>> {
     }
 }
 
-fn log_issues(key: &FamilyKey, view: &Path, identity: &ViewIdentity, issues: &[IntegrityIssue]) {
+fn log_issues(
+    key: &FamilyKey,
+    view: &Path,
+    identity: &ViewIdentity,
+    issues: &[IntegrityIssue],
+    trigger: &'static str,
+    repair: bool,
+) {
     for issue in issues.iter().take(MAX_ISSUES_PER_VIEW) {
         error!(
             identifier = %key.identifier,
@@ -943,6 +1175,8 @@ fn log_issues(key: &FamilyKey, view: &Path, identity: &ViewIdentity, issues: &[I
             view = %view.display(),
             view_type = identity.kind(),
             pubkey = %identity.pubkey_hex(),
+            trigger,
+            repair,
             category = issue.category,
             reference = %issue.reference,
             actual_oid = issue.actual_oid.as_deref().unwrap_or(""),
@@ -957,6 +1191,8 @@ fn log_issues(key: &FamilyKey, view: &Path, identity: &ViewIdentity, issues: &[I
             identifier = %key.identifier,
             object_format = %key.object_format,
             view = %view.display(),
+            trigger,
+            repair,
             suppressed = issues.len() - MAX_ISSUES_PER_VIEW,
             manual_inspection = true,
             "Additional Git authorization-integrity issues suppressed for this view"
@@ -1055,6 +1291,7 @@ mod tests {
             expectation,
             &baseline_refs,
             baseline_head.as_deref(),
+            true,
         )
         .unwrap()
     }
@@ -1109,6 +1346,41 @@ mod tests {
     }
 
     #[test]
+    fn check_only_reports_safe_repairs_without_mutating_refs() {
+        let (_temp, _storage, _key, view, commits) = fixture();
+        let expected_pr = format!("refs/nostr/{}", "d".repeat(64));
+        git(&view, &["update-ref", "refs/heads/main", &commits[0]]);
+        git(&view, &["update-ref", "refs/heads/stale", &commits[0]]);
+        let baseline_refs = list_refs(&view).unwrap().into_iter().collect();
+        let baseline_head = symbolic_head(&view).unwrap();
+        let expectation = ViewExpectation {
+            state_refs: BTreeMap::from([("refs/heads/main".to_owned(), commits[1].clone())]),
+            state_head: Some("refs/heads/main".to_owned()),
+            has_authoritative_state: true,
+            pr_refs: BTreeMap::from([(expected_pr.clone(), commits[2].clone())]),
+            ..ViewExpectation::default()
+        };
+
+        let (repairs, issues) = reconcile_view(
+            &view,
+            ObjectFormat::Sha1,
+            expectation,
+            &baseline_refs,
+            baseline_head.as_deref(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(repairs.updated, 1);
+        assert_eq!(repairs.created, 1);
+        assert_eq!(repairs.deleted, 1);
+        assert!(issues.is_empty(), "{issues:#?}");
+        assert_eq!(git(&view, &["rev-parse", "refs/heads/main"]), commits[0]);
+        assert!(ref_exists(&view, "refs/heads/stale"));
+        assert!(!ref_exists(&view, &expected_pr));
+    }
+
+    #[test]
     fn missing_authoritative_object_requires_manual_inspection() {
         let (_temp, _storage, _key, view, commits) = fixture();
         git(&view, &["update-ref", "refs/heads/main", &commits[0]]);
@@ -1150,6 +1422,7 @@ mod tests {
             expectation,
             &baseline_refs,
             baseline_head.as_deref(),
+            true,
         )
         .unwrap();
 

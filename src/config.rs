@@ -367,6 +367,17 @@ pub struct Config {
     #[arg(long, env = "NGIT_RELAY_DATA_PATH", default_value = "./data/relay")]
     pub relay_data_path: String,
 
+    /// Restrict automatic startup integrity passes to these repository identifiers.
+    ///
+    /// Empty by default, which checks every installed identifier family. This is
+    /// intended only for staged validation before a full production sweep.
+    #[arg(
+        long,
+        env = "NGIT_STARTUP_INTEGRITY_IDENTIFIERS",
+        value_delimiter = ','
+    )]
+    pub startup_integrity_identifiers: Vec<String>,
+
     /// Server bind address (IP:PORT)
     #[arg(long, env = "NGIT_BIND_ADDRESS", default_value = "127.0.0.1:7334")]
     pub bind_address: String,
@@ -978,6 +989,22 @@ impl Config {
             ));
         }
 
+        let mut startup_integrity_identifiers = std::collections::HashSet::new();
+        for identifier in &self.startup_integrity_identifiers {
+            if !crate::git::validate_repository_identifier(identifier) {
+                return Err(anyhow!(
+                    "NGIT_STARTUP_INTEGRITY_IDENTIFIERS contains invalid repository identifier {:?}",
+                    identifier
+                ));
+            }
+            if !startup_integrity_identifiers.insert(identifier) {
+                return Err(anyhow!(
+                    "NGIT_STARTUP_INTEGRITY_IDENTIFIERS contains duplicate repository identifier {:?}",
+                    identifier
+                ));
+            }
+        }
+
         // Validate archive configuration
         let archive_whitelist = WhitelistEntry::parse_whitelist(&self.archive_whitelist);
         let archive_grasp_services = self.parse_archive_grasp_services();
@@ -1309,6 +1336,7 @@ impl Config {
             relay_description: "test description".to_string(),
             git_data_path: "./test_data/git".to_string(),
             relay_data_path: "./test_data/relay".to_string(),
+            startup_integrity_identifiers: Vec::new(),
             bind_address: "127.0.0.1:7334".to_string(),
             trusted_proxy_cidrs: Vec::new(),
             database_backend: DatabaseBackend::Memory,
@@ -1415,8 +1443,38 @@ mod tests {
         assert_eq!(config.base_path, "/");
         assert_eq!(config.bind_address, "127.0.0.1:7334");
         assert!(config.trusted_proxy_cidrs.is_empty());
+        assert!(config.startup_integrity_identifiers.is_empty());
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    #[test]
+    fn startup_integrity_scope_parses_and_validates() {
+        let config = Config::try_parse_from([
+            "ngit-grasp",
+            "--domain",
+            "example.com",
+            "--startup-integrity-identifiers",
+            "repo-one,repo-two",
+        ])
+        .expect("startup integrity scope should parse");
+
+        assert_eq!(
+            config.startup_integrity_identifiers,
+            ["repo-one", "repo-two"]
+        );
+
+        let invalid = Config {
+            startup_integrity_identifiers: vec!["../escape".to_owned()],
+            ..Config::for_testing()
+        };
+        assert!(invalid.validate().is_err());
+
+        let duplicate = Config {
+            startup_integrity_identifiers: vec!["repo".to_owned(), "repo".to_owned()],
+            ..Config::for_testing()
+        };
+        assert!(duplicate.validate().is_err());
     }
 
     #[test]

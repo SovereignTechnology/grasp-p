@@ -421,9 +421,13 @@ authorization bypass. Instead it emits a bounded, structured `ERROR` with
 authorized State still in purgatory also defers State mutation and is reported
 for inspection rather than racing event promotion.
 
-Both startup passes run in the background after database initialization. They
-do not extend the offline migration window or make relay availability depend
-on a remote Git server. Their stable terminal log messages are `Git
+Both startup passes run in the background after database initialization. By
+default they cover every installed identifier family. A temporary
+`NGIT_STARTUP_INTEGRITY_IDENTIFIERS` scope can limit both passes to named
+families during staged release-candidate validation; an empty scope is required
+for the final full sweep. The passes do not extend the offline migration window
+or make relay availability depend on a remote Git server. Their stable terminal
+log messages are `Git
 storage-integrity startup pass completed` and `Git authorization-integrity
 startup pass completed`. Because the authorization pass is online, it refreshes
 the accepted events immediately before mutation and refuses to overwrite any
@@ -436,16 +440,24 @@ can heal pre-existing missing objects. Unindexed legacy packs are preserved
 under `.grasp/migration/unindexed-packs/` when their backup is retired; there
 is no separate legacy repair subsystem.
 
-Operators can queue an identifier-scoped storage check in the live process:
+Operators can queue an identifier-scoped storage and event-authorization check
+in the live process:
 
 ```console
 ngit-grasp integrity-check --identifier example
 ngit-grasp integrity-check --identifier example --repair
 ```
 
-The command writes a durable request beneath `.grasp/integrity-requests/`.
-The server consumes it while holding its normal in-process family locks, so a
-manual repair cannot race an object-producing request in another view.
+Without `--repair`, the command reports structural faults, ref differences,
+and manual-inspection findings without changing objects, refs, or `HEAD`. With
+`--repair`, it also heals storage from accepted clone sources and applies the
+same unambiguous State/PR/PR-Update ref fixes as the startup pass. Unexplained
+PR refs remain preserved in both modes. The command writes a durable request
+beneath `.grasp/integrity-requests/`. The server consumes it while holding its
+normal in-process family locks, so a manual repair cannot race an
+object-producing request in another view. Completion is reported separately as
+`Manual Git storage-integrity request completed` and `Manual Git
+authorization-integrity request completed` with the identifier and repair mode.
 
 ## Security and privacy trade-offs
 

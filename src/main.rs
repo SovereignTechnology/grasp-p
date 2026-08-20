@@ -37,7 +37,7 @@ enum Cli {
     /// This is an operator/admin maintenance command and is idempotent.
     HoldingEject(nostr::lifecycle::HoldingEjectArgs),
 
-    /// Queue an identifier-family integrity check in the running relay.
+    /// Queue storage- and event-authorization integrity checks in the running relay.
     IntegrityCheck(ngit_grasp::git::integrity::IntegrityCheckArgs),
 }
 
@@ -73,9 +73,9 @@ async fn main() -> Result<()> {
             println!(
                 "Queued {} for identifier '{}' at {}",
                 if integrity_args.repair {
-                    "integrity check and repair"
+                    "storage and authorization-integrity check and repair"
                 } else {
-                    "integrity check"
+                    "storage and authorization-integrity check"
                 },
                 integrity_args.identifier,
                 path.display()

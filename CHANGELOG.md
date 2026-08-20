@@ -44,6 +44,8 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   that construct `Config` with a struct literal must provide it.
 - Added `base_path` to the public `Config` struct. Rust consumers that
   construct `Config` with a struct literal must provide it.
+- Added `startup_integrity_identifiers` to the public `Config` struct. Rust
+  consumers that construct `Config` with a struct literal must provide it.
 
 ### Security
 
@@ -79,16 +81,25 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   the requested repository namespace, allowing unauthenticated reads of Git
   repositories accessible to the service. With GRASP-06 enabled, crafted PR
   submissions could also write Git objects and PR refs into another hosted
-  repository without its maintainer authorization. Operators must upgrade
-  to v3.0.0. On every v3 startup, a non-blocking authorization-integrity pass
-  compares every served branch, tag, `HEAD`, and `refs/nostr/*` ref with the
+  repository without its maintainer authorization. Any deployment that enabled
+  GRASP-06 on a tagged build through v2.1.2 must treat hosted-repository
+  integrity as potentially compromised until it completes the v3 checks.
+  Operators must upgrade to v3.0.0. By default, every v3 startup runs a
+  non-blocking authorization-integrity pass that compares every served branch,
+  tag, `HEAD`, and `refs/nostr/*` ref with the
   accepted State, PR, and PR Update events (including precisely scoped
   in-flight events). It repairs unambiguous differences and emits
   `manual_inspection=true` errors without deleting unexplained PR refs that
   may be evidence. GRASP-06 operators must check those logs and the terminal
   `Git authorization-integrity startup pass completed` summary; any non-zero
   `manual_inspection` or `failed` count means the named repository still
-  requires review.
+  requires review. `NGIT_STARTUP_INTEGRITY_IDENTIFIERS` can temporarily scope
+  both startup integrity passes for release-candidate validation, but scoped
+  logs establish integrity only for the named repositories. Operators must
+  remove the scope and complete the default all-family sweep before treating
+  the v3 upgrade as complete. The live `integrity-check --identifier` command
+  now compares storage and event authorization together; it is check-only by
+  default and applies safe fixes with `--repair`.
 
 ### Added
 

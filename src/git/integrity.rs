@@ -27,8 +27,8 @@ use super::validate_repository_identifier;
 const REQUEST_VERSION: u32 = 1;
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Arguments for queueing an identifier-family integrity check in the live
-/// relay process.
+/// Arguments for queueing storage- and authorization-integrity checks in the
+/// live relay process.
 #[derive(Debug, Args)]
 pub struct IntegrityCheckArgs {
     /// Repository identifier (`d` tag value). All object formats and views for
@@ -36,7 +36,8 @@ pub struct IntegrityCheckArgs {
     #[arg(long)]
     pub identifier: String,
 
-    /// Attempt repair using accepted repository clone URLs.
+    /// Apply safe storage and ref repairs. Without this flag the request only
+    /// reports differences from structural and authoritative event state.
     #[arg(long, default_value_t = false)]
     pub repair: bool,
 
@@ -157,15 +158,22 @@ struct PassStats {
 
 /// Start the non-blocking integrity worker.
 ///
-/// It checks and heals every installed family once after startup, then
-/// consumes identifier-scoped requests written by [`enqueue_manual_check`].
+/// It checks and heals the configured startup scope once, then consumes
+/// identifier-scoped requests written by [`enqueue_manual_check`]. An empty
+/// startup scope means every installed family.
 pub fn spawn_integrity_worker(
     storage: LocalGitStorage,
     source: Arc<crate::purgatory::sync::RealSyncContext>,
+    startup_identifiers: Vec<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_startup_pass(&storage, source.as_ref()).await;
-        super::authorization_integrity::run_startup_pass(&storage, source.as_ref()).await;
+        run_startup_pass(&storage, source.as_ref(), &startup_identifiers).await;
+        super::authorization_integrity::run_startup_pass(
+            &storage,
+            source.as_ref(),
+            &startup_identifiers,
+        )
+        .await;
         let first = tokio::time::Instant::now() + REQUEST_POLL_INTERVAL;
         let mut interval = tokio::time::interval_at(first, REQUEST_POLL_INTERVAL);
         loop {
@@ -175,19 +183,35 @@ pub fn spawn_integrity_worker(
     })
 }
 
-async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(storage: &LocalGitStorage, source: &S) {
-    let families = match discover_families(storage) {
-        Ok(families) => families,
-        Err(error) => {
-            error!(%error, "Git storage-integrity startup discovery failed");
-            return;
-        }
+async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(
+    storage: &LocalGitStorage,
+    source: &S,
+    identifiers: &[String],
+) {
+    let (families, missing) =
+        match discover_families(storage).map(|families| select_families(families, identifiers)) {
+            Ok(selection) => selection,
+            Err(error) => {
+                error!(%error, "Git storage-integrity startup discovery failed");
+                return;
+            }
+        };
+    let mut stats = PassStats {
+        failed: missing.len(),
+        ..PassStats::default()
     };
+    for identifier in missing {
+        error!(
+            %identifier,
+            "Configured startup integrity identifier matched no installed family"
+        );
+    }
     info!(
         families = families.len(),
+        scoped = !identifiers.is_empty(),
+        requested_identifiers = identifiers.len(),
         "Git storage-integrity startup pass started"
     );
-    let mut stats = PassStats::default();
     for key in families {
         run_one_family(storage, &key, source, true, "startup", &mut stats).await;
         tokio::task::yield_now().await;
@@ -202,9 +226,9 @@ async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(storage: &LocalGitStor
     );
 }
 
-async fn process_manual_requests<S: FamilyRepairSource + ?Sized>(
+async fn process_manual_requests(
     storage: &LocalGitStorage,
-    source: &S,
+    source: &crate::purgatory::sync::RealSyncContext,
 ) {
     let requests = match load_requests(storage) {
         Ok(requests) => requests,
@@ -214,45 +238,60 @@ async fn process_manual_requests<S: FamilyRepairSource + ?Sized>(
         }
     };
     for (path, request) in requests {
-        let families = match discover_families(storage) {
-            Ok(families) => families
-                .into_iter()
-                .filter(|key| key.identifier == request.identifier)
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                error!(
-                    identifier = %request.identifier,
-                    %error,
-                    "Manual Git integrity family discovery failed"
-                );
-                remove_consumed_request(&path);
-                continue;
-            }
-        };
-        if families.is_empty() {
-            error!(
-                identifier = %request.identifier,
-                "Manual Git integrity request matched no identifier family"
-            );
-            remove_consumed_request(&path);
-            continue;
+        if run_manual_storage_request(storage, source, &request).await {
+            super::authorization_integrity::run_identifier_pass(
+                storage,
+                source,
+                &request.identifier,
+                request.repair,
+            )
+            .await;
         }
-        let mut stats = PassStats::default();
-        for key in families {
-            run_one_family(storage, &key, source, request.repair, "manual", &mut stats).await;
-        }
-        info!(
-            identifier = %request.identifier,
-            repair = request.repair,
-            checked = stats.checked,
-            healthy = stats.healthy,
-            repaired = stats.repaired,
-            unresolved = stats.unresolved,
-            failed = stats.failed,
-            "Manual Git identifier-family integrity request completed"
-        );
         remove_consumed_request(&path);
     }
+}
+
+async fn run_manual_storage_request<S: FamilyRepairSource + ?Sized>(
+    storage: &LocalGitStorage,
+    source: &S,
+    request: &IntegrityRequest,
+) -> bool {
+    let families = match discover_families(storage) {
+        Ok(families) => families
+            .into_iter()
+            .filter(|key| key.identifier == request.identifier)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            error!(
+                identifier = %request.identifier,
+                %error,
+                "Manual Git integrity family discovery failed"
+            );
+            return false;
+        }
+    };
+    if families.is_empty() {
+        error!(
+            identifier = %request.identifier,
+            "Manual Git integrity request matched no identifier family"
+        );
+        return false;
+    }
+    let mut stats = PassStats::default();
+    for key in families {
+        run_one_family(storage, &key, source, request.repair, "manual", &mut stats).await;
+    }
+    info!(
+        identifier = %request.identifier,
+        repair = request.repair,
+        checked = stats.checked,
+        healthy = stats.healthy,
+        repaired = stats.repaired,
+        unresolved = stats.unresolved,
+        failed = stats.failed,
+        "Manual Git storage-integrity request completed"
+    );
+    true
 }
 
 async fn run_one_family<S: FamilyRepairSource + ?Sized>(
@@ -528,6 +567,34 @@ pub fn discover_families(storage: &LocalGitStorage) -> Result<Vec<FamilyKey>> {
             .cmp(&(right.object_format.as_str(), right.identifier.as_str()))
     });
     Ok(families)
+}
+
+/// Restrict discovered families to an operator-supplied identifier scope.
+///
+/// An empty scope selects every family. The second result lists requested
+/// identifiers that did not match either object format, so a typo cannot
+/// silently produce a reassuring empty pass.
+pub(crate) fn select_families(
+    families: Vec<FamilyKey>,
+    identifiers: &[String],
+) -> (Vec<FamilyKey>, Vec<String>) {
+    if identifiers.is_empty() {
+        return (families, Vec::new());
+    }
+    let requested: BTreeSet<_> = identifiers.iter().cloned().collect();
+    let mut found = BTreeSet::new();
+    let selected = families
+        .into_iter()
+        .filter(|key| {
+            let selected = requested.contains(&key.identifier);
+            if selected {
+                found.insert(key.identifier.clone());
+            }
+            selected
+        })
+        .collect();
+    let missing = requested.difference(&found).cloned().collect();
+    (selected, missing)
 }
 
 /// Inspect one family and every owner or `/prs/` view backed by its identifier.
@@ -1079,6 +1146,22 @@ mod tests {
     }
 
     #[test]
+    fn startup_scope_selects_named_families_and_reports_missing_names() {
+        let families = vec![
+            FamilyKey::sha1("alpha").unwrap(),
+            FamilyKey::new(ObjectFormat::Sha256, "alpha").unwrap(),
+            FamilyKey::sha1("beta").unwrap(),
+        ];
+        let scope = vec!["alpha".to_owned(), "missing".to_owned()];
+
+        let (selected, missing) = select_families(families, &scope);
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|key| key.identifier == "alpha"));
+        assert_eq!(missing, vec!["missing"]);
+    }
+
+    #[test]
     fn manual_requests_are_durable_and_identifier_scoped() {
         let temp = tempfile::tempdir().unwrap();
         let args = IntegrityCheckArgs {
@@ -1110,7 +1193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_requests_are_consumed_by_the_family_worker() {
+    async fn manual_storage_requests_are_identifier_scoped() {
         let (temp, storage, _key, _view, _commit) = fixture();
         let args = IntegrityCheckArgs {
             identifier: "shared".to_owned(),
@@ -1123,7 +1206,9 @@ mod tests {
             family_objects: temp.path().join("unused"),
         };
 
-        process_manual_requests(&storage, &source).await;
+        let requests = load_requests(&storage).unwrap();
+        assert!(run_manual_storage_request(&storage, &source, &requests[0].1).await);
+        remove_consumed_request(&request);
 
         assert!(!request.exists());
     }

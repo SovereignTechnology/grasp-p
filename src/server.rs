@@ -455,6 +455,7 @@ impl RelayServer {
         background_tasks.push(git::integrity::spawn_integrity_worker(
             git_storage,
             sync_ctx.clone(),
+            config.startup_integrity_identifiers.clone(),
         ));
         info!("Git storage and authorization-integrity worker started");
 

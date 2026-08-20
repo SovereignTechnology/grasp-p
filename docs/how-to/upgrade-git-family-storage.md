@@ -63,6 +63,26 @@ Git storage-integrity startup pass completed
 Git authorization-integrity startup pass completed
 ```
 
+For a release-candidate deployment, operators may temporarily limit both
+startup passes to selected identifiers while validating runtime and log output:
+
+```bash
+NGIT_STARTUP_INTEGRITY_IDENTIFIERS=repo-one,repo-two
+```
+
+The equivalent NixOS option is
+`startupIntegrityIdentifiers = [ "repo-one" "repo-two" ];`. A scoped summary
+establishes integrity only for those names; it is not the v3 security sweep.
+Remove the scope and observe a successful all-family pair of terminal summaries
+before declaring the upgrade complete. The relay stays online during both
+scoped and full passes.
+
+Any service that enabled GRASP-06 on a tagged release through v2.1.2 must treat
+its hosted repositories as potentially compromised until the full pass has
+completed and every reported exception has been resolved. Passing a selected
+scope is useful validation evidence, but it does not clear repositories that
+were not named.
+
 These passes are non-blocking: the relay is online while they inspect and heal
 the migrated views. In the storage summary, an `unresolved` or `failed` count
 above zero has a corresponding `ERROR` naming the identifier. In the
@@ -83,6 +103,18 @@ The authorization pass treats the accepted event database as authoritative:
 - precisely scoped active purgatory entries are tolerated as in-flight state.
   Legacy unscoped placeholders are preserved but reported because they cannot
   prove which owner and identifier originally received the push.
+
+To repeat both checks for one family without restarting the relay, queue a
+check-only request first and inspect the two manual completion summaries:
+
+```console
+ngit-grasp integrity-check --identifier repo-one
+ngit-grasp integrity-check --identifier repo-one --repair
+```
+
+Only the second command applies safe fixes. Re-run the check-only command after
+repair; `repair_needed`, `manual_inspection`, and `failed` must all be zero for
+that identifier to be considered clean.
 
 A retained backup protects an unhealthy family's legacy data, and a legacy
 shallow view continues serving at its pre-upgrade level rather than being made

@@ -379,6 +379,30 @@ NGIT_DATABASE_BACKEND=memory
 
 ---
 
+#### `NGIT_STARTUP_INTEGRITY_IDENTIFIERS`
+
+**Description:** Comma-separated repository identifiers to check during the
+automatic startup storage- and authorization-integrity passes
+
+**Type:** String list
+
+**Default:** Empty, meaning every installed identifier family
+
+**Required:** No
+
+```bash
+# Staged validation of two families
+NGIT_STARTUP_INTEGRITY_IDENTIFIERS=repo-one,repo-two
+```
+
+Use a non-empty value only to validate a release candidate on selected
+families while the relay remains online. Remove the setting for the full
+security sweep: scoped startup logs establish integrity only for the named
+identifiers. Invalid or duplicate identifiers stop startup. The corresponding
+NixOS option is `startupIntegrityIdentifiers`.
+
+---
+
 ### Proactive Sync Configuration (GRASP-02)
 
 These options configure the proactive sync feature that synchronizes events from other relays.

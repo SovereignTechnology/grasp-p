@@ -94,7 +94,9 @@ runtime:
   database initialization. The former checks family objects and thin-view
   wiring; the latter reconciles each served ref against accepted State, PR,
   and PR Update events, auto-repairing only unambiguous differences and
-  logging preserved evidence for manual inspection
+  logging preserved evidence for manual inspection. Both cover all families
+  by default, with a shared temporary identifier scope for staged validation;
+  durable manual requests run the same pair in check-only or repair mode
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
   resolves, then stop background mutation, persist a final state snapshot
   (purgatory and rejected-events cache), and clean up placeholder refs

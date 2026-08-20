@@ -190,6 +190,18 @@ let
         '';
       };
 
+      startupIntegrityIdentifiers = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "repo-one" "repo-two" ];
+        description = ''
+          Repository identifiers checked by the automatic startup storage-
+          and authorization-integrity passes. An empty list checks every
+          installed identifier family and is required for a complete sweep.
+          A non-empty list is intended only for staged validation.
+        '';
+      };
+
       metricsEnabled = mkOption {
         type = types.bool;
         default = true;
@@ -634,6 +646,9 @@ let
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.trustedProxyCidrs != [ ]) {
       NGIT_TRUSTED_PROXY_CIDRS = concatStringsSep "," cfg.trustedProxyCidrs;
+    } // optionalAttrs (cfg.startupIntegrityIdentifiers != [ ]) {
+      NGIT_STARTUP_INTEGRITY_IDENTIFIERS =
+        concatStringsSep "," cfg.startupIntegrityIdentifiers;
     } // optionalAttrs (cfg.relayName != null) {
       NGIT_RELAY_NAME = cfg.relayName;
     } // optionalAttrs (cfg.archiveReadOnly != null) {
