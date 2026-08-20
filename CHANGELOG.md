@@ -29,6 +29,17 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   so operators must plan for relay downtime during the upgrade. The largest
   GRASP service migrated so far spent 51 minutes migrating 2,294 repository views
   into 2,014 identifier families, retired 2,291 backups, and retained three for automatic integrity repair.
+- Maintainer authorization now uses reciprocal membership. A pubkey listed by
+  a confirmed maintainer is only invited and cannot publish authoritative
+  repository state until its own kind-30617 announcement for the same
+  identifier lists back an existing confirmed maintainer. At release time,
+  this changes the effective authorization state of zero live repositories;
+  it is breaking for future invitations because they now require an explicit
+  acceptance step. Repository announcements now support the NIP-34 `M`
+  (lead maintainer), `m` (co-maintainer), and `o` (moderator) role tags.
+  Active `M` and `m` entries define maintainers; `o` does not grant
+  repository-state authority. The deprecated `maintainers` tag is used as a
+  fallback only when none of those role tags are present.
 - Added `trusted_proxy_cidrs` to the public `Config` struct. Rust consumers
   that construct `Config` with a struct literal must provide it.
 - Added `base_path` to the public `Config` struct. Rust consumers that
@@ -440,8 +451,8 @@ defensive limits explicit and operator-configurable.
 - Fixed maintainer invitation acceptance and synchronization across owner-only,
   invitee-only, shared, and temporarily unavailable GRASP servers. Acceptance
   now converges without an invitee state event or additional Git push, handles
-  an invitee repository that already exists, and preserves the one-way
-  authority granted by an invitation before reciprocal acceptance.
+  an invitee repository that already exists, and withholds the invitee's state
+  authority until reciprocal acceptance.
 - Kept invitation recovery responsive during restarts, rate limits, large relay
   sets, and expired dependency caches by bounding actor work, retaining exact
   relay hints, and keeping connection and subscription retries scheduler-owned.
