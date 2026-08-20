@@ -411,6 +411,10 @@ This a useful feature of other git servers.
 
 ## Quick Start
 
+Tagged releases provide a statically linked x86_64 Linux archive accompanied
+by `SHA256SUMS`. The archive can be installed without a Rust or Nix toolchain;
+on a Linux flake system, build the same output with `nix build .#static`.
+
 ```bash
 # install ngit
 curl -Ls https://ngit.dev/install.sh | bash

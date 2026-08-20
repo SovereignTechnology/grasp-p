@@ -73,6 +73,9 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
 
 ### Added
 
+- Build a reproducible, statically linked x86_64 Linux archive and checksum
+  from every version tag.
+
 - Add `NGIT_BASE_PATH` / `--base-path` (NixOS `basePath`) so one GRASP server
   can be mounted below a shared domain path. WebSocket, Git Smart HTTP,
   GRASP-06, NIP-11, metrics, icons, landing pages, service matching, generated

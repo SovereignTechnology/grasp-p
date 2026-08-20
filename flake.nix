@@ -13,6 +13,8 @@
         if self ? rev then self.rev
         else if self ? dirtyRev then self.dirtyRev
         else "unknown";
+      ngitGraspVersion =
+        (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     in
     (flake-utils.lib.eachDefaultSystem (system:
       let
@@ -44,46 +46,65 @@
         };
 
         # Both crates are members of a single workspace sharing one Cargo.lock.
-        packages.default = self.packages.${system}.ngit-grasp;
+        packages = {
+          default = self.packages.${system}.ngit-grasp;
 
-        packages.ngit-grasp = pkgs.rustPlatform.buildRustPackage {
-          pname = "ngit-grasp";
-          version = "2.1.2";
-          src = ./.;
-          NGIT_BUILD_REVISION = sourceRevision;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
+          ngit-grasp = pkgs.rustPlatform.buildRustPackage {
+            pname = "ngit-grasp";
+            version = ngitGraspVersion;
+            src = ./.;
+            NGIT_BUILD_REVISION = sourceRevision;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
+
+            # Only build/test the ngit-grasp package, not the whole workspace.
+            cargoBuildFlags = [ "-p" "ngit-grasp" ];
+
+            nativeBuildInputs = with pkgs; [ pkg-config git ];
+
+            buildInputs = with pkgs; [ openssl ];
+
+            # Run lib tests only; integration tests spawn a live relay and require
+            # network access not available in the Nix sandbox.
+            doCheck = true;
+            cargoTestFlags = [ "-p" "ngit-grasp" "--lib" ];
           };
 
-          # Only build/test the ngit-grasp package, not the whole workspace.
-          cargoBuildFlags = [ "-p" "ngit-grasp" ];
+          grasp-audit = pkgs.rustPlatform.buildRustPackage {
+            pname = "grasp-audit";
+            version = "0.2.0";
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
 
-          nativeBuildInputs = with pkgs; [ pkg-config git ];
+            cargoBuildFlags = [ "-p" "grasp-audit" ];
 
-          buildInputs = with pkgs; [ openssl ];
+            nativeBuildInputs = with pkgs; [ pkg-config git ];
 
-          # Run lib tests only; integration tests spawn a live relay and require
-          # network access not available in the Nix sandbox.
-          doCheck = true;
-          cargoTestFlags = [ "-p" "ngit-grasp" "--lib" ];
-        };
+            buildInputs = with pkgs; [ openssl ];
 
-        packages.grasp-audit = pkgs.rustPlatform.buildRustPackage {
-          pname = "grasp-audit";
-          version = "0.2.0";
-          src = ./.;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
+            # Audit tests require a running Nostr relay; skip in the sandbox.
+            doCheck = false;
           };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # Portable release binary used by the tag-triggered release workflow.
+          static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
+            pname = "ngit-grasp";
+            version = ngitGraspVersion;
+            src = ./.;
+            NGIT_BUILD_REVISION = sourceRevision;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+            };
 
-          cargoBuildFlags = [ "-p" "grasp-audit" ];
+            cargoBuildFlags = [ "-p" "ngit-grasp" ];
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs.pkgsStatic; [ openssl ];
 
-          nativeBuildInputs = with pkgs; [ pkg-config git ];
-
-          buildInputs = with pkgs; [ openssl ];
-
-          # Audit tests require a running Nostr relay; skip in the sandbox.
-          doCheck = false;
+            doCheck = false;
+          };
         };
       })) // {
         # NixOS module for deployment

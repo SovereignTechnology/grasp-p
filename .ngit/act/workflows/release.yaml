@@ -1,0 +1,61 @@
+on:
+  push:
+    tags: ["v*"]
+
+name: release assets
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Restore Nix store cache
+        continue-on-error: true
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: release-nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock') }}
+          restore-prefixes-first-match: release-nix-${{ runner.os }}-
+          # cache-nix-action requires a token even with purge disabled;
+          # github.token is empty under ngit-ci, so any non-empty value works.
+          token: unused
+      - name: Build static binary
+        run: nix build .#static --out-link result-static
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          if [[ -z "$version" || "$version" == *[!A-Za-z0-9._+-]* ]]; then
+            echo "unsupported release version from tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          package_version="$(nix eval --raw .#static.version)"
+          if [[ "$version" != "$package_version" ]]; then
+            echo "tag version $version does not match package version $package_version" >&2
+            exit 1
+          fi
+
+          target="x86_64-unknown-linux-musl"
+          archive="ngit-grasp-${version}-${target}"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+
+          install -Dm755 result-static/bin/ngit-grasp \
+            "release-stage/${archive}/ngit-grasp"
+          install -Dm644 LICENSE "release-stage/${archive}/LICENSE"
+
+          mkdir -p dist
+          tar --sort=name --mtime="@${source_date_epoch}" \
+            --owner=0 --group=0 --numeric-owner -C release-stage \
+            -czf "dist/${archive}.tar.gz" "$archive"
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngit-grasp-release-assets
+          path: dist/*
+          if-no-files-found: error
