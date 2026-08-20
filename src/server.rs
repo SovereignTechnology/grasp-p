@@ -456,7 +456,7 @@ impl RelayServer {
             git_storage,
             sync_ctx.clone(),
         ));
-        info!("Git identifier-family integrity worker started");
+        info!("Git storage and authorization-integrity worker started");
 
         // Create throttle manager for rate limiting remote git servers
         // Default: 5 concurrent requests per domain, 60 requests per minute per domain

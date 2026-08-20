@@ -90,6 +90,11 @@ runtime:
   identity stays local so the relay's existence is never advertised
 - Atomically checkpoint purgatory and rejected-event recovery state every 60
   seconds without consuming the checkpoint during restore
+- Start non-blocking storage-integrity and authorization-integrity passes after
+  database initialization. The former checks family objects and thin-view
+  wiring; the latter reconciles each served ref against accepted State, PR,
+  and PR Update events, auto-repairing only unambiguous differences and
+  logging preserved evidence for manual inspection
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
   resolves, then stop background mutation, persist a final state snapshot
   (purgatory and rejected-events cache), and clean up placeholder refs

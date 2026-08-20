@@ -382,14 +382,15 @@ View lifecycle locks remain responsible for “may this path be removed?” The
 family lock is responsible for “is this object inventory and manifest update
 atomic?” Neither lock grants authorization.
 
-## Integrity and healing
+## Storage and authorization integrity
 
-Integrity is defined for an object-format/identifier family, not for one
-owner path. A pass checks the family pack set and object graph, then checks
-every owner and `/prs/` view with the same identifier for the correct alternate
-and for refs whose targets are available in the family. Multiple independent
-histories in one identifier are valid, and unreachable objects are not an
-error: retained delete-state and rollback data intentionally remain present.
+Storage integrity is defined for an object-format/identifier family, not for
+one owner path. The storage pass checks the family pack set and object graph,
+then checks every owner and `/prs/` view with the same identifier for the
+correct alternate and for refs whose targets are available in the family.
+Multiple independent histories in one identifier are valid, and unreachable
+objects are not an error: retained delete-state and rollback data intentionally
+remain present.
 
 The relay starts one non-blocking pass after migration, database
 initialization, and construction of the hardened outbound Git client. Broken
@@ -401,6 +402,33 @@ integrity check again. An unresolved family produces an `ERROR` log containing
 bounded counts and OID/diagnostic samples; it does not make availability depend
 on remote servers.
 
+Authorization integrity is the second, view-scoped layer. It derives each
+owner's branch, tag, and `HEAD` set from the NIP-01-preferred accepted State
+event published by that owner's confirmed maintainer set. It derives
+`refs/nostr/<event-id>` from accepted PR and PR Update events using the same
+maintainer-overlap propagation rule as normal event processing. GRASP-06 views
+also require the signer and this relay's clone URL to name that exact
+submitter/identifier coordinate. Exactly scoped active purgatory entries are
+recognized so an in-flight push is not mistaken for corruption.
+
+The pass creates or updates missing/wrong authorized refs once their objects
+are available, deletes stale State-governed branch and tag refs, and repairs
+`HEAD`. Before giving up on a missing expected object it uses the same accepted
+clone URLs and hardened fetch path as storage healing. It does not delete an
+unexplained PR or unknown-namespace ref: that ref may be evidence of a past
+authorization bypass. Instead it emits a bounded, structured `ERROR` with
+`manual_inspection=true`, the view and ref, and actual/expected targets. An
+authorized State still in purgatory also defers State mutation and is reported
+for inspection rather than racing event promotion.
+
+Both startup passes run in the background after database initialization. They
+do not extend the offline migration window or make relay availability depend
+on a remote Git server. Their stable terminal log messages are `Git
+storage-integrity startup pass completed` and `Git authorization-integrity
+startup pass completed`. Because the authorization pass is online, it refreshes
+the accepted events immediately before mutation and refuses to overwrite any
+ref that changed after its initial snapshot.
+
 This is also the migration repair path. Migration remains a deterministic,
 offline conversion that preserves every Git-readable object and the exact
 legacy refs. Once those paths are thin family views, the ordinary family pass
@@ -408,7 +436,7 @@ can heal pre-existing missing objects. Unindexed legacy packs are preserved
 under `.grasp/migration/unindexed-packs/` when their backup is retired; there
 is no separate legacy repair subsystem.
 
-Operators can queue the same identifier-scoped check in the live process:
+Operators can queue an identifier-scoped storage check in the live process:
 
 ```console
 ngit-grasp integrity-check --identifier example

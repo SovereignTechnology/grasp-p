@@ -80,7 +80,15 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   repositories accessible to the service. With GRASP-06 enabled, crafted PR
   submissions could also write Git objects and PR refs into another hosted
   repository without its maintainer authorization. Operators must upgrade
-  to v3.0.0; GRASP-06 operators should review hosted repository integrity.
+  to v3.0.0. On every v3 startup, a non-blocking authorization-integrity pass
+  compares every served branch, tag, `HEAD`, and `refs/nostr/*` ref with the
+  accepted State, PR, and PR Update events (including precisely scoped
+  in-flight events). It repairs unambiguous differences and emits
+  `manual_inspection=true` errors without deleting unexplained PR refs that
+  may be evidence. GRASP-06 operators must check those logs and the terminal
+  `Git authorization-integrity startup pass completed` summary; any non-zero
+  `manual_inspection` or `failed` count means the named repository still
+  requires review.
 
 ### Added
 

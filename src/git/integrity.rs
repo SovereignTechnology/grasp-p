@@ -165,6 +165,7 @@ pub fn spawn_integrity_worker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         run_startup_pass(&storage, source.as_ref()).await;
+        super::authorization_integrity::run_startup_pass(&storage, source.as_ref()).await;
         let first = tokio::time::Instant::now() + REQUEST_POLL_INTERVAL;
         let mut interval = tokio::time::interval_at(first, REQUEST_POLL_INTERVAL);
         loop {
@@ -178,13 +179,13 @@ async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(storage: &LocalGitStor
     let families = match discover_families(storage) {
         Ok(families) => families,
         Err(error) => {
-            error!(%error, "Git identifier-family integrity startup discovery failed");
+            error!(%error, "Git storage-integrity startup discovery failed");
             return;
         }
     };
     info!(
         families = families.len(),
-        "Git identifier-family integrity startup pass started"
+        "Git storage-integrity startup pass started"
     );
     let mut stats = PassStats::default();
     for key in families {
@@ -197,7 +198,7 @@ async fn run_startup_pass<S: FamilyRepairSource + ?Sized>(storage: &LocalGitStor
         repaired = stats.repaired,
         unresolved = stats.unresolved,
         failed = stats.failed,
-        "Git identifier-family integrity startup pass completed"
+        "Git storage-integrity startup pass completed"
     );
 }
 
@@ -651,7 +652,7 @@ pub(crate) fn family_contains_closure(family: &Path, refs_source: &Path) -> Resu
     Ok(())
 }
 
-fn discover_views(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_views(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Vec<PathBuf>> {
     let mut views = Vec::new();
     let entries = match std::fs::read_dir(storage.git_data_path()) {
         Ok(entries) => entries,
@@ -699,7 +700,7 @@ fn maybe_add_view(directory: &Path, key: &FamilyKey, views: &mut Vec<PathBuf>) -
     Ok(())
 }
 
-fn list_refs(repo: &Path) -> Result<Vec<(String, String)>> {
+pub(crate) fn list_refs(repo: &Path) -> Result<Vec<(String, String)>> {
     let output = Command::new("git")
         .args(["for-each-ref", "--format=%(refname)%00%(objectname)"])
         .current_dir(repo)

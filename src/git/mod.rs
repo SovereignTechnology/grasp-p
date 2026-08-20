@@ -18,6 +18,7 @@
 //! - `POST /<npub>/<identifier>.git/git-receive-pack` - Push operation
 
 pub mod authorization;
+pub mod authorization_integrity;
 pub mod handlers;
 pub mod integrity;
 pub mod migration;

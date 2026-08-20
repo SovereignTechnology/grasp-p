@@ -1121,6 +1121,19 @@ impl Purgatory {
             .collect()
     }
 
+    /// Snapshot every active PR event and git-data-first placeholder.
+    ///
+    /// The authorization-integrity pass needs the event ID (the map key) as
+    /// well as the entry so it can distinguish a legitimate in-flight ref
+    /// from an unexplained served ref. Keeping this crate-private avoids
+    /// exposing the purgatory's internal indexing as public API.
+    pub(crate) fn pr_entries_for_integrity(&self) -> Vec<(String, PrPurgatoryEntry)> {
+        self.pr_events
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
     /// Remove expired entries from purgatory.
     ///
     /// Should be called periodically (every 60 seconds) by background task to clean up

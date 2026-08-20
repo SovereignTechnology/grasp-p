@@ -1351,25 +1351,23 @@ async fn process_purgatory_state_events(
     result
 }
 
-/// Check if a state event is the latest authorized state for a given maintainer set.
+/// Select the latest authorized State event for a given maintainer set.
 ///
 /// Only considers states already in the database, not other purgatory states.
 ///
 /// # Arguments
-/// * `state` - The state event to check
 /// * `maintainers` - The set of authorized maintainers for the owner
 /// * `db_states` - State events from the database
 ///
 /// # Returns
-/// true if this state is the latest (or equal latest) among all authorized states in the DB
-fn is_latest_authorized_state(
-    state: &RepositoryState,
+/// The NIP-01-preferred State: newest timestamp, then lowest event ID.
+pub fn latest_authorized_state<'a>(
     maintainers: &[String],
-    db_states: &[RepositoryState],
-) -> bool {
+    db_states: &'a [RepositoryState],
+) -> Option<&'a RepositoryState> {
     // Find the NIP-01-preferred authorized state from the database: newest
     // timestamp wins, and the lowest event ID wins an equal-timestamp tie.
-    let latest_db_state = db_states
+    db_states
         .iter()
         .filter(|s| maintainers.contains(&s.event.pubkey.to_hex()))
         .max_by(|a, b| {
@@ -1379,7 +1377,15 @@ fn is_latest_authorized_state(
                 .created_at
                 .cmp(&b.event.created_at)
                 .then_with(|| b.event.id.cmp(&a.event.id))
-        });
+        })
+}
+
+fn is_latest_authorized_state(
+    state: &RepositoryState,
+    maintainers: &[String],
+    db_states: &[RepositoryState],
+) -> bool {
+    let latest_db_state = latest_authorized_state(maintainers, db_states);
 
     match latest_db_state {
         None => true, // No other states exist in DB, this is the latest

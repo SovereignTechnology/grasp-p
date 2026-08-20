@@ -360,6 +360,71 @@ impl RealSyncContext {
         urls.dedup();
         Ok(urls)
     }
+
+    pub(crate) async fn accepted_repository_data_for_integrity(
+        &self,
+        identifier: &str,
+    ) -> Result<RepositoryData> {
+        crate::git::authorization::fetch_repository_data_excluding_purgatory(
+            &self.database,
+            identifier,
+        )
+        .await
+    }
+
+    /// Accepted PR and PR-update events used to reconstruct the authorized
+    /// `refs/nostr/*` surface during the startup integrity pass.
+    pub(crate) async fn accepted_pr_events_for_integrity(
+        &self,
+    ) -> Result<Vec<nostr_sdk::prelude::Event>> {
+        use nostr_sdk::prelude::{Filter, Kind};
+
+        self.database
+            .query(Filter::new().kinds([Kind::GitPullRequest, Kind::GitPullRequestUpdate]))
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|error| anyhow::anyhow!("Database query failed: {error}"))
+    }
+
+    /// Revalidate a bounded set of PR IDs immediately before ref mutation.
+    /// Deleted events disappear from this result, preventing a long-running
+    /// online pass from recreating refs from its older startup snapshot.
+    pub(crate) async fn accepted_pr_events_by_id_for_integrity(
+        &self,
+        ids: &[nostr_sdk::prelude::EventId],
+    ) -> Result<Vec<nostr_sdk::prelude::Event>> {
+        use nostr_sdk::prelude::{Filter, Kind};
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.database
+            .query(
+                Filter::new()
+                    .ids(ids.iter().copied())
+                    .kinds([Kind::GitPullRequest, Kind::GitPullRequestUpdate]),
+            )
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|error| anyhow::anyhow!("Database query failed: {error}"))
+    }
+
+    pub(crate) fn pending_pr_entries_for_integrity(
+        &self,
+    ) -> Vec<(String, crate::purgatory::PrPurgatoryEntry)> {
+        self.purgatory.pr_entries_for_integrity()
+    }
+
+    pub(crate) fn pending_state_events_for_integrity(
+        &self,
+        identifier: &str,
+    ) -> Vec<crate::purgatory::StatePurgatoryEntry> {
+        self.purgatory.find_state(identifier)
+    }
+
+    pub(crate) fn service_address_for_integrity(&self) -> Option<&str> {
+        self.our_domain_value.as_deref()
+    }
 }
 
 const MISS_MEMO_TTL: Duration = Duration::from_secs(30 * 60);

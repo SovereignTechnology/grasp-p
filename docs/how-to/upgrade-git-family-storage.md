@@ -51,18 +51,42 @@ crash-safe, and safe to resume by restarting the same v3 release. It:
 
 Progress is stored below `.grasp/migration/`; the completed layout is marked by
 `.grasp/storage-version`. Do not edit these files while the service is running.
+A later v3 restart sees that completed marker and does not repeat the offline
+v2 conversion; the production-scale 51-minute cost applies to the first
+v2-to-v3 migration, not every v3 deployment.
 
-Confirm that the service reaches its normal listening state, then check the
-terminal integrity summary:
+Confirm that the service reaches its normal listening state, then follow the
+logs until both terminal integrity summaries appear:
 
 ```text
-Git identifier-family integrity startup pass completed
+Git storage-integrity startup pass completed
+Git authorization-integrity startup pass completed
 ```
 
-An `unresolved` or `failed` count above zero has a corresponding `ERROR` naming
-the identifier. The server has already attempted automatic repair. A retained
-backup protects an unhealthy family's legacy data, and a legacy shallow view
-continues serving at its pre-upgrade level rather than being made less usable.
+These passes are non-blocking: the relay is online while they inspect and heal
+the migrated views. In the storage summary, an `unresolved` or `failed` count
+above zero has a corresponding `ERROR` naming the identifier. In the
+authorization summary, a `manual_inspection` or `failed` count above zero has
+a corresponding `ERROR` naming the exact view, ref, actual target, expected
+target, and reason. The server has already attempted safe automatic repair.
+It deliberately preserves unexplained `refs/nostr/*` and unknown-namespace
+refs as evidence instead of guessing that deletion is safe.
+
+The authorization pass treats the accepted event database as authoritative:
+
+- the latest State event from the owner's confirmed maintainer set defines
+  all and only `refs/heads/*`, `refs/tags/*`, and `HEAD`;
+- accepted PR and PR Update events define `refs/nostr/<event-id>` in every
+  owner view selected by the existing maintainer-overlap rules;
+- a GRASP-06 contributor view additionally requires the event signer, clone
+  URL, and repository identifier to match that exact `/prs/` coordinate;
+- precisely scoped active purgatory entries are tolerated as in-flight state.
+  Legacy unscoped placeholders are preserved but reported because they cannot
+  prove which owner and identifier originally received the push.
+
+A retained backup protects an unhealthy family's legacy data, and a legacy
+shallow view continues serving at its pre-upgrade level rather than being made
+less usable.
 
 ## Roll back
 
