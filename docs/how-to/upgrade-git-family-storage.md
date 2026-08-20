@@ -77,11 +77,14 @@ Remove the scope and observe a successful all-family pair of terminal summaries
 before declaring the upgrade complete. The relay stays online during both
 scoped and full passes.
 
-Any service that enabled GRASP-06 on a tagged release through v2.1.2 must treat
-its hosted repositories as potentially compromised until the full pass has
-completed and every reported exception has been resolved. Passing a selected
-scope is useful validation evidence, but it does not clear repositories that
-were not named.
+Any service that enabled GRASP-06 on a tagged release through v2.1.2 should
+treat its hosted Git repositories as potentially containing unauthorized
+objects or refs until the full v3 integrity pass has completed and every
+reported exception has been resolved. Conforming Nostr Git clients that resolve
+refs from valid signed State, PR, and PR Update events are not expected to
+accept this unauthorized data; direct Git consumers do not have that
+protection. Passing a selected scope is useful validation evidence, but it does
+not clear repositories that were not named.
 
 These passes are non-blocking: the relay is online while they inspect and heal
 the migrated views. In the storage summary, an `unresolved` or `failed` count

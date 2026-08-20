@@ -82,11 +82,14 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   repositories accessible to the service. With GRASP-06 enabled, crafted PR
   submissions could also write Git objects and PR refs into another hosted
   repository without its maintainer authorization. Any deployment that enabled
-  GRASP-06 on a tagged build through v2.1.2 must treat hosted-repository
-  integrity as potentially compromised until it completes the v3 checks.
-  Operators must upgrade to v3.0.0. By default, every v3 startup runs a
-  non-blocking authorization-integrity pass that compares every served branch,
-  tag, `HEAD`, and `refs/nostr/*` ref with the
+  GRASP-06 on a tagged build through v2.1.2 should treat its hosted Git
+  repositories as potentially containing unauthorized objects or refs until it
+  completes the v3 integrity checks. Conforming Nostr Git clients that resolve
+  refs from valid signed State, PR, and PR Update events are not expected to
+  accept this unauthorized data; direct Git consumers do not have that
+  protection. Operators must upgrade to v3.0.0. By default, every v3 startup
+  runs a non-blocking authorization-integrity pass that compares every served
+  branch, tag, `HEAD`, and `refs/nostr/*` ref with the
   accepted State, PR, and PR Update events (including precisely scoped
   in-flight events). Owner-view PR refs require either confirmed-maintainer
   overlap with the target or an exact standard clone URL naming that owner and
