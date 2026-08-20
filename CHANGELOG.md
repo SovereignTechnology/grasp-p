@@ -7,15 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-08-20
+
 ### Summary
 
-Private Repos - via private grasp service (grasp-08) - initially self-hosted only but the intention is to allow providers to offer it as service.
+ngit-grasp 3.0.0 adds self-hosted private repositories through GRASP-08, with
+the protocol designed so hosting providers can offer managed private services
+later.
 
-Proactive Sync Plus (GRASP-03) - a big enabler for maintainer based moderation and simplier and more performant git nostr clients.
+Proactive Sync Plus (GRASP-03) enables maintainer-based moderation and simpler,
+more performant Nostr Git clients.
 
-Performance and Security fixes - along with other improvements; immediate upgrade recommended; some breaking changes make v2-v3 a one way street!
+This major release also includes significant security and performance fixes;
+an immediate upgrade is recommended. Its Git storage migration makes the
+v2-to-v3 upgrade one-way without restoring a pre-upgrade snapshot.
 
-Expect a bit of downtime as a git data migraiton is performed on startup. The largest grasp service relay.ngit.dev took 50mins.
+Plan for downtime while the first v3 startup migrates Git data. The largest
+GRASP service tested so far, `relay.ngit.dev`, took approximately 51 minutes.
 
 ### Breaking changes
 
@@ -563,7 +571,8 @@ defensive limits explicit and operator-configurable.
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.2...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.0...HEAD
+[3.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.2...v3.0.0
 [2.1.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.1...v2.1.2
 [2.1.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.0...v2.1.1
 [2.1.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.0.0...v2.1.0
