@@ -405,11 +405,14 @@ on remote servers.
 Authorization integrity is the second, view-scoped layer. It derives each
 owner's branch, tag, and `HEAD` set from the NIP-01-preferred accepted State
 event published by that owner's confirmed maintainer set. It derives
-`refs/nostr/<event-id>` from accepted PR and PR Update events using the same
-maintainer-overlap propagation rule as normal event processing. GRASP-06 views
-also require the signer and this relay's clone URL to name that exact
-submitter/identifier coordinate. Exactly scoped active purgatory entries are
-recognized so an in-flight push is not mistaken for corruption.
+`refs/nostr/<event-id>` from accepted PR and PR Update events when the same
+confirmed-maintainer overlap as normal event processing selects the view, or
+when an exact standard clone URL names that owner and identifier on this
+service. Foreign hosts, different coordinates, URL suffixes, and `/prs/` URLs
+cannot authorize a standard owner view. GRASP-06 views separately require the
+signer and this relay's clone URL to name that exact submitter/identifier
+coordinate. Exactly scoped active purgatory entries are recognized so an
+in-flight push is not mistaken for corruption.
 
 The pass creates or updates missing/wrong authorized refs once their objects
 are available, deletes stale State-governed branch and tag refs, and repairs

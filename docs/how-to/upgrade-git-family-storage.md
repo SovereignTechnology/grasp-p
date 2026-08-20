@@ -96,8 +96,11 @@ The authorization pass treats the accepted event database as authoritative:
 
 - the latest State event from the owner's confirmed maintainer set defines
   all and only `refs/heads/*`, `refs/tags/*`, and `HEAD`;
-- accepted PR and PR Update events define `refs/nostr/<event-id>` in every
-  owner view selected by the existing maintainer-overlap rules;
+- accepted PR and PR Update events define `refs/nostr/<event-id>` in an owner
+  view when either the confirmed-maintainer overlap selects that view or an
+  exact standard clone URL names that owner and identifier on this service;
+  foreign hosts, different coordinates, suffixes, and `/prs/` URLs do not
+  authorize the owner view;
 - a GRASP-06 contributor view additionally requires the event signer, clone
   URL, and repository identifier to match that exact `/prs/` coordinate;
 - precisely scoped active purgatory entries are tolerated as in-flight state.

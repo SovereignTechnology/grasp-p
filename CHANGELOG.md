@@ -88,7 +88,10 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   non-blocking authorization-integrity pass that compares every served branch,
   tag, `HEAD`, and `refs/nostr/*` ref with the
   accepted State, PR, and PR Update events (including precisely scoped
-  in-flight events). It repairs unambiguous differences and emits
+  in-flight events). Owner-view PR refs require either confirmed-maintainer
+  overlap with the target or an exact standard clone URL naming that owner and
+  identifier on the service; similar, foreign, and `/prs/` URLs do not count.
+  It repairs unambiguous differences and emits
   `manual_inspection=true` errors without deleting unexplained PR refs that
   may be evidence. GRASP-06 operators must check those logs and the terminal
   `Git authorization-integrity startup pass completed` summary; any non-zero
