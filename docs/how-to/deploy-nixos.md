@@ -1,0 +1,570 @@
+# Deploy ngit-grasp on NixOS
+
+**Purpose:** Deploy ngit-grasp to a production NixOS server
+**Difficulty:** Intermediate
+**Time:** 30-60 minutes
+
+This guide implements the shared
+[deployment contract](../reference/deployment-contract.md) with the repository's
+NixOS module. For another environment, return to the
+[deployment chooser](deploy.md).
+
+---
+
+## Problem
+
+You want to:
+- Deploy ngit-grasp to a NixOS server
+- Configure it as a systemd service
+- Set up reverse proxy (Caddy)
+- Ensure proper security and monitoring
+
+---
+
+## Prerequisites
+
+- NixOS server with SSH access
+- Flakes enabled on server and local machine
+- Domain name configured (DNS pointing to server)
+- Basic knowledge of NixOS configuration
+
+---
+
+## Solution
+
+### Step 1: Add ngit-grasp to Your Server's Flake
+
+In your server's `flake.nix`, add ngit-grasp as an input:
+
+```nix
+{
+  inputs = {
+    # Keep the nixpkgs input already used by this server configuration.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    ngit-grasp.url =
+      "git+https://gitnostr.com/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp.git";
+  };
+
+  outputs = { self, nixpkgs, ngit-grasp, ... }@inputs: {
+    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      specialArgs = { inherit inputs; };
+      modules = [
+        ./configuration.nix
+        # ... other modules
+      ];
+    };
+  };
+}
+```
+
+---
+
+### Step 2: Create Service Configuration
+
+Create a new file for your ngit-grasp service (e.g., `services/ngit-grasp.nix`):
+
+```nix
+{ inputs, ... }:
+
+{
+  imports = [ inputs.ngit-grasp.nixosModules.default ];
+
+  services.ngit-grasp.production = {
+    enable = true;
+    domain = "ngit.example.com";
+
+    # Network
+    bindAddress = "127.0.0.1";
+    port = 8082;
+    # Only Caddy can reach the loopback backend, so its forwarded client IP is trusted.
+    trustedProxyCidrs = [ "127.0.0.1/32" ];
+
+    # Storage
+    dataDir = "/persistent/ngit-grasp";
+
+    # Identity
+    relayName = "My GRASP Relay";
+    relayDescription = "A Rust GRASP implementation with proactive sync";
+    relayOwnerNsecFile = "/run/agenix/ngit-grasp-relay-owner-nsec";
+
+    # Sync - bootstrap from relay.ngit.dev
+    syncBootstrapRelayUrl = "wss://relay.ngit.dev";
+
+    # Metrics
+    metricsEnabled = true;
+
+    # Logging
+    logLevel = "info";
+  };
+
+  # Caddy reverse proxy
+  services.caddy.virtualHosts."ngit.example.com" = {
+    extraConfig = ''
+      reverse_proxy 127.0.0.1:8082 {
+        # Caddy manages X-Forwarded-For automatically.
+        header_up X-Real-IP {remote_host}
+      }
+    '';
+  };
+}
+```
+
+**Key configuration options:**
+
+- **Instance name** (`production`): Can be any name. Used for systemd service (`ngit-grasp-production`)
+- **domain**: Your relay's domain (used in GRASP validation)
+- **port**: Local port (use reverse proxy for HTTPS)
+- **trustedProxyCidrs**: Proxy source ranges allowed to supply the client IP
+  - Keep empty for a directly exposed listener
+  - Keep the backend private; trusting a public-facing source range permits spoofed headers
+  - Caddy automatically maintains `X-Forwarded-For`; `header_up`, not `header_down`,
+    changes headers sent to the backend
+- **dataDir**: Where git repos and database are stored
+- **relayOwnerNsecFile**: Path to file containing relay owner's nsec
+  - Passed to ngit-grasp as a protected systemd credential, not a process argument
+  - The runtime secret file must already exist (for example through agenix or sops-nix)
+  - Permissions on that external source file remain the operator or secret manager's responsibility
+  - Alternative: `relayOwnerNsec = "nsec1..."` (less secure, in nix store)
+  - If neither option is set, ngit-grasp loads or creates `.relay-owner.nsec` in `dataDir`
+- **syncBootstrapRelayUrl**: Bootstrap relay to sync from on startup
+
+See [nix/example-configuration.nix](../../nix/example-configuration.nix) for more examples.
+
+---
+
+### Step 3: Import the Service
+
+Import your service configuration in your main configuration file:
+
+```nix
+# In configuration.nix or services/default.nix
+{
+  imports = [
+    ./services/ngit-grasp.nix
+    # ... other services
+  ];
+}
+```
+
+---
+
+### Step 4: Update Flake Lock
+
+```bash
+cd /path/to/server/config
+nix flake update ngit-grasp
+git add flake.lock
+git commit -m "Add ngit-grasp and update flake.lock"
+```
+
+---
+
+### Step 5: Validate Configuration
+
+Before deploying, validate that the flake evaluates without starting its builds:
+
+```bash
+nix flake check --no-build
+```
+
+#### Resource-safe module validation
+
+Nix copies path-valued build inputs into the store when they are forced. A Git
+flake is materialized from its tracked files first, but a standalone path into a
+working tree does not inherit that Git filtering.
+
+This matters when testing ngit-grasp's NixOS module locally. Importing
+`nix/module.nix` is lazy by itself, but rendering an enabled service forces the
+module-built package through `ExecStart`. The package's `src = ../.` then
+resolves relative to that module. If the module was imported directly from a
+working tree, Nix may recursively hash or copy ignored `target/`, `.git`, and
+linked-worktree data while it appears to be evaluating the configuration.
+
+Use `inputs.ngit-grasp.nixosModules.default` from a Git-backed flake input, as
+shown above. For local module changes, commit them to a temporary Git branch and
+use that Git source, or replace `buildRustPackage` with a test stub that ignores
+all build attributes so `src` remains unforced. Do not use a direct
+working-tree module import for a test that enables an instance.
+
+Inspect the derivation plan before starting a build:
+
+```bash
+nixos-rebuild dry-build --flake .#your-hostname
+```
+
+Multiple ngit-grasp instances should normally share one ngit-grasp package
+derivation. Avoid service-level `ExecStart` overrides that force another flake
+package or Rust toolchain. If distinct versions are intentional, build them
+sequentially or on appropriately sized remote builders. For an initial local
+build, constrain Nix while confirming the plan behaves as expected:
+
+```bash
+nixos-rebuild build --flake .#your-hostname --max-jobs 1 --cores 2
+```
+
+---
+
+### Step 6: Deploy to Server
+
+Deploy the new configuration to your server:
+
+```bash
+# Build and switch in one command (builds on server)
+nixos-rebuild switch --flake .#your-hostname \
+  --target-host user@server.example.com \
+  --use-remote-sudo \
+  --build-host user@server.example.com
+```
+
+**Alternative:** Build locally, then deploy:
+
+```bash
+# Build locally
+nixos-rebuild build --flake .#your-hostname
+
+# Deploy to server
+nixos-rebuild switch --flake .#your-hostname \
+  --target-host user@server.example.com \
+  --use-remote-sudo
+```
+
+**Note:** Building locally requires your machine to trust the server's nix signing key.
+
+---
+
+### Step 7: Verify Deployment
+
+SSH to the server and check the service:
+
+```bash
+ssh user@server.example.com
+
+# Check service status
+systemctl status ngit-grasp-production
+
+# View recent logs
+journalctl -u ngit-grasp-production -n 50 --no-pager
+
+# Check if listening on port
+ss -tlnp | grep 8082
+```
+
+---
+
+### Step 8: Test Functionality
+
+From your local machine, test the relay:
+
+```bash
+# Test NIP-11 relay info
+curl https://ngit.example.com -H "Accept: application/nostr+json" | jq
+
+# Test WebSocket connection
+websocat wss://ngit.example.com
+# Then type: ["REQ","test",{}]
+# Should receive events
+
+# Test git clone (if you have repos)
+git ls-remote https://ngit.example.com/<npub>/<repo>.git
+```
+
+---
+
+## Configuration Options
+
+### Required
+- `enable` - Enable this instance
+- `domain` - Domain where relay is hosted
+
+### Network
+- `basePath` - Public URL mount path (default: `/`)
+- `bindAddress` - IP to bind to (default: "127.0.0.1")
+- `port` - Port to listen on (default: 7334)
+- `trustedProxyCidrs` - Proxy networks allowed to provide the WebSocket client
+  IP (default: empty; forwarded headers ignored)
+
+### Storage
+- `dataDir` - Base directory for data (default: /var/lib/ngit-grasp-{name})
+- `databaseBackend` - "lmdb" | "memory" (default: "lmdb")
+
+See [Upgrade Git family storage](upgrade-git-family-storage.md) before updating
+an existing instance to a release that enables identifier-family storage.
+
+### Identity
+- `relayName` - Relay name for NIP-11 (default: "{domain} grasp relay")
+- `relayDescription` - Relay description
+- `relayOwnerNsecFile` - Runtime secret file loaded as a systemd credential (recommended)
+- `relayOwnerNsec` - Inline nsec (less secure)
+
+### Sync
+- `syncBootstrapRelayUrl` - Bootstrap relay URL (optional)
+- `syncDisableNegentropy` - Disable NIP-77 negentropy (default: false)
+- `syncMaxBackoffSecs` - Max backoff for reconnection (default: 3600)
+- `syncDisconnectCheckIntervalSecs` - Check interval (default: 60)
+- `syncBaseBackoffSecs` - Base backoff time (default: 5)
+
+### Metrics
+- `metricsEnabled` - Enable `/metrics` below the configured base path (default: true)
+- `metricsConnectionPerIpAbuseThreshold` - Abuse threshold (default: 10)
+- `metricsTopNRepos` - Number of top repos to track (default: 10)
+
+### Logging
+- `logLevel` - "trace" | "debug" | "info" | "warn" | "error" (default: "info")
+
+### Security
+- `user` - User to run as (default: "ngit-grasp-{name}")
+- `group` - Group to run as (default: "ngit-grasp")
+
+See [nix/module.nix](../../nix/module.nix) for complete option definitions.
+
+---
+
+## Systemd Service
+
+The NixOS module creates a systemd service: `ngit-grasp-{instance-name}`
+
+```bash
+# Start/stop/restart
+systemctl start ngit-grasp-production
+systemctl stop ngit-grasp-production
+systemctl restart ngit-grasp-production
+
+# Enable/disable autostart
+systemctl enable ngit-grasp-production
+systemctl disable ngit-grasp-production
+
+# View logs
+journalctl -u ngit-grasp-production -f
+journalctl -u ngit-grasp-production --since "1 hour ago"
+
+# Check status
+systemctl status ngit-grasp-production
+```
+
+---
+
+## Multiple Instances
+
+You can run multiple instances on the same server:
+
+```nix
+services.ngit-grasp = {
+  production = {
+    enable = true;
+    domain = "ngit.example.com";
+    port = 8082;
+    dataDir = "/persistent/ngit-production";
+  };
+
+  staging = {
+    enable = true;
+    domain = "ngit-staging.example.com";
+    port = 8083;
+    dataDir = "/persistent/ngit-staging";
+    logLevel = "debug";
+  };
+};
+```
+
+Each instance:
+- Runs as separate systemd service: `ngit-grasp-production`, `ngit-grasp-staging`
+- Has its own user: `ngit-grasp-production`, `ngit-grasp-staging`
+- Stores data in separate directory
+- Can have different configuration
+
+---
+
+## Troubleshooting
+
+### Service won't start
+
+**Check logs:**
+```bash
+journalctl -u ngit-grasp-production -n 50
+```
+
+**Common issues:**
+- Port already in use: Check with `ss -tlnp | grep 8082`
+- Data directory permissions: Should be owned by service user
+- Invalid nsec file: Check file exists and contains valid nsec
+
+### Can't connect via WebSocket
+
+**Check:**
+- Service is running: `systemctl status ngit-grasp-production`
+- Firewall allows connections: `nix run nixpkgs#nmap -- -p 443 ngit.example.com`
+- Caddy is configured correctly: `systemctl status caddy`
+- DNS resolves: `dig ngit.example.com`
+
+### Sync not working
+
+**Check logs for sync errors:**
+```bash
+journalctl -u ngit-grasp-production | grep -i sync
+```
+
+**Common issues:**
+- Bootstrap relay URL incorrect or unreachable
+- Network connectivity issues
+- Bootstrap relay doesn't support negentropy (disable with `syncDisableNegentropy = true`)
+
+### High memory/CPU usage
+
+**Monitor metrics:**
+```bash
+curl http://localhost:8082/metrics
+```
+
+**Tune configuration:**
+- Reduce `metricsTopNRepos`
+- Increase `syncMaxBackoffSecs`
+- Tune `syncMaxBackoffSecs` for your network conditions
+
+---
+
+## Rollback
+
+If deployment fails, rollback to previous configuration:
+
+```bash
+# On the server
+nixos-rebuild switch --rollback
+
+# Or remotely
+nixos-rebuild switch --rollback \
+  --target-host user@server.example.com \
+  --use-remote-sudo
+```
+
+If the release changed on-disk storage, a NixOS generation rollback is not
+enough. Restore the matching pre-upgrade snapshot of the complete `dataDir`
+before starting the older service. See the
+[deployment contract](../reference/deployment-contract.md#upgrade-and-rollback).
+
+---
+
+## Upgrading
+
+To upgrade ngit-grasp:
+
+```bash
+# Update flake input
+nix flake update ngit-grasp
+
+# Review changes
+git diff flake.lock
+
+# Commit
+git add flake.lock
+git commit -m "Update ngit-grasp"
+
+# Deploy
+nixos-rebuild switch --flake .#your-hostname \
+  --target-host user@server.example.com \
+  --use-remote-sudo \
+  --build-host user@server.example.com
+```
+
+---
+
+## Security Hardening
+
+The NixOS module includes systemd hardening:
+
+- `NoNewPrivileges = true` - Prevents privilege escalation
+- `ProtectSystem = "strict"` - Read-only filesystem except dataDir
+- `ProtectHome = true` - No access to home directories
+- `PrivateTmp = true` - Private /tmp
+- `RestrictAddressFamilies` - Only allow needed network families
+
+Additional recommendations:
+
+1. **Use a runtime secret file instead of an inline key:**
+   ```nix
+   relayOwnerNsecFile = "/run/agenix/ngit-grasp-relay-owner-nsec";
+   # NOT: relayOwnerNsec = "nsec1...";  # Ends up in nix store!
+   ```
+
+   The module exposes the file to ngit-grasp as the `relay_owner_nsec`
+   systemd credential. The key does not appear in `ExecStart` or the process
+   command line. ngit-grasp does not modify the external source file; keep its
+   ownership and permissions restricted through your secret manager.
+
+2. **Restrict data directory permissions:**
+   ```bash
+   chmod 750 /persistent/ngit-grasp
+   chown ngit-grasp-production:ngit-grasp /persistent/ngit-grasp
+   ```
+
+3. **Use HTTPS (reverse proxy required):**
+   - ngit-grasp binds to localhost by default
+   - Use Caddy/nginx for TLS termination
+   - Caddy handles certificates automatically
+
+4. **Monitor logs regularly:**
+   ```bash
+   journalctl -u ngit-grasp-production --since today | grep -i error
+   ```
+
+---
+
+## Monitoring
+
+### Prometheus Metrics
+
+ngit-grasp exposes Prometheus metrics at `/metrics`:
+
+```bash
+curl http://localhost:8082/metrics
+```
+
+See [Prometheus Setup](./prometheus-setup.md) for complete monitoring guide.
+
+### Basic Health Checks
+
+```bash
+# Check if service is running
+systemctl is-active ngit-grasp-production
+
+# Check if port is listening
+nc -zv localhost 8082
+
+# Check relay info
+curl https://ngit.example.com -H "Accept: application/nostr+json"
+
+# Check disk usage
+du -sh /persistent/ngit-grasp/*
+```
+
+## Backup
+
+Back up the complete `dataDir`, including `.relay-owner.nsec`, `git/`, and
+`relay/`, from one point in time. For a portable consistent backup, stop the
+instance before taking the snapshot:
+
+```bash
+systemctl stop ngit-grasp-production
+# Snapshot or back up /persistent/ngit-grasp with the host's storage tooling.
+systemctl start ngit-grasp-production
+```
+
+Keep an off-host copy and test restoration into an isolated, non-public
+instance. Never start the restored copy alongside production with the same
+domain and relay identity.
+
+---
+
+## Related Documentation
+
+- [Configuration Reference](../reference/configuration.md) - All configuration options
+- [NixOS Module](../../nix/module.nix) - Module source code
+- [Example Configuration](../../nix/example-configuration.nix) - More examples
+- [Prometheus Setup](./prometheus-setup.md) - Monitoring guide
+- [Nix Flakes How-To](./nix-flakes.md) - Nix development environment
+- [Deployment Contract](../reference/deployment-contract.md) - Shared runtime and persistence rules
+- [Deployment Chooser](deploy.md) - Other supported environments
+
+---
+
+*Part of the [ngit-grasp how-to guides](./)*

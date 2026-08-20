@@ -868,47 +868,20 @@ Relax the write policy to accept all repository announcements regardless of clon
 
 ## Deployment
 
-### Single Binary
+The runtime remains one binary plus Git, but persistence, identity, proxying,
+and single-writer behavior are part of the production boundary. The normative
+[deployment contract](../reference/deployment-contract.md) owns those shared
+requirements.
 
-```bash
-cargo build --release
-NGIT_RELAY_OWNER_NSEC=nsec1... \
-  ./target/release/ngit-grasp --domain example.com
-```
+Supported artifacts are maintained alongside their operating guides:
 
-### Docker
+- the root `Dockerfile` and Compose configurations;
+- `deploy/systemd/ngit-grasp.service` for conventional Linux;
+- `nix/module.nix` for declarative NixOS instances; and
+- managed-host templates for single-instance deployments.
 
-```dockerfile
-FROM rust:1.75 as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/ngit-grasp /usr/local/bin/
-EXPOSE 7334
-CMD ["ngit-grasp"]
-```
-
-### Systemd
-
-```ini
-[Unit]
-Description=ngit-grasp GRASP server
-After=network.target
-
-[Service]
-Type=simple
-User=git
-WorkingDirectory=/opt/ngit-grasp
-EnvironmentFile=/opt/ngit-grasp/.env
-ExecStart=/usr/local/bin/ngit-grasp
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
+See the [deployment chooser](../how-to/deploy.md) rather than copying an
+illustrative container or service definition from this architecture document.
 
 ## Security Considerations
 
