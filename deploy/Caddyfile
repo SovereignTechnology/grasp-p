@@ -1,0 +1,3 @@
+{$NGIT_DOMAIN} {
+	reverse_proxy ngit-grasp:7334
+}

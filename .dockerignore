@@ -1,0 +1,11 @@
+.git
+.direnv
+.env
+.relay-owner.nsec
+data
+result
+result-*
+target
+work
+worktrees
+**/target
