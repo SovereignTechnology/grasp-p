@@ -16,11 +16,11 @@ A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized
 - **Relay Owner Identity**: Root-mounted relays serve `_@domain` through NIP-05; every deployment seeds a minimal bot profile and single-relay NIP-65 list and trusts service events signed by the relay owner
 - **Integrated Authorization**: Validates Git pushes against Nostr state events without requiring external hooks
 
-Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-relay)) which uses nginx + git-http-backend + pre-receive hooks + Khatru (Go), `ngit-grasp` provides a unified Rust service that handles both Git and Nostr protocols natively.
-
 ## Status
 
-**Production Ready** - Full GRASP-01 and GRASP-02 implementation with comprehensive test coverage.
+**Production Ready** - Full GRASP-01 and GRASP-02 support, default-on GRASP-03
+Sync+, and opt-in GRASP-05, GRASP-06, and GRASP-08 profiles with comprehensive
+test coverage.
 
 ## Key Features
 
@@ -28,13 +28,17 @@ Unlike the reference implementation ([ngit-relay](https://gitworkshop.dev/npub15
 - **Integrated Authorization**: Push validation happens inline during the Git receive-pack operation
 - **GRASP-01 Compliant**: Core service requirements for Git hosting with Nostr authorization
   - **Flexible Curation & Moderation**: Repository whitelists (GRASP-01 mode), repository blacklists (moderation), and event blacklists (author blocking)
-- **GRASP-02 Proactive Sync**: Sophisticated relay-to-relay event and git data synchronization
+- **GRASP-02 & GRASP-03 Sync**: Proactive repository sync plus Nostr outbox mailbox discovery
   - **NIP-77 Negentropy**: Efficient set reconciliation with automatic fallback to REQ+EOSE
   - **Live & Historic Sync**: Real-time event streaming plus catch-up for past events
+  - **Conversation Recovery**: Discovers accepted thread activity from participants' NIP-65 inboxes and outboxes
+  - **Bounded Discovery**: Sanitizes peer relay URLs, limits per-author mailbox selection, and falls back to operator-selected relays when necessary
   - **Smart Throttling**: Respectful rate limiting (5 concurrent, 30/min per domain) with exponential backoff
   - **Multi-Maintainer First-Class**: Internal sync of pushed git data across all maintainer repositories
   - **Intelligent Purgatory**: Auto-fetches missing git data from clone URLs when events arrive first
   - **Discovery-Driven**: Dynamically connects to relays listed in repository announcements
+- **GRASP-08 Private Services**: Optional service-wide NIP-42/NIP-98 authentication with private-to-private relay synchronization
+- **Identifier-Family Git Storage**: Deduplicates objects across owner and contributor views while keeping their refs and authorization isolated
 - **Deletion Lifecycle**: NIP-09 deletion requests, NIP-62 request-to-vanish, blacklist/whitelist parity, and service de-listing share one cascade/holding/archive/recovery path for related events and git data
 - **Developer-Friendly**: Built with modern Rust async patterns using tokio and actix-web
 
@@ -71,9 +75,11 @@ deletion/vanish requests for archival relays.
 
 See [Repository Lifecycle](docs/explanation/repository-lifecycle.md) for details.
 
-### Sophisticated Sync System (GRASP-02)
+### Sophisticated Sync System (GRASP-02 & GRASP-03)
 
-The proactive sync implementation is production-grade with advanced features:
+GRASP-02 provides proactive repository sync, while the default-on GRASP-03
+Sync+ overlay recovers related conversations from participants' Nostr
+mailboxes.
 
 **NIP-77 Negentropy with Intelligent Fallback:**
 
@@ -86,6 +92,15 @@ The proactive sync implementation is production-grade with advanced features:
 - **Layer 1**: Repository announcements and maintainer lists (connection-level)
 - **Layer 2**: Events tagging repositories (a/A/q tags, batched per 100 repos)
 - **Layer 3**: Events tagging root events (e/E/q tags, batched per 100 IDs)
+
+**NIP-65 Mailbox Discovery (GRASP-03):**
+
+- Discovers eligible owners, maintainers, root authors, and conversation participants through user-index relays and retained NIP-65 lists
+- Keeps accepted root-author inboxes in ordinary live/rotating coverage while probing broader participant mailboxes with thread-scoped historical queries
+- Probes owners' and maintainers' bounded inboxes for repository-scoped history on public instances, recovering roots and replies published away from repository relays
+- Uses operator-configured fallback relays when an eligible author has no accepted NIP-65 list
+- Sanitizes and canonicalizes peer relay URLs, with at most four selected relays per author and purpose
+- Reuses GRASP-02 connection pacing, subscription budgets, pagination, validation, and persistence
 
 **Connection Health Management:**
 
@@ -107,10 +122,15 @@ The proactive sync implementation is production-grade with advanced features:
 **First-Class Multi-Maintainer Support:**
 
 - Git data pushed to one maintainer's repo automatically syncs to all other maintainers
-- Shared object databases for storage efficiency (planned)
+- Identifier-family object storage shares Git objects across related owner and GRASP-06 contributor views
+- Thin repository views preserve independent refs, HEAD, and authorization while reusing family history
 - Seamless collaboration without manual coordination
 
-See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for full architectural details.
+See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) and
+[GRASP-03 Proactive Sync Plus](docs/explanation/grasp-03-proactive-sync-plus.md)
+for sync architecture, and
+[Identifier-Family Git Object Storage](docs/explanation/git-family-object-storage.md)
+for the shared storage model.
 
 ## GRASP Compliance
 
@@ -130,23 +150,31 @@ See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for f
 - ✅ **Purgatory**: Events without git data held for 30 minutes, auto-released when data arrives
 - ✅ **Deletion Lifecycle**: NIP-09/NIP-62 support with GRASP-aware cascade deletion, related git-data archival/removal, holding/archive recovery, and archival-relay disrespector mode
 
-### GRASP-02 (Proactive Sync) ✅
+### GRASP-02 & GRASP-03 (Proactive Sync and Sync+) ✅
 
-- ✅ **Relay Discovery**: Automatically connects to relays listed in repository announcements
-- ✅ **Event Sync**: Proactive sync from discovered relays using NIP-77 negentropy with REQ+EOSE fallback
+- ✅ **GRASP-02 Relay Discovery**: Automatically connects to relays listed in repository announcements
+- ✅ **GRASP-02 Event Sync**: Proactive sync from discovered relays using NIP-77 negentropy with REQ+EOSE fallback
   - Live subscriptions (`limit:0`) for real-time event streaming
   - Historic sync with automatic pagination for large result sets
   - Daily full reconciliation to detect drift
   - Connection health tracking with exponential backoff
-- ✅ **Git Data Sync**: Automatic fetching of missing git data from clone URLs
+- ✅ **GRASP-02 Git Data Sync**: Automatic fetching of missing git data from clone URLs
   - Smart timing: 3min delay for user events, 500ms for synced events
   - Respectful throttling: 5 concurrent requests, 30/min per domain
   - Round-robin fairness across repositories
   - Exponential backoff with fresh start on new events
-- ✅ **Multi-Maintainer Support**: Pushed git data automatically synced to all maintainer repositories
+- ✅ **GRASP-02 Multi-Maintainer Support**: Pushed git data automatically synced to all maintainer repositories
+- ✅ **GRASP-03 Mailbox Discovery**: Finds accepted conversation activity through eligible authors' NIP-65 read/write relays
+  - Default-on with an explicit opt-out and conditional NIP-11 advertisement
+  - Thread-scoped historic probes for accepted participants
+  - Repository-scoped historic probes for owners and maintainers on public instances
+  - Bounded recursive descendant discovery and per-author relay selection
+  - User-index discovery with operator-configured mailbox fallbacks
 - ✅ **Comprehensive Monitoring**: Prometheus metrics for sync health, bandwidth, and relay status
 
-**See**: [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) and [Purgatory Git Data Sync](docs/explanation/grasp-02-proactive-sync-purgatory-git-data.md)
+**See**: [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md),
+[GRASP-03 Proactive Sync Plus](docs/explanation/grasp-03-proactive-sync-plus.md),
+and [Purgatory Git Data Sync](docs/explanation/grasp-02-proactive-sync-purgatory-git-data.md)
 
 ### GRASP-05 (Archive) ✅
 
@@ -172,6 +200,21 @@ See [GRASP-02 Proactive Sync](docs/explanation/grasp-02-proactive-sync.md) for f
 **Disabled by default** — enable with `NGIT_GRASP06_ENABLE=true`. `/prs/` repos are isolated from proactive sync and repo listings; they are a submission side-channel, not first-class hosted repos.
 
 **See**: [Enable GRASP-06](docs/how-to/enable-grasp-06.md) and [GRASP-06 Design](docs/explanation/grasp-06-contributor-pr-submission.md)
+
+### GRASP-08 (Private Service) — opt-in
+
+- ✅ Requires NIP-42 authentication before a WebSocket session can read or publish events
+- ✅ Requires repository-scoped NIP-98 credentials for Git Smart HTTP requests
+- ✅ Uses a service-wide member set combining configured npubs with eligible accepted-relay owners
+- ✅ Preserves GRASP-01 maintainer authorization for repository writes
+- ✅ Supports authenticated private-to-private event and git-data sync while public instances avoid private peers
+- ✅ Keeps NIP-11, the root NIP-05 identity, the landing page, and the service icon public for discovery
+
+**Disabled by default** — enable with `NGIT_PRIVATE_MODE=true` and configure at
+least one `NGIT_PRIVATE_MEMBERS` entry. Private mode cannot be combined with
+GRASP-06 because the contributor endpoint is intentionally unauthenticated.
+
+**See**: [GRASP-08 Private Service Authentication](docs/explanation/grasp-08-private-service.md)
 
 ## Curation & Moderation
 
@@ -282,7 +325,7 @@ ngit-grasp implements multiple layers of defense against abuse, spam, and denial
 - **Archive whitelist** - Mirror specific repositories (GRASP-05 mode)
 - See [Curation & Moderation](#curation--moderation) section above for details
 
-**Relay Sync Protection (GRASP-02):**
+**Relay Sync Protection (GRASP-02 & GRASP-03):**
 - **Exponential backoff** - Failed connections: 5s → 10s → 20s → ... → 1 hour max
 - **Naughty list** - Suppress relays with infrastructure issues until expiry (12h default)
 - **Rate limit detection** - Auto 65s cooldown when remote relays rate limit us
@@ -302,25 +345,7 @@ ngit-grasp implements multiple layers of defense against abuse, spam, and denial
 
 **See**: [Defensive Measures](docs/explanation/defensive-measures.md) for complete details and future enhancements.
 
-## Roadmap
-
-### GRASP-02 Enhancements
-
-**Proactive Sync Plus:**
-
-- 🔄 Scan read/write relays of repo/PR/Patch/Issue authors for related comments
-- 🔄 Stricter anti-spam mechanisms for author relay events
-- 🔄 Periodic scanning of relays in User Grasp Lists for announcements listing our relay
-
-### Data Efficiency
-
-**Git Object Deduplication:**
-
-- 🔄 Shared object database across repositories
-- 🔄 Use `GIT_ALTERNATE_OBJECT_DIRECTORIES` or `.git/objects/info/alternates`
-- 🔄 Significant storage savings for multi-maintainer repositories
-
-### Monitoring & Observability
+## Monitoring & Observability
 
 ngit-grasp exposes comprehensive Prometheus metrics at `/metrics` for:
 
@@ -336,12 +361,13 @@ ngit-grasp exposes comprehensive Prometheus metrics at `/metrics` for:
 - Events received, stored, rejected by kind
 - Purgatory status (events waiting for git data)
 
-**Sync Health (GRASP-02):**
+**Sync Health (GRASP-02 & GRASP-03):**
 
 - Per-relay connection status and health states
 - Event sync rates and bandwidth
 - Git data fetch attempts and success rates
 - Domain throttling metrics
+- Fixed-cardinality Sync+ author, mailbox, cursor, and worker state
 
 **Configuration Options:**
 
@@ -354,6 +380,8 @@ ngit-grasp exposes comprehensive Prometheus metrics at `/metrics` for:
 **Privacy:** IP addresses are never exposed in metrics - only aggregate counts.
 
 See [Monitoring Overview](docs/explanation/monitoring.md) and [Prometheus Setup Guide](docs/how-to/prometheus-setup.md) for deployment.
+
+## Roadmap
 
 ### Deletion Lifecycle Follow-ups
 
@@ -371,14 +399,6 @@ Grasp servers can be DoS by pushing large amounts of git data to `refs/nostr/<ev
 ### Reject Commits with Secrets
 
 This a useful feature of other git servers.
-
-### Store all user grasp lists (for better grasp discovery)
-
-✅ **Implemented**: Kind 10317 (User Grasp List) events are now accepted and synced from all relays for better GRASP repository discovery.
-
-**Future enhancement**: We aspire to also accept and weekly sync kind 10002 (user relay lists) and kind 0 (user metadata) events, but only for authors of accepted events. This would require an additional state-driven layer 2 filter (see Roadmap in GRASP-02 Proactive Sync documentation).
-
-**Future enhancement**: should we periodically scan relays in UserGraspLists to check for announcements that list our relay?
 
 ## Technology Stack
 
@@ -472,16 +492,46 @@ passes the key through a protected systemd credential.
 | Trusted proxy CIDRs | `--trusted-proxy-cidrs`  | `NGIT_TRUSTED_PROXY_CIDRS`  | (empty; forwarded headers ignored)           |
 | Database backend    | `--database-backend`     | `NGIT_DATABASE_BACKEND`     | `lmdb`                                       |
 
-#### GRASP-02 Sync Settings
+#### GRASP-02 & GRASP-03 Sync Settings
 
-| Option                    | CLI Flag                                | Environment Variable                       | Default         |
-| ------------------------- | --------------------------------------- | ------------------------------------------ | --------------- |
-| Bootstrap relay           | `--sync-bootstrap-relay-url`            | `NGIT_SYNC_BOOTSTRAP_RELAY_URL`            | (optional)      |
-| Base backoff              | `--sync-base-backoff-secs`              | `NGIT_SYNC_BASE_BACKOFF_SECS`              | `5` seconds     |
-| Max backoff               | `--sync-max-backoff-secs`               | `NGIT_SYNC_MAX_BACKOFF_SECS`               | `3600` (1 hour) |
-| Disconnect check interval | `--sync-disconnect-check-interval-secs` | `NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS` | `60` seconds    |
-| Disable negentropy        | `--sync-disable-negentropy`             | `NGIT_SYNC_DISABLE_NEGENTROPY`             | `false`         |
-| Batch window              | N/A                                     | `NGIT_SYNC_BATCH_WINDOW_MS`                | `5000` ms       |
+| Option                     | CLI Flag                                | Environment Variable                       | Default               |
+| -------------------------- | --------------------------------------- | ------------------------------------------ | --------------------- |
+| Bootstrap relay            | `--sync-bootstrap-relay-url`            | `NGIT_SYNC_BOOTSTRAP_RELAY_URL`            | (optional)            |
+| Sync+ mailbox discovery    | `--sync-plus-enabled`                   | `NGIT_SYNC_PLUS_ENABLED`                   | `true`                |
+| User-index relays          | `--user-index-relays`                   | `NGIT_USER_INDEX_RELAYS`                   | 3 public indexes      |
+| Sync+ fallback relays      | `--sync-plus-fallback-relays`           | `NGIT_SYNC_PLUS_FALLBACK_RELAYS`           | 4 public relays       |
+| Recursive descendant limit | `--sync-recursive-descendant-limit`     | `NGIT_SYNC_RECURSIVE_DESCENDANT_LIMIT`     | `500`                 |
+| Allow non-global targets   | `--sync-allow-non-global-targets`       | `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`       | `false`               |
+| Base backoff               | `--sync-base-backoff-secs`              | `NGIT_SYNC_BASE_BACKOFF_SECS`              | `5` seconds           |
+| Max backoff                | `--sync-max-backoff-secs`               | `NGIT_SYNC_MAX_BACKOFF_SECS`               | `3600` (1 hour)       |
+| Disconnect check interval  | `--sync-disconnect-check-interval-secs` | `NGIT_SYNC_DISCONNECT_CHECK_INTERVAL_SECS` | `60` seconds          |
+| Disable negentropy         | `--sync-disable-negentropy`             | `NGIT_SYNC_DISABLE_NEGENTROPY`             | `false`               |
+
+**GRASP-02/03 Sync Notes:**
+
+- **Sync+**: Enabled by default. It discovers eligible authors' accepted NIP-65 relay lists and adds bounded mailbox coverage on top of GRASP-02. Disable it to retain ordinary proactive sync without advertising GRASP-03.
+- **User-index relays**: Default to `wss://purplepag.es`, `wss://index.hzrd149.com`, and `wss://indexer.coracle.social` for relay-owner identity publication and eligible-author NIP-65 discovery.
+- **Fallback relays**: Default to `wss://relay.ditto.pub`, `wss://relay.damus.io`, `wss://nos.lol`, and `wss://relay.primal.net` when a successful user-index lookup finds no accepted NIP-65 list.
+- **Recursive descendant limit**: Bounds the query frontier below each event that directly tags a repository root; direct root-tagging events do not consume the allowance.
+- **Outbound target safety**: Event-provided relay and clone targets must be globally reachable by default. Only enable non-global targets for tests or closed development networks.
+- **Bootstrap relay**: Optional starting point for relay discovery. The system automatically discovers additional relays from repository announcements; a missing URL scheme defaults to `wss://`.
+- **Backoff settings**: Control exponential reconnection backoff (`base * 2^(failures-1)`, capped at max).
+- **Negentropy**: Can be disabled to exercise the REQ+EOSE fallback path.
+
+#### GRASP-08 Private Service Settings
+
+| Option                | CLI Flag                 | Environment Variable        | Default                        |
+| --------------------- | ------------------------ | --------------------------- | ------------------------------ |
+| Private mode          | `--private-mode`         | `NGIT_PRIVATE_MODE`         | `false`                        |
+| Permanent members     | `--private-members`      | `NGIT_PRIVATE_MEMBERS`      | (required in private mode)     |
+| Canonical Git origin  | `--private-public-origin` | `NGIT_PRIVATE_PUBLIC_ORIGIN` | inferred from `NGIT_DOMAIN`    |
+
+Private mode is a service-wide read boundary: every WebSocket session uses
+NIP-42 and every Git Smart HTTP request uses the GRASP-08 repository-scoped
+NIP-98 profile. Membership grants read access, while GRASP-01 still determines
+who may push. See the
+[configuration reference](docs/reference/configuration.md#grasp-08-private-service)
+for deployment constraints and reverse-proxy guidance.
 
 #### Curation & Moderation Settings
 
@@ -502,13 +552,6 @@ passes the key through a protected systemd credential.
 | Holding retention             | `--holding-retention-secs`        | `NGIT_HOLDING_RETENTION_SECS`        | `7776000` (90 days) |
 | Holding cleanup interval      | `--holding-cleanup-interval-secs` | `NGIT_HOLDING_CLEANUP_INTERVAL_SECS` | `86400` (1 day)     |
 | Blacklist auto-restore        | `--blacklist-auto-restore`        | `NGIT_BLACKLIST_AUTO_RESTORE`        | `false`             |
-
-**Sync Notes:**
-
-- **Bootstrap relay**: Optional starting point for relay discovery. System automatically discovers additional relays from repository announcements. URL scheme is optional - if not provided, `wss://` is assumed (e.g., `git.shakespeare.diy` → `wss://git.shakespeare.diy`).
-- **Backoff settings**: Controls exponential backoff for failed connections (`base * 2^(failures-1)`, capped at max).
-- **Negentropy**: Can be disabled for testing REQ+EOSE fallback behavior.
-- **Batch window**: Self-subscriber batches events for this duration before triggering sync filters.
 
 ### Database Backends
 
@@ -660,7 +703,7 @@ ngit-grasp/
 │   │       ├── state.rs     # State event validation + ref alignment
 │   │       ├── pr_event.rs  # PR/PR Update validation
 │   │       └── related.rs   # Forward/backward reference checking
-│   ├── sync/                # GRASP-02 Proactive Sync (relay-to-relay)
+│   ├── sync/                # GRASP-02/03 proactive sync and mailbox discovery
 │   │   ├── mod.rs           # SyncManager, main loop, data structures
 │   │   ├── algorithms.rs    # derive_relay_targets(), compute_actions()
 │   │   ├── filters.rs       # 3-layer filter building (announcements, repos, events)
@@ -689,7 +732,7 @@ ngit-grasp/
 │       ├── bandwidth.rs     # Bandwidth tracking
 │       └── connection.rs    # Connection tracking
 ├── docs/                    # Documentation (Diátaxis framework)
-│   ├── explanation/         # Architecture, decisions, GRASP-02 deep-dives
+│   ├── explanation/         # Architecture, decisions, and GRASP deep-dives
 │   ├── how-to/              # Deployment, configuration guides
 │   ├── tutorials/           # Getting started, first steps
 │   └── reference/           # API docs, test strategy
@@ -698,30 +741,11 @@ ngit-grasp/
 └── README.md
 ```
 
-## Comparison with ngit-relay
-
-| Feature             | ngit-relay (Go)                           | ngit-grasp (Rust)                                    |
-| ------------------- | ----------------------------------------- | ---------------------------------------------------- |
-| Language            | Go                                        | Rust                                                 |
-| Components          | nginx + git-http-backend + hooks + Khatru | Single integrated binary                             |
-| Authorization       | Pre-receive Git hook                      | Inline during receive-pack                           |
-| GRASP-01            | ✅ Complete                               | ✅ Complete                                          |
-| GRASP-02 Event Sync | ✅ Limited                                | ✅ Advanced (NIP-77 negentropy + fallback)           |
-| GRASP-02 Git Sync   | ✅ Basic                                  | ✅ Automatic purgatory hunting                       |
-| GRASP-06 PR Submit  | ❌                                        | ✅ Opt-in (`NGIT_GRASP06_ENABLE`)                   |
-| Multi-Maintainer    | ✅ Supported                              | ✅ First-class (auto-sync across repos)              |
-| Purgatory           | ✅ 24-hour expiry                         | ✅ 30-minute expiry + proactive git data fetching    |
-| Health Tracking     | Basic                                     | Advanced (exponential backoff, rate limit detection) |
-| Deployment          | Docker + supervisord                      | Single binary                                        |
-| Testing             | Go tests + shell scripts                  | Rust unit + integration tests                        |
-| Performance         | Good                                      | Excellent (zero-copy, async)                         |
-| Monitoring          | Basic logs                                | Comprehensive Prometheus metrics                     |
-
 ## Contributing
 
 Contributions welcome! Please:
 
-1. Read [docs/explanation/architecture.md](docs/ARCHITECTURE.md)
+1. Read [the architecture overview](docs/explanation/architecture.md)
 2. Open an issue to discuss major changes
 3. Follow Rust conventions and run `cargo fmt` + `cargo clippy`
 4. Add tests for new functionality
@@ -730,15 +754,17 @@ Contributions welcome! Please:
 
 MIT License - see [LICENSE](LICENSE) for details
 
-## Related Projects
+## Sister Projects
+
+- [ngit](https://gitworkshop.dev/danconwaydev.com/ngit) - CLI and Git remote helper for collaborating on repositories over Nostr
+- [ngit-ci](https://gitworkshop.dev/danconwaydev.com/ngit-ci) - Self-hosted CI that watches Nostr Git repositories and publishes signed results
+
+## Related Specifications
 
 - [GRASP Protocol](https://gitworkshop.dev/danconwaydev.com/grasp) - Protocol specification
-- [ngit-relay](https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-relay) - Reference implementation in Go
-- [ngit](https://gitworkshop.dev/ngit) - Nostr Git plugin for git CLI
 - [NIP-34](https://nips.nostr.com/34) - Git Stuff (Nostr protocol)
 
 ## Acknowledgments
 
-- Reference implementation by [@DanConwayDev](https://gitworkshop.dev/danconwaydev.com)
 - [rust-nostr](https://github.com/rust-nostr/nostr) team for excellent Nostr libraries
 - Git community for the Smart HTTP protocol
