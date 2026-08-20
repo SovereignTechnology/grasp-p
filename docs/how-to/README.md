@@ -24,21 +24,6 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 
 ## Available How-To Guides
 
-### [Release ngit-grasp](release.md)
-
-**Problem:** Publish and deploy a versioned release across every supported channel
-**Difficulty:** Advanced
-
-**You'll learn:**
-
-- Prepare and validate release metadata
-- Publish immutable Nostr tags and verify ngit-ci artifacts
-- Reconcile the GitHub mirror and decide the crates.io policy
-- Avoid confusing ngit-grasp with the archived ngit-relay container
-- Roll out the one-way v3 migration safely
-
----
-
 ### [Upgrade from v2 to v3 Git family storage](upgrade-git-family-storage.md)
 
 **Problem:** Perform the one-way identifier-family storage migration safely
