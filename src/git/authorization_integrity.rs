@@ -10,7 +10,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
-use nostr_sdk::prelude::{Event, EventId, FromBech32, PublicKey, ToBech32};
+use nostr::types::url::Url;
+use nostr_sdk::prelude::{Event, EventId, FromBech32, Kind, PublicKey, ToBech32};
 use tracing::{error, info, warn};
 
 use super::authorization::{compute_membership, extract_commit_tag, RepositoryData};
@@ -705,12 +706,18 @@ fn event_applies_to_view(
     service_address: Option<&str>,
 ) -> bool {
     match identity {
-        ViewIdentity::Owner { .. } => {
+        ViewIdentity::Owner { pubkey } => {
             let tagged = tagged_owners(event, identifier);
             maintainers.is_some_and(|maintainers| {
                 maintainers
                     .iter()
                     .any(|maintainer| tagged.contains(maintainer))
+            }) || service_address.is_some_and(|service| {
+                standard_clone_coordinates(event, service).iter().any(
+                    |(clone_owner, clone_identifier)| {
+                        clone_owner == pubkey && clone_identifier == identifier
+                    },
+                )
             })
         }
         ViewIdentity::Prs { submitter } => {
@@ -758,7 +765,71 @@ fn event_relevant_to_identifier(
             crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(event, domain)
                 .iter()
                 .any(|candidate| candidate == identifier)
+                || standard_clone_coordinates(event, domain)
+                    .iter()
+                    .any(|(_, candidate)| candidate == identifier)
         })
+}
+
+/// Return exact owner-view coordinates named by a PR event's standard clone URLs.
+///
+/// The configured service may include a mount path. URLs must use HTTP(S),
+/// match that authority and mount exactly, contain no credentials/query/fragment,
+/// and end at the canonical `/<npub>/<identifier>.git` repository root.
+fn standard_clone_coordinates(event: &Event, service: &str) -> Vec<(PublicKey, String)> {
+    if !matches!(
+        event.kind,
+        Kind::GitPullRequest | Kind::GitPullRequestUpdate
+    ) {
+        return Vec::new();
+    }
+
+    let mut coordinates = Vec::new();
+    for tag in event.tags.iter() {
+        let values = tag.as_slice();
+        if values.first().map(String::as_str) != Some("clone") {
+            continue;
+        }
+        for raw_url in values.iter().skip(1) {
+            if let Some(coordinate) = standard_clone_coordinate(raw_url, service) {
+                if !coordinates.contains(&coordinate) {
+                    coordinates.push(coordinate);
+                }
+            }
+        }
+    }
+    coordinates
+}
+
+fn standard_clone_coordinate(raw_url: &str, service: &str) -> Option<(PublicKey, String)> {
+    let url = Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !crate::outbound::url_matches_service_domain(raw_url, service)
+    {
+        return None;
+    }
+
+    let configured = service.trim().trim_end_matches('/');
+    let configured = if configured.contains("://") {
+        configured.to_owned()
+    } else {
+        format!("http://{configured}")
+    };
+    let service_url = Url::parse(&configured).ok()?;
+    let service_path = service_url.path().trim_end_matches('/');
+    let repository_path = if service_path.is_empty() {
+        url.path()
+    } else {
+        url.path()
+            .strip_prefix(service_path)
+            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))?
+    };
+    let (npub, identifier) = super::parse_repository_root_url(repository_path)?;
+    Some((PublicKey::from_bech32(&npub).ok()?, identifier))
 }
 
 fn placeholder_applies_to_view(
@@ -1501,5 +1572,96 @@ mod tests {
             Some(&pr_commit)
         );
         assert_eq!(expectation.pr_refs.len(), 1);
+    }
+
+    #[test]
+    fn owner_view_accepts_only_its_exact_standard_clone_endpoint() {
+        let source_owner = Keys::generate();
+        let target_owner = Keys::generate();
+        let other_owner = Keys::generate();
+        let source_npub = source_owner.public_key().to_bech32().unwrap();
+        let other_npub = other_owner.public_key().to_bech32().unwrap();
+        let identity = ViewIdentity::Owner {
+            pubkey: source_owner.public_key(),
+        };
+        let maintainers = vec![source_owner.public_key().to_hex()];
+        let target = format!(
+            "30617:{}:upstream-project",
+            target_owner.public_key().to_hex()
+        );
+        let matching_url = format!("https://relay.example/grasp/{source_npub}/source-project.git");
+        let event_with_clone = |url: String| {
+            EventBuilder::new(Kind::GitPullRequest, "")
+                .tags([
+                    Tag::custom("a", [target.clone()]),
+                    Tag::custom("c", ["1".repeat(40)]),
+                    Tag::custom("clone", [url]),
+                ])
+                .finalize(&source_owner)
+                .unwrap()
+        };
+
+        let matching = event_with_clone(matching_url.clone());
+        assert!(event_applies_to_view(
+            &matching,
+            &identity,
+            "source-project",
+            Some(&maintainers),
+            Some("relay.example/grasp"),
+        ));
+        assert!(event_relevant_to_identifier(
+            &matching,
+            "source-project",
+            Some("relay.example/grasp"),
+        ));
+
+        let rejected_urls = [
+            format!("https://relay.example/grasp/{other_npub}/source-project.git"),
+            format!("https://relay.example/grasp/{source_npub}/other-project.git"),
+            format!("https://other.example/grasp/{source_npub}/source-project.git"),
+            format!("{matching_url}?download=1"),
+            format!("{matching_url}#fragment"),
+            format!("{matching_url}/info/refs"),
+            format!("https://relay.example/grasp/prs/{source_npub}/source-project.git"),
+        ];
+        for url in rejected_urls {
+            let event = event_with_clone(url.clone());
+            assert!(
+                !event_applies_to_view(
+                    &event,
+                    &identity,
+                    "source-project",
+                    Some(&maintainers),
+                    Some("relay.example/grasp"),
+                ),
+                "unexpectedly accepted {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_view_retains_base_repository_a_tag_authorization() {
+        let owner = Keys::generate();
+        let submitter = Keys::generate();
+        let event = EventBuilder::new(Kind::GitPullRequestUpdate, "")
+            .tags([
+                Tag::custom(
+                    "a",
+                    [format!("30617:{}:project", owner.public_key().to_hex())],
+                ),
+                Tag::custom("c", ["2".repeat(40)]),
+            ])
+            .finalize(&submitter)
+            .unwrap();
+
+        assert!(event_applies_to_view(
+            &event,
+            &ViewIdentity::Owner {
+                pubkey: owner.public_key(),
+            },
+            "project",
+            Some(&[owner.public_key().to_hex()]),
+            Some("relay.example"),
+        ));
     }
 }
