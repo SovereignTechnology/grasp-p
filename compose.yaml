@@ -1,0 +1,46 @@
+name: ngit-grasp
+
+services:
+  ngit-grasp:
+    build:
+      context: .
+      args:
+        NGIT_BUILD_REVISION: "${NGIT_BUILD_REVISION:-unknown}"
+        NGIT_IMAGE_REVISION: "${NGIT_IMAGE_REVISION:-unknown}"
+        NGIT_IMAGE_VERSION: "${NGIT_IMAGE_VERSION:-dev}"
+    image: "${NGIT_IMAGE:-ngit-grasp:local}"
+    restart: unless-stopped
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      NGIT_DOMAIN: "${NGIT_DOMAIN:?copy deploy.env.example to .env and set NGIT_DOMAIN}"
+      NGIT_BASE_PATH: "${NGIT_BASE_PATH:-/}"
+      NGIT_LOG_LEVEL: "${NGIT_LOG_LEVEL:-info}"
+    ports:
+      - "127.0.0.1:${NGIT_HOST_PORT:-7334}:7334"
+    volumes:
+      - ngit-grasp-data:/data
+    networks:
+      - backend
+    stop_grace_period: 5m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --header 'Accept: application/nostr+json'
+          "http://127.0.0.1:7334$${NGIT_BASE_PATH:-/}" >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  ngit-grasp-data:
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: "${NGIT_COMPOSE_SUBNET:-172.30.73.0/24}"

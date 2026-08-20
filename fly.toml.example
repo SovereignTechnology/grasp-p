@@ -1,0 +1,42 @@
+# Copy this file to fly.toml, then change the app, primary_region, and
+# NGIT_DOMAIN values before creating the Fly app.
+app = "replace-with-a-unique-ngit-grasp-name"
+primary_region = "ord"
+kill_signal = "SIGTERM"
+kill_timeout = 300
+
+[build]
+dockerfile = "Dockerfile"
+
+[env]
+NGIT_DOMAIN = "ngit.example.com"
+NGIT_BASE_PATH = "/"
+NGIT_BIND_ADDRESS = "0.0.0.0:7334"
+NGIT_GIT_DATA_PATH = "/data/git"
+NGIT_RELAY_DATA_PATH = "/data/relay"
+NGIT_LOG_LEVEL = "info"
+
+[deploy]
+strategy = "immediate"
+
+[http_service]
+internal_port = 7334
+force_https = true
+auto_stop_machines = "off"
+auto_start_machines = true
+min_machines_running = 1
+
+[[http_service.checks]]
+grace_period = "30s"
+interval = "30s"
+method = "GET"
+timeout = "5s"
+path = "/"
+
+[[mounts]]
+source = "ngit_grasp_data"
+destination = "/data"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "1gb"

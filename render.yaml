@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ngit-grasp
+    runtime: docker
+    plan: starter
+    autoDeployTrigger: off
+    healthCheckPath: /
+    maxShutdownDelaySeconds: 300
+    disk:
+      name: ngit-grasp-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      - key: NGIT_DOMAIN
+        sync: false
+      - key: NGIT_BASE_PATH
+        value: /
+      - key: NGIT_LOG_LEVEL
+        value: info

@@ -406,9 +406,22 @@ This a useful feature of other git servers.
 
 ## Quick Start
 
-Tagged releases provide a statically linked x86_64 Linux archive accompanied
-by `SHA256SUMS`. The archive can be installed without a Rust or Nix toolchain;
-on a Linux flake system, build the same output with `nix build .#static`.
+For production, start with the [deployment chooser](docs/how-to/deploy.md).
+The repository ships Docker and Compose configurations, a NixOS module, a
+hardened systemd unit, and templates for selected managed hosts. All supported
+paths preserve the same
+[deployment contract](docs/reference/deployment-contract.md).
+
+The shortest fresh-VPS path uses Docker Compose and Caddy:
+
+```bash
+cp deploy.env.example .env
+# Set NGIT_DOMAIN in .env and point DNS at this server.
+docker compose -f compose.yaml -f compose.caddy.yaml up --build -d
+scripts/verify-deployment.sh https://ngit.example.com
+```
+
+For development from source:
 
 ```bash
 # install ngit
@@ -443,7 +456,9 @@ nix develop -c cargo test --lib
 - Purgatory system activates, ready to hunt for missing git data
 - Prometheus metrics exposed at `<base-path>/metrics`
 
-**Don't have Nix?** See [Getting Started Tutorial](docs/tutorials/getting-started.md) for alternative setup methods.
+**Don't have Nix?** Use the container path above or see the
+[Getting Started Tutorial](docs/tutorials/getting-started.md) for development
+alternatives.
 
 ## Configuration
 

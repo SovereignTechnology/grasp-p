@@ -24,6 +24,18 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 
 ## Available How-To Guides
 
+### [Deploy ngit-grasp](deploy.md)
+
+**Problem:** Run a durable production relay in a supported hosting environment
+
+**You'll learn:**
+
+- Choose Docker, NixOS, systemd Linux, Proxmox, or managed hosting
+- Preserve the relay identity, Git repositories, and LMDB state
+- Configure TLS, verify protocols, back up, and upgrade safely
+
+---
+
 ### [Upgrade from v2 to v3 Git family storage](upgrade-git-family-storage.md)
 
 **Problem:** Perform the one-way identifier-family storage migration safely
@@ -63,18 +75,6 @@ How-to guides are **recipes** that show you how to solve specific problems or ac
 ---
 
 ## Planned How-To Guides
-
-### Deploy ngit-grasp
-**Status:** 🔜 Planned (waiting for main server)
-
-**Problem:** Deploy to production  
-**You'll learn:**
-- Server requirements
-- Reverse proxy setup (nginx/Caddy)
-- SSL/TLS configuration
-- Monitoring and logging
-
----
 
 ### Run Compliance Tests
 **Status:** 🔜 Planned

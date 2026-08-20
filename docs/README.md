@@ -36,7 +36,8 @@ WORKING       │  How-To        │    Reference     │
 **For:** Users with basic knowledge solving real problems  
 **Style:** Practical recipes and solutions
 
-- **[Deploy ngit-grasp](how-to/deploy.md)** - Production deployment guide
+- **[Deploy ngit-grasp](how-to/deploy.md)** - Choose Docker, NixOS, Linux, Proxmox, or managed hosting
+- **[Deployment contract](reference/deployment-contract.md)** - Shared runtime and persistence requirements
 - **[Configure Nix Flakes](how-to/nix-flakes.md)** - Nix development environment
 - **[Run Compliance Tests](how-to/test-compliance.md)** - GRASP compliance testing
 - **[Upgrade nostr-sdk](how-to/upgrade-nostr-sdk.md)** - Handling SDK upgrades
@@ -74,8 +75,8 @@ WORKING       │  How-To        │    Reference     │
 
 ### I want to deploy ngit-grasp
 1. Review [Configuration Reference](reference/configuration.md)
-2. Follow [Deployment How-To](how-to/deploy.md)
-3. Set up monitoring and backups
+2. Choose an environment in [Deploy ngit-grasp](how-to/deploy.md)
+3. Verify the deployment and test its backup
 
 ### I want to develop on ngit-grasp
 1. Follow [Getting Started Tutorial](tutorials/getting-started.md)

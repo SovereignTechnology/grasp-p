@@ -59,7 +59,7 @@ forces `ExecStart`, which coerces `src = ../.`; a standalone local path is not
 Git-filtered and may hash or copy ignored `target/` and worktree data. Use the
 Git-backed flake module, or a builder stub that ignores all build attributes and
 keeps `src` lazy. See
-[`docs/how-to/deploy.md`](docs/how-to/deploy.md#resource-safe-module-validation)
+[`docs/how-to/deploy-nixos.md`](docs/how-to/deploy-nixos.md#resource-safe-module-validation)
 for resource-safe validation and deployment.
 
 ### Testing ngit-grasp (Main Project)

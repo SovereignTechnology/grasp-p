@@ -2,7 +2,8 @@
 # 
 # Usage:
 #   1. Add to your server's flake.nix inputs:
-#      inputs.ngit-grasp.url = "github:DanConwayDev/ngit-grasp";
+#      inputs.ngit-grasp.url =
+#        "git+https://gitnostr.com/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp.git";
 #
 #   2. Import the module in your configuration:
 #      imports = [ inputs.ngit-grasp.nixosModules.default ];

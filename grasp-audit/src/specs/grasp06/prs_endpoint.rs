@@ -699,7 +699,7 @@ fn git_push(cwd: &Path, url: &str, refname: &str) -> std::io::Result<std::proces
 ///
 /// Spec-correct rejection looks like:
 /// - exit non-zero, AND
-/// - stderr does NOT contain `not found` / `Not Found` / similar 404 hints.
+/// - stderr does not contain a transport-specific missing-repository message.
 ///
 /// In practice this means the rejection came from `git-receive-pack` on the
 /// server side (typically an `ERR` pkt-line such as
@@ -717,10 +717,7 @@ fn check_push_rejected_not_404(cwd: &Path, url: &str, refname: &str) -> Result<(
     }
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Match git's two common 404 phrasings. `to_lowercase` keeps it robust to
-    // future git releases tweaking capitalisation; the substrings are stable.
-    let lower = stderr.to_lowercase();
-    if lower.contains("not found") || lower.contains("404") {
+    if stderr_indicates_missing_prs_endpoint(&stderr) {
         return Err(format!(
             "Push to {} (ref={}) failed with a 404 — the /prs/ endpoint is not implemented. \
              GRASP-06 06.md line 11 requires the endpoint to be reachable as an empty bare \
@@ -733,4 +730,40 @@ fn check_push_rejected_not_404(cwd: &Path, url: &str, refname: &str) -> Result<(
     }
 
     Ok(())
+}
+
+/// Recognize Git's missing-smart-HTTP-endpoint diagnostics without treating
+/// arbitrary `404` digits in an echoed URL as an HTTP status.
+fn stderr_indicates_missing_prs_endpoint(stderr: &str) -> bool {
+    stderr.to_lowercase().lines().any(|line| {
+        let line = line.trim();
+        line.contains("requested url returned error: 404")
+            || line == "remote: repository not found."
+            || (line.starts_with("fatal: repository ") && line.ends_with(" not found"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stderr_indicates_missing_prs_endpoint;
+
+    #[test]
+    fn missing_endpoint_detection_accepts_git_transport_diagnostics() {
+        for stderr in [
+            "fatal: unable to access 'https://example.test/repo.git/': The requested URL returned error: 404",
+            "fatal: repository 'https://example.test/repo.git/' not found",
+            "remote: Repository not found.",
+        ] {
+            assert!(stderr_indicates_missing_prs_endpoint(stderr), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn missing_endpoint_detection_ignores_404_digits_in_rejection_url() {
+        let stderr = "remote: ERR GRASP-06: only pushes to refs/nostr/<event-id> are accepted\n\
+fatal: the remote end hung up unexpectedly\n\
+error: failed to push some refs to 'http://127.0.0.1/prs/npub/audit-probe-6218-404b.git'";
+
+        assert!(!stderr_indicates_missing_prs_endpoint(stderr));
+    }
 }

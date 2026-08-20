@@ -24,6 +24,13 @@ Reference documentation provides **factual, technical information** that you loo
 
 ## Available Reference Documentation
 
+### [Deployment Contract](deployment-contract.md)
+
+Shared process, endpoint, persistence, identity, backup, single-writer, health,
+and upgrade requirements for every supported hosting environment.
+
+---
+
 ### [Configuration](configuration.md)
 **Complete reference for all configuration options**
 
