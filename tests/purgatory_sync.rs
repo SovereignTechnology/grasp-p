@@ -940,7 +940,7 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
     let mock_relay = MockRelay::start().await;
 
     // 3. git_server - SmartGitServer with PR commit only
-    //    Using SmartGitServer because purgatory sync uses `git fetch --depth=1`
+    //    Using SmartGitServer because this fixture exercises smart HTTP fetches
     //    which requires the Git Smart HTTP protocol (not dumb HTTP)
     let git_server = SmartGitServer::start(repo_b.path()).await;
 

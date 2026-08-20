@@ -122,9 +122,42 @@ Only the second command applies safe fixes. Re-run the check-only command after
 repair; `repair_needed`, `manual_inspection`, and `failed` must all be zero for
 that identifier to be considered clean.
 
-A retained backup protects an unhealthy family's legacy data, and a legacy
-shallow view continues serving at its pre-upgrade level rather than being made
-less usable.
+A retained backup protects an unhealthy family's legacy data. A non-zero
+`shallow_views` count identifies the marked depth-one fallback used only by a
+seven-day untagged development interval; no tagged v1 or v2 release shipped
+that behavior. Do not attribute an unmarked `missing_oids` result to that bug.
+It means the incomplete graph predated the v3 conversion, but its exact origin
+cannot be inferred from the missing object alone. Earlier manual copies or data
+migrations, an incomplete source, and other legacy storage damage can have the
+same result.
+
+### Recover an unresolved object graph
+
+Automatic repair can only use objects available from the accepted clone URLs.
+If all announced servers inherited the same gap, ask a maintainer with a
+known-complete local clone to run the following, substituting the OIDs from the
+relay's `ERROR` log:
+
+```bash
+git fsck --full
+git cat-file -e '<missing-oid>^{commit}'
+git cat-file -e '<child-oid>^{commit}'
+git cat-file -p '<child-oid>'
+git update-ref refs/integrity-repair/<child-short-id> '<child-oid>'
+git bundle create repository-integrity-repair.bundle \
+  refs/integrity-repair/<child-short-id>
+git update-ref -d refs/integrity-repair/<child-short-id>
+git bundle verify repository-integrity-repair.bundle
+sha256sum repository-integrity-repair.bundle
+```
+
+The `fsck` and both `cat-file` checks must succeed. Transfer the bundle and its
+SHA-256 digest through agreed channels; an ordinary push or `ngit sync` may be
+a no-op when the relay already advertises the authorized tip. Import the bundle
+under a temporary ref, remove that ref after the objects are present, queue the
+identifier with `--repair`, and finish with a check-only request. Do not delete
+the retained migration backup until storage reports `unresolved=0` and
+`failed=0`.
 
 ## Roll back
 
@@ -133,6 +166,6 @@ starting v2. Do not point v2 at thin family views, even if ordinary clones
 appear to work: v2 does not coordinate writes through the shared family or
 preserve its durability invariants.
 
-The storage model, automatic shallow-history compatibility repair, and detailed
-retirement guarantees are described in
+The storage model, legacy incomplete-history repair, and detailed retirement
+guarantees are described in
 [Identifier-family Git object storage](../explanation/git-family-object-storage.md#v2-to-v3-migration-boundary).

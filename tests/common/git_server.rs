@@ -43,8 +43,8 @@
 //! - **SimpleGitServer**: Fast, lightweight, good for basic `git fetch` without depth limits
 //! - **SmartGitServer**: Full protocol support, required for `--depth=1` shallow fetches
 //!
-//! The purgatory sync system uses `git fetch --depth=1`, so tests involving purgatory
-//! sync should use `SmartGitServer`.
+//! Tests which explicitly exercise shallow client fetches should use
+//! `SmartGitServer`; ordinary purgatory sync performs full fetches.
 
 use grasp_audit::git_command;
 use std::net::SocketAddr;
@@ -525,7 +525,7 @@ mod tests {
 /// - Shallow fetches (`git fetch --depth=1`)
 /// - Full protocol negotiation
 ///
-/// This is required for testing purgatory sync, which uses `git fetch --depth=1`.
+/// This is required for tests which explicitly exercise shallow client fetches.
 pub struct SmartGitServer {
     /// Shutdown signal sender
     shutdown_tx: Option<oneshot::Sender<()>>,

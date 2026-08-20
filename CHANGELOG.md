@@ -170,14 +170,17 @@ Expect a bit of downtime as a git data migraiton is performed on startup. The la
   a warning, backup-directory removals are fsynced before their journals are
   removed, and completed installations whose backups were already removed
   manually start unchanged.
-- Reconcile server-side shallow repositories left by untagged development
-  builds between 2026-01-05 (`623cae5`) and 2026-01-12 (`f25eea8`). No tagged
-  v1 or v2 release shipped the depth-one fallback fetch. The affected
-  non-happy path fetched missing state or PR data from another listed Git
-  server when the objects had not arrived by push. V3 preserves existing
-  shallow clone behavior and the legacy backup, automatically requests the
-  complete closure from accepted clone sources, and logs any family that
-  remains shallow without making it less available.
+- Detect and reconcile incomplete object graphs inherited from legacy storage.
+  The v3 migration preserves the legacy repository and its backup; the online
+  integrity worker then requests missing objects from every accepted clone
+  source and logs any family that remains incomplete without making it less
+  available. A server-side
+  `shallow` marker specifically identifies repositories created by the
+  depth-one fallback in untagged development builds between 2026-01-05
+  (`623cae5`) and 2026-01-12 (`f25eea8`); no tagged v1 or v2 release shipped
+  that behavior. Missing ancestors without a `shallow` marker are not
+  attributed to that bug and can require a complete maintainer clone or bundle
+  when every announced server inherited the same incomplete history.
 - Scope bare log levels to ngit-grasp while keeping dependencies at warnings;
   explicit tracing filter expressions remain unchanged.
 - Keep per-event discovery and validation details at debug, retain aggregate

@@ -259,31 +259,41 @@ retained-root, or shared-object write model. A software rollback therefore
 requires restoring the Git and relay-data snapshot taken before v3; changing
 only the binary is not supported.
 
-One pre-release development interval can leave server-side shallow
-repositories for v3 to reconcile. State Git-data fallback was introduced by
-commit `623cae5` on 2026-01-05 with `git fetch --depth=1`, carried into the
-rewritten purgatory sync path, and changed to a full fetch by commit `f25eea8`
-on 2026-01-12. The first tagged release was v1.0.0 on 2026-02-26 and already
-contained the fix, so no tagged v1 or v2 release shipped the shallow-fetch
-behavior. Only operators who deployed an untagged source revision from that
-seven-day interval can have repositories created by this bug.
+V3 can encounter an object graph which was already incomplete in legacy
+storage. Migration copies every Git-readable object and preserves the backup;
+it does not manufacture a missing ancestor or infer its provenance. Earlier
+manual copies or data migrations, an incomplete source repository, and other
+pre-existing storage damage can all produce the same unmarked symptom. The
+integrity report therefore describes the evidence (`missing_oids`, broken
+links, and `shallow_views`) rather than assigning a cause from a missing object
+alone.
 
-The affected path was the non-happy-path Git-data fallback. It ran only when a
-pending state or PR event named OIDs which had not arrived through an ordinary
-push, then fetched those OIDs into an existing local repository from another
-announcement or PR clone URL. A repository whose required data arrived through
-the normal push path did not invoke this fallback.
+One known and narrower source has an unambiguous marker. State Git-data fallback
+was introduced by commit `623cae5` on 2026-01-05 with
+`git fetch --depth=1`, carried into the rewritten purgatory sync path, and
+changed to a full fetch by commit `f25eea8` on 2026-01-12. The first tagged
+release was v1.0.0 on 2026-02-26 and already contained the fix, so no tagged v1
+or v2 release shipped the shallow-fetch behavior. Only operators who deployed
+an untagged source revision from that seven-day interval can have repositories
+created by this bug. The affected fallback ran only when a pending State or PR
+event named OIDs which had not arrived through an ordinary push.
 
-V3 treats a legacy `shallow` marker as compatibility state rather than a reason
-to delete or disable the repository. Migration preserves the marker on the thin
-view so its shallow clones and current tree continue to work, and retains the
-legacy backup. After the listener starts, the ordinary integrity worker
-requests the complete closure from other accepted clone servers. On success it
-removes the marker; the next v3 launch retires the now-redundant backup. On
-failure the existing shallow clone and current tree remain available, the
-backup remains, and an `ERROR` log identifies the family with a non-zero
-`shallow_views` count. The operator does not need to take a separate action for
-the v3 upgrade.
+V3 treats that legacy `shallow` marker as compatibility state rather than a
+reason to delete or disable the repository. Migration preserves the marker on
+the thin view and retains the legacy backup. After the listener starts, the
+ordinary integrity worker requests the complete closure from other accepted
+clone servers. On success it removes the marker; the next v3 launch retires the
+now-redundant backup. On failure the existing shallow repository and backup
+remain, and an `ERROR` identifies the family with a non-zero `shallow_views`
+count.
+
+An incomplete graph with `shallow_views=0` is a different case. V3 still tries
+every accepted clone source, but all listed servers may share the same missing
+history or the complete source may no longer be announced. Such a family stays
+unresolved until an operator obtains the missing closure from a known-complete
+maintainer clone or bundle. Matching a signed State event is not enough to
+prove this closure: State authorizes ref tips, while storage integrity also
+checks every object reachable behind those tips.
 
 ## Startup migration
 
