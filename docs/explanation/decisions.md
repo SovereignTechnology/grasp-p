@@ -258,11 +258,17 @@ NIP-34 maintainers model refined in nips commit `781590b`).
   otherwise-valid membership data over a formatting slip. Since only
   current activity matters here, consolidation reduces to: a pubkey is a
   maintainer while any of its `M`/`m` entries is active.
-- An announcement using role tags acknowledges its author via an active
+- An announcement using role tags acknowledges its author via an active valid
   self-entry, or implicitly: an author who appears in no role tag is a
-  maintainer for the repository's entire history. Only an ended self-entry
-  means the member left, which takes precedence over assignments in other
-  announcements.
+  maintainer for the repository's entire history. An ended, deferred,
+  malformed, or moderator-only self-entry makes the author currently inactive,
+  which takes precedence over assignments in other announcements.
+- Announcement parsing consumes role history into a current-only view:
+  active maintainers, active lead targets, and current author activity. The
+  boundary history itself is not retained by authorization.
+- Lead resolution preserves distinct internal failures for missing selected or
+  lead announcements, inactive selected authors, incomplete or ambiguous paths,
+  and cycles. All are collapsed to no authority at policy boundaries.
 - A `u` (subordinate fork) tag has no effect on maintainership: the author
   of a role-less announcement asserts maintainership with or without it.
 

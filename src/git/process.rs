@@ -7,7 +7,7 @@
 //! - When git pushes trigger purgatory releases (receive-pack handler)
 
 use crate::git;
-use crate::git::authorization::{collect_authorized_maintainers, RepositoryData};
+use crate::git::authorization::{collect_state_maintainers_by_coordinate, RepositoryData};
 use crate::git::sync::{
     align_repository_with_state, copy_missing_oids_between_repos,
     sync_pr_refs_to_tagged_owner_repos,
@@ -75,7 +75,7 @@ pub fn process_state_with_git_data(
     let state_author = state.event.pubkey.to_hex();
 
     // Collect authorized maintainers per owner
-    let by_owner = collect_authorized_maintainers(&db_repo_data.announcements);
+    let by_owner = collect_state_maintainers_by_coordinate(&db_repo_data.announcements);
 
     // Step 1: Identify owner repos that the state event author is maintainer for
     let authorized_owners: Vec<&String> = by_owner

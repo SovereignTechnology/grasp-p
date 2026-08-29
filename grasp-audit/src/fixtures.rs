@@ -193,8 +193,9 @@ pub trait Fixture: Send + Sync {
 /// - `MaintainerAnnouncement` + `MaintainerState` → uses ValidRepoSent's repo_id
 /// - `RecursiveMaintainerRepoAndState` → uses ValidRepoSent's repo_id
 ///
-/// This enables testing recursive maintainer authorization chains where multiple
-/// parties publish announcements and state events for the same repository.
+/// The legacy `RecursiveMaintainer` fixture name denotes a transitive case.
+/// Its announcements are reciprocal, so it tests confirmed membership rather
+/// than authority from unilateral recursive listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FixtureKind {
     /// Basic repository announcement (kind 30617)
@@ -403,12 +404,13 @@ pub enum FixtureKind {
 
     /// Maintainer's state event with git data successfully pushed (full 5-stage fixture)
     ///
-    /// This fixture tests that a maintainer can authorize pushes with ONLY a state event,
-    /// without publishing their own repo announcement.
+    /// This fixture tests that a reciprocally confirmed maintainer can
+    /// authorize pushes. It publishes the maintainer's acknowledgment
+    /// announcement before the State event.
     ///
     /// This fixture represents the complete flow for testing maintainer push authorization:
     /// 1. **OwnerStateDataPushed dependency**: Owner's repo and state event already on relay, git data pushed
-    /// 2. **Sent**: Sends maintainer state event to relay (returns OK, accepted but 'purgatory:...' message)
+    /// 2. **Sent**: Sends the reciprocal announcement, then the maintainer State event
     /// 3. **Verify Not Served**: Confirms event is not served by relays
     /// 4. **DataPushed**: Clones repo, creates maintainer deterministic commit, force-pushes to relay
     /// 5. **Verified**: Confirms event is served by relay
@@ -419,26 +421,27 @@ pub enum FixtureKind {
     /// - Git push verified to succeed (force push with maintainer's state event authorizes the commit)
     MaintainerStateDataPushed,
 
-    /// Recursive maintainer's state event with git data successfully pushed (full 5-stage fixture)
+    /// Transitively confirmed maintainer's state event with git data pushed.
     ///
-    /// This fixture tests that a recursive maintainer (authorized via maintainer chain) can
-    /// authorize pushes. The recursive maintainer is listed in the maintainer's announcement,
-    /// not the owner's announcement, so this tests the recursive maintainer traversal.
+    /// The legacy fixture name says “recursive maintainer”; authority actually
+    /// comes from reciprocal confirmation through the selected component. The
+    /// additional maintainer is listed by the direct maintainer, not by the
+    /// selected coordinate's author.
     ///
-    /// This fixture represents the complete flow for testing recursive maintainer push authorization:
+    /// This fixture represents the complete transitive-confirmation flow:
     /// 1. **Generated**: (MaintainerStateDataPushed dependency includes ValidRepoSent + OwnerStateDataPushed)
-    ///    Creates MaintainerAnnouncement + RecursiveMaintainerState
+    ///    Creates the additional maintainer's reciprocal announcement and State event
     /// 2. **Sent**: Sends events to relay (returns OK, accepted but 'purgatory:...' message)
     /// 3. **Verify Not Served**: Confirms event is not served by relays
-    /// 4. **DataPushed**: Clones repo, creates recursive maintainer deterministic commit, pushes to relay
+    /// 4. **DataPushed**: Clones repo, creates the additional maintainer's deterministic commit, pushes to relay
     /// 5. **Verified**: Confirms event is served by relay
     ///
-    /// Chain: Owner -> Maintainer -> RecursiveMaintainer
+    /// Component: selected author ↔ direct maintainer ↔ additional maintainer
     ///
     /// - Requires MaintainerStateDataPushed (establishes Owner -> Maintainer chain with git data)
-    /// - State event signed by recursive maintainer keys (`client.recursive_maintainer_keys()`)
+    /// - State event signed by the legacy-named recursive maintainer keys (`client.recursive_maintainer_keys()`)
     /// - Points to RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH
-    /// - Git push verified to succeed (recursive maintainer's state event authorizes the commit)
+    /// - Git push verified to succeed through transitively confirmed membership
     RecursiveMaintainerStateDataPushed,
 }
 
@@ -1709,11 +1712,11 @@ impl<'a> TestContext<'a> {
         Ok(maintainer_state_event)
     }
 
-    /// Build RecursiveMaintainerStateDataPushed fixture: full 5-stage fixture for recursive maintainer push authorization
+    /// Build the legacy-named recursive fixture for transitive confirmed authorization.
     ///
-    /// This tests that a recursive maintainer (authorized via maintainer chain) can authorize pushes.
-    /// The recursive maintainer is listed in the maintainer's announcement, not the owner's announcement,
-    /// so this tests the recursive maintainer traversal (Owner -> Maintainer -> RecursiveMaintainer).
+    /// The additional maintainer is listed in the direct maintainer's
+    /// announcement rather than the selected author's announcement, and
+    /// publishes a reciprocal announcement before gaining authority.
     ///
     /// Depends on MaintainerStateDataPushed - the maintainer's data has already been
     /// pushed and the maintainer's announcement (which assigns the recursive
@@ -1723,14 +1726,14 @@ impl<'a> TestContext<'a> {
     ///
     /// This handles all stages of the fixture:
     /// 1. **Generated**: (MaintainerStateDataPushed dependency includes ValidRepoSent + OwnerStateDataPushed)
-    ///    Creates MaintainerAnnouncement + RecursiveMaintainerState
+    ///    Creates the additional maintainer's reciprocal announcement and State event
     /// 2. **Sent**: Sends events to relay (returns OK, accepted but 'purgatory:...' message)
     /// 3. **Verify Not Served**: Confirms event is not served by relays
-    /// 4. **DataPushed**: Clones repo, creates recursive maintainer deterministic commit, pushes to relay
+    /// 4. **DataPushed**: Clones repo, creates the additional maintainer's deterministic commit, pushes to relay
     /// 5. **Verified**: Confirms event is served by relay
     ///
     /// # Returns
-    /// The recursive maintainer's state event (kind 30618) after all stages complete successfully
+    /// The transitively confirmed maintainer's State event after all stages complete
     async fn build_recursive_maintainer_state_data_pushed(&self) -> Result<Event> {
         use nostr_sdk::prelude::*;
 
@@ -1877,7 +1880,7 @@ impl<'a> TestContext<'a> {
                         "Push was rejected but should have been accepted. \
                 The recursive maintainer published a state event with commit {}, \
                 and the relay should authorize pushes matching this state event \
-                through recursive maintainer traversal (Owner -> Maintainer -> RecursiveMaintainer).",
+                through the transitively confirmed reciprocal component.",
                         RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH
                     ));
                 }

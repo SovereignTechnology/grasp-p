@@ -360,8 +360,9 @@ impl PushAuthorizationTests {
         results.add(Self::test_push_rejected_without_state_event(client, relay_domain).await);
         results.add(Self::test_push_authorized_by_owner_state(client, relay_domain).await);
         results.add(Self::test_push_rejected_wrong_commit(client, relay_domain).await);
-        results
-            .add(Self::test_push_authorized_by_maintainer_state_only(client, relay_domain).await);
+        results.add(
+            Self::test_push_authorized_by_confirmed_maintainer_state(client, relay_domain).await,
+        );
         results.add(
             Self::test_push_authorized_by_recursive_maintainer_state(client, relay_domain).await,
         );
@@ -679,12 +680,11 @@ impl PushAuthorizationTests {
         }
     }
 
-    /// Test push authorized by maintainer state event only (no announcement)
+    /// Test push authorized by a reciprocally confirmed maintainer State event.
     ///
     /// GRASP-01: "respecting the recursive maintainer set"
-    /// This tests that a maintainer can authorize pushes with ONLY a state event,
-    /// without publishing their own repo announcement. The maintainer is still
-    /// listed in the owner's announcement, so they're a valid maintainer.
+    /// Listing alone is an invitation. The fixture publishes the maintainer's
+    /// reciprocal announcement before its State event becomes authoritative.
     ///
     /// This test uses the MaintainerStateDataPushed fixture which handles all 5 stages:
     /// 1. **OwnerStateDataPushed dependency**: Owner's repo and state event already on relay, git data pushed
@@ -695,11 +695,11 @@ impl PushAuthorizationTests {
     ///
     /// The test wraps the fixture result in pass/fail using the error message.
     #[allow(unused_variables)] // relay_domain is now handled by fixture
-    pub async fn test_push_authorized_by_maintainer_state_only(
+    pub async fn test_push_authorized_by_confirmed_maintainer_state(
         client: &AuditClient,
         relay_domain: &str,
     ) -> TestResult {
-        let test_name = "test_push_authorized_by_maintainer_state_only";
+        let test_name = "test_push_authorized_by_confirmed_maintainer_state";
         let ctx = TestContext::new(client);
 
         // The MaintainerStateDataPushed fixture handles all stages:
@@ -711,29 +711,30 @@ impl PushAuthorizationTests {
             Ok(_maintainer_state_event) => TestResult::new(
                 test_name,
                 SpecRef::GitAcceptPushesAlignState,
-                "Push authorized by maintainer state event only (no announcement)",
+                "Push authorized by reciprocally confirmed maintainer state",
             )
             .pass(),
             Err(e) => TestResult::new(
                 test_name,
                 SpecRef::GitAcceptPushesAlignState,
-                "Push authorized by maintainer state event only (no announcement)",
+                "Push authorized by reciprocally confirmed maintainer state",
             )
             .fail(format!("{}", e)),
         }
     }
 
-    /// Test push authorized by recursive maintainer state event
+    /// Test push authorized by a transitively confirmed maintainer State event.
     ///
     /// GRASP-01: "respecting the recursive maintainer set"
-    /// This tests recursive maintainer chains: Owner -> Maintainer -> RecursiveMaintainer
+    /// The legacy fixture name describes a selected author ↔ direct maintainer
+    /// ↔ additional maintainer reciprocal component.
     ///
     /// This test uses the RecursiveMaintainerStateDataPushed fixture which handles all 5 stages:
     /// 1. **Generated**: (MaintainerStateDataPushed dependency includes ValidRepo + OwnerStateDataPushed)
     ///    Creates MaintainerAnnouncement + RecursiveMaintainerState
     /// 2. **Sent**: Sends events to relay (returns OK, accepted but 'purgatory:...' message)
     /// 3. **Verify Not Served**: Confirms event is not served by relays
-    /// 4. **DataPushed**: Clones repo, creates recursive maintainer deterministic commit, pushes to relay
+    /// 4. **DataPushed**: Clones repo, creates the additional maintainer's deterministic commit, pushes to relay
     /// 5. **Verified**: Confirms event is served by relay
     ///
     /// The test wraps the fixture result in pass/fail using the error message.
@@ -754,13 +755,13 @@ impl PushAuthorizationTests {
             Ok(_recursive_maintainer_state_event) => TestResult::new(
                 test_name,
                 SpecRef::GitAcceptPushesAlignState,
-                "Push authorized by recursive maintainer state event",
+                "Push authorized by transitively confirmed maintainer state",
             )
             .pass(),
             Err(e) => TestResult::new(
                 test_name,
                 SpecRef::GitAcceptPushesAlignState,
-                "Push authorized by recursive maintainer state event",
+                "Push authorized by transitively confirmed maintainer state",
             )
             .fail(format!("{}", e)),
         }
@@ -776,7 +777,7 @@ impl PushAuthorizationTests {
     /// This test is compatible with any descendant of `OwnerStateDataPushed`:
     /// - `OwnerStateDataPushed` - owner's state event with git data pushed
     /// - `MaintainerStateDataPushed` - maintainer's state event with git data pushed
-    /// - `RecursiveMaintainerStateDataPushed` - recursive maintainer's state event with git data pushed
+    /// - `RecursiveMaintainerStateDataPushed` - transitively confirmed maintainer's State event with Git data pushed
     ///
     /// All of these establish valid state on the relay that a non-maintainer should NOT be able to override.
     ///

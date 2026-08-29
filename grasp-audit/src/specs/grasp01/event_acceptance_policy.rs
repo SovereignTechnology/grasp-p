@@ -5,9 +5,9 @@
 //! This file validates that a GRASP-01 compliant relay:
 //! - Accepts valid NIP-34 repository announcements listing the service
 //! - Rejects announcements that don't list the service in clone and relays tags
-//!   EXCEPTION: maintainer announcements (from authors in the maintainer chain)
-//!   MUST be accepted even without listing the service - this enables recursive maintainer
-//!   chain discovery and more reliable GRASP-02 sync capabilities
+//!   EXCEPTION: maintainer-discovery candidates MUST be accepted even without
+//!   listing the service. Admission enables dependency discovery and GRASP-02
+//!   sync; it does not itself grant State-event authority.
 //! - Accepts repository state announcements
 //! - Accepts events that TAG accepted repositories
 //! - Accepts events that ARE TAGGED BY accepted events (transitive)
@@ -397,18 +397,16 @@ impl EventAcceptancePolicyTests {
         .await
     }
 
-    /// Test: Accept recursive maintainer announcement without service in clone tag
+    /// Test: Admit a maintainer-discovery announcement without the service.
     ///
     /// Spec: Line 7 of ../grasp/01.md (EXCEPTION to rejection rule)
-    /// Requirement: MUST accept recursive maintainer announcements for chain discovery
+    /// Requirement: MUST accept candidate announcements for dependency discovery
     ///
     /// GRASP-01: "respecting the recursive maintainer set"
     ///
-    /// When a recursive maintainer is listed in a maintainer's announcement, they may
-    /// publish their own announcement for the same repo (with their own maintainers).
-    /// The relay MUST accept this recursive maintainer's announcement even if it doesn't
-    /// list this GRASP server in its clone tag - because the relay needs it to discover
-    /// the full recursive maintainer chain.
+    /// A listed candidate may publish its reciprocal announcement for the same
+    /// identifier. The relay must admit that announcement without this GRASP
+    /// server in its clone tag so membership dependencies can be discovered.
     ///
     /// This also enables GRASP-02 to sync state events and git data when authoritative
     /// users publish them to other relays/git servers, keeping repos up-to-date.
@@ -416,18 +414,16 @@ impl EventAcceptancePolicyTests {
         client: &AuditClient,
     ) -> TestResult {
         TestResult::new(
-            "accept_recursive_maintainer_announcement_without_service",
+            "accept_maintainer_discovery_announcement_without_service",
             SpecRef::NostrRelayRejectMissingCloneRelays,
-            "MUST accept recursive maintainer announcements for chain discovery",
+            "MUST admit maintainer announcements needed for dependency discovery",
         )
         .run(|| async {
             // Create TestContext for mode-aware fixture management
             let ctx = TestContext::new(client);
 
-            // Step 1: Get RecursiveMaintainerStateDataPushed fixture
-            // This establishes: Owner -> Maintainer -> RecursiveMaintainer chain
-            // with all git data pushed. The recursive maintainer is already listed
-            // in maintainer's announcement (and maintainer in owner's announcement).
+            // Step 1: Get the legacy-named recursive fixture. It establishes a
+            // transitively reciprocal component with all Git data pushed.
             let recursive_state = ctx
                 .get_fixture(FixtureKind::RecursiveMaintainerStateDataPushed)
                 .await
@@ -447,7 +443,7 @@ impl EventAcceptancePolicyTests {
                 .ok_or("Missing d tag in recursive maintainer state")?
                 .to_string();
 
-            // Step 2: Build a recursive maintainer announcement that DOES NOT include
+            // Step 2: Build the additional maintainer's announcement without
             // this GRASP server in its clone tag - simulating an announcement pointing
             // to a different server (e.g., another GRASP server)
             let recursive_maintainer_npub = client
@@ -496,7 +492,7 @@ impl EventAcceptancePolicyTests {
 
             let event_id = recursive_maintainer_announcement.id;
 
-            // Step 3: Send the recursive maintainer announcement
+            // Step 3: Send the maintainer-discovery announcement.
             client
                 .send_event(recursive_maintainer_announcement)
                 .await
@@ -516,14 +512,13 @@ impl EventAcceptancePolicyTests {
                 .await
                 .map_err(|e| format!("Failed to query events: {}", e))?;
 
-            // Verify the recursive maintainer's announcement was stored
+            // Verify the dependency announcement was stored.
             if !events.iter().any(|e| e.id == event_id) {
                 return Err(format!(
-                    "Recursive maintainer announcement was NOT accepted by relay. \
-                    The recursive maintainer (listed in maintainer's announcement, which is \
-                    listed in owner's announcement) published their own announcement for \
-                    repo {} with an external clone URL. The relay should accept this to \
-                    enable full recursive maintainer chain discovery. Event ID: {}",
+                    "Maintainer dependency announcement was NOT accepted by relay. \
+                    A transitively listed candidate published a reciprocal announcement for \
+                    repo {} with an external clone URL. The relay should admit it for \
+                    dependency discovery without treating admission as authority. Event ID: {}",
                     repo_id, event_id
                 ));
             }

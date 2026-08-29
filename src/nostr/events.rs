@@ -14,7 +14,7 @@ use nostr_sdk::prelude::{Event, Kind, PublicKey, ToBech32};
 /// Values after the pubkey alternate between numeric start and end
 /// boundaries. `defer` is valid only as the final end boundary and is never
 /// active. Malformed history must not grant repository authority.
-fn role_entry_is_active(slice: &[String]) -> bool {
+fn role_entry_is_currently_active(slice: &[String]) -> bool {
     if slice.len() < 2 {
         return false;
     }
@@ -32,6 +32,19 @@ fn role_entry_is_active(slice: &[String]) -> bool {
     }
 
     boundaries.is_empty() || boundaries.len() % 2 == 1
+}
+
+/// Present-tense authorization facts derived from NIP-34 indexed roles.
+///
+/// Role history is consumed while parsing the announcement, but is not kept:
+/// relay authorization only needs the current maintainer set, current lead
+/// targets, and whether the announcement author currently claims a maintainer
+/// role.
+#[derive(Debug, Clone)]
+struct CurrentMaintainerRoles {
+    active_maintainers: Vec<String>,
+    active_leads: Vec<String>,
+    announcement_author_is_active_maintainer: bool,
 }
 
 // NOTE: Using rust-nostr Kind variants instead of hardcoded constants:
@@ -55,20 +68,23 @@ pub struct RepositoryAnnouncement {
     /// announcement uses `M`/`m`/`o` role tags, which take precedence per
     /// NIP-34.
     pub maintainers: Vec<String>,
-    /// Currently-active maintainer pubkeys from NIP-34 `M`/`m` role tags;
-    /// `None` when the announcement contains no role tags. Moderator (`o`)
-    /// entries never contribute: moderators are not maintainers.
+    /// Compatibility projection of currently active indexed `M`/`m` roles.
+    ///
+    /// Internal authorization uses the single parsed `CurrentMaintainerRoles`
+    /// snapshot. This field preserves the v3.0 public API and should not be
+    /// interpreted as role history.
+    #[doc(hidden)]
+    pub role_maintainers: Option<Vec<String>>,
+    /// Present-tense authorization facts derived from NIP-34 `M`/`m`/`o`
+    /// role tags; `None` when the announcement contains no indexed roles.
+    /// Moderator (`o`) entries never contribute maintainer authority.
     ///
     /// Both `M` and `m` grant maintainer authority, so they collapse into one
-    /// maintainer set. Active `M` entries additionally drive lead resolution
-    /// through [`Self::active_leads`]. Entries whose role history is malformed
-    /// or ended are excluded entirely: historic listing never grants
-    /// authority for a past period.
-    pub role_maintainers: Option<Vec<String>>,
-    /// Whether any role tag names the author, active or ended. Per NIP-34 an
-    /// author without a self-entry is implicitly a maintainer for the
-    /// repository's entire history.
-    author_has_role_entry: bool,
+    /// maintainer set. Active `M` entries additionally drive lead resolution.
+    /// Entries whose role history is malformed or ended are excluded entirely
+    /// after parsing: historic listing never grants authority for a past
+    /// period.
+    current_roles: Option<CurrentMaintainerRoles>,
 }
 
 impl RepositoryAnnouncement {
@@ -172,7 +188,8 @@ impl RepositoryAnnouncement {
         // the author is not implicitly a maintainer.
         let mut role_tags_present = false;
         let mut author_has_role_entry = false;
-        let mut role_active: Vec<String> = Vec::new();
+        let mut active_maintainers: Vec<String> = Vec::new();
+        let mut active_leads: Vec<String> = Vec::new();
         for tag in event.tags.iter() {
             let slice = tag.as_slice();
             let Some(kind) = slice.first() else { continue };
@@ -190,17 +207,28 @@ impl RepositoryAnnouncement {
             if kind == "o" {
                 continue;
             }
-            if role_entry_is_active(slice) {
+            if role_entry_is_currently_active(slice) {
                 let Some(parsed_pubkey) = parsed_pubkey else {
                     continue;
                 };
                 let pubkey = parsed_pubkey.to_hex();
-                if !role_active.contains(&pubkey) {
-                    role_active.push(pubkey);
+                if !active_maintainers.contains(&pubkey) {
+                    active_maintainers.push(pubkey.clone());
+                }
+                if kind == "M" && !active_leads.contains(&pubkey) {
+                    active_leads.push(pubkey);
                 }
             }
         }
-        let role_maintainers = role_tags_present.then_some(role_active);
+        let current_roles = role_tags_present.then(|| CurrentMaintainerRoles {
+            announcement_author_is_active_maintainer: !author_has_role_entry
+                || active_maintainers.contains(&event.pubkey.to_hex()),
+            active_maintainers,
+            active_leads,
+        });
+        let role_maintainers = current_roles
+            .as_ref()
+            .map(|roles| roles.active_maintainers.clone());
 
         // Extract maintainers from the deprecated "maintainers" tag per NIP-34
         // Format: ["maintainers", "<pubkey1-hex>", "<pubkey2-hex>", ...]
@@ -231,7 +259,7 @@ impl RepositoryAnnouncement {
             web_urls,
             maintainers,
             role_maintainers,
-            author_has_role_entry,
+            current_roles,
         })
     }
 
@@ -244,10 +272,10 @@ impl RepositoryAnnouncement {
     /// listing alone makes none of their events authoritative.
     pub fn listed_maintainers(&self) -> Vec<String> {
         let author = self.event.pubkey.to_hex();
-        let source = self
-            .role_maintainers
-            .as_deref()
-            .unwrap_or(&self.maintainers);
+        let source = match &self.current_roles {
+            Some(roles) => &roles.active_maintainers,
+            None => &self.maintainers,
+        };
         let mut listed: Vec<String> = Vec::new();
         for pubkey in source {
             if *pubkey != author && !listed.contains(pubkey) {
@@ -262,25 +290,10 @@ impl RepositoryAnnouncement {
     /// An active `M` is both a maintainer edge and an explicit lead pointer.
     /// Duplicate records for one target are consolidated; distinct targets
     /// remain visible so authority resolution can fail closed on ambiguity.
-    pub fn active_leads(&self) -> Vec<String> {
-        let mut leads = Vec::new();
-        for tag in self.event.tags.iter() {
-            let slice = tag.as_slice();
-            if slice.first().map(String::as_str) != Some("M") || !role_entry_is_active(slice) {
-                continue;
-            }
-            let Some(pubkey) = slice
-                .get(1)
-                .and_then(|value| PublicKey::from_hex(value).ok())
-            else {
-                continue;
-            };
-            let pubkey = pubkey.to_hex();
-            if !leads.contains(&pubkey) {
-                leads.push(pubkey);
-            }
-        }
-        leads
+    pub fn active_leads(&self) -> &[String] {
+        self.current_roles
+            .as_ref()
+            .map_or(&[], |roles| roles.active_leads.as_slice())
     }
 
     /// Whether this announcement asserts an active maintainer role for its
@@ -288,29 +301,31 @@ impl RepositoryAnnouncement {
     ///
     /// With role tags the author is active via an active `M`/`m` self-entry,
     /// or implicitly: per NIP-34 an author who appears in no role tag is a
-    /// maintainer for the repository's entire history. Only a self-entry
-    /// that asserts no active maintainer role - an ended entry, or a
-    /// moderator-only (`o`) entry - means the author is not a maintainer,
-    /// which takes precedence over assignments in other announcements. In
-    /// the deprecated format the author always asserts maintainership; a
-    /// `u` (subordinate fork) tag has no effect on maintainership.
-    pub fn author_role_active(&self) -> bool {
-        match &self.role_maintainers {
-            Some(active) => {
-                !self.author_has_role_entry || active.contains(&self.event.pubkey.to_hex())
-            }
-            None => true,
-        }
+    /// maintainer for the repository's entire history. A self-entry with no
+    /// active valid `M`/`m` role - ended, deferred, malformed, or
+    /// moderator-only (`o`) - means the author is not a maintainer. That
+    /// present-tense result takes precedence over assignments in other
+    /// announcements. In the deprecated format the author always asserts
+    /// maintainership; a `u` (subordinate fork) tag has no effect.
+    pub fn announcement_author_is_active_maintainer(&self) -> bool {
+        self.current_roles
+            .as_ref()
+            .is_none_or(|roles| roles.announcement_author_is_active_maintainer)
     }
 
-    /// Whether this announcement shows its author is not a maintainer: a
-    /// role tag names the author but no `M`/`m` entry of theirs is active -
-    /// they left, or hold only the moderator (`o`) role.
-    ///
-    /// An author absent from all role tags has *not* left - they are
-    /// implicitly a maintainer for the repository's entire history.
+    /// Compatibility alias for v3.0 callers.
+    #[deprecated(since = "3.0.1", note = "use announcement_author_is_active_maintainer")]
+    pub fn author_role_active(&self) -> bool {
+        self.announcement_author_is_active_maintainer()
+    }
+
+    /// Compatibility alias for v3.0 callers.
+    #[deprecated(
+        since = "3.0.1",
+        note = "test announcement_author_is_active_maintainer directly"
+    )]
     pub fn author_has_left(&self) -> bool {
-        self.role_maintainers.is_some() && !self.author_role_active()
+        self.current_roles.is_some() && !self.announcement_author_is_active_maintainer()
     }
 
     /// Check if this announcement lists the given domain in clone URLs
@@ -1061,7 +1076,7 @@ mod tests {
             !listed.contains(&author),
             "author is excluded from the listed set"
         );
-        assert!(announcement.author_role_active());
+        assert!(announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1096,8 +1111,21 @@ mod tests {
             ],
         );
 
-        assert!(!announcement.author_role_active());
+        assert!(!announcement.announcement_author_is_active_maintainer());
         assert!(announcement.listed_maintainers().contains(&lead));
+    }
+
+    #[test]
+    fn test_malformed_self_role_is_inactive() {
+        let keys = create_test_keys();
+        let author = keys.public_key().to_hex();
+
+        let announcement = role_announcement(
+            &keys,
+            vec![("m", vec![author, "not-a-timestamp".to_string()])],
+        );
+
+        assert!(!announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1108,7 +1136,7 @@ mod tests {
         // Deprecated format: the author implicitly asserts maintainership,
         // with or without a `u` (subordinate fork) tag.
         let plain = role_announcement(&keys, vec![("maintainers", vec![upstream.clone()])]);
-        assert!(plain.author_role_active());
+        assert!(plain.announcement_author_is_active_maintainer());
 
         let fork = role_announcement(
             &keys,
@@ -1117,8 +1145,7 @@ mod tests {
                 ("u", vec![format!("30617:{upstream}:test-repo")]),
             ],
         );
-        assert!(fork.author_role_active());
-        assert!(!fork.author_has_left());
+        assert!(fork.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1129,8 +1156,7 @@ mod tests {
         // Role tags that do not name the author: the author is implicitly a
         // maintainer for the repository's entire history.
         let announcement = role_announcement(&keys, vec![("m", vec![other])]);
-        assert!(announcement.author_role_active());
-        assert!(!announcement.author_has_left());
+        assert!(announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1186,7 +1212,7 @@ mod tests {
         assert!(announcement.maintainers.is_empty());
         assert!(announcement.listed_maintainers().is_empty());
         assert!(!announcement.listed_maintainers().contains(&moderator));
-        assert!(announcement.author_role_active());
+        assert!(announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1199,8 +1225,7 @@ mod tests {
         // maintainer, so the implicit-maintainer rule does not apply.
         let announcement = role_announcement(&keys, vec![("M", vec![lead]), ("o", vec![author])]);
 
-        assert!(!announcement.author_role_active());
-        assert!(announcement.author_has_left());
+        assert!(!announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]
@@ -1284,8 +1309,7 @@ mod tests {
             .unwrap();
 
         let announcement = RepositoryAnnouncement::from_event(event).unwrap();
-        assert!(announcement.author_role_active());
-        assert!(!announcement.author_has_left());
+        assert!(announcement.announcement_author_is_active_maintainer());
     }
 
     #[test]

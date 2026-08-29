@@ -108,12 +108,13 @@ impl StatePolicy {
             return Ok(reject_invalid("no announcement exists for this repository"));
         }
 
-        let authorized_owners = crate::git::authorization::pubkey_authorised_for_repo_owners(
-            &event.pubkey,
-            &db_repo_data,
-        );
+        let authorized_coordinates =
+            crate::git::authorization::repository_coordinates_authorized_by(
+                &event.pubkey,
+                &db_repo_data,
+            );
 
-        if authorized_owners.is_empty() {
+        if authorized_coordinates.is_empty() {
             if is_synced {
                 tracing::debug!(
                     event_id = %event.id,
@@ -140,7 +141,7 @@ impl StatePolicy {
             event_id = %event.id,
             identifier = %state.identifier,
             author = %event.pubkey.to_hex(),
-            authorized_for_owners = ?authorized_owners,
+            authorized_coordinates = ?authorized_coordinates,
             "State event author authorized via maintainer set"
         );
 
@@ -151,25 +152,25 @@ impl StatePolicy {
         // premature expiry during slow sync operations — the repo is actively receiving
         // metadata so it should stay alive.
         //
-        // We extend for all owners that authorized this state event, since the state
-        // event proves the repo is active regardless of which owner's announcement
-        // authorized it.
-        for owner_hex in &authorized_owners {
-            if let Ok(owner_pk) = nostr_sdk::prelude::PublicKey::from_hex(owner_hex) {
+        // We extend every selected coordinate that authorizes this state event.
+        for selected_pubkey_hex in &authorized_coordinates {
+            if let Ok(selected_pubkey) =
+                nostr_sdk::prelude::PublicKey::from_hex(selected_pubkey_hex)
+            {
                 if self
                     .ctx
                     .purgatory
-                    .has_purgatory_announcement(&owner_pk, &state.identifier)
+                    .has_purgatory_announcement(&selected_pubkey, &state.identifier)
                 {
                     self.ctx.purgatory.extend_announcement_expiry(
-                        &owner_pk,
+                        &selected_pubkey,
                         &state.identifier,
                         std::time::Duration::from_secs(1800),
                     );
                     tracing::debug!(
                         event_id = %event.id,
                         identifier = %state.identifier,
-                        owner = %owner_hex,
+                        selected_pubkey = %selected_pubkey_hex,
                         "Extended purgatory announcement expiry due to state event arrival"
                     );
                 }
@@ -185,13 +186,16 @@ impl StatePolicy {
         // reconcile pass (`reapply_stored`). Reconcile instead of returning
         // early as an ordinary duplicate.
         let state_already_in_db = db_repo_data.states.iter().any(|e| e.event.id.eq(&event.id));
-        let has_authorized_purgatory_announcement = authorized_owners.iter().any(|owner_hex| {
-            nostr_sdk::prelude::PublicKey::from_hex(owner_hex).is_ok_and(|owner| {
-                self.ctx
-                    .purgatory
-                    .has_purgatory_announcement(&owner, &state.identifier)
-            })
-        });
+        let has_authorized_purgatory_announcement =
+            authorized_coordinates.iter().any(|selected_pubkey_hex| {
+                nostr_sdk::prelude::PublicKey::from_hex(selected_pubkey_hex).is_ok_and(
+                    |selected_pubkey| {
+                        self.ctx
+                            .purgatory
+                            .has_purgatory_announcement(&selected_pubkey, &state.identifier)
+                    },
+                )
+            });
 
         if state_already_in_db && !has_authorized_purgatory_announcement && !reapply_stored {
             tracing::debug!("processed state event duplicate (in db): {}", event.id);

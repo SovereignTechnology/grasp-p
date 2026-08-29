@@ -974,7 +974,7 @@ needs the inviter's Git data. In that flow:
 1. Dependency-resolvable entries remain in the cold index until processing succeeds.
 2. If the full event is still in the hot cache, it is re-processed immediately.
 3. If the full event expired, the sync manager requests only the retained event
-   IDs from connected relays across the recursive maintainer chain. Each
+   IDs from connected relays across the maintainer-discovery dependency chain. Each
    request explicitly targets its associated relay connection instead of the
    SDK's automatic pool-wide relay selection.
 4. Relay requests run in parallel as bounded background work; announcements are processed before state events that may depend on them.

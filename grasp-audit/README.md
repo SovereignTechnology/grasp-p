@@ -156,7 +156,7 @@ Test coverage of GRASP-01 specification:
 
 - Repository announcement acceptance
 - State event handling
-- Push authorization (owner, maintainer, recursive maintainer)
+- Push authorization (selected coordinate, direct maintainer, and transitively confirmed maintainer)
 - Event acceptance policy
 - Git clone over HTTP
 - CORS headers
@@ -367,7 +367,7 @@ pub async fn test_something(client: &AuditClient) -> TestResult {
 | `PREventSentAfterWrongPush`          | PR event sent after wrong commit was pushed. Tests cleanup behavior.                                                                             | Testing post-event ref cleanup             |
 | `OwnerStateDataPushed`               | Full owner push flow: state event + git data pushed. Points to `DETERMINISTIC_COMMIT_HASH`.                                                      | Testing owner push authorization           |
 | `MaintainerStateDataPushed`          | Full maintainer push flow: force-pushes over owner's data. Points to `MAINTAINER_DETERMINISTIC_COMMIT_HASH`.                                     | Testing maintainer push authorization      |
-| `RecursiveMaintainerStateDataPushed` | Full recursive maintainer push flow: Owner → Maintainer → RecursiveMaintainer chain. Points to `RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH`. | Testing recursive maintainer authorization |
+| `RecursiveMaintainerStateDataPushed` | Full transitive reciprocal-confirmation flow: selected coordinate → maintainer → additional maintainer. Points to `RECURSIVE_MAINTAINER_DETERMINISTIC_COMMIT_HASH`. | Testing transitively confirmed authorization |
 | `HeadSetToDevelopBranch`             | State event with HEAD=refs/heads/develop. Depends on RecursiveMaintainerStateDataPushed.                                                         | Testing HEAD branch switching              |
 
 #### Deterministic Commit Hashes

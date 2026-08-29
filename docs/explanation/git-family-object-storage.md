@@ -413,8 +413,9 @@ bounded counts and OID/diagnostic samples; it does not make availability depend
 on remote servers.
 
 Authorization integrity is the second, view-scoped layer. It derives each
-owner's branch, tag, and `HEAD` set from the NIP-01-preferred accepted State
-event published by that owner's confirmed maintainer set. It derives
+owner view's branch, tag, and `HEAD` set from the NIP-01-preferred accepted
+State event published by the confirmed maintainer component resolved from
+that selected owner coordinate. It derives
 `refs/nostr/<event-id>` from accepted PR and PR Update events when the same
 confirmed-maintainer overlap as normal event processing selects the view, or
 when an exact standard clone URL names that owner and identifier on this

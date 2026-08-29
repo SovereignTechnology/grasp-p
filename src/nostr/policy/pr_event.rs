@@ -8,7 +8,7 @@ use nostr_sdk::prelude::Event;
 use super::PolicyContext;
 use crate::git;
 use crate::git::authorization::{
-    collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
+    collect_state_maintainers_by_coordinate, fetch_repository_data_excluding_purgatory,
 };
 use crate::grasp06::receive::RepoInitLocks;
 
@@ -427,7 +427,7 @@ impl PrEventPolicy {
         }
 
         // 4. Identify owner repos that list any of the maintainers using this function
-        let by_owner = collect_authorized_maintainers(&db_repo_data.announcements);
+        let by_owner = collect_state_maintainers_by_coordinate(&db_repo_data.announcements);
 
         // 5. Return the repo_path for each owner whose authorized maintainers include any of our maintainers
         let mut repo_paths = Vec::new();

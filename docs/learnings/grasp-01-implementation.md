@@ -32,14 +32,14 @@
 - ✅ Accepts repository announcements listing this service
 - ✅ Accepts repository state announcements
 - ✅ Accepts events tagging/tagged by accepted repos
-- ✅ Recursive maintainer announcement support
+- ✅ Maintainer-discovery announcement support without implicit State authority
 - ✅ NIP-11 document with `supported_grasps` field
 - ✅ CORS headers on all endpoints
 
 **Git HTTP Service:**
 - ✅ Serves git at `/<npub>/<identifier>.git`
 - ✅ Push validation against state events
-- ✅ Recursive maintainer chain support
+- ✅ Active-lead resolution with reciprocal maintainer confirmation
 - ✅ HEAD set from state events
 - ✅ `refs/nostr/<event-id>` support for PRs
 - ✅ `allow-tip-sha1-in-want` and `allow-reachable-sha1-in-want` (GRASP-01 requirement)
@@ -70,8 +70,8 @@ flowchart TD
     
     A --> AC{Lists our service in clone AND relays?}
     AC -->|Yes| ACCEPT1[Accept + Create Repo]
-    AC -->|No| RM{Is recursive maintainer?}
-    RM -->|Yes| ACCEPT2[Accept - for discovery]
+    AC -->|No| RM{Has maintainer discovery path?}
+    RM -->|Yes| ACCEPT2[Admit dependency - no authority granted]
     RM -->|No| REJECT1[Reject]
     
     S --> SA{Author authorized?}

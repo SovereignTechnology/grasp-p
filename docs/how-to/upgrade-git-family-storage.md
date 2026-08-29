@@ -97,7 +97,8 @@ refs as evidence instead of guessing that deletion is safe.
 
 The authorization pass treats the accepted event database as authoritative:
 
-- the latest State event from the owner's confirmed maintainer set defines
+- the latest State event from the confirmed maintainer component resolved for
+  the selected owner coordinate defines
   all and only `refs/heads/*`, `refs/tags/*`, and `HEAD`;
 - accepted PR and PR Update events define `refs/nostr/<event-id>` in an owner
   view when either the confirmed-maintainer overlap selects that view or an

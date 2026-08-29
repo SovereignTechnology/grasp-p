@@ -82,8 +82,8 @@
 //! );
 //!
 //! // Re-process `hot_events` immediately. For candidate IDs without a full
-//! // hot-cache event, request that exact event from the recursive maintainer
-//! // relay chain. Keep each entry indexed until policy processing succeeds,
+//! // hot-cache event, request that exact event from the maintainer-discovery
+//! // relay dependencies. Keep each entry indexed until processing succeeds,
 //! // then call `index.remove(&event_id)`.
 //! ```
 

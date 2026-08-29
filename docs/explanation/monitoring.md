@@ -344,7 +344,7 @@ When a maintainer announcement arrives before the owner announcement:
 1. Maintainer event rejected → hot cache + cold index
 2. Reciprocal owner announcement enters purgatory → retain the cold ID until recovery succeeds
 3. If still in hot cache → immediate policy re-processing
-4. If expired from hot cache → exact-ID requests run in parallel across the recursive maintainer relay chain
+4. If expired from hot cache → exact-ID requests run in parallel across the maintainer-discovery relay dependencies
 5. Empty or failed requests keep the ID for a throttled retry
 6. Successful processing removes the event from both tiers
 

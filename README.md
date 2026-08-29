@@ -135,7 +135,7 @@ for the shared storage model.
 - ✅ Accepts NIP-34 repository announcements and state events
 - ✅ Git Smart HTTP service at `/<npub>/<identifier>.git`
 - ✅ Push validation against Nostr state events
-- ✅ Multi-maintainer support via recursive maintainer sets
+- ✅ Multi-maintainer support via active lead resolution and reciprocal confirmation
 - ✅ Support for `refs/nostr/<event-id>` for PRs
 - ✅ Git capabilities: `allow-tip-sha1-in-want`, `allow-reachable-sha1-in-want`, `uploadpack.allowFilter`
 - ✅ CORS support for web-based Git clients

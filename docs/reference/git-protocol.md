@@ -278,10 +278,10 @@ pub async fn validate_push(
     // 2. Get pubkey from npub
     let pubkey = decode_npub(npub)?;
     
-    // 3. Get maintainer set (recursive)
-    let maintainers = get_maintainers(&events, &pubkey, identifier);
+    // 3. Resolve this selected coordinate's current authority
+    let maintainers = resolve_current_maintainers(&events, &pubkey, identifier);
     if maintainers.is_empty() {
-        return Err(Error::NoAnnouncement);
+        return Err(Error::NoResolvedAuthority);
     }
     
     // 4. Get latest state from maintainers

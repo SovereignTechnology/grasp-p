@@ -1466,8 +1466,8 @@ pub async fn run_probe_with_options(
 
                 // git_refs_match_state: fetch all served kind 30618 state events for this
                 // repo (by #d tag), derive expected refs (latest timestamp wins per ref
-                // across all authorized state events — relay already validated auth,
-                // including recursive maintainer chains), then compare against git refs.
+                // across all authorized state events — relay already validated the
+                // selected coordinate's resolved reciprocal component), then compare.
                 match refs_body_fallback {
                     None => {
                         checks.push(skipped(
@@ -1479,8 +1479,8 @@ pub async fn run_probe_with_options(
                         let fetched_refs = parse_refs(&body);
 
                         // Fetch all state events for this repo_id from the relay.
-                        // The relay only serves authorized state events (owner + full
-                        // recursive maintainer chain already resolved by the relay).
+                        // The relay only serves state events authorized by a selected
+                        // coordinate's resolved reciprocal component.
                         let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
                             nostr_sdk::prelude::SingleLetterTag::LOWERCASE_D,
                             ann_id.clone(),
@@ -1510,8 +1510,8 @@ pub async fn run_probe_with_options(
                         } else {
                             // Build expected refs: for each ref name, the state event with
                             // the highest created_at timestamp wins (mirrors relay behaviour).
-                            // This correctly handles recursive maintainership — any authorized
-                            // party's state event may be the most recent for a given ref.
+                            // Any confirmed member's state event may be the most recent
+                            // for a given ref.
                             let mut expected: std::collections::HashMap<String, String> =
                                 std::collections::HashMap::new();
                             let mut latest_ts: std::collections::HashMap<String, u64> =

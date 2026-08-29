@@ -75,7 +75,8 @@ impl AnnouncementPolicy {
         match validation_result {
             AnnouncementResult::Reject(reason) => {
                 // Validation failed - check maintainer exception
-                // GRASP-01 Exception: Accept announcements from recursive maintainers
+                // GRASP-01 exception: admit maintainer-discovery candidates.
+                // This does not grant confirmed membership or state authority.
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
                         // If this pubkey+identifier has a purgatory entry AND the incoming
@@ -128,10 +129,7 @@ impl AnnouncementPolicy {
                         }
 
                         match self
-                            .is_maintainer_in_any_announcement(
-                                &announcement.identifier,
-                                &event.pubkey,
-                            )
+                            .has_maintainer_discovery_path(&announcement.identifier, &event.pubkey)
                             .await
                         {
                             Ok(true) => AnnouncementResult::AcceptMaintainer,
@@ -420,25 +418,24 @@ impl AnnouncementPolicy {
         Ok(())
     }
 
-    /// Check if a pubkey is currently listed as a maintainer in any announcement
-    /// for this identifier
+    /// Check whether a pubkey has an admission path for maintainer discovery.
     ///
-    /// A pubkey qualifies if:
-    /// 1. They are the owner (pubkey) of an accepted announcement with this identifier, OR
-    /// 2. ANY announcement with this identifier currently lists them as a maintainer
-    ///    (active `M`/`m` role tags or the deprecated `maintainers` tag)
+    /// A pubkey qualifies if it authored an accepted announcement with this
+    /// identifier, or any announcement with the identifier currently lists it
+    /// as a maintainer (active `M`/`m` roles or deprecated `maintainers`).
     ///
-    /// This enables accepting announcements from maintainers even when they don't list
-    /// this GRASP server, for maintainer chain discovery and GRASP-02 sync. It
-    /// deliberately includes *invited* pubkeys - their announcement is exactly how we
-    /// learn they accepted the role - but excludes pubkeys whose role history shows
-    /// the role has ended.
+    /// This enables accepting candidate announcements even when they do not
+    /// list this GRASP server, for maintainer dependency discovery and
+    /// GRASP-02 sync. It deliberately includes *invited* pubkeys: their announcement is
+    /// exactly how the relay learns they accepted the role. It is an admission
+    /// and dependency-discovery predicate only; it does not establish
+    /// reciprocal membership or grant repository-state authority.
     ///
     /// Checks both the database (promoted announcements) and purgatory (announcements
     /// waiting for git data). This is necessary because a maintainer's announcement
-    /// (which lists the recursive maintainer) may still be in purgatory when the
-    /// recursive maintainer's announcement arrives.
-    async fn is_maintainer_in_any_announcement(
+    /// (which lists the next candidate) may still be in purgatory when that
+    /// candidate's announcement arrives.
+    async fn has_maintainer_discovery_path(
         &self,
         identifier: &str,
         author: &PublicKey,

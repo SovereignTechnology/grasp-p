@@ -5,7 +5,7 @@ use nostr_sdk::prelude::{Event, EventId, Filter, Kind, PublicKey, SingleLetterTa
 use super::policy::{identifier_from_event, DeletionPolicy};
 use crate::git;
 use crate::git::authorization::{
-    collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
+    collect_state_maintainers_by_coordinate, fetch_repository_data_excluding_purgatory,
 };
 use crate::git::process;
 use crate::nostr::events::RepositoryState;
@@ -256,7 +256,7 @@ impl DeletionPolicy {
             }
         };
 
-        if crate::git::authorization::pubkey_authorised_for_repo_owners(
+        if crate::git::authorization::repository_coordinates_authorized_by(
             &candidate.pubkey,
             &repo_data,
         )
@@ -410,7 +410,7 @@ impl DeletionPolicy {
             return;
         }
 
-        let by_owner = collect_authorized_maintainers(&repo_data.announcements);
+        let by_owner = collect_state_maintainers_by_coordinate(&repo_data.announcements);
 
         for announcement in &repo_data.announcements {
             let owner_hex = announcement.event.pubkey.to_hex();

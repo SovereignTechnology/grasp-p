@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use nostr_sdk::prelude::{Event, SaveEventStatus};
 
 use crate::git::authorization::{
-    collect_authorized_maintainers, fetch_repository_data_excluding_purgatory,
+    collect_state_maintainers_by_coordinate, fetch_repository_data_excluding_purgatory,
     fetch_repository_data_with_purgatory, RepositoryData,
 };
 use crate::git::{self, oid_exists};
@@ -206,7 +206,7 @@ pub fn sync_pr_refs_to_tagged_owner_repos(
     );
 
     // Collect authorized maintainers per owner
-    let by_owner = collect_authorized_maintainers(&db_repo_data.announcements);
+    let by_owner = collect_state_maintainers_by_coordinate(&db_repo_data.announcements);
 
     for (owner, maintainers) in &by_owner {
         // Skip the source owner - we already have the data there
@@ -382,7 +382,7 @@ pub fn sync_to_owner_repos(
     let mut result = SyncResult::default();
 
     // Collect authorized maintainers per owner
-    let by_owner = collect_authorized_maintainers(&db_repo_data.announcements);
+    let by_owner = collect_state_maintainers_by_coordinate(&db_repo_data.announcements);
     let state_author = state.event.pubkey.to_hex();
 
     debug!(
@@ -1002,7 +1002,7 @@ pub async fn process_repos_populated_by_state_copy(
 ) -> ProcessResult {
     let empty_oids: HashSet<String> = HashSet::new();
     let mut aggregate = ProcessResult::default();
-    let maintainers_by_owner = collect_authorized_maintainers(&repo_data.announcements);
+    let maintainers_by_owner = collect_state_maintainers_by_coordinate(&repo_data.announcements);
 
     for announcement in &repo_data.announcements {
         let target_repo_path = git_data_path.join(announcement.repo_path());
@@ -1134,12 +1134,13 @@ async fn process_purgatory_state_events(
 
         // CRITICAL: Check authorization before processing
         // State events MUST be rejected if author is not in maintainer set
-        let authorized_owners = crate::git::authorization::pubkey_authorised_for_repo_owners(
-            &entry.event.pubkey,
-            &db_repo_data,
-        );
+        let authorized_coordinates =
+            crate::git::authorization::repository_coordinates_authorized_by(
+                &entry.event.pubkey,
+                &db_repo_data,
+            );
 
-        if authorized_owners.is_empty() {
+        if authorized_coordinates.is_empty() {
             warn!(
                 identifier = %identifier,
                 event_id = %entry.event.id,
@@ -1160,7 +1161,7 @@ async fn process_purgatory_state_events(
             identifier = %identifier,
             event_id = %entry.event.id,
             author = %entry.event.pubkey.to_hex(),
-            authorized_for_owners = ?authorized_owners,
+            authorized_coordinates = ?authorized_coordinates,
             "State event author authorized via maintainer set"
         );
 

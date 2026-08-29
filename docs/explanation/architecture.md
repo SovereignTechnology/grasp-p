@@ -199,10 +199,10 @@ See [`src/git/handlers.rs:22-98`](src/git/handlers.rs:22-98) for the info-refs i
 **Core Logic:**
 
 ```rust
-/// Get authorization info for a repository owner
-pub async fn get_authorization_for_owner(
+/// Get authorization for the repository coordinate selected by the URL
+pub async fn get_state_authorization_for_selected_repo(
     database: &SharedDatabase,
-    pubkey: &PublicKey,
+    selected_pubkey: &str,
     identifier: &str,
 ) -> Result<AuthorizationResult, AuthorizationError>
 
@@ -230,8 +230,8 @@ The [`Nip34WritePolicy`](src/nostr/builder.rs:51) is the core event validation l
 ///
 /// Validates all events according to GRASP-01 specification:
 /// - Repository announcements must list service in clone and relays tags
-///   EXCEPTION: Recursive maintainer announcements are accepted even without
-///   listing the service, to enable maintainer chain discovery and GRASP-02 sync
+///   EXCEPTION: Maintainer-discovery candidates are accepted even without
+///   listing the service; this admits dependencies but grants no state authority
 /// - Repository state announcements must have valid structure
 /// - Other events must reference accepted repositories or events
 /// - Forward references are supported (events referenced by accepted events)
@@ -319,8 +319,13 @@ suppresses the deprecated `maintainers` fallback, and a self-`o` entry is
 a self-role, so a moderator-only author is not implicitly a maintainer.
 `o` listings do not create maintainer invitations.
 
-Authorization follows a reciprocal membership rule, computed per owner by
+Authorization follows a reciprocal membership rule, computed per selected
+announcement coordinate by
 [`compute_membership`](src/git/authorization.rs):
+
+Here, **selected coordinate** is the authorization term. **Owner view** remains
+the storage term for the physical `<announcement-pubkey>/<identifier>.git`
+repository selected by a URL; it does not imply that signer retains authority.
 
 - A pubkey listed as a maintainer is only **invited** until its own
   announcement for the same identifier lists back an existing confirmed
@@ -339,6 +344,14 @@ Authorization follows a reciprocal membership rule, computed per owner by
   Missing, ambiguous, and cyclic explicit paths grant no state authority, and
   a former maintainer's forwarding coordinate does not restore that signer to
   the confirmed set.
+- Parsing retains only a present-tense role view: current `M`/`m`
+  maintainers, current `M` lead targets, and whether the announcement author
+  currently claims maintainership. History markers are validated and consumed
+  to derive that view, then discarded.
+- Lead resolution records why a coordinate failed (missing selected or lead
+  announcement, inactive selected author, incomplete or ambiguous path, or
+  cycle). Authorization callers deliberately collapse every failure to an
+  empty set while diagnostics and tests retain the distinction.
 
 #### [`policy/state.rs`](src/nostr/policy/state.rs) - State Event Authorization
 
@@ -497,9 +510,10 @@ Configuration is loaded via **clap CLI > environment variables > .env > defaults
                 ↓
 4. Extract npub and identifier from URL
                 ↓
-5. authorization::get_authorization_for_owner()
+5. authorization::get_state_authorization_for_selected_repo()
    ├─ Query database for announcements
-   ├─ Compute confirmed maintainer set (reciprocal membership)
+   ├─ Resolve selected coordinate through its active lead path
+   ├─ Compute confirmed maintainer set (reciprocal fixpoint)
    └─ Get latest authorized state
                 ↓
 6. authorization::validate_push_refs()

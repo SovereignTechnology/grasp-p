@@ -100,7 +100,7 @@ Client              Server (ngit-grasp)
 pub async fn authorize_push(
     database: &SharedDatabase,
     identifier: &str,
-    owner_pubkey: &str,
+    selected_pubkey: &str,
     request_body: &Bytes,
     purgatory: &Arc<Purgatory>,  // Can check purgatory!
     repo_path: &std::path::Path,
@@ -223,7 +223,7 @@ pub async fn handle_receive_pack(
     let auth = authorize_push(
         &database,
         identifier,
-        owner_pubkey,
+        selected_pubkey,
         &body,
         &purgatory,  // Can check purgatory!
         &repo_path
@@ -310,7 +310,7 @@ The authorization flow (from [`src/git/authorization.rs:51-162`](../../src/git/a
 pub async fn authorize_push(
     database: &SharedDatabase,
     identifier: &str,
-    owner_pubkey: &str,
+    selected_pubkey: &str,
     request_body: &Bytes,
     purgatory: &Arc<Purgatory>,
     repo_path: &std::path::Path,
@@ -328,7 +328,8 @@ pub async fn authorize_push(
 
     // 4. Handle normal refs (state events)
     //    - Check database + purgatory for state events
-    //    - Collect authorized maintainers
+    //    - Resolve the selected coordinate's active lead path
+    //    - Compute reciprocal confirmed membership from that root
     //    - Find latest authorized state
     //    - Validate refs match state
 
@@ -340,7 +341,9 @@ pub async fn authorize_push(
 
 1. **For state refs** (`refs/heads/*`, `refs/tags/*`):
 
-   - Query database for announcements → collect authorized maintainers
+   - Parse role history into current activity only
+   - Resolve the URL-selected coordinate through one active `M` path
+   - Compute its reciprocal confirmed-maintainer component
    - Check **purgatory** for matching state events (critical for purgatory flow!)
    - Filter to events from authorized maintainers
    - Find latest state event
@@ -353,6 +356,14 @@ pub async fn authorize_push(
    - Collect PR events from purgatory for post-push processing
 
 **No-Op Push Acceptance:** Pushes where all refs have `old_oid == new_oid` are accepted without requiring a purgatory state event, matching Git's "Everything up-to-date" behavior and avoiding race condition rejections.
+
+Role history does not flow through authorization. Announcement parsing
+validates the alternating start/end markers and derives only current active
+maintainers, current active `M` lead targets, and whether the announcement
+author currently claims maintainership. Authorization then resolves the
+selected coordinate's lead path and computes reciprocal membership. Missing,
+inactive, incomplete, ambiguous, or cyclic roots fail closed; their distinct
+internal results exist for diagnostics, not as alternative authority modes.
 
 ---
 
@@ -369,15 +380,19 @@ When a state event arrives via WebSocket or sync:
 impl StatePolicy {
     async fn admit_event(&self, event: &Event) -> Result<Decision, Error> {
         // Check 1: Does announcement exist for this repository?
-        let announcements = query_announcements(pubkey, identifier);
+        let announcements = query_announcements(identifier);
         if announcements.is_empty() {
             return Reject("No announcement exists for repository");
         }
         
-        // Check 2: Is author in maintainer set?
-        let maintainers = build_maintainer_set(announcements);
-        if !maintainers.contains(&event.author) {
-            return Reject("Author not in maintainer set");
+        // Check 2: Does any selected coordinate resolve to a confirmed
+        // component containing this state-event author?
+        let coordinates = repository_coordinates_authorized_by(
+            event.author,
+            announcements,
+        );
+        if coordinates.is_empty() {
+            return Reject("Author not authorized for this repository");
         }
         
         // If git data doesn't exist yet, goes to purgatory
@@ -393,12 +408,15 @@ When a repository announcement is accepted, waiting state events are re-evaluate
 ```rust
 // After announcement is saved to database
 for state_event in purgatory.get_state_events(identifier) {
-    // Re-check authorization now that announcement exists
-    if author_in_maintainer_set(state_event.author, identifier) {
+    // Re-resolve current authorization now that the dependency exists.
+    if repository_coordinates_authorized_by(
+        state_event.author,
+        announcements,
+    ).is_empty() {
+        // Remove from purgatory - not currently authorized
+    } else {
         // If git data now exists, save to database
         // Otherwise, keep in purgatory
-    } else {
-        // Remove from purgatory - not authorized
     }
 }
 ```
@@ -411,7 +429,11 @@ When git data is pushed, purgatory state events are validated before saving:
 // src/git/handlers.rs - after successful git push
 for state_event in purgatory.get_matching_state_events(identifier) {
     // Final authorization check before database save
-    if author_in_maintainer_set(state_event.author, identifier) {
+    let coordinates = repository_coordinates_authorized_by(
+        state_event.author,
+        announcements,
+    );
+    if !coordinates.is_empty() {
         database.save(state_event);
         purgatory.remove(state_event);
     } else {
@@ -447,7 +469,7 @@ available. During that bootstrap flow, rejected state events are:
 
 1. **Retained** in the cold index until policy processing succeeds
 2. **Retrieved** from the hot cache and re-processed immediately when the full event is still available
-3. **Fetched by exact event ID** from the recursive maintainer relay chain when the hot-cache copy has expired
+3. **Fetched by exact event ID** from maintainer-discovery relay dependencies when the hot-cache copy has expired
 4. **Removed from both tiers** only after the event is accepted, enters purgatory, or is already stored
 
 Repository announcements are processed before dependent state events. Network

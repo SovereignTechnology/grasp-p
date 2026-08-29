@@ -10,7 +10,8 @@
 //! ## Authorization Flow (Efficient Single-Query Approach)
 //!
 //! 1. Fetch announcement and state events for the repository from the relay database
-//! 2. Compute the confirmed maintainer set for the owner's repository
+//! 2. Resolve the selected repository coordinate and compute its confirmed
+//!    maintainer set
 //! 3. Find the latest state event authored by a confirmed maintainer
 //! 4. Validate that the pushed refs match the state event
 //!
@@ -51,14 +52,14 @@ use nostr_sdk::prelude::{Kind, PublicKey};
 pub async fn authorize_push(
     database: &SharedDatabase,
     identifier: &str,
-    owner_pubkey: &str,
+    selected_pubkey: &str,
     request_body: &Bytes,
     purgatory: &Arc<Purgatory>,
     repo_path: &std::path::Path,
 ) -> anyhow::Result<AuthorizationResult> {
     debug!(
-        "Authorizing push for {} owned by {} via database query",
-        identifier, owner_pubkey
+        "Authorizing push for {} through selected coordinate {} via database query",
+        identifier, selected_pubkey
     );
 
     // Parse refs from the push request
@@ -126,10 +127,10 @@ pub async fn authorize_push(
             "Found {} non-refs/nostr/ refs - checking state authorization",
             state_refs.len()
         );
-        let auth_result = get_state_authorization_for_specific_owner_repo(
+        let auth_result = get_state_authorization_for_selected_repo(
             database,
             identifier,
-            owner_pubkey,
+            selected_pubkey,
             purgatory,
             &pushed_refs, //it would be better to accept state_refs but thats in different format
             repo_path,
@@ -298,25 +299,35 @@ pub async fn fetch_repository_data_with_purgatory(
     Ok(repo_data)
 }
 
+pub fn repository_coordinates_authorized_by(
+    pubkey: &PublicKey,
+    db_repo_data: &RepositoryData,
+) -> Vec<String> {
+    let mut authorized_coordinates = HashSet::new();
+    let collections = collect_state_maintainers_by_coordinate(&db_repo_data.announcements);
+    let pubkey = pubkey.to_hex();
+    for (selected_pubkey, authorized) in collections {
+        if authorized.contains(&pubkey) {
+            authorized_coordinates.insert(selected_pubkey);
+        }
+    }
+    authorized_coordinates.into_iter().collect()
+}
+
+/// Compatibility alias retaining the v3.0 public API.
+#[deprecated(since = "3.0.1", note = "use repository_coordinates_authorized_by")]
 pub fn pubkey_authorised_for_repo_owners(
     pubkey: &PublicKey,
     db_repo_data: &RepositoryData,
 ) -> Vec<String> {
-    let mut repo_owners_authorising_pubkey = HashSet::new();
-    let collections = collect_authorized_maintainers(&db_repo_data.announcements);
-    for (owner, authoised) in collections {
-        if authoised.contains(&pubkey.to_hex()) {
-            repo_owners_authorising_pubkey.insert(owner.to_string());
-        }
-    }
-    repo_owners_authorising_pubkey.iter().cloned().collect()
+    repository_coordinates_authorized_by(pubkey, db_repo_data)
 }
 
-/// Confirmed membership of one owner's repository.
+/// Confirmed membership resolved from one selected repository coordinate.
 #[derive(Debug, Default)]
 pub struct RepoMembership {
     /// Pubkeys whose repository state events are authoritative for this
-    /// owner's selected repository view: the resolved lead or selected
+    /// selected repository view: the resolved lead or selected
     /// leadless/legacy root plus every confirmed maintainer.
     pub state_maintainers: HashSet<String>,
     /// Pubkeys currently listed as maintainers whose own announcement does
@@ -326,7 +337,31 @@ pub struct RepoMembership {
     pub invited: HashSet<String>,
 }
 
-/// Compute the confirmed maintainer set for `owner`'s repository.
+/// Why a selected repository coordinate could not resolve an authority root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MembershipResolutionError {
+    SelectedAnnouncementMissing {
+        selected_pubkey: String,
+    },
+    SelectedAuthorInactive {
+        selected_pubkey: String,
+    },
+    LeadAnnouncementMissing {
+        lead_pubkey: String,
+    },
+    LeadPathIncomplete {
+        at_pubkey: String,
+    },
+    AmbiguousActiveLeads {
+        at_pubkey: String,
+        leads: Vec<String>,
+    },
+    LeadCycle {
+        at_pubkey: String,
+    },
+}
+
+/// Resolve the confirmed maintainer set for a selected repository coordinate.
 ///
 /// A pubkey listed as a maintainer is only *invited* until its own
 /// announcement for the same identifier lists back a pubkey that is already
@@ -344,11 +379,11 @@ pub struct RepoMembership {
 /// path. Missing, ambiguous, or cyclic explicit paths grant no authority.
 /// This prevents a removed maintainer's forwarding coordinate from restoring
 /// that signer to the confirmed set.
-pub fn compute_membership(
+fn resolve_membership(
     announcements: &[RepositoryAnnouncement],
-    owner: &str,
+    selected_pubkey: &str,
     identifier: &str,
-) -> RepoMembership {
+) -> Result<RepoMembership, MembershipResolutionError> {
     let find = |pubkey: &str| {
         announcements
             .iter()
@@ -359,26 +394,50 @@ pub fn compute_membership(
     // this is a legacy or deliberately leadless view rooted at the selected
     // author. Once an explicit path is followed, only an active self-M may
     // terminate it; incomplete, ambiguous, and cyclic paths fail closed.
-    let mut root = owner.to_string();
+    let mut root = selected_pubkey.to_string();
     let mut followed_explicit_lead = false;
     let mut visited = HashSet::new();
     loop {
         if !visited.insert(root.clone()) {
-            return RepoMembership::default();
+            return Err(MembershipResolutionError::LeadCycle { at_pubkey: root });
         }
         let Some(announcement) = find(&root) else {
-            return RepoMembership::default();
+            return Err(if followed_explicit_lead {
+                MembershipResolutionError::LeadAnnouncementMissing { lead_pubkey: root }
+            } else {
+                MembershipResolutionError::SelectedAnnouncementMissing {
+                    selected_pubkey: root,
+                }
+            });
         };
         let active_leads = announcement.active_leads();
-        match active_leads.as_slice() {
-            [] if !followed_explicit_lead && announcement.author_role_active() => break,
-            [] => return RepoMembership::default(),
-            [lead] if lead == &root && announcement.author_role_active() => break,
+        match active_leads {
+            [] if !followed_explicit_lead
+                && announcement.announcement_author_is_active_maintainer() =>
+            {
+                break;
+            }
+            [] if !followed_explicit_lead => {
+                return Err(MembershipResolutionError::SelectedAuthorInactive {
+                    selected_pubkey: root,
+                });
+            }
+            [] => {
+                return Err(MembershipResolutionError::LeadPathIncomplete { at_pubkey: root });
+            }
+            // A valid active self-M necessarily makes the announcement
+            // author an active maintainer, so it is a complete terminal.
+            [lead] if lead == &root => break,
             [lead] if lead != &root => {
                 root = lead.clone();
                 followed_explicit_lead = true;
             }
-            _ => return RepoMembership::default(),
+            _ => {
+                return Err(MembershipResolutionError::AmbiguousActiveLeads {
+                    at_pubkey: root,
+                    leads: active_leads.to_vec(),
+                });
+            }
         }
     }
 
@@ -401,7 +460,7 @@ pub fn compute_membership(
             let Some(candidate_announcement) = find(candidate) else {
                 continue; // invited: no announcement of their own yet
             };
-            if !candidate_announcement.author_role_active() {
+            if !candidate_announcement.announcement_author_is_active_maintainer() {
                 continue; // left: an ended self-role takes precedence
             }
             let lists_back = candidate_announcement
@@ -420,63 +479,111 @@ pub fn compute_membership(
                 .filter(|pubkey| !confirmed.contains(pubkey))
                 // A pubkey whose own announcement shows it left is not
                 // invited.
-                .filter(|pubkey| !find(pubkey).is_some_and(|a| a.author_has_left()))
+                .filter(|pubkey| {
+                    find(pubkey).is_none_or(|a| a.announcement_author_is_active_maintainer())
+                })
                 .collect();
-            return RepoMembership {
+            return Ok(RepoMembership {
                 state_maintainers: confirmed,
                 invited,
-            };
+            });
         }
     }
 }
 
-/// Collect authorized state publishers grouped by owner from a set of
-/// announcements.
+/// Compute membership while preserving the fail-closed public shape.
 ///
-/// For each announcement, returns a map from owner pubkey to the pubkeys
-/// whose repository state events are authoritative for that owner's
-/// repository: the confirmed maintainer set computed by
+/// Callers that only need authorization receive an empty membership when the
+/// selected coordinate cannot resolve. The internal resolver retains the
+/// precise failure reason for diagnostics and focused tests.
+pub fn compute_membership(
+    announcements: &[RepositoryAnnouncement],
+    selected_pubkey: &str,
+    identifier: &str,
+) -> RepoMembership {
+    match resolve_membership(announcements, selected_pubkey, identifier) {
+        Ok(membership) => membership,
+        Err(error) => {
+            debug!(
+                selected_pubkey,
+                identifier,
+                ?error,
+                "Membership resolution failed closed"
+            );
+            RepoMembership::default()
+        }
+    }
+}
+
+/// Collect authorized state publishers grouped by selected announcement
+/// coordinate.
+///
+/// For each announcement, returns a map from its author pubkey to the pubkeys
+/// whose repository state events are authoritative through that selected
+/// coordinate: the confirmed maintainer set computed by
 /// [`compute_membership`]. Invited pubkeys (listed but without a reciprocal
-/// announcement) are never included.
-pub fn collect_authorized_maintainers(
+/// announcement) are never included. Coordinates with invalid lead
+/// resolution remain present with an empty set so callers fail closed.
+pub fn collect_state_maintainers_by_coordinate(
     announcements: &[RepositoryAnnouncement],
 ) -> HashMap<String, Vec<String>> {
-    let mut by_owner: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_coordinate: HashMap<String, Vec<String>> = HashMap::new();
 
     for announcement in announcements {
-        let owner = announcement.event.pubkey.to_hex();
-        let membership = compute_membership(announcements, &owner, &announcement.identifier);
-        by_owner.insert(owner, membership.state_maintainers.into_iter().collect());
+        let selected_pubkey = announcement.event.pubkey.to_hex();
+        let maintainers =
+            match resolve_membership(announcements, &selected_pubkey, &announcement.identifier) {
+                Ok(membership) => membership.state_maintainers.into_iter().collect(),
+                Err(error) => {
+                    debug!(
+                        identifier = %announcement.identifier,
+                        selected_pubkey,
+                        ?error,
+                        "Selected repository coordinate has no state authority"
+                    );
+                    Vec::new()
+                }
+            };
+        by_coordinate.insert(selected_pubkey, maintainers);
     }
 
     debug!(
-        "Collected confirmed state maintainers for {} owners from {} announcements",
-        by_owner.len(),
+        "Collected confirmed state maintainers for {} coordinates from {} announcements",
+        by_coordinate.len(),
         announcements.len()
     );
 
-    by_owner
+    by_coordinate
 }
 
-/// Get the authorization result for a repository scoped to a specific owner
+/// Compatibility alias retaining the v3.0 public API.
+#[deprecated(since = "3.0.1", note = "use collect_state_maintainers_by_coordinate")]
+pub fn collect_authorized_maintainers(
+    announcements: &[RepositoryAnnouncement],
+) -> HashMap<String, Vec<String>> {
+    collect_state_maintainers_by_coordinate(announcements)
+}
+
+/// Get the authorization result for a selected repository coordinate.
 ///
 /// Push authorization checks ONLY purgatory for state events. The database represents
 /// the current git state, while purgatory holds the intended future state that pushes
 /// should be authorized against.
 ///
-/// A push to `alice/my-repo` should only consider authorization from alice's
-/// announcement, not bob's announcement for the same identifier.
+/// A push to `alice/my-repo` resolves authority from Alice's selected
+/// coordinate. That coordinate may validly lead to Bob's announcement, but an
+/// unrelated same-identifier component is not considered.
 ///
 /// It:
 /// 1. Fetches announcements for the identifier
-/// 2. Collects authorized maintainers from owner's announcement
+/// 2. Resolves authorized maintainers from the selected coordinate
 /// 3. Checks purgatory for matching state events from authorized maintainers
 ///
 /// Returns an `AuthorizationResult` that indicates whether a push is authorized.
-pub async fn get_state_authorization_for_specific_owner_repo(
+pub async fn get_state_authorization_for_selected_repo(
     database: &SharedDatabase,
     identifier: &str,
-    owner_pubkey: &str,
+    selected_pubkey: &str,
     purgatory: &std::sync::Arc<crate::purgatory::Purgatory>,
     pushed_refs: &[(String, String, String)],
     repo_path: &std::path::Path,
@@ -494,16 +601,16 @@ pub async fn get_state_authorization_for_specific_owner_repo(
         ));
     }
 
-    // Collect authorized maintainers grouped by owner from all announcements
-    let by_owner = collect_authorized_maintainers(&repo_data.announcements);
+    // Collect authorized maintainers grouped by selected coordinate.
+    let by_coordinate = collect_state_maintainers_by_coordinate(&repo_data.announcements);
 
-    // Look up the authorized set for this specific owner
-    let authorized: HashSet<String> = match by_owner.get(owner_pubkey) {
+    // Look up the authorized set resolved from this specific coordinate.
+    let authorized: HashSet<String> = match by_coordinate.get(selected_pubkey) {
         Some(maintainers) => maintainers.iter().cloned().collect(),
         None => {
             return Ok(AuthorizationResult::denied(format!(
-                "No repository announcement found for owner {}",
-                owner_pubkey
+                "No repository announcement found for selected coordinate {}",
+                selected_pubkey
             )));
         }
     };
@@ -515,10 +622,10 @@ pub async fn get_state_authorization_for_specific_owner_repo(
     }
 
     debug!(
-        "Found {} authorized maintainers for repository {} (owner: {})",
+        "Found {} authorized maintainers for repository {} (selected coordinate: {})",
         authorized.len(),
         identifier,
-        owner_pubkey
+        selected_pubkey
     );
 
     // Accept pushes where all refs are already at the desired state (old_oid == new_oid)
@@ -530,8 +637,8 @@ pub async fn get_state_authorization_for_specific_owner_repo(
 
         if all_refs_unchanged {
             debug!(
-                "All pushed refs unchanged (old_oid == new_oid) for {} owned by {}, accepting without purgatory check",
-                identifier, owner_pubkey
+                "All pushed refs unchanged (old_oid == new_oid) for {} through selected coordinate {}, accepting without purgatory check",
+                identifier, selected_pubkey
             );
             return Ok(AuthorizationResult {
                 authorized: true,
@@ -601,7 +708,7 @@ pub async fn get_state_authorization_for_specific_owner_repo(
                 // also extends the announcement's expiry. The repo is actively receiving
                 // git data, so the announcement should not expire prematurely.
                 // This also revives soft-expired announcements (recreates bare repo).
-                if let Ok(owner_pk) = PublicKey::parse(owner_pubkey) {
+                if let Ok(owner_pk) = PublicKey::parse(selected_pubkey) {
                     if purgatory.has_purgatory_announcement(&owner_pk, identifier) {
                         purgatory.extend_announcement_expiry(
                             &owner_pk,
@@ -610,7 +717,7 @@ pub async fn get_state_authorization_for_specific_owner_repo(
                         );
                         debug!(
                             identifier = %identifier,
-                            owner = %owner_pubkey,
+                            selected_pubkey,
                             "Extended purgatory announcement expiry due to git push authorization"
                         );
                     }
@@ -716,6 +823,33 @@ pub async fn get_state_authorization_for_specific_owner_repo(
     Ok(AuthorizationResult::denied(
         "No matching state event found in purgatory from authorized publishers",
     ))
+}
+
+/// Compatibility alias retaining the v3.0 public API.
+///
+/// The legacy `owner_pubkey` argument is the selected announcement coordinate;
+/// it never grants implicit authority to that signer.
+#[deprecated(
+    since = "3.0.1",
+    note = "use get_state_authorization_for_selected_repo"
+)]
+pub async fn get_state_authorization_for_specific_owner_repo(
+    database: &SharedDatabase,
+    identifier: &str,
+    owner_pubkey: &str,
+    purgatory: &std::sync::Arc<crate::purgatory::Purgatory>,
+    pushed_refs: &[(String, String, String)],
+    repo_path: &std::path::Path,
+) -> Result<AuthorizationResult> {
+    get_state_authorization_for_selected_repo(
+        database,
+        identifier,
+        owner_pubkey,
+        purgatory,
+        pushed_refs,
+        repo_path,
+    )
+    .await
 }
 
 /// Result of authorization check
@@ -1298,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_owner_is_sole_state_maintainer() {
+    fn test_selected_legacy_author_is_sole_state_maintainer() {
         let alice = create_test_keys();
         let identifier = "test-repo";
         let announcements = vec![parse(create_announcement_event(&alice, identifier, &[]))];
@@ -1309,17 +1443,23 @@ mod tests {
     }
 
     #[test]
-    fn test_no_owner_announcement_means_no_membership() {
+    fn test_missing_selected_announcement_means_no_membership() {
         let alice = create_test_keys();
         let bob = create_test_keys();
         let identifier = "test-repo";
 
-        // Only Bob has announced; Alice's repository has no membership.
+        // Only Bob has announced; Alice's selected coordinate cannot resolve.
         let announcements = vec![parse(create_announcement_event(&bob, identifier, &[]))];
 
         let membership = compute_membership(&announcements, &hex(&alice), identifier);
         assert!(membership.state_maintainers.is_empty());
         assert!(membership.invited.is_empty());
+        assert_eq!(
+            resolve_membership(&announcements, &hex(&alice), identifier).unwrap_err(),
+            MembershipResolutionError::SelectedAnnouncementMissing {
+                selected_pubkey: hex(&alice)
+            }
+        );
     }
 
     #[test]
@@ -1339,8 +1479,8 @@ mod tests {
         assert!(!membership.state_maintainers.contains(&hex(&bob)));
         assert!(membership.invited.contains(&hex(&bob)));
 
-        let by_owner = collect_authorized_maintainers(&announcements);
-        assert!(!by_owner[&hex(&alice)].contains(&hex(&bob)));
+        let by_coordinate = collect_state_maintainers_by_coordinate(&announcements);
+        assert!(!by_coordinate[&hex(&alice)].contains(&hex(&bob)));
     }
 
     #[test]
@@ -1506,6 +1646,12 @@ mod tests {
         let membership = compute_membership(&announcements, &hex(&alice), identifier);
         assert!(membership.state_maintainers.is_empty());
         assert!(membership.invited.is_empty());
+        assert_eq!(
+            resolve_membership(&announcements, &hex(&alice), identifier).unwrap_err(),
+            MembershipResolutionError::SelectedAuthorInactive {
+                selected_pubkey: hex(&alice)
+            }
+        );
     }
 
     #[test]
@@ -1537,9 +1683,9 @@ mod tests {
             announcements,
             states: Vec::new(),
         };
-        assert!(pubkey_authorised_for_repo_owners(&bob.public_key(), &repo_data).is_empty());
+        assert!(repository_coordinates_authorized_by(&bob.public_key(), &repo_data).is_empty());
         assert_eq!(
-            pubkey_authorised_for_repo_owners(&alice.public_key(), &repo_data)
+            repository_coordinates_authorized_by(&alice.public_key(), &repo_data)
                 .into_iter()
                 .collect::<HashSet<_>>(),
             HashSet::from([hex(&alice), hex(&bob)])
@@ -1557,32 +1703,65 @@ mod tests {
             identifier,
             &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
         ));
-        let missing_lead = compute_membership(
+        let missing_lead = resolve_membership(
             std::slice::from_ref(&bob_announcement),
             &hex(&bob),
             identifier,
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_lead,
+            MembershipResolutionError::LeadAnnouncementMissing {
+                lead_pubkey: hex(&alice)
+            }
         );
-        assert!(missing_lead.state_maintainers.is_empty());
+
+        let lead_without_active_m = parse(create_announcement_event(&alice, identifier, &[]));
+        let incomplete = resolve_membership(
+            &[bob_announcement.clone(), lead_without_active_m],
+            &hex(&bob),
+            identifier,
+        )
+        .unwrap_err();
+        assert_eq!(
+            incomplete,
+            MembershipResolutionError::LeadPathIncomplete {
+                at_pubkey: hex(&alice)
+            }
+        );
 
         let ambiguous = parse(create_role_announcement(
             &alice,
             identifier,
             &[("M", vec![hex(&alice)]), ("M", vec![hex(&bob)])],
         ));
-        let ambiguous_lead = compute_membership(&[ambiguous], &hex(&alice), identifier);
-        assert!(ambiguous_lead.state_maintainers.is_empty());
+        let ambiguous_lead =
+            resolve_membership(&[ambiguous], &hex(&alice), identifier).unwrap_err();
+        assert_eq!(
+            ambiguous_lead,
+            MembershipResolutionError::AmbiguousActiveLeads {
+                at_pubkey: hex(&alice),
+                leads: vec![hex(&alice), hex(&bob)],
+            }
+        );
 
         let alice_announcement = parse(create_role_announcement(
             &alice,
             identifier,
             &[("M", vec![hex(&bob)]), ("m", vec![hex(&alice)])],
         ));
-        let cycle = compute_membership(
+        let cycle = resolve_membership(
             &[alice_announcement, bob_announcement],
             &hex(&alice),
             identifier,
+        )
+        .unwrap_err();
+        assert_eq!(
+            cycle,
+            MembershipResolutionError::LeadCycle {
+                at_pubkey: hex(&alice)
+            }
         );
-        assert!(cycle.state_maintainers.is_empty());
     }
 
     #[test]

@@ -311,7 +311,7 @@ This method establishes:
 - strict management NIP-98 validation;
 - private HTTP responses;
 - repository scope parsing;
-- recursive maintainer authorization;
+- selected-coordinate authorization through active leads and reciprocal membership;
 - indistinguishable absent/unauthorized behavior; and
 - a custom method and result schema discoverable by the UI.
 

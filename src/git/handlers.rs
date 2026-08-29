@@ -631,7 +631,7 @@ async fn stream_upload_pack_output<S, E>(
 /// * `request_body` - The git pack data from the client
 /// * `database` - Database reference for authorization queries
 /// * `identifier` - The repository identifier (d tag) for authorization lookup
-/// * `owner_pubkey` - The owner's public key (hex) from the URL path, scoping authorization
+/// * `owner_pubkey` - Announcement pubkey from the URL path; selects the repository coordinate whose authority is resolved
 /// * `git_data_path` - Base path for git repositories (for syncing to other owner repos)
 /// * `git_protocol` - Optional Git protocol version (e.g., "version=2")
 #[allow(clippy::too_many_arguments)]
