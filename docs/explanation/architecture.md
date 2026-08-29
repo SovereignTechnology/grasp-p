@@ -296,16 +296,18 @@ pub struct RepositoryState { ... }
 Announcements carry maintainer listings in two formats:
 
 - **Indexed role tags** (`M` lead, `m` co-maintainer). A tag may record
-  history as alternating start/end timestamps; it is currently active when
-  it has fewer than four elements or an odd number of elements. Ended
-  entries are ignored entirely - the history is only used to conclude a
-  role has *ended*, never to grant authority for a past period. The lead /
-  co-maintainer distinction carries no meaning for this service. A pubkey
-  may appear in multiple role tags: one of each letter records a role
-  transition, and out-of-spec duplicates under the same letter are
-  tolerated. Histories are consolidated - the pubkey is a maintainer while
-  any `M`/`m` entry is active. An author who appears in no role tag is
-  implicitly a maintainer for the repository's entire history.
+  history as alternating numeric start/end timestamps; `defer` is valid only
+  as the final end boundary. It is currently active when it has no boundaries
+  or its final valid boundary is a start. Ended, deferred, and malformed
+  entries grant no authority - the history is only used to conclude a role
+  has *ended*, never to grant authority for a past period. Both `M` and `m`
+  grant maintainer authority, while active `M` records also form the lead
+  path that roots the selected repository view. A pubkey may appear in
+  multiple role tags: one of each letter records a role transition, and
+  out-of-spec duplicates under the same letter are tolerated. Histories are
+  consolidated - the pubkey is a maintainer while any valid `M`/`m` entry is
+  active. An author who appears in no role tag is implicitly a maintainer for
+  the repository's entire history.
 - **Deprecated `maintainers` tag** (fallback). Ignored when `M`/`m` tags
   are present. Without any listing tags the author is the sole maintainer.
   A `u` (subordinate fork) tag has no effect on maintainership.
@@ -331,9 +333,12 @@ Authorization follows a reciprocal membership rule, computed per owner by
   author: an ended `M`/`m` self-entry means the pubkey has left, which
   takes precedence over assignments in other announcements. An author who
   appears in no role tag implicitly asserts maintainership.
-- The owner is always a confirmed maintainer of their own repository:
-  announcing a repository in their namespace is what creates it on this
-  service.
+- A valid active `M` path is followed to a terminal self-`M` before the
+  reciprocal fixpoint is seeded. Without an active `M`, the selected author
+  roots a legacy or deliberately leadless view while their own role is active.
+  Missing, ambiguous, and cyclic explicit paths grant no state authority, and
+  a former maintainer's forwarding coordinate does not restore that signer to
+  the confirmed set.
 
 #### [`policy/state.rs`](src/nostr/policy/state.rs) - State Event Authorization
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct kind `30618` repository-state authority for a view explicitly
+  selected through a former maintainer's coordinate. Previously, only that
+  selected view could continue accepting state signed by the former
+  maintainer after the lead stopped assigning them; this did not restore the
+  former maintainer's authority over views selected through the lead or any
+  other maintainer. Selected views now resolve authority through valid active
+  `M` records to the terminal maintainer. Ended selected authors, malformed
+  role histories, missing or ambiguous lead targets, and lead cycles fail
+  closed.
+
 ## [3.0.0] - 2026-08-20
 
 ### Summary

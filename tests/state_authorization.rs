@@ -298,6 +298,81 @@ async fn state_event_rejected_as_unauthorized(client: &Client, keys: &Keys) -> b
 }
 
 #[tokio::test]
+async fn test_reject_state_from_announcement_author_with_ended_self_role() {
+    let relay = TestRelay::start().await;
+    let owner_keys = Keys::generate();
+
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom(
+                "m",
+                [
+                    owner_keys.public_key().to_hex(),
+                    "0".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+        ])
+        .finalize(&owner_keys)
+        .unwrap();
+
+    let client = Client::default();
+    client.add_relay(relay.url()).await.unwrap();
+    client.connect().await;
+    client.send_event(&announcement).await.unwrap();
+
+    assert!(
+        state_event_rejected_as_unauthorized(&client, &owner_keys).await,
+        "an ended selected author's state event must be rejected as unauthorized"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn test_reject_state_from_unassigned_forwarding_author() {
+    let relay = TestRelay::start().await;
+    let lead_keys = Keys::generate();
+    let former_keys = Keys::generate();
+
+    let lead_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("M", [lead_keys.public_key().to_hex()]),
+        ])
+        .finalize(&lead_keys)
+        .unwrap();
+    let former_announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags([
+            Tag::custom("d", ["test-repo"]),
+            Tag::custom("clone", [format!("https://{}/test.git", relay.domain())]),
+            Tag::custom("relays", [relay.url()]),
+            Tag::custom("M", [lead_keys.public_key().to_hex()]),
+            Tag::custom("m", [former_keys.public_key().to_hex()]),
+        ])
+        .finalize(&former_keys)
+        .unwrap();
+
+    let client = Client::default();
+    client.add_relay(relay.url()).await.unwrap();
+    client.connect().await;
+    client.send_event(&lead_announcement).await.unwrap();
+    client.send_event(&former_announcement).await.unwrap();
+
+    assert!(
+        state_event_rejected_as_unauthorized(&client, &former_keys).await,
+        "a forwarding signer not assigned by the lead must not regain state authority"
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn test_reject_state_from_invited_maintainer() {
     let relay = TestRelay::start().await;
 

@@ -7,7 +7,32 @@
 /// - NIP-34: https://nips.nostr.com/34
 /// - GRASP-01: https://gitworkshop.dev/danconwaydev.com/grasp/01.md
 use anyhow::{anyhow, Result};
-use nostr_sdk::prelude::{Event, Kind, ToBech32};
+use nostr_sdk::prelude::{Event, Kind, PublicKey, ToBech32};
+
+/// Whether a NIP-34 indexed role record is syntactically valid and active.
+///
+/// Values after the pubkey alternate between numeric start and end
+/// boundaries. `defer` is valid only as the final end boundary and is never
+/// active. Malformed history must not grant repository authority.
+fn role_entry_is_active(slice: &[String]) -> bool {
+    if slice.len() < 2 {
+        return false;
+    }
+
+    let boundaries = &slice[2..];
+    for (index, value) in boundaries.iter().enumerate() {
+        if value == "defer" {
+            let is_final_end = index % 2 == 1 && index + 1 == boundaries.len();
+            if !is_final_end {
+                return false;
+            }
+        } else if value.parse::<u64>().is_err() {
+            return false;
+        }
+    }
+
+    boundaries.is_empty() || boundaries.len() % 2 == 1
+}
 
 // NOTE: Using rust-nostr Kind variants instead of hardcoded constants:
 // - KIND_REPOSITORY_ANNOUNCEMENT -> Kind::GitRepoAnnouncement (30617)
@@ -34,11 +59,11 @@ pub struct RepositoryAnnouncement {
     /// `None` when the announcement contains no role tags. Moderator (`o`)
     /// entries never contribute: moderators are not maintainers.
     ///
-    /// The lead (`M`) / co-maintainer (`m`) distinction carries no meaning
-    /// for this service, so both collapse into one maintainer set. Entries
-    /// whose role history shows the role has ended are excluded entirely: an
-    /// ended role means the pubkey is no longer a maintainer, and historic
-    /// listing never grants authority for a past period.
+    /// Both `M` and `m` grant maintainer authority, so they collapse into one
+    /// maintainer set. Active `M` entries additionally drive lead resolution
+    /// through [`Self::active_leads`]. Entries whose role history is malformed
+    /// or ended are excluded entirely: historic listing never grants
+    /// authority for a past period.
     pub role_maintainers: Option<Vec<String>>,
     /// Whether any role tag names the author, active or ended. Per NIP-34 an
     /// author without a self-entry is implicitly a maintainer for the
@@ -127,13 +152,14 @@ impl RepositoryAnnouncement {
         // Extract maintainer pubkeys from NIP-34 `M`/`m`/`o` role tags
         // Format: ["M"|"m"|"o", "<pubkey-hex>", "<start>", "<end>", ...]
         // A role tag lists a pubkey followed by optional alternating start/end
-        // history timestamps; it is currently active when it has fewer than
-        // four elements or an odd number of elements. Ended entries are
-        // ignored entirely. A pubkey may appear in multiple role tags: one
-        // tag of each letter records transitions between roles, and
-        // out-of-spec duplicates under the same letter are tolerated. The
-        // histories are consolidated - the pubkey is a maintainer while any
-        // of its `M`/`m` entries is active.
+        // history timestamps; it is currently active when it has no history
+        // or its final valid boundary is a start. `defer` is accepted only as
+        // the final end boundary. Ended and malformed entries are ignored for
+        // authority. A pubkey may appear in multiple role tags: one tag of
+        // each letter records transitions between roles, and out-of-spec
+        // duplicates under the same letter are tolerated. The histories are
+        // consolidated - the pubkey is a maintainer while any of its valid
+        // `M`/`m` entries is active.
         //
         // The moderator role (`o`) grants no maintainership: moderators are
         // only empowered to have status events (kinds 1630-1633) treated as
@@ -144,7 +170,6 @@ impl RepositoryAnnouncement {
         // counts as a role tag: its presence suppresses the deprecated
         // `maintainers` fallback, and a self-`o` entry is a self-role, so
         // the author is not implicitly a maintainer.
-        let author_hex = event.pubkey.to_hex();
         let mut role_tags_present = false;
         let mut author_has_role_entry = false;
         let mut role_active: Vec<String> = Vec::new();
@@ -158,15 +183,21 @@ impl RepositoryAnnouncement {
             let Some(pubkey) = slice.get(1).filter(|value| !value.is_empty()) else {
                 continue;
             };
-            if *pubkey == author_hex {
+            let parsed_pubkey = PublicKey::from_hex(pubkey).ok();
+            if parsed_pubkey.as_ref() == Some(&event.pubkey) {
                 author_has_role_entry = true;
             }
             if kind == "o" {
                 continue;
             }
-            let active = slice.len() < 4 || slice.len() % 2 == 1;
-            if active && !role_active.contains(pubkey) {
-                role_active.push(pubkey.clone());
+            if role_entry_is_active(slice) {
+                let Some(parsed_pubkey) = parsed_pubkey else {
+                    continue;
+                };
+                let pubkey = parsed_pubkey.to_hex();
+                if !role_active.contains(&pubkey) {
+                    role_active.push(pubkey);
+                }
             }
         }
         let role_maintainers = role_tags_present.then_some(role_active);
@@ -224,6 +255,32 @@ impl RepositoryAnnouncement {
             }
         }
         listed
+    }
+
+    /// Distinct targets of syntactically valid, currently-active `M` records.
+    ///
+    /// An active `M` is both a maintainer edge and an explicit lead pointer.
+    /// Duplicate records for one target are consolidated; distinct targets
+    /// remain visible so authority resolution can fail closed on ambiguity.
+    pub fn active_leads(&self) -> Vec<String> {
+        let mut leads = Vec::new();
+        for tag in self.event.tags.iter() {
+            let slice = tag.as_slice();
+            if slice.first().map(String::as_str) != Some("M") || !role_entry_is_active(slice) {
+                continue;
+            }
+            let Some(pubkey) = slice
+                .get(1)
+                .and_then(|value| PublicKey::from_hex(value).ok())
+            else {
+                continue;
+            };
+            let pubkey = pubkey.to_hex();
+            if !leads.contains(&pubkey) {
+                leads.push(pubkey);
+            }
+        }
+        leads
     }
 
     /// Whether this announcement asserts an active maintainer role for its
@@ -928,20 +985,22 @@ mod tests {
     }
 
     #[test]
-    fn test_role_tag_activeness_by_element_count() {
+    fn test_role_tag_activeness_requires_valid_history() {
         let keys = create_test_keys();
         let author = keys.public_key().to_hex();
         let other = create_test_keys().public_key().to_hex();
 
         // (history values after the pubkey, expected active)
-        // Tag element counts: 2 -> active, 3 -> active, 4 -> ended,
-        // 5 -> active, 6 -> ended.
         let cases: Vec<(Vec<&str>, bool)> = vec![
             (vec![], true),
             (vec!["100"], true),
             (vec!["100", "200"], false),
             (vec!["100", "200", "300"], true),
             (vec!["100", "200", "300", "400"], false),
+            (vec!["100", "defer"], false),
+            (vec!["not-a-timestamp"], false),
+            (vec!["defer"], false),
+            (vec!["100", "defer", "300"], false),
         ];
 
         for (history, expected_active) in cases {
@@ -955,6 +1014,28 @@ mod tests {
                 "history {history:?} expected active={expected_active}"
             );
         }
+    }
+
+    #[test]
+    fn test_active_leads_include_only_valid_distinct_targets() {
+        let keys = create_test_keys();
+        let first = create_test_keys().public_key().to_hex();
+        let second = create_test_keys().public_key().to_hex();
+        let ended = create_test_keys().public_key().to_hex();
+        let malformed = create_test_keys().public_key().to_hex();
+
+        let announcement = role_announcement(
+            &keys,
+            vec![
+                ("M", vec![first.clone()]),
+                ("M", vec![first.clone(), "100".to_string()]),
+                ("M", vec![second.clone()]),
+                ("M", vec![ended, "100".to_string(), "200".to_string()]),
+                ("M", vec![malformed, "not-a-timestamp".to_string()]),
+            ],
+        );
+
+        assert_eq!(announcement.active_leads(), vec![first, second]);
     }
 
     #[test]

@@ -215,9 +215,11 @@ NIP-34 maintainers model refined in nips commit `781590b`).
   until its own announcement for the same identifier lists back an existing
   confirmed maintainer.
 - Only confirmed maintainers publish authoritative repository state.
-- The owner is always a confirmed maintainer of their own repository:
-  announcing a repository in their namespace is what creates it on this
-  service.
+- Authority is rooted at the terminal lead reached through valid active `M`
+  records. Without an active `M`, the selected author roots a legacy or
+  deliberately leadless view only while their own role is active. Once an
+  explicit path is followed, a missing target, multiple active targets, or a
+  cycle grants no repository-state authority.
 
 ### Implementation choices
 
@@ -240,15 +242,16 @@ NIP-34 maintainers model refined in nips commit `781590b`).
 - `M` (lead) and `m` (co-maintainer) tags are the primary maintainer
   listing (per the model clarified in nips commit `986edd1`); when present
   the deprecated `maintainers` tag is ignored per NIP-34 (and parsed as
-  empty). The role distinction carries no meaning for this service: both
-  collapse into one maintainer set.
-- Role tags may record history as alternating start/end timestamps; a tag
-  is currently active when it has fewer than four elements or an odd number
-  of elements. Ended entries are ignored entirely: role history is only
-  used to conclude that a pubkey is *no longer* a maintainer, never to
-  grant time-scoped retroactive authority over historic events. The
-  NIP's owner-first precedence for conflicting past-role records is
-  therefore unused.
+  empty). Both grant equal maintainer authority, while active `M` records
+  additionally define the lead path used to root that authority.
+- Role tags may record history as alternating numeric start/end timestamps;
+  `defer` is valid only as the final end boundary. A valid tag is currently
+  active when it has no boundaries or its final boundary is a start. Ended,
+  deferred, and malformed entries grant no authority: role history is only
+  used to conclude that a pubkey is *no longer* a maintainer, never to grant
+  time-scoped retroactive authority over historic events. The NIP's
+  owner-first precedence for conflicting past-role records is therefore
+  unused.
 - A pubkey may appear in multiple role tags: one of each letter records a
   role transition per the NIP, and out-of-spec duplicates under the same
   letter are consolidated rather than rejected - rejecting them would drop
@@ -284,4 +287,3 @@ the `M`/`m` assignments they might carry (the NIP says role combinations
 beyond self-plus-lead SHOULD be avoided unless the author is `M`), and
 moderator membership gets no reciprocal-confirmation treatment. Both only
 matter if status-event authority is ever enforced.
-

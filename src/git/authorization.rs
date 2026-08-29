@@ -316,7 +316,8 @@ pub fn pubkey_authorised_for_repo_owners(
 #[derive(Debug, Default)]
 pub struct RepoMembership {
     /// Pubkeys whose repository state events are authoritative for this
-    /// owner's repository: the owner plus every confirmed maintainer.
+    /// owner's selected repository view: the resolved lead or selected
+    /// leadless/legacy root plus every confirmed maintainer.
     pub state_maintainers: HashSet<String>,
     /// Pubkeys currently listed as maintainers whose own announcement does
     /// not yet list back a confirmed maintainer. Their announcements must
@@ -337,9 +338,12 @@ pub struct RepoMembership {
 /// assignments in other announcements. An author who appears in no role tag
 /// implicitly asserts maintainership for the repository's entire history.
 ///
-/// The owner is always a confirmed maintainer of their own repository:
-/// announcing a repository in their namespace is what creates it on this
-/// service.
+/// An explicit active `M` path is resolved before the fixpoint is seeded. A
+/// self-`M` terminates at the lead; an announcement without an active `M`
+/// seeds its author only when resolution has not already followed an explicit
+/// path. Missing, ambiguous, or cyclic explicit paths grant no authority.
+/// This prevents a removed maintainer's forwarding coordinate from restoring
+/// that signer to the confirmed set.
 pub fn compute_membership(
     announcements: &[RepositoryAnnouncement],
     owner: &str,
@@ -350,11 +354,35 @@ pub fn compute_membership(
             .iter()
             .find(|a| a.event.pubkey.to_hex() == pubkey && a.identifier == identifier)
     };
-    if find(owner).is_none() {
-        return RepoMembership::default();
+    // Resolve the selected coordinate's explicit lead path before seeding
+    // reciprocal membership. With no active M on the selected announcement,
+    // this is a legacy or deliberately leadless view rooted at the selected
+    // author. Once an explicit path is followed, only an active self-M may
+    // terminate it; incomplete, ambiguous, and cyclic paths fail closed.
+    let mut root = owner.to_string();
+    let mut followed_explicit_lead = false;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(root.clone()) {
+            return RepoMembership::default();
+        }
+        let Some(announcement) = find(&root) else {
+            return RepoMembership::default();
+        };
+        let active_leads = announcement.active_leads();
+        match active_leads.as_slice() {
+            [] if !followed_explicit_lead && announcement.author_role_active() => break,
+            [] => return RepoMembership::default(),
+            [lead] if lead == &root && announcement.author_role_active() => break,
+            [lead] if lead != &root => {
+                root = lead.clone();
+                followed_explicit_lead = true;
+            }
+            _ => return RepoMembership::default(),
+        }
     }
 
-    let mut confirmed: HashSet<String> = HashSet::from([owner.to_string()]);
+    let mut confirmed: HashSet<String> = HashSet::from([root]);
     // Fixpoint: keep confirming listed pubkeys whose own announcement lists
     // back an already-confirmed maintainer. The confirmed set only grows, so
     // the loop terminates.
@@ -1456,6 +1484,131 @@ mod tests {
 
         let membership = compute_membership(&announcements, &hex(&alice), identifier);
         assert!(membership.state_maintainers.contains(&hex(&bob)));
+
+        let selected_from_bob = compute_membership(&announcements, &hex(&bob), identifier);
+        assert_eq!(
+            selected_from_bob.state_maintainers,
+            membership.state_maintainers
+        );
+    }
+
+    #[test]
+    fn test_ended_selected_author_has_no_state_authority() {
+        let alice = create_test_keys();
+        let identifier = "test-repo";
+
+        let announcements = vec![parse(create_role_announcement(
+            &alice,
+            identifier,
+            &[("m", vec![hex(&alice), "100".to_string(), "200".to_string()])],
+        ))];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert!(membership.state_maintainers.is_empty());
+        assert!(membership.invited.is_empty());
+    }
+
+    #[test]
+    fn test_removed_selected_maintainer_resolves_lead_without_regaining_authority() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        // Alice no longer assigns Bob. Bob's still-active acceptance and M
+        // redirect keep the coordinate attached to Alice, but do not seed Bob
+        // as a maintainer of a separate same-identifier repository.
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("M", vec![hex(&alice)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&bob), identifier);
+        assert_eq!(membership.state_maintainers, HashSet::from([hex(&alice)]));
+
+        let repo_data = RepositoryData {
+            announcements,
+            states: Vec::new(),
+        };
+        assert!(pubkey_authorised_for_repo_owners(&bob.public_key(), &repo_data).is_empty());
+        assert_eq!(
+            pubkey_authorised_for_repo_owners(&alice.public_key(), &repo_data)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([hex(&alice), hex(&bob)])
+        );
+    }
+
+    #[test]
+    fn test_incomplete_ambiguous_or_cyclic_lead_path_grants_no_state_authority() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        let bob_announcement = parse(create_role_announcement(
+            &bob,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+        ));
+        let missing_lead = compute_membership(
+            std::slice::from_ref(&bob_announcement),
+            &hex(&bob),
+            identifier,
+        );
+        assert!(missing_lead.state_maintainers.is_empty());
+
+        let ambiguous = parse(create_role_announcement(
+            &alice,
+            identifier,
+            &[("M", vec![hex(&alice)]), ("M", vec![hex(&bob)])],
+        ));
+        let ambiguous_lead = compute_membership(&[ambiguous], &hex(&alice), identifier);
+        assert!(ambiguous_lead.state_maintainers.is_empty());
+
+        let alice_announcement = parse(create_role_announcement(
+            &alice,
+            identifier,
+            &[("M", vec![hex(&bob)]), ("m", vec![hex(&alice)])],
+        ));
+        let cycle = compute_membership(
+            &[alice_announcement, bob_announcement],
+            &hex(&alice),
+            identifier,
+        );
+        assert!(cycle.state_maintainers.is_empty());
+    }
+
+    #[test]
+    fn test_explicit_leadless_roles_still_root_selected_authority() {
+        let alice = create_test_keys();
+        let bob = create_test_keys();
+        let identifier = "test-repo";
+
+        let announcements = vec![
+            parse(create_role_announcement(
+                &alice,
+                identifier,
+                &[("m", vec![hex(&alice)]), ("m", vec![hex(&bob)])],
+            )),
+            parse(create_role_announcement(
+                &bob,
+                identifier,
+                &[("m", vec![hex(&bob)]), ("m", vec![hex(&alice)])],
+            )),
+        ];
+
+        let membership = compute_membership(&announcements, &hex(&alice), identifier);
+        assert_eq!(
+            membership.state_maintainers,
+            HashSet::from([hex(&alice), hex(&bob)])
+        );
     }
 
     #[test]
