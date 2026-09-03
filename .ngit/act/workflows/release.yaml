@@ -25,7 +25,7 @@ jobs:
           token: unused
       - name: Build static binary
         run: nix build .#static --out-link result-static
-      - name: Package release assets
+      - name: Package release asset
         shell: bash
         run: |
           set -euo pipefail
@@ -53,12 +53,11 @@ jobs:
           tar --sort=name --mtime="@${source_date_epoch}" \
             --owner=0 --group=0 --numeric-owner -C release-stage \
             -czf "dist/${archive}.tar.gz" "$archive"
-          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
           name: ngit-grasp-release-assets
-          path: dist/*
+          path: dist/*.tar.gz
           if-no-files-found: error
       - name: Publish NIP-82 release
         shell: bash
@@ -75,10 +74,18 @@ jobs:
           printf '%s\n' "$NGIT_PUBLISHER_NBUNKSEC" > "$signer_file"
 
           version="${GITHUB_REF_NAME#v}"
+          released_at="$(git for-each-ref \
+            --format='%(creatordate:unix)' \
+            "refs/tags/$GITHUB_REF_NAME")"
+          if [[ ! "$released_at" =~ ^[0-9]+$ ]]; then
+            echo "could not derive release date from tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
           ngit release publish "$version" \
             --repo nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp \
             --manifest .ngit/release.yaml \
             --tag "$GITHUB_REF_NAME" \
+            --released-at "$released_at" \
             --nbunksec-file "$signer_file" \
             --defaults \
             --repo-relay-only \

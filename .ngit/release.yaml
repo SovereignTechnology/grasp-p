@@ -36,6 +36,9 @@ publication:
   zapstore_relay: true
   strict_metadata: true
 assets:
+  # The signed kind-3063 event carries the archive's SHA-256. A separate
+  # checksum asset would duplicate that trust record, and some catalogs require
+  # every release asset to declare a target platform.
   - file: dist/ngit-grasp-{version}-x86_64-unknown-linux-musl.tar.gz
     filename: ngit-grasp-{version}-x86_64-unknown-linux-musl.tar.gz
     mime: application/gzip
@@ -52,8 +55,3 @@ assets:
       - "77"
       - "98"
     variant: static-musl
-  - file: dist/SHA256SUMS
-    identifier: ngit-grasp-checksums
-    filename: SHA256SUMS
-    mime: text/plain
-    platform_agnostic: true
