@@ -1,0 +1,59 @@
+schema: 1
+identifier: ngit-grasp
+pubkey: npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr
+name: ngit-grasp
+summary: A self-hostable Nostr relay and Git server for decentralized repositories.
+description: |
+  ngit-grasp is a production-ready Rust implementation of GRASP (Git Relays
+  Authorized via Signed-Nostr Proofs). It combines a Nostr relay with Git Smart
+  HTTP, validates repository writes against signed Nostr state, and synchronizes
+  repositories across decentralized Git hosting providers.
+tags:
+  - nostr
+  - git
+  - grasp
+  - relay
+  - self-hosting
+  - rust
+license: MIT
+website: https://gitworkshop.dev/danconwaydev.com/ngit-grasp
+repository: nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp
+icon: static/icon.png
+channel: main
+release_notes: CHANGELOG.md
+publication:
+  blossom_servers:
+    - https://blossom.primal.net
+    - https://blossom.ditto.pub
+    - https://haven.danconwaydev.com
+  # Keep Zapstore in discovery as well as publication so ngit can preserve the
+  # existing application while replacing zsp as the release publisher.
+  relays:
+    - wss://relay.zapstore.dev
+    - wss://relay.ditto.pub
+    - wss://relay.dreamith.to
+    - wss://relay.primal.net
+  zapstore_relay: true
+  strict_metadata: true
+assets:
+  - file: dist/ngit-grasp-{version}-x86_64-unknown-linux-musl.tar.gz
+    filename: ngit-grasp-{version}-x86_64-unknown-linux-musl.tar.gz
+    mime: application/gzip
+    platforms:
+      - linux-x86_64
+    supported_nips:
+      - "01"
+      - "05"
+      - "09"
+      - "11"
+      - "34"
+      - "42"
+      - "62"
+      - "77"
+      - "98"
+    variant: static-musl
+  - file: dist/SHA256SUMS
+    identifier: ngit-grasp-checksums
+    filename: SHA256SUMS
+    mime: text/plain
+    platform_agnostic: true

@@ -10,6 +10,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - uses: danconwaydev/setup-ngit@v3
       - uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
@@ -59,3 +60,26 @@ jobs:
           name: ngit-grasp-release-assets
           path: dist/*
           if-no-files-found: error
+      - name: Publish NIP-82 release
+        shell: bash
+        env:
+          NGIT_PUBLISHER_NBUNKSEC: ${{ secrets.NGIT_PUBLISHER_NBUNKSEC }}
+        run: |
+          set -euo pipefail
+
+          : "${NGIT_PUBLISHER_NBUNKSEC:?Set the NGIT_PUBLISHER_NBUNKSEC repository secret}"
+
+          umask 077
+          signer_file="$RUNNER_TEMP/ngit-release-nbunksec"
+          trap 'rm -f "$signer_file"' EXIT
+          printf '%s\n' "$NGIT_PUBLISHER_NBUNKSEC" > "$signer_file"
+
+          version="${GITHUB_REF_NAME#v}"
+          ngit release publish "$version" \
+            --repo nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp \
+            --manifest .ngit/release.yaml \
+            --tag "$GITHUB_REF_NAME" \
+            --nbunksec-file "$signer_file" \
+            --defaults \
+            --repo-relay-only \
+            --json
