@@ -74,6 +74,12 @@ jobs:
           printf '%s\n' "$NGIT_PUBLISHER_NBUNKSEC" > "$signer_file"
 
           version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == *-* ]]; then
+            prerelease="${version#*-}"
+            channel="${prerelease%%[.+]*}"
+          else
+            channel=main
+          fi
           released_at="$(git for-each-ref \
             --format='%(creatordate:unix)' \
             "refs/tags/$GITHUB_REF_NAME")"
@@ -84,6 +90,7 @@ jobs:
           ngit release publish "$version" \
             --repo nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp \
             --manifest .ngit/release.yaml \
+            --channel "$channel" \
             --tag "$GITHUB_REF_NAME" \
             --released-at "$released_at" \
             --nbunksec-file "$signer_file" \

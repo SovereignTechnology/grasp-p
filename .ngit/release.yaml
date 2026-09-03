@@ -19,7 +19,6 @@ license: MIT
 website: https://gitworkshop.dev/danconwaydev.com/ngit-grasp
 repository: nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp
 icon: static/icon.png
-channel: main
 release_notes: CHANGELOG.md
 publication:
   blossom_servers:
