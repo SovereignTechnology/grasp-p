@@ -2,7 +2,7 @@
 
 **Status**: Implemented, single-service scope (opt-in via `NGIT_PRIVATE_MODE`)
 
-**Spec**: [GRASP-08](https://github.com/DanConwayDev/grasp/blob/main/08.md)
+**Spec**: [GRASP-08](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/08.md)
 **Related**: [Architecture](architecture.md), [Defensive Measures](defensive-measures.md), [Repository Lifecycle](repository-lifecycle.md)
 **Configuration**: [`NGIT_PRIVATE_MODE`, `NGIT_PRIVATE_MEMBERS`, `NGIT_PRIVATE_PUBLIC_ORIGIN`](../reference/configuration.md)
 

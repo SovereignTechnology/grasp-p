@@ -8,7 +8,7 @@ This document explains the Git Smart HTTP protocol as it relates to our inline a
 
 ### GRASP-01 Requirements (MUST)
 
-Per the [GRASP-01 specification](https://github.com/DanConwayDev/grasp/blob/main/01.md), implementations **MUST** advertise and support the following git capabilities:
+Per the [GRASP-01 specification](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/01.md), implementations **MUST** advertise and support the following git capabilities:
 
 - **`allow-reachable-sha1-in-want`**: Allows clients to request commits reachable from any ref
 - **`allow-tip-sha1-in-want`**: Allows clients to request specific commit SHAs directly

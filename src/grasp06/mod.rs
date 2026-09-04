@@ -1,6 +1,6 @@
 //! GRASP-06 — Contributor Pull Request Submission.
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //! Design: `docs/explanation/grasp-06-contributor-pr-submission.md`
 //!
 //! This module is gated behind [`crate::config::Config::grasp06_enable`].

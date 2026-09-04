@@ -362,7 +362,7 @@ and drops that admission while waiting for a busy domain.
 
 State and PR purgatory entries **automatically expire** after 30 minutes.
 
-From the [GRASP-01 spec](https://github.com/DanConwayDev/grasp/blob/main/01.md#purgatory):
+From the [GRASP-01 spec](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/01.md#purgatory):
 
 > Events should be kept in purgatory and otherwise discarded after 30 minutes.
 

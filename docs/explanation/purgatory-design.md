@@ -19,7 +19,7 @@ Either nostr events or git pushes can arrive in any order:
 
 When both halves arrive, they are processed together and saved to the database.
 
-**Spec Reference**: [GRASP-01 Purgatory Section](https://github.com/DanConwayDev/grasp/blob/main/01.md#purgatory)
+**Spec Reference**: [GRASP-01 Purgatory Section](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/01.md#purgatory)
 
 > Accepted repo state announcements, PRs and PR Updates SHOULD be accepted with message "purgatory: won't be served until git data arrives" and kept in purgatory (not served) until the related git data arrives and otherwise discarded after 30 minutes.
 

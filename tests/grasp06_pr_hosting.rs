@@ -1,6 +1,6 @@
 //! GRASP-06 contributor PR hosting integration tests
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! Each test is driven by one of two macros depending on whether the relay
 //! under test has GRASP-06 enabled:

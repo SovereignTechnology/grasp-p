@@ -1,6 +1,6 @@
 //! GRASP-06 specification tests
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! ## Test Suites
 //!
@@ -292,7 +292,7 @@ impl Grasp06Tests {
         );
         println!("{}GRASP-06 Compliance Report{}", BOLD, RESET);
         println!(
-            "Source: github.com/DanConwayDev/grasp/blob/main/06.md (commit: {})",
+            "Source: https://gitworkshop.dev/danconwaydev.com/grasp/tree/{}/06.md",
             GRASP_06_COMMIT_ID
         );
         println!(

@@ -1,6 +1,6 @@
 //! GRASP-06 NIP-11 advertisement tests
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! These tests cover the discovery-gate contract from the "on" side: when
 //! the relay opts into GRASP-06, its NIP-11 document MUST advertise the

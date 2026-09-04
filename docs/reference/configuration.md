@@ -1035,7 +1035,7 @@ NGIT_ARCHIVE_READ_ONLY=true  # Default
 
 ### GRASP-06 Contributor PR Submission
 
-These options control the optional `/prs/<npub>/<identifier>.git` contributor pull-request submission endpoint per the [GRASP-06 specification](https://github.com/DanConwayDev/grasp/blob/main/06.md). The route is below `NGIT_BASE_PATH` when a non-root mount is configured.
+These options control the optional `/prs/<npub>/<identifier>.git` contributor pull-request submission endpoint per the [GRASP-06 specification](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md). The route is below `NGIT_BASE_PATH` when a non-root mount is configured.
 
 #### `NGIT_GRASP06_ENABLE`
 

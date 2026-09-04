@@ -428,7 +428,7 @@ For development from source:
 curl -Ls https://ngit.dev/install.sh | bash
 
 # Clone the repository
-git clone nostr://danconwaydev.com/relay.ngit.dev/ngit-grasp
+git clone nostr://danconwaydev.com/ngit-grasp
 cd ngit-grasp
 
 # Build (using Nix for reproducible environment)
@@ -770,7 +770,7 @@ MIT License - see [LICENSE](LICENSE) for details
 
 ## Sister Projects
 
-- [ngit](https://gitworkshop.dev/danconwaydev.com/ngit) - CLI and Git remote helper for collaborating on repositories over Nostr
+- [ngit](https://ngit.dev) - CLI and Git remote helper for collaborating on repositories over Nostr
 - [ngit-ci](https://gitworkshop.dev/danconwaydev.com/ngit-ci) - Self-hosted CI that watches Nostr Git repositories and publishes signed results
 
 ## Related Specifications

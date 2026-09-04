@@ -95,4 +95,4 @@ If you need any of these today, leave `NGIT_GRASP06_ENABLE=false`.
 
 ## Spec
 
-[GRASP-06 spec (draft)](https://github.com/DanConwayDev/grasp/blob/main/06.md). Design notes: [docs/explanation/grasp-06-contributor-pr-submission.md](../explanation/grasp-06-contributor-pr-submission.md).
+[GRASP-06 spec (draft)](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md). Design notes: [docs/explanation/grasp-06-contributor-pr-submission.md](../explanation/grasp-06-contributor-pr-submission.md).

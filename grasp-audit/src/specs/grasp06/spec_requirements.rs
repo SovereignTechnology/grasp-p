@@ -1,7 +1,7 @@
 //! GRASP-06 Specification Requirements
 //!
 //! Embedded specification requirements from the GRASP-06 spec document.
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! This is the single source of truth for spec text displayed in audit reports.
 

@@ -1,6 +1,6 @@
 //! GRASP-06 event-acceptance relaxation tests
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! Covers 06.md lines 19–22: PR and PR Update events that would otherwise be
 //! rejected under GRASP-01 for not referencing an accepted repository

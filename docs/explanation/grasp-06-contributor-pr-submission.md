@@ -2,7 +2,7 @@
 
 **Status**: Implemented (opt-in via `NGIT_GRASP06_ENABLE`)
 
-**Spec**: [GRASP-06](https://github.com/DanConwayDev/grasp/blob/main/06.md)
+**Spec**: [GRASP-06](https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md)
 **Related**: [Purgatory Design](purgatory-design.md), [Architecture](architecture.md), [Inline Authorization](inline-authorization.md)
 **Operator how-to**: [Enable GRASP-06](../how-to/enable-grasp-06.md)
 

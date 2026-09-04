@@ -414,7 +414,7 @@ let
           When disabled (default), /prs/* returns 404 and event acceptance is
           unchanged.
 
-          See: https://github.com/DanConwayDev/grasp/blob/main/06.md
+          See: https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md
         '';
       };
 

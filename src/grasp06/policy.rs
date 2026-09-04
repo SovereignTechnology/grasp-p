@@ -1,6 +1,6 @@
 //! Acceptance helpers for GRASP-06 PR / PR-Update events.
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md> (lines 19–22).
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md> (lines 19–22).
 //!
 //! Under GRASP-06 a relay MUST accept a kind 1618 (PR) or 1619 (PR Update)
 //! event for a repository coordinate it has no accepted announcement for,

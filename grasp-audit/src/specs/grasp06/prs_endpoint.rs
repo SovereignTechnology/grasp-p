@@ -1,6 +1,6 @@
 //! GRASP-06 /prs/ endpoint tests
 //!
-//! Spec: <https://github.com/DanConwayDev/grasp/blob/main/06.md>
+//! Spec: <https://gitworkshop.dev/danconwaydev.com/grasp/tree/master/06.md>
 //!
 //! Each test here maps 1:1 to a MUST in the spec, or to an audit-derived
 //! invariant that follows directly from NIP-11 discovery semantics.
