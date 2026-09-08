@@ -206,8 +206,8 @@ Implemented according to design specification in [`purgatory-design.md`](purgato
 
 ## Question: Who may publish authoritative repository state?
 
-**Decision (2026-08): maintainer membership is reciprocal** (following the
-NIP-34 maintainers model refined in nips commit `781590b`).
+**Decision (2026-08): maintainer membership is reciprocal**, following the
+[maintainer protocol for AI implementers](https://ngit.dev/protocol/nip-34/maintainers/ai-implementers).
 
 ### The model
 

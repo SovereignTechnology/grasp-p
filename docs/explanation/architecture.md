@@ -293,6 +293,10 @@ pub struct RepositoryState { ... }
 
 #### Maintainer Membership Model
 
+The cross-project behavior is defined by the
+[maintainer protocol for AI implementers](https://ngit.dev/protocol/nip-34/maintainers/ai-implementers).
+This section describes the relay-specific read-side implementation.
+
 Announcements carry maintainer listings in two formats:
 
 - **Indexed role tags** (`M` lead, `m` co-maintainer). A tag may record

@@ -128,6 +128,15 @@ Both `TestRelay` and `test-ngit-relay.sh` use random ports to avoid conflicts. I
 
 ## Code Patterns
 
+### Maintainer Protocol
+
+The cross-project implementation guide is maintained in the repository
+`nostr://danconwaydev.com/relay.ngit.dev/ngit-docs` at
+`docs/protocol/nip-34/maintainers/ai-implementers.md`. It is published as the
+[maintainer protocol for AI implementers](https://ngit.dev/protocol/nip-34/maintainers/ai-implementers).
+Check it when changing maintainer-role parsing, graph resolution, authority, or
+repository membership workflows.
+
 ### nostr-sdk 0.43 Breaking Changes (vs 0.35)
 
 **Field access, not method calls:**
