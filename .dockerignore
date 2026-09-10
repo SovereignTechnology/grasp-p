@@ -2,6 +2,7 @@
 .direnv
 .env
 .relay-owner.nsec
+artifacts
 data
 result
 result-*

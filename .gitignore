@@ -4,6 +4,9 @@
 # Rust build artifacts (single workspace target at repo root)
 target/
 
+# Generated OCI release layouts
+/artifacts/
+
 # Working directory (session-specific temporary files)
 work/*
 !work/README.md

@@ -39,7 +39,7 @@ ARG NGIT_IMAGE_REVISION=unknown
 LABEL org.opencontainers.image.title="ngit-grasp" \
       org.opencontainers.image.description="GRASP relay and Git Smart HTTP server" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://gitnostr.com/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp.git" \
+      org.opencontainers.image.source="https://ngit.dev/ngit-grasp.git" \
       org.opencontainers.image.version="${NGIT_IMAGE_VERSION}" \
       org.opencontainers.image.revision="${NGIT_IMAGE_REVISION}"
 

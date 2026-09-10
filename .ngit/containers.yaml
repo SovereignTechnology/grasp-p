@@ -1,0 +1,17 @@
+schema: 1
+publication:
+  blossom_servers:
+    - https://blossom.primal.net
+    - https://blossom.ditto.pub
+    - https://haven.danconwaydev.com
+  relays:
+    - wss://relay.zapstore.dev
+    - wss://relay.ditto.pub
+    - wss://relay.dreamith.to
+    - wss://relay.primal.net
+containers:
+  ngit-grasp:
+    layout: artifacts/ngit-grasp
+    title: ngit-grasp
+    description: A self-hostable Nostr relay and Git server for decentralized repositories.
+    source: https://ngit.dev/ngit-grasp.git

@@ -76,9 +76,18 @@ created. The fields follow Render's
 [persistent disk guide](https://render.com/docs/disks) describes the storage
 and scaling constraints.
 
-Render Blueprints require a repository connected through one of Render's
-supported Git providers. Until ngit-grasp has an authorized mirror or published
-OCI image, use Render's **Public Git Repository** flow with the canonical URL:
+The published image is available to provider workflows that accept a public
+Docker-compatible registry reference:
+
+```text
+ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest
+```
+
+Pin an explicit release version instead of `latest` for repeatable production
+deployments. The supplied `render.yaml` remains source-backed because Render
+Blueprints require a repository connected through one of Render's supported
+Git providers. Use Render's **Public Git Repository** flow with the canonical
+URL:
 
 ```text
 https://gitnostr.com/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp.git

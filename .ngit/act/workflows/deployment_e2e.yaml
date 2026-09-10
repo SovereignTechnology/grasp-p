@@ -10,7 +10,9 @@ on:
       - "build.rs"
       - "compose*.yaml"
       - "deploy/**"
+      - "scripts/build-container-layout.sh"
       - "scripts/test-container-deployment.sh"
+      - "scripts/test-container-release.sh"
       - "src/**"
   pull_request:
 
@@ -32,7 +34,12 @@ jobs:
             echo "this workflow requires an ngit-ci operator opt-in" >&2
             exit 1
           fi
-      - name: Build, replace, and verify the container
+      - name: Build, import, replace, and verify the OCI release layout
+        shell: bash
         run: |
-          nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq \
-            --command scripts/test-container-deployment.sh
+          set -euo pipefail
+
+          version="$(nix eval --raw .#static.version)"
+          revision="$(git rev-parse 'HEAD^{commit}')"
+          nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq nixpkgs#skopeo \
+            --command scripts/test-container-release.sh "$version" "$revision"
