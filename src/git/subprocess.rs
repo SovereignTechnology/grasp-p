@@ -142,7 +142,7 @@ mod tests {
     fn create_bare_repo() -> TempDir {
         let dir = TempDir::new().unwrap();
         let status = StdCommand::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
             .arg(dir.path())
             .status()
             .expect("Failed to run git init");
