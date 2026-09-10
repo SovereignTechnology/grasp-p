@@ -7,12 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-09-11
+
+This release contains no production runtime changes. It improves release and
+deployment plumbing, source-owned documentation exports, canonical project
+references, and build-time test portability.
+
+### Added
+
+- Export a deterministic, side-effect-free command and configuration schema for
+  pinned downstream documentation generation.
+
 ### Changed
 
+- Publish tagged static archives as signed NIP-82 releases, using the `main`
+  channel for stable versions and a channel derived from the prerelease label
+  for release candidates.
 - Publish release container images as Nostr kind-30624 repositories backed by
   redundant Blossom storage. Stable images receive version and `latest` tags;
   prereleases receive version and channel tags. Maintainers can backfill an
   exact prior-release tag through CI without moving a stable channel backwards.
+- Point GRASP implementation references and maintainer guidance at their
+  canonical Nostr Git sources.
+
+### Fixed
+
+- Make shallow-migration and bare-repository test fixtures deterministic across
+  Git default-branch configurations, while keeping routine `git init` output
+  out of test logs.
 
 ## [3.0.1] - 2026-08-29
 
@@ -592,7 +614,8 @@ defensive limits explicit and operator-configurable.
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.1...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.2...HEAD
+[3.0.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.1...v3.0.2
 [3.0.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.0...v3.0.1
 [3.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.2...v3.0.0
 [2.1.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.1...v2.1.2
