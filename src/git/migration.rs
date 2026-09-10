@@ -2172,7 +2172,13 @@ mod tests {
         let origin = temp.path().join("origin.git");
         git(
             temp.path(),
-            &["init", "--bare", "--quiet", origin.to_str().unwrap()],
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                origin.to_str().unwrap(),
+            ],
         );
         let parent = write_commit_object(&origin, None);
         let child = write_commit_object(&origin, Some(&parent));
