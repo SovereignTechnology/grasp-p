@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Publish release container images as Nostr kind-30624 repositories backed by
+  redundant Blossom storage. Stable images receive version and `latest` tags;
+  prereleases receive version and channel tags. Maintainers can backfill an
+  exact prior-release tag through CI without moving a stable channel backwards.
+
 ## [3.0.1] - 2026-08-29
 
 ### Fixed

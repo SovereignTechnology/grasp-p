@@ -417,9 +417,14 @@ The shortest fresh-VPS path uses Docker Compose and Caddy:
 ```bash
 cp deploy.env.example .env
 # Set NGIT_DOMAIN in .env and point DNS at this server.
-docker compose -f compose.yaml -f compose.caddy.yaml up --build -d
+export NGIT_IMAGE="ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest"
+docker compose -f compose.yaml -f compose.caddy.yaml pull ngit-grasp
+docker compose -f compose.yaml -f compose.caddy.yaml up --no-build -d
 scripts/verify-deployment.sh https://ngit.example.com
 ```
+
+Pin an explicit release version instead of `latest` for reproducible
+production deployments. The Docker guide also covers source builds.
 
 For development from source:
 

@@ -7,9 +7,11 @@ container_name=ngit-grasp-deployment-test-${test_suffix}
 volume_name=ngit-grasp-deployment-test-${test_suffix}
 if [ -n "${NGIT_TEST_IMAGE:-}" ]; then
     image_name=${NGIT_TEST_IMAGE}
+    build_test_image=false
     remove_test_image=false
 else
     image_name=ngit-grasp:deployment-test-${test_suffix}
+    build_test_image=true
     remove_test_image=true
 fi
 
@@ -71,7 +73,9 @@ relay_pubkey() {
         "$1" | jq -er '.pubkey'
 }
 
-"${container_engine}" build --tag "${image_name}" .
+if [ "${build_test_image}" = true ]; then
+    "${container_engine}" build --tag "${image_name}" .
+fi
 "${container_engine}" volume create "${volume_name}" >/dev/null
 
 start_container

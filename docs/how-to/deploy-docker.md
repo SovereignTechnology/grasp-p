@@ -7,6 +7,17 @@ Caddy overlay for automatic HTTPS.
 The image contains ngit-grasp, Git, CA certificates, and a small init process.
 It prepares `/data` and then runs ngit-grasp as UID/GID `10001`.
 
+Stable release images are published through Nostr, with their OCI blobs stored
+on Blossom. Docker and Podman can pull them through the ncontainer gateway:
+
+```bash
+docker pull ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest
+```
+
+`latest` tracks the newest stable release. Replace it with an explicit release
+version for a reproducible deployment. Release candidates are also published
+under their prerelease channel, such as `rc`.
+
 ## Prerequisites
 
 - Docker Engine with Compose v2, or a compatible Podman Compose setup
@@ -28,7 +39,9 @@ cp deploy.env.example .env
 Set `NGIT_DOMAIN` in `.env`, then start the relay and Caddy:
 
 ```bash
-docker compose -f compose.yaml -f compose.caddy.yaml up --build -d
+export NGIT_IMAGE="ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest"
+docker compose -f compose.yaml -f compose.caddy.yaml pull ngit-grasp
+docker compose -f compose.yaml -f compose.caddy.yaml up --no-build -d
 docker compose -f compose.yaml -f compose.caddy.yaml ps
 scripts/verify-deployment.sh https://ngit.example.com
 ```
@@ -46,9 +59,14 @@ its path routing explicitly.
 Start only the relay service:
 
 ```bash
-docker compose up --build -d
+export NGIT_IMAGE="ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest"
+docker compose pull ngit-grasp
+docker compose up --no-build -d
 curl -H 'Accept: application/nostr+json' http://127.0.0.1:7334
 ```
+
+To build a checked-out source revision instead, leave `NGIT_IMAGE` unset and
+use `docker compose up --build -d` with the same Compose file selection.
 
 Proxy the public HTTPS hostname to `http://127.0.0.1:7334`. Preserve WebSocket
 upgrades, request methods, bodies, and query strings. Forwarded client IP
@@ -109,15 +127,20 @@ non-public deployment before relying on it.
 
 ## Upgrade
 
-Pin or check out the intended tag, read `CHANGELOG.md`, take a backup, and
-rebuild without overlapping the old and new writers:
+Read `CHANGELOG.md`, take a backup, select an explicit release tag, and replace
+the container without overlapping the old and new writers:
 
 ```bash
+export NGIT_IMAGE="ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:3.0.2"
+docker compose pull ngit-grasp
 docker compose stop ngit-grasp
-docker compose build --pull ngit-grasp
-docker compose up -d ngit-grasp
+docker compose up --no-build -d ngit-grasp
 scripts/verify-deployment.sh https://ngit.example.com
 ```
+
+Replace `3.0.2` with the intended release. For a source-built deployment,
+check out that tag and run `docker compose build --pull ngit-grasp` before
+starting the service instead.
 
 For storage-changing releases, follow the linked migration guide and restore
 the pre-upgrade volume snapshot before attempting a binary rollback.

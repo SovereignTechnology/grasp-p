@@ -14,6 +14,14 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
+      - name: Require the disposable guest container daemon
+        shell: bash
+        run: |
+          if [[ ! -S /var/run/docker.sock ]]; then
+            echo "container daemon socket is not available" >&2
+            echo "this workflow requires an ngit-ci operator opt-in" >&2
+            exit 1
+          fi
       - name: Restore Nix store cache
         continue-on-error: true
         uses: nix-community/cache-nix-action@v7
@@ -53,12 +61,50 @@ jobs:
           tar --sort=name --mtime="@${source_date_epoch}" \
             --owner=0 --group=0 --numeric-owner -C release-stage \
             -czf "dist/${archive}.tar.gz" "$archive"
+      - name: Build OCI image layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          revision="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          nix shell nixpkgs#docker-client nixpkgs#jq nixpkgs#skopeo \
+            --command scripts/build-container-layout.sh "$version" "$revision"
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
           name: ngit-grasp-release-assets
           path: dist/*.tar.gz
           if-no-files-found: error
+      - name: Publish OCI container
+        shell: bash
+        env:
+          NGIT_PUBLISHER_NBUNKSEC: ${{ secrets.NGIT_PUBLISHER_NBUNKSEC }}
+        run: |
+          set -euo pipefail
+
+          : "${NGIT_PUBLISHER_NBUNKSEC:?Set the NGIT_PUBLISHER_NBUNKSEC repository secret}"
+
+          umask 077
+          signer_file="$RUNNER_TEMP/ngit-container-nbunksec"
+          trap 'rm -f "$signer_file"' EXIT
+          printf '%s\n' "$NGIT_PUBLISHER_NBUNKSEC" > "$signer_file"
+
+          ngit container publish ngit-grasp \
+            --repo nostr://npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/relay.ngit.dev/ngit-grasp \
+            --manifest .ngit/containers.yaml \
+            --nbunksec-file "$signer_file" \
+            --defaults \
+            --repo-relay-only \
+            --json
+      - name: Pull and verify the published image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          nix shell nixpkgs#docker-client \
+            --command scripts/verify-published-container.sh "$version"
       - name: Publish NIP-82 release
         shell: bash
         env:

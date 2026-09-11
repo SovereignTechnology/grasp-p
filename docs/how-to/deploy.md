@@ -6,7 +6,7 @@ guide matching the host you already operate; every guide implements the same
 
 | Environment | Start here | Supplied artifact |
 | --- | --- | --- |
-| Docker or Podman host | [Docker and Compose](deploy-docker.md) | `Dockerfile`, `compose.yaml`, optional Caddy overlay |
+| Docker or Podman host | [Docker and Compose](deploy-docker.md) | Published OCI image, `compose.yaml`, optional Caddy overlay |
 | NixOS | [NixOS module](deploy-nixos.md) | `nixosModules.default` |
 | Debian, Ubuntu, or another systemd Linux | [Static binary and systemd](deploy-linux.md) | Static flake package and service unit |
 | Proxmox LXC or VM | [Proxmox](deploy-proxmox-lxc.md) | Direct systemd or Compose path |
@@ -18,7 +18,9 @@ with the Caddy overlay:
 ```bash
 cp deploy.env.example .env
 # Set NGIT_DOMAIN in .env and point its DNS records at this server.
-docker compose -f compose.yaml -f compose.caddy.yaml up --build -d
+export NGIT_IMAGE="ncontainer.io/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp:latest"
+docker compose -f compose.yaml -f compose.caddy.yaml pull ngit-grasp
+docker compose -f compose.yaml -f compose.caddy.yaml up --no-build -d
 scripts/verify-deployment.sh https://ngit.example.com
 ```
 
