@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::{ffi::OsStr, io::IsTerminal};
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,6 +13,8 @@ use ngit_grasp::{
     nostr,
     server::RelayServer,
 };
+
+mod docs_export;
 
 /// Top-level CLI dispatcher.
 ///
@@ -43,6 +45,14 @@ enum Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Documentation builds need only the static command model. Dispatch before
+    // dotenv, clap parsing, secret discovery, filesystem access, or relay
+    // startup so exporting metadata is safe in an isolated build environment.
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(docs_export::INTERNAL_COMMAND)) {
+        docs_export::write_stdout()?;
+        return Ok(());
+    }
+
     // Load .env file before clap parses, so env vars are available.
     dotenvy::dotenv().ok();
 
