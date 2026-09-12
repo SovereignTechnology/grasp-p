@@ -2834,7 +2834,11 @@ impl RelayConnection {
 }
 
 #[cfg(test)]
+mod test_relay;
+
+#[cfg(test)]
 mod tests {
+    use super::test_relay::TestRelay;
     use super::*;
 
     #[test]
@@ -3111,10 +3115,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_events_targets_the_connections_exact_relay() {
-        let configured = LocalRelayBuilder::default().build();
-        configured.run().await.expect("start configured relay");
-        let other = LocalRelayBuilder::default().build();
-        other.run().await.expect("start other relay");
+        let configured = TestRelay::start(LocalRelayBuilder::default()).await;
+        let other = TestRelay::start(LocalRelayBuilder::default()).await;
 
         let expected = EventBuilder::new(Kind::TextNote, "only on the other relay")
             .finalize(&Keys::generate())
@@ -3167,8 +3169,7 @@ mod tests {
         const AUTHORS: usize = 3;
         const EVENTS_PER_AUTHOR: usize = 400;
 
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start burst relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let mut authors = Vec::with_capacity(AUTHORS);
         for author_index in 0..AUTHORS {
             let keys = Keys::generate();
@@ -3229,8 +3230,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_empty_eose_cannot_arrive_before_permit_registration() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start empty relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -3276,8 +3276,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_closed_subscription_is_removed_from_sdk_registry() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start registry relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -3311,8 +3310,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_rate_closed_paces_later_wire_requests() {
-        let relay = LocalRelayBuilder::default().queries_per_minute(1).build();
-        relay.run().await.expect("start query-limited relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default().queries_per_minute(1)).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -3816,8 +3814,7 @@ mod tests {
 
     #[tokio::test]
     async fn minimum_churn_extension_keeps_full_and_auxiliary_subscriptions_open() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start local relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -3879,8 +3876,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_minimum_churn_extension_restores_only_the_retired_tail() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start local relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -3971,8 +3967,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_close_failure_restores_the_already_closed_tail_group() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start local relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let connection = RelayConnection::new(
             relay.url().await.to_string(),
             Some(Keys::generate()),
@@ -4414,8 +4409,7 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_transient_capacity_rejects_a_saturated_session() {
-        let relay = LocalRelayBuilder::default().build();
-        relay.run().await.expect("start local relay");
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
         let relay_url = relay.url().await.to_string();
         let connection = permissive_connection(&relay_url, Keys::generate());
         connection.connect(3).await.expect("connect local relay");
