@@ -205,7 +205,9 @@ async fn test_live_sync_batches_repo_filters_below_source_req_limit() {
 
 #[tokio::test]
 async fn live_sync_regroups_after_filter_count_refusal() {
-    let source = MockRelay::start_with_max_filters(3).await;
+    // Minimum-churn startup can split core and auxiliary coverage into two
+    // filters each. A one-filter cap forces regrouping under either ordering.
+    let source = MockRelay::start_with_max_filters(1).await;
     let syncing = TestRelay::start_with_sync(None).await;
     let keys = Keys::generate();
     let repo_id = "adaptive-filter-count";
