@@ -135,17 +135,17 @@ mod tests {
         entry.attempt_count = 5;
         entry.next_attempt = Instant::now() + Duration::from_secs(120);
 
-        // New event arrives with shorter delay
+        // Capture the call bounds instead of assuming the scheduler runs promptly.
+        let original_next = entry.next_attempt;
+        let before = Instant::now();
         entry.on_new_event(Duration::from_secs(10));
+        let after = Instant::now();
 
         // Attempt count should be reset
         assert_eq!(entry.attempt_count, 0);
 
-        // next_attempt should be updated to the sooner time
-        // (within a small tolerance for test timing)
-        let expected = Instant::now() + Duration::from_secs(10);
-        assert!(entry.next_attempt <= expected + Duration::from_millis(100));
-        assert!(entry.next_attempt >= expected - Duration::from_millis(100));
+        assert!(entry.next_attempt >= original_next.min(before + Duration::from_secs(10)));
+        assert!(entry.next_attempt <= original_next.min(after + Duration::from_secs(10)));
     }
 
     #[test]
@@ -160,16 +160,14 @@ mod tests {
         assert_eq!(entry.attempt_count, 0);
 
         // But next_attempt should not be pushed back
-        assert!(entry.next_attempt <= original_next + Duration::from_millis(100));
+        assert_eq!(entry.next_attempt, original_next);
     }
 
     #[test]
     fn is_ready_checks_both_conditions() {
         let mut entry = SyncQueueEntry::new(Duration::from_secs(0));
 
-        // Should be ready initially (no delay, not in progress)
-        // Note: there might be a tiny delay, so we wait a moment
-        std::thread::sleep(Duration::from_millis(10));
+        // A zero delay is already ready; monotonic time cannot move backward.
         assert!(entry.is_ready());
 
         // Mark as in progress - should not be ready
@@ -185,12 +183,13 @@ mod tests {
     #[test]
     fn on_sync_complete_increments_and_schedules() {
         let mut entry = SyncQueueEntry::new(Duration::from_secs(0));
-        std::thread::sleep(Duration::from_millis(10)); // Ensure next_attempt has passed
 
         entry.in_progress = true;
         entry.attempt_count = 0;
 
+        let before = Instant::now();
         entry.on_sync_complete();
+        let after = Instant::now();
 
         // Should no longer be in progress
         assert!(!entry.in_progress);
@@ -199,8 +198,7 @@ mod tests {
         assert_eq!(entry.attempt_count, 1);
 
         // Next attempt should be scheduled with backoff (20s for attempt 1)
-        let expected = Instant::now() + Duration::from_secs(20);
-        assert!(entry.next_attempt >= expected - Duration::from_millis(100));
-        assert!(entry.next_attempt <= expected + Duration::from_millis(100));
+        assert!(entry.next_attempt >= before + Duration::from_secs(20));
+        assert!(entry.next_attempt <= after + Duration::from_secs(20));
     }
 }
