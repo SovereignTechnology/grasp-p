@@ -1,48 +1,13 @@
-//! Race-free port reservation for test fixtures.
+//! Bound listener ownership for test fixtures.
 //!
-//! ## The race
+//! Reserving a port and dropping its listener before the server binds leaves
+//! a race with every other concurrent test. Instead, retain the listener and
+//! transfer it directly to an in-process fixture or through the subprocess
+//! listener handoff protocol. Retain a clone across server restarts.
 //!
-//! The naive pattern — bind `127.0.0.1:0`, read the kernel-assigned port,
-//! drop the listener, hand the bare `u16` to whoever wants it — has a
-//! TOCTOU window between drop and the consumer's actual `bind`. During
-//! that window, anything else in the process (or, more rarely, another
-//! process) can be handed the same port by the kernel.
-//!
-//! The race is rare on lightly-loaded hardware but has been observed in
-//! CI and during development, and the failure mode
-//! (`Address already in use (os error 98)`) is a hard test fail with no
-//! useful information for the next debugger. The hazard is sharply worse
-//! in patterns that reserve a port well in advance of binding (e.g.
-//! pre-allocating a port to embed in an announcement event before
-//! starting the relay that will host it).
-//!
-//! Our in-process fixtures ([`MockRelay`], [`SmartGitServer`]) avoid the
-//! race entirely by **keeping the listener bound** and handing it
-//! straight to their tokio accept loop. That trick doesn't work for the
-//! [`TestRelay`] subprocess — `ngit-grasp` binds itself from
-//! `NGIT_BIND_ADDRESS`, and inheriting the pre-bound fd would require
-//! Unix-specific `pre_exec` plumbing we'd rather not own in the test
-//! harness.
-//!
-//! ## The reservation pattern
-//!
-//! Instead, [`reserve_port`] returns a [`PortReservation`] that **holds the
-//! bound `TcpListener`** until the caller is about to start the real
-//! service. While any reservation is live, no other call to
-//! `reserve_port` in this process can be handed the same port — the
-//! kernel won't reissue a port that is currently bound.
-//!
-//! The caller drops the reservation immediately before the real bind,
-//! shrinking the TOCTOU window from "however long the fixture takes to
-//! spawn" (or, worse, "however long the test takes to build the
-//! announcement event") to "a few microseconds inside the start
-//! function". The retry loop in [`crate::common::relay::TestRelay`]
-//! covers that residual window — defense-in-depth that has never been
-//! observed to fire in local stress runs.
-//!
-//! [`MockRelay`]: crate::common::mock_relay::MockRelay
-//! [`SmartGitServer`]: crate::common::git_server::SmartGitServer
-//! [`TestRelay`]: crate::common::relay::TestRelay
+//! [`UnavailableEndpoint`] accepts and closes connections while retaining the
+//! address. Recovery stops that accept loop before handing the same listener
+//! to the recovered service, so another test can never claim the port.
 
 use std::net::TcpListener;
 
@@ -50,17 +15,9 @@ use std::net::TcpListener;
 /// a live `TcpListener` so that no other [`reserve_port`] call in this
 /// process can be handed the same number.
 ///
-/// The reservation is released by:
-///
-/// - calling [`PortReservation::release`] to consume the reservation and
-///   return the port number (preferred — makes the release explicit at the
-///   call site), or
-/// - simply dropping the value (also fine, but the release point is then
-///   tied to lexical scope).
-///
-/// The caller should release **immediately** before the consuming service
-/// performs its own `bind` so that the TOCTOU window between
-/// reservation-release and service-bind is as small as possible.
+/// Transfer it with [`PortReservation::into_std_listener`] to start a service
+/// without releasing its address. Dropping it or calling `release` relinquishes
+/// the address and must not be used before starting a replacement service.
 #[derive(Debug)]
 pub struct PortReservation {
     port: u16,
@@ -71,10 +28,8 @@ pub struct PortReservation {
 
 /// Reserve a specific loopback port.
 ///
-/// Used by restart flows that must reuse an address already embedded in
-/// published events (e.g. a repository announcement naming the relay's
-/// domain). Fails while the port is still bound — callers should wait
-/// for the previous holder to exit and retry within a bounded deadline.
+/// Fails while another listener owns the address. Restart flows should retain
+/// and transfer their existing listener rather than binding again.
 pub fn reserve_specific(port: u16) -> std::io::Result<PortReservation> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     Ok(PortReservation {
@@ -89,10 +44,23 @@ impl PortReservation {
         self.port
     }
 
-    /// Consume the reservation, dropping the underlying listener and
-    /// returning the port number. The port is now free for the caller's
-    /// real service to bind. Prefer this over relying on lexical drop —
-    /// it makes the release point explicit at the call site.
+    /// Transfer the bound listener without making its port available again.
+    pub fn into_std_listener(self) -> TcpListener {
+        self._listener
+    }
+
+    /// Wrap a listener retained across a subprocess restart.
+    pub fn from_listener(listener: TcpListener) -> Self {
+        Self {
+            port: listener
+                .local_addr()
+                .expect("reserved listener address")
+                .port(),
+            _listener: listener,
+        }
+    }
+
+    /// Relinquish the address. A later bind to this port is inherently racy.
     pub fn release(self) -> u16 {
         let port = self.port;
         // `self` is consumed; the listener inside is dropped here.
@@ -103,7 +71,7 @@ impl PortReservation {
 
 /// Bind `127.0.0.1:0`, capture the assigned port, and **keep the listener
 /// bound** inside the returned [`PortReservation`] until the caller
-/// releases it.
+/// transfers or drops it.
 ///
 /// While the reservation is live, no other `reserve_port` call in this
 /// process will be handed the same port. See module docs for why this
@@ -118,6 +86,79 @@ pub fn reserve_port() -> PortReservation {
     PortReservation {
         port,
         _listener: listener,
+    }
+}
+
+/// A continuously reserved endpoint that rejects protocol connections until
+/// its listener is transferred to a recovered service.
+pub struct UnavailableEndpoint {
+    listener: Option<TcpListener>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for UnavailableEndpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UnavailableEndpoint {
+    pub fn new() -> Self {
+        Self::from_listener(reserve_port().into_std_listener())
+    }
+
+    pub fn from_listener(listener: TcpListener) -> Self {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking unavailable endpoint");
+        let accepting = tokio::net::TcpListener::from_std(
+            listener.try_clone().expect("retain unavailable listener"),
+        )
+        .expect("register unavailable listener");
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = accepting
+                    .accept()
+                    .await
+                    .expect("accept unavailable connection");
+                drop(stream);
+            }
+        });
+        Self {
+            listener: Some(listener),
+            task: Some(task),
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.listener
+            .as_ref()
+            .expect("owned unavailable listener")
+            .local_addr()
+            .expect("unavailable address")
+            .port()
+    }
+
+    pub async fn into_listener(mut self) -> TcpListener {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            match tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("unavailable accept loop should stop before recovery")
+            {
+                Err(error) if error.is_cancelled() => {}
+                result => panic!("unavailable accept loop ended unexpectedly: {result:?}"),
+            }
+        }
+        self.listener.take().expect("transfer unavailable listener")
+    }
+}
+
+impl Drop for UnavailableEndpoint {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -139,14 +180,36 @@ mod tests {
         assert_ne!(a.port(), c.port());
     }
 
-    // Note: there is intentionally no "released port is immediately
-    // bindable" unit test. Once released, the port re-enters the
-    // kernel's free pool, and under heavy parallel test load (where
-    // dozens of `reserve_port` / `TcpListener::bind("127.0.0.1:0")`
-    // calls are racing each other) another test can be handed that
-    // port number before this one rebinds. That race is exactly what
-    // `reserve_port` exists to suppress for the held-reservation
-    // window; once released, it is by design out of scope. The
-    // "bindable after release" property is implicitly exercised by
-    // every passing `TestRelay::start*` integration test.
+    #[tokio::test]
+    async fn unavailable_endpoint_preserves_address_through_recovery() {
+        use tokio::io::AsyncReadExt;
+        let endpoint = UnavailableEndpoint::new();
+        let address = endpoint.listener.as_ref().unwrap().local_addr().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut byte = [0];
+            match client.read(&mut byte).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("unavailable endpoint should close clients: {result:?}"),
+            }
+        })
+        .await
+        .expect("unavailable endpoint should reject connections");
+
+        let listener = endpoint.into_listener().await;
+        assert_eq!(listener.local_addr().unwrap(), address);
+        assert_eq!(
+            TcpListener::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (_, peer) = listener.accept().await.unwrap();
+            assert_eq!(peer, client.local_addr().unwrap());
+        })
+        .await
+        .expect("recovered listener should own every new connection");
+    }
 }

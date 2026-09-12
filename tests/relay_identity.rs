@@ -5,6 +5,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use common::port::UnavailableEndpoint;
 use common::{reserve_port, wait_for_event_on_relay, MockRelay, TestClient, TestRelay};
 use nostr::nips::nip65;
 use nostr_sdk::prelude::*;
@@ -244,9 +245,9 @@ async fn wiped_relay_adopts_identity_from_user_index_instead_of_publishing() {
 
 #[tokio::test]
 async fn identity_publication_defers_until_a_user_index_relay_is_reachable() {
-    // Release the reservation so connection attempts fail fast with refused;
-    // the MockRelay rebinds the same port later in the test.
-    let port = reserve_port().release();
+    // Reject protocol connections while retaining the recovery address.
+    let unavailable = UnavailableEndpoint::new();
+    let port = unavailable.port();
     let index_url = format!("ws://127.0.0.1:{port}");
 
     let relay = TestRelay::start_with_sync(Some(index_url)).await;
@@ -272,7 +273,7 @@ async fn identity_publication_defers_until_a_user_index_relay_is_reachable() {
 
     // Once an empty index becomes reachable, the generated identity is
     // released: seeded locally and published to the index.
-    let index = MockRelay::start_on_port(port).await;
+    let index = MockRelay::start_on_listener(unavailable.into_listener().await, Vec::new()).await;
     for url in [relay.url(), index.url()] {
         for kind in [Kind::Metadata, Kind::RelayList] {
             assert!(
@@ -297,9 +298,15 @@ async fn stored_identity_is_not_pushed_to_recovering_index_holding_an_identity()
     // Index A stays unreachable until it "recovers" already holding the
     // operator's customized profile; index B is reachable so the phase-1
     // index check can succeed without A.
-    let port_a = reserve_port().release();
-    let port_b = reserve_port().release();
-    let index_b = MockRelay::start_on_port(port_b).await;
+    let unavailable_a = UnavailableEndpoint::new();
+    let port_a = unavailable_a.port();
+    let listener_b = reserve_port().into_std_listener();
+    let port_b = listener_b.local_addr().expect("index B address").port();
+    let index_b = MockRelay::start_on_listener(
+        listener_b.try_clone().expect("retain index B listener"),
+        Vec::new(),
+    )
+    .await;
     let git_data = tempfile::tempdir().expect("git data dir");
     let relay_data = tempfile::tempdir().expect("relay data dir");
     let relay = TestRelay::start_on_reservation_persistent_user_index_relays(
@@ -338,8 +345,10 @@ async fn stored_identity_is_not_pushed_to_recovering_index_holding_an_identity()
     // identity events must wait for a successful index check before any
     // publication, then reach only relays confirmed to hold nothing.
     index_b.stop().await;
+    let unavailable_b = UnavailableEndpoint::from_listener(listener_b);
     let relay = relay.restart().await;
-    let index_b = MockRelay::start_on_port(port_b).await;
+    let index_b =
+        MockRelay::start_on_listener(unavailable_b.into_listener().await, Vec::new()).await;
     for kind in [Kind::Metadata, Kind::RelayList] {
         assert!(
             wait_for_event_on_relay(
@@ -356,7 +365,11 @@ async fn stored_identity_is_not_pushed_to_recovering_index_holding_an_identity()
     // A recovers already holding the customized profile. The per-relay
     // re-check before every send must adopt it locally instead of pushing
     // the stored (formerly generated) profile over it.
-    let index_a = MockRelay::start_on_port_with_events(port_a, vec![customized.clone()]).await;
+    let index_a = MockRelay::start_on_listener(
+        unavailable_a.into_listener().await,
+        vec![customized.clone()],
+    )
+    .await;
     assert!(
         wait_for_event_on_relay(
             relay.url(),
@@ -548,4 +561,20 @@ fn assert_identity_shape(relay: &TestRelay, events: &[Event]) {
     assert_eq!(advertised.len(), 1);
     assert_eq!(advertised[0].0.to_string(), relay.url());
     assert_eq!(advertised[0].1, None, "unmarked means read and write");
+}
+
+#[tokio::test]
+async fn subprocess_restart_retains_the_reserved_endpoint() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let relay = TestRelay::start().await;
+        let url = relay.url().to_string();
+        let relay = relay.restart().await;
+        assert_eq!(relay.url(), url);
+        let (_connection, _) = tokio_tungstenite::connect_async(relay.url())
+            .await
+            .expect("restarted subprocess must serve the inherited listener");
+        relay.stop().await;
+    })
+    .await
+    .expect("subprocess startup and restart must complete");
 }

@@ -34,7 +34,7 @@
 //! - Does NOT perform any GRASP validation (no purgatory, no git data checks)
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -46,6 +46,7 @@ use hyper_util::rt::TokioIo;
 use nostr_sdk::prelude::*;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 /// Mock Nostr relay that accepts all events without validation.
 ///
@@ -195,6 +196,25 @@ impl MockRelay {
         .await
     }
 
+    /// Recover on an owned listener, with initial events visible before accepts.
+    pub async fn start_on_listener(listener: std::net::TcpListener, events: Vec<Event>) -> Self {
+        let port = listener.local_addr().expect("mock listener address").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock listener");
+        let listener = TcpListener::from_std(listener).expect("register mock listener");
+        Self::start_with_listener(
+            listener,
+            port,
+            RateLimit::default(),
+            None,
+            None,
+            events,
+            None,
+        )
+        .await
+    }
+
     /// Internal method to start the relay with an existing listener.
     #[allow(clippy::too_many_arguments)]
     async fn start_with_listener(
@@ -232,6 +252,8 @@ impl MockRelay {
         let server_relay = relay.clone();
 
         let handle = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            let upgrades = Arc::new(Mutex::new(JoinSet::new()));
             loop {
                 tokio::select! {
                     accept_result = listener.accept() => {
@@ -242,8 +264,10 @@ impl MockRelay {
                                 let custom_nip11 = custom_nip11.clone();
                                 let io = TokioIo::new(stream);
 
-                                tokio::spawn(async move {
+                                let upgrades = upgrades.clone();
+                                connections.spawn(async move {
                                     let service = service_fn(move |req| {
+                                        let upgrades = upgrades.clone();
                                         let relay = relay.clone();
                                         let custom_nip11 = custom_nip11.clone();
                                         async move {
@@ -253,6 +277,7 @@ impl MockRelay {
                                                 remote_addr,
                                                 pagination,
                                                 custom_nip11,
+                                                upgrades,
                                             )
                                             .await
                                         }
@@ -275,12 +300,15 @@ impl MockRelay {
                             }
                         }
                     }
-                    _ = &mut shutdown_rx => {
-                        // Shutdown signal received
-                        break;
-                    }
+                    _ = &mut shutdown_rx => break,
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            // Stop HTTP services before draining upgrades so no service can
+            // create another WebSocket task after the snapshot is taken.
+            connections.shutdown().await;
+            let mut upgrades = std::mem::take(&mut *upgrades.lock().unwrap());
+            upgrades.shutdown().await;
         });
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -321,13 +349,17 @@ impl MockRelay {
 
         // Wait for server task to complete
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("mock relay tasks should stop")
+                .expect("mock relay server task should not panic");
         }
     }
 }
 
 impl Drop for MockRelay {
     fn drop(&mut self) {
+        self.relay.shutdown();
         // Send shutdown signal if not already sent
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -342,6 +374,7 @@ async fn handle_request(
     addr: SocketAddr,
     pagination: Option<PaginationConfig>,
     custom_nip11: Option<serde_json::Value>,
+    upgrades: Arc<Mutex<JoinSet<()>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check for WebSocket upgrade request
     let is_websocket = req
@@ -361,8 +394,10 @@ async fn handle_request(
         if let Some(key) = key {
             let accept_key = derive_accept_key(key.as_bytes());
 
-            // Spawn task to handle the upgraded connection
-            tokio::spawn(async move {
+            // Retain upgrade tasks until the fixture shuts down.
+            let mut upgrades = upgrades.lock().unwrap();
+            while upgrades.try_join_next().is_some() {}
+            upgrades.spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         if let Err(e) = relay.take_connection(TokioIo::new(upgraded), addr).await {
@@ -472,6 +507,33 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn stop_closes_active_websocket_sessions() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mock = MockRelay::start().await;
+            let (mut client, _) = tokio_tungstenite::connect_async(mock.url()).await.unwrap();
+            client
+                .send(Message::Text(r#"["REQ","stop-probe",{"limit":1}]"#.into()))
+                .await
+                .unwrap();
+            loop {
+                let message = client.next().await.unwrap().unwrap();
+                if message.to_text().is_ok_and(|text| text.contains("EOSE")) {
+                    break;
+                }
+            }
+            mock.stop().await;
+            assert!(matches!(
+                client.next().await,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+        })
+        .await
+        .expect("mock stop must close active sessions");
+    }
+
+    #[tokio::test]
     async fn test_mock_relay_starts_and_stops() {
         let mock = MockRelay::start().await;
 
@@ -494,10 +556,10 @@ mod tests {
             .add_relay(mock.url())
             .await
             .expect("Failed to add relay");
-        client.connect().await;
-
-        // Wait for connection
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        client
+            .try_connect_relay(mock.url(), Duration::from_secs(5))
+            .await
+            .expect("connect to mock relay");
 
         // Create and send a simple event
         let event = EventBuilder::new(Kind::TextNote, "Test note from MockRelay test")

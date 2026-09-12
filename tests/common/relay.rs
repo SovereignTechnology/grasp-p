@@ -16,7 +16,7 @@ use nostr_sdk::prelude::{Keys, ToBech32};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
 use crate::common::port::{self, PortReservation};
@@ -26,31 +26,18 @@ use crate::common::port::{self, PortReservation};
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to retry the HTTP probe while waiting for readiness.
 const READY_POLL: Duration = Duration::from_millis(100);
-/// Extra grace after the HTTP service responds before declaring the relay
-/// ready.
-const READY_GRACE: Duration = Duration::from_millis(100);
 /// Per-attempt timeout for the HTTP readiness probe once TCP connects.
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-/// How many fresh port reservations to attempt before giving up. The
-/// subprocess binds itself from `NGIT_BIND_ADDRESS`, so there is a
-/// microsecond-scale TOCTOU window between [`PortReservation::release`]
-/// and the subprocess's own `bind`. If that window loses the race the
-/// subprocess exits before its TCP listener accepts; the readiness
-/// check picks that up via `try_wait` so we can retry on a fresh port
-/// instead of hanging the full readiness timeout.
-///
-/// In practice this loop has never been observed to fire in local
-/// stress testing — kept as defense-in-depth for CI / loaded hardware.
-const MAX_BIND_ATTEMPTS: usize = 5;
 
 /// Test relay fixture that manages relay lifecycle
 ///
 /// Automatically starts and stops the ngit-grasp relay for testing.
-/// Uses a kernel-assigned port held open by a [`PortReservation`] until
-/// just before subprocess spawn, eliminating the same-process port race
-/// that plagued the older "bind, drop, return port" pattern.
+/// Transfers a kernel-assigned listener to the child while retaining a
+/// parent copy, so startup and same-address restart never release the port.
 pub struct TestRelay {
     process: Child,
+    /// Parent copy retains the address across a same-endpoint restart.
+    listener: std::net::TcpListener,
     url: String,
     port: u16,
     /// Relay-owner identity configured in the subprocess.
@@ -725,49 +712,21 @@ impl TestRelay {
 
     /// Single entry point that drives the spawn+readiness loop.
     ///
-    /// Retries up to [`MAX_BIND_ATTEMPTS`] times if the subprocess exits
-    /// early — that's the signature of having lost the bind race in the
-    /// microseconds between [`PortReservation::release`] and the
-    /// subprocess's own `bind`. Each retry draws a brand-new
-    /// kernel-assigned port; two consecutive `AddrInUse` failures would
-    /// therefore require two independent races back to back.
-    async fn start_internal(initial_reservation: PortReservation, options: RelayOptions) -> Self {
-        let mut reservation = Some(initial_reservation);
-        for attempt in 1..=MAX_BIND_ATTEMPTS {
-            // Each attempt consumes the current reservation. On retry we
-            // re-acquire from the kernel — guaranteed to give us a port
-            // number different from any reservation currently held
-            // elsewhere in this process.
-            let r = reservation
-                .take()
-                .expect("reservation always present on attempt entry");
-            match Self::try_start_once(r, &options).await {
-                StartOutcome::Ready(relay) => return relay,
-                StartOutcome::EarlyExit { status } if attempt < MAX_BIND_ATTEMPTS => {
-                    eprintln!(
-                        "[TestRelay] ngit-grasp exited early on attempt \
-                         {attempt}/{MAX_BIND_ATTEMPTS} (status: {status:?}); \
-                         likely a port-bind race — retrying with a fresh port",
-                    );
-                    reservation = Some(port::reserve_port());
-                    continue;
-                }
-                StartOutcome::EarlyExit { status } => {
-                    panic!(
-                        "ngit-grasp subprocess exited early after {MAX_BIND_ATTEMPTS} attempts \
-                         (last exit status: {status:?}). If this is not a port-bind race, \
-                         check /tmp/relay-*.log for the relay's stdout."
-                    );
-                }
-            }
+    /// Transfer the reserved listener to the child. Startup errors are real
+    /// failures; no port is released and no address retry is needed.
+    async fn start_internal(reservation: PortReservation, options: RelayOptions) -> Self {
+        match Self::try_start_once(reservation, &options).await {
+            StartOutcome::Ready(relay) => relay,
+            StartOutcome::EarlyExit { status } => panic!(
+                "ngit-grasp exited before readiness (status: {status:?}); see /tmp/relay-*.log"
+            ),
         }
-        unreachable!("MAX_BIND_ATTEMPTS loop terminated without returning")
     }
 
     /// One attempt at spawning ngit-grasp on the given reservation and
     /// waiting for it to be ready. Returns [`StartOutcome::EarlyExit`]
     /// specifically when the subprocess died before the readiness probe
-    /// succeeded — the caller may retry in that case.
+    /// succeeded.
     async fn try_start_once(reservation: PortReservation, options: &RelayOptions) -> StartOutcome {
         let port = reservation.port();
         let bind_address = format!("127.0.0.1:{}", port);
@@ -960,16 +919,31 @@ impl TestRelay {
             );
         }
 
-        // Release the port reservation immediately before spawning the
-        // subprocess that will bind it. Holding the reservation through
-        // env-var setup above is what keeps any concurrent
-        // `reserve_port()` calls from picking this same number.
-        let _ = reservation.release();
+        // Transfer the reservation through exec and retain a parent copy
+        // for same-address restarts. The port is never released during startup.
+        let listener = reservation.into_std_listener();
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::process::CommandExt};
+            let fd = listener.as_raw_fd();
+            cmd.env("NGIT_TEST_LISTENER_FD", fd.to_string());
+            // SAFETY: fcntl is async-signal-safe; the parent owns the descriptor
+            // through spawn. The child adopts it before starting the server.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let process = cmd.spawn().expect("Failed to start relay process");
 
         let mut relay = Self {
             process,
+            listener,
             url,
             port,
             owner_keys: test_keys.clone(),
@@ -1035,26 +1009,12 @@ impl TestRelay {
     pub async fn restart(mut self) -> Self {
         let port = self.port;
         let options = self.options.clone();
-
+        let reservation = port::PortReservation::from_listener(
+            self.listener.try_clone().expect("retain restart listener"),
+        );
         let _ = self.process.kill();
         let _ = self.process.wait();
         drop(self);
-
-        // The kernel frees the port once the child is fully gone; retry
-        // the specific-port reservation within a bounded deadline.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let reservation = loop {
-            match port::reserve_specific(port) {
-                Ok(reservation) => break reservation,
-                Err(error) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "port {port} not released by stopped relay within deadline: {error}"
-                    );
-                    sleep(Duration::from_millis(50)).await;
-                }
-            }
-        };
 
         match Self::try_start_once(reservation, &options).await {
             StartOutcome::Ready(relay) => relay,
@@ -1102,7 +1062,6 @@ impl TestRelay {
                 Ok(()) => {
                     // HTTP service handled a request successfully, so the
                     // accept loop, Hyper service, and relay wiring are ready.
-                    sleep(READY_GRACE).await;
                     return ReadyOutcome::Ready;
                 }
                 Err(_) if Instant::now() < deadline => {
@@ -1131,8 +1090,10 @@ impl TestRelay {
             );
             stream.write_all(request.as_bytes()).await?;
 
-            let mut response = [0_u8; 64];
-            let read = stream.read(&mut response).await?;
+            let mut response = Vec::new();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let read =
+                tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut response).await?;
             if read == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1163,13 +1124,7 @@ impl TestRelay {
 
     /// Stop the relay
     pub async fn stop(mut self) {
-        // Kill the process (gracefully if possible)
-        let _ = self.process.kill();
-
-        // Wait a bit for graceful shutdown
-        sleep(Duration::from_millis(100)).await;
-
-        // Force kill if still running
+        // kill() sends SIGKILL; reap directly instead of guessing a grace period.
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
