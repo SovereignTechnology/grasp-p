@@ -766,11 +766,11 @@ async fn test_rejected_cache_entries_expired_during_downtime() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state_path = temp_dir.path().join("rejected_cache.json");
 
-    // Create index with very short expiry
-    let index = RejectedEventsIndex::new(
-        Duration::from_millis(50),  // Hot cache: 50ms
-        Duration::from_millis(100), // Cold index: 100ms
-    );
+    // Use production-scale retention periods so host scheduling cannot
+    // accidentally expire the cold entry during this test.
+    let hot_expiry = Duration::from_secs(60);
+    let cold_expiry = Duration::from_secs(7 * 24 * 60 * 60);
+    let index = RejectedEventsIndex::new(hot_expiry, cold_expiry);
     let keys = Keys::generate();
 
     let event = create_test_event(&keys, "test").await;
@@ -785,11 +785,20 @@ async fn test_rejected_cache_entries_expired_during_downtime() {
     // Save to disk
     index.save_to_disk(&state_path).unwrap();
 
-    // Simulate downtime longer than hot cache expiry
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    // Simulate two minutes of downtime in the persisted snapshot instead
+    // of relying on a narrow wall-clock interval between two expirations.
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    snapshot["saved_at"] = serde_json::to_value(
+        std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("simulated downtime must fit in SystemTime"),
+    )
+    .unwrap();
+    std::fs::write(&state_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
     // Restore
-    let index2 = RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_millis(100));
+    let index2 = RejectedEventsIndex::new(hot_expiry, cold_expiry);
     index2.restore_from_disk(&state_path).unwrap();
 
     // Both should be restored initially
