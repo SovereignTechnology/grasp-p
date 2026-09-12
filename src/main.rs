@@ -15,6 +15,8 @@ use ngit_grasp::{
 };
 
 mod docs_export;
+#[cfg(unix)]
+mod test_listener;
 
 /// Top-level CLI dispatcher.
 ///
@@ -45,6 +47,14 @@ enum Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Harnesses probe this before handing a reserved Unix listener to the child.
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--internal-test-listener-support"))
+    {
+        #[cfg(unix)]
+        println!("ngit-test-listener-v1");
+        return Ok(());
+    }
+
     // Documentation builds need only the static command model. Dispatch before
     // dotenv, clap parsing, secret discovery, filesystem access, or relay
     // startup so exporting metadata is safe in an isolated build environment.
@@ -123,6 +133,12 @@ async fn run_relay(config: Config) -> Result<()> {
         "Starting ngit-grasp"
     );
 
+    #[cfg(unix)]
+    let server = match test_listener::from_env()? {
+        Some(listener) => RelayServer::start_with_listener(config, listener).await?,
+        None => RelayServer::start(config).await?,
+    };
+    #[cfg(not(unix))]
     let server = RelayServer::start(config).await?;
 
     server.run_until(shutdown_signal()).await

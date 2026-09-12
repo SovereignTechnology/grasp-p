@@ -1507,6 +1507,13 @@ mod tests {
         keys.sign_event(unsigned).unwrap()
     }
 
+    fn expire_hot_cache(cache: &HotCache) {
+        let expired_at = Instant::now() - cache.expiry_duration;
+        for entry in cache.entries.write().unwrap().values_mut() {
+            entry.cached_at = expired_at;
+        }
+    }
+
     fn simulate_checkpoint_downtime(path: &Path, downtime: Duration) {
         let json = std::fs::read_to_string(path).expect("read rejected-event checkpoint");
         let mut state: RejectedCacheState =
@@ -1598,7 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_cache_expires_after_duration() {
-        let cache = HotCache::new(Duration::from_millis(50));
+        let cache = HotCache::new(Duration::from_secs(120));
         let event = create_test_event().await;
 
         cache.add(
@@ -1611,8 +1618,8 @@ mod tests {
 
         assert!(cache.contains(&event.id));
 
-        // Wait for expiry
-        std::thread::sleep(Duration::from_millis(60));
+        // Move the cache timestamp to its expiry boundary without waiting.
+        expire_hot_cache(&cache);
 
         let expired = cache.cleanup_expired();
         assert_eq!(expired, 1);
@@ -1698,14 +1705,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_unrecoverable_ids_expire_with_cold_bound() {
-        let index = RejectedEventsIndex::new(Duration::from_millis(10), Duration::from_millis(50));
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         let event = create_test_event().await;
 
         index.add_unrecoverable(event.id, 30617);
         assert!(index.contains(&event.id));
 
-        // Passage of time is the behaviour under test (bounded expiry)
-        std::thread::sleep(Duration::from_millis(60));
+        // Set the rejection timestamp at the cold expiry boundary.
+        index
+            .unrecoverable
+            .entries
+            .write()
+            .unwrap()
+            .get_mut(&event.id)
+            .unwrap()
+            .rejected_at = Instant::now() - index.unrecoverable.expiry_duration;
 
         assert!(!index.contains(&event.id));
         assert_eq!(index.cleanup_expired_unrecoverable(), 1);
@@ -1793,8 +1807,8 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_expired_both_tiers() {
         let index = RejectedEventsIndex::new(
-            Duration::from_millis(50),  // Hot cache expires quickly
-            Duration::from_millis(100), // Cold index expires slower
+            Duration::from_secs(120),    // Hot cache expires quickly
+            Duration::from_secs(604800), // Cold index expires slower
         );
         let event = create_test_event().await;
 
@@ -1805,15 +1819,22 @@ mod tests {
             RejectionReason::DoesNotListService,
         );
 
-        // Wait for hot cache to expire
-        std::thread::sleep(Duration::from_millis(60));
+        // Expire only the hot tier, independently of scheduler timing.
+        expire_hot_cache(&index.hot_cache);
 
         let (hot_expired, cold_expired) = index.cleanup_expired_for_type("announcement");
         assert_eq!(hot_expired, 1);
         assert_eq!(cold_expired, 0); // Not expired yet
 
-        // Wait for cold index to expire
-        std::thread::sleep(Duration::from_millis(50));
+        // Now expire the remaining cold entry explicitly.
+        index
+            .cold_index
+            .entries
+            .write()
+            .unwrap()
+            .get_mut(&event.id)
+            .unwrap()
+            .rejected_at = Instant::now() - index.cold_index.expiry_duration;
 
         let (hot_expired, cold_expired) = index.cleanup_expired_for_type("announcement");
         assert_eq!(hot_expired, 0); // Already cleaned up
@@ -1822,8 +1843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hot_cache_miss_after_expiry() {
-        let index =
-            RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_secs(604800));
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         let event = create_test_event().await;
         let pubkey = event.pubkey;
         let identifier = "test-repo".to_string();
@@ -1835,8 +1855,8 @@ mod tests {
             RejectionReason::MaintainerNotYetValid,
         );
 
-        // Wait for hot cache to expire
-        std::thread::sleep(Duration::from_millis(60));
+        // Expire only the hot tier, independently of scheduler timing.
+        expire_hot_cache(&index.hot_cache);
 
         let (removed, hot_events) =
             index.invalidate_and_get(&pubkey, &identifier, Some(EventType::Announcement));
@@ -1847,8 +1867,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_dependency_candidate_keeps_id_for_targeted_refetch() {
-        let index =
-            RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_secs(604800));
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         let keys = Keys::generate();
         let dependency_event = keys
             .sign_event(
@@ -1877,7 +1896,7 @@ mod tests {
             RejectionReason::Other,
         );
 
-        std::thread::sleep(Duration::from_millis(60));
+        expire_hot_cache(&index.hot_cache);
 
         let (event_ids, hot_events) =
             index.dependency_candidates(&pubkey, &identifier, Some(EventType::State));
@@ -2110,7 +2129,7 @@ mod tests {
         let state_path = temp_dir.path().join("rejected_cache.json");
 
         let index = RejectedEventsIndex::new(
-            Duration::from_millis(50),   // Hot cache expires quickly
+            Duration::from_secs(120),    // Hot cache expires quickly
             Duration::from_secs(604800), // Cold index lasts long
         );
         let event = create_test_event().await;
@@ -2123,8 +2142,8 @@ mod tests {
             RejectionReason::MaintainerNotYetValid,
         );
 
-        // Wait for hot cache to expire
-        std::thread::sleep(Duration::from_millis(60));
+        // Expire only the hot tier, independently of scheduler timing.
+        expire_hot_cache(&index.hot_cache);
         index.cleanup_expired_for_type("announcement");
 
         assert_eq!(index.hot_cache_len(), 0);
@@ -2135,7 +2154,7 @@ mod tests {
 
         // Restore into new index
         let index2 =
-            RejectedEventsIndex::new(Duration::from_millis(50), Duration::from_secs(604800));
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         index2.restore_from_disk(&state_path).unwrap();
 
         // Verify only cold index restored (hot cache was empty)
@@ -2514,8 +2533,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let state_path = temp_dir.path().join("rejected_cache.json");
 
-        // Create index with 2 second hot cache expiry
-        let index = RejectedEventsIndex::new(Duration::from_secs(2), Duration::from_secs(604800));
+        // Use the normal TTL and simulate the elapsed part explicitly.
+        let index = RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         let event = create_test_event().await;
 
         index.add_announcement(
@@ -2525,24 +2544,40 @@ mod tests {
             RejectionReason::DoesNotListService,
         );
 
-        // Wait 200ms (small fraction of TTL)
-        std::thread::sleep(Duration::from_millis(200));
+        // Save an entry that has already consumed part of its TTL.
+        index
+            .hot_cache
+            .entries
+            .write()
+            .unwrap()
+            .get_mut(&event.id)
+            .unwrap()
+            .cached_at = Instant::now() - Duration::from_secs(30);
 
         // Save to disk
         index.save_to_disk(&state_path).unwrap();
 
         // Immediately restore (minimal downtime)
-        let index2 = RejectedEventsIndex::new(Duration::from_secs(2), Duration::from_secs(604800));
+        let index2 =
+            RejectedEventsIndex::new(Duration::from_secs(120), Duration::from_secs(604800));
         index2.restore_from_disk(&state_path).unwrap();
 
-        // Event should still be retrievable (has ~1.8s remaining)
+        // Restoring must retain the elapsed age, not reset the TTL.
+        assert!(
+            index2.hot_cache.entries.read().unwrap()[&event.id]
+                .cached_at
+                .elapsed()
+                >= Duration::from_secs(30)
+        );
+
+        // The remaining TTL still permits retrieval.
         let events = index2
             .hot_cache
             .get_maintainer_events(&event.pubkey, "test-repo", None);
         assert_eq!(events.len(), 1);
 
-        // Wait 2 seconds (total 2.2s > 2s expiry)
-        std::thread::sleep(Duration::from_secs(2));
+        // Advance the restored entry to expiry without a wall-clock wait.
+        expire_hot_cache(&index2.hot_cache);
 
         // Now it should be expired
         let events = index2

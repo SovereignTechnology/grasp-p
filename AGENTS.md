@@ -121,10 +121,14 @@ nix develop -c cargo test -p grasp-audit --lib specific_test_name -- --nocapture
 ### Troubleshooting
 
 **Buffer Size Errors:**
-If you see mpsc channel buffer size panics on first test run, this is usually transient. Simply run the tests again.
+Capture the failing test and panic before retrying. Diagnose the fixture or
+capacity assumption; a successful rerun alone does not establish correctness.
 
 **Port Conflicts:**
-Both `TestRelay` and `test-ngit-relay.sh` use random ports to avoid conflicts. If you see port errors, ensure no stale processes are running.
+`TestRelay` transfers an owned loopback listener into the subprocess and
+retains it across restarts. Do not release a reservation and rebind its port.
+See [test fixture guidance](docs/how-to/test-fixtures.md) for readiness,
+shutdown, and timing rules. Audit external server scripts separately.
 
 ## Code Patterns
 

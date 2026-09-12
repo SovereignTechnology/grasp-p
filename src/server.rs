@@ -82,7 +82,7 @@ impl RelayServer {
     /// Expects `config.relay_owner_nsec` to be set (see [`Config::load`])
     /// and does **not** install a tracing subscriber — that is the
     /// caller's concern.
-    pub async fn start(mut config: Config) -> Result<Self> {
+    pub async fn start(config: Config) -> Result<Self> {
         // Bind first so kernel-assigned ports are resolved before any
         // component captures the domain / bind address.
         let requested: SocketAddr = config
@@ -92,6 +92,12 @@ impl RelayServer {
         let listener = TcpListener::bind(&requested)
             .await
             .with_context(|| format!("failed to bind {}", requested))?;
+        Self::start_with_listener(config, listener).await
+    }
+
+    /// Start from an already bound listener without releasing its address.
+    /// Used by subprocess test fixtures to preserve their port reservation.
+    pub async fn start_with_listener(mut config: Config, listener: TcpListener) -> Result<Self> {
         let local_addr = listener.local_addr()?;
         config.bind_address = local_addr.to_string();
         if config.domain.is_empty() {

@@ -34,6 +34,7 @@ impl SetupDropRelay {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
@@ -43,7 +44,7 @@ impl SetupDropRelay {
                         let dropped_tx = dropped_tx.clone();
                         let dropped_rx = dropped_rx.clone();
                         let active_websockets = active_websockets.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             handle_connection(
                                 stream,
                                 nip11_tx,
@@ -55,9 +56,13 @@ impl SetupDropRelay {
                             .await;
                         });
                     }
+                    result = connections.join_next(), if !connections.is_empty() => {
+                        result.expect("connection task").expect("fixture connection panicked");
+                    }
                     _ = &mut shutdown_rx => break,
                 }
             }
+            connections.shutdown().await;
         });
 
         Self {
@@ -142,6 +147,9 @@ async fn handle_connection(
 
 impl Drop for SetupDropRelay {
     fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }

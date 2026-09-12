@@ -19,6 +19,24 @@ use super::purgatory_helpers::{
 };
 use super::sync_helpers::create_repo_announcement;
 
+/// Wait for promotion rather than assuming the worker runs within a fixed delay.
+async fn wait_until_served(client: &AuditClient, event_id: EventId) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .is_event_on_relay(event_id)
+                .await
+                .expect("query promoted event")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("event {event_id} was not served after git data arrived"));
+}
+
 /// Publish a repo announcement, submit a matching state event, and push the
 /// deterministic git data so the announcement is promoted out of purgatory and
 /// becomes queryable.
@@ -130,16 +148,7 @@ pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Even
         Err(e) => panic!("git push error while promoting repo: {}", e),
     }
 
-    // Give the relay a moment to promote the events out of purgatory.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
 
     (announcement, repo_id)
 }
@@ -253,15 +262,7 @@ pub async fn publish_served_repo_with_maintainers(
         Err(e) => panic!("git push error while promoting repo: {}", e),
     }
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
 
     (announcement, repo_id)
 }
@@ -320,22 +321,8 @@ pub async fn publish_served_repo_with_state_event(
     push_to_relay(temp_dir.path(), &relay_domain, &npub, &repo_id)
         .expect("git push should promote announcement + state event out of purgatory");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
-    assert!(
-        client
-            .is_event_on_relay(state_event.id)
-            .await
-            .expect("query state event"),
-        "state event should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
+    wait_until_served(client, state_event.id).await;
 
     (announcement, repo_id, state_event)
 }
@@ -406,22 +393,8 @@ pub async fn publish_served_repo_with_state_event_and_maintainers(
     push_to_relay(temp_dir.path(), &relay_domain, &npub, &repo_id)
         .expect("git push should promote announcement + state event out of purgatory");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
-    assert!(
-        client
-            .is_event_on_relay(state_event.id)
-            .await
-            .expect("query state event"),
-        "state event should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
+    wait_until_served(client, state_event.id).await;
 
     (announcement, repo_id, state_event)
 }
@@ -483,8 +456,6 @@ pub async fn publish_served_announcement_for_identifier(
         .await
         .expect("relay should accept state event");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     if client
         .is_event_on_relay(announcement.id)
         .await
@@ -536,13 +507,7 @@ pub async fn publish_served_announcement_for_identifier(
         Err(e) => panic!("git push error while promoting repo: {}", e),
     }
 
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
 
     announcement
 }
@@ -599,8 +564,6 @@ pub async fn publish_served_announcement_with_state_for_identifier(
         .await
         .expect("relay should accept state event");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let announcement_served = client
         .is_event_on_relay(announcement.id)
         .await
@@ -656,20 +619,8 @@ pub async fn publish_served_announcement_with_state_for_identifier(
         Err(e) => panic!("git push error while promoting repo: {}", e),
     }
 
-    assert!(
-        client
-            .is_event_on_relay(announcement.id)
-            .await
-            .expect("query announcement"),
-        "announcement should be served after git data arrives"
-    );
-    assert!(
-        client
-            .is_event_on_relay(state_event.id)
-            .await
-            .expect("query state event"),
-        "state event should be served after git data arrives"
-    );
+    wait_until_served(client, announcement.id).await;
+    wait_until_served(client, state_event.id).await;
 
     (announcement, state_event)
 }

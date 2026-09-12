@@ -74,6 +74,7 @@ impl NegLimitingProxy {
         let accept_opened = opened.clone();
 
         let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
@@ -82,7 +83,7 @@ impl NegLimitingProxy {
                         let peak = accept_peak.clone();
                         let rejected = accept_rejected.clone();
                         let opened = accept_opened.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(error) = proxy_connection(
                                 stream,
                                 &backend_url,
@@ -98,9 +99,13 @@ impl NegLimitingProxy {
                             }
                         });
                     }
+                    result = connections.join_next(), if !connections.is_empty() => {
+                        result.expect("connection task").expect("fixture connection panicked");
+                    }
                     _ = &mut shutdown_rx => break,
                 }
             }
+            connections.shutdown().await;
         });
 
         Self {
@@ -146,6 +151,9 @@ impl NegLimitingProxy {
 
 impl Drop for NegLimitingProxy {
     fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }

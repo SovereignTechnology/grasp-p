@@ -106,7 +106,6 @@ pub fn offset_to_instant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -117,17 +116,14 @@ mod tests {
 
         let offset = instant_to_offset(future, now_system, now_instant);
 
-        // Should be approximately 60 seconds (within tolerance)
-        assert!(offset.as_secs() >= 59 && offset.as_secs() <= 61);
+        assert_eq!(offset, Duration::from_secs(60));
     }
 
     #[test]
     fn test_instant_to_offset_past() {
         let now_system = SystemTime::now();
-        let past_instant = Instant::now();
-        // Simulate some time passing
-        thread::sleep(Duration::from_millis(10));
         let now_instant = Instant::now();
+        let past_instant = now_instant - Duration::from_secs(10);
 
         let offset = instant_to_offset(past_instant, now_system, now_instant);
 
@@ -137,22 +133,9 @@ mod tests {
 
     #[test]
     fn test_offset_to_instant_with_time_remaining() {
-        let saved_at = SystemTime::now();
+        let saved_at = SystemTime::now() - Duration::from_secs(10);
         let offset = Duration::from_secs(60);
-
-        // Simulate a very short downtime (< 10ms)
-        thread::sleep(Duration::from_millis(5));
-
-        let now_instant = Instant::now();
-        let restored = offset_to_instant(offset, saved_at, now_instant);
-
-        // Should be approximately 60 seconds in the future
-        let remaining = restored.duration_since(now_instant);
-        assert!(
-            remaining.as_secs() >= 59 && remaining.as_secs() <= 61,
-            "Expected ~60s, got {}s",
-            remaining.as_secs()
-        );
+        assert_restored_within_call_bounds(offset, saved_at, Instant::now());
     }
 
     #[test]
@@ -178,21 +161,23 @@ mod tests {
         // Convert to offset
         let offset = instant_to_offset(future, now_system, now_instant);
 
-        // Immediately convert back (minimal downtime)
-        let restored = offset_to_instant(offset, now_system, now_instant);
+        assert_restored_within_call_bounds(offset, now_system, now_instant);
+    }
 
-        // Should be very close to the original future instant
-        let diff = if restored > future {
-            restored.duration_since(future)
-        } else {
-            future.duration_since(restored)
+    // The conversion reads SystemTime internally. Bound that read with actual
+    // observations instead of assuming a maximum scheduling delay.
+    fn assert_restored_within_call_bounds(
+        offset: Duration,
+        saved_at: SystemTime,
+        reference: Instant,
+    ) {
+        let before = SystemTime::now();
+        let restored = offset_to_instant(offset, saved_at, reference);
+        let after = SystemTime::now();
+        let remaining_at = |now: SystemTime| {
+            offset.saturating_sub(now.duration_since(saved_at).unwrap_or(Duration::ZERO))
         };
-
-        // Allow for small timing differences (< 100ms)
-        assert!(
-            diff < Duration::from_millis(100),
-            "Round trip should preserve instant within 100ms, got {}ms",
-            diff.as_millis()
-        );
+        assert!(restored >= reference + remaining_at(after));
+        assert!(restored <= reference + remaining_at(before));
     }
 }

@@ -35,6 +35,7 @@ use hyper_util::rt::TokioIo;
 use nostr_sdk::prelude::{Event, Keys, Kind, PublicKey};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -82,6 +83,8 @@ impl AuthGatingRelay {
         let backend_url = backend_url.to_string();
         let accept_state = state.clone();
         let handle = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            let upgrades = Arc::new(Mutex::new(JoinSet::new()));
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
@@ -89,11 +92,13 @@ impl AuthGatingRelay {
                         let backend_url = backend_url.clone();
                         let state = accept_state.clone();
                         let io = TokioIo::new(stream);
-                        tokio::spawn(async move {
+                        let upgrades = upgrades.clone();
+                        connections.spawn(async move {
                             let service = service_fn(move |req| {
+                                let upgrades = upgrades.clone();
                                 let backend_url = backend_url.clone();
                                 let state = state.clone();
-                                async move { handle_request(req, backend_url, mode, state).await }
+                                async move { handle_request(req, backend_url, mode, state, upgrades).await }
                             });
                             // Errors are expected when clients disconnect.
                             let _ = http1::Builder::new()
@@ -103,8 +108,12 @@ impl AuthGatingRelay {
                         });
                     }
                     _ = &mut shutdown_rx => break,
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            connections.shutdown().await;
+            let mut upgrades = std::mem::take(&mut *upgrades.lock().unwrap());
+            upgrades.shutdown().await;
         });
 
         Self {
@@ -140,7 +149,10 @@ impl AuthGatingRelay {
             let _ = tx.send(());
         }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("auth gating relay tasks should stop")
+                .expect("auth gating relay server task should not panic");
         }
     }
 }
@@ -158,6 +170,7 @@ async fn handle_request(
     backend_url: String,
     mode: GateMode,
     state: GateState,
+    upgrades: Arc<Mutex<JoinSet<()>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let is_websocket = req
         .headers()
@@ -173,7 +186,9 @@ async fn handle_request(
             .map(str::to_string)
         {
             let accept_key = derive_accept_key(key.as_bytes());
-            tokio::spawn(async move {
+            let mut upgrades = upgrades.lock().unwrap();
+            while upgrades.try_join_next().is_some() {}
+            upgrades.spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         let ws = WebSocketStream::from_raw_socket(
@@ -251,7 +266,7 @@ async fn run_session(
 
     let mut authenticated = false;
     let mut backend: Option<SplitSink<_, Message>> = None;
-    let mut backend_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut backend_tasks = JoinSet::new();
 
     while let Some(message) = client_rx.next().await {
         let message = message.map_err(|e| format!("client read: {e}"))?;
@@ -273,7 +288,7 @@ async fn run_session(
                                 .map_err(|e| format!("backend connect failed: {e}"))?;
                         let (backend_tx, backend_rx) = backend_ws.split();
                         backend = Some(backend_tx);
-                        backend_task = Some(spawn_backend_forwarder(backend_rx, client_tx.clone()));
+                        backend_tasks.spawn(forward_backend(backend_rx, client_tx.clone()));
                     }
                     continue;
                 }
@@ -342,9 +357,7 @@ async fn run_session(
         }
     }
 
-    if let Some(task) = backend_task {
-        task.abort();
-    }
+    backend_tasks.shutdown().await;
     Ok(())
 }
 
@@ -395,20 +408,18 @@ async fn handle_auth(
     .await
 }
 
-fn spawn_backend_forwarder(
+async fn forward_backend(
     mut backend_rx: SplitStream<
         WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     >,
     client_tx: SharedClientSink,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(message) = backend_rx.next().await {
-            let Ok(message) = message else { break };
-            if client_tx.lock().await.send(message).await.is_err() {
-                break;
-            }
+) {
+    while let Some(message) = backend_rx.next().await {
+        let Ok(message) = message else { break };
+        if client_tx.lock().await.send(message).await.is_err() {
+            break;
         }
-    })
+    }
 }
 
 /// Derive the Sec-WebSocket-Accept key from the request key.
@@ -426,4 +437,26 @@ fn derive_accept_key(request_key: &[u8]) -> String {
         &base64::engine::general_purpose::STANDARD,
         hash.as_byte_array(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_closes_active_websocket_sessions() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let gate = AuthGatingRelay::start("ws://127.0.0.1:1", GateMode::Restricted).await;
+            let (mut client, _) = tokio_tungstenite::connect_async(gate.url()).await.unwrap();
+            let challenge = client.next().await.unwrap().unwrap();
+            assert!(challenge.to_text().unwrap().contains("AUTH"));
+            gate.stop().await;
+            assert!(matches!(
+                client.next().await,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+        })
+        .await
+        .expect("gate stop must close active sessions");
+    }
 }
