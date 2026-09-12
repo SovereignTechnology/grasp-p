@@ -31,6 +31,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 /// One observed `POST /git-upload-pack` exchange.
 #[derive(Debug, Clone)]
@@ -77,6 +78,7 @@ impl UploadPackCountingProxy {
         let accept_info_refs = info_refs.clone();
 
         let handle = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             // One shared upstream client; keep it plain so request and
             // response bodies pass through byte-for-byte.
             let client = reqwest::Client::builder()
@@ -92,7 +94,7 @@ impl UploadPackCountingProxy {
                         let client = client.clone();
                         let exchanges = accept_exchanges.clone();
                         let info_refs = accept_info_refs.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let io = TokioIo::new(stream);
                             let service = service_fn(move |req| {
                                 let backend_url = backend_url.clone();
@@ -118,8 +120,10 @@ impl UploadPackCountingProxy {
                         });
                     }
                     _ = &mut shutdown_rx => break,
+                    _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            connections.shutdown().await;
         });
 
         Self {
@@ -155,7 +159,10 @@ impl UploadPackCountingProxy {
             let _ = tx.send(());
         }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("upload-pack proxy tasks should stop")
+                .expect("upload-pack proxy server task should not panic");
         }
     }
 }
@@ -290,6 +297,41 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_closes_active_forwarded_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = UploadPackCountingProxy::start(&format!(
+                "http://{}",
+                backend.local_addr().unwrap()
+            ))
+            .await;
+            let address = proxy.url().strip_prefix("http://").unwrap();
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(
+                    b"GET /info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let (mut upstream, _) = backend.accept().await.unwrap();
+            let mut request = [0; 256];
+            assert!(upstream.read(&mut request).await.unwrap() > 0);
+            // The request has reached the backend, which deliberately retains
+            // the connection without replying while the proxy is stopped.
+            proxy.stop().await;
+            let mut byte = [0];
+            match client.read(&mut byte).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                result => panic!("proxy retained an active request after stop: {result:?}"),
+            }
+        })
+        .await
+        .expect("proxy stop must close active requests");
+    }
 
     #[test]
     fn parse_wants_extracts_oids_from_pkt_lines() {

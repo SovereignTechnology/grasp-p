@@ -31,13 +31,14 @@ impl FlappingRelay {
         let notify = connection_observed.clone();
 
         let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
                         let observed = observed.clone();
                         let notify = notify.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
                             else {
                                 // NIP-11 HTTP probes are expected to fail this
@@ -61,9 +62,13 @@ impl FlappingRelay {
                             }
                         });
                     }
+                    result = connections.join_next(), if !connections.is_empty() => {
+                        result.expect("connection task").expect("fixture connection panicked");
+                    }
                     _ = &mut shutdown_rx => break,
                 }
             }
+            connections.shutdown().await;
         });
 
         Self {
@@ -112,6 +117,9 @@ impl FlappingRelay {
 
 impl Drop for FlappingRelay {
     fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
