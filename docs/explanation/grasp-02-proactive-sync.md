@@ -40,6 +40,12 @@ Key Architectural Points:
     stable after rebuilding
 - **Quick Reconnect** (< 15mins) - doesn't do a full reconciliation vs fresh start (longer disconnect or relaunch binary)
 - **Background timers** handle relay connection health and metrics, handling reconnects after backoff and recovery after rate-limiting
+- **Completed discovery reads** require both the exact REQ's EOSE and a
+  drained, validated event stream. A disconnect or local deadline before EOSE
+  is a failed fetch, even if some events arrived. This avoids treating partial
+  pages as successful mailbox history or an empty response as proof that no
+  NIP-65 relay list exists. The SDK still handles event validation and AUTH
+  retries; ngit-grasp additionally verifies the terminal protocol evidence.
 
 Sections:
 

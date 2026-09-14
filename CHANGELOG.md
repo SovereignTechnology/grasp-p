@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Require EOSE before accepting background discovery history, instead of treating
+  a disconnected or timed-out partial response as a completed fetch.
+
 - Preserve background discovery relay backoff across idle-connection cleanup
   so unavailable mailbox and profile sources do not restart their retry history.
 
