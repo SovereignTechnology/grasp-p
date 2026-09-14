@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve background discovery relay backoff across idle-connection cleanup
+  so unavailable mailbox and profile sources do not restart their retry history.
+
 - Render metrics on a blocking worker and serialize scrapes so repository
   counting does not occupy async workers serving relay and Git requests.
 

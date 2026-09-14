@@ -744,6 +744,14 @@ is deliberately historical-only: owning or maintaining a repository never adds
 that author's inbox relays to ordinary persistent live repository targets.
 Private instances omit repository-coordinate mailbox expansion.
 
+Discovery source and mailbox scope also own connection retry state. The empty
+relay checker and reconnect scheduler include that scope, including in-flight
+fetches and future probe deadlines, without adding persistent subscriptions.
+Healthy idle discovery sessions can retire after their fetch; failed or
+policy-limited sessions retain their backoff until recovery or scope removal.
+This prevents cleanup from erasing a failure every two seconds and allowing
+discovery to dial the same unavailable endpoint from a fresh retry history.
+
 ### Rejected Events Index
 
 The rejected events index solves two critical problems during sync:
