@@ -523,8 +523,19 @@ async fn test_relay_connected_status() {
 
     let source_url = harness.source_url(0).to_string();
 
-    // Check connected status
-    let metrics = harness.get_metrics().await.unwrap();
+    // HTTP readiness does not imply that outbound sync has connected yet.
+    // Observe this source's gauge, not an aggregate that another relay can satisfy.
+    let metrics = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let metrics = harness.get_metrics().await.unwrap();
+            if metrics.relay_connected(&source_url) == Some(true) {
+                return metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("source relay should become connected within the deadline");
 
     println!("Checking connection status for {}", source_url);
 
