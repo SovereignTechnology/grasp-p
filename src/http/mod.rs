@@ -1073,6 +1073,13 @@ pub async fn run_server_on_listener(
 
     loop {
         let (socket, addr) = listener.accept().await?;
+        // WebSocket EVENT/EOSE and streaming Git responses flush small writes.
+        // Nagle can hold the tail until the peer's delayed ACK (about 40 ms
+        // even through a loopback proxy), multiplying multi-query latency.
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::warn!(peer = %addr, %error, "Could not disable Nagle for client socket");
+            continue;
+        }
         let io = TokioIo::new(socket);
         let service = HttpService::new(
             relay.clone(),

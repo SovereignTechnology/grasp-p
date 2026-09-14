@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Avoid delayed-acknowledgement stalls in small WebSocket and Git responses by
+  enabling `TCP_NODELAY` on accepted connections.
+
 ## [3.0.2] - 2026-09-11
 
 This release contains no production runtime changes. It improves release and

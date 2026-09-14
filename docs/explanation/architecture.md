@@ -75,6 +75,9 @@ runtime:
 
 - Bind the TCP listener (supports `:0` for kernel-assigned ports; the
   resolved address back-fills `bind_address` and, if empty, `domain`)
+- Disable Nagle on accepted sockets so small EVENT/EOSE and streaming Git
+  writes do not wait for the peer's delayed acknowledgements, including
+  when the immediate peer is a local reverse proxy
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
 - Set up shared storage (LMDB or Memory), purgatory, sync manager, and
   background maintenance tasks
