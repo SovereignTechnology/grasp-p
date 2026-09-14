@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep periodic recovery checkpoints off async workers, release snapshot locks
+  before disk I/O, and finish active checkpoints before the shutdown snapshot.
+
 - Avoid delayed-acknowledgement stalls in small WebSocket and Git responses by
   enabling `TCP_NODELAY` on accepted connections.
 

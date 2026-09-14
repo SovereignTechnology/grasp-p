@@ -1,5 +1,6 @@
 mod atomic_file;
 pub mod audit_cleanup;
+mod checkpoint;
 pub mod cleanup_empty_repos;
 pub mod config;
 pub mod git;

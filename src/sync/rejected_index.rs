@@ -1357,6 +1357,15 @@ impl RejectedEventsIndex {
             related_dependencies: serializable_related_entries,
         };
 
+        // The snapshot owns its data. Ingestion must not wait on JSON
+        // encoding, fsync or rename while holding these synchronous locks.
+        drop((
+            hot_entries,
+            cold_entries,
+            unrecoverable_entries,
+            related_entries,
+        ));
+
         // Replace the previous checkpoint only after the new snapshot is
         // complete and durable. An abrupt stop must leave one valid version.
         let json = serde_json::to_string_pretty(&state)?;

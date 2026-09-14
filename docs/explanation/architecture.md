@@ -92,7 +92,11 @@ runtime:
   Transient failures retry with a capped backoff, and in private mode the
   identity stays local so the relay's existence is never advertised
 - Atomically checkpoint purgatory and rejected-event recovery state every 60
-  seconds without consuming the checkpoint during restore
+  seconds without consuming the checkpoint during restore. Serialization and
+  durable filesystem writes run on a blocking worker, with at most one
+  checkpoint active and the next interval measured from completion. Shutdown
+  joins any active checkpoint before writing the final snapshot, preventing
+  an older background write from replacing it
 - Start non-blocking storage-integrity and authorization-integrity passes after
   database initialization. The former checks family objects and thin-view
   wiring; the latter reconciles each served ref against accepted State, PR,

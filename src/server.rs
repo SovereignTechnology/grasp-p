@@ -66,6 +66,7 @@ pub struct RelayServer {
     /// cleanup, purgatory sync loop). Aborted on shutdown so the host
     /// process does not leak tasks per relay instance.
     background_tasks: Vec<JoinHandle<()>>,
+    checkpoint: crate::checkpoint::CheckpointTask,
     git_data_path: String,
 }
 
@@ -363,11 +364,8 @@ impl RelayServer {
         let checkpoint_purgatory = purgatory.clone();
         let checkpoint_rejected = rejected_events_index.clone();
         let checkpoint_root = PathBuf::from(config.effective_git_data_path());
-        background_tasks.push(tokio::spawn(async move {
-            let first = tokio::time::Instant::now() + SYNC_STATE_CHECKPOINT_INTERVAL;
-            let mut interval = tokio::time::interval_at(first, SYNC_STATE_CHECKPOINT_INTERVAL);
-            loop {
-                interval.tick().await;
+        let checkpoint =
+            crate::checkpoint::CheckpointTask::start(SYNC_STATE_CHECKPOINT_INTERVAL, move || {
                 let purgatory_path = checkpoint_root.join("purgatory-state.json");
                 if let Err(error) = checkpoint_purgatory.save_to_disk(&purgatory_path) {
                     warn!(%error, "Failed to checkpoint purgatory state");
@@ -376,8 +374,7 @@ impl RelayServer {
                 if let Err(error) = checkpoint_rejected.save_to_disk(&rejected_path) {
                     warn!(%error, "Failed to checkpoint rejected-events cache");
                 }
-            }
-        }));
+            });
         info!(
             interval_secs = SYNC_STATE_CHECKPOINT_INTERVAL.as_secs(),
             "Crash-safe sync-state checkpoint task started"
@@ -492,6 +489,7 @@ impl RelayServer {
             private_access,
             deletion_cleanup,
             background_tasks,
+            checkpoint,
             git_data_path,
         })
     }
@@ -547,6 +545,7 @@ impl RelayServer {
             task.abort();
             let _ = task.await;
         }
+        self.checkpoint.shutdown().await;
 
         self.deletion_cleanup.shutdown().await;
 
