@@ -78,6 +78,8 @@ runtime:
 - Disable Nagle on accepted sockets so small EVENT/EOSE and streaming Git
   writes do not wait for the peer's delayed acknowledgements, including
   when the immediate peer is a local reverse proxy
+- Render metrics on a blocking worker, serializing concurrent scrapes before
+  spawning filesystem scans so monitoring cannot occupy the network executor
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
 - Set up shared storage (LMDB or Memory), purgatory, sync manager, and
   background maintenance tasks

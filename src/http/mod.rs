@@ -923,7 +923,18 @@ impl Service<Request<Incoming>> for HttpService {
             if let Some(ref metrics) = self.metrics {
                 let metrics = metrics.clone();
                 return Box::pin(async move {
-                    let output = metrics.render();
+                    let output = match metrics.render_async().await {
+                        Ok(output) => output,
+                        Err(error) => {
+                            tracing::error!(%error, "Metrics render worker failed");
+                            return Ok(add_cors_headers(
+                                Response::builder().header("server", "ngit-grasp"),
+                            )
+                            .status(500)
+                            .body(full_body("Metrics temporarily unavailable"))
+                            .unwrap());
+                        }
+                    };
                     Ok(
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(200)

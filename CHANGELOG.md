@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Render metrics on a blocking worker and serialize scrapes so repository
+  counting does not occupy async workers serving relay and Git requests.
+
 - Keep periodic recovery checkpoints off async workers, release snapshot locks
   before disk I/O, and finish active checkpoints before the shutdown snapshot.
 
