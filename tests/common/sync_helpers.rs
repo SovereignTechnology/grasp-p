@@ -1431,27 +1431,75 @@ pub async fn setup_announcement_on_relay(
     push_to_relay(git_temp_dir.path(), &relay.domain(), &npub, identifier)
         .expect("Failed to push git data to relay");
 
-    assert!(
-        wait_for_event_on_relay(
+    for (label, event) in [("state", &state_event), ("announcement", &announcement)] {
+        let visible = wait_for_event_on_relay(
             relay.url(),
-            Filter::new().id(state_event.id),
-            Duration::from_secs(10)
+            Filter::new().id(event.id),
+            Duration::from_secs(10),
         )
-        .await,
-        "pushed state event must leave purgatory"
-    );
-
-    assert!(
-        wait_for_event_on_relay(
-            relay.url(),
-            Filter::new().id(announcement.id),
-            Duration::from_secs(10)
-        )
-        .await,
-        "pushed announcement must leave purgatory"
-    );
+        .await;
+        if !visible {
+            report_setup_visibility_failure(relay, keys, identifier, event).await;
+        }
+        assert!(visible, "pushed {label} must leave purgatory");
+    }
 
     (announcement, git_temp_dir)
+}
+
+/// Diagnose a failed exact-ID check without extending its success deadline.
+async fn report_setup_visibility_failure(
+    relay: &TestRelay,
+    keys: &Keys,
+    identifier: &str,
+    expected: &Event,
+) {
+    eprintln!(
+        "setup visibility failure: relay={} kind={} author={} identifier={} expected_id={} created_at={}",
+        relay.url(), expected.kind.as_u16(), expected.pubkey, identifier,
+        expected.id, expected.created_at
+    );
+    // A different event at the same replaceable address distinguishes a lost
+    // replacement race from an event that was never promoted or served.
+    let diagnostic = tokio::time::timeout(Duration::from_secs(5), async {
+        let client = TestClient::new(relay.url(), keys.clone()).await?;
+        let result = client
+            .client
+            .fetch_events(
+                Filter::new()
+                    .kind(expected.kind)
+                    .author(expected.pubkey)
+                    .identifier(identifier),
+            )
+            .timeout(Duration::from_secs(2))
+            .await;
+        client.disconnect().await;
+        let events = result.map_err(|error| error.to_string())?;
+        for event in events.iter() {
+            eprintln!(
+                "stored candidate: id={} created_at={}",
+                event.id, event.created_at
+            );
+        }
+        eprintln!("stored candidate count: {}", events.len());
+        Ok::<(), String>(())
+    })
+    .await;
+    match diagnostic {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("setup diagnostic query failed: {error}"),
+        Err(_) => eprintln!("setup diagnostic query timed out"),
+    }
+    match std::fs::read_to_string(relay.log_path()) {
+        Ok(log) => {
+            let tail = log.lines().rev().take(80).collect::<Vec<_>>();
+            eprintln!("setup relay log tail:");
+            for line in tail.into_iter().rev() {
+                eprintln!("{line}");
+            }
+        }
+        Err(error) => eprintln!("setup relay log unavailable: {error}"),
+    }
 }
 
 /// Unified sync test helper that automatically determines sync mode.
