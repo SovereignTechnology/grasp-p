@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Require EOSE before accepting background discovery history, instead of treating
+  a disconnected or timed-out partial response as a completed fetch.
+
+- Preserve background discovery relay backoff across idle-connection cleanup
+  so unavailable mailbox and profile sources do not restart their retry history.
+
+- Render metrics on a blocking worker and serialize scrapes so repository
+  counting does not occupy async workers serving relay and Git requests.
+
+- Keep periodic recovery checkpoints off async workers, release snapshot locks
+  before disk I/O, and finish active checkpoints before the shutdown snapshot.
+
+- Avoid delayed-acknowledgement stalls in small WebSocket and Git responses by
+  enabling `TCP_NODELAY` on accepted connections.
+
 ## [3.0.2] - 2026-09-11
 
 This release contains no production runtime changes. It improves release and

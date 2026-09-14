@@ -75,6 +75,11 @@ runtime:
 
 - Bind the TCP listener (supports `:0` for kernel-assigned ports; the
   resolved address back-fills `bind_address` and, if empty, `domain`)
+- Disable Nagle on accepted sockets so small EVENT/EOSE and streaming Git
+  writes do not wait for the peer's delayed acknowledgements, including
+  when the immediate peer is a local reverse proxy
+- Render metrics on a blocking worker, serializing concurrent scrapes before
+  spawning filesystem scans so monitoring cannot occupy the network executor
 - Initialize Nostr relay builder with custom [`Nip34WritePolicy`](src/nostr/builder.rs:51)
 - Set up shared storage (LMDB or Memory), purgatory, sync manager, and
   background maintenance tasks
@@ -89,7 +94,11 @@ runtime:
   Transient failures retry with a capped backoff, and in private mode the
   identity stays local so the relay's existence is never advertised
 - Atomically checkpoint purgatory and rejected-event recovery state every 60
-  seconds without consuming the checkpoint during restore
+  seconds without consuming the checkpoint during restore. Serialization and
+  durable filesystem writes run on a blocking worker, with at most one
+  checkpoint active and the next interval measured from completion. Shutdown
+  joins any active checkpoint before writing the final snapshot, preventing
+  an older background write from replacing it
 - Start non-blocking storage-integrity and authorization-integrity passes after
   database initialization. The former checks family objects and thin-view
   wiring; the latter reconciles each served ref against accepted State, PR,
@@ -734,6 +743,14 @@ maintainer mailbox without broadening an ordinary participant mailbox, and it
 is deliberately historical-only: owning or maintaining a repository never adds
 that author's inbox relays to ordinary persistent live repository targets.
 Private instances omit repository-coordinate mailbox expansion.
+
+Discovery source and mailbox scope also own connection retry state. The empty
+relay checker and reconnect scheduler include that scope, including in-flight
+fetches and future probe deadlines, without adding persistent subscriptions.
+Healthy idle discovery sessions can retire after their fetch; failed or
+policy-limited sessions retain their backoff until recovery or scope removal.
+This prevents cleanup from erasing a failure every two seconds and allowing
+discovery to dial the same unavailable endpoint from a fresh retry history.
 
 ### Rejected Events Index
 

@@ -1960,6 +1960,20 @@ struct Nip65DiscoveryState {
 }
 
 impl Nip65DiscoveryState {
+    /// Connection ownership includes historical discovery work, even while
+    /// its next query is deferred. It is not persistent subscription scope.
+    fn connection_targets(&self) -> HashSet<String> {
+        self.author_sources
+            .values()
+            .flatten()
+            .chain(self.mailbox_roots.keys())
+            .chain(self.mailbox_repositories.keys())
+            .chain(self.mailbox_probes_in_flight.iter())
+            .chain(self.in_flight.iter().map(|(relay, _)| relay))
+            .cloned()
+            .collect()
+    }
+
     fn has_mailbox_scope(&self, relay: &str) -> bool {
         self.mailbox_roots.contains_key(relay) || self.mailbox_repositories.contains_key(relay)
     }
@@ -6422,6 +6436,22 @@ impl SyncManager {
         if !self.nip65_discovery_only_relays.contains(source) {
             return;
         }
+        // Retirement forgets connection health. A failed or policy-limited
+        // source must retain its session state until recovery or removal from
+        // discovery ownership, otherwise the next probe bypasses its backoff.
+        if self.health_tracker.get_failure_count(source) > 0
+            || self.health_tracker.is_subscription_paused(source)
+        {
+            return;
+        }
+        if let Some(connection) = self.connections.get(source) {
+            if !connection.is_connected().await {
+                // The disconnect notification may still be queued behind a
+                // fetch result. Let it record the unexpected failure instead
+                // of relabeling the session as an intentional retirement.
+                return;
+            }
+        }
         let now = Instant::now();
         let has_author_work =
             self.nip65_discovery
@@ -7221,7 +7251,12 @@ impl SyncManager {
             // Once the connection ends naturally, however, reconcile its
             // confirmed state with the latest index before deciding whether it
             // should ever reconnect.
-            let desired = self.derive_targets().await.remove(relay_url);
+            let desired = self.derive_targets().await.remove(relay_url).or_else(|| {
+                self.nip65_discovery
+                    .connection_targets()
+                    .contains(relay_url)
+                    .then(RelaySyncNeeds::default)
+            });
             let Some(desired) = desired else {
                 tracing::info!(
                     relay = %relay_url,
@@ -8420,6 +8455,7 @@ impl SyncManager {
 
         let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
+        desired_relays.extend(self.nip65_discovery.connection_targets());
 
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
@@ -8531,7 +8567,8 @@ impl SyncManager {
     ///
     /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
-        let desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
+        let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
+        desired_relays.extend(self.nip65_discovery.connection_targets());
 
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {
@@ -10969,6 +11006,37 @@ mod tests {
             !source.is_disconnect_candidate(false, false),
             "confirmed repository work keeps the source connected"
         );
+    }
+
+    #[test]
+    fn discovery_connection_ownership_survives_retry_deadlines_and_in_flight_removal() {
+        let author = Keys::generate().public_key();
+        let profile = "wss://profile.example".to_string();
+        let mailbox = "wss://mailbox.example".to_string();
+        let retired = "wss://retired.example".to_string();
+        let mut discovery = Nip65DiscoveryState::default();
+        discovery
+            .author_sources
+            .insert(author, HashSet::from([profile.clone()]));
+        discovery
+            .mailbox_repositories
+            .insert(mailbox.clone(), HashSet::from(["repo".into()]));
+        discovery
+            .mailbox_probe_next_at
+            .insert(mailbox.clone(), Instant::now() + Duration::from_secs(3600));
+        discovery.in_flight.insert((retired.clone(), author));
+
+        let disconnected = RelayState::default();
+        for relay in [&profile, &mailbox, &retired] {
+            assert!(!disconnected
+                .is_disconnect_candidate(false, discovery.connection_targets().contains(relay)));
+        }
+        discovery.in_flight.clear();
+        assert!(!discovery.connection_targets().contains(&retired));
+        discovery.author_sources.clear();
+        discovery.install_mailbox_overlay(HashMap::new(), HashMap::new(), Instant::now());
+        assert!(discovery.connection_targets().is_empty());
+        assert!(disconnected.is_disconnect_candidate(false, false));
     }
 
     #[test]

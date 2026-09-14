@@ -923,7 +923,18 @@ impl Service<Request<Incoming>> for HttpService {
             if let Some(ref metrics) = self.metrics {
                 let metrics = metrics.clone();
                 return Box::pin(async move {
-                    let output = metrics.render();
+                    let output = match metrics.render_async().await {
+                        Ok(output) => output,
+                        Err(error) => {
+                            tracing::error!(%error, "Metrics render worker failed");
+                            return Ok(add_cors_headers(
+                                Response::builder().header("server", "ngit-grasp"),
+                            )
+                            .status(500)
+                            .body(full_body("Metrics temporarily unavailable"))
+                            .unwrap());
+                        }
+                    };
                     Ok(
                         add_cors_headers(Response::builder().header("server", "ngit-grasp"))
                             .status(200)
@@ -1073,6 +1084,13 @@ pub async fn run_server_on_listener(
 
     loop {
         let (socket, addr) = listener.accept().await?;
+        // WebSocket EVENT/EOSE and streaming Git responses flush small writes.
+        // Nagle can hold the tail until the peer's delayed ACK (about 40 ms
+        // even through a loopback proxy), multiplying multi-query latency.
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::warn!(peer = %addr, %error, "Could not disable Nagle for client socket");
+            continue;
+        }
         let io = TokioIo::new(socket);
         let service = HttpService::new(
             relay.clone(),

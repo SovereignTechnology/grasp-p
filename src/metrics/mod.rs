@@ -564,6 +564,7 @@ pub fn record_manual_ejection(
 #[derive(Clone)]
 pub struct Metrics {
     inner: Arc<MetricsInner>,
+    render_permit: Arc<tokio::sync::Semaphore>,
 }
 
 struct MetricsInner {
@@ -628,6 +629,7 @@ impl Metrics {
         let inner = MetricsInner::new(abuse_threshold, git_data_path);
         Self {
             inner: Arc::new(inner),
+            render_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -793,6 +795,24 @@ impl Metrics {
     }
 
     // === Rendering ===
+
+    /// Render a scrape without blocking the async executor on filesystem
+    /// traversal or encoding. Concurrent scrapes wait before spawning work;
+    /// cancelling an HTTP request cannot release a running worker's permit.
+    pub async fn render_async(&self) -> Result<String, tokio::task::JoinError> {
+        let permit = self
+            .render_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("metrics render semaphore is never closed");
+        let metrics = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            metrics.render()
+        })
+        .await
+    }
 
     /// Render all metrics in Prometheus text format.
     ///
@@ -1104,6 +1124,21 @@ impl Drop for GitOperationTimer {
 mod tests {
     use super::*;
 
+    async fn concurrent_scrapes_wait_without_blocking_the_runtime(metrics: &Metrics) {
+        use futures_util::FutureExt;
+        let permit = metrics.render_permit.clone().acquire_owned().await.unwrap();
+        let render = metrics.render_async();
+        tokio::pin!(render);
+        assert!(render.as_mut().now_or_never().is_none());
+        drop(permit);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), render)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.contains("ngit_uptime_seconds"));
+        assert_eq!(metrics.render_permit.available_permits(), 1);
+    }
+
     #[test]
     fn test_count_repositories_on_disk() {
         use std::fs;
@@ -1153,8 +1188,8 @@ mod tests {
     ///
     /// If additional Metrics tests are needed, they should either be added to this
     /// test or use a separate test-specific Prometheus registry.
-    #[test]
-    fn test_metrics_with_repository_counting() {
+    #[tokio::test]
+    async fn test_metrics_with_repository_counting() {
         use std::fs;
         use tempfile::TempDir;
 
@@ -1211,5 +1246,11 @@ mod tests {
         // Render should count 3 repos
         let output = metrics.render();
         assert!(output.contains("ngit_repositories_total 3"));
+        concurrent_scrapes_wait_without_blocking_the_runtime(&metrics).await;
+        assert!(metrics
+            .render_async()
+            .await
+            .unwrap()
+            .contains("ngit_repositories_total 3"));
     }
 }

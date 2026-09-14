@@ -7,6 +7,47 @@ use nostr_sdk::prelude::*;
 use crate::common::flapping_relay::FlappingRelay;
 use crate::common::{TestClient, TestRelay};
 
+#[tokio::test]
+async fn discovery_only_mailbox_keeps_failure_history_through_cleanup() {
+    use crate::common::{send_to_relay_url, setup_announcement_on_relay, MockRelay};
+
+    let index = MockRelay::start().await;
+    let flapping = FlappingRelay::start().await;
+    let owner = Keys::generate();
+    let relay_list = EventBuilder::new(Kind::RelayList, "")
+        .tags([Tag::custom("r", vec![flapping.url(), "read"])])
+        .finalize(&owner)
+        .unwrap();
+    send_to_relay_url(index.url(), &relay_list).await.unwrap();
+    let syncing = TestRelay::start_with_sync(Some(index.url().to_string())).await;
+    let domain = syncing.domain();
+    let (_announcement, _git) =
+        setup_announcement_on_relay(&syncing, &owner, &[&domain], "discovery-mailbox-backoff")
+            .await;
+
+    // Owner inbox discovery has no ordinary repository/root live target.
+    // The two-second cleanup pass previously erased its first failure before
+    // the next handshake, so it could never reach this recovery state.
+    flapping
+        .wait_for_connections(2, Duration::from_secs(60))
+        .await;
+    let logs = wait_for_log(
+        &syncing.log_path(),
+        "consecutive_failures=1",
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(logs.lines().any(|line| {
+        line.contains(flapping.url())
+            && line.contains("consecutive_failures=1")
+            && line.contains("preserving failure streak until stable")
+    }));
+
+    syncing.stop().await;
+    flapping.stop().await;
+    index.stop().await;
+}
+
 async fn wait_for_log(log_path: &std::path::Path, needle: &str, timeout: Duration) -> String {
     tokio::time::timeout(timeout, async {
         loop {
