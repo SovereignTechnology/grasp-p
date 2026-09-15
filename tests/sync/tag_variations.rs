@@ -61,12 +61,11 @@ async fn test_layer2_sync_with_lowercase_a_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -152,12 +151,11 @@ async fn test_layer2_sync_with_uppercase_a_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -245,12 +243,11 @@ async fn test_layer2_sync_with_q_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -344,12 +341,11 @@ async fn test_layer3_sync_with_lowercase_e_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -460,12 +456,11 @@ async fn test_layer3_sync_with_uppercase_e_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -580,12 +575,11 @@ async fn test_layer3_sync_with_q_tag() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has

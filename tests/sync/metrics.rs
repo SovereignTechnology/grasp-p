@@ -243,7 +243,7 @@ async fn test_startup_sync_event_count() {
     let domains = [source_relay.domain(), syncing_relay.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (announcement, _git_dir_source) =
+    let (announcement, repository) =
         setup_announcement_on_relay(&source_relay, &keys, &domain_refs, repo_id).await;
     println!(
         "Announcement {} set up on source relay with git data",
@@ -286,8 +286,7 @@ async fn test_startup_sync_event_count() {
     source_client.disconnect().await;
 
     // 8. Set up announcement on SYNCING relay (triggers discovery of source relay)
-    let (_announcement_syncing, _git_dir_syncing) =
-        setup_announcement_on_relay(&syncing_relay, &keys, &domain_refs, repo_id).await;
+    repository.install(&syncing_relay).await;
     println!("Announcement set up on syncing relay (triggers discovery of source)");
 
     // 9. Wait for discovery + sync on the observable condition the test

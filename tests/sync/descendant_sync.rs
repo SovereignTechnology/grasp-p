@@ -31,12 +31,14 @@ async fn historic_recursive_cap_is_enforced_and_reconstructed_after_restart() {
     let source = TestRelay::start_with_relay_max_subscriptions(4).await;
     let keys = Keys::generate();
     let repo_id = "restart-safe-recursive-cap";
-    let source_domains = [source.domain()];
+    let syncing_reservation = reserve_port();
+    let syncing_domain = format!("127.0.0.1:{}", syncing_reservation.port());
+    let source_domains = [source.domain(), syncing_domain];
     let source_refs = source_domains
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let (_announcement, _source_git) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&source, &keys, &source_refs, repo_id).await;
     let source_client = TestClient::new(source.url(), keys.clone())
         .await
@@ -64,7 +66,7 @@ async fn historic_recursive_cap_is_enforced_and_reconstructed_after_restart() {
     let syncing_git_dir = tempfile::tempdir().expect("create syncing git dir");
     let syncing_data_dir = tempfile::tempdir().expect("create syncing relay data dir");
     let syncing = TestRelay::start_on_reservation_persistent_sync_with_recursive_limit(
-        reserve_port(),
+        syncing_reservation,
         None,
         true,
         syncing_git_dir.path().to_path_buf(),
@@ -72,10 +74,7 @@ async fn historic_recursive_cap_is_enforced_and_reconstructed_after_restart() {
         LIMIT,
     )
     .await;
-    let domains = [source.domain(), syncing.domain()];
-    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
-    let (_target_announcement, _target_git) =
-        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+    repository.install(&syncing).await;
 
     for descendant in [&first, &second] {
         assert!(
@@ -154,12 +153,14 @@ async fn historic_sync_recovers_recursive_parent_only_descendants() {
 
     // Seed the source before the syncing relay exists so this exercises the
     // complete historic rotation, not ordinary live coverage.
-    let source_domains = [source.domain()];
+    let syncing_reservation = reserve_port();
+    let syncing_domain = format!("127.0.0.1:{}", syncing_reservation.port());
+    let source_domains = [source.domain(), syncing_domain];
     let source_refs = source_domains
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let (_announcement, _source_git) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&source, &keys, &source_refs, repo_id).await;
     let source_client = TestClient::new(source.url(), keys.clone())
         .await
@@ -188,11 +189,9 @@ async fn historic_sync_recovers_recursive_parent_only_descendants() {
             .expect("seed source event");
     }
 
-    let syncing = TestRelay::start_with_sync(None).await;
-    let domains = [source.domain(), syncing.domain()];
-    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
-    let (_target_announcement, _target_git) =
-        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+    let syncing =
+        TestRelay::start_on_reservation_with_options(syncing_reservation, None, false).await;
+    repository.install(&syncing).await;
 
     assert!(
         wait_for_event_on_relay(
@@ -235,12 +234,14 @@ async fn descendant_live_coverage_is_preferred_when_capacity_remains() {
     let source = TestRelay::start().await;
     let keys = Keys::generate();
     let repo_id = "live-descendant-coverage";
-    let source_domains = [source.domain()];
+    let syncing_reservation = reserve_port();
+    let syncing_domain = format!("127.0.0.1:{}", syncing_reservation.port());
+    let source_domains = [source.domain(), syncing_domain];
     let source_refs = source_domains
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let (_announcement, _source_git) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&source, &keys, &source_refs, repo_id).await;
     let source_client = TestClient::new(source.url(), keys.clone())
         .await
@@ -252,11 +253,9 @@ async fn descendant_live_coverage_is_preferred_when_capacity_remains() {
     source_client.send_event(&issue).await.unwrap();
     source_client.send_event(&direct_reply).await.unwrap();
 
-    let syncing = TestRelay::start_with_sync(None).await;
-    let domains = [source.domain(), syncing.domain()];
-    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
-    let (_target_announcement, _target_git) =
-        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+    let syncing =
+        TestRelay::start_on_reservation_with_options(syncing_reservation, None, false).await;
+    repository.install(&syncing).await;
     assert!(
         wait_for_log(
             &syncing.log_path(),
@@ -295,12 +294,14 @@ async fn historic_sync_recovers_address_tag_descendants() {
     let source = TestRelay::start_with_relay_max_subscriptions(4).await;
     let keys = Keys::generate();
     let repo_id = "addressable-descendant-history";
-    let source_domains = [source.domain()];
+    let syncing_reservation = reserve_port();
+    let syncing_domain = format!("127.0.0.1:{}", syncing_reservation.port());
+    let source_domains = [source.domain(), syncing_domain];
     let source_refs = source_domains
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let (_announcement, _source_git) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&source, &keys, &source_refs, repo_id).await;
     let source_client = TestClient::new(source.url(), keys.clone())
         .await
@@ -334,11 +335,9 @@ async fn historic_sync_recovers_address_tag_descendants() {
         source_client.send_event(event).await.unwrap();
     }
 
-    let syncing = TestRelay::start_with_sync(None).await;
-    let domains = [source.domain(), syncing.domain()];
-    let domain_refs = domains.iter().map(String::as_str).collect::<Vec<_>>();
-    let (_target_announcement, _target_git) =
-        setup_announcement_on_relay(&syncing, &keys, &domain_refs, repo_id).await;
+    let syncing =
+        TestRelay::start_on_reservation_with_options(syncing_reservation, None, false).await;
+    repository.install(&syncing).await;
 
     for event in &address_only_children {
         assert!(

@@ -61,7 +61,7 @@ async fn test_discovers_layer3_via_layer2() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (announcement, _git_dir_a) =
+    let (announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     let announcement_id = announcement.id;
     println!(
@@ -102,8 +102,7 @@ async fn test_discovers_layer3_via_layer2() {
     client_a.disconnect().await;
 
     // 8. Set up announcement on relay_b (triggers discovery of relay_a)
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b (should trigger discovery of relay_a)");
 
     // 9/10. Verify the patch syncs to relay_b. The bounded poll on the synced
@@ -176,7 +175,7 @@ async fn test_relay_discovery_via_announcements_with_historic_sync() {
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
     let repo_id = "test-repo-chain";
 
-    let (announcement, _git_dir_a) =
+    let (announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     let announcement_id = announcement.id;
     println!(
@@ -207,8 +206,7 @@ async fn test_relay_discovery_via_announcements_with_historic_sync() {
     client_a.disconnect().await;
 
     // 6. Set up announcement on relay_b (triggers discovery of relay_a)
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b (should trigger discovery of relay_a)");
 
     // 7/8. Verify the Layer 2 event syncs to relay_b. The bounded poll on the

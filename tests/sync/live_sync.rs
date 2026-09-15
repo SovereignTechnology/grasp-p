@@ -299,12 +299,11 @@ async fn test_live_sync_layer2_events() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 5. Wait for discovery: events published before the syncing relay has
@@ -397,12 +396,11 @@ async fn test_live_sync_layer3_events() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
     println!("Announcement set up on relay_a with git data");
 
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcement set up on relay_b with git data (triggers discovery)");
 
     // 3. Wait for discovery: events published before the syncing relay has
@@ -573,10 +571,9 @@ async fn test_live_sync_event_ordering() {
     let domains = [relay_a.domain(), relay_b.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (_announcement, _git_dir_a) =
+    let (_announcement, repository) =
         setup_announcement_on_relay(&relay_a, &keys, &domain_refs, repo_id).await;
-    let (_announcement_b, _git_dir_b) =
-        setup_announcement_on_relay(&relay_b, &keys, &domain_refs, repo_id).await;
+    repository.install(&relay_b).await;
     println!("Announcements set up on both relays with git data");
 
     // 3. Wait for discovery: events published before the syncing relay has
