@@ -46,6 +46,7 @@ mod sync {
     pub mod proactive_sync_plus;
     pub mod purgatory_fetch;
     pub mod reconnect_backoff;
+    pub mod repository_fixture;
     pub mod req_concurrency;
     pub mod stale_connect_result;
     pub mod tag_variations;

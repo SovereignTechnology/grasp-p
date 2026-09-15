@@ -27,6 +27,24 @@ Connection tasks belong to their fixture's accept loop. Stopping the fixture
 cancels and joins them; dropping it cancels the owner. Git fixture subprocesses
 are cancelled with their request, and all three pipes are driven concurrently.
 
+## Shared repository identity
+
+`setup_announcement_on_relay` returns an announcement and a `RepositoryFixture`.
+Prepare it once for each logical repository, then call `fixture.install(&relay)`
+for every other relay. It reuses the signed announcement, signed state event,
+and Git commit. Repeating setup independently can create competing replaceable
+events at the same owner/identifier and different Git histories.
+
+List all participating domains when preparing the fixture. If historic tests
+must seed a source before starting the syncing relay, reserve the target's
+listener first and transfer it into the target after seeding. Do not use sleeps
+or fabricated future timestamps to order copies of the same fixture. Tests of
+actual repository revisions should construct those revisions explicitly.
+
+The sync regression `reinstalling_shared_repository_preserves_event_ids_and_git_refs`
+checks exact announcement/state IDs and remote Git refs across installation and
+reinstallation on two relays.
+
 ## Time and streaming assertions
 
 Age private cache timestamps explicitly and bracket wall-clock timestamps

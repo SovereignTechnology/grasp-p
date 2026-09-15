@@ -243,7 +243,7 @@ async fn test_startup_sync_event_count() {
     let domains = [source_relay.domain(), syncing_relay.domain()];
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
-    let (announcement, _git_dir_source) =
+    let (announcement, repository) =
         setup_announcement_on_relay(&source_relay, &keys, &domain_refs, repo_id).await;
     println!(
         "Announcement {} set up on source relay with git data",
@@ -286,8 +286,7 @@ async fn test_startup_sync_event_count() {
     source_client.disconnect().await;
 
     // 8. Set up announcement on SYNCING relay (triggers discovery of source relay)
-    let (_announcement_syncing, _git_dir_syncing) =
-        setup_announcement_on_relay(&syncing_relay, &keys, &domain_refs, repo_id).await;
+    repository.install(&syncing_relay).await;
     println!("Announcement set up on syncing relay (triggers discovery of source)");
 
     // 9. Wait for discovery + sync on the observable condition the test
@@ -523,8 +522,19 @@ async fn test_relay_connected_status() {
 
     let source_url = harness.source_url(0).to_string();
 
-    // Check connected status
-    let metrics = harness.get_metrics().await.unwrap();
+    // HTTP readiness does not imply that outbound sync has connected yet.
+    // Observe this source's gauge, not an aggregate that another relay can satisfy.
+    let metrics = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let metrics = harness.get_metrics().await.unwrap();
+            if metrics.relay_connected(&source_url) == Some(true) {
+                return metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("source relay should become connected within the deadline");
 
     println!("Checking connection status for {}", source_url);
 

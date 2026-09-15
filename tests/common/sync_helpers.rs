@@ -1351,107 +1351,176 @@ pub async fn push_unique_git_data_to_relay(
     git_temp_dir
 }
 
-/// Set up a repository announcement on a relay with git data so it passes purgatory.
+/// One repository's immutable Git data and signed events for all test relays.
 ///
-/// With the announcement purgatory feature, announcements (kind 30617) require git
-/// data before they are promoted to the relay's main DB. This helper:
-///
-/// 1. Creates a local git repo with a commit
-/// 2. Builds an announcement and state event (kind 30618) pointing to the relay
-/// 3. Sends both to the relay (they go to purgatory)
-/// 4. Git pushes to the relay → releases both from purgatory immediately
-/// 5. Returns the announcement event and temp dir (keep alive for test duration)
-///
-/// # Arguments
-/// * `relay` - The relay to set up the announcement on
-/// * `keys` - Keys to sign the announcement with (repo owner)
-/// * `domains` - All domains that should be listed in the announcement (including relay.domain())
-/// * `identifier` - Repository identifier (d-tag)
-///
-/// # Returns
-/// `(Event, tempfile::TempDir)` - The announcement event and temp dir.
-/// The temp dir MUST be kept alive for the duration of the test.
+/// Preparing separate copies can mint competing replaceable events for the same
+/// owner/identifier and different Git commits. Prepare once, list every endpoint
+/// (reserve its listener first if necessary), and install this fixture on each
+/// relay. Keep it alive until the test finishes.
+pub struct RepositoryFixture {
+    git_dir: tempfile::TempDir,
+    announcement: Event,
+    state_event: Event,
+    keys: Keys,
+    identifier: String,
+}
+
+impl RepositoryFixture {
+    pub fn new(keys: &Keys, domains: &[&str], identifier: &str) -> Self {
+        use super::purgatory_helpers::{
+            create_state_event, create_test_repo_with_commit, CommitVariant,
+        };
+
+        let npub = keys
+            .public_key()
+            .to_bech32()
+            .expect("Failed to convert public key to npub");
+
+        // Create local git repo with a commit
+        let git_temp_dir = tempfile::tempdir().expect("Failed to create temp dir for git repo");
+        let commit_hash =
+            create_test_repo_with_commit(git_temp_dir.path(), CommitVariant::StateTest)
+                .expect("Failed to create test git repo");
+
+        // Build clone URLs and relay URLs from domains
+        let clone_urls: Vec<String> = domains
+            .iter()
+            .map(|d| format!("http://{}/{}/{}.git", d, npub, identifier))
+            .collect();
+        let relay_urls: Vec<String> = domains.iter().map(|d| format!("ws://{}", d)).collect();
+
+        // Build announcement event (lists ALL domains for relay discovery)
+        let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
+            .tags(vec![
+                Tag::identifier(identifier),
+                Tag::custom("clone", clone_urls.clone()),
+                Tag::custom("relays", relay_urls.clone()),
+            ])
+            .finalize(keys)
+            .expect("Failed to sign repo announcement");
+
+        // Build state event with all domains' clone URLs
+        let state_event = create_state_event(
+            keys,
+            identifier,
+            &[("main", &commit_hash)],
+            &[],
+            &clone_urls.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &relay_urls.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )
+        .expect("Failed to create state event");
+
+        Self {
+            git_dir: git_temp_dir,
+            announcement,
+            state_event,
+            keys: keys.clone(),
+            identifier: identifier.to_string(),
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.git_dir.path()
+    }
+
+    /// Publish the same events and push the same commit to another relay.
+    pub async fn install(&self, relay: &TestRelay) {
+        use super::purgatory_helpers::push_to_relay;
+
+        send_to_relay(relay, &self.announcement)
+            .await
+            .expect("Failed to send announcement");
+        send_to_relay(relay, &self.state_event)
+            .await
+            .expect("Failed to send state event");
+        let npub = self.keys.public_key().to_bech32().expect("owner npub");
+        push_to_relay(self.path(), &relay.domain(), &npub, &self.identifier)
+            .expect("Failed to push git data to relay");
+
+        for (label, event) in [
+            ("state", &self.state_event),
+            ("announcement", &self.announcement),
+        ] {
+            let visible = wait_for_event_on_relay(
+                relay.url(),
+                Filter::new().id(event.id),
+                Duration::from_secs(10),
+            )
+            .await;
+            if !visible {
+                report_setup_visibility_failure(relay, &self.keys, &self.identifier, event).await;
+            }
+            assert!(visible, "pushed {label} must leave purgatory");
+        }
+    }
+}
+
+/// Prepare and install a repository on its first relay. For another relay,
+/// call `install` on the returned fixture instead of preparing a new copy.
 pub async fn setup_announcement_on_relay(
     relay: &TestRelay,
     keys: &Keys,
     domains: &[&str],
     identifier: &str,
-) -> (Event, tempfile::TempDir) {
-    use super::purgatory_helpers::{
-        create_state_event, create_test_repo_with_commit, push_to_relay, CommitVariant,
-    };
+) -> (Event, RepositoryFixture) {
+    let fixture = RepositoryFixture::new(keys, domains, identifier);
+    fixture.install(relay).await;
+    (fixture.announcement.clone(), fixture)
+}
 
-    let npub = keys
-        .public_key()
-        .to_bech32()
-        .expect("Failed to convert public key to npub");
-
-    // Create local git repo with a commit
-    let git_temp_dir = tempfile::tempdir().expect("Failed to create temp dir for git repo");
-    let commit_hash = create_test_repo_with_commit(git_temp_dir.path(), CommitVariant::StateTest)
-        .expect("Failed to create test git repo");
-
-    // Build clone URLs and relay URLs from domains
-    let clone_urls: Vec<String> = domains
-        .iter()
-        .map(|d| format!("http://{}/{}/{}.git", d, npub, identifier))
-        .collect();
-    let relay_urls: Vec<String> = domains.iter().map(|d| format!("ws://{}", d)).collect();
-
-    // Build announcement event (lists ALL domains for relay discovery)
-    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "Repository state")
-        .tags(vec![
-            Tag::identifier(identifier),
-            Tag::custom("clone", clone_urls.clone()),
-            Tag::custom("relays", relay_urls.clone()),
-        ])
-        .finalize(keys)
-        .expect("Failed to sign repo announcement");
-
-    // Build state event with all domains' clone URLs
-    let state_event = create_state_event(
-        keys,
-        identifier,
-        &[("main", &commit_hash)],
-        &[],
-        &clone_urls.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &relay_urls.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-    )
-    .expect("Failed to create state event");
-
-    // Send announcement and state event to relay (both go to purgatory)
-    send_to_relay(relay, &announcement)
-        .await
-        .expect("Failed to send announcement");
-    send_to_relay(relay, &state_event)
-        .await
-        .expect("Failed to send state event");
-
-    // Git push to relay → releases both from purgatory
-    push_to_relay(git_temp_dir.path(), &relay.domain(), &npub, identifier)
-        .expect("Failed to push git data to relay");
-
-    assert!(
-        wait_for_event_on_relay(
-            relay.url(),
-            Filter::new().id(state_event.id),
-            Duration::from_secs(10)
-        )
-        .await,
-        "pushed state event must leave purgatory"
+/// Diagnose a failed exact-ID check without extending its success deadline.
+async fn report_setup_visibility_failure(
+    relay: &TestRelay,
+    keys: &Keys,
+    identifier: &str,
+    expected: &Event,
+) {
+    eprintln!(
+        "setup visibility failure: relay={} kind={} author={} identifier={} expected_id={} created_at={}",
+        relay.url(), expected.kind.as_u16(), expected.pubkey, identifier,
+        expected.id, expected.created_at
     );
-
-    assert!(
-        wait_for_event_on_relay(
-            relay.url(),
-            Filter::new().id(announcement.id),
-            Duration::from_secs(10)
-        )
-        .await,
-        "pushed announcement must leave purgatory"
-    );
-
-    (announcement, git_temp_dir)
+    // A different event at the same replaceable address distinguishes a lost
+    // replacement race from an event that was never promoted or served.
+    let diagnostic = tokio::time::timeout(Duration::from_secs(5), async {
+        let client = TestClient::new(relay.url(), keys.clone()).await?;
+        let result = client
+            .client
+            .fetch_events(
+                Filter::new()
+                    .kind(expected.kind)
+                    .author(expected.pubkey)
+                    .identifier(identifier),
+            )
+            .timeout(Duration::from_secs(2))
+            .await;
+        client.disconnect().await;
+        let events = result.map_err(|error| error.to_string())?;
+        for event in events.iter() {
+            eprintln!(
+                "stored candidate: id={} created_at={}",
+                event.id, event.created_at
+            );
+        }
+        eprintln!("stored candidate count: {}", events.len());
+        Ok::<(), String>(())
+    })
+    .await;
+    match diagnostic {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("setup diagnostic query failed: {error}"),
+        Err(_) => eprintln!("setup diagnostic query timed out"),
+    }
+    match std::fs::read_to_string(relay.log_path()) {
+        Ok(log) => {
+            let tail = log.lines().rev().take(80).collect::<Vec<_>>();
+            eprintln!("setup relay log tail:");
+            for line in tail.into_iter().rev() {
+                eprintln!("{line}");
+            }
+        }
+        Err(error) => eprintln!("setup relay log unavailable: {error}"),
+    }
 }
 
 /// Unified sync test helper that automatically determines sync mode.
