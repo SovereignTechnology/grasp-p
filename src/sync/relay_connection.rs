@@ -45,8 +45,8 @@ const SUBSCRIPTION_RESERVED_MARGIN: usize = 2;
 /// allowance is exhausted.
 ///
 /// NIP-11 cannot advertise query-rate windows. One start every 600 ms is 100
-/// starts/minute, leaving operational slack below rust-nostr 0.45's newly
-/// introduced 120/minute LocalRelay default. This is deliberately reactive:
+/// starts/minute, leaving operational slack below the 120/minute limit used
+/// by older rust-nostr relays. This is deliberately reactive:
 /// proactively pacing non-urgent history needs request-class priority so live
 /// coverage is not delayed, and belongs in a separate scheduler change.
 const QUERY_PACING_INITIAL_INTERVAL: Duration = Duration::from_millis(600);

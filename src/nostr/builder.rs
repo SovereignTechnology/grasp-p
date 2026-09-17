@@ -36,24 +36,6 @@ use crate::private::PrivateAccess;
 use crate::purgatory::promotion_hooks::NostrPurgatoryPromotionHooks;
 use crate::sync::rejected_index::RejectedEventsIndex;
 
-/// Connection-wide frame allowance layered above the operation-specific
-/// write, query, and authentication quotas.
-///
-/// rust-nostr's 300/minute default closed production browser clients during
-/// ordinary bursty subscription churn. One hundred frames per second preserves a
-/// bounded catch-all for malformed/non-operation traffic while leaving the
-/// tighter operation quotas in charge of valid protocol work.
-const CLIENT_MESSAGES_PER_MINUTE: u32 = 6_000;
-
-/// Temporary compatibility override for rust-nostr 0.45's newly introduced
-/// 120-query-per-minute default.
-///
-/// A finite per-connection bound remains useful as one DoS layer, but 120 is
-/// too restrictive for legitimate sync and NIP-77 currently charges every
-/// SDK-managed `NEG-MSG` continuation against the same allowance. Re-evaluate
-/// this 10× value after upstream separates or otherwise revises that accounting.
-const CLIENT_QUERIES_PER_MINUTE: u32 = 1_200;
-
 /// Cumulative serialized REQ state retained for one client connection.
 ///
 /// Repository sync legitimately keeps multiple byte-budgeted live filters
@@ -1145,9 +1127,7 @@ pub async fn create_relay(
             max_reqs: config.relay_max_subscriptions,
             notes_per_minute: 60,
         })
-        .queries_per_minute(CLIENT_QUERIES_PER_MINUTE)
         .auth_events_per_minute(30)
-        .messages_per_minute(CLIENT_MESSAGES_PER_MINUTE)
         .max_websocket_message_size(5 * 1024 * 1024)
         .max_event_size(config.relay_max_event_size_bytes)
         .websocket_handshake_timeout(Duration::from_secs(10))
@@ -1160,11 +1140,11 @@ pub async fn create_relay(
         .max_query_results(config.relay_filter_limit)
         .default_filter_limit(config.relay_filter_limit);
 
-    // `LocalRelayBuilder` otherwise applies rust-nostr's own finite default.
-    // In ngit-grasp, an unset limit deliberately delegates admission control to
-    // the OS and surrounding infrastructure, as documented by every config
-    // surface. Explicit operator limits remain exact.
-    builder = builder.max_connections(effective_max_connections(config.max_connections));
+    // The SDK defaults to unlimited established connections. Preserve an
+    // explicit operator limit when one is configured.
+    if let Some(limit) = config.max_connections {
+        builder = builder.max_connections(limit);
+    }
 
     let relay = builder.build();
 
@@ -1195,26 +1175,4 @@ pub async fn create_relay(
             history,
         },
     })
-}
-
-fn effective_max_connections(configured: Option<usize>) -> usize {
-    configured.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
-}
-
-#[cfg(test)]
-mod connection_limit_tests {
-    use super::effective_max_connections;
-
-    #[test]
-    fn unset_connection_limit_overrides_dependency_default() {
-        assert_eq!(
-            effective_max_connections(None),
-            tokio::sync::Semaphore::MAX_PERMITS
-        );
-    }
-
-    #[test]
-    fn configured_connection_limit_remains_exact() {
-        assert_eq!(effective_max_connections(Some(2)), 2);
-    }
 }

@@ -13,9 +13,10 @@ production admission policy.
 | Results per filter | 500 | `NGIT_RELAY_FILTER_LIMIT` | `max_limit`, `default_limit` |
 | Serialized event size | 192 KiB | `NGIT_RELAY_MAX_EVENT_SIZE_BYTES` | No equivalent field |
 | Event writes per minute | 60 | Fixed | No standard field |
-| Queries per minute | 1,200 | Fixed temporary override | No standard field |
+| Query starts per minute | 1,200 | Upstream default | No standard field |
+| NIP-77 continuations per minute | 1,200 | Upstream default | No standard field |
 | Authentication events per minute | 30 | Fixed | No standard field |
-| WebSocket messages per minute | 6,000 | Fixed | No standard field |
+| WebSocket messages per minute | 6,000 | Upstream default | No standard field |
 | WebSocket message size | 5 MiB | Fixed | `max_message_length` |
 | Handshake deadline | 10 seconds | Fixed | No standard field |
 | Subscription-ID length | 250 bytes | Fixed | `max_subid_length` |
@@ -43,13 +44,11 @@ matches the maximum admitted WebSocket message, and provides about four times
 the observed working-set headroom. NIP-11 has no field for this cumulative
 byte limit, so clients cannot negotiate it.
 
-The 1,200-query allowance temporarily overrides rust-nostr 0.45's newly
-introduced 120/minute default. A finite per-connection bound remains one useful
-DoS layer, but the upstream default is unusually restrictive for sync clients
-and currently counts every SDK-managed NIP-77 `NEG-MSG` continuation as another
-query. Review this 10× override after upstream changes that accounting; a small
-per-connection quota is not a substitute for per-IP admission or global
-resource bounds because clients can multiply connections.
+The SDK now supplies the 1,200-query-start and 6,000-message allowances that
+ngit-grasp previously overrode locally. NIP-77 `NEG-MSG` continuations use a
+separate 1,200/minute allowance and still count against the connection-wide
+message limit. These finite per-connection quotas do not replace per-IP
+admission or global resource bounds because clients can multiply connections.
 
 ## Client adaptation
 

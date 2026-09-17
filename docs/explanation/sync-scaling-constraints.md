@@ -92,14 +92,16 @@ rust-nostr reports its configured ceiling. The learned ceiling never rises in
 the session and resets on reconnect. A one-filter refusal is not recoverable
 by regrouping and uses the ordinary long `filter_incompatible` policy pause.
 
-### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.0)
+### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.3)
 
 - `max_reqs` = 500, enforced for REQ only (`src/nostr/builder.rs`).
-- Negentropy: **no concurrency limit at all** (upstream `TODO`), 60000-byte
-  frame limit per NEG message.
+- Negentropy: ngit-grasp configures at most 10 retained sessions and 50,000
+  retained items per connection, with a 60,000-byte protocol frame limit.
+  Continuations have a separate allowance from query starts. LMDB scans run
+  on blocking workers, so a scan does not occupy an async runtime worker.
 - 20 filters per REQ by default; no limit on tag values per filter.
-- Query result limits (verified 2026-08-06 against the published
-  `nostr-sdk-0.45.0` crate source, `src/local_relay/local/inner.rs`):
+- Query result limits (verified against the published `nostr-sdk-0.45.3`
+  crate source, `src/local_relay/local/inner.rs`):
   enforced **per filter, not per REQ**. A filter without a `limit` is given
   `default_filter_limit` (500); the effective limit is then clamped to
   `min(limit, max_filter_limit, max_query_results)` (defaults: no
@@ -191,18 +193,13 @@ strfry and Ditto have no native limiter at all, deferring to deployment
 infrastructure. The full survey with citations is preserved in this
 file's history (commit `9723ff4`).
 
-The 120-query allowance is a newly enabled rust-nostr 0.45 LocalRelay default,
-not a floor established by that survey. It is unusually restrictive: none of
-the other audited implementations enables an equivalent query-specific,
-per-connection default. A finite limit is still useful as one layer of DoS
-protection, but a small per-connection bucket is not sufficient protection by
-itself because a hostile client can multiply connections; per-IP admission and
-global resource bounds address that threat more directly. rust-nostr also
-charges SDK-managed NIP-77 `NEG-MSG` continuation frames to this same bucket,
-so one application-started reconciliation can consume multiple query tokens.
-ngit-grasp temporarily overrides that default to 1,200 queries/minute while
-retaining a finite per-connection backstop. Re-evaluate the 10× value after
-upstream separates or otherwise revises NIP-77 continuation accounting.
+rust-nostr 0.45.3 supplies the 1,200-query-start allowance that ngit-grasp
+previously selected with a compatibility override. NIP-77 continuations use
+an independent 1,200/minute allowance, while all frames still share the
+6,000/minute message cap. A finite per-connection limit remains one DoS layer;
+per-IP admission and global resource bounds address clients multiplying
+connections. Outbound pacing remains necessary for peers with older SDKs or
+stricter operator-selected limits.
 
 NIP-11 describes hard relay limitations, not rate-limit algorithms. The
 standard fields relevant here are `max_limit` and
@@ -484,7 +481,7 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   first rejects locally queued starts for the existing 65-second cooldown so
   their incomplete work can be re-derived in priority order, then learns a
   shared query-start interval: 600 ms initially (100 starts/minute, below the
-  rust-nostr 120/minute default), doubling on a later rate-limit episode up to
+  older rust-nostr 120/minute limit), doubling on a later rate-limit episode up to
   10 seconds. Live, transient REQ, exact-ID fetch and NIP-77 round starts all
   pass through that reactive pacer in addition to background work retaining
   its proactive spacing. Relays that never report a query rate limit still

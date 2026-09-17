@@ -82,3 +82,51 @@ async fn catch_all_limit_still_closes_excessive_frame_burst() {
     );
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn sdk_query_allowance_accepts_more_than_120_starts() {
+    let relay = TestRelay::start().await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (mut stream, _) = tokio_tungstenite::connect_async(relay.url()).await.unwrap();
+        for _ in 0..121 {
+            stream
+                .send(Message::Text(
+                    r#"["REQ","probe",{"kinds":[1],"limit":0}]"#.into(),
+                ))
+                .await
+                .unwrap();
+            let response = stream.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(response, r#"["EOSE","probe"]"#);
+        }
+        stream.close(None).await.unwrap();
+    })
+    .await
+    .expect("query burst exceeded deadline");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn sdk_default_allows_more_than_128_established_connections() {
+    let relay = TestRelay::start().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut connections = Vec::new();
+        for _ in 0..129 {
+            let (mut stream, _) = tokio_tungstenite::connect_async(relay.url()).await.unwrap();
+            stream
+                .send(Message::Text(
+                    r#"["REQ","probe",{"kinds":[1],"limit":0}]"#.into(),
+                ))
+                .await
+                .unwrap();
+            let response = stream.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(response, r#"["EOSE","probe"]"#);
+            connections.push(stream);
+        }
+        for mut stream in connections {
+            stream.close(None).await.unwrap();
+        }
+    })
+    .await
+    .expect("connection admission exceeded deadline");
+    relay.stop().await;
+}
