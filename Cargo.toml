@@ -17,15 +17,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"]
 http-body-util = "0.1"
 
 # Nostr
-#
-# The stable 0.45 series contains the upstream NEG-OPEN handling fix used by
-# the embedded relay. Caret requirements accept compatible patch releases.
-nostr = "0.45.0"
-# `local-relay` carries the embedded relay implementation, previously the
-# separate `nostr-relay-builder` crate.
-nostr-sdk = { version = "0.45.0", features = ["local-relay"] }
-nostr-lmdb = "0.45.0"
-nostr-memory = "0.45.0"
+nostr = "0.45.5"
+nostr-sdk = { version = "0.45.3", features = ["local-relay"] }
+nostr-lmdb = "0.45.3"
+nostr-memory = "0.45.2"
 
 # Utilities
 # SHA-1 for the `Sec-WebSocket-Accept` handshake. `nostr` uses this same crate

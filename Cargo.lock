@@ -1359,9 +1359,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.45.0"
+version = "0.45.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7279feef28d43a04c0b3529acd4fea923ac816729bd643191b292296f1f6cc13"
+checksum = "38ca5c25a6df8d4d78fdf39b42792438f6ce22b4809ccbfdb27582ed9ca45407"
 dependencies = [
  "base64",
  "bech32",
@@ -1379,13 +1379,14 @@ dependencies = [
  "unicode-normalization",
  "universal-time",
  "url",
+ "zeroize",
 ]
 
 [[package]]
 name = "nostr-database"
-version = "0.45.0"
+version = "0.45.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81c7ffd33114d62c737dd2b8f77ffec4693c64b7a1c6090cab0d0009f9986e22"
+checksum = "309950383c9854ca413d195705400e78b1376aedc48f3256754a86c609c047e8"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1393,9 +1394,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-gossip"
-version = "0.45.0"
+version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa07539e52a71cb91fe0d693facaa298f03fcf9edcd66a521094e18e286e2336"
+checksum = "4ea822fd48ff6b84b81ddf84169e6edf1dc0bc9b312c8e41685b2278debaac3d"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1403,9 +1404,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-lmdb"
-version = "0.45.0"
+version = "0.45.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7a313418ff58bfa444ba4b71200ff8fe2d3eb31f2b5d0d8fdb7f5e60a703d31"
+checksum = "79727470014fb64cd1e03bf52f82bc46b69cc7ac0a9298a517498a0e84239f2a"
 dependencies = [
  "async-utility",
  "flatbuffers",
@@ -1419,9 +1420,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-memory"
-version = "0.45.0"
+version = "0.45.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a827de4b11c4f2b235eabe37f1a67460db68e453606f4755e1ac5a522347a86"
+checksum = "f5a9091e50b0ebcf8d9bd8ded23665d0434aa0eeb22b8464fc882ac124dbe5bf"
 dependencies = [
  "btreecap",
  "nostr",
@@ -1431,9 +1432,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.45.0"
+version = "0.45.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "359881fbaded2d19a5003609673744b8b68c4973817598eb0e262d049ec9c3f3"
+checksum = "c53a37469ce2df8fe6471b6a4d1c4da833f86c7ba0138ac95299b6f37f69ec84"
 dependencies = [
  "async-utility",
  "async-wsocket",

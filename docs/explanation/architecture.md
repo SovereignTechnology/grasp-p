@@ -118,9 +118,8 @@ runtime:
 ```rust
 hyper = "1"
 tokio = { version = "1", features = ["full"] }
-nostr-relay-builder = "0.45.0-alpha.3"
-nostr-sdk = "0.45.0-alpha.3"
-nostr-lmdb = "0.45.0-alpha.3"
+nostr-sdk = { version = "0.45.3", features = ["local-relay"] }
+nostr-lmdb = "0.45.3"
 ```
 
 ### 2. HTTP Module ([`src/http/mod.rs`](src/http/mod.rs))

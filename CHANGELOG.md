@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Upgrade the Nostr SDK and database dependencies to released 0.45 patch
+  versions. NIP-77 database scans now run off async workers, avoiding runtime
+  stalls that can delay unrelated relay connections. Reconciliation excludes
+  expired events, and NIP-77 continuation messages no longer consume the
+  query-start allowance.
+
+- Pick up upstream relay validation fixes that reject reposted protected
+  events and verify the declared proof-of-work target as well as the event hash.
+
 - Require EOSE before accepting background discovery history, instead of treating
   a disconnected or timed-out partial response as a completed fetch.
 
