@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Honor lower-ID same-second replacements in the public owner-repository sync
+  helper while preserving replay suppression.
+
 - Restore relay-owner profiles and relay lists using the lower event ID when
   fetched versions share a timestamp.
 

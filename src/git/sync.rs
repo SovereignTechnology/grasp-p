@@ -403,16 +403,12 @@ pub fn sync_to_owner_repos(
         }
 
         // Find the previous latest state for this owner's maintainer set
-        let previous_state = db_repo_data
-            .states
-            .iter()
-            .filter(|s| maintainers.contains(&s.event.pubkey.to_hex()))
-            .max_by_key(|s| s.event.created_at);
+        let previous_state = latest_authorized_state(maintainers, &db_repo_data.states);
 
-        // Only update if this state is newer than any existing state
-        // TODO: in event of a tie, the event with the biggest event id wins
+        // Apply only a strictly preferred state; replaying the same event is a no-op.
         if let Some(prev) = previous_state {
-            if state.event.created_at <= prev.event.created_at {
+            if !crate::nostr::events::compare_replacement_events(&state.event, &prev.event).is_gt()
+            {
                 debug!(
                     identifier = %state.identifier,
                     owner = %owner,
@@ -1842,6 +1838,75 @@ pub fn extract_owner_from_repo_path(repo_path: &Path, git_data_path: &Path) -> O
 mod tests {
     use super::*;
     use nostr_sdk::prelude::Keys;
+
+    #[test]
+    fn owner_repo_sync_honors_same_second_replacement_order() {
+        use crate::nostr::events::RepositoryAnnouncement;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Kind, Tag, Timestamp};
+
+        let keys = Keys::generate();
+        let announcement = RepositoryAnnouncement::from_event(
+            EventBuilder::new(Kind::GitRepoAnnouncement, "")
+                .tags([Tag::identifier("tie-test")])
+                .finalize(&keys)
+                .unwrap(),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join(announcement.repo_path());
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&repo)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let build = |content: &str, timestamp| {
+            RepositoryState::from_event(
+                EventBuilder::new(Kind::RepoState, content)
+                    .tags([Tag::identifier("tie-test")])
+                    .custom_created_at(Timestamp::from_secs(timestamp))
+                    .finalize(&keys)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut pair = [build("first", 1000), build("second", 1000)];
+        pair.sort_by_key(|state| state.event.id);
+        let [winner, loser] = pair;
+        let mut data = RepositoryData {
+            announcements: vec![announcement],
+            states: vec![loser.clone()],
+        };
+        assert_eq!(
+            sync_to_owner_repos(&repo, &winner, &data, root.path()).repos_synced,
+            1
+        );
+        data.states = vec![winner.clone()];
+        assert_eq!(
+            sync_to_owner_repos(&repo, &loser, &data, root.path()).repos_synced,
+            0
+        );
+        assert_eq!(
+            sync_to_owner_repos(&repo, &winner, &data, root.path()).repos_synced,
+            0
+        );
+        for states in [
+            vec![winner.clone(), loser.clone()],
+            vec![loser, winner.clone()],
+        ] {
+            data.states = states;
+            assert_eq!(
+                sync_to_owner_repos(&repo, &winner, &data, root.path()).repos_synced,
+                0
+            );
+            assert_eq!(
+                sync_to_owner_repos(&repo, &build("later", 1001), &data, root.path()).repos_synced,
+                1
+            );
+        }
+    }
 
     #[test]
     fn test_process_result_default() {
