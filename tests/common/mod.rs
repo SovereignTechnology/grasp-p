@@ -4,6 +4,7 @@
 
 pub mod auth_gating_relay;
 pub mod censoring_proxy;
+pub mod event_ordering;
 pub mod flapping_relay;
 pub mod git_server;
 pub mod mock_relay;

@@ -45,6 +45,24 @@ The sync regression `reinstalling_shared_repository_preserves_event_ids_and_git_
 checks exact announcement/state IDs and remote Git refs across installation and
 reinstallation on two relays.
 
+## Replacement ordering
+
+Ordinary revisions must explicitly advance beyond their predecessor. Use
+`common::event_ordering::timestamp_after(previous.created_at)` when building
+an event, or `event_after(event, keys, previous.created_at)` to re-sign a
+fabricated event while retaining its payload and audit tags. Advancement is
+checked for overflow and follows future-dated predecessors too; it does not
+use a global counter or wait for the wall clock. For re-announcements after a
+coordinate deletion, advance beyond the signed deletion's cutoff. Subsequent
+revisions advance beyond the last revision, not the original event.
+
+Keep explicit timestamps for deliberate historical, cutoff and conflict tests.
+To exercise equal-timestamp ID ordering, build two distinct candidates for the
+same coordinate and timestamp, sort by ID, and submit the larger ID before the
+smaller one. Do not mine against a random predecessor: even a large bounded
+search can fail for a sufficiently low ID. Nonce tags can be present on both
+candidates when their compatibility is part of the scenario.
+
 ## Time and streaming assertions
 
 Age private cache timestamps explicitly and bracket wall-clock timestamps

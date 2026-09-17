@@ -48,6 +48,16 @@ async fn wait_until_served(client: &AuditClient, event_id: EventId) {
 /// events (issues/notes) that reference the promoted repo are served
 /// immediately and do not need this dance.
 pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Event, String) {
+    let (announcement, repo_id, _) = publish_served_audit_repo_with_state(client, test_name).await;
+    (announcement, repo_id)
+}
+
+/// Publish the audit repository at DETERMINISTIC_COMMIT_HASH and return its
+/// signed initial state so replacement tests can order revisions explicitly.
+pub async fn publish_served_audit_repo_with_state(
+    client: &AuditClient,
+    test_name: &str,
+) -> (Event, String, Event) {
     let relay_url = client
         .relay_url()
         .await
@@ -150,7 +160,7 @@ pub async fn publish_served_repo(client: &AuditClient, test_name: &str) -> (Even
 
     wait_until_served(client, announcement.id).await;
 
-    (announcement, repo_id)
+    (announcement, repo_id, state_event)
 }
 
 /// Publish a served repository announcement while listing additional

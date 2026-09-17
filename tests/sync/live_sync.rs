@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
-use crate::common::{sync_helpers::*, MockRelay, TestRelay};
+use crate::common::{event_ordering::timestamp_after, sync_helpers::*, MockRelay, TestRelay};
 
 #[tokio::test]
 async fn replacement_announcement_retires_old_relay_only_after_natural_disconnect() {
@@ -37,7 +37,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
         .map(String::as_str)
         .collect::<Vec<_>>();
 
-    let (_initial, _git_dir) =
+    let (initial, _git_dir) =
         setup_announcement_on_relay(&syncing, &keys, &initial_refs, repo_id).await;
 
     let old_label = format!(
@@ -91,7 +91,7 @@ async fn replacement_announcement_retires_old_relay_only_after_natural_disconnec
                     .collect::<Vec<_>>(),
             ),
         ])
-        .custom_created_at(Timestamp::from(Timestamp::now().as_secs() + 1))
+        .custom_created_at(timestamp_after(initial.created_at))
         .finalize(&keys)
         .unwrap();
     let client = TestClient::new(syncing.url(), keys.clone()).await.unwrap();

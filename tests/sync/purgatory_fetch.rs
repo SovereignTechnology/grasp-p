@@ -26,6 +26,7 @@
 //! The proxy records every upload-pack POST with its `want` lines, so the
 //! test can assert the shape of the outbound fetching, not just the result.
 
+use crate::common::event_ordering::timestamp_after;
 use std::path::Path;
 use std::time::Duration;
 
@@ -340,7 +341,7 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
     let info_refs_before_second_pass = proxy.info_refs_count();
     let syncing_state_v2 = EventBuilder::new(Kind::RepoState, "")
         .tags(syncing_state.tags.clone())
-        .custom_created_at(Timestamp::from_secs(syncing_state.created_at.as_secs() + 1))
+        .custom_created_at(timestamp_after(syncing_state.created_at))
         .finalize(&keys)
         .expect("create fresh syncing state event");
     mock_client

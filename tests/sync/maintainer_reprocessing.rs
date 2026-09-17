@@ -29,6 +29,7 @@
 //! announcements are in relay_a's DB), wait briefly for the sync round-trip, then
 //! send the owner announcement + git push.
 
+use crate::common::event_ordering::timestamp_after;
 use grasp_audit::git_command;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -339,9 +340,7 @@ async fn test_existing_repository_invitation_acceptance_syncs_without_invitee_pu
         &[invitee_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(
-        initial_announcement.created_at.as_secs() + 1,
-    ))
+    .custom_created_at(timestamp_after(initial_announcement.created_at))
     .finalize(&owner_keys)
     .expect("Failed to create owner invitation announcement");
     for relay in owner_servers {
@@ -523,7 +522,7 @@ async fn test_invitee_only_acceptance_recovers_cold_owner_invitation() {
         &[owner_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(invitation.created_at.as_secs() + 1))
+    .custom_created_at(timestamp_after(invitation.created_at))
     .finalize(&invitee_keys)
     .expect("Failed to create invitee acceptance");
     let (invitee_clone_urls, _) = repository_urls(&invitee_keys, &invitee_servers, identifier);
@@ -660,7 +659,7 @@ async fn unresolved_repositories_share_one_dependency_poll_per_relay() {
                 &[owner.public_key()],
                 identifier,
             )
-            .custom_created_at(Timestamp::from_secs(invitation.created_at.as_secs() + 1))
+            .custom_created_at(timestamp_after(invitation.created_at))
             .finalize(&invitee_keys)
             .expect("Failed to create invitee acceptance")
         })
@@ -772,10 +771,6 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_after_acceptance()
         .await;
     }
 
-    // Deliberate timestamp spacing: the invitee events below are dated one
-    // second after the owner state, so let wall-clock time pass that mark.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     let invitee_git = tempfile::tempdir().expect("Failed to create invitee repository directory");
     let invitee_commit = create_test_repo_with_commit(invitee_git.path(), CommitVariant::PrTest)
         .expect("Failed to create invitee repository commit");
@@ -786,7 +781,7 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_after_acceptance()
         .expect("Failed to encode invitee npub");
     let (invitee_clone_urls, invitee_relay_urls) =
         repository_urls(&invitee_keys, &invitee_servers, identifier);
-    let invitee_created_at = Timestamp::from_secs(owner_state.created_at.as_secs() + 1);
+    let invitee_created_at = timestamp_after(owner_state.created_at);
     let invitee_announcement =
         repository_announcement(&invitee_keys, &invitee_servers, &[], identifier)
             .custom_created_at(invitee_created_at)
@@ -853,7 +848,7 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_after_acceptance()
         &[invitee_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(invitee_created_at.as_secs() + 1))
+    .custom_created_at(timestamp_after(invitee_created_at))
     .finalize(&owner_keys)
     .expect("Failed to create owner invitation");
     for relay in owner_servers {
@@ -898,7 +893,7 @@ async fn test_invitation_applies_newer_invitee_state_to_owner_after_acceptance()
         &[owner_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(invitee_created_at.as_secs() + 2))
+    .custom_created_at(timestamp_after(invitation.created_at))
     .finalize(&invitee_keys)
     .expect("Failed to create invitee acceptance");
     for relay in invitee_servers {
@@ -1028,10 +1023,6 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         .await;
     }
 
-    // Deliberate timestamp spacing: the owner events below are dated one
-    // second after the invitee state, so let wall-clock time pass that mark.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     let owner_git = tempfile::tempdir().expect("Failed to create owner repository directory");
     let owner_commit = create_test_repo_with_commit(owner_git.path(), CommitVariant::PrTest)
         .expect("Failed to create owner repository commit");
@@ -1042,7 +1033,7 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         .expect("Failed to encode owner npub");
     let (owner_clone_urls, owner_relay_urls) =
         repository_urls(&owner_keys, &owner_servers, identifier);
-    let owner_created_at = Timestamp::from_secs(invitee_state.created_at.as_secs() + 1);
+    let owner_created_at = timestamp_after(invitee_state.created_at);
     let initial_owner_announcement =
         repository_announcement(&owner_keys, &owner_servers, &[], identifier)
             .custom_created_at(owner_created_at)
@@ -1087,7 +1078,7 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         &[invitee_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(owner_created_at.as_secs() + 1))
+    .custom_created_at(timestamp_after(owner_created_at))
     .finalize(&owner_keys)
     .expect("Failed to create owner invitation");
     for relay in owner_servers {
@@ -1137,7 +1128,7 @@ async fn test_acceptance_replaces_existing_invitee_repository_with_newer_owner_s
         &[owner_keys.public_key()],
         identifier,
     )
-    .custom_created_at(Timestamp::from_secs(owner_created_at.as_secs() + 2))
+    .custom_created_at(timestamp_after(invitation.created_at))
     .finalize(&invitee_keys)
     .expect("Failed to create invitee acceptance");
     for relay in invitee_servers {

@@ -4,7 +4,8 @@
 mod common;
 
 use clap::Parser;
-use common::{publish_served_repo, TestRelay};
+use common::event_ordering::timestamp_after;
+use common::{publish_served_audit_repo_with_state, publish_served_repo, TestRelay};
 use grasp_audit::{AuditClient, AuditConfig, DETERMINISTIC_COMMIT_HASH};
 use ngit_grasp::config::Config;
 use ngit_grasp::grasp06::receive::new_repo_init_locks;
@@ -77,10 +78,8 @@ fn build_state_version(
         .expect("build state version")
 }
 
-/// Build a state version with ngit's one-use nonce tag.  Varying the nonce
-/// lets the test deterministically produce an ID that wins NIP-01's
-/// equal-timestamp tie-break without changing the state coordinate.
-fn build_grinded_state_version(
+/// Build a same-coordinate candidate with ngit's one-use nonce tag.
+fn build_nonce_state_version(
     client: &AuditClient,
     repo_id: &str,
     created_at: Timestamp,
@@ -105,7 +104,7 @@ fn build_grinded_state_version(
         ])
         .custom_created_at(created_at)
         .finalize(client.keys())
-        .expect("build grinded state version")
+        .expect("build nonce state version")
 }
 
 fn build_policy_for_history_regression(
@@ -167,20 +166,11 @@ async fn newer_30618_supersedes_older_and_preserves_old_in_history() {
         .await
         .expect("create audit client");
 
-    let (_announcement, repo_id) = publish_served_repo(&client, "history-30618").await;
-    // `publish_served_repo` already saved a 30618 for this coordinate. Nostr
-    // replaceable ordering is only second-granular, so a same-second "old"
-    // event can be rejected instead of superseding the fixture event. Start the
-    // test sequence in a deterministic future second to make both replacements
-    // strictly newer.
-    let base_ts = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
+    let (_announcement, repo_id, initial_state) =
+        publish_served_audit_repo_with_state(&client, "history-30618").await;
+    let base_ts = timestamp_after(initial_state.created_at);
     let old_state = build_state_version(&client, &repo_id, base_ts, "state-v1");
-    let new_state = build_state_version(
-        &client,
-        &repo_id,
-        Timestamp::from_secs(base_ts.as_secs() + 30),
-        "state-v2",
-    );
+    let new_state = build_state_version(&client, &repo_id, timestamp_after(base_ts), "state-v2");
 
     client
         .send_event(old_state.clone())
@@ -242,15 +232,17 @@ async fn same_second_30618_replacement_keeps_nip01_lowest_id() {
         .await
         .expect("create audit client");
 
-    let (_announcement, repo_id) = publish_served_repo(&client, "same-second-state").await;
+    let (_announcement, repo_id, initial_state) =
+        publish_served_audit_repo_with_state(&client, "same-second-state").await;
     // Keep the test sequence after the fixture's initial state event while
     // deliberately making the two explicit versions share one timestamp.
-    let created_at = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
-    let existing = build_state_version(&client, &repo_id, created_at, "state-v1");
-    let replacement = (0..100_000)
-        .map(|nonce| build_grinded_state_version(&client, &repo_id, created_at, nonce))
-        .find(|candidate| candidate.id < existing.id)
-        .expect("nonce grinding must produce a lower NIP-01 event ID");
+    let created_at = timestamp_after(initial_state.created_at);
+    let mut candidates = [
+        build_nonce_state_version(&client, &repo_id, created_at, 0),
+        build_nonce_state_version(&client, &repo_id, created_at, 1),
+    ];
+    candidates.sort_by_key(|event| event.id);
+    let [replacement, existing] = candidates;
 
     assert_eq!(existing.created_at, replacement.created_at);
     assert!(

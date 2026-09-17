@@ -3,6 +3,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+use common::event_ordering::{event_after, timestamp_after};
 use common::{
     announcement_coordinate, build_deletion, create_pr_event, create_state_event,
     create_test_repo_with_commit, publish_served_announcement_for_identifier, publish_served_repo,
@@ -35,7 +36,12 @@ fn metadata_tag_value(event: &Event, key: &str) -> Option<String> {
     })
 }
 
-fn build_reannouncement(client: &AuditClient, relay: &TestRelay, repo_id: &str) -> Event {
+fn build_reannouncement(
+    client: &AuditClient,
+    relay: &TestRelay,
+    repo_id: &str,
+    after: Timestamp,
+) -> Event {
     build_reannouncement_with_clone(
         client,
         relay,
@@ -49,6 +55,7 @@ fn build_reannouncement(client: &AuditClient, relay: &TestRelay, repo_id: &str) 
             client.public_key().to_bech32().expect("pubkey to bech32"),
             repo_id
         ),
+        after,
     )
 }
 
@@ -57,6 +64,7 @@ fn build_reannouncement_with_clone(
     relay: &TestRelay,
     repo_id: &str,
     clone_url: &str,
+    after: Timestamp,
 ) -> Event {
     let relay_url = relay.url().to_string();
 
@@ -66,6 +74,7 @@ fn build_reannouncement_with_clone(
         .tag(Tag::custom("name", vec![repo_id.to_string()]))
         .tag(Tag::custom("clone", vec![clone_url.to_string()]))
         .tag(Tag::custom("relays", vec![relay_url]))
+        .custom_time(timestamp_after(after))
         .build(client.keys())
         .expect("build re-announcement")
 }
@@ -332,23 +341,17 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
 
     if delete_state_with_tombstone {
         let state_coord = format!("30618:{}:{}", client.public_key().to_hex(), repo_id);
+        let deletion = build_deletion(&client, &[], std::slice::from_ref(&state_coord));
         client
-            .send_event(build_deletion(
-                &client,
-                &[],
-                std::slice::from_ref(&state_coord),
-            ))
+            .send_event(deletion.clone())
             .await
             .expect("delete old state by coordinate");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&announcement_coord));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&announcement_coord),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("delete announcement coordinate");
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -370,8 +373,7 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
         std::fs::remove_dir_all(&repo_path).expect("remove live repo after deletion");
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannouncement = build_reannouncement(&client, &relay, &repo_id);
+    let reannouncement = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannouncement.clone())
         .await
@@ -430,6 +432,12 @@ async fn submit_new_state_and_push_for_promotion(
         &[relay_url.as_str()],
     )
     .unwrap_or_else(|e| panic!("build {state_label} state event: {e}"));
+
+    let state_event = event_after(
+        state_event,
+        fixture.client.keys(),
+        fixture.reannouncement.created_at,
+    );
 
     fixture
         .client
@@ -617,8 +625,12 @@ async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
     let first_state = submit_new_state_and_push_for_promotion(&fixture, "idempotent-first").await;
 
     // Trigger another post-promotion write flow; recovery should remain a no-op.
-    let second_reannouncement =
-        build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
+    let second_reannouncement = build_reannouncement(
+        &fixture.client,
+        &fixture.relay,
+        &fixture.repo_id,
+        fixture.reannouncement.created_at,
+    );
     fixture
         .client
         .send_event(second_reannouncement.clone())
@@ -739,8 +751,12 @@ async fn maintainer_announcement_accept_route_runs_recovery_trigger_a() {
     )
     .await;
 
-    let maintainer_reannouncement =
-        build_reannouncement(&fixture.client, &fixture.relay, &fixture.repo_id);
+    let maintainer_reannouncement = build_reannouncement(
+        &fixture.client,
+        &fixture.relay,
+        &fixture.repo_id,
+        fixture.reannouncement.created_at,
+    );
     fixture
         .client
         .send_event(maintainer_reannouncement.clone())
@@ -809,6 +825,12 @@ async fn state_event_received_route_runs_promotion_recovery_with_tombstones() {
         &[relay_url.as_str()],
     )
     .expect("build state-route recovery trigger state event");
+
+    let recovery_state = event_after(
+        recovery_state,
+        fixture.client.keys(),
+        fixture.reannouncement.created_at,
+    );
 
     fixture
         .client
@@ -883,6 +905,12 @@ async fn state_event_received_route_fallback_is_deterministic_when_recovery_arti
     )
     .expect("build fallback state-route trigger state event");
 
+    let fallback_state = event_after(
+        fallback_state,
+        fixture.client.keys(),
+        fixture.reannouncement.created_at,
+    );
+
     fixture
         .client
         .send_event(fallback_state.clone())
@@ -943,12 +971,9 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
     client.send_event(issue.clone()).await.expect("send issue");
 
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion");
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -970,8 +995,7 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
         std::fs::remove_dir_all(&repo_path).expect("remove live repo to force archive restore");
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce = build_reannouncement(&client, &relay, &repo_id);
+    let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannounce.clone())
         .await
@@ -1104,12 +1128,9 @@ async fn out_of_retention_reannouncement_behaves_as_fresh_new_repo() {
     client.send_event(issue.clone()).await.expect("send issue");
 
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion");
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1123,8 +1144,7 @@ async fn out_of_retention_reannouncement_behaves_as_fresh_new_repo() {
         .await
         .expect("force cleanup expired holding records");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce = build_reannouncement(&client, &relay, &repo_id);
+    let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannounce.clone())
         .await
@@ -1165,12 +1185,9 @@ async fn partial_recovery_missing_archive_restores_events_only_deterministically
     client.send_event(issue.clone()).await.expect("send issue");
 
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion");
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1186,8 +1203,7 @@ async fn partial_recovery_missing_archive_restores_events_only_deterministically
     let archive_path = relay.git_data_path().join(".archive").join(archive_rel);
     std::fs::remove_file(&archive_path).expect("remove archive file to force partial recovery");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce = build_reannouncement(&client, &relay, &repo_id);
+    let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannounce.clone())
         .await
@@ -1227,12 +1243,9 @@ async fn partial_recovery_missing_holding_payload_restores_git_only_deterministi
     client.send_event(issue.clone()).await.expect("send issue");
 
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion");
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -1251,8 +1264,7 @@ async fn partial_recovery_missing_holding_payload_restores_git_only_deterministi
         std::fs::remove_dir_all(&repo_path).expect("remove live repo to require archive restore");
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce = build_reannouncement(&client, &relay, &repo_id);
+    let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannounce.clone())
         .await
@@ -1288,25 +1300,21 @@ async fn repeated_reannouncement_recovery_trigger_is_idempotent() {
     client.send_event(issue.clone()).await.expect("send issue");
 
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(&client, &[], std::slice::from_ref(&coordinate));
     client
-        .send_event(build_deletion(
-            &client,
-            &[],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion");
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let first = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
-        .send_event(build_reannouncement(&client, &relay, &repo_id))
+        .send_event(first.clone())
         .await
         .expect("first re-announcement");
     tokio::time::sleep(Duration::from_millis(700)).await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let second = build_reannouncement(&client, &relay, &repo_id);
+    let second = build_reannouncement(&client, &relay, &repo_id, first.created_at);
     client
         .send_event(second.clone())
         .await
@@ -1379,12 +1387,9 @@ async fn multi_maintainer_reannouncement_restores_deleted_owner_slice() {
             .expect("send patch event");
     }
 
+    let deletion = build_deletion(&client_a, &[], std::slice::from_ref(&coordinate_a));
     client_a
-        .send_event(build_deletion(
-            &client_a,
-            &[],
-            std::slice::from_ref(&coordinate_a),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("delete maintainer a announcement");
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1402,8 +1407,7 @@ async fn multi_maintainer_reannouncement_restores_deleted_owner_slice() {
         .await
         .expect("query surviving announcement b"));
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce_a = build_reannouncement(&client_a, &relay, &repo_id);
+    let reannounce_a = build_reannouncement(&client_a, &relay, &repo_id, deletion.created_at);
     client_a
         .send_event(reannounce_a)
         .await
@@ -1431,18 +1435,18 @@ async fn disrespector_mode_has_no_recovery_state_to_apply() {
 
     let (announcement, repo_id) = publish_served_repo(&client, "recovery-disrespector").await;
     let coordinate = announcement_coordinate(&announcement, &repo_id);
+    let deletion = build_deletion(
+        &client,
+        &[announcement.id],
+        std::slice::from_ref(&coordinate),
+    );
     client
-        .send_event(build_deletion(
-            &client,
-            &[announcement.id],
-            std::slice::from_ref(&coordinate),
-        ))
+        .send_event(deletion.clone())
         .await
         .expect("send deletion request in disrespector mode");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reannounce = build_reannouncement(&client, &relay, &repo_id);
+    let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(reannounce)
         .await
