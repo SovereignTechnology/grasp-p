@@ -12,6 +12,33 @@ use nostr_sdk::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+/// Derive refs from one complete state snapshot: newest timestamp, then lowest ID.
+/// The caller supplies the states fetched for the probed repository.
+fn expected_state_refs<'a>(
+    state_events: impl IntoIterator<Item = &'a Event>,
+) -> std::collections::HashMap<String, String> {
+    let winner = state_events.into_iter().max_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let Some(winner) = winner else {
+        return std::collections::HashMap::new();
+    };
+    winner
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let name = tag.kind().to_string();
+            if name.starts_with("refs/heads/") || name.starts_with("refs/tags/") {
+                tag.content().map(|hash| (name, hash.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 const MAX_NIP11_BODY_BYTES: usize = 256 * 1024;
 const MAX_GIT_ADVERTISEMENT_BYTES: usize = 1024 * 1024;
 
@@ -1465,9 +1492,8 @@ pub async fn run_probe_with_options(
                 };
 
                 // git_refs_match_state: fetch all served kind 30618 state events for this
-                // repo (by #d tag), derive expected refs (latest timestamp wins per ref
-                // across all authorized state events — relay already validated the
-                // selected coordinate's resolved reciprocal component), then compare.
+                // repo (by #d tag), select the newest complete state snapshot
+                // (lowest event ID breaks timestamp ties), then compare its refs.
                 match refs_body_fallback {
                     None => {
                         checks.push(skipped(
@@ -1508,36 +1534,7 @@ pub async fn run_probe_with_options(
                                 ),
                             });
                         } else {
-                            // Build expected refs: for each ref name, the state event with
-                            // the highest created_at timestamp wins (mirrors relay behaviour).
-                            // Any confirmed member's state event may be the most recent
-                            // for a given ref.
-                            let mut expected: std::collections::HashMap<String, String> =
-                                std::collections::HashMap::new();
-                            let mut latest_ts: std::collections::HashMap<String, u64> =
-                                std::collections::HashMap::new();
-
-                            for state_ev in state_events.iter() {
-                                let ts = state_ev.created_at.as_secs();
-                                for tag in state_ev.tags.iter() {
-                                    let kind_str = tag.kind().to_string();
-                                    if !kind_str.starts_with("refs/heads/")
-                                        && !kind_str.starts_with("refs/tags/")
-                                    {
-                                        continue;
-                                    }
-                                    let hash = match tag.content() {
-                                        Some(h) => h.to_string(),
-                                        None => continue,
-                                    };
-                                    let prev_ts =
-                                        latest_ts.get(kind_str.as_str()).copied().unwrap_or(0);
-                                    if ts >= prev_ts {
-                                        expected.insert(kind_str.to_string(), hash);
-                                        latest_ts.insert(kind_str.to_string(), ts);
-                                    }
-                                }
-                            }
+                            let expected = expected_state_refs(state_events.iter());
 
                             let mut mismatches: Vec<String> = Vec::new();
                             for (refname, expected_hash) in &expected {
@@ -1614,6 +1611,57 @@ pub async fn run_probe_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ref_state(keys: &Keys, timestamp: u64, branch: &str) -> Event {
+        EventBuilder::new(Kind::RepoState, "")
+            .tags([
+                Tag::identifier("test-repo"),
+                Tag::custom("refs/heads/main", ["a".repeat(40)]),
+                Tag::custom(format!("refs/heads/{branch}"), ["b".repeat(40)]),
+                Tag::custom(format!("refs/tags/{branch}"), ["c".repeat(40)]),
+                Tag::custom("HEAD", ["ref: refs/heads/main"]),
+                Tag::custom("refs/nostr/private", ["d".repeat(40)]),
+            ])
+            .custom_created_at(Timestamp::from_secs(timestamp))
+            .finalize(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn expected_refs_choose_lower_id_snapshot_on_timestamp_tie() {
+        // Different maintainers can both have a served state at the same timestamp.
+        let mut states = [
+            ref_state(&Keys::generate(), 100, "first"),
+            ref_state(&Keys::generate(), 100, "second"),
+        ];
+        states.sort_by_key(|event| event.id);
+        let [winner, loser] = states;
+        let expected = expected_state_refs([&winner]);
+        assert_eq!(expected.len(), 3);
+        for order in [[&winner, &loser], [&loser, &winner]] {
+            assert_eq!(expected_state_refs(order), expected);
+        }
+    }
+
+    #[test]
+    fn expected_refs_drop_branches_and_tags_absent_from_newest_state() {
+        let keys = Keys::generate();
+        let older = ref_state(&keys, 100, "removed");
+        let newer = ref_state(&keys, 101, "current");
+        let expected = expected_state_refs([&newer]);
+        assert!(!expected.contains_key("refs/heads/removed"));
+        assert!(!expected.contains_key("refs/tags/removed"));
+        for order in [[&older, &newer], [&newer, &older]] {
+            assert_eq!(expected_state_refs(order), expected);
+        }
+        assert!(expected_state_refs([]).is_empty());
+        let empty = EventBuilder::new(Kind::RepoState, "")
+            .tags([Tag::identifier("test-repo")])
+            .custom_created_at(Timestamp::from_secs(102))
+            .finalize(&keys)
+            .unwrap();
+        assert!(expected_state_refs([&older, &newer, &empty]).is_empty());
+    }
 
     #[test]
     fn probe_check_catalog_preserves_public_names_and_order() {

@@ -67,7 +67,7 @@ bodies. They are deliberately read-only and cannot be combined with
 | `nip11_fetch` | NIP-11 relay info document is served (shows software & version) |
 | `serves_latest_announcement` | At least one kind:30617 repo announcement is served |
 | `git_fetch_refs` | Git HTTP info/refs endpoint responds |
-| `git_refs_match_state` | Git refs match the latest kind:30618 state events |
+| `git_refs_match_state` | Git refs match the newest kind:30618 state snapshot (lowest event ID breaks timestamp ties) |
 
 **Additional checks with `--create-repo`:**
 

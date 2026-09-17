@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Select one complete repository state in the read-only audit probe, using
+  the lower event ID for same-second ties. Older states no longer contribute
+  removed branches or tags to the expected Git refs.
+
 - Honor lower-ID same-second replacements in the public owner-repository sync
   helper while preserving replay suppression.
 
