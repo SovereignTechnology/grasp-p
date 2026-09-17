@@ -4,6 +4,8 @@
 //! human-readable or JSON format. It is designed to be fast and non-destructive
 //! when run in read-only mode.
 
+mod state;
+
 use crate::audit::AuditConfig;
 use crate::client::AuditClient;
 use crate::fixtures::{create_commit, init_local_repo, try_push};
@@ -1224,42 +1226,8 @@ pub async fn run_probe_with_options(
             }
             Some(body) => {
                 let fetched_refs = parse_refs(&body);
-                let mut mismatches: Vec<String> = Vec::new();
-
-                if let Some(ref state_ev) = state_event_opt {
-                    for tag in state_ev.tags.iter() {
-                        let kind_str = tag.kind().to_string();
-                        // Only check refs/heads/* and refs/tags/*, skip HEAD and refs/nostr/*
-                        if !kind_str.starts_with("refs/heads/")
-                            && !kind_str.starts_with("refs/tags/")
-                        {
-                            continue;
-                        }
-                        let expected_hash = match tag.content() {
-                            Some(h) => h.to_string(),
-                            None => continue,
-                        };
-                        let found = fetched_refs.iter().find(|(r, _)| r == &kind_str);
-                        match found {
-                            Some((_, actual_hash)) if actual_hash == &expected_hash => {}
-                            Some((_, actual_hash)) => {
-                                mismatches.push(format!(
-                                    "{}: expected {} got {}",
-                                    kind_str,
-                                    &expected_hash[..8.min(expected_hash.len())],
-                                    &actual_hash[..8.min(actual_hash.len())]
-                                ));
-                            }
-                            None => {
-                                mismatches.push(format!(
-                                    "{}: expected {} not found in refs",
-                                    kind_str,
-                                    &expected_hash[..8.min(expected_hash.len())]
-                                ));
-                            }
-                        }
-                    }
-                }
+                let expected = expected_state_refs(state_event_opt.iter());
+                let mismatches = state::ref_mismatches(&expected, &fetched_refs);
 
                 checks.push(ProbeCheck {
                     name: ProbeCheckName::GitRefsMatchState.as_str(),
@@ -1536,28 +1504,7 @@ pub async fn run_probe_with_options(
                         } else {
                             let expected = expected_state_refs(state_events.iter());
 
-                            let mut mismatches: Vec<String> = Vec::new();
-                            for (refname, expected_hash) in &expected {
-                                let found = fetched_refs.iter().find(|(r, _)| r == refname);
-                                match found {
-                                    Some((_, actual_hash)) if actual_hash == expected_hash => {}
-                                    Some((_, actual_hash)) => {
-                                        mismatches.push(format!(
-                                            "{}: expected {} got {}",
-                                            refname,
-                                            &expected_hash[..8.min(expected_hash.len())],
-                                            &actual_hash[..8.min(actual_hash.len())]
-                                        ));
-                                    }
-                                    None => {
-                                        mismatches.push(format!(
-                                            "{}: expected {} not found in refs",
-                                            refname,
-                                            &expected_hash[..8.min(expected_hash.len())]
-                                        ));
-                                    }
-                                }
-                            }
+                            let mismatches = state::ref_mismatches(&expected, &fetched_refs);
 
                             checks.push(ProbeCheck {
                                 name: ProbeCheckName::GitRefsMatchState.as_str(),

@@ -69,6 +69,10 @@ bodies. They are deliberately read-only and cannot be combined with
 | `git_fetch_refs` | Git HTTP info/refs endpoint responds |
 | `git_refs_match_state` | Git refs match the newest kind:30618 state snapshot (lowest event ID breaks timestamp ties) |
 
+Both read-only and write probes compare the complete branch/tag set: missing,
+changed, and unexpected refs fail. HEAD, Nostr refs, and peeled annotated-tag
+entries are excluded from that set.
+
 **Additional checks with `--create-repo`:**
 
 | Check | What it verifies |

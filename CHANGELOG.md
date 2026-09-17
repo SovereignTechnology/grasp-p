@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Report unexpected branches and tags in audit probes, including refs left
+  behind when the winning repository state is empty.
+
 - Select one complete repository state in the read-only audit probe, using
   the lower event ID for same-second ties. Older states no longer contribute
   removed branches or tags to the expected Git refs.
