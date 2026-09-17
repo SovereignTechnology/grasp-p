@@ -39,7 +39,7 @@ use std::time::Duration;
 
 /// Build a state event with a nonce that changes its ID without changing its
 /// replaceable coordinate or declared repository state.
-fn build_grinded_state_event(
+fn build_nonce_state_event(
     keys: &Keys,
     identifier: &str,
     commit_hash: &str,
@@ -66,7 +66,7 @@ fn build_grinded_state_event(
         ])
         .custom_created_at(created_at)
         .finalize(keys)
-        .expect("build grinded state event")
+        .expect("build nonce-bearing state event")
 }
 
 /// Test that a git push triggers `process_newly_available_git_data` and
@@ -181,29 +181,19 @@ async fn same_second_same_author_states_in_purgatory_keep_nip01_lowest_id() {
     let npub = keys.public_key().to_bech32().expect("encode public key");
     let clone_url = format!("http://{}/{}/{}.git", relay.domain(), npub, identifier);
     let created_at = Timestamp::from_secs(Timestamp::now().as_secs() + 1);
-    let losing_state = build_grinded_state_event(
-        &keys,
-        identifier,
-        &commit_hash,
-        &clone_url,
-        relay.url(),
-        created_at,
-        0,
-    );
-    let winning_state = (1..100_000)
-        .map(|nonce| {
-            build_grinded_state_event(
-                &keys,
-                identifier,
-                &commit_hash,
-                &clone_url,
-                relay.url(),
-                created_at,
-                nonce,
-            )
-        })
-        .find(|candidate| candidate.id < losing_state.id)
-        .expect("nonce grinding must produce a lower NIP-01 event ID");
+    let mut candidates = [0, 1].map(|nonce| {
+        build_nonce_state_event(
+            &keys,
+            identifier,
+            &commit_hash,
+            &clone_url,
+            relay.url(),
+            created_at,
+            nonce,
+        )
+    });
+    candidates.sort_by_key(|event| event.id);
+    let [winning_state, losing_state] = candidates;
 
     assert_eq!(losing_state.created_at, winning_state.created_at);
     assert!(winning_state.id < losing_state.id);
