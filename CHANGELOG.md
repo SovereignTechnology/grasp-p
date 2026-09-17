@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Apply the lower-event-ID tie-break to same-second purgatory replacements.
+  Git push authorization now selects the preferred matching state regardless
+  of arrival order, and a winning announcement that removes this service
+  evicts its purgatory entry and associated repository data.
+
 - Preserve all persisted root events when rebuilding sync state at startup.
   Purgatory cleanup can no longer remove a partially reconstructed repository
   and leave its older threads untracked until another restart.

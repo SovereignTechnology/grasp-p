@@ -419,9 +419,13 @@ pub struct Purgatory {
    - Bare repo created immediately so pushes can succeed
    - Announcement promoted to database only when git data proves content exists
    - Two-phase soft expiry: bare repo deleted at 30 min, event retained 24h for revival
+   - De-list replacements evict an owner's entry only when they win NIP-01
+     ordering: later timestamp, or lower event ID at the same timestamp.
 
 3. **Late Binding**: State event refs are extracted at git push time, not event arrival
    - Enables flexible matching when pushes arrive out-of-order
+   - Among matching states from authorized authors, push authorization selects
+     the latest timestamp, breaking ties with the lowest event ID.
    - Helper functions in [`helpers.rs`](../../src/purgatory/helpers.rs) handle ref extraction
 
 4. **Bidirectional Waiting**: Either side can arrive first

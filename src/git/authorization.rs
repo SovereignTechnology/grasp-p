@@ -685,10 +685,14 @@ pub async fn get_state_authorization_for_selected_repo(
             .collect();
 
         if !authorized_events.is_empty() {
-            // Find the latest event
+            // NIP-01 prefers the lower event ID when timestamps tie.
             let latest_authorized = authorized_events
                 .iter()
-                .max_by_key(|event| event.created_at)
+                .max_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| right.id.cmp(&left.id))
+                })
                 .unwrap(); // Safe because we checked the vec is not empty
 
             // Parse the event into RepositoryState
@@ -1376,6 +1380,80 @@ fn describe_known_event_mismatch(
 mod tests {
     use super::*;
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+
+    #[tokio::test]
+    async fn nip01_purgatory_state_selection_is_independent_of_arrival_order() {
+        let keys = Keys::generate();
+        let identifier = "same-second-state";
+        let commit = "1234567890abcdef1234567890abcdef12345678";
+        let timestamp = Timestamp::from_secs(100);
+        let make_state = |signer: &Keys, content: &str, created_at| {
+            EventBuilder::new(Kind::RepoState, content)
+                .tags([
+                    Tag::identifier(identifier),
+                    Tag::custom("refs/heads/main", [commit]),
+                ])
+                .custom_created_at(created_at)
+                .finalize(signer)
+                .unwrap()
+        };
+        let mut states = [
+            make_state(&keys, "a", timestamp),
+            make_state(&keys, "b", timestamp),
+        ];
+        states.sort_by_key(|event| event.id);
+        let [winner, loser] = states;
+        let outsider = make_state(&Keys::generate(), "unauthorized", Timestamp::from_secs(200));
+        let newer = make_state(&keys, "newer", Timestamp::from_secs(101));
+
+        for candidates in [[&winner, &loser], [&loser, &winner]] {
+            let directory = tempfile::tempdir().unwrap();
+            let purgatory = Arc::new(Purgatory::new(directory.path().to_path_buf()));
+            let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+            database
+                .save_event(&create_announcement_event(&keys, identifier, &[]))
+                .await
+                .unwrap();
+            for event in candidates.into_iter().chain([&outsider]) {
+                purgatory.add_state(event.clone(), identifier.into(), event.pubkey, false);
+            }
+            let pushed = vec![("0".repeat(40), commit.into(), "refs/heads/main".into())];
+            let selected = keys.public_key().to_hex();
+            let result = get_state_authorization_for_selected_repo(
+                &database,
+                identifier,
+                &selected,
+                &purgatory,
+                &pushed,
+                directory.path(),
+            )
+            .await
+            .unwrap();
+            assert!(result.authorized);
+            assert_eq!(result.state.unwrap().event.id, winner.id);
+            assert_eq!(
+                result
+                    .purgatory_events
+                    .iter()
+                    .map(|event| event.id)
+                    .collect::<Vec<_>>(),
+                vec![winner.id]
+            );
+
+            purgatory.add_state(newer.clone(), identifier.into(), keys.public_key(), false);
+            let result = get_state_authorization_for_selected_repo(
+                &database,
+                identifier,
+                &selected,
+                &purgatory,
+                &pushed,
+                directory.path(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.state.unwrap().event.id, newer.id);
+        }
+    }
 
     fn create_test_keys() -> Keys {
         Keys::generate()

@@ -80,7 +80,7 @@ impl AnnouncementPolicy {
                 match RepositoryAnnouncement::from_event(event.clone()) {
                     Ok(announcement) => {
                         // If this pubkey+identifier has a purgatory entry AND the incoming
-                        // event is strictly newer, the owner is sending a replacement that
+                        // event wins NIP-01 ordering, the owner is sending a replacement that
                         // removes our service. Clear the purgatory entry and its bare repo.
                         //
                         // If the incoming event is older than the purgatory entry (e.g. a
@@ -90,7 +90,11 @@ impl AnnouncementPolicy {
                             .ctx
                             .purgatory
                             .find_announcement(&event.pubkey, &announcement.identifier)
-                            .is_some_and(|entry| event.created_at > entry.event.created_at);
+                            .is_some_and(|entry| {
+                                event.created_at > entry.event.created_at
+                                    || (event.created_at == entry.event.created_at
+                                        && event.id < entry.event.id)
+                            });
 
                         if should_evict {
                             self.remove_purgatory_announcement(
@@ -524,6 +528,74 @@ mod tests {
             ])
             .finalize(keys)
             .expect("signed announcement")
+    }
+
+    #[tokio::test]
+    async fn nip01_purgatory_delisting_evicts_only_the_winning_replacement() {
+        let keys = Keys::generate();
+        let identifier = "membership-gate-repo";
+        let mut candidates = ["first.example", "second.example"].map(|domain| {
+            let event = service_announcement(&keys, domain);
+            let event = EventBuilder::new(event.kind, event.content)
+                .tags(event.tags.to_vec())
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(100))
+                .finalize(&keys)
+                .unwrap();
+            (event, domain)
+        });
+        candidates.sort_by_key(|(event, _)| event.id);
+        let [(winner, winner_domain), (loser, loser_domain)] = candidates;
+
+        for (stored, domain, incoming, evicted) in [
+            (&loser, loser_domain, &winner, true),
+            (&winner, winner_domain, &loser, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo_path = directory.path().join("repo.git");
+            std::fs::create_dir(&repo_path).unwrap();
+            let mut config = Config::for_testing();
+            config.domain = domain.into();
+            let purgatory = Arc::new(crate::purgatory::Purgatory::new(
+                directory.path().to_path_buf(),
+            ));
+            purgatory.add_announcement(
+                stored.clone(),
+                identifier.into(),
+                keys.public_key(),
+                repo_path.clone(),
+                HashSet::new(),
+            );
+            let state = EventBuilder::new(Kind::RepoState, "")
+                .tag(Tag::identifier(identifier))
+                .finalize(&keys)
+                .unwrap();
+            purgatory.add_state(state, identifier.into(), keys.public_key(), false);
+            let ctx = PolicyContext::new_for_test(
+                domain.to_string(),
+                Arc::new(nostr_memory::MemoryDatabase::unbounded()),
+                directory.path().to_path_buf(),
+                Arc::clone(&purgatory),
+                config.clone(),
+            );
+            let policy = AnnouncementPolicy::new(ctx, config, None);
+            policy.validate(incoming).await;
+            assert_eq!(
+                purgatory
+                    .find_announcement(&keys.public_key(), identifier)
+                    .is_none(),
+                evicted
+            );
+            assert_eq!(!repo_path.exists(), evicted);
+            assert_eq!(purgatory.find_state(identifier).is_empty(), evicted);
+            // Replaying a non-winning de-list must remain harmless.
+            policy.validate(incoming).await;
+            assert_eq!(
+                purgatory
+                    .find_announcement(&keys.public_key(), identifier)
+                    .is_none(),
+                evicted
+            );
+        }
     }
 
     #[tokio::test]
