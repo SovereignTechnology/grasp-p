@@ -1472,53 +1472,42 @@ pub async fn run_probe_with_options(
                     Some(body) => {
                         let fetched_refs = parse_refs(&body);
 
-                        // Fetch all state events for this repo_id from the relay.
-                        // The relay only serves state events authorized by a selected
-                        // coordinate's resolved reciprocal component.
-                        let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
-                            nostr_sdk::prelude::SingleLetterTag::LOWERCASE_D,
-                            ann_id.clone(),
-                        );
-                        let state_events = client
+                        // Resolve authority and state from the same repository-scoped fetch.
+                        let filter = Filter::new()
+                            .kinds([Kind::GitRepoAnnouncement, Kind::RepoState])
+                            .custom_tag(SingleLetterTag::LOWERCASE_D, ann_id.clone());
+                        let expected = match client
                             .client()
-                            .fetch_events(state_filter)
+                            .fetch_events(filter)
                             .timeout(
                                 deadline
                                     .saturating_duration_since(Instant::now())
                                     .min(Duration::from_secs(5)),
                             )
                             .await
-                            .unwrap_or_default();
-
-                        if state_events.is_empty() {
-                            checks.push(ProbeCheck {
-                                name: ProbeCheckName::GitRefsMatchState.as_str(),
-                                passed: false,
-                                skipped: false,
-                                duration_ms: 0,
-                                detail: None,
-                                error: Some(
-                                    "no kind:30618 state events found for this repo".to_string(),
-                                ),
-                            });
-                        } else {
-                            let expected = expected_state_refs(state_events.iter());
-
-                            let mismatches = state::ref_mismatches(&expected, &fetched_refs);
-
-                            checks.push(ProbeCheck {
-                                name: ProbeCheckName::GitRefsMatchState.as_str(),
-                                passed: mismatches.is_empty(),
-                                skipped: false,
-                                duration_ms: 0,
-                                detail: None,
-                                error: if mismatches.is_empty() {
-                                    None
-                                } else {
-                                    Some(mismatches.join("; "))
-                                },
-                            });
-                        }
+                        {
+                            Ok(events) => {
+                                state::scoped_state_refs(events.iter(), ev.pubkey, &ann_id)
+                            }
+                            Err(error) => Err(format!(
+                                "failed to fetch repository authority and state: {error}"
+                            )),
+                        };
+                        let error = match expected {
+                            Ok(expected) => {
+                                let mismatches = state::ref_mismatches(&expected, &fetched_refs);
+                                (!mismatches.is_empty()).then(|| mismatches.join("; "))
+                            }
+                            Err(error) => Some(error),
+                        };
+                        checks.push(ProbeCheck {
+                            name: ProbeCheckName::GitRefsMatchState.as_str(),
+                            passed: error.is_none(),
+                            skipped: false,
+                            duration_ms: 0,
+                            detail: None,
+                            error,
+                        });
                     }
                 }
             }
