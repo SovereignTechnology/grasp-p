@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve all persisted root events when rebuilding sync state at startup.
+  Purgatory cleanup can no longer remove a partially reconstructed repository
+  and leave its older threads untracked until another restart.
+
 - Upgrade the Nostr SDK and database dependencies to released 0.45 patch
   versions. NIP-77 database scans now run off async workers, avoiding runtime
   stalls that can delay unrelated relay connections. Reconciliation excludes

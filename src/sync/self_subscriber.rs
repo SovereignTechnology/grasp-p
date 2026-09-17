@@ -204,10 +204,10 @@ impl SelfSubscriber {
     /// (which has limits on the number of events returned).
     ///
     /// Query order:
-    /// 1. First query: Get announcements (30617) to populate repo_sync_index
-    ///    with repos and their relays
-    /// 2. Second query: Get root events (1617/1618/1621) for handle_root_event()
-    ///    to add root event IDs for Layer 3 filter creation
+    /// 1. First query: Stage announcements (30617) and their relay ownership.
+    /// 2. Second query: Stage root events (1617/1618/1621) for Layer 3 filters.
+    ///
+    /// Publish the complete repository index only when processing the batch.
     ///
     /// Returns a PendingUpdates containing all repos that need Layer 2/3 filters.
     async fn load_existing_events(&self) -> PendingUpdates {
@@ -215,7 +215,7 @@ impl SelfSubscriber {
 
         tracing::info!("Loading all events from database");
 
-        // First query: Get all announcements to populate repo_sync_index
+        // First query: Stage all announcements and their relay ownership.
         let announcement_filter = Filter::new().kind(Kind::GitRepoAnnouncement);
 
         let announcements = match self.database.query(announcement_filter).await {
@@ -242,26 +242,11 @@ impl SelfSubscriber {
             }
         }
 
-        // Update repo_sync_index with announcements BEFORE querying root events
-        {
-            let mut index = self.repo_sync_index.write().await;
-            for (repo_id, needs) in &pending.repos {
-                let entry = index
-                    .entry(repo_id.clone())
-                    .or_insert_with(|| RepoSyncNeeds {
-                        relays: HashSet::new(),
-                        root_events: HashSet::new(),
-                        // Stage relay ownership while root reconstruction is
-                        // still in progress. process_batch performs the one
-                        // existing Full promotion after the complete startup
-                        // batch has been assembled.
-                        sync_level: SyncLevel::StateOnly,
-                    });
-                entry.relays.extend(needs.relays.clone());
-            }
-        }
+        // Keep startup reconstruction private until process_batch publishes the
+        // complete Full entry. A temporary StateOnly entry can be pruned by
+        // purgatory reconciliation while the root query is still running.
 
-        // Second query: Get all root events for handle_root_event()
+        // Second query: Stage all roots belonging to those announcements.
         let root_filter =
             Filter::new().kinds(vec![Kind::GitPatch, Kind::GitIssue, Kind::GitPullRequest]);
 
@@ -283,7 +268,22 @@ impl SelfSubscriber {
         // Process root events
         let mut root_events_processed = 0;
         for event in root_events.iter() {
-            self.handle_root_event(event, &mut pending).await;
+            let Some(repo_ref) = root_event_repo_ref(event) else {
+                continue;
+            };
+            let Some(needs) = pending.repos.get(&repo_ref) else {
+                continue;
+            };
+            let relays = needs.relays.clone();
+            self.root_candidate_index.write().await.insert(
+                event.id,
+                super::discovery::AcceptedRoot {
+                    id: event.id,
+                    author: event.pubkey,
+                    repository: repo_ref.clone(),
+                },
+            );
+            pending.add_root_event(repo_ref, relays, event.id);
             root_events_processed += 1;
         }
 
@@ -481,6 +481,9 @@ impl SelfSubscriber {
         // This ensures all repos get Layer 2/3 filters created, not just those
         // returned by the WebSocket subscription (which has limits)
         let mut pending = self.load_existing_events().await;
+        // Publish before consuming queued live notifications so newly arriving
+        // roots can resolve their repository through the completed index.
+        self.process_batch(&mut pending).await;
 
         // Timer does NOT reset on new events - use interval
         let mut timer = tokio::time::interval(batch_window);
@@ -794,11 +797,13 @@ mod tests {
         );
 
         let mut pending = subscriber.load_existing_events().await;
-        assert_eq!(
-            repo_sync_index.read().await[&repo].sync_level,
-            SyncLevel::StateOnly,
-            "startup reconstruction must not start full sync before the batch is complete"
+        assert!(
+            !repo_sync_index.read().await.contains_key(&repo),
+            "startup reconstruction must remain private until the batch is complete"
         );
+        // The purgatory timer can run during startup. It must have no staged
+        // repository to prune, and all reconstructed roots must survive it.
+        super::super::reconcile_purgatory_relay_ownership(&mut *repo_sync_index.write().await, &[]);
         assert!(root_candidate_index.read().await.contains_key(&root.id));
         {
             let candidates = root_candidate_index.read().await;
@@ -811,6 +816,11 @@ mod tests {
         }
 
         subscriber.process_batch(&mut pending).await;
+        assert_eq!(
+            repo_sync_index.read().await[&repo].root_events,
+            HashSet::from([root.id]),
+            "purgatory reconciliation must not discard reconstructed roots"
+        );
         assert_eq!(
             repo_sync_index.read().await[&repo].sync_level,
             SyncLevel::Full

@@ -660,6 +660,9 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
   root events to follow, attached in-process to the embedded relay rather than
   dialling the public listener (works identically under GRASP-08 private mode,
   whose auth gate would refuse a self-dial)
+- **Startup reconstruction** stages persisted announcements and roots privately,
+  then publishes complete Full entries before requesting sync. Purgatory
+  cleanup cannot prune a partially reconstructed repository.
 - **Three-way diff** (`compute_actions`) determines new subscriptions needed
 - **Smart reconnection** - uses `since` filter for quick reconnects (<15 min), fresh sync otherwise
 - **Health tracking** with exponential backoff for failing relays
