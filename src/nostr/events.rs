@@ -9,6 +9,14 @@
 use anyhow::{anyhow, Result};
 use nostr_sdk::prelude::{Event, Kind, PublicKey, ToBech32};
 
+/// Compare replacement preference within an already-selected event scope.
+/// Greater means preferred: later timestamp, then lower event ID (NIP-01).
+pub(crate) fn compare_replacement_events(left: &Event, right: &Event) -> std::cmp::Ordering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then_with(|| right.id.cmp(&left.id))
+}
+
 /// Whether a NIP-34 indexed role record is syntactically valid and active.
 ///
 /// Values after the pubkey alternate between numeric start and end

@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use super::PolicyContext;
 use crate::config::Config;
-use crate::nostr::events::{validate_announcement, RepositoryAnnouncement};
+use crate::nostr::events::{
+    compare_replacement_events, validate_announcement, RepositoryAnnouncement,
+};
 use crate::private::PrivateAccess;
 
 /// Result of announcement policy evaluation
@@ -91,9 +93,7 @@ impl AnnouncementPolicy {
                             .purgatory
                             .find_announcement(&event.pubkey, &announcement.identifier)
                             .is_some_and(|entry| {
-                                event.created_at > entry.event.created_at
-                                    || (event.created_at == entry.event.created_at
-                                        && event.id < entry.event.id)
+                                compare_replacement_events(event, &entry.event).is_gt()
                             });
 
                         if should_evict {
@@ -345,11 +345,7 @@ impl AnnouncementPolicy {
             Err(e) => return Err(format!("Database query failed: {}", e)),
         };
 
-        Ok(events.into_iter().max_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| right.id.cmp(&left.id))
-        }))
+        Ok(events.into_iter().max_by(compare_replacement_events))
     }
 
     /// Add an announcement to purgatory

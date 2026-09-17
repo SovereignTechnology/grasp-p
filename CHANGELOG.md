@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Honor same-second lower-ID replacements when de-listing served repositories,
+  capturing superseded history, and choosing rollback or post-deletion state.
+  History capture time no longer overrides the original events' ID tie-break.
+
 - Apply the lower-event-ID tie-break to same-second purgatory replacements.
   Git push authorization now selects the preferred matching state regardless
   of arrival order, and a winning announcement that removes this service

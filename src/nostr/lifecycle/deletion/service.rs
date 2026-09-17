@@ -3,7 +3,7 @@ use nostr_sdk::prelude::{
     nip62, Event, Filter, Kind, PublicKey, RelayUrl, SingleLetterTag, Timestamp, WritePolicyResult,
 };
 
-use crate::nostr::events::RepositoryAnnouncement;
+use crate::nostr::events::{compare_replacement_events, RepositoryAnnouncement};
 use crate::nostr::lifecycle::{RequestClassification, RequestLifecycleRecord};
 use crate::nostr::policy::{duplicate, reject_error, reject_invalid, AnnouncementResult};
 
@@ -527,7 +527,7 @@ impl DeletionService {
             );
 
         let current = match self.ctx.database().query(filter).await {
-            Ok(events) => events.into_iter().max_by_key(|event| event.created_at),
+            Ok(events) => events.into_iter().max_by(compare_replacement_events),
             Err(e) => {
                 tracing::warn!(
                     owner = %incoming.pubkey.to_hex(),
@@ -544,7 +544,7 @@ impl DeletionService {
         };
 
         // Not newer than what we already serve -> no runtime parity action.
-        if incoming.created_at <= current.created_at {
+        if !compare_replacement_events(incoming, &current).is_gt() {
             return;
         }
 
@@ -631,7 +631,7 @@ impl DeletionService {
         };
 
         for superseded in existing {
-            if superseded.id == incoming.id || superseded.created_at >= incoming.created_at {
+            if !compare_replacement_events(incoming, &superseded).is_gt() {
                 continue;
             }
 
@@ -892,6 +892,97 @@ mod tests {
             config,
             new_repo_init_locks(),
         )
+    }
+
+    fn replacement_candidates(kind: Kind) -> [(Event, &'static str); 2] {
+        let keys = Keys::generate();
+        let mut candidates = ["first.example", "second.example"].map(|domain| {
+            let event = EventBuilder::new(kind, domain)
+                .tags([
+                    Tag::identifier("replacement-order"),
+                    Tag::custom("clone", [format!("https://{domain}/repo.git")]),
+                    Tag::custom("relays", [format!("wss://{domain}")]),
+                ])
+                .custom_created_at(Timestamp::from_secs(100))
+                .finalize(&keys)
+                .unwrap();
+            (event, domain)
+        });
+        candidates.sort_by_key(|(event, _)| event.id);
+        candidates
+    }
+
+    #[tokio::test]
+    async fn replacement_order_controls_served_delisting() {
+        let [(winner, winner_domain), (loser, loser_domain)] =
+            replacement_candidates(Kind::GitRepoAnnouncement);
+        for (current, domain, incoming, deleted) in [
+            (&loser, loser_domain, &winner, true),
+            (&winner, winner_domain, &loser, false),
+            (&winner, winner_domain, &winner, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ctx = context(crate::config::Config::for_testing());
+            ctx.domain = domain.into();
+            ctx.config.domain = domain.into();
+            ctx.git_data_path = directory.path().to_path_buf();
+            ctx.purgatory = Arc::new(Purgatory::new(directory.path().to_path_buf()));
+            ctx.database.save_event(current).await.unwrap();
+            let service = DeletionService::new(ctx);
+            service.maybe_apply_runtime_delist_deletion(incoming).await;
+            assert_eq!(
+                service
+                    .ctx
+                    .database
+                    .event_by_id(&current.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                deleted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_order_controls_same_second_history_capture() {
+        for kind in [Kind::GitRepoAnnouncement, Kind::RepoState] {
+            let [(winner, _), (loser, _)] = replacement_candidates(kind);
+            for (current, incoming, captures) in [
+                (&loser, &winner, 1),
+                (&winner, &loser, 0),
+                (&winner, &winner, 0),
+            ] {
+                let service = DeletionService::new(context(crate::config::Config::for_testing()));
+                service.ctx.database.save_event(current).await.unwrap();
+                service
+                    .capture_superseded_replaceable_history(incoming)
+                    .await;
+                let coordinate = format!(
+                    "{}:{}:replacement-order",
+                    kind.as_u16(),
+                    current.pubkey.to_hex()
+                );
+                let records = service
+                    .history()
+                    .superseded_records_for_coordinate_before(&coordinate, incoming.created_at)
+                    .await;
+                assert_eq!(records.len(), captures);
+                if captures == 1 {
+                    assert_eq!(records[0].superseded_event_id, Some(current.id));
+                    assert_eq!(records[0].replaced_by, Some(incoming.id));
+                    assert_eq!(
+                        service
+                            .history()
+                            .event_by_id(&current.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .id,
+                        current.id
+                    );
+                }
+            }
+        }
     }
 
     fn deletion(keys: &Keys, target: EventId) -> Event {

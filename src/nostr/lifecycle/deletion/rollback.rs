@@ -8,7 +8,7 @@ use crate::git::authorization::{
     collect_state_maintainers_by_coordinate, fetch_repository_data_excluding_purgatory,
 };
 use crate::git::process;
-use crate::nostr::events::RepositoryState;
+use crate::nostr::events::{compare_replacement_events, RepositoryState};
 use crate::nostr::lifecycle::RecoveryScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,11 +169,7 @@ impl DeletionPolicy {
             return None;
         };
 
-        events.into_iter().max_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        })
+        events.into_iter().max_by(compare_replacement_events)
     }
 
     pub(super) async fn rollback_deleted_active_replaceable(&self, plan: &ReplaceableRollbackPlan) {
@@ -423,16 +419,7 @@ impl DeletionPolicy {
                 continue;
             }
 
-            let latest_state = repo_data
-                .states
-                .iter()
-                .filter(|state| maintainers.contains(&state.event.pubkey.to_hex()))
-                .max_by(|a, b| {
-                    a.event
-                        .created_at
-                        .cmp(&b.event.created_at)
-                        .then_with(|| a.event.id.cmp(&b.event.id))
-                });
+            let latest_state = latest_authorized_state(&repo_data.states, maintainers);
 
             match latest_state {
                 Some(state) => {
@@ -486,5 +473,60 @@ impl DeletionPolicy {
                 }
             }
         }
+    }
+}
+
+fn latest_authorized_state<'a>(
+    states: &'a [RepositoryState],
+    maintainers: &[String],
+) -> Option<&'a RepositoryState> {
+    states
+        .iter()
+        .filter(|state| maintainers.contains(&state.event.pubkey.to_hex()))
+        .max_by(|a, b| compare_replacement_events(&a.event, &b.event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+
+    #[test]
+    fn replacement_order_selects_authorized_state_for_realignment() {
+        let keys = [Keys::generate(), Keys::generate()];
+        let make_state = |keys: &Keys, time| {
+            RepositoryState::from_event(
+                EventBuilder::new(Kind::RepoState, "")
+                    .tags([
+                        Tag::identifier("repo"),
+                        Tag::custom(
+                            "refs/heads/main",
+                            ["1234567890abcdef1234567890abcdef12345678"],
+                        ),
+                    ])
+                    .custom_created_at(Timestamp::from_secs(time))
+                    .finalize(keys)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut candidates = [make_state(&keys[0], 100), make_state(&keys[1], 100)];
+        candidates.sort_by_key(|state| state.event.id);
+        let [winner, loser] = candidates;
+        let authorized = keys.map(|keys| keys.public_key().to_hex());
+        let outsider = make_state(&Keys::generate(), 200);
+        for states in [
+            vec![winner.clone(), loser.clone(), outsider.clone()],
+            vec![loser.clone(), winner.clone(), outsider.clone()],
+        ] {
+            assert_eq!(
+                latest_authorized_state(&states, &authorized)
+                    .unwrap()
+                    .event
+                    .id,
+                winner.event.id
+            );
+        }
+        assert!(latest_authorized_state(&[outsider], &authorized).is_none());
     }
 }

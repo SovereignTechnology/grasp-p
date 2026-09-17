@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::nostr::events::{RepositoryAnnouncement, RepositoryState};
+use crate::nostr::events::{compare_replacement_events, RepositoryAnnouncement, RepositoryState};
 use crate::nostr::SharedDatabase;
 use crate::purgatory::Purgatory;
 use nostr_sdk::prelude::{Kind, PublicKey};
@@ -688,11 +688,7 @@ pub async fn get_state_authorization_for_selected_repo(
             // NIP-01 prefers the lower event ID when timestamps tie.
             let latest_authorized = authorized_events
                 .iter()
-                .max_by(|left, right| {
-                    left.created_at
-                        .cmp(&right.created_at)
-                        .then_with(|| right.id.cmp(&left.id))
-                })
+                .max_by(|left, right| compare_replacement_events(left, right))
                 .unwrap(); // Safe because we checked the vec is not empty
 
             // Parse the event into RepositoryState

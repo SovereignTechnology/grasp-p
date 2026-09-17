@@ -184,8 +184,9 @@ impl ReplaceableHistoryStore {
     ///
     /// Ordering is deterministic:
     /// 1. `superseded_at` descending (missing treated as 0)
-    /// 2. `captured_at` descending (missing treated as 0)
-    /// 3. `metadata_event_id` descending
+    /// 2. Superseded event ID ascending (NIP-01); missing IDs last
+    /// 3. `captured_at` descending (missing treated as 0)
+    /// 4. `metadata_event_id` descending for duplicate capture records
     pub async fn latest_superseded_before(
         &self,
         coordinate: &str,
@@ -199,6 +200,12 @@ impl ReplaceableHistoryStore {
             b.superseded_at
                 .unwrap_or_else(|| Timestamp::from_secs(0))
                 .cmp(&a.superseded_at.unwrap_or_else(|| Timestamp::from_secs(0)))
+                .then_with(|| {
+                    a.superseded_event_id
+                        .is_none()
+                        .cmp(&b.superseded_event_id.is_none())
+                })
+                .then_with(|| a.superseded_event_id.cmp(&b.superseded_event_id))
                 .then_with(|| {
                     b.captured_at
                         .unwrap_or_else(|| Timestamp::from_secs(0))
@@ -260,6 +267,41 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(created_at))
             .finalize(keys)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replacement_order_precedes_capture_time_for_rollback_history() {
+        let store = ReplaceableHistoryStore::in_memory();
+        let keys = Keys::generate();
+        let mut candidates = [
+            announcement(&keys, "repo", 100, "a"),
+            announcement(&keys, "repo", 100, "b"),
+        ];
+        candidates.sort_by_key(|event| event.id);
+        let [winner, loser] = candidates;
+        let coordinate = format!("30617:{}:repo", keys.public_key().to_hex());
+        // Capture order is deliberately opposite to replacement preference.
+        for (event, captured) in [(&winner, "100"), (&loser, "200")] {
+            let metadata = EventBuilder::new(Kind::from(HISTORY_METADATA_KIND), "")
+                .tags([
+                    Tag::event(event.id),
+                    Tag::custom("a", [coordinate.clone()]),
+                    Tag::custom(HISTORY_SUPERSEDED_AT_TAG, ["100"]),
+                    Tag::custom(HISTORY_CAPTURED_AT_TAG, [captured]),
+                ])
+                .finalize(&store.metadata_signer)
+                .unwrap();
+            store.db.save_event(&metadata).await.unwrap();
+        }
+        let selected = store
+            .latest_superseded_before(&coordinate, Timestamp::from_secs(100))
+            .await
+            .unwrap();
+        assert_eq!(selected.superseded_event_id, Some(winner.id));
+        assert!(store
+            .latest_superseded_before(&coordinate, Timestamp::from_secs(99))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -722,14 +722,22 @@ behavior.
 
 The relay archives superseded 30617/30618 versions on write and uses that
 history at deletion time to pick rollback candidates for active `e`-target
-deletions (announcement + state).
+deletions (announcement + state). Same-second replacements use the NIP-01
+lower-event-ID tie-break for history capture, served-repository de-listing,
+active-version selection and post-deletion state alignment. Losing replacements
+and exact replays do not trigger history capture or de-list deletion.
+
+History candidates are ordered by their original event timestamp descending,
+then original event ID ascending. Capture time and metadata ID only break ties
+between records for the same original event; processing order cannot override
+replacement preference. Timestamp cutoffs and author checks still apply.
 
 This architecture is covered by two integration-test layers:
 
-- `tests/replaceable_history.rs` verifies the durable history substrate:
+- `tests/lifecycle/replaceable_history.rs` verifies the durable history substrate:
   superseded 30617/30618 payloads are captured, queryable by coordinate/cutoff,
   survive LMDB restart, and do not change normal serving semantics.
-- `tests/nip09_state_cascade.rs` verifies deletion behavior that consumes that
+- `tests/lifecycle/nip09_state_cascade.rs` verifies deletion behavior that consumes that
   substrate: active 30618 `e` deletion restores the previous state event and
   realigns refs, active 30617 `e` deletion restores the previous announcement
   when history exists, coordinate deletion cutoff semantics do not incorrectly

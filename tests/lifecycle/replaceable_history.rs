@@ -298,6 +298,23 @@ async fn same_second_30618_replacement_keeps_nip01_lowest_id() {
         "the lower-ID state must remain the NIP-01 winner after restart"
     );
 
+    let deletion = EventBuilder::new(Kind::EventDeletion, "delete same-second winner")
+        .tag(Tag::event(replacement.id))
+        .custom_created_at(timestamp_after(replacement.created_at))
+        .finalize(client.keys())
+        .expect("sign deletion with original author");
+    restarted_client
+        .send_event(deletion)
+        .await
+        .expect("delete active winner");
+    common::wait_for_event_served(restarted.url(), &existing.id, Duration::from_secs(10))
+        .await
+        .expect("restore same-second predecessor from durable history");
+    assert!(!restarted_client
+        .is_event_on_relay(replacement.id)
+        .await
+        .unwrap());
+
     restarted.stop().await;
 }
 
