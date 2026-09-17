@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore relay-owner profiles and relay lists using the lower event ID when
+  fetched versions share a timestamp.
+
 - Honor same-second lower-ID replacements when de-listing served repositories,
   capturing superseded history, and choosing rollback or post-deletion state.
   History capture time no longer overrides the original events' ID tie-break.

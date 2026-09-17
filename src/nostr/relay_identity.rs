@@ -605,11 +605,7 @@ fn newest_owner_event_of_kind(
     events
         .iter()
         .filter(|event| event.pubkey == owner && event.kind == kind && event.verify().is_ok())
-        .max_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        })
+        .max_by(|a, b| crate::nostr::events::compare_replacement_events(a, b))
         .cloned()
 }
 
@@ -665,6 +661,46 @@ fn is_loopback_authority(domain: &str) -> bool {
 mod tests {
     use super::*;
     use nostr::nips::nip65;
+
+    #[test]
+    fn owner_identity_selection_uses_nip01_ordering() {
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        for kind in [Kind::Metadata, Kind::RelayList] {
+            let build = |keys: &Keys, kind, timestamp, content: &str| {
+                EventBuilder::new(kind, content)
+                    .custom_created_at(Timestamp::from_secs(timestamp))
+                    .finalize(keys)
+                    .unwrap()
+            };
+            let mut pair = [
+                build(&owner, kind, 1000, "first"),
+                build(&owner, kind, 1000, "second"),
+            ];
+            pair.sort_by_key(|event| event.id);
+            let [winner, loser] = pair;
+            let mut invalid = build(&owner, kind, 2000, "invalid");
+            invalid.content.push_str("tampered");
+            let mut events = std::collections::BTreeSet::from([
+                winner.clone(),
+                loser,
+                build(&stranger, kind, 2000, "wrong author"),
+                build(&owner, Kind::TextNote, 2000, "wrong kind"),
+                invalid,
+                build(&owner, kind, 999, "older"),
+            ]);
+            assert_eq!(
+                newest_owner_event_of_kind(&events, owner.public_key(), kind),
+                Some(winner)
+            );
+            let newer = build(&owner, kind, 1001, "newer");
+            events.insert(newer.clone());
+            assert_eq!(
+                newest_owner_event_of_kind(&events, owner.public_key(), kind),
+                Some(newer)
+            );
+        }
+    }
 
     #[test]
     fn identity_is_minimal_and_lists_only_this_relay_for_read_and_write() {

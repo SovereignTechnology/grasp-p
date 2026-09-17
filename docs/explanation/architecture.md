@@ -91,6 +91,8 @@ runtime:
   or generated, is sent before at least one user-index relay has been
   checked for its kind, every send is preceded by a per-relay re-check, and
   an identity found on an index is adopted locally instead of overwritten.
+  Among verified owner events of a kind, the newest timestamp wins; equal
+  timestamps select the lowest event ID.
   Transient failures retry with a capped backoff, and in private mode the
   identity stays local so the relay's existence is never advertised
 - Atomically checkpoint purgatory and rejected-event recovery state every 60
