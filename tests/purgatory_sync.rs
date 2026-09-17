@@ -273,18 +273,13 @@ async fn test_state_event_syncs_from_remote() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay");
-    source_client.connect().await;
-
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&source_client).await;
 
     // Send announcement to source relay
     source_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 4. Create and send state event BEFORE pushing
     // The state event goes to purgatory on source relay, which authorizes the push
@@ -319,8 +314,6 @@ async fn test_state_event_syncs_from_remote() {
         .send_event(&state_event)
         .await
         .expect("Failed to send state event to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 5. Push git data to source relay
     // The state event in purgatory authorizes this push
@@ -439,18 +432,13 @@ async fn test_pr_event_syncs_from_remote() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay");
-    source_client.connect().await;
-
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&source_client).await;
 
     // Step 1: Send announcement to source relay → purgatory (StateOnly)
     source_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 2: Create and send state event → purgatory (no git data yet)
     let clone_urls = [
@@ -484,8 +472,6 @@ async fn test_pr_event_syncs_from_remote() {
         .await
         .expect("Failed to send state event to source");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Step 3: Push git data to source relay
     // This promotes the announcement from StateOnly to Full AND releases state event
     push_to_relay(temp_dir.path(), &source_relay.domain(), &npub, identifier)
@@ -518,15 +504,12 @@ async fn test_pr_event_syncs_from_remote() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay for PR");
-    pr_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&pr_client).await;
 
     pr_client
         .send_event(&pr_event)
         .await
         .expect("Failed to send PR event to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 5: Push PR commit to refs/nostr/<event-id> on source relay
     // This releases the PR event from purgatory
@@ -656,18 +639,13 @@ async fn test_concurrent_state_and_pr_sync() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay");
-    source_client.connect().await;
-
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&source_client).await;
 
     // Step 1: Send announcement to source relay → purgatory (StateOnly)
     source_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 2: Create and send state event → purgatory (no git data yet)
     let clone_urls = [
@@ -704,8 +682,6 @@ async fn test_concurrent_state_and_pr_sync() {
         .await
         .expect("Failed to send state event to source");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Step 3: Push git data to source relay
     // This promotes the announcement from StateOnly to Full AND releases state event
     push_to_relay(temp_dir.path(), &source_relay.domain(), &npub, identifier)
@@ -738,15 +714,12 @@ async fn test_concurrent_state_and_pr_sync() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay for PR");
-    pr_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&pr_client).await;
 
     pr_client
         .send_event(&pr_event)
         .await
         .expect("Failed to send PR event to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 5: Push PR commit to refs/nostr/<event-id> on source relay
     // This releases the PR event from purgatory
@@ -995,14 +968,12 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
         .add_relay(source_grasp.url())
         .await
         .expect("Failed to add source_grasp relay");
-    source_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&source_client).await;
 
     source_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to source_grasp");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Create state event referencing commit_a
     let state_event = create_state_event(
@@ -1026,7 +997,6 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
         .send_event(&state_event)
         .await
         .expect("Failed to send state event to source_grasp");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Push main branch (commit_a) to source_grasp - releases state event
     push_to_relay(repo_a.path(), &source_grasp.domain(), &npub, identifier)
@@ -1051,14 +1021,12 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
         .add_relay(mock_relay.url())
         .await
         .expect("Failed to add mock_relay for announcement");
-    mock_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&mock_client).await;
 
     mock_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to mock_relay");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let repo_coord = build_repo_coord(&owner_keys, identifier);
 
@@ -1084,8 +1052,7 @@ async fn test_pr_event_clone_tag_sync_with_partial_oid_aggregation_from_multiple
         .add_relay(mock_relay.url())
         .await
         .expect("Failed to add mock_relay");
-    pr_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&pr_client).await;
 
     pr_client
         .send_event(&pr_event)
