@@ -4,6 +4,8 @@
 //! human-readable or JSON format. It is designed to be fast and non-destructive
 //! when run in read-only mode.
 
+mod state;
+
 use crate::audit::AuditConfig;
 use crate::client::AuditClient;
 use crate::fixtures::{create_commit, init_local_repo, try_push};
@@ -1224,42 +1226,8 @@ pub async fn run_probe_with_options(
             }
             Some(body) => {
                 let fetched_refs = parse_refs(&body);
-                let mut mismatches: Vec<String> = Vec::new();
-
-                if let Some(ref state_ev) = state_event_opt {
-                    for tag in state_ev.tags.iter() {
-                        let kind_str = tag.kind().to_string();
-                        // Only check refs/heads/* and refs/tags/*, skip HEAD and refs/nostr/*
-                        if !kind_str.starts_with("refs/heads/")
-                            && !kind_str.starts_with("refs/tags/")
-                        {
-                            continue;
-                        }
-                        let expected_hash = match tag.content() {
-                            Some(h) => h.to_string(),
-                            None => continue,
-                        };
-                        let found = fetched_refs.iter().find(|(r, _)| r == &kind_str);
-                        match found {
-                            Some((_, actual_hash)) if actual_hash == &expected_hash => {}
-                            Some((_, actual_hash)) => {
-                                mismatches.push(format!(
-                                    "{}: expected {} got {}",
-                                    kind_str,
-                                    &expected_hash[..8.min(expected_hash.len())],
-                                    &actual_hash[..8.min(actual_hash.len())]
-                                ));
-                            }
-                            None => {
-                                mismatches.push(format!(
-                                    "{}: expected {} not found in refs",
-                                    kind_str,
-                                    &expected_hash[..8.min(expected_hash.len())]
-                                ));
-                            }
-                        }
-                    }
-                }
+                let expected = expected_state_refs(state_event_opt.iter());
+                let mismatches = state::ref_mismatches(&expected, &fetched_refs);
 
                 checks.push(ProbeCheck {
                     name: ProbeCheckName::GitRefsMatchState.as_str(),
@@ -1504,74 +1472,42 @@ pub async fn run_probe_with_options(
                     Some(body) => {
                         let fetched_refs = parse_refs(&body);
 
-                        // Fetch all state events for this repo_id from the relay.
-                        // The relay only serves state events authorized by a selected
-                        // coordinate's resolved reciprocal component.
-                        let state_filter = Filter::new().kind(Kind::RepoState).custom_tag(
-                            nostr_sdk::prelude::SingleLetterTag::LOWERCASE_D,
-                            ann_id.clone(),
-                        );
-                        let state_events = client
+                        // Resolve authority and state from the same repository-scoped fetch.
+                        let filter = Filter::new()
+                            .kinds([Kind::GitRepoAnnouncement, Kind::RepoState])
+                            .custom_tag(SingleLetterTag::LOWERCASE_D, ann_id.clone());
+                        let expected = match client
                             .client()
-                            .fetch_events(state_filter)
+                            .fetch_events(filter)
                             .timeout(
                                 deadline
                                     .saturating_duration_since(Instant::now())
                                     .min(Duration::from_secs(5)),
                             )
                             .await
-                            .unwrap_or_default();
-
-                        if state_events.is_empty() {
-                            checks.push(ProbeCheck {
-                                name: ProbeCheckName::GitRefsMatchState.as_str(),
-                                passed: false,
-                                skipped: false,
-                                duration_ms: 0,
-                                detail: None,
-                                error: Some(
-                                    "no kind:30618 state events found for this repo".to_string(),
-                                ),
-                            });
-                        } else {
-                            let expected = expected_state_refs(state_events.iter());
-
-                            let mut mismatches: Vec<String> = Vec::new();
-                            for (refname, expected_hash) in &expected {
-                                let found = fetched_refs.iter().find(|(r, _)| r == refname);
-                                match found {
-                                    Some((_, actual_hash)) if actual_hash == expected_hash => {}
-                                    Some((_, actual_hash)) => {
-                                        mismatches.push(format!(
-                                            "{}: expected {} got {}",
-                                            refname,
-                                            &expected_hash[..8.min(expected_hash.len())],
-                                            &actual_hash[..8.min(actual_hash.len())]
-                                        ));
-                                    }
-                                    None => {
-                                        mismatches.push(format!(
-                                            "{}: expected {} not found in refs",
-                                            refname,
-                                            &expected_hash[..8.min(expected_hash.len())]
-                                        ));
-                                    }
-                                }
+                        {
+                            Ok(events) => {
+                                state::scoped_state_refs(events.iter(), ev.pubkey, &ann_id)
                             }
-
-                            checks.push(ProbeCheck {
-                                name: ProbeCheckName::GitRefsMatchState.as_str(),
-                                passed: mismatches.is_empty(),
-                                skipped: false,
-                                duration_ms: 0,
-                                detail: None,
-                                error: if mismatches.is_empty() {
-                                    None
-                                } else {
-                                    Some(mismatches.join("; "))
-                                },
-                            });
-                        }
+                            Err(error) => Err(format!(
+                                "failed to fetch repository authority and state: {error}"
+                            )),
+                        };
+                        let error = match expected {
+                            Ok(expected) => {
+                                let mismatches = state::ref_mismatches(&expected, &fetched_refs);
+                                (!mismatches.is_empty()).then(|| mismatches.join("; "))
+                            }
+                            Err(error) => Some(error),
+                        };
+                        checks.push(ProbeCheck {
+                            name: ProbeCheckName::GitRefsMatchState.as_str(),
+                            passed: error.is_none(),
+                            skipped: false,
+                            duration_ms: 0,
+                            detail: None,
+                            error,
+                        });
                     }
                 }
             }
