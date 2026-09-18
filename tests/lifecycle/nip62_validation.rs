@@ -51,10 +51,12 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-use common::{announcement_served_by_coordinate, build_vanish, publish_served_repo, TestRelay};
+use common::{
+    announcement_served_by_coordinate, build_vanish, publish_served_repo, wait_until_not_served,
+    TestRelay,
+};
 
 use grasp_audit::{AuditClient, AuditConfig};
-use std::time::Duration;
 
 /// 1. A kind-62 vanish targeting this relay (`ALL_RELAYS`) is accepted and the
 ///    author's served events are removed.
@@ -77,7 +79,6 @@ async fn vanish_removes_authors_served_events() {
         .await
         .expect("relay should accept issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         client
             .is_event_on_relay(issue_id)
@@ -100,7 +101,8 @@ async fn vanish_removes_authors_served_events() {
         .await
         .expect("relay should accept a well-formed vanish request");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, issue_id).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let issue_served = client
         .is_event_on_relay(issue_id)
@@ -153,8 +155,6 @@ async fn events_from_vanished_pubkey_are_rejected() {
         .await
         .expect("relay should accept the vanish request");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // A brand-new event from the now-vanished pubkey must be rejected.
     let issue = client
         .create_issue(
@@ -167,8 +167,6 @@ async fn events_from_vanished_pubkey_are_rejected() {
     let issue_id = issue.id;
 
     let result = client.send_event(issue).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let served = client
         .is_event_on_relay(issue_id)
@@ -218,7 +216,6 @@ async fn vanish_does_not_affect_other_authors() {
         .await
         .expect("relay should accept A's issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         author_a
             .is_event_on_relay(issue_id)
@@ -233,8 +230,6 @@ async fn vanish_does_not_affect_other_authors() {
         .send_event(vanish)
         .await
         .expect("relay should accept B's vanish request");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // A's events must be untouched.
     let issue_served = author_a
@@ -251,7 +246,6 @@ async fn vanish_does_not_affect_other_authors() {
     let new_issue_id = new_issue.id;
     let new_result = author_a.send_event(new_issue).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let new_served = author_a
         .is_event_on_relay(new_issue_id)
         .await
@@ -300,7 +294,6 @@ async fn vanish_targeting_this_relay_url_is_actioned() {
         .await
         .expect("relay should accept issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         client
             .is_event_on_relay(issue_id)
@@ -315,7 +308,8 @@ async fn vanish_targeting_this_relay_url_is_actioned() {
         .await
         .expect("relay should accept a vanish request that targets it by URL");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, issue_id).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let issue_served = client
         .is_event_on_relay(issue_id)
@@ -358,7 +352,6 @@ async fn vanish_targeting_other_relay_is_not_actioned() {
         .await
         .expect("relay should accept issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         client
             .is_event_on_relay(issue_id)
@@ -374,8 +367,6 @@ async fn vanish_targeting_other_relay_is_not_actioned() {
         .await
         .expect("relay should accept a vanish request that does not target it");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let issue_served = client
         .is_event_on_relay(issue_id)
         .await
@@ -390,7 +381,6 @@ async fn vanish_targeting_other_relay_is_not_actioned() {
     let later_id = later.id;
     let later_result = client.send_event(later).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let later_served = client
         .is_event_on_relay(later_id)
         .await
