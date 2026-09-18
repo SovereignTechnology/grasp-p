@@ -8,7 +8,8 @@ use common::{
     announcement_coordinate, build_deletion, create_pr_event, create_state_event,
     create_test_repo_with_commit, publish_served_announcement_for_identifier, publish_served_repo,
     publish_served_repo_with_maintainers, publish_served_repo_with_state_event, push_to_relay,
-    CommitVariant, TestRelay,
+    wait_for, wait_until_not_served, wait_until_served, CommitVariant, TestRelay,
+    OBSERVABLE_EFFECT_TIMEOUT,
 };
 use grasp_audit::git_command;
 use grasp_audit::{AuditClient, AuditConfig};
@@ -127,7 +128,8 @@ async fn publish_served_repo_for_identifier(
         .expect("send served state event");
 
     push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id).expect("push served repo data");
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    wait_until_served(&client, announcement.id).await;
+    wait_until_served(&client, state_event.id).await;
 
     assert!(
         client
@@ -203,7 +205,8 @@ async fn publish_served_repo_for_identifier_with_maintainers(
 
     push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id)
         .expect("push served repo data with maintainers");
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    wait_until_served(&client, announcement.id).await;
+    wait_until_served(&client, state_event.id).await;
 
     assert!(
         client
@@ -346,7 +349,7 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
             .send_event(deletion.clone())
             .await
             .expect("delete old state by coordinate");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_until_not_served(&client, old_state_event.id).await;
     }
 
     let deletion = build_deletion(&client, &[], std::slice::from_ref(&announcement_coord));
@@ -354,7 +357,7 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
         .send_event(deletion.clone())
         .await
         .expect("delete announcement coordinate");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let store = open_holding(&relay).await;
     let archive_rel = store
@@ -378,7 +381,6 @@ async fn setup_parked_announcement_with_failed_ingest_recovery(
         .send_event(reannouncement.clone())
         .await
         .expect("send re-announcement expected to park in purgatory");
-    tokio::time::sleep(Duration::from_millis(700)).await;
 
     assert!(
         !client
@@ -454,7 +456,7 @@ async fn submit_new_state_and_push_for_promotion(
 
     push_to_relay(temp_dir.path(), &relay_domain, &npub, &fixture.repo_id)
         .unwrap_or_else(|e| panic!("push {state_label} state commit for promotion: {e}"));
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    wait_until_served(&fixture.client, state_event.id).await;
 
     state_event
 }
@@ -562,7 +564,8 @@ async fn purgatory_promotion_tombstoned_pr_events_do_not_restore_pr_refs() {
         ))
         .await
         .expect("submit PR tombstone deletion request before promotion");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&fixture.client, fixture.pr.id).await;
+    wait_until_not_served(&fixture.client, fixture.pr_update.id).await;
 
     std::fs::write(&fixture.archive_path, &fixture.archive_backup)
         .expect("restore archive bytes before PR tombstone promotion");
@@ -636,7 +639,6 @@ async fn repeated_purgatory_promotion_attempts_remain_idempotent() {
         .send_event(second_reannouncement.clone())
         .await
         .expect("send second re-announcement after promotion");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(fixture
         .client
@@ -976,7 +978,8 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
         .send_event(deletion.clone())
         .await
         .expect("send deletion");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, issue.id).await;
+    wait_until_not_served(&client, state_event.id).await;
 
     assert!(!client
         .is_event_on_relay(issue.id)
@@ -1000,7 +1003,8 @@ async fn reannouncement_restores_events_and_git_archive_happy_path() {
         .send_event(reannounce.clone())
         .await
         .expect("send re-announcement");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_until_served(&client, reannounce.id).await;
+    wait_until_served(&client, issue.id).await;
 
     assert!(client
         .is_event_on_relay(reannounce.id)
@@ -1042,7 +1046,6 @@ async fn replacement_announcement_delisting_this_relay_triggers_runtime_deletion
         .create_issue(&announcement, "runtime delist issue", "body", vec![])
         .expect("build issue");
     client.send_event(issue.clone()).await.expect("send issue");
-    tokio::time::sleep(Duration::from_millis(600)).await;
 
     assert!(client
         .is_event_on_relay(issue.id)
@@ -1072,7 +1075,8 @@ async fn replacement_announcement_delisting_this_relay_triggers_runtime_deletion
         rejection.is_err(),
         "replacement delist announcement should be rejected"
     );
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    wait_until_not_served(&client, announcement.id).await;
+    wait_until_not_served(&client, state_event.id).await;
 
     assert!(
         !client
@@ -1133,7 +1137,7 @@ async fn out_of_retention_reannouncement_behaves_as_fresh_new_repo() {
         .send_event(deletion.clone())
         .await
         .expect("send deletion");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let store = open_holding(&relay).await;
     store
@@ -1149,7 +1153,6 @@ async fn out_of_retention_reannouncement_behaves_as_fresh_new_repo() {
         .send_event(reannounce.clone())
         .await
         .expect("send re-announcement");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(
         !client
@@ -1190,7 +1193,7 @@ async fn partial_recovery_missing_archive_restores_events_only_deterministically
         .send_event(deletion.clone())
         .await
         .expect("send deletion");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let store = open_holding(&relay).await;
     let archive_rel = store
@@ -1208,7 +1211,9 @@ async fn partial_recovery_missing_archive_restores_events_only_deterministically
         .send_event(reannounce.clone())
         .await
         .expect("send re-announcement");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_until_served(&client, reannounce.id).await;
+    wait_until_served(&client, issue.id).await;
+    wait_until_served(&client, state_event.id).await;
 
     assert!(client
         .is_event_on_relay(reannounce.id)
@@ -1248,7 +1253,7 @@ async fn partial_recovery_missing_holding_payload_restores_git_only_deterministi
         .send_event(deletion.clone())
         .await
         .expect("send deletion");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let store = open_holding(&relay).await;
     store
@@ -1269,7 +1274,12 @@ async fn partial_recovery_missing_holding_payload_restores_git_only_deterministi
         .send_event(reannounce.clone())
         .await
         .expect("send re-announcement");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_for(
+        "git repository restored from archive",
+        OBSERVABLE_EFFECT_TIMEOUT,
+        || async { repo_path.is_dir() },
+    )
+    .await;
 
     assert!(
         repo_path.is_dir(),
@@ -1305,21 +1315,24 @@ async fn repeated_reannouncement_recovery_trigger_is_idempotent() {
         .send_event(deletion.clone())
         .await
         .expect("send deletion");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, announcement.id).await;
+    wait_until_not_served(&client, issue.id).await;
 
     let first = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
         .send_event(first.clone())
         .await
         .expect("first re-announcement");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_served(&client, first.id).await;
+    wait_until_served(&client, issue.id).await;
 
     let second = build_reannouncement(&client, &relay, &repo_id, first.created_at);
     client
         .send_event(second.clone())
         .await
         .expect("second re-announcement");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_served(&client, second.id).await;
+    wait_until_served(&client, issue.id).await;
 
     assert!(client
         .is_event_on_relay(issue.id)
@@ -1392,7 +1405,7 @@ async fn multi_maintainer_reannouncement_restores_deleted_owner_slice() {
         .send_event(deletion.clone())
         .await
         .expect("delete maintainer a announcement");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_until_not_served(&client_a, deleted_patch.id).await;
 
     assert!(!client_a
         .is_event_on_relay(deleted_patch.id)
@@ -1412,7 +1425,7 @@ async fn multi_maintainer_reannouncement_restores_deleted_owner_slice() {
         .send_event(reannounce_a)
         .await
         .expect("reannounce maintainer a");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_until_served(&client_a, deleted_patch.id).await;
 
     assert!(client_a
         .is_event_on_relay(deleted_patch.id)
@@ -1444,7 +1457,6 @@ async fn disrespector_mode_has_no_recovery_state_to_apply() {
         .send_event(deletion.clone())
         .await
         .expect("send deletion request in disrespector mode");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let reannounce = build_reannouncement(&client, &relay, &repo_id, deletion.created_at);
     client
