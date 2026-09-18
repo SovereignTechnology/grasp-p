@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-09-18
+
+This patch improves repository-state correctness, startup recovery, and relay
+responsiveness, and makes audit probes more accurate. It also includes released
+Nostr SDK fixes and more deterministic test fixtures.
+
 ### Fixed
 
 - Scope read-only audit state selection to the selected repository's confirmed
@@ -668,7 +674,8 @@ defensive limits explicit and operator-configurable.
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.2...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.3...HEAD
+[3.0.3]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.2...v3.0.3
 [3.0.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.1...v3.0.2
 [3.0.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.0...v3.0.1
 [3.0.0]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v2.1.2...v3.0.0
