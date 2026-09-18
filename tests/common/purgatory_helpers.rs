@@ -367,78 +367,55 @@ pub fn create_announcement_event(
         .map_err(|e| format!("Failed to sign announcement event: {}", e))
 }
 
-/// Wait for an event to be served by a relay (not in purgatory).
+/// Wait until `relay_url` serves `event_id`, polling at a fixed short
+/// interval with one connection, bounded by `timeout`.
 ///
-/// Polls the relay until the event is queryable, indicating it has
-/// been released from purgatory. Uses exponential backoff for polling.
-///
-/// # Arguments
-/// * `relay_url` - WebSocket URL of the relay
-/// * `event_id` - Event ID to wait for
-/// * `timeout` - Maximum time to wait
-///
-/// # Returns
-/// * `Ok(Event)` - The event was found
-/// * `Err(String)` - Timeout or error
+/// A healthy relay answers the first poll, so the wait costs one round
+/// trip. When the event is still being promoted, a fixed interval keeps
+/// the detection delay near the interval instead of letting an exponential
+/// backoff stretch it under load.
 pub async fn wait_for_event_served(
     relay_url: &str,
     event_id: &EventId,
     timeout: Duration,
 ) -> Result<Event, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll_interval = Duration::from_millis(100);
+    let fetch_timeout = Duration::from_secs(1);
+
     let temp_keys = Keys::generate();
     let client = Client::builder()
         .authenticator(SignerAuthenticator::new(temp_keys))
         .build();
-
     client
         .add_relay(relay_url)
         .await
         .map_err(|e| format!("Failed to add relay: {}", e))?;
-
-    client.connect().await;
-
-    // Wait for connection
-    let mut connected = false;
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let relays = client.relays().await;
-        if relays.values().any(|r| r.status().is_connected()) {
-            connected = true;
-            break;
-        }
-    }
-
-    if !connected {
+    let output = client.try_connect().timeout(timeout).await;
+    if output.success.is_empty() {
         client.disconnect().await;
-        return Err("Failed to connect to relay".to_string());
+        return Err(format!(
+            "Failed to connect to relay {}: {:?}",
+            relay_url, output.failed
+        ));
     }
 
-    // Poll for the event with exponential backoff
-    let start = std::time::Instant::now();
-    let mut poll_interval = Duration::from_millis(100);
-    let max_interval = Duration::from_secs(2);
-
-    while start.elapsed() < timeout {
-        let filter = Filter::new().id(*event_id);
-
-        match client
-            .fetch_events(filter)
-            .timeout(Duration::from_secs(2))
+    let filter = Filter::new().id(*event_id);
+    loop {
+        if let Ok(events) = client
+            .fetch_events(filter.clone())
+            .timeout(fetch_timeout)
             .await
         {
-            Ok(events) => {
-                if let Some(event) = events.into_iter().next() {
-                    client.disconnect().await;
-                    return Ok(event);
-                }
-            }
-            Err(_) => {
-                // Ignore fetch errors, will retry
+            if let Some(event) = events.into_iter().next() {
+                client.disconnect().await;
+                return Ok(event);
             }
         }
-
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(poll_interval).await;
-        poll_interval = std::cmp::min(poll_interval * 2, max_interval);
     }
 
     client.disconnect().await;

@@ -103,28 +103,16 @@ async fn start_relay_with_grasp_services(services: &str) -> (Child, String, Path
     (process, url, git_data_path)
 }
 
-/// Wait for the relay to be ready to accept connections
+/// Wait for the relay to be ready to accept connections.
+///
+/// A successful TCP connect only proves the socket is bound: the accept loop
+/// and HTTP service may still be coming up. Poll the relay's HTTP handler
+/// instead, bounded by a deadline, so the immediately-following WebSocket
+/// client is racing a relay that has already served a request.
 async fn wait_for_relay_ready(port: u16) {
-    let max_attempts = 50; // 5 seconds total
-    let delay = Duration::from_millis(100);
-
-    for attempt in 0..max_attempts {
-        // Try to connect to the relay
-        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-            Ok(_) => {
-                // Connection successful, relay is ready
-                // Give it a tiny bit more time to fully initialize
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return;
-            }
-            Err(_) => {
-                if attempt == max_attempts - 1 {
-                    panic!("Relay failed to start after {} attempts", max_attempts);
-                }
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
+    common::relay::wait_for_http_ready(port, Duration::from_secs(10))
+        .await
+        .expect("Relay should become ready");
 }
 
 /// Test that announcements with matching GRASP service domains are accepted.
@@ -161,18 +149,16 @@ async fn test_archive_accepts_matching_grasp_service() {
         .authenticator(SignerAuthenticator::new(keys.clone()))
         .build();
     client.add_relay(&url).await.expect("Failed to add relay");
-    client.connect().await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&client).await;
 
     client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify repository was created (announcement was accepted)
+    // The relay runs the archive write policy and creates the bare repository
+    // inside event admission, before it replies. The completed send is
+    // therefore the barrier: the directory already exists, or never will.
     let repo_path = git_data_path.join(format!("{}/{}.git", npub, identifier));
 
     assert!(
@@ -220,18 +206,16 @@ async fn test_archive_rejects_non_matching_grasp_service() {
         .authenticator(SignerAuthenticator::new(keys.clone()))
         .build();
     client.add_relay(&url).await.expect("Failed to add relay");
-    client.connect().await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&client).await;
 
     client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify repository was NOT created (announcement was rejected)
+    // Admission completes before the relay replies, and a rejected
+    // announcement never reaches repository creation, so the absence check
+    // needs no grace period after the send.
     let repo_path = git_data_path.join(format!("{}/{}.git", npub, identifier));
 
     assert!(
@@ -281,14 +265,12 @@ async fn test_archive_multiple_grasp_services() {
         .authenticator(SignerAuthenticator::new(keys1.clone()))
         .build();
     client1.add_relay(&url).await.expect("Failed to add relay");
-    client1.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&client1).await;
 
     client1
         .send_event(&announcement1)
         .await
         .expect("Failed to send announcement");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Test second service (gitlab.example.org)
     let keys2 = Keys::generate();
@@ -316,14 +298,12 @@ async fn test_archive_multiple_grasp_services() {
         .authenticator(SignerAuthenticator::new(keys2.clone()))
         .build();
     client2.add_relay(&url).await.expect("Failed to add relay");
-    client2.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&client2).await;
 
     client2
         .send_event(&announcement2)
         .await
         .expect("Failed to send announcement");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Test non-listed service (github.com)
     let keys3 = Keys::generate();
@@ -348,16 +328,16 @@ async fn test_archive_multiple_grasp_services() {
         .authenticator(SignerAuthenticator::new(keys3.clone()))
         .build();
     client3.add_relay(&url).await.expect("Failed to add relay");
-    client3.connect().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&client3).await;
 
     client3
         .send_event(&announcement3)
         .await
         .expect("Failed to send announcement");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Verify first service announcement was accepted
+    // Each send above completed only after the relay replied, and the bare
+    // repository is created inside admission, so all three outcomes are
+    // already settled.
     let repo_path1 = git_data_path.join(format!("{}/{}.git", npub1, identifier1));
     assert!(
         repo_path1.exists(),
@@ -431,18 +411,13 @@ async fn test_archive_read_only_creates_bare_repo() {
         .add_relay(source_relay.url())
         .await
         .expect("Failed to add source relay");
-    source_client.connect().await;
-
-    // Wait for connection
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::relay::connect_client(&source_client).await;
 
     // Send announcement to source relay
     source_client
         .send_event(&announcement)
         .await
         .expect("Failed to send announcement to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 4. Create and send state event
     let clone_urls = [
@@ -476,8 +451,6 @@ async fn test_archive_read_only_creates_bare_repo() {
         .send_event(&state_event)
         .await
         .expect("Failed to send state event to source");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 5. Push git data to source relay
     // The state event in purgatory authorizes this push

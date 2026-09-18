@@ -159,10 +159,7 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .add_relay(source.url())
         .await
         .expect("add source relay");
-    source_client
-        .connect()
-        .and_wait(Duration::from_secs(30))
-        .await;
+    crate::common::relay::connect_client(&source_client).await;
     source_client
         .send_event(&source_announcement)
         .await
@@ -239,10 +236,7 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .add_relay(mock.url())
         .await
         .expect("add mock relay");
-    mock_client
-        .connect()
-        .and_wait(Duration::from_secs(30))
-        .await;
+    crate::common::relay::connect_client(&mock_client).await;
     mock_client
         .send_event(&syncing_announcement)
         .await

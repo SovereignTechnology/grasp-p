@@ -12,7 +12,7 @@
 //! `start_on_reservation_*` constructors — the listener stays bound for
 //! the duration of the reservation, eliminating the same-process race.
 
-use nostr_sdk::prelude::{Keys, ToBech32};
+use nostr_sdk::prelude::{Client, Keys, ToBech32};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1078,48 +1078,8 @@ impl TestRelay {
     }
 
     async fn probe_http_ready(&self) -> std::io::Result<()> {
-        let probe = async {
-            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port)).await?;
-            // Use the relay's HTTP handler rather than a bare TCP connect:
-            // this verifies the accept loop and Hyper service are both live,
-            // which is what the immediately-following WebSocket tests need.
-            let base_path = self.options.base_path.as_deref().unwrap_or("/");
-            let request = format!(
-                "GET {base_path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-                self.port
-            );
-            stream.write_all(request.as_bytes()).await?;
-
-            let mut response = Vec::new();
-            let mut reader = tokio::io::BufReader::new(stream);
-            let read =
-                tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut response).await?;
-            if read == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "readiness probe got empty HTTP response",
-                ));
-            }
-
-            let status = String::from_utf8_lossy(&response[..read]);
-            if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200") {
-                Ok(())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("readiness probe got non-200 response: {status:?}"),
-                ))
-            }
-        };
-
-        tokio::time::timeout(READY_PROBE_TIMEOUT, probe)
-            .await
-            .unwrap_or_else(|_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "HTTP readiness probe timed out",
-                ))
-            })
+        let base_path = self.options.base_path.as_deref().unwrap_or("/");
+        probe_http_ready(self.port, base_path).await
     }
 
     /// Stop the relay
@@ -1136,6 +1096,91 @@ impl Drop for TestRelay {
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
+}
+
+/// Probe a relay's HTTP handler once, returning `Ok(())` only on a 200
+/// response. A raw TCP connect can succeed before Hyper has installed the
+/// service that accepts test clients, so only a handled request proves the
+/// accept loop and relay wiring are live.
+pub async fn probe_http_ready(port: u16, base_path: &str) -> std::io::Result<()> {
+    let probe = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let request = format!(
+            "GET {base_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let read =
+            tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut response).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "readiness probe got empty HTTP response",
+            ));
+        }
+
+        let status = String::from_utf8_lossy(&response[..read]);
+        if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200") {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("readiness probe got non-200 response: {status:?}"),
+            ))
+        }
+    };
+
+    tokio::time::timeout(READY_PROBE_TIMEOUT, probe)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP readiness probe timed out",
+            ))
+        })
+}
+
+/// Poll [`probe_http_ready`] until the relay answers, bounded by `timeout`.
+///
+/// Used by test-local relay fixtures that spawn the binary themselves and so
+/// cannot reuse [`TestRelay`]'s own readiness wait.
+pub async fn wait_for_http_ready(port: u16, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe_http_ready(port, "/").await {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "relay at 127.0.0.1:{port} did not answer HTTP within {timeout:?}: {e}"
+                ))
+            }
+            Err(_) => sleep(READY_POLL).await,
+        }
+    }
+}
+
+/// Connect `client` to its configured relays and return only once every
+/// relay reports a completed connection attempt, failing the test if any
+/// attempt fails.
+///
+/// `Client::connect().and_wait(..)` observes connection state through status
+/// notifications after a separate status check; a loopback relay can connect
+/// in that gap under scheduler pressure, and the missed notification then
+/// stalls the caller for the whole timeout. `try_connect` awaits the attempt
+/// itself, so healthy runs continue immediately and failures are explicit.
+pub async fn connect_client(client: &Client) {
+    let output = client.try_connect().timeout(Duration::from_secs(30)).await;
+    assert!(
+        output.failed.is_empty(),
+        "relay connection attempts failed: {:?}",
+        output.failed
+    );
+    assert!(
+        !output.success.is_empty(),
+        "no relay connection was attempted; add relays before connecting"
+    );
 }
 
 /// Internal outcome of a single [`TestRelay::try_start_once`] attempt.

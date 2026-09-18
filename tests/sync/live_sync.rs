@@ -486,7 +486,7 @@ async fn test_live_sync_layer3_events() {
             .authenticator(SignerAuthenticator::new(temp_keys))
             .build();
         if client.add_relay(relay_b.url()).await.is_ok() {
-            client.connect().and_wait(Duration::from_secs(30)).await;
+            crate::common::relay::connect_client(&client).await;
 
             let fetch_filter = Filter::new().kind(Kind::Comment).id(comment_id);
 
@@ -642,7 +642,7 @@ async fn test_live_sync_event_ordering() {
 
     let events_found: Vec<Event>;
     if client.add_relay(relay_b.url()).await.is_ok() {
-        client.connect().and_wait(Duration::from_secs(30)).await;
+        crate::common::relay::connect_client(&client).await;
 
         let filter = Filter::new().kind(Kind::GitIssue).author(keys.public_key());
 

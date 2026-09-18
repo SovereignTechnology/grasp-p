@@ -454,7 +454,7 @@ async fn test_pagination_for_large_historic_sync() {
         .add_relay(syncing.url())
         .await
         .expect("Failed to add syncing relay to client");
-    client.connect().and_wait(Duration::from_secs(30)).await;
+    crate::common::relay::connect_client(&client).await;
 
     // Poll until every issue has paginated across, up to a bounded deadline.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
