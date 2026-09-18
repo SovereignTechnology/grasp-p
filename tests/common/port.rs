@@ -16,8 +16,8 @@ use std::net::TcpListener;
 /// process can be handed the same number.
 ///
 /// Transfer it with [`PortReservation::into_std_listener`] to start a service
-/// without releasing its address. Dropping it or calling `release` relinquishes
-/// the address and must not be used before starting a replacement service.
+/// without releasing its address. Dropping it relinquishes the address, so a
+/// reservation must be transferred, not dropped, to start a service on it.
 #[derive(Debug)]
 pub struct PortReservation {
     port: u16,
@@ -58,14 +58,6 @@ impl PortReservation {
                 .port(),
             _listener: listener,
         }
-    }
-
-    /// Relinquish the address. A later bind to this port is inherently racy.
-    pub fn release(self) -> u16 {
-        let port = self.port;
-        // `self` is consumed; the listener inside is dropped here.
-        drop(self);
-        port
     }
 }
 
