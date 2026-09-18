@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce outbound relay rate-limit cooldowns after queued requests finish
+  waiting for pacing or subscription capacity. Process rate-limit signals even
+  when sync event delivery is blocked, and log one warning per cooldown episode.
+
 ## [3.0.3] - 2026-09-18
 
 This patch improves repository-state correctness, startup recovery, and relay

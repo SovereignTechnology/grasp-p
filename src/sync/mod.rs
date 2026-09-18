@@ -4801,14 +4801,14 @@ impl SyncManager {
                     }
                     RelayEvent::Notice(notice) => {
                         if is_rate_limit_message(&notice) {
-                            tracing::warn!(
+                            // The connection control lane records the cooldown;
+                            // replaying it here could restart an expired episode
+                            // after a delayed event queue drains.
+                            tracing::debug!(
                                 relay = %relay_url_clone,
                                 notice = %notice,
                                 "Rate limiting NOTICE detected from relay"
                             );
-
-                            // Mark relay as rate limited
-                            health_tracker.record_rate_limit(&relay_url_clone);
 
                             // Update metrics with new health state
                             if let Some(ref metrics) = metrics_clone {
@@ -4843,21 +4843,11 @@ impl SyncManager {
                             && !is_filter_count_refusal(&reason)
                             && subscription_state_byte_limit(&reason).is_none()
                         {
-                            let already_paused = health_tracker.is_rate_limited(&relay_url_clone);
-                            if already_paused {
-                                tracing::debug!(
-                                    relay = %relay_url_clone,
-                                    reason = %reason,
-                                    "Repeated rate-limiting CLOSED during active cooldown"
-                                );
-                            } else {
-                                tracing::info!(
-                                    relay = %relay_url_clone,
-                                    reason = %reason,
-                                    "Rate limiting CLOSED detected from relay"
-                                );
-                            }
-                            health_tracker.record_rate_limit(&relay_url_clone);
+                            tracing::debug!(
+                                relay = %relay_url_clone,
+                                reason = %reason,
+                                "Rate limiting CLOSED detected from relay"
+                            );
                             if let Some(ref metrics) = metrics_clone {
                                 metrics.record_health_state(
                                     &relay_url_clone,
@@ -5490,7 +5480,8 @@ impl SyncManager {
                 keys,
                 source,
                 policy,
-            );
+            )
+            .with_health_tracker(Arc::clone(&self.health_tracker));
             self.connections.insert(relay_url.clone(), connection);
             if nip65_discovery_only {
                 self.nip65_discovery_only_relays.insert(relay_url.clone());
