@@ -6,11 +6,13 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+use common::relay::connect_client;
 use common::{
     announcement_coordinate, announcement_served_by_coordinate, build_deletion,
     create_test_repo_with_commit, publish_served_announcement_with_state_for_identifier,
     publish_served_repo, publish_served_repo_with_state_event,
-    publish_served_repo_with_state_event_and_maintainers, push_to_relay, CommitVariant, TestRelay,
+    publish_served_repo_with_state_event_and_maintainers, push_to_relay, wait_until_not_served,
+    wait_until_served, CommitVariant, TestRelay,
 };
 
 use grasp_audit::git_command;
@@ -130,8 +132,7 @@ async fn raw_announcement_served_by_coordinate(
         .authenticator(SignerAuthenticator::new(Keys::generate()))
         .build();
     raw_client.add_relay(relay_url).await.expect("add relay");
-    raw_client.connect().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    connect_client(&raw_client).await;
 
     let filter = Filter::new()
         .kind(Kind::GitRepoAnnouncement)
@@ -196,7 +197,8 @@ async fn test_state_event_deleted_with_announcement() {
         .await
         .expect("relay should accept announcement deletion");
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    wait_until_not_served(&client, announcement.id).await;
+    wait_until_not_served(&client, state_event.id).await;
 
     let announcement_survived = client
         .is_event_on_relay(announcement.id)
@@ -263,7 +265,8 @@ async fn test_state_events_are_independent_per_repository() {
         .await
         .expect("relay should accept announcement deletion");
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    wait_until_not_served(&client, announcement_a.id).await;
+    wait_until_not_served(&client, state_a.id).await;
 
     let announcement_a_survived = client
         .is_event_on_relay(announcement_a.id)
@@ -326,7 +329,6 @@ async fn test_e_delete_active_state_rolls_back_and_realigns_refs() {
 
     client.send_event(v1.clone()).await.expect("send v1 state");
     client.send_event(v2.clone()).await.expect("send v2 state");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let owner_repo = repo_path(&relay, &client, &repo_id);
     let refs_before = list_repo_refs(&owner_repo);
@@ -339,7 +341,8 @@ async fn test_e_delete_active_state_rolls_back_and_realigns_refs() {
         .send_event(build_deletion(&client, &[v2.id], &[]))
         .await
         .expect("send e-tag deletion for active state");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_served(&client, v1.id).await;
+    wait_until_not_served(&client, v2.id).await;
 
     assert!(
         client
@@ -385,7 +388,6 @@ async fn test_e_delete_active_announcement_rolls_back_previous_version() {
         .send_event(v2.clone())
         .await
         .expect("send replacement announcement");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(
         client
@@ -399,7 +401,8 @@ async fn test_e_delete_active_announcement_rolls_back_previous_version() {
         .send_event(build_deletion(&client, &[v2.id], &[]))
         .await
         .expect("send e-tag deletion for active announcement");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_served(&client, v1.id).await;
+    wait_until_not_served(&client, v2.id).await;
 
     assert!(
         client
@@ -443,7 +446,6 @@ async fn test_a_delete_coordinate_old_cutoff_keeps_newer_active_state() {
 
     client.send_event(v1.clone()).await.expect("send v1 state");
     client.send_event(v2.clone()).await.expect("send v2 state");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let owner_repo = repo_path(&relay, &client, &repo_id);
     let refs_before = list_repo_refs(&owner_repo);
@@ -460,7 +462,7 @@ async fn test_a_delete_coordinate_old_cutoff_keeps_newer_active_state() {
         .send_event(deletion)
         .await
         .expect("send a-tag deletion with cutoff");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, v1.id).await;
 
     assert!(
         !client
@@ -506,7 +508,6 @@ async fn test_a_delete_coordinate_cutoff_deletes_active_without_history_resurrec
 
     client.send_event(v1.clone()).await.expect("send v1 state");
     client.send_event(v2.clone()).await.expect("send v2 state");
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let owner_repo = repo_path(&relay, &client, &repo_id);
     let coordinate = format!("30618:{}:{}", client.public_key().to_hex(), repo_id);
@@ -520,7 +521,8 @@ async fn test_a_delete_coordinate_cutoff_deletes_active_without_history_resurrec
         .send_event(deletion)
         .await
         .expect("send a-tag deletion with active cutoff");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, v1.id).await;
+    wait_until_not_served(&client, v2.id).await;
 
     assert!(
         !client
@@ -592,7 +594,9 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
         .send_event(build_deletion(&client, &[original_state.id], &[]))
         .await
         .expect("send deletion for only active state");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_not_served(&client, original_state.id).await;
+    wait_until_not_served(&client, announcement.id).await;
+    wait_until_not_served(&client, dependent_issue.id).await;
 
     assert!(
         !client
@@ -697,7 +701,7 @@ async fn test_delete_only_active_state_with_no_history_moves_scope_to_purgatory_
     let npub = client.public_key().to_bech32().expect("npub");
     push_to_relay(temp_dir.path(), &relay.domain(), &npub, &repo_id)
         .expect("push recovery git data");
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    wait_until_served(&client, announcement.id).await;
 
     assert!(
         client
@@ -777,13 +781,13 @@ async fn test_multi_maintainer_state_deletion_rolls_back_without_affecting_other
         .send_event(a_v2.clone())
         .await
         .expect("send maintainer A v2");
-    tokio::time::sleep(Duration::from_millis(700)).await;
 
     client_a
         .send_event(build_deletion(&client_a, &[a_v2.id], &[]))
         .await
         .expect("delete maintainer A active state");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until_served(&client_a, a_v1.id).await;
+    wait_until_not_served(&client_a, a_v2.id).await;
 
     assert!(
         client_a
