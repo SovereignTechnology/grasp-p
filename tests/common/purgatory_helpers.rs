@@ -16,6 +16,8 @@ use nostr_sdk::prelude::*;
 use std::path::Path;
 use std::time::Duration;
 
+use super::relay::connect_client;
+
 // NOTE: Using rust-nostr Kind variants:
 // - Kind::RepoState.as_u16() -> Kind::RepoState (30618)
 // - Kind::GitPullRequest.as_u16() -> Kind::GitPullRequest (1618)
@@ -452,24 +454,7 @@ pub async fn verify_event_not_served(
         .add_relay(relay_url)
         .await
         .map_err(|e| format!("Failed to add relay: {}", e))?;
-
-    client.connect().await;
-
-    // Wait for connection
-    let mut connected = false;
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let relays = client.relays().await;
-        if relays.values().any(|r| r.status().is_connected()) {
-            connected = true;
-            break;
-        }
-    }
-
-    if !connected {
-        client.disconnect().await;
-        return Err("Failed to connect to relay".to_string());
-    }
+    connect_client(&client).await;
 
     // Check that event is NOT served
     let filter = Filter::new().id(*event_id);
