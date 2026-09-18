@@ -16,7 +16,7 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 
 use super::port::{self, PortReservation, UnavailableEndpoint};
-use super::relay::TestRelay;
+use super::relay::{connect_client, TestRelay};
 
 const DESCENDANT_LIVE_LOG: &str = "Installed priority-bounded auxiliary live coverage";
 
@@ -134,28 +134,27 @@ impl TestClient {
         Ok(test_client)
     }
 
-    /// Connect to the relay with retry logic.
+    /// Connect to the relay and return once the connection attempt completes.
     ///
-    /// Attempts connection up to 30 times with 100ms delays (3 seconds total).
+    /// `try_connect` awaits the attempt itself instead of polling status
+    /// notifications, so a healthy loopback relay connects without a fixed
+    /// delay and a failure surfaces immediately with the SDK's reason.
     pub async fn connect(&self) -> Result<(), String> {
-        self.client.connect().await;
-
-        // Wait for connection with retries (matching existing pattern)
-        for attempt in 0..30 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let relays = self.client.relays().await;
-            if relays.values().any(|r| r.status().is_connected()) {
-                return Ok(());
-            }
-            if attempt == 29 {
-                return Err(format!(
-                    "Failed to connect to relay {} after 3 seconds",
-                    self.relay_url
-                ));
-            }
+        let output = self
+            .client
+            .try_connect()
+            .timeout(Duration::from_secs(3))
+            .await;
+        if let Some((relay, error)) = output.failed.iter().next() {
+            return Err(format!("Failed to connect to relay {relay}: {error}"));
         }
-
-        Err("Connection loop exited unexpectedly".to_string())
+        if output.success.is_empty() {
+            return Err(format!(
+                "No connection attempt was made to relay {}",
+                self.relay_url
+            ));
+        }
+        Ok(())
     }
 
     /// Send an event with bounded retry for transient transport failures.
@@ -532,57 +531,37 @@ fn check_sync_connections_in_metrics(metrics: &str, expected: usize) -> bool {
 pub async fn wait_for_event_on_relay(relay_url: &str, filter: Filter, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     let poll_interval = Duration::from_millis(200);
+    // A healthy relay answers the first poll, so the fetch window only bounds
+    // a slow EOSE; the outer deadline bounds the whole wait.
+    let fetch_timeout = Duration::from_millis(500);
 
-    loop {
-        // Create a fresh client for each poll attempt (avoids stale connection state)
-        let temp_keys = Keys::generate();
-        let client = Client::builder()
-            .authenticator(SignerAuthenticator::new(temp_keys))
-            .build();
+    let temp_keys = Keys::generate();
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(temp_keys))
+        .build();
+    client
+        .add_relay(relay_url)
+        .await
+        .expect("add relay for event wait");
+    connect_client(&client).await;
 
-        if client.add_relay(relay_url).await.is_err() {
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(poll_interval).await;
-            continue;
-        }
-
-        client.connect().await;
-
-        // Wait for connection
-        let mut connected = false;
-        for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let relays = client.relays().await;
-            if relays.values().any(|r| r.status().is_connected()) {
-                connected = true;
-                break;
+    let found = loop {
+        if let Ok(events) = client
+            .fetch_events(filter.clone())
+            .timeout(fetch_timeout)
+            .await
+        {
+            if !events.is_empty() {
+                break true;
             }
         }
-
-        if connected {
-            // Use a short fetch window — if the event is there, EOSE comes back quickly
-            let fetch_timeout = Duration::from_millis(500);
-            let result = client
-                .fetch_events(filter.clone())
-                .timeout(fetch_timeout)
-                .await;
-            client.disconnect().await;
-
-            match result {
-                Ok(events) if !events.is_empty() => return true,
-                _ => {}
-            }
-        } else {
-            client.disconnect().await;
-        }
-
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            break false;
         }
         tokio::time::sleep(poll_interval).await;
-    }
+    };
+    client.disconnect().await;
+    found
 }
 
 /// Build repo coordinate string for use in 'a' tags.
