@@ -83,17 +83,20 @@ async fn test_metrics_availability_during_sync() {
 
     wait_for_metrics_ready(sync_relay.url(), Duration::from_secs(30)).await;
 
-    // Make multiple metrics requests while sync is active. The 200ms gap is
-    // deliberate scrape spacing, not a wait for a condition.
-    for i in 0..3 {
-        let metrics = fetch_metrics(sync_relay.url()).await;
-        assert!(
-            metrics.is_ok(),
-            "Metrics request {} should succeed during sync",
-            i + 1
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // Scrape while the sync connection to the source is still being
+    // established, then again once the connection gauge reports it, so the
+    // samples bracket sync activity instead of being spaced by a timer.
+    assert!(
+        fetch_metrics(sync_relay.url()).await.is_ok(),
+        "metrics request should succeed while sync is connecting"
+    );
+    wait_for_sync_connection(sync_relay.url(), 1, Duration::from_secs(30))
+        .await
+        .expect("sync connection to the source relay should be reported");
+    assert!(
+        fetch_metrics(sync_relay.url()).await.is_ok(),
+        "metrics request should succeed while sync is connected"
+    );
 
     sync_relay.stop().await;
     source_relay.stop().await;
