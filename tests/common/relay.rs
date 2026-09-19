@@ -1095,6 +1095,37 @@ impl Drop for TestRelay {
         // Ensure process is killed when TestRelay is dropped
         let _ = self.process.kill();
         let _ = self.process.wait();
+        if std::thread::panicking() {
+            // Sandboxed builders discard /tmp after failure. Preserve a bounded
+            // tail from every participating relay in libtest's failure output.
+            // Diagnostic I/O must never cause a second panic during unwinding.
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let path = self.log_path();
+            let tail = (|| -> std::io::Result<Vec<u8>> {
+                let mut file = std::fs::File::open(&path)?;
+                let start = file.metadata()?.len().saturating_sub(64 * 1024);
+                file.seek(SeekFrom::Start(start))?;
+                let mut bytes = Vec::new();
+                file.take(64 * 1024).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })();
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "Relay {} failure log ({})",
+                self.port,
+                path.display()
+            );
+            match tail {
+                Ok(bytes) => {
+                    let _ = stderr.write_all(&bytes);
+                    let _ = writeln!(stderr);
+                }
+                Err(error) => {
+                    let _ = writeln!(stderr, "Could not read relay log: {error}");
+                }
+            }
+        }
     }
 }
 
