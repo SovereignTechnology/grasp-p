@@ -9272,6 +9272,172 @@ impl SyncManager {
 mod tests {
     use super::*;
 
+    /// Seed both repositories before driving maintenance: sequential network
+    /// publication can straddle ticks and leave their retry deadlines offset.
+    #[tokio::test]
+    async fn unresolved_repositories_share_one_dependency_poll_per_relay() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve query observer listener");
+        let address = listener.local_addr().unwrap();
+        let relay_url = format!("ws://{address}");
+        let (query_tx, query_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut query_tx = Some(query_tx);
+            while let Some(frame) = socket.next().await {
+                let frame = frame.unwrap();
+                if !frame.is_text() {
+                    continue;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if request[0] == "REQ" {
+                    // Observe the complete dependency exchange through its CLOSE.
+                    query_tx
+                        .take()
+                        .expect("one batched dependency query")
+                        .send(request.clone())
+                        .unwrap();
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                } else if request[0] == "CLOSE" {
+                    break;
+                }
+            }
+        });
+        // Abort the owned fixture on assertion failure as well as normal exit.
+        struct AbortServer(tokio::task::AbortHandle);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server_guard = AbortServer(server.abort_handle());
+        let directory = tempfile::tempdir().expect("create manager directory");
+        let git_path = directory.path().join("git");
+        let mut config = Config::for_testing();
+        config.git_data_path = git_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        // Cold-index behavior is the subject; no wall-clock TTL wait is needed.
+        config.rejected_hot_cache_duration_secs = 0;
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory.clone(),
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .expect("create manager relay runtime");
+        // Treat the observer as our own service to suppress unrelated live
+        // subscriptions. Exact-ID recovery still uses its connected socket.
+        let mut manager = SyncManager::new(
+            None,
+            address.to_string(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path.clone(),
+            None,
+            None,
+            None,
+        );
+        let connection = RelayConnection::new(
+            relay_url.clone(),
+            None,
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection.connect(5).await.expect("connect query observer");
+        manager.connections.insert(relay_url.clone(), connection);
+        manager.relay_sync_index.write().await.insert(
+            relay_url.clone(),
+            RelayState {
+                connection_status: ConnectionStatus::Connected,
+                ..RelayState::default()
+            },
+        );
+        let invitee = Keys::generate();
+        let mut expected_ids = HashSet::new();
+        for identifier in ["batched-dependency-one", "batched-dependency-two"] {
+            let owner = Keys::generate();
+            let invitation = EventBuilder::new(Kind::GitRepoAnnouncement, "Owner invitation")
+                .tags([
+                    Tag::identifier(identifier),
+                    Tag::custom(
+                        "clone",
+                        [format!("https://example.invalid/{identifier}.git")],
+                    ),
+                    Tag::custom("relays", [relay_url.clone()]),
+                    Tag::custom("maintainers", [invitee.public_key().to_hex()]),
+                ])
+                .finalize(&owner)
+                .unwrap();
+            expected_ids.insert(invitation.id.to_hex());
+            manager.rejected_events_index.add_announcement_from_relay(
+                invitation,
+                owner.public_key(),
+                identifier.into(),
+                RejectionReason::DoesNotListService,
+                Some(relay_url.clone()),
+            );
+            let acceptance = EventBuilder::new(Kind::GitRepoAnnouncement, "Invitee acceptance")
+                .tags([
+                    Tag::identifier(identifier),
+                    Tag::custom("clone", [format!("http://{address}/{identifier}.git")]),
+                    Tag::custom("relays", [relay_url.clone()]),
+                    Tag::custom("maintainers", [owner.public_key().to_hex()]),
+                ])
+                .finalize(&invitee)
+                .unwrap();
+            purgatory.add_announcement(
+                acceptance,
+                identifier.into(),
+                invitee.public_key(),
+                git_path.join(identifier),
+                HashSet::from([relay_url.clone()]),
+            );
+        }
+
+        // No background manager loop runs: this pass sees both fresh entries.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.sync_purgatory_announcements_to_index(),
+        )
+        .await
+        .expect("maintenance must finish");
+        let query = tokio::time::timeout(Duration::from_secs(5), query_rx)
+            .await
+            .expect("dependency query deadline")
+            .expect("query observer");
+        assert_eq!(query.as_array().unwrap().len(), 3, "one exact-ID filter");
+        let actual_ids: HashSet<String> = serde_json::from_value(query[2]["ids"].clone()).unwrap();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "both repositories share one query"
+        );
+        assert_eq!(query[2]["limit"], 2);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("query fixture must finish after CLOSE")
+            .expect("query fixture");
+        manager.shutdown().await;
+    }
+
     #[tokio::test]
     async fn accepted_dependency_reprocesses_a_synced_policy_orphan() {
         let directory = tempfile::tempdir().expect("create test directory");

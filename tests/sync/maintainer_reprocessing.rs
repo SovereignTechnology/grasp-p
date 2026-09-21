@@ -37,9 +37,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 
-use crate::common::{
-    censoring_proxy::CensoringProxy, mock_relay::MockRelay, sync_helpers::*, TestRelay,
-};
+use crate::common::{sync_helpers::*, TestRelay};
 
 async fn wait_for_log(path: &Path, needle: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -589,108 +587,6 @@ async fn test_invitee_only_acceptance_recovers_cold_owner_invitation() {
 
     invitee_relay.stop().await;
     owner_relay.stop().await;
-}
-
-/// Cold dependency polling for separate repositories sharing a relay is
-/// combined into one exact-ID query on each maintenance round.
-#[tokio::test]
-async fn unresolved_repositories_share_one_dependency_poll_per_relay() {
-    let source = MockRelay::start().await;
-    let proxy = CensoringProxy::start(source.url()).await;
-    let invitee_relay =
-        TestRelay::start_with_sync_and_rejected_hot_cache(Some(proxy.url().to_string()), 1).await;
-    let invitee_keys = Keys::generate();
-    let owners = [Keys::generate(), Keys::generate()];
-    let identifiers = ["batched-dependency-one", "batched-dependency-two"];
-
-    let mut invitations = Vec::new();
-    for (owner, identifier) in owners.iter().zip(identifiers) {
-        let invitation = EventBuilder::new(Kind::GitRepoAnnouncement, "Owner invitation")
-            .tags([
-                Tag::identifier(identifier),
-                Tag::custom(
-                    "clone",
-                    [format!(
-                        "https://example.invalid/{}/{}.git",
-                        owner.public_key().to_hex(),
-                        identifier
-                    )],
-                ),
-                Tag::custom("relays", [proxy.url().to_string()]),
-                Tag::custom("maintainers", [invitee_keys.public_key().to_hex()]),
-            ])
-            .finalize(owner)
-            .expect("Failed to create owner invitation");
-        send_to_relay_url(source.url(), &invitation)
-            .await
-            .expect("Failed to seed owner invitation");
-        invitations.push(invitation);
-    }
-
-    for invitation in &invitations {
-        let invitation_note = invitation
-            .id
-            .to_bech32()
-            .expect("Failed to encode invitation event ID");
-        assert!(
-            wait_for_log(
-                &invitee_relay.log_path(),
-                &invitation_note,
-                Duration::from_secs(10),
-            )
-            .await,
-            "Invitee relay should reject and index both owner invitations"
-        );
-        proxy.withhold(invitation.id);
-    }
-
-    // Passage of the configured one-second hot-cache TTL is required so both
-    // repositories exercise cold exact-ID recovery on the same relay.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let acceptances: Vec<Event> = owners
-        .iter()
-        .zip(identifiers)
-        .zip(&invitations)
-        .map(|((owner, identifier), invitation)| {
-            repository_announcement(
-                &invitee_keys,
-                &[&invitee_relay],
-                &[owner.public_key()],
-                identifier,
-            )
-            .custom_created_at(timestamp_after(invitation.created_at))
-            .finalize(&invitee_keys)
-            .expect("Failed to create invitee acceptance")
-        })
-        .collect();
-    let client = Client::default();
-    client
-        .add_relay(invitee_relay.url())
-        .await
-        .expect("Failed to add invitee relay");
-    client.connect().await;
-    for acceptance in &acceptances {
-        client
-            .send_event(acceptance)
-            .await
-            .expect("Failed to publish invitee acceptance");
-    }
-    client.disconnect().await;
-
-    assert!(
-        wait_for_log(
-            &invitee_relay.log_path(),
-            "repository_count=2 requested_count=2 fetched_count=0",
-            Duration::from_secs(20),
-        )
-        .await,
-        "Separate repositories should share one dependency query to their common relay"
-    );
-
-    invitee_relay.stop().await;
-    proxy.stop().await;
-    source.stop().await;
 }
 
 /// Listing a maintainer immediately authorizes that maintainer's state for the

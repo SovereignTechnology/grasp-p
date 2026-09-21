@@ -72,6 +72,12 @@ and retain assertions about terminal flush and post-push promotion ordering.
 Fixed sleeps remain appropriate only when elapsed time is itself under test;
 polling an observable condition must always have a bounded deadline.
 
+For maintenance batching, seed all due inputs before explicitly invoking the
+manager pass and inspect the emitted query. Sequential network publications can
+straddle timer ticks and acquire different retry deadlines; waiting longer does
+not guarantee they will ever share a batch. Keep separate integration coverage
+for admission and eventual recovery through the public protocol.
+
 Targeted regressions include `fixture_lifecycle`, `relay_identity`,
 `git_response_streaming`, and the shared Git-server tests in `sync`.
 Full package validation remains necessary after these scoped checks.
