@@ -452,6 +452,27 @@ impl EventAcceptancePolicyTests {
                 .to_bech32()
                 .map_err(|e| format!("Failed to convert recursive maintainer pubkey: {}", e))?;
 
+            // This replaces the reciprocal announcement created by the fixture.
+            // Order it after that event explicitly: using the wall clock alone
+            // makes a fast run depend on the equal-timestamp event-ID tie-break.
+            let previous_time = client
+                .query(
+                    Filter::new()
+                        .kind(Kind::GitRepoAnnouncement)
+                        .author(client.recursive_maintainer_keys().public_key())
+                        .identifier(&repo_id),
+                )
+                .await
+                .map_err(|e| format!("Failed to query reciprocal announcement: {e}"))?
+                .iter()
+                .map(|event| event.created_at.as_secs())
+                .max()
+                .ok_or("Fixture reciprocal announcement is not served")?;
+            let replacement_time = previous_time
+                .checked_add(1)
+                .ok_or("Reciprocal announcement timestamp overflow")?
+                .max(Timestamp::now().as_secs());
+
             // Create announcement with external clone URL (not this server)
             let recursive_maintainer_announcement = client
                 .event_builder(
@@ -487,6 +508,7 @@ impl EventAcceptancePolicyTests {
                     "maintainers",
                     vec![client.maintainer_pubkey_hex()],
                 ))
+                .custom_time(Timestamp::from(replacement_time))
                 .build(client.recursive_maintainer_keys())
                 .map_err(|e| format!("Failed to build recursive maintainer announcement: {}", e))?;
 
@@ -498,9 +520,8 @@ impl EventAcceptancePolicyTests {
                 .await
                 .map_err(|e| format!("Failed to send recursive maintainer announcement: {}", e))?;
 
-            // Wait for propagation
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
+            // The successful send acknowledges storage of this external
+            // announcement; verify its exact ID without a propagation sleep.
             // Step 4: Query to verify it was accepted
             let filter = Filter::new()
                 .kind(Kind::GitRepoAnnouncement)
