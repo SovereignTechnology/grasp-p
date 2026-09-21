@@ -19,22 +19,68 @@ use super::purgatory_helpers::{
 };
 use super::sync_helpers::create_repo_announcement;
 
-/// Wait for promotion rather than assuming the worker runs within a fixed delay.
-async fn wait_until_served(client: &AuditClient, event_id: EventId) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if client
+/// Deadline for observable effects that complete outside the relay's reply,
+/// such as purgatory promotion after a Git push.
+pub const OBSERVABLE_EFFECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll `condition` at a short fixed interval until it holds or the deadline
+/// passes, panicking with `description` on timeout.
+///
+/// The relay applies write-policy effects, including NIP-09 and NIP-62
+/// lifecycle deletions, before it replies `OK`, so an awaited send already
+/// proves those effects. Use this helper for effects that complete in a
+/// spawned task after the reply, or to make an absence assertion robust to a
+/// future asynchronous implementation, never as a substitute for a fixed
+/// delay before an assertion that the reply already covers.
+pub async fn wait_for<F, Fut>(description: &str, timeout: Duration, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{description} did not hold within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until the relay serves `event_id`, bounded by
+/// [`OBSERVABLE_EFFECT_TIMEOUT`]. Use after a Git push or another action whose
+/// promotion completes outside the relay's reply.
+pub async fn wait_until_served(client: &AuditClient, event_id: EventId) {
+    wait_for(
+        &format!("event {event_id} being served"),
+        OBSERVABLE_EFFECT_TIMEOUT,
+        || async {
+            client
                 .is_event_on_relay(event_id)
                 .await
-                .expect("query promoted event")
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("event {event_id} was not served after git data arrived"));
+                .expect("query event expected to become served")
+        },
+    )
+    .await;
+}
+
+/// Wait until the relay stops serving `event_id`, bounded by
+/// [`OBSERVABLE_EFFECT_TIMEOUT`].
+pub async fn wait_until_not_served(client: &AuditClient, event_id: EventId) {
+    wait_for(
+        &format!("event {event_id} no longer being served"),
+        OBSERVABLE_EFFECT_TIMEOUT,
+        || async {
+            !client
+                .is_event_on_relay(event_id)
+                .await
+                .expect("query event expected to stop being served")
+        },
+    )
+    .await;
 }
 
 /// Publish a repo announcement, submit a matching state event, and push the

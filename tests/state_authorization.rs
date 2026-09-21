@@ -92,9 +92,6 @@ async fn test_reject_state_from_unauthorized_author() {
     // Send announcement
     client.send_event(&announcement).await.unwrap();
 
-    // Wait for announcement to be processed
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     // Try to send state event from unauthorized author
     let state_event = EventBuilder::new(Kind::RepoState, "")
         .tags([
@@ -155,9 +152,6 @@ async fn test_accept_state_from_announcement_author() {
 
     // Send announcement
     client.send_event(&announcement).await.unwrap();
-
-    // Wait for announcement to be processed
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Send state event from same author (should be accepted or go to purgatory)
     let state_event = EventBuilder::new(Kind::RepoState, "")
@@ -237,9 +231,6 @@ async fn test_accept_state_from_maintainer() {
     // Send announcements
     client.send_event(&announcement).await.unwrap();
     client.send_event(&reciprocal_announcement).await.unwrap();
-
-    // Wait for announcements to be processed
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Send state event from maintainer
     let state_event = EventBuilder::new(Kind::RepoState, "")
@@ -396,7 +387,6 @@ async fn test_reject_state_from_invited_maintainer() {
     client.connect().await;
 
     client.send_event(&announcement).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     assert!(
         state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,
@@ -444,7 +434,6 @@ async fn test_accept_state_from_role_tag_maintainer() {
 
     client.send_event(&announcement).await.unwrap();
     client.send_event(&reciprocal_announcement).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     assert!(
         !state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,
@@ -502,7 +491,6 @@ async fn test_reject_state_from_removed_maintainer() {
 
     client.send_event(&announcement).await.unwrap();
     let _ = client.send_event(&reciprocal_announcement).await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     assert!(
         state_event_rejected_as_unauthorized(&client, &maintainer_keys).await,

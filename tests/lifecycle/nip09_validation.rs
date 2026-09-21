@@ -54,12 +54,11 @@ mod common;
 
 use common::{
     announcement_coordinate, announcement_served_by_coordinate, build_deletion,
-    publish_served_repo, TestRelay,
+    publish_served_repo, wait_until_not_served, TestRelay,
 };
 
 use grasp_audit::{AuditClient, AuditConfig};
 use nostr_sdk::prelude::*;
-use std::time::Duration;
 
 /// 1. A deletion targeting an existing, author-owned event by `e` tag is
 ///    accepted and the target is no longer served.
@@ -84,8 +83,6 @@ async fn valid_deletion_by_event_id_removes_target() {
         .await
         .expect("relay should accept issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     assert!(
         client
             .is_event_on_relay(issue_id)
@@ -100,7 +97,7 @@ async fn valid_deletion_by_event_id_removes_target() {
         .await
         .expect("relay should accept deletion of own event");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, issue_id).await;
 
     let still_served = client
         .is_event_on_relay(issue_id)
@@ -191,13 +188,9 @@ async fn deletion_before_target_rejects_later_submission() {
         .await
         .expect("relay should accept pre-emptive deletion of own (not-yet-seen) event");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Now send the issue the deletion already targeted. The resubmission gate
     // must reject it because a tombstone for this id already exists.
     let result = client.send_event(issue.clone()).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let served = client
         .is_event_on_relay(issue_id)
@@ -272,13 +265,9 @@ async fn out_of_order_deletion_by_other_pubkey_not_actioned() {
     let deletion = build_deletion(&author_b, &[issue_id], &[]);
     let _ = author_b.send_event(deletion).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // A now submits the genuine event. It must be accepted: B's deletion of an
     // event B does not own must never have been actioned.
     let result = author_a.send_event(issue.clone()).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let served = author_a
         .is_event_on_relay(issue_id)
@@ -323,7 +312,6 @@ async fn deletion_author_mismatch_rejected() {
         .await
         .expect("relay should accept A's issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         author_a
             .is_event_on_relay(issue_id)
@@ -393,7 +381,6 @@ async fn multiple_event_targets_in_one_deletion() {
             .expect("relay should accept issue");
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     for id in &ids {
         assert!(
             client
@@ -411,7 +398,9 @@ async fn multiple_event_targets_in_one_deletion() {
         .await
         .expect("relay should accept multi-target deletion");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    for id in &ids {
+        wait_until_not_served(&client, *id).await;
+    }
 
     let mut still_served = Vec::new();
     for id in &ids {
@@ -453,7 +442,6 @@ async fn mixed_e_and_a_tag_deletion() {
         .await
         .expect("relay should accept issue");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         client
             .is_event_on_relay(issue_id)
@@ -469,7 +457,8 @@ async fn mixed_e_and_a_tag_deletion() {
         .await
         .expect("relay should accept mixed e/a deletion");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, issue_id).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let issue_served = client
         .is_event_on_relay(issue_id)
@@ -660,7 +649,6 @@ async fn newer_addressable_event_survives_a_tag_deletion() {
         .await
         .expect("relay should accept addressable event referencing the repo");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         client
             .is_event_on_relay(v1_id)
@@ -678,7 +666,7 @@ async fn newer_addressable_event_survives_a_tag_deletion() {
         .await
         .expect("relay should accept deletion by coordinate");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, v1_id).await;
 
     // Stage 4: v1 must be gone.
     assert!(
@@ -705,8 +693,6 @@ async fn newer_addressable_event_survives_a_tag_deletion() {
         .send_event(v2.clone())
         .await
         .expect("relay should accept an addressable event newer than the deletion request");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let served_by_id = client
         .is_event_on_relay(v2_id)
@@ -766,7 +752,7 @@ async fn normal_mode_honours_deletion() {
         .await
         .expect("normal relay should OK the kind-5 deletion");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_not_served(&client, announcement.id).await;
 
     let served_by_id = client
         .is_event_on_relay(announcement.id)

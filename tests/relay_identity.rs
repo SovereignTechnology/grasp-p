@@ -6,11 +6,45 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use common::port::UnavailableEndpoint;
-use common::{reserve_port, wait_for_event_on_relay, MockRelay, TestClient, TestRelay};
+use common::{
+    reserve_port, wait_for_event_on_relay, wait_for_log_line, MockRelay, TestClient, TestRelay,
+};
 use nostr::nips::nip65;
 use nostr_sdk::prelude::*;
 
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Relay log lines from `src/nostr/relay_identity.rs` that mark the
+/// publication task's decisions.
+const INDEX_HOLDS_IDENTITY: &str =
+    "User-index relays already hold a relay-owner identity of this kind";
+const RELAY_HOLDS_IDENTITY: &str =
+    "User-index relay already has a relay-owner identity of this kind";
+const PUBLICATION_DEFERRED: &str =
+    "No user-index relay reachable; deferring relay-owner identity publication";
+const PRIVATE_MODE_SUPPRESSED: &str =
+    "Private mode enabled; relay-owner identity stays local and is not published";
+
+/// Wait until at least `count` lines of the relay log satisfy `predicate`.
+async fn wait_for_log_count(
+    path: &std::path::Path,
+    timeout: Duration,
+    count: usize,
+    predicate: impl Fn(&str) -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(path).await {
+            if content.lines().filter(|line| predicate(line)).count() >= count {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 #[tokio::test]
 async fn relay_owner_identity_is_local_indexed_and_trusted_for_undedicated_kinds() {
@@ -154,23 +188,27 @@ async fn restart_preserves_customized_profile_and_never_overwrites_index_copy() 
     // locally, and the copy already on the user index is left untouched:
     // identities found on an index are adopted, never replaced, so pushing
     // a profile update out to the indexes is the operator's own client's
-    // job. Non-replacement is stable absence over time, so poll across
-    // several identity retry cycles (test mode retries every 200ms-2s).
+    // job. The restarted publication task logs one adoption per identity
+    // kind when its index check finds the existing copies; after both, it
+    // has nothing left to publish, so the index copy is checked once.
     let stored = fetch_events(relay.url(), profile_filter.clone()).await;
     assert_eq!(
         event_ids(&stored),
         BTreeSet::from([customized.id]),
         "restart seeding must not overwrite the operator-customized profile"
     );
-    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < observation_deadline {
-        assert_eq!(
-            event_ids(&fetch_events(index.url(), profile_filter.clone()).await),
-            generated_ids,
-            "restart must not overwrite the identity already on the user index"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    assert!(
+        wait_for_log_count(&relay.log_path(), OBSERVATION_TIMEOUT, 2, |line| {
+            line.contains(INDEX_HOLDS_IDENTITY)
+        })
+        .await,
+        "restarted relay did not adopt both identity kinds from the user index"
+    );
+    assert_eq!(
+        event_ids(&fetch_events(index.url(), profile_filter.clone()).await),
+        generated_ids,
+        "restart must not overwrite the identity already on the user index"
+    );
 
     relay.stop().await;
     index.stop().await;
@@ -256,20 +294,22 @@ async fn identity_publication_defers_until_a_user_index_relay_is_reachable() {
         .author(owner)
         .kinds([Kind::Metadata, Kind::RelayList]);
 
-    // With no reachable user index, nothing may be seeded locally. Deferral
-    // is stable absence over time, so observe it across several identity
-    // retry cycles (test mode retries every 200ms-2s) by polling rather
-    // than asserting once.
-    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < observation_deadline {
-        assert!(
-            fetch_events(relay.url(), identity_filter.clone())
-                .await
-                .is_empty(),
-            "identity must not be seeded while no user-index relay is reachable"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // With no reachable user index, nothing may be seeded locally. The
+    // publication task logs every deferred retry, so two logged deferrals
+    // prove it ran through retry cycles before the local check.
+    assert!(
+        wait_for_log_count(&relay.log_path(), OBSERVATION_TIMEOUT, 2, |line| {
+            line.contains(PUBLICATION_DEFERRED)
+        })
+        .await,
+        "relay did not log deferred identity publication retries"
+    );
+    assert!(
+        fetch_events(relay.url(), identity_filter.clone())
+            .await
+            .is_empty(),
+        "identity must not be seeded while no user-index relay is reachable"
+    );
 
     // Once an empty index becomes reachable, the generated identity is
     // released: seeded locally and published to the index.
@@ -390,22 +430,27 @@ async fn stored_identity_is_not_pushed_to_recovering_index_holding_an_identity()
         .await,
         "relay list was not delivered to the recovered index"
     );
-    // Non-displacement is stable absence over time, so poll across several
-    // identity retry cycles (test mode retries every 200ms-2s).
-    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < observation_deadline {
-        let profiles = fetch_events(
-            index_a.url(),
-            Filter::new().author(owner).kind(Kind::Metadata),
-        )
-        .await;
-        assert_eq!(
-            event_ids(&profiles),
-            BTreeSet::from([customized.id]),
-            "stored profile displaced the customized identity on the recovering index"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // The per-relay check logs the adoption of A's profile in place of the
+    // pending publication; after that, A holds nothing further to receive.
+    assert!(
+        wait_for_log_line(&relay.log_path(), OBSERVATION_TIMEOUT, |line| {
+            line.contains(RELAY_HOLDS_IDENTITY)
+                && line.contains(index_a.url())
+                && line.contains("kind=0")
+        })
+        .await,
+        "relay did not adopt the customized profile from the recovering index"
+    );
+    let profiles = fetch_events(
+        index_a.url(),
+        Filter::new().author(owner).kind(Kind::Metadata),
+    )
+    .await;
+    assert_eq!(
+        event_ids(&profiles),
+        BTreeSet::from([customized.id]),
+        "stored profile displaced the customized identity on the recovering index"
+    );
 
     relay.stop().await;
     index_a.stop().await;
@@ -455,19 +500,22 @@ async fn private_mode_seeds_identity_locally_but_never_publishes_it() {
         .kinds([Kind::Metadata, Kind::RelayList]);
 
     // A private relay must not leak its existence through identity events
-    // on the user-index relays. Suppression is stable absence over time, so
-    // poll across several identity retry cycles (test mode retries every
-    // 200ms-2s) rather than asserting once.
-    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < observation_deadline {
-        assert!(
-            fetch_events(index.url(), identity_filter.clone())
-                .await
-                .is_empty(),
-            "identity must not be published to user-index relays in private mode"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // on the user-index relays. Private mode logs that publication is
+    // suppressed and starts no publication task, so once the line is
+    // present nothing can reach the index later.
+    assert!(
+        wait_for_log_line(&relay.log_path(), OBSERVATION_TIMEOUT, |line| {
+            line.contains(PRIVATE_MODE_SUPPRESSED)
+        })
+        .await,
+        "private relay did not log suppressed identity publication"
+    );
+    assert!(
+        fetch_events(index.url(), identity_filter.clone())
+            .await
+            .is_empty(),
+        "identity must not be published to user-index relays in private mode"
+    );
 
     // Local seeding and serving still work: the owner — the sole GRASP-08
     // member — authenticates with NIP-42 and queries both identity events.
