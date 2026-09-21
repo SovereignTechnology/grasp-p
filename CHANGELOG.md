@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-09-21
+
 ### Fixed
 
 - Fix queued sync requests bypassing relay rate-limit backoff and continuing
   to send requests during the cooldown. Rate-limit signals now take effect even
   when sync event processing is blocked, and repeated signals no longer flood
   warning logs.
+- Preserve repository membership while a pending announcement is saved, so
+  concurrent reconciliation cannot restore obsolete Git state.
+- Retain live roots received while their accepted repository announcement is
+  waiting for batch processing, so their discovery work is not lost.
 
 ### Dependencies
 
@@ -689,7 +695,8 @@ defensive limits explicit and operator-configurable.
 
 Initial release of ngit-grasp, a GRASP relay implementation in Rust.
 
-[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.3...HEAD
+[unreleased]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.4...HEAD
+[3.0.4]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.3...v3.0.4
 [3.0.3]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.2...v3.0.3
 [3.0.2]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.1...v3.0.2
 [3.0.1]: https://gitworkshop.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit-grasp/compare/v3.0.0...v3.0.1
