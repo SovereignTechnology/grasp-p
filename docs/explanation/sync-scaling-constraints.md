@@ -503,10 +503,19 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   IDs as metric labels. Live subscriptions are ledgered first, so NEG,
   transient REQ,
   and purgatory exact-ID polling share only the remaining capacity.
-- Permit acquisition checks relay health first: while a rate-limit or
-  transient-failure cooldown is active, queued rounds take the REQ+EOSE
-  fallback path (which is itself budget-accounted) instead of firing into a
-  relay that just complained.
+- The scheduler and outbound connection share the relay's rate-limit state.
+  NOTICE and rate-limited CLOSED messages update that state on the independent
+  control stream, even when event delivery to the processor is blocked. New
+  work checks it before pacing, then checks again after pacing and capacity
+  waits immediately before handing a REQ, direct fetch, or new NIP-77 round
+  to the SDK. Queued work rejected during the cooldown releases its permits
+  and returns an error for the existing incomplete-work recovery paths.
+  Filter-count and retained-subscription-byte refusals keep their specialized
+  recovery paths rather than activating this generic cooldown. Requests
+  already handed to the SDK and SDK-owned protocol continuations are not
+  cancelled by this check; existing live subscriptions remain open.
+  Negentropy's separate transient-failure cooldown still directs later rounds
+  to the budget-accounted REQ+EOSE fallback.
 - The reactive machinery (escalating cooldown, rate-limit detection in both
   NOTICE and subscription-specific CLOSED messages, and per-batch fallback)
   remains the backstop for relays whose limits are below our floors. A

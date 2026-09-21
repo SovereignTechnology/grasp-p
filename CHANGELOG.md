@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix queued sync requests bypassing relay rate-limit backoff and continuing
+  to send requests during the cooldown. Rate-limit signals now take effect even
+  when sync event processing is blocked, and repeated signals no longer flood
+  warning logs.
+
 ## [3.0.3] - 2026-09-18
 
 This patch improves repository-state correctness, startup recovery, and relay
