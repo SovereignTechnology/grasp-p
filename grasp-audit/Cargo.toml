@@ -13,7 +13,7 @@ path = "src/bin/grasp-audit.rs"
 
 [dependencies]
 # Nostr
-nostr-sdk = "0.45.3"
+nostr-sdk = "0.45.4"
 
 # Async
 tokio = { version = "1", features = ["full"] }

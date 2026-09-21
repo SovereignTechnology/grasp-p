@@ -18,7 +18,7 @@ http-body-util = "0.1"
 
 # Nostr
 nostr = "0.45.5"
-nostr-sdk = { version = "0.45.3", features = ["local-relay"] }
+nostr-sdk = { version = "0.45.4", features = ["local-relay"] }
 nostr-lmdb = "0.45.3"
 nostr-memory = "0.45.2"
 

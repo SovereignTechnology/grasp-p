@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when sync event processing is blocked, and repeated signals no longer flood
   warning logs.
 
+### Dependencies
+
+- Update compatible Cargo dependencies, including `nostr-sdk` 0.45.4. The
+  embedded relay now closes affected live subscriptions when their event buffer
+  overflows, allowing clients to detect gaps and resubscribe for stored events.
+  It also checks the connection limit before the WebSocket handshake.
+- Update `negentropy` to 0.5.1, reducing allocations during reconciliation.
+
 ## [3.0.3] - 2026-09-18
 
 This patch improves repository-state correctness, startup recovery, and relay
