@@ -481,7 +481,11 @@ async fn missing_relay_list_uses_bounded_fallback_coverage() {
     assert!(
         sync_log.lines().any(|line| {
             line.contains("Updated proactive participant mailbox coverage from NIP-65")
-                && line.contains("fallback_authors=1")
+                && line.split_whitespace().any(|field| {
+                    field
+                        .strip_prefix("fallback_authors=")
+                        .is_some_and(|count| count.parse::<usize>().is_ok_and(|count| count > 0))
+                })
         }),
         "fallback activation should remain observable"
     );
