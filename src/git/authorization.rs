@@ -269,11 +269,12 @@ pub async fn fetch_repository_data_with_purgatory(
     purgatory: &crate::purgatory::Purgatory,
     identifier: &str,
 ) -> Result<RepositoryData> {
-    // First, fetch from database
+    // Snapshot both sides of the database query: a promotion can finish while
+    // the query is suspended, and must not leave us with the old DB graph and
+    // an already-removed purgatory entry.
+    let mut purgatory_announcements = purgatory.get_announcements_by_identifier(identifier);
     let mut repo_data = fetch_repository_data_excluding_purgatory(database, identifier).await?;
-
-    // Then, add announcements from purgatory
-    let purgatory_announcements = purgatory.get_announcements_by_identifier(identifier);
+    purgatory_announcements.extend(purgatory.get_announcements_by_identifier(identifier));
     let purgatory_count = purgatory_announcements.len();
 
     for entry in purgatory_announcements {
@@ -282,7 +283,14 @@ pub async fn fetch_repository_data_with_purgatory(
                 current.event.pubkey == announcement.event.pubkey
                     && current.identifier == announcement.identifier
             }) {
-                *current = announcement;
+                if crate::nostr::events::compare_replacement_events(
+                    &announcement.event,
+                    &current.event,
+                )
+                .is_gt()
+                {
+                    *current = announcement;
+                }
             } else {
                 repo_data.announcements.push(announcement);
             }

@@ -915,6 +915,14 @@ impl Purgatory {
         })
     }
 
+    /// Finish a saved promotion without removing a concurrently replaced entry.
+    pub(crate) fn finish_announcement_promotion(&self, event: &Event, identifier: &str) {
+        self.announcement_purgatory
+            .remove_if(&(event.pubkey, identifier.to_string()), |_, entry| {
+                entry.event.id == event.id
+            });
+    }
+
     /// Check if there's an announcement in purgatory for the given owner and identifier.
     ///
     /// # Arguments

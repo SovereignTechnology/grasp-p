@@ -1275,7 +1275,8 @@ async fn process_purgatory_state_events(
                                 .await;
                         }
 
-                        if let Some(ann_event) = purgatory.promote_announcement(owner, identifier) {
+                        if let Some(entry) = purgatory.find_announcement(owner, identifier) {
+                            let ann_event = entry.event;
                             match save_promoted_event(
                                 database,
                                 &ann_event,
@@ -1285,6 +1286,7 @@ async fn process_purgatory_state_events(
                             .await
                             {
                                 Ok(_) => {
+                                    purgatory.finish_announcement_promotion(&ann_event, identifier);
                                     info!(
                                         identifier = %identifier,
                                         owner = %owner,
@@ -1623,7 +1625,12 @@ async fn process_purgatory_announcements(
     }
 
     // Check if there's an announcement in purgatory for this owner and identifier
-    let announcement_event = purgatory.promote_announcement(&owner, identifier);
+    // Keep the candidate visible to authorization throughout the database save.
+    // Removing it first briefly restores an older membership graph and can
+    // reapply an obsolete state over refs already aligned to the new graph.
+    let announcement_event = purgatory
+        .find_announcement(&owner, identifier)
+        .map(|entry| entry.event);
 
     if let Some(event) = announcement_event {
         // Save to database
@@ -1636,6 +1643,7 @@ async fn process_purgatory_announcements(
         .await
         {
             Ok(_) => {
+                purgatory.finish_announcement_promotion(&event, identifier);
                 info!(
                     identifier = %identifier,
                     event_id = %event.id,
@@ -1838,6 +1846,112 @@ pub fn extract_owner_from_repo_path(repo_path: &Path, git_data_path: &Path) -> O
 mod tests {
     use super::*;
     use nostr_sdk::prelude::Keys;
+
+    #[tokio::test]
+    async fn promotion_preserves_membership_until_save_and_retains_a_newer_candidate() {
+        use crate::git::authorization::fetch_repository_data_with_purgatory;
+        use crate::nostr::events::RepositoryAnnouncement;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Kind, Tag, Timestamp};
+        use std::sync::Arc;
+
+        struct InspectPromotion {
+            database: SharedDatabase,
+            purgatory: Arc<Purgatory>,
+            replacement: Event,
+            repo: std::path::PathBuf,
+        }
+        #[async_trait]
+        impl PurgatoryPromotionHooks for InspectPromotion {
+            async fn before_event_saved(&self, event: &Event, context: PurgatorySaveContext) {
+                assert_eq!(context, PurgatorySaveContext::Announcement);
+                let data = fetch_repository_data_with_purgatory(
+                    &self.database,
+                    &self.purgatory,
+                    "promotion-race",
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    data.announcements[0].event.id, event.id,
+                    "authorization must retain the candidate until its save completes"
+                );
+                // A replacement arriving during the save must survive cleanup.
+                self.purgatory.add_announcement(
+                    self.replacement.clone(),
+                    "promotion-race".into(),
+                    event.pubkey,
+                    self.repo.clone(),
+                    HashSet::new(),
+                );
+            }
+        }
+        let keys = Keys::generate();
+        let build = |timestamp| {
+            EventBuilder::new(Kind::GitRepoAnnouncement, "")
+                .tag(Tag::identifier("promotion-race"))
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .finalize(&keys)
+                .unwrap()
+        };
+        let old = build(100);
+        let candidate = build(101);
+        let replacement = build(102);
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join(
+            RepositoryAnnouncement::from_event(candidate.clone())
+                .unwrap()
+                .repo_path(),
+        );
+        let database: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        database.save_event(&old).await.unwrap();
+        let purgatory = Arc::new(Purgatory::new(root.path().to_path_buf()));
+        purgatory.add_announcement(
+            candidate.clone(),
+            "promotion-race".into(),
+            keys.public_key(),
+            repo.clone(),
+            HashSet::new(),
+        );
+        let hooks = InspectPromotion {
+            database: database.clone(),
+            purgatory: purgatory.clone(),
+            replacement: replacement.clone(),
+            repo: repo.clone(),
+        };
+        let result = process_purgatory_announcements(
+            "promotion-race",
+            &repo,
+            &database,
+            None,
+            &purgatory,
+            root.path(),
+            Some(&hooks),
+        )
+        .await;
+        assert!(result.errors.is_empty());
+        assert_eq!(result.announcements_released, 1);
+        assert_eq!(
+            purgatory
+                .find_announcement(&keys.public_key(), "promotion-race")
+                .unwrap()
+                .event
+                .id,
+            replacement.id
+        );
+        assert!(database
+            .query(nostr_sdk::prelude::Filter::new().id(candidate.id))
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.id == candidate.id));
+        // A stale purgatory snapshot must not hide a newer saved announcement.
+        let newest = build(103);
+        database.save_event(&newest).await.unwrap();
+        let data = fetch_repository_data_with_purgatory(&database, &purgatory, "promotion-race")
+            .await
+            .unwrap();
+        assert_eq!(data.announcements[0].event.id, newest.id);
+    }
 
     #[test]
     fn owner_repo_sync_honors_same_second_replacement_order() {
