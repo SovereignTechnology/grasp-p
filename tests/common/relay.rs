@@ -71,6 +71,9 @@ struct RelayOptions {
     disable_negentropy: bool,
     archive_all: bool,
     archive_read_only: bool,
+    /// Comma-separated GRASP service domains whose repositories this relay
+    /// archives (`NGIT_ARCHIVE_GRASP_SERVICES`).
+    archive_grasp_services: Option<String>,
     grasp06_enable: bool,
     deletion_request_disrespector: bool,
     lmdb_backend: bool,
@@ -406,6 +409,19 @@ impl TestRelay {
     /// means to attribute to the relay under test alone. The production
     /// policy rejects non-global event-directed targets, so the source stays
     /// scenery. Its own hosting, admission, and serving behavior is unchanged.
+    /// Start a relay that archives repositories hosted on the given
+    /// comma-separated GRASP service domains.
+    pub async fn start_with_archive_grasp_services(services: &str) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                archive_grasp_services: Some(services.to_string()),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     pub async fn start_archive_source_behind_proxy() -> Self {
         Self::start_internal(
             port::reserve_port(),
@@ -879,6 +895,9 @@ impl TestRelay {
         }
         if options.archive_read_only {
             cmd.env("NGIT_ARCHIVE_READ_ONLY", "true");
+        }
+        if let Some(services) = &options.archive_grasp_services {
+            cmd.env("NGIT_ARCHIVE_GRASP_SERVICES", services);
         }
 
         // Enable GRASP-06 if requested. If the binary does not yet recognise

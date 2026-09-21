@@ -35,85 +35,7 @@ use common::{
     wait_for_sync_connection, CommitVariant, TestRelay,
 };
 use nostr_sdk::prelude::*;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-
-/// Helper to start a relay with archive_grasp_services configuration
-///
-/// This is a specialized version of TestRelay::start_on_reservation_with_archive_and_sync
-/// that adds the NGIT_ARCHIVE_GRASP_SERVICES environment variable.
-async fn start_relay_with_grasp_services(services: &str) -> (Child, String, PathBuf) {
-    // Reserve a port and hold the listener bound until just before the
-    // subprocess spawns — mirrors the pattern in `TestRelay`. Without
-    // this hold, a parallel test in this process could be handed the
-    // same port between the kernel-assigned bind and ngit-grasp's own
-    // bind, producing a flaky `Address already in use` failure.
-    let reservation = port::reserve_port();
-    let relay_port = reservation.port();
-    let bind_address = format!("127.0.0.1:{}", relay_port);
-    let url = format!("ws://127.0.0.1:{}", relay_port);
-
-    // Create temporary directory for git repositories
-    let git_data_dir = tempfile::tempdir().expect("Failed to create temporary git data directory");
-
-    // Use the built binary directly
-    let binary_path = std::env::current_exe()
-        .expect("Failed to get current exe")
-        .parent()
-        .expect("Failed to get parent dir")
-        .parent()
-        .expect("Failed to get grandparent dir")
-        .join("ngit-grasp");
-
-    // Give the relay a stable signing identity for NIP-11 and NIP-42.
-    let test_keys = nostr_sdk::prelude::Keys::generate();
-    let test_nsec = test_keys
-        .secret_key()
-        .to_bech32()
-        .expect("Failed to generate test nsec");
-
-    // Start the relay process with archive_grasp_services
-    let mut cmd = Command::new(&binary_path);
-    cmd.env("NGIT_BIND_ADDRESS", &bind_address)
-        .env("NGIT_DOMAIN", &bind_address)
-        .env("NGIT_GIT_DATA_PATH", git_data_dir.path())
-        .env("NGIT_DATABASE_BACKEND", "memory")
-        .env("NGIT_RELAY_OWNER_NSEC", &test_nsec)
-        .env("NGIT_ARCHIVE_GRASP_SERVICES", services)
-        .env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    // Release the reservation immediately before spawn so the subprocess
-    // can bind the port. See `tests/common/port.rs` for the rationale.
-    let _ = reservation.release();
-
-    let process = cmd.spawn().expect("Failed to start relay process");
-
-    // Store git data path for test assertions
-    let git_data_path = git_data_dir.path().to_path_buf();
-
-    // Wait for relay to be ready
-    wait_for_relay_ready(relay_port).await;
-
-    (process, url, git_data_path)
-}
-
-/// Wait for the relay to be ready to accept connections.
-///
-/// A successful TCP connect only proves the socket is bound: the accept loop
-/// and HTTP service may still be coming up. Poll the relay's HTTP handler
-/// instead, bounded by a deadline, so the immediately-following WebSocket
-/// client is racing a relay that has already served a request.
-async fn wait_for_relay_ready(port: u16) {
-    common::relay::wait_for_http_ready(port, Duration::from_secs(10))
-        .await
-        .expect("Relay should become ready");
-}
 
 /// Test that announcements with matching GRASP service domains are accepted.
 ///
@@ -123,8 +45,9 @@ async fn wait_for_relay_ready(port: u16) {
 /// 3. Verify announcement is accepted (repository is created)
 #[tokio::test]
 async fn test_archive_accepts_matching_grasp_service() {
-    let (mut process, url, git_data_path) =
-        start_relay_with_grasp_services("git.example.com").await;
+    let relay = TestRelay::start_with_archive_grasp_services("git.example.com").await;
+    let url = relay.url().to_string();
+    let git_data_path = relay.git_data_path().clone();
     let keys = Keys::generate();
     let identifier = "test-repo";
 
@@ -168,8 +91,7 @@ async fn test_archive_accepts_matching_grasp_service() {
 
     // Cleanup
     client.disconnect().await;
-    let _ = process.kill();
-    let _ = process.wait();
+    relay.stop().await;
 }
 
 /// Test that announcements with non-matching GRASP service domains are rejected.
@@ -180,8 +102,9 @@ async fn test_archive_accepts_matching_grasp_service() {
 /// 3. Verify announcement is rejected (repository is NOT created)
 #[tokio::test]
 async fn test_archive_rejects_non_matching_grasp_service() {
-    let (mut process, url, git_data_path) =
-        start_relay_with_grasp_services("git.example.com").await;
+    let relay = TestRelay::start_with_archive_grasp_services("git.example.com").await;
+    let url = relay.url().to_string();
+    let git_data_path = relay.git_data_path().clone();
     let keys = Keys::generate();
     let identifier = "test-repo";
 
@@ -225,8 +148,7 @@ async fn test_archive_rejects_non_matching_grasp_service() {
 
     // Cleanup
     client.disconnect().await;
-    let _ = process.kill();
-    let _ = process.wait();
+    relay.stop().await;
 }
 
 /// Test that multiple configured GRASP services work correctly.
@@ -239,8 +161,10 @@ async fn test_archive_rejects_non_matching_grasp_service() {
 /// 5. Verify it is rejected
 #[tokio::test]
 async fn test_archive_multiple_grasp_services() {
-    let (mut process, url, git_data_path) =
-        start_relay_with_grasp_services("git.example.com,gitlab.example.org").await;
+    let relay =
+        TestRelay::start_with_archive_grasp_services("git.example.com,gitlab.example.org").await;
+    let url = relay.url().to_string();
+    let git_data_path = relay.git_data_path().clone();
 
     // Test first service (git.example.com)
     let keys1 = Keys::generate();
@@ -362,8 +286,7 @@ async fn test_archive_multiple_grasp_services() {
     client1.disconnect().await;
     client2.disconnect().await;
     client3.disconnect().await;
-    let _ = process.kill();
-    let _ = process.wait();
+    relay.stop().await;
 }
 
 /// Test that archive_read_only mode creates bare git repositories and syncs data
