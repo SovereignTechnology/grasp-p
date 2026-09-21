@@ -31,35 +31,29 @@ async fn discovery_only_mailbox_keeps_failure_history_through_cleanup() {
     flapping
         .wait_for_connections(2, Duration::from_secs(60))
         .await;
-    let logs = wait_for_log(
-        &syncing.log_path(),
-        "consecutive_failures=1",
-        Duration::from_secs(15),
-    )
-    .await;
-    assert!(logs.lines().any(|line| {
-        line.contains(flapping.url())
-            && line.contains("consecutive_failures=1")
-            && line.contains("preserving failure streak until stable")
-    }));
+    wait_for_retained_failure_streak(&syncing, flapping.url(), Duration::from_secs(15)).await;
 
     syncing.stop().await;
     flapping.stop().await;
     index.stop().await;
 }
 
-async fn wait_for_log(log_path: &std::path::Path, needle: &str, timeout: Duration) -> String {
+async fn wait_for_retained_failure_streak(relay: &TestRelay, url: &str, timeout: Duration) {
     tokio::time::timeout(timeout, async {
         loop {
-            let contents = std::fs::read_to_string(log_path).unwrap_or_default();
-            if contents.contains(needle) {
-                return contents;
+            let contents = std::fs::read_to_string(relay.log_path()).unwrap_or_default();
+            if contents.lines().any(|line| {
+                line.contains(url)
+                    && line.contains("consecutive_failures=1")
+                    && line.contains("preserving failure streak until stable")
+            }) {
+                return;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("relay log never contained {needle:?}"))
+    .unwrap_or_else(|_| panic!("relay {url} never reconnected with its first failure retained"));
 }
 
 #[tokio::test]
@@ -101,17 +95,12 @@ async fn flapping_relay_handshakes_do_not_reset_exponential_backoff() {
     // its WebSocket handshake as proof of stability. Each session reaches a
     // normal REQ before the fixture drops it. Unit coverage below the actor
     // boundary verifies that the retained count drives the next backoff step.
-    let attempts = flapping
+    // The fixture reports all sessions observed so far. A delayed test task
+    // may resume after further reconnects; only the minimum is a precondition.
+    flapping
         .wait_for_connections(2, Duration::from_secs(25))
         .await;
-    assert_eq!(attempts.len(), 2);
-    let logs = wait_for_log(
-        &syncing.log_path(),
-        "consecutive_failures=1",
-        Duration::from_secs(20),
-    )
-    .await;
-    assert!(logs.contains("preserving failure streak until stable"));
+    wait_for_retained_failure_streak(&syncing, flapping.url(), Duration::from_secs(20)).await;
 
     client.disconnect().await;
     syncing.stop().await;
