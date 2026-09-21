@@ -128,8 +128,8 @@ async fn publish_served_repo_for_identifier(
         .expect("send served state event");
 
     push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id).expect("push served repo data");
-    wait_until_served(&client, announcement.id).await;
-    wait_until_served(&client, state_event.id).await;
+    wait_until_served(client, announcement.id).await;
+    wait_until_served(client, state_event.id).await;
 
     assert!(
         client
@@ -205,8 +205,8 @@ async fn publish_served_repo_for_identifier_with_maintainers(
 
     push_to_relay(temp_dir.path(), &relay_domain, &npub, repo_id)
         .expect("push served repo data with maintainers");
-    wait_until_served(&client, announcement.id).await;
-    wait_until_served(&client, state_event.id).await;
+    wait_until_served(client, announcement.id).await;
+    wait_until_served(client, state_event.id).await;
 
     assert!(
         client
