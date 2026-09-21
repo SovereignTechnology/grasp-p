@@ -1216,10 +1216,12 @@ mod tests {
         // render() recounts from disk)
         let output = metrics.render();
         assert!(output.contains("ngit_repositories_total 0"));
-        assert!(output.contains("process_cpu_seconds_total"));
-        assert!(output.contains("process_resident_memory_bytes"));
         #[cfg(target_os = "linux")]
         {
+            // ProcessCollector is registered only on Linux, just like the
+            // cgroup collectors below. Repository metrics are portable.
+            assert!(output.contains("process_cpu_seconds_total"));
+            assert!(output.contains("process_resident_memory_bytes"));
             if let Some(directory) = cgroup_v2_directory() {
                 if cgroup_cpu_seconds(&directory).is_some() {
                     assert!(output.contains("ngit_cgroup_cpu_seconds_total"));
