@@ -37,17 +37,16 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return;
+    tokio::time::timeout(timeout, async {
+        loop {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{description} did not hold within {timeout:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{description} did not hold within {timeout:?}"));
 }
 
 /// Wait until the relay serves `event_id`, bounded by

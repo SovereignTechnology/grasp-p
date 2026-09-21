@@ -56,3 +56,18 @@ async fn flapping_relay_closes_connections_on_stop() {
 async fn setup_drop_relay_closes_connections_on_stop() {
     check_shutdown!(SetupDropRelay::start().await);
 }
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "stalled query did not hold within")]
+async fn observable_wait_deadline_cancels_a_stalled_query() {
+    // The outer timer makes a missing inner deadline fail deterministically
+    // rather than hanging this regression. Paused time avoids a wall-clock wait.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        common::wait_for("stalled query", Duration::from_secs(10), || {
+            std::future::pending::<bool>()
+        }),
+    )
+    .await
+    .expect("wait helper failed to enforce its own deadline");
+}
