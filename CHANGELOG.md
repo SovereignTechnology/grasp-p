@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce relay policy-refusal pauses for queued sync and mailbox requests.
+  Stop historic batch admission at the first failure, release started groups,
+  and keep partial coverage unconfirmed for recovery after the pause.
+
 ## [3.0.4] - 2026-09-21
 
 ### Fixed

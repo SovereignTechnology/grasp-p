@@ -22,7 +22,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::health::{RelayHealthTracker, RATE_LIMIT_COOLDOWN_SECS};
-use super::{is_filter_count_refusal, is_rate_limit_message, subscription_state_byte_limit};
+use super::{
+    is_filter_count_refusal, is_rate_limit_message, policy_refusal, subscription_state_byte_limit,
+    PolicyRefusal,
+};
 use crate::nostr::SharedDatabase;
 use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSource};
 
@@ -652,6 +655,12 @@ impl RelayConnection {
         if self.health_tracker.is_rate_limited(&self.url) {
             return Err(format!(
                 "Query start deferred for {}: rate-limit cooldown active",
+                self.url
+            ));
+        }
+        if self.health_tracker.is_subscription_paused(&self.url) {
+            return Err(format!(
+                "Query start deferred for {}: relay policy cooldown active",
                 self.url
             ));
         }
@@ -1756,6 +1765,20 @@ impl RelayConnection {
                             message,
                         } => {
                             terminal_connection.record_subscription_rate_limit(&message);
+                            // Mailbox fetches and queued requests can outlive
+                            // the manager turn. Pause them on the control lane
+                            // before releasing the refused request's capacity.
+                            // Filter regrouping and the one NIP-42 retry remain
+                            // manager-owned recovery decisions.
+                            if !is_auth_required_message(&message)
+                                && policy_refusal(&message).is_some_and(|category| {
+                                    category != PolicyRefusal::FilterIncompatible
+                                })
+                            {
+                                terminal_connection
+                                    .health_tracker
+                                    .record_policy_refusal(&terminal_connection.url);
+                            }
                             let subscription_id = subscription_id.into_owned();
                             // An auth-required CLOSED is only a retry signal
                             // when an authenticator can actually answer the
@@ -1765,7 +1788,7 @@ impl RelayConnection {
                                 || !is_auth_required_message(&message)
                             {
                                 terminal_connection
-                                    .retire_peer_closed_subscription(&subscription_id)
+                                    .retire_subscription(&subscription_id)
                                     .await;
                             }
                         }
@@ -2374,9 +2397,9 @@ impl RelayConnection {
                 .contains_key(subscription_id)
     }
 
-    async fn retire_peer_closed_subscription(&self, subscription_id: &SubscriptionId) {
-        self.release_transient_req_permit(subscription_id);
-        // A peer CLOSED is terminal for this subscription. In particular,
+    pub(super) async fn retire_subscription(&self, subscription_id: &SubscriptionId) {
+        // A peer CLOSED or interrupted batch is terminal for this subscription.
+        // Keep its slot until CLOSE is queued when retiring local work. In particular,
         // rust-nostr retains auth-required REQs when an authenticator is
         // configured so it can retry them after NIP-42. SyncManager owns all
         // deliberate recovery, therefore keeping that desired entry lets SDK
@@ -2390,6 +2413,7 @@ impl RelayConnection {
                 "Failed to retire peer-closed subscription"
             );
         }
+        self.release_transient_req_permit(subscription_id);
     }
 
     pub(super) async fn retire_auth_refused_subscription(&self, subscription_id: &SubscriptionId) {
@@ -3460,9 +3484,7 @@ mod tests {
             .expect("one live subscription");
         assert_eq!(connection.subscription_count().await, 1);
 
-        connection
-            .retire_peer_closed_subscription(&subscription_id)
-            .await;
+        connection.retire_subscription(&subscription_id).await;
 
         assert_eq!(
             connection.subscription_count().await,
@@ -3476,10 +3498,19 @@ mod tests {
 
     #[tokio::test]
     async fn notice_cooldown_rejects_queued_requests_before_sdk_send() {
+        queued_cooldown_wire_regression(false).await;
+    }
+
+    #[tokio::test]
+    async fn policy_cooldown_rejects_queued_requests_before_sdk_send() {
+        queued_cooldown_wire_regression(true).await;
+    }
+
+    async fn queued_cooldown_wire_regression(policy: bool) {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
 
-        // Each request is polled into a known queue before a real wire NOTICE.
+        // Each request is polled into a known queue before a real wire refusal.
         // The processor queue stays full: only the control lane can pause it.
         for kind in [
             "historic",
@@ -3496,12 +3527,19 @@ mod tests {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
                 notice_rx.await.unwrap();
-                for message in ["queue blocker", "ERROR: too many concurrent REQs"] {
-                    ws.send(Message::Text(
-                        serde_json::json!(["NOTICE", message]).to_string().into(),
-                    ))
-                    .await
-                    .unwrap();
+                let refusal = if policy {
+                    serde_json::json!([
+                        "CLOSED",
+                        "refused-query",
+                        "blocked: this is a private relay"
+                    ])
+                } else {
+                    serde_json::json!(["NOTICE", "ERROR: too many concurrent REQs"])
+                };
+                for message in [serde_json::json!(["NOTICE", "queue blocker"]), refusal] {
+                    ws.send(Message::Text(message.to_string().into()))
+                        .await
+                        .unwrap();
                 }
                 let mut requests = 0;
                 while let Some(frame) = ws.next().await {
@@ -3600,7 +3638,7 @@ mod tests {
             );
             notice_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
-                while !health.is_rate_limited(&connection.url) {
+                while !health.is_subscription_paused(&connection.url) {
                     tokio::task::yield_now().await;
                 }
             })
@@ -3618,7 +3656,7 @@ mod tests {
             let error = result
                 .expect("queued work must unwind")
                 .expect_err("cooldown must prevent send");
-            assert!(error.contains("rate-limit cooldown"), "{kind}: {error}");
+            assert!(error.contains("cooldown"), "{kind}: {error}");
             assert_eq!(
                 connection
                     .nip77_transient_failures
@@ -3649,6 +3687,21 @@ mod tests {
                 request_rx.try_recv().is_err(),
                 "no request sent during cooldown"
             );
+            if policy {
+                // Policy expiry itself is covered by the health tracker test.
+                // Here the full wire exchange must contain no new request.
+                connection.disconnect().await;
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), server)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0,
+                    "policy-refused work must never reach the wire ({kind})"
+                );
+                event_loop.abort();
+                continue;
+            }
             health.clear_rate_limit(&connection.url);
             connection
                 .subscribe_live_filter_groups(vec![vec![Filter::new().kind(Kind::TextNote)]])

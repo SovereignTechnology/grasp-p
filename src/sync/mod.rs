@@ -8808,13 +8808,20 @@ impl SyncManager {
                             .insert(subscription_id, PaginationState::new(filter_group));
                     }
                     Err(error) => {
-                        tracing::error!(
-                            relay = %relay_url,
-                            batch_id,
-                            group_idx,
-                            error = %error,
-                            "Failed to subscribe to filter in historic_sync"
-                        );
+                        if self.health_tracker.is_subscription_paused(relay_url) {
+                            tracing::debug!(relay = %relay_url, batch_id, group_idx,
+                                %error, "Historic batch deferred during subscription pause");
+                        } else {
+                            tracing::warn!(relay = %relay_url, batch_id, group_idx,
+                                %error, "Historic batch interrupted during admission");
+                        }
+                        // A partial set cannot prove coverage for this batch.
+                        // Release started work and let the normal missing-item
+                        // recovery retry the complete set after admission opens.
+                        for subscription_id in &subscription_ids {
+                            connection.retire_subscription(subscription_id).await;
+                        }
+                        return (HashSet::new(), HashMap::new());
                     }
                 }
             }
@@ -8879,6 +8886,9 @@ impl SyncManager {
         purpose: PendingBatchPurpose,
         force_req_eose: bool,
     ) -> Option<u64> {
+        if self.health_tracker.is_subscription_paused(relay_url) {
+            return None;
+        }
         // DEBUG TRACING: Log all filters being passed to historic_sync
         tracing::debug!(
             relay = %relay_url,
@@ -9181,9 +9191,9 @@ impl SyncManager {
                 .await;
 
             if subscription_ids.is_empty() && !filters_with_since.is_empty() {
-                tracing::warn!(
+                tracing::debug!(
                     relay = %relay_url,
-                    "All filter subscriptions failed in historic_sync"
+                    "Historic batch was not fully admitted; leaving coverage unconfirmed"
                 );
                 return None;
             }
@@ -9271,6 +9281,157 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interrupted_historic_admission_does_not_confirm_partial_coverage() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let git_path = PathBuf::from(&config.git_data_path);
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut manager = SyncManager::new(
+            None,
+            "service.example".into(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path,
+            None,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let health = manager.health_tracker.clone();
+        let server_url = url.clone();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut complete_tx = Some(complete_tx);
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut count = 0;
+            while let Some(Ok(frame)) = ws.next().await {
+                if frame.is_close() {
+                    break;
+                }
+                if !frame.is_text() {
+                    continue;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if request[0] == "REQ" {
+                    count += 1;
+                    if count == 4 {
+                        complete_tx.take().unwrap().send(()).unwrap();
+                    }
+                    if count == 1 {
+                        // The only ledger slot stays occupied until this pause
+                        // is visible. Later groups cannot race past it.
+                        health.record_rate_limit(&server_url);
+                    }
+                    ws.send(Message::Text(
+                        serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            }
+            count
+        });
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server_guard = AbortOnDrop(server.abort_handle());
+        let connection = RelayConnection::new(
+            url.clone(),
+            None,
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        )
+        .with_health_tracker(manager.health_tracker.clone());
+        connection.connect(3).await.unwrap();
+        connection.reset_subscription_budget(Some(3)); // One usable slot.
+        connection.reduce_max_filters_per_req(2); // One filter per group.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let event_loop = tokio::spawn(connection.clone().run_event_loop(tx));
+        let _event_guard = AbortOnDrop(event_loop.abort_handle());
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let _drain_guard = AbortOnDrop(drain.abort_handle());
+        manager.connections.insert(url.clone(), connection.clone());
+        let filters: Vec<_> = (1..=3)
+            .map(|n| Filter::new().kind(Kind::Custom(n)))
+            .collect();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.historic_sync_with_options(
+                &url,
+                filters.clone(),
+                PendingItems::default(),
+                None,
+                PendingBatchPurpose::Announcements,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "partial admission cannot create a confirmable batch"
+        );
+        assert!(manager.pending_sync_index.read().await.get(&url).is_none());
+        assert_eq!(connection.subscription_count().await, 0);
+
+        manager.health_tracker.clear_rate_limit(&url);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.historic_sync_with_options(
+                &url,
+                filters,
+                PendingItems::default(),
+                None,
+                PendingBatchPurpose::Announcements,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_some(),
+            "all groups must remain retryable after the pause"
+        );
+        tokio::time::timeout(Duration::from_secs(3), complete_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        connection.disconnect().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            4
+        );
+    }
 
     /// Seed both repositories before driving maintenance: sequential network
     /// publication can straddle ticks and leave their retry deadlines offset.

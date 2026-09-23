@@ -752,6 +752,13 @@ is deliberately historical-only: owning or maintaining a repository never adds
 that author's inbox relays to ordinary persistent live repository targets.
 Private instances omit repository-coordinate mailbox expansion.
 
+The final connection admission check enforces both rate-limit and policy
+pauses, including work queued by mailbox workers. Definitive policy CLOSED
+responses update the shared pause on the independent control stream, without
+waiting for event processing. Historic batches interrupted during admission
+retire their started subscriptions and leave the complete set unconfirmed for
+later recovery; completing a subset is not evidence of complete coverage.
+
 Discovery source and mailbox scope also own connection retry state. The empty
 relay checker and reconnect scheduler include that scope, including in-flight
 fetches and future probe deadlines, without adding persistent subscriptions.

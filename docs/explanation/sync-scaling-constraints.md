@@ -503,7 +503,9 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   IDs as metric labels. Live subscriptions are ledgered first, so NEG,
   transient REQ,
   and purgatory exact-ID polling share only the remaining capacity.
-- The scheduler and outbound connection share the relay's rate-limit state.
+- The scheduler and outbound connection share the relay's rate-limit and
+  policy-refusal state. Definitive blocked/restricted CLOSED responses pause
+  admission on the control stream too, including participant mailbox fetches.
   NOTICE and rate-limited CLOSED messages update that state on the independent
   control stream, even when event delivery to the processor is blocked. New
   work checks it before pacing, then checks again after pacing and capacity
@@ -514,6 +516,10 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   recovery paths rather than activating this generic cooldown. Requests
   already handed to the SDK and SDK-owned protocol continuations are not
   cancelled by this check; existing live subscriptions remain open.
+  Historic group admission stops at the first failure and retires any groups
+  already started. A partial set never becomes a confirmable batch: the whole
+  set remains eligible for ordinary recovery after the pause. Expected local
+  deferrals are debug messages, rather than one error per remaining group.
   Negentropy's separate transient-failure cooldown still directs later rounds
   to the budget-accounted REQ+EOSE fallback.
 - The reactive machinery (escalating cooldown, rate-limit detection in both
