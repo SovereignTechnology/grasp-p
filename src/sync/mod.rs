@@ -1811,6 +1811,7 @@ fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
     }
     let message = message.to_ascii_lowercase();
     if message.contains("unsupported filter")
+        || message.contains("filter item too large")
         || message.contains("filter validation failed")
         || message.contains("unsupported: invalid filters")
         || message.contains("filter 'limit' must be a positive integer")
@@ -8097,7 +8098,9 @@ impl SyncManager {
             return;
         }
 
-        if policy_refusal(reason) == Some(PolicyRefusal::FilterIncompatible) {
+        // Only a filter-count refusal can be repaired by regrouping.
+        // Invalid individual filters remain invalid even in one-filter REQs.
+        if is_filter_count_refusal(reason) {
             let pending_filter_count = {
                 let pending = self.pending_sync_index.read().await;
                 pending.get(relay_url).and_then(|batches| {
@@ -10988,6 +10991,86 @@ mod tests {
         assert!(!is_rate_limit_message("blocked: unsupported filter"));
     }
 
+    #[tokio::test]
+    async fn oversized_filter_parks_retries_without_learning_a_filter_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        config.sync_disable_negentropy = true;
+        config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let git_path = PathBuf::from(&config.git_data_path);
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut manager = SyncManager::new(
+            None,
+            "service.example".into(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path,
+            None,
+            None,
+            None,
+        );
+
+        let url = "wss://limited.example";
+        let connection = RelayConnection::new(
+            url.into(),
+            None,
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        let limit = connection.max_filters_per_req();
+        let generation = connection.current_subscription_generation();
+        manager.connections.insert(url.into(), connection.clone());
+        let id = SubscriptionId::new("oversized-filter");
+        manager.pending_sync_index.write().await.insert(
+            url.into(),
+            vec![PendingBatch {
+                batch_id: 1,
+                purpose: PendingBatchPurpose::Core,
+                items: PendingItems::default(),
+                outstanding_subs: HashSet::from([id.clone()]),
+                sync_method: SyncMethod::ReqEose,
+                pagination_state: HashMap::new(),
+                requested_event_ids: None,
+                received_event_ids: None,
+                initial_hydration_counts: None,
+                retry_count: 0,
+                failed: false,
+            }],
+        );
+        manager
+            .handle_subscription_closed(
+                url,
+                id,
+                "ERROR: bad req: error parsing #a: filter item too large",
+                Some(generation),
+                Some(8),
+            )
+            .await;
+        assert!(manager.health_tracker.is_subscription_paused(url));
+        assert_eq!(
+            connection.max_filters_per_req(),
+            limit,
+            "splitting groups cannot repair an oversized individual filter"
+        );
+        assert!(!manager.has_pending_batches(url).await);
+        manager.shutdown().await;
+    }
+
     #[test]
     fn policy_refusal_classifier_uses_bounded_categories() {
         assert_eq!(
@@ -11017,6 +11100,9 @@ mod tests {
         );
         for reason in [
             "unsupported: invalid filters",
+            "ERROR: bad req: error parsing #a: filter item too large",
+            "ERROR: bad req: error parsing #A: filter item too large",
+            "ERROR: bad req: error parsing #q: filter item too large",
             "invalid: Filter 'limit' must be a positive integer, got 0",
         ] {
             assert_eq!(

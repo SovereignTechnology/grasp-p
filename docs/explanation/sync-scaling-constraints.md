@@ -83,7 +83,7 @@ sizing nor the pagination model can be negotiated reliably; both need
 conservative defaults, observation, and reactive fallback.
 
 The reactive filter-count fallback is session-local. An explicit
-filter-validation refusal for a multi-filter REQ geometrically lowers that
+filter-count refusal for a multi-filter REQ geometrically lowers that
 connection's grouping ceiling (`10 → 5 → 2 → 1`, or from the actual rejected
 group size) and re-derives the rejected historic batch or complete live
 coverage without parsing arbitrary response numbers. This matters because
@@ -91,8 +91,10 @@ strfry reports the submitted count (`invalid number of filters: 8`), whereas
 rust-nostr reports its configured ceiling. The learned ceiling never rises in
 the session and resets on reconnect. A one-filter refusal is not recoverable
 by regrouping and uses the ordinary long `filter_incompatible` policy pause.
-Explicit invalid-filter and positive-limit-only refusals use that same policy
-pause for core coverage, rather than repeating an unchanged filter after each
+Explicit invalid-filter, oversized-filter-item, and positive-limit-only
+refusals use that same policy pause for core coverage, even when the rejected
+REQ contains multiple filters. Splitting a group cannot repair an invalid
+individual filter. This avoids repeating an unchanged filter after each
 short rate-limit cooldown. Refused auxiliary descendant live coverage retains
 its existing historical fallback.
 
