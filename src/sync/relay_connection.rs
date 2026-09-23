@@ -625,6 +625,9 @@ pub struct RelayConnection {
     /// Permits held by open transient subscriptions, keyed by subscription
     /// id; released on EOSE/CLOSED, connection teardown, or the watchdog
     transient_req_permits_held: TransientReqPermitMap,
+    timeout_sender: std::sync::Arc<
+        std::sync::Mutex<Option<mpsc::Sender<super::SubscriptionClosedNotification>>>,
+    >,
     /// Ledger slots held for persistent subscriptions until CLOSE/teardown.
     live_req_permits_held: LiveReqPermitMap,
     /// Cumulative retained REQ bytes learned from a relay's CLOSED response.
@@ -812,6 +815,7 @@ impl RelayConnection {
             transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            timeout_sender: Default::default(),
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -887,6 +891,7 @@ impl RelayConnection {
             transient_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            timeout_sender: Default::default(),
             live_req_permits_held: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -2206,7 +2211,9 @@ impl RelayConnection {
                         .expect("transient subscription has a pre-registered id"),
                 )
                 .close_on(
-                    SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE),
+                    SubscribeAutoCloseOptions::default()
+                        .exit_policy(ReqExitPolicy::ExitOnEOSE)
+                        .timeout(Some(TRANSIENT_REQ_PERMIT_TIMEOUT)),
                 )
                 .await
         } else {
@@ -2421,6 +2428,26 @@ impl RelayConnection {
         // deliberate recovery, therefore keeping that desired entry lets SDK
         // retries bypass our cooldowns and grow the registry with every
         // replacement generation.
+        // SDK unsubscribe only removes persistent subscriptions. Explicitly
+        // close transient siblings when aborting a batch; their SDK entries
+        // expire at the configured auto-close deadline.
+        let transient = self
+            .transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .contains_key(subscription_id);
+        if transient {
+            if let Ok(Some(relay)) = self.client.relay(&self.url).await {
+                if let Err(error) = relay
+                    .send_msg(ClientMessage::close(subscription_id.clone()))
+                    .await
+                {
+                    tracing::debug!(relay = %self.url, %subscription_id, %error,
+                        "Failed to close retired transient subscription");
+                    return;
+                }
+            }
+        }
         if let Err(error) = self.client.unsubscribe(subscription_id).await {
             tracing::debug!(
                 relay = %self.url,
@@ -2468,80 +2495,90 @@ impl RelayConnection {
     /// Register a held transient-REQ permit for `sub_id` and start its
     /// watchdog.
     fn hold_transient_req_permit(&self, sub_id: SubscriptionId, permit: HeldTransientPermits) {
+        let generation = permit.generation;
         self.transient_req_permits_held
             .lock()
             .expect("transient permit map poisoned")
             .insert(sub_id.clone(), permit);
-
-        // A timed-out REQ is closed individually. NIP-01 defines CLOSE as the
-        // client-side end of a subscription, so a successfully enqueued CLOSE
-        // is the accounting boundary after which this one slot can be reused.
-        // If CLOSE cannot be sent, retain the permit until ordinary connection
-        // teardown clears it; local capacity must not run ahead of the relay.
-        let held = std::sync::Arc::clone(&self.transient_req_permits_held);
-        let client = self.client.clone();
-        let url = self.url.clone();
-        let relay_url = self.url.clone();
+        let connection = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(TRANSIENT_REQ_PERMIT_TIMEOUT).await;
-            let held_request = held
-                .lock()
-                .expect("transient permit map poisoned")
-                .get(&sub_id)
-                .map(|permits| (permits.generation, permits.request_class));
-            if let (Some((generation, request_class)), Ok(Some(relay))) =
-                (held_request, client.relay(&url).await)
-            {
-                let sdk_subscription_active = relay.subscription(&sub_id).await.is_some();
-                let diagnostic = held
-                    .lock()
-                    .expect("transient permit map poisoned")
-                    .get(&sub_id)
-                    .filter(|permits| permits.generation == generation)
-                    .map(|permits| {
-                        (
-                            permits.delivered_events,
-                            permits.opened_at.elapsed().as_secs(),
-                            permits.last_event_at.map(|at| at.elapsed().as_secs()),
-                        )
-                    });
-                let (delivered_events, open_seconds, idle_seconds) =
-                    diagnostic.unwrap_or((0, TRANSIENT_REQ_PERMIT_TIMEOUT.as_secs(), None));
-                if relay
-                    .send_msg(ClientMessage::close(sub_id.clone()))
-                    .await
-                    .is_ok()
-                {
-                    Self::release_transient_req_permit_for_generation(&held, &sub_id, generation);
-                    tracing::warn!(
-                        relay = %relay_url,
-                        sub_id = %sub_id,
-                        request_class = request_class.as_str(),
-                        sdk_subscription_active,
-                        delivered_events,
-                        open_seconds,
-                        idle_seconds,
-                        "Transient REQ watchdog sent CLOSE after missing EOSE/CLOSED"
-                    );
-                    crate::metrics::record_transient_req_watchdog(request_class.as_str(), "closed");
-                } else {
-                    tracing::warn!(
-                        relay = %relay_url,
-                        sub_id = %sub_id,
-                        request_class = request_class.as_str(),
-                        sdk_subscription_active,
-                        delivered_events,
-                        open_seconds,
-                        idle_seconds,
-                        "Transient REQ watchdog could not send CLOSE; retaining subscription slot"
-                    );
-                    crate::metrics::record_transient_req_watchdog(
-                        request_class.as_str(),
-                        "close_failed",
-                    );
-                }
-            }
+            connection
+                .expire_transient_request(sub_id, generation)
+                .await;
         });
+    }
+
+    pub(super) fn set_timeout_sender(
+        &self,
+        sender: mpsc::Sender<super::SubscriptionClosedNotification>,
+    ) {
+        *self.timeout_sender.lock().expect("timeout sender poisoned") = Some(sender);
+    }
+
+    async fn expire_transient_request(&self, sub_id: SubscriptionId, generation: u64) {
+        let diagnostic = self
+            .transient_req_permits_held
+            .lock()
+            .expect("transient permit map poisoned")
+            .get(&sub_id)
+            .filter(|held| held.generation == generation)
+            .map(|held| {
+                (
+                    held.request_class,
+                    held.delivered_events,
+                    held.opened_at.elapsed().as_secs(),
+                    held.last_event_at.map(|at| at.elapsed().as_secs()),
+                )
+            });
+        let Some((request_class, delivered_events, open_seconds, idle_seconds)) = diagnostic else {
+            return;
+        };
+        let Ok(Some(relay)) = self.client.relay(&self.url).await else {
+            return;
+        };
+        let sdk_subscription_active = relay.subscription(&sub_id).await.is_some();
+        // SDK unsubscribe deliberately ignores auto-closing subscriptions.
+        // Their explicit close_on timeout retires the SDK registry entry;
+        // this CLOSE is the local ledger boundary, even if SDK cleanup races it.
+        if let Err(error) = relay.send_msg(ClientMessage::close(sub_id.clone())).await {
+            tracing::warn!(relay = %self.url, %sub_id, %error,
+                "Transient REQ watchdog could not send CLOSE; retaining subscription slot");
+            crate::metrics::record_transient_req_watchdog(request_class.as_str(), "close_failed");
+            return;
+        }
+        // A real EOSE/CLOSED or session reset may have won while CLOSE awaited
+        // the sender. Never turn its successful completion into a timeout.
+        if !Self::release_transient_req_permit_for_generation(
+            &self.transient_req_permits_held,
+            &sub_id,
+            generation,
+        ) {
+            return;
+        }
+        tracing::warn!(relay = %self.url, %sub_id, request_class = request_class.as_str(),
+            sdk_subscription_active, delivered_events, open_seconds, idle_seconds,
+            "Transient REQ watchdog retired timed-out request");
+        crate::metrics::record_transient_req_watchdog(request_class.as_str(), "closed");
+        let sender = self
+            .timeout_sender
+            .lock()
+            .expect("timeout sender poisoned")
+            .clone();
+        if let Some(sender) = sender {
+            // Capacity is released before bounded actor backpressure. This is
+            // a failed terminal, never a synthetic successful EOSE.
+            let _ = sender
+                .send(super::SubscriptionClosedNotification {
+                    relay_url: self.url.clone(),
+                    subscription_id: sub_id,
+                    reason: "local request timeout".into(),
+                    generation: Some(generation),
+                    live_filter_count: None,
+                    timed_out: true,
+                })
+                .await;
+        }
     }
 
     fn record_transient_req_event(&self, sub_id: &SubscriptionId) {
@@ -4549,6 +4586,82 @@ mod tests {
             .try_acquire_many_owned(8)
             .expect("CLOSED must make the complete live budget re-admittable");
         drop(full_capacity);
+    }
+
+    #[tokio::test]
+    async fn watchdog_retires_sdk_subscription_and_reports_failed_terminal() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (wire_tx, mut wire_rx) = mpsc::channel(16);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(frame)) = ws.next().await {
+                match frame {
+                    Message::Text(text) => {
+                        let _ = wire_tx.send(text.to_string()).await;
+                    }
+                    Message::Ping(bytes) => {
+                        let _ = ws.send(Message::Pong(bytes)).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+        let connection = permissive_connection(&url, Keys::generate());
+        connection.connect(3).await.unwrap();
+        let (tx, mut rx) = super::super::lifecycle_notification_channel();
+        connection.set_timeout_sender(tx);
+        let id = connection
+            .subscribe_filter(
+                Filter::new().kind(Kind::GitIssue),
+                TransientRequestClass::HistoricPage,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !wire_rx.recv().await.unwrap().contains("REQ") {}
+        })
+        .await
+        .unwrap();
+        let generation = connection.current_subscription_generation();
+        connection
+            .expire_transient_request(id.clone(), generation.wrapping_add(1))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale timer must not close a current request"
+        );
+        assert!(connection.holds_subscription_permit(&id));
+        let relay = connection.client.relay(&url).await.unwrap().unwrap();
+        assert!(relay.subscription(&id).await.is_some());
+
+        // Time itself is the behavior under test; no two-minute wall-clock wait.
+        tokio::time::pause();
+        tokio::time::advance(TRANSIENT_REQ_PERMIT_TIMEOUT + Duration::from_secs(1)).await;
+        let notification = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(notification.timed_out);
+        assert_eq!(notification.subscription_id, id);
+        assert_eq!(notification.generation, Some(generation));
+        assert!(!connection.holds_subscription_permit(&id));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while relay.subscription(&id).await.is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("SDK auto-close timeout must remove the subscription registry entry");
+        connection.expire_transient_request(id, generation).await;
+        assert!(rx.try_recv().is_err(), "retirement must be idempotent");
+        tokio::time::resume();
+        connection.disconnect().await;
+        server.abort();
     }
 
     #[tokio::test]

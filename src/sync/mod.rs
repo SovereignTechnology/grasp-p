@@ -1730,12 +1730,13 @@ pub struct EoseNotification {
 }
 
 #[derive(Debug)]
-struct SubscriptionClosedNotification {
+pub(super) struct SubscriptionClosedNotification {
     relay_url: String,
     subscription_id: SubscriptionId,
     reason: String,
     generation: Option<u64>,
     live_filter_count: Option<usize>,
+    timed_out: bool,
 }
 
 // One global actor consumes terminal state changes from every outbound relay.
@@ -4114,6 +4115,19 @@ impl SyncManager {
                 closed = subscription_closed_rx.recv() => {
                     if let Some(notification) = closed {
                         let mut manager = sync_manager.lock().await;
+                        if notification.timed_out {
+                            manager.handle_request_timeout(notification).await;
+                            continue;
+                        }
+                        // The per-relay forwarder queues EOSE before a later
+                        // CLOSED, but these inboxes are selected independently.
+                        // Apply queued successes first so a CLOSE acknowledgement
+                        // cannot abort an already completed historic request.
+                        let queued_eose = eose_rx.len();
+                        for _ in 0..queued_eose {
+                            let Ok(eose) = eose_rx.try_recv() else { break };
+                            manager.handle_eose(&eose.relay_url, eose.sub_id).await;
+                        }
                         manager.handle_subscription_closed(
                             &notification.relay_url,
                             notification.subscription_id,
@@ -4375,6 +4389,7 @@ impl SyncManager {
             }
         };
 
+        connection.set_timeout_sender(self.subscription_closed_tx.as_ref().unwrap().clone());
         let (event_tx, mut event_rx) =
             mpsc::channel::<RelayEvent>(relay_connection::RELAY_EVENT_BUFFER_CAPACITY);
 
@@ -4639,6 +4654,7 @@ impl SyncManager {
                                 reason,
                                 generation: live_generation,
                                 live_filter_count,
+                                timed_out: false,
                             })
                             .await;
                     }
@@ -7882,6 +7898,45 @@ impl SyncManager {
         }
     }
 
+    async fn handle_request_timeout(&mut self, notification: SubscriptionClosedNotification) {
+        let Some(connection) = self.connections.get(&notification.relay_url).cloned() else {
+            return;
+        };
+        if notification.generation != Some(connection.current_subscription_generation()) {
+            return;
+        }
+        self.retire_incomplete_request_batch(
+            &notification.relay_url,
+            &notification.subscription_id,
+        )
+        .await;
+    }
+
+    async fn retire_incomplete_request_batch(
+        &mut self,
+        relay_url: &str,
+        subscription_id: &SubscriptionId,
+    ) {
+        let Some(connection) = self.connections.get(relay_url).cloned() else {
+            return;
+        };
+        let batch = {
+            let mut pending = self.pending_sync_index.write().await;
+            take_batch_containing_subscription(&mut pending, relay_url, subscription_id)
+        };
+        let Some(batch) = batch else {
+            return;
+        };
+        self.release_removed_descendant_batch(relay_url, &batch);
+        for id in &batch.outstanding_subs {
+            connection.retire_subscription(id).await;
+        }
+        // Leave the items unconfirmed: the regular coverage reconciler can
+        // retry them. A watchdog provides no evidence of complete history.
+        tracing::warn!(relay = %relay_url, batch_id = batch.batch_id,
+            "Historic request ended without EOSE; retired its incomplete batch");
+    }
+
     async fn handle_subscription_closed(
         &mut self,
         relay_url: &str,
@@ -8129,6 +8184,11 @@ impl SyncManager {
                 reason,
                 "Unexpected live subscription closure; deferring one repair attempt until cooldown"
             );
+        } else {
+            // Includes CLOSED acknowledging the SDK deadline before our local
+            // watchdog fires. EOSE already removes successful wire IDs.
+            self.retire_incomplete_request_batch(relay_url, &subscription_id)
+                .await;
         }
     }
 
@@ -8962,11 +9022,12 @@ mod tests {
                 .insert(url.clone(), RelayState::default());
             urls.push(url);
         }
+        let mut stalled_sub = None;
         tokio::time::timeout(Duration::from_secs(5), async {
             manager.handle_connect_or_reconnect(&urls[0]).await;
             loop {
-                let (number, live, _) = observed_rx.recv().await.unwrap();
-                if number == 0 && !live { break; }
+                let (number, live, id) = observed_rx.recv().await.unwrap();
+                if number == 0 && !live { stalled_sub = Some(SubscriptionId::new(id)); break; }
             }
             // Admission now waits for relay A's occupied history slot. That
             // wait must not be inherited by the caller or another connection.
@@ -9006,6 +9067,49 @@ mod tests {
         }).await.expect("relay B live coverage and history must not wait for relay A");
         assert!(!manager.relay_sync_index.read().await[&urls[0]].announcements_synced);
         assert!(!manager.pending_sync_index.read().await[&urls[0]].is_empty());
+        let generation = manager.connections[&urls[0]].current_subscription_generation();
+        let notification = |generation| SubscriptionClosedNotification {
+            relay_url: urls[0].clone(),
+            subscription_id: stalled_sub.clone().unwrap(),
+            reason: "local request timeout".into(),
+            generation: Some(generation),
+            live_filter_count: None,
+            timed_out: true,
+        };
+        manager
+            .handle_request_timeout(notification(generation.wrapping_add(1)))
+            .await;
+        assert!(manager.pending_sync_index.read().await[&urls[0]]
+            .iter()
+            .any(|batch| batch.purpose == PendingBatchPurpose::Announcements));
+        manager
+            .handle_request_timeout(notification(generation))
+            .await;
+        assert!(!manager.pending_sync_index.read().await[&urls[0]]
+            .iter()
+            .any(|batch| batch.purpose == PendingBatchPurpose::Announcements));
+        assert!(!manager.relay_sync_index.read().await[&urls[0]].announcements_synced);
+        assert!(manager.relay_sync_index.read().await[&urls[1]].announcements_synced);
+        // An SDK timeout can receive CLOSED before our watchdog wakes. That
+        // terminal must retire pending work too, without claiming coverage.
+        let closed_id = SubscriptionId::new("sdk-timeout-closed");
+        let mut batch = manager.pending_sync_index.read().await[&urls[0]][0].clone();
+        batch.outstanding_subs = HashSet::from([closed_id.clone()]);
+        manager
+            .pending_sync_index
+            .write()
+            .await
+            .insert(urls[0].clone(), vec![batch]);
+        manager
+            .handle_subscription_closed(&urls[0], closed_id, "closed", None, None)
+            .await;
+        assert!(manager
+            .pending_sync_index
+            .read()
+            .await
+            .get(&urls[0])
+            .is_none_or(Vec::is_empty));
+        assert!(!manager.relay_sync_index.read().await[&urls[0]].announcements_synced);
         manager.shutdown().await;
         assert!(manager.pending_sync_index.read().await.is_empty());
         servers.abort_all();

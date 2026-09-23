@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retire incomplete historic batches when transient requests time out or close
+  before EOSE, and bound SDK subscription retention with an auto-close deadline.
+
 - Keep slow history reconciliation and paced requests out of the shared sync
   actor so other relays establish live sync promptly, with bounded background
   history workers.

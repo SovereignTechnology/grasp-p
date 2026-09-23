@@ -366,7 +366,13 @@ timed-out subscription and releases only that subscription's generation-scoped
 slot after the SDK accepts the message; valid production startup pages exceeded
 30 seconds, while two minutes remains a bounded escape from a stuck
 subscription. If CLOSE cannot be enqueued, the slot remains held until ordinary
-connection teardown so local accounting cannot run ahead of the relay. Exact-ID
+connection teardown so local accounting cannot run ahead of the relay. The SDK
+auto-close deadline also removes transient registry entries: SDK unsubscribe
+alone only removes persistent subscriptions. A generation-checked timeout
+notification retires the pending batch, cancels its remaining admission work,
+and closes its other requests without confirming coverage. Unexpected transient
+CLOSED follows the same failure path; queued EOSE is processed first so a
+successful response followed by CLOSED still confirms normally. Exact-ID
 purgatory polling uses the same transient class bound and shared ledger as
 historic pagination. Transient subscription IDs and their permits are
 registered locally before the REQ is sent; this ordering is required because
