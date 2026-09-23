@@ -16,6 +16,7 @@ pub mod algorithms;
 pub mod discovery;
 pub mod filters;
 pub mod health;
+mod history;
 pub mod in_process_transport;
 pub mod metrics;
 pub mod missing_events;
@@ -1671,30 +1672,6 @@ pub struct PendingItems {
     pub root_events: HashSet<EventId>,
 }
 
-fn take_drained_batch_as_failed(
-    pending: &mut HashMap<String, Vec<PendingBatch>>,
-    relay_url: &str,
-    batch_id: u64,
-) -> Option<PendingBatch> {
-    let (batch_index, remove_relay) = {
-        let batches = pending.get(relay_url)?;
-        let batch_index = batches
-            .iter()
-            .position(|batch| batch.batch_id == batch_id)?;
-        if !batches[batch_index].outstanding_subs.is_empty() {
-            return None;
-        }
-        (batch_index, batches.len() == 1)
-    };
-
-    let mut batch = pending.get_mut(relay_url)?.remove(batch_index);
-    batch.failed = true;
-    if remove_relay {
-        pending.remove(relay_url);
-    }
-    Some(batch)
-}
-
 fn take_batch_containing_subscription(
     pending: &mut HashMap<String, Vec<PendingBatch>>,
     relay_url: &str,
@@ -1730,18 +1707,6 @@ fn register_negentropy_hydration_attempt(
     if is_retry {
         batch.retry_count += 1;
     }
-}
-
-fn mark_deferred_pagination(
-    batch: &mut PendingBatch,
-    completed_sub_id: &SubscriptionId,
-) -> SubscriptionId {
-    let deferred_sub_id = SubscriptionId::new(format!(
-        "deferred-pagination-{}-{completed_sub_id}",
-        batch.batch_id
-    ));
-    batch.outstanding_subs.insert(deferred_sub_id.clone());
-    deferred_sub_id
 }
 
 // =============================================================================
@@ -2702,6 +2667,8 @@ pub struct SyncManager {
     /// Shared bound for DNS and websocket handshakes.
     connect_attempt_semaphore: Arc<Semaphore>,
     connect_start_pacer: Arc<Mutex<Option<tokio::time::Instant>>>,
+    history_tasks: history::HistoryTasks,
+    history_result_tx: Option<tokio::sync::mpsc::Sender<history::HistoryResult>>,
     /// Relays whose subscription consolidation waits for in-flight batches to drain.
     deferred_consolidations: DeferredConsolidations,
     /// Relays whose complete persistent filter set exceeds a learned remote
@@ -2833,6 +2800,8 @@ impl SyncManager {
             in_flight_connect_attempts: HashMap::new(),
             connect_attempt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS)),
             connect_start_pacer: Arc::new(Mutex::new(None)),
+            history_tasks: history::HistoryTasks::default(),
+            history_result_tx: None,
             deferred_consolidations: DeferredConsolidations::default(),
             byte_limited_live_relays: HashMap::new(),
             descendant_sync_rotations: HashMap::new(),
@@ -2985,90 +2954,18 @@ impl SyncManager {
                     "Grouped subscription hit pagination threshold, fetching next page"
                 );
 
-                // A NOTICE can arrive immediately before this page's EOSE.
-                // Keep a sentinel in the batch and let a detached worker
-                // resume the exact grouped page after the cooldown.
-                if self.health_tracker.is_subscription_paused(relay_url) {
-                    let deferred_sub_id = mark_deferred_pagination(batch, &sub_id);
-                    drop(pending);
-
-                    let Some(connection) = self.connections.get(&relay_url_for_pagination).cloned()
-                    else {
-                        tracing::error!(
-                            relay = %relay_url_for_pagination,
-                            batch_id,
-                            "Cannot defer rate-limited pagination without a relay connection"
-                        );
-                        return;
-                    };
-                    Self::spawn_deferred_pagination(
-                        connection,
-                        self.health_tracker.clone(),
-                        self.pending_sync_index.clone(),
-                        relay_url_for_pagination,
-                        batch_id,
-                        deferred_sub_id,
-                        next_page,
-                    );
-                    return;
-                }
-
+                let new_sub_id = SubscriptionId::generate();
+                batch.outstanding_subs.insert(new_sub_id.clone());
+                let class = next_page.request_class();
+                batch.pagination_state.insert(new_sub_id.clone(), next_page);
                 drop(pending);
-
-                let mut next_page_started = false;
-                if let Some(conn) = self.connections.get(&relay_url_for_pagination) {
-                    match conn
-                        .subscribe_filters(next_filters.clone(), next_page.request_class())
-                        .await
-                    {
-                        Ok(new_sub_id) => {
-                            let mut pending = self.pending_sync_index.write().await;
-                            if let Some(batches) = pending.get_mut(&relay_url_for_pagination) {
-                                if let Some(batch) =
-                                    batches.iter_mut().find(|b| b.batch_id == batch_id)
-                                {
-                                    batch.outstanding_subs.insert(new_sub_id.clone());
-                                    next_page_started = true;
-                                    batch.pagination_state.insert(new_sub_id.clone(), next_page);
-                                    tracing::info!(
-                                        relay = %relay_url_for_pagination,
-                                        new_sub_id = %new_sub_id,
-                                        batch_id,
-                                        "Next grouped page subscription created"
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                relay = %relay_url_for_pagination,
-                                batch_id,
-                                error = %error,
-                                "Failed to create grouped pagination subscription"
-                            );
-                        }
-                    }
-                }
-
-                if !next_page_started {
-                    let completed_batch = {
-                        let mut pending = self.pending_sync_index.write().await;
-                        take_drained_batch_as_failed(
-                            &mut pending,
-                            &relay_url_for_pagination,
-                            batch_id,
-                        )
-                    };
-                    if let Some(batch) = completed_batch {
-                        tracing::warn!(
-                            relay = %relay_url_for_pagination,
-                            batch_id,
-                            "Pagination could not continue; completing drained batch as failed"
-                        );
-                        self.confirm_batch(&relay_url_for_pagination, batch).await;
-                    }
-                }
-
+                self.spawn_history_queries(
+                    &relay_url_for_pagination,
+                    batch_id,
+                    vec![(new_sub_id, next_filters, class)],
+                    true,
+                )
+                .await;
                 return;
             }
         }
@@ -3362,114 +3259,19 @@ impl SyncManager {
                         }
                     }
 
-                    let mut successful_subscriptions = 0usize;
-                    for (subscription_id, filter) in &retry_subscriptions {
-                        let result = if let Some(conn) = self.connections.get(&relay_url_for_retry)
-                        {
-                            conn.subscribe_filter_with_id(
-                                filter.clone(),
-                                TransientRequestClass::NegentropyRetry,
-                                subscription_id.clone(),
-                            )
-                            .await
-                        } else {
-                            Err("Relay connection disappeared before hydration retry".to_string())
-                        };
-                        match result {
-                            Ok(_) => successful_subscriptions += 1,
-                            Err(e) => {
-                                tracing::error!(
-                                    relay = %relay_url_for_retry,
-                                    batch_id = batch_id,
-                                    error = %e,
-                                    "Failed to create retry subscription for missing events"
-                                );
-                                let mut pending = self.pending_sync_index.write().await;
-                                if let Some(batch) =
-                                    pending.get_mut(&relay_url_for_retry).and_then(|batches| {
-                                        batches.iter_mut().find(|batch| batch.batch_id == batch_id)
-                                    })
-                                {
-                                    batch.outstanding_subs.remove(subscription_id);
-                                }
-                            }
-                        }
-                    }
-
-                    if successful_subscriptions > 0 {
-                        // Immediate EOSEs may have drained every successful
-                        // subscription before the final failed send unwound.
-                        // Complete that otherwise signal-less edge here.
-                        let mut pending = self.pending_sync_index.write().await;
-                        let completed_batch = take_drained_batch_as_failed(
-                            &mut pending,
-                            &relay_url_for_retry,
-                            batch_id,
-                        );
-                        let retry_attempt = pending
-                            .get(&relay_url_for_retry)
-                            .and_then(|batches| {
-                                batches.iter().find(|batch| batch.batch_id == batch_id)
+                    self.spawn_history_queries(
+                        &relay_url_for_retry,
+                        batch_id,
+                        retry_subscriptions
+                            .into_iter()
+                            .map(|(id, filter)| {
+                                (id, vec![filter], TransientRequestClass::NegentropyRetry)
                             })
-                            .map(|batch| batch.retry_count);
-                        drop(pending);
-                        if let Some(batch) = completed_batch {
-                            self.confirm_batch(&relay_url_for_retry, batch).await;
-                        }
-                        tracing::info!(
-                            relay = %relay_url_for_retry,
-                            batch_id = batch_id,
-                            retry_subs = successful_subscriptions,
-                            missing_events = missing.len(),
-                            retry_attempt = retry_attempt.unwrap_or(retry_count + 1),
-                            "Created retry subscriptions for missing negentropy events"
-                        );
-                        // Early return - batch not complete yet, waiting for retry EOSE
-                        return;
-                    } else {
-                        // Failed to create retry subscriptions. Finalize the
-                        // batch as failed (an incomplete batch must not be
-                        // reported as successfully complete) and keep the
-                        // missing IDs represented for bounded recovery.
-                        let relay_already_degraded = {
-                            let index = self.relay_sync_index.read().await;
-                            index
-                                .get(&relay_url_for_retry)
-                                .map(|state| state.historic_sync_had_failures)
-                                .unwrap_or(false)
-                        };
-                        let register_outcome =
-                            self.missing_event_recovery.lock().unwrap().register(
-                                &relay_url_for_retry,
-                                batch_id,
-                                missing.iter().copied(),
-                                relay_already_degraded,
-                                Instant::now(),
-                            );
-                        tracing::error!(
-                            relay = %relay_url_for_retry,
-                            batch_id = batch_id,
-                            missing_count = missing.len(),
-                            pending_recovery = register_outcome.pending_total,
-                            "Failed to retry missing events - confirming batch with partial results; bounded missing-event recovery scheduled"
-                        );
-
-                        // Re-acquire lock to extract the batch
-                        let mut pending = self.pending_sync_index.write().await;
-                        if let Some(batches) = pending.get_mut(&relay_url_for_retry) {
-                            if let Some(idx) = batches.iter().position(|b| b.batch_id == batch_id) {
-                                let mut completed_batch = batches.remove(idx);
-                                completed_batch.failed = true;
-                                if batches.is_empty() {
-                                    pending.remove(&relay_url_for_retry);
-                                }
-                                drop(pending);
-                                self.confirm_batch(&relay_url_for_retry, completed_batch)
-                                    .await;
-                            }
-                        }
-                        return;
-                    }
+                            .collect(),
+                        false,
+                    )
+                    .await;
+                    return;
                 }
             }
         }
@@ -3487,81 +3289,6 @@ impl SyncManager {
 
         // 4. Confirm the batch (moves items to RelayState)
         self.confirm_batch(relay_url, completed_batch).await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_deferred_pagination(
-        connection: RelayConnection,
-        health_tracker: Arc<RelayHealthTracker>,
-        pending_sync_index: PendingSyncIndex,
-        relay_url: String,
-        batch_id: u64,
-        deferred_sub_id: SubscriptionId,
-        next_page: PaginationState,
-    ) {
-        tokio::spawn(async move {
-            let next_filters = next_page.filters();
-            tracing::info!(
-                relay = %relay_url,
-                batch_id,
-                filter_count = next_filters.len(),
-                "Rate limited during historic pagination; deferring the exact next page without blocking the sync actor"
-            );
-
-            loop {
-                if let Some(remaining) = health_tracker.get_remaining_backoff(&relay_url) {
-                    tokio::time::sleep(remaining + Duration::from_millis(10)).await;
-                    continue;
-                }
-
-                // Hold only the pending-index lock while subscribing. This
-                // prevents a very fast EOSE from reaching the actor before its
-                // new subscription ID is registered, without blocking the
-                // SyncManager mutex or the purgatory timer.
-                let mut pending = pending_sync_index.write().await;
-                let Some(batch) = pending.get_mut(&relay_url).and_then(|batches| {
-                    batches.iter_mut().find(|batch| batch.batch_id == batch_id)
-                }) else {
-                    tracing::debug!(
-                        relay = %relay_url,
-                        batch_id,
-                        "Deferred pagination batch no longer exists"
-                    );
-                    return;
-                };
-                if !batch.outstanding_subs.contains(&deferred_sub_id) {
-                    return;
-                }
-
-                match connection
-                    .subscribe_filters(next_filters.clone(), next_page.request_class())
-                    .await
-                {
-                    Ok(new_sub_id) => {
-                        batch.outstanding_subs.remove(&deferred_sub_id);
-                        batch.outstanding_subs.insert(new_sub_id.clone());
-                        batch.pagination_state.insert(new_sub_id.clone(), next_page);
-                        tracing::info!(
-                            relay = %relay_url,
-                            new_sub_id = %new_sub_id,
-                            batch_id,
-                            "Deferred pagination resumed after rate-limit cooldown"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        drop(pending);
-                        tracing::warn!(
-                            relay = %relay_url,
-                            batch_id,
-                            error = %error,
-                            "Deferred pagination subscription failed; retrying"
-                        );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        });
     }
 
     /// Drive bounded recovery of events relays reported during negentropy
@@ -4153,6 +3880,7 @@ impl SyncManager {
     ///
     /// This is triggered by the daily timer to detect state drift over time.
     async fn daily_sync(&mut self, relay_url: &str) {
+        self.history_tasks.cancel_relay(relay_url);
         tracing::info!(relay = %relay_url, "Starting daily sync");
         self.cancel_deferred_consolidation(relay_url, "daily sync reset");
         let _ = self
@@ -4257,6 +3985,9 @@ impl SyncManager {
         // connection-attempt cap can complete while the actor is busy.
         let (connect_attempt_result_tx, mut connect_attempt_result_rx) =
             mpsc::channel::<ConnectAttemptResult>(MAX_CONCURRENT_CONNECT_ATTEMPTS);
+
+        let (history_result_tx, mut history_result_rx) = mpsc::channel(8);
+        self.history_result_tx = Some(history_result_tx);
 
         let (nip65_discovery_result_tx, mut nip65_discovery_result_rx) =
             mpsc::channel::<Nip65DiscoveryResult>(1);
@@ -4408,6 +4139,11 @@ impl SyncManager {
                         None => {
                             tracing::debug!("Connect attempt result channel closed");
                         }
+                    }
+                }
+                result = history_result_rx.recv() => {
+                    if let Some(result) = result {
+                        sync_manager.lock().await.handle_history_result(result).await;
                     }
                 }
                 result = nip65_discovery_result_rx.recv() => {
@@ -4991,6 +4727,7 @@ impl SyncManager {
     /// 4. L1 live + L1 historic (negentropy if available)
     /// 5. compute_actions → AddFilters → sync_computed_filters for L2+L3
     async fn fresh_start(&mut self, relay_url: &str) {
+        self.history_tasks.cancel_relay(relay_url);
         let _now = Timestamp::now();
 
         tracing::info!(relay = %relay_url, "Starting fresh_start");
@@ -5381,6 +5118,7 @@ impl SyncManager {
     /// Basic connection health is managed by the connection worker and its
     /// stability timer. This method handles reconnect-specific sync and metrics.
     async fn quick_reconnect(&mut self, relay_url: &str, since: Timestamp) {
+        self.history_tasks.cancel_relay(relay_url);
         self.cancel_deferred_consolidation(relay_url, "quick reconnect");
 
         // Step 1: Clear PendingSyncIndex for this relay
@@ -7256,6 +6994,7 @@ impl SyncManager {
     /// - Unexpected disconnects: Updates state to Disconnected, keeps RelayConnection for reconnect
     /// - Intentional disconnects: Completes cleanup of Disconnecting relays (removes from indices)
     async fn handle_disconnect(&mut self, relay_url: &str) {
+        self.history_tasks.cancel_relay(relay_url);
         // Learned page sizes and NIP-11 hints belong to the ended WebSocket session.
         self.pagination_sessions.remove(relay_url);
         // A connection can end after a descendant REQ was sent but before its
@@ -7368,6 +7107,7 @@ impl SyncManager {
     /// `disconnect_relay` calls it directly without decrementing the connected
     /// gauge a second time.
     async fn complete_ended_session(&mut self, relay_url: &str, was_connected: bool) {
+        self.history_tasks.cancel_relay(relay_url);
         if let Some(ref metrics) = self.metrics {
             metrics.record_connection_status(relay_url, ConnectionStatus::Disconnected);
         }
@@ -8134,6 +7874,7 @@ impl SyncManager {
     }
 
     fn release_removed_descendant_batch(&mut self, relay_url: &str, batch: &PendingBatch) {
+        self.history_tasks.finish(batch.batch_id);
         if batch.purpose == PendingBatchPurpose::Descendants {
             if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
                 rotation.mark_completed(batch.batch_id, false, Instant::now());
@@ -8802,76 +8543,6 @@ impl SyncManager {
             })
     }
 
-    /// Submit grouped REQ+EOSE filters through the connection's transient
-    /// queue and return the subscriptions that actually started.
-    ///
-    /// Callers submit only the current group while the connection waits for a
-    /// shared-ledger permit, rather than pre-queuing an unbounded historic
-    /// batch. The connection owns each permit until EOSE/CLOSED (or watchdog
-    /// recovery).
-    async fn subscribe_historic_filter_groups(
-        &self,
-        relay_url: &str,
-        batch_id: u64,
-        filters: &[Filter],
-    ) -> (
-        HashSet<SubscriptionId>,
-        HashMap<SubscriptionId, PaginationState>,
-    ) {
-        let mut subscription_ids = HashSet::new();
-        let mut pagination_state = HashMap::new();
-        let max_filters = self
-            .connections
-            .get(relay_url)
-            .map(RelayConnection::max_filters_per_req)
-            .unwrap_or(MAX_FILTERS_PER_REQ);
-
-        for (group_idx, filter_group) in group_filters_for_req_with_max(filters, max_filters)
-            .into_iter()
-            .enumerate()
-        {
-            tracing::debug!(
-                relay = %relay_url,
-                batch_id,
-                group_idx,
-                filter_count = filter_group.len(),
-                filters = ?filter_group,
-                "Subscribing to grouped filters in REQ+EOSE path"
-            );
-
-            if let Some(connection) = self.connections.get(relay_url) {
-                match connection
-                    .subscribe_filters(filter_group.clone(), TransientRequestClass::HistoricPage)
-                    .await
-                {
-                    Ok(subscription_id) => {
-                        subscription_ids.insert(subscription_id.clone());
-                        pagination_state
-                            .insert(subscription_id, PaginationState::new(filter_group));
-                    }
-                    Err(error) => {
-                        if self.health_tracker.is_subscription_paused(relay_url) {
-                            tracing::debug!(relay = %relay_url, batch_id, group_idx,
-                                %error, "Historic batch deferred during subscription pause");
-                        } else {
-                            tracing::warn!(relay = %relay_url, batch_id, group_idx,
-                                %error, "Historic batch interrupted during admission");
-                        }
-                        // A partial set cannot prove coverage for this batch.
-                        // Release started work and let the normal missing-item
-                        // recovery retry the complete set after admission opens.
-                        for subscription_id in &subscription_ids {
-                            connection.retire_subscription(subscription_id).await;
-                        }
-                        return (HashSet::new(), HashMap::new());
-                    }
-                }
-            }
-        }
-
-        (subscription_ids, pagination_state)
-    }
-
     /// Sync historical events and track in PendingSyncIndex
     ///
     /// This method handles historical synchronization for a set of filters,
@@ -8969,309 +8640,146 @@ impl SyncManager {
             filters
         };
 
-        // Check if we should use negentropy
-        let use_negentropy = !force_req_eose
-            && !self.config.sync_disable_negentropy
-            && connection.supports_negentropy().await;
-
-        // Generate batch ID
+        let result_tx = self.history_result_tx.clone()?;
         let batch_id = self.next_batch_id();
-
-        // Track whether negentropy succeeded (for fallback logic)
-        let mut negentropy_succeeded = false;
-
-        if use_negentropy && !filters_with_since.is_empty() {
-            // NIP-77 negentropy path
-            tracing::debug!(
-                relay = %relay_url,
-                batch_id = batch_id,
-                filter_count = filters_with_since.len(),
-                repos = items.repos.len(),
-                root_events = items.root_events.len(),
-                "Starting historic_sync with negentropy"
-            );
-
-            // Create PendingBatch for negentropy (empty outstanding_subs and pagination_state)
-            let batch = PendingBatch {
-                batch_id,
-                purpose,
-                items: items.clone(),
-                outstanding_subs: HashSet::new(),
-                sync_method: SyncMethod::Negentropy,
-                pagination_state: HashMap::new(), // Negentropy doesn't use pagination
-                requested_event_ids: None,        // Will be set after negentropy diff
-                received_event_ids: None,         // Will be set after negentropy diff
-                initial_hydration_counts: None,
-                retry_count: 0,
-                failed: false,
-            };
-
-            // Add to pending_sync_index
-            {
-                let mut pending = self.pending_sync_index.write().await;
-                pending
-                    .entry(relay_url.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(batch);
-            }
-
-            // Perform negentropy sync for all filters concurrently
-            // Note: We sync each filter separately because negentropy works on a single filter
-            let diff_futures: Vec<_> = filters_with_since
-                .iter()
-                .enumerate()
-                .map(|(idx, filter)| {
-                    let filter = filter.clone();
-                    let conn = connection.clone();
-                    async move { (idx, conn.negentropy_sync_diff(filter).await) }
-                })
-                .collect();
-
-            let diff_results = futures_util::future::join_all(diff_futures).await;
-
-            // Process results - collect all event IDs we need to fetch
-            let mut all_remote_ids = Vec::new();
-            let mut failed_count = 0;
-
-            // Get event IDs to exclude: purgatory + rejected announcements
-            let purgatory_ids = self.purgatory.event_ids();
-            let rejected_ids = self.rejected_events_index.get_all_event_ids();
-            let excluded_ids: HashSet<EventId> =
-                purgatory_ids.union(&rejected_ids).cloned().collect();
-
-            for (idx, result) in diff_results {
-                match result {
-                    Ok(reconciliation) => {
-                        let remote_excluding_ids: HashSet<EventId> = reconciliation
-                            .remote
-                            .keys()
-                            .filter(|id| !excluded_ids.contains(id))
-                            .copied()
-                            .collect();
-                        let remote_count = remote_excluding_ids.len();
-                        tracing::debug!(
-                            relay = %relay_url,
-                            filter_idx = idx,
-                            remote_count = remote_count,
-                            local_count = reconciliation.local.len(),
-                            "Negentropy diff completed for filter"
-                        );
-                        if remote_count > 0 {
-                            all_remote_ids.extend(remote_excluding_ids);
-                        }
-                    }
-                    Err(e) => {
-                        failed_count += 1;
-                        tracing::debug!(
-                            relay = %relay_url,
-                            filter_idx = idx,
-                            error = %e,
-                            "Negentropy diff failed for filter in historic_sync"
-                        );
-                    }
-                }
-            }
-
-            // Require ALL filters to succeed to confirm the batch
-            if failed_count > 0 {
-                // Remove failed negentropy batch and fall back to REQ+EOSE
-                {
-                    let mut pending = self.pending_sync_index.write().await;
-                    if let Some(batches) = pending.get_mut(relay_url) {
-                        let batch_idx = batches.iter().position(|b| b.batch_id == batch_id);
-                        if let Some(idx) = batch_idx {
-                            batches.remove(idx);
-                            if batches.is_empty() {
-                                pending.remove(relay_url);
-                            }
-                        }
-                    }
-                }
-
-                tracing::info!(
-                    relay = %relay_url,
-                    batch_id = batch_id,
-                    failed_count = failed_count,
-                    total_filters = filters_with_since.len(),
-                    "historic_sync (negentropy) failed - falling back to REQ+EOSE"
-                );
-
-                // Fall through to REQ+EOSE path below
-            } else {
-                // Negentropy succeeded - mark success and process results
-                negentropy_succeeded = true;
-
-                if all_remote_ids.is_empty() {
-                    // Remove batch from pending and confirm it (no items to download)
-                    let completed_batch = {
-                        let mut pending = self.pending_sync_index.write().await;
-                        if let Some(batches) = pending.get_mut(relay_url) {
-                            let batch_idx = batches.iter().position(|b| b.batch_id == batch_id);
-                            if let Some(idx) = batch_idx {
-                                let batch = batches.remove(idx);
-                                if batches.is_empty() {
-                                    pending.remove(relay_url);
-                                }
-                                Some(batch)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(batch) = completed_batch {
-                        self.confirm_batch(relay_url, batch).await;
-                    }
-
-                    tracing::info!(
-                        relay = %relay_url,
-                        batch_id = batch_id,
-                        total_received = 0,
-                        "historic_sync (negentropy) completed - already up-to-date"
-                    );
-
-                    // Batch already confirmed, nothing more to do
-                    return Some(batch_id);
-                }
-
-                // launch subscriptions to fetch missing events by id
-                let ids_filters: Vec<_> = all_remote_ids
-                    .chunks(300)
-                    .map(|c| Filter::new().ids(c.iter().copied()))
-                    .collect();
-
-                tracing::info!(
-                    relay = %relay_url,
-                    batch_id = batch_id,
-                    total_event_ids = all_remote_ids.len(),
-                    filter_chunks = ids_filters.len(),
-                    "Creating subscriptions to fetch missing events by ID"
-                );
-
-                let planned_subscriptions: Vec<_> = ids_filters
-                    .into_iter()
-                    .map(|filter| (SubscriptionId::generate(), filter))
-                    .collect();
-                {
-                    let mut pending = self.pending_sync_index.write().await;
-                    if let Some(relay_batches) = pending.get_mut(relay_url) {
-                        if let Some(batch) =
-                            relay_batches.iter_mut().find(|b| b.batch_id == batch_id)
-                        {
-                            register_negentropy_hydration_attempt(
-                                batch,
-                                planned_subscriptions
-                                    .iter()
-                                    .map(|(subscription_id, _)| subscription_id.clone()),
-                                all_remote_ids.iter().copied(),
-                                false,
-                            );
-                        }
-                    }
-                }
-                for (idx, (subscription_id, filter)) in planned_subscriptions.iter().enumerate() {
-                    let result = if let Some(conn) = self.connections.get(relay_url) {
-                        conn.subscribe_filter_with_id(
-                            filter.clone(),
-                            TransientRequestClass::NegentropyHydration,
-                            subscription_id.clone(),
-                        )
-                        .await
-                    } else {
-                        Err("Relay connection disappeared before hydration REQ".to_string())
-                    };
-                    if let Err(e) = result {
-                        tracing::error!(
-                            relay = %relay_url,
-                            batch_id = batch_id,
-                            chunk_idx = idx,
-                            error = %e,
-                            "Failed to subscribe to ID filter chunk"
-                        );
-                        let completed_batch = {
-                            let mut pending = self.pending_sync_index.write().await;
-                            if let Some(batch) = pending.get_mut(relay_url).and_then(|batches| {
-                                batches.iter_mut().find(|batch| batch.batch_id == batch_id)
-                            }) {
-                                batch.outstanding_subs.remove(subscription_id);
-                            }
-                            take_drained_batch_as_failed(&mut pending, relay_url, batch_id)
-                        };
-                        if let Some(batch) = completed_batch {
-                            self.confirm_batch(relay_url, batch).await;
-                        }
-                    }
-                }
-                tracing::debug!(
-                    relay = %relay_url,
-                    batch_id = batch_id,
-                    subscription_ids = planned_subscriptions.len(),
-                    events = all_remote_ids.len(),
-                    "historic_sync (Negentropy) created subscriptions to fetch missing events by id, awaiting EOSE"
-                );
-            }
-        }
-
-        // Use REQ+EOSE if negentropy was not attempted or failed
-        if !negentropy_succeeded {
-            // Traditional REQ+EOSE path
-            tracing::debug!(
-                relay = %relay_url,
-                batch_id = batch_id,
-                filter_count = filters_with_since.len(),
-                repos = items.repos.len(),
-                root_events = items.root_events.len(),
-                use_negentropy = use_negentropy,
-                "Starting historic_sync with REQ+EOSE"
-            );
-
-            // Keep several OR filters under each relay-visible subscription.
-            let (subscription_ids, pagination_state) = self
-                .subscribe_historic_filter_groups(relay_url, batch_id, &filters_with_since)
-                .await;
-
-            if subscription_ids.is_empty() && !filters_with_since.is_empty() {
-                tracing::debug!(
-                    relay = %relay_url,
-                    "Historic batch was not fully admitted; leaving coverage unconfirmed"
-                );
-                return None;
-            }
-
-            // Create PendingBatch for REQ+EOSE
-            let batch = PendingBatch {
+        // A local admission barrier prevents early EOSE from confirming a batch
+        // while its worker is still reconciling or admitting later paced groups.
+        let barrier = SubscriptionId::generate();
+        self.pending_sync_index
+            .write()
+            .await
+            .entry(relay_url.to_owned())
+            .or_default()
+            .push(PendingBatch {
                 batch_id,
                 purpose,
                 items,
-                outstanding_subs: subscription_ids,
+                outstanding_subs: HashSet::from([barrier.clone()]),
                 sync_method: SyncMethod::ReqEose,
-                pagination_state,
-                requested_event_ids: None, // Not used for REQ+EOSE
-                received_event_ids: None,  // Not used for REQ+EOSE
+                pagination_state: HashMap::new(),
+                requested_event_ids: None,
+                received_event_ids: None,
                 initial_hydration_counts: None,
-                retry_count: 0, // Not used for REQ+EOSE
+                retry_count: 0,
                 failed: false,
-            };
-
-            // Add to pending_sync_index
-            {
-                let mut pending = self.pending_sync_index.write().await;
-                pending
-                    .entry(relay_url.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(batch);
-            }
-
-            tracing::debug!(
-                relay = %relay_url,
-                batch_id = batch_id,
-                "historic_sync (REQ+EOSE) batch created, awaiting EOSE"
-            );
-        }
-
+            });
+        self.history_tasks.spawn(
+            history::HistoryJob {
+                relay_url: relay_url.to_owned(),
+                batch_id,
+                barrier,
+                connection,
+                filters: filters_with_since,
+                allow_negentropy: !force_req_eose && !self.config.sync_disable_negentropy,
+                prepared: None,
+                wait_for_cooldown: false,
+                health: self.health_tracker.clone(),
+                pending: self.pending_sync_index.clone(),
+                purgatory: self.purgatory.clone(),
+                rejected: self.rejected_events_index.clone(),
+            },
+            result_tx,
+        );
         Some(batch_id)
+    }
+
+    async fn spawn_history_queries(
+        &mut self,
+        relay_url: &str,
+        batch_id: u64,
+        queries: Vec<(SubscriptionId, Vec<Filter>, TransientRequestClass)>,
+        wait_for_cooldown: bool,
+    ) {
+        let (Some(connection), Some(result_tx)) = (
+            self.connections.get(relay_url).cloned(),
+            self.history_result_tx.clone(),
+        ) else {
+            return;
+        };
+        let barrier = SubscriptionId::generate();
+        {
+            let mut pending = self.pending_sync_index.write().await;
+            let Some(batch) = pending
+                .get_mut(relay_url)
+                .and_then(|batches| batches.iter_mut().find(|batch| batch.batch_id == batch_id))
+            else {
+                return;
+            };
+            batch.outstanding_subs.insert(barrier.clone());
+        }
+        self.history_tasks.spawn(
+            history::HistoryJob {
+                relay_url: relay_url.to_owned(),
+                batch_id,
+                barrier,
+                connection,
+                filters: Vec::new(),
+                allow_negentropy: false,
+                prepared: Some(queries),
+                wait_for_cooldown,
+                health: self.health_tracker.clone(),
+                pending: self.pending_sync_index.clone(),
+                purgatory: self.purgatory.clone(),
+                rejected: self.rejected_events_index.clone(),
+            },
+            result_tx,
+        );
+    }
+
+    async fn handle_history_result(&mut self, result: history::HistoryResult) {
+        self.history_tasks.complete(&result.barrier);
+        match result.outcome {
+            Ok(()) => self.handle_eose(&result.relay_url, result.barrier).await,
+            Err(error) => {
+                let batch = {
+                    let mut pending = self.pending_sync_index.write().await;
+                    take_batch_containing_subscription(
+                        &mut pending,
+                        &result.relay_url,
+                        &result.barrier,
+                    )
+                };
+                if let Some(batch) = batch {
+                    self.release_removed_descendant_batch(&result.relay_url, &batch);
+                    if let Some(connection) = self.connections.get(&result.relay_url) {
+                        for id in &batch.outstanding_subs {
+                            if id != &result.barrier {
+                                connection.retire_subscription(id).await;
+                            }
+                        }
+                    }
+                    if batch.retry_count > 0 {
+                        if let Some(requested) = &batch.requested_event_ids {
+                            let received = batch
+                                .received_event_ids
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_default();
+                            let missing =
+                                requested.difference(&received).copied().collect::<Vec<_>>();
+                            let degraded = self
+                                .relay_sync_index
+                                .read()
+                                .await
+                                .get(&result.relay_url)
+                                .is_some_and(|state| state.historic_sync_had_failures);
+                            self.missing_event_recovery.lock().unwrap().register(
+                                &result.relay_url,
+                                batch.batch_id,
+                                missing,
+                                degraded,
+                                Instant::now(),
+                            );
+                        }
+                        let mut batch = batch;
+                        batch.failed = true;
+                        self.confirm_batch(&result.relay_url, batch).await;
+                    }
+                    tracing::debug!(relay = %result.relay_url, batch_id = result.batch_id,
+                        %error, "Historic admission interrupted");
+                }
+            }
+        }
     }
 
     /// Gracefully shutdown the SyncManager
@@ -9283,6 +8791,7 @@ impl SyncManager {
     ///
     /// After calling this method, the SyncManager is no longer usable.
     pub async fn shutdown(&mut self) {
+        self.history_tasks.clear();
         tracing::info!("Starting SyncManager shutdown");
 
         // 1. Send shutdown signal to all background tasks
@@ -9358,6 +8867,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_history_does_not_block_another_relays_live_startup() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        config.sync_disable_negentropy = true;
+        config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let git_path = PathBuf::from(&config.git_data_path);
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut manager = SyncManager::new(
+            None,
+            "service.example".into(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path,
+            None,
+            None,
+            None,
+        );
+        let (history_tx, mut history_rx) = tokio::sync::mpsc::channel(8);
+        manager.history_result_tx = Some(history_tx);
+        let (disconnect_tx, _disconnect_rx) = tokio::sync::mpsc::channel(100);
+        let (eose_tx, mut eose_rx) = lifecycle_notification_channel();
+        let (closed_tx, _closed_rx) = lifecycle_notification_channel();
+        manager.disconnect_tx = Some(disconnect_tx);
+        manager.eose_tx = Some(eose_tx);
+        manager.subscription_closed_tx = Some(closed_tx);
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(100);
+        let mut servers = tokio::task::JoinSet::new();
+        let mut urls = Vec::new();
+        for number in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let observed_tx = observed_tx.clone();
+            servers.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                while let Some(Ok(frame)) = ws.next().await {
+                    if !frame.is_text() {
+                        continue;
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    if request[0] == "REQ" {
+                        let live = request[2]["limit"] == 0;
+                        observed_tx
+                            .send((number, live, request[1].as_str().unwrap().to_owned()))
+                            .await
+                            .unwrap();
+                        // Relay A never completes history. Relay B responds
+                        // immediately, exercising EOSE during worker admission.
+                        if live || number == 1 {
+                            ws.send(Message::Text(
+                                serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                    }
+                }
+            });
+            let connection = RelayConnection::new(
+                url.clone(),
+                None,
+                RelayTargetSource::OperatorConfigured,
+                OutboundTargetPolicy::default(),
+            )
+            .with_health_tracker(manager.health_tracker.clone());
+            connection.connect(3).await.unwrap();
+            connection.reset_subscription_budget(Some(4)); // One live and one historic slot.
+            connection.reduce_max_filters_per_req(2);
+            manager.connections.insert(url.clone(), connection);
+            manager
+                .relay_sync_index
+                .write()
+                .await
+                .insert(url.clone(), RelayState::default());
+            urls.push(url);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            manager.handle_connect_or_reconnect(&urls[0]).await;
+            loop {
+                let (number, live, _) = observed_rx.recv().await.unwrap();
+                if number == 0 && !live { break; }
+            }
+            // Admission now waits for relay A's occupied history slot. That
+            // wait must not be inherited by the caller or another connection.
+            manager.historic_sync_with_options(&urls[0],
+                vec![Filter::new().kind(Kind::Custom(123)), Filter::new().kind(Kind::Custom(124))],
+                PendingItems::default(), None, PendingBatchPurpose::Core, true).await.unwrap();
+            manager.handle_connect_or_reconnect(&urls[1]).await;
+            loop {
+                let (number, live, _) = observed_rx.recv().await.unwrap();
+                if number == 1 && live { break; }
+            }
+            let root = EventId::from_byte_array([0; 32]);
+            let items = PendingItems { root_events: HashSet::from([root]), ..Default::default() };
+            manager.historic_sync_with_options(&urls[1],
+                vec![Filter::new().kind(Kind::Custom(125)), Filter::new().kind(Kind::Custom(126))],
+                items, None, PendingBatchPurpose::Core, true).await.unwrap();
+            // Process completions as the actor does; immediate EOSE on the
+            // first group must not confirm the two-group batch prematurely.
+            let mut checked_first_group = false;
+            loop {
+                tokio::select! {
+                    Some(result) = history_rx.recv() => manager.handle_history_result(result).await,
+                    Some(eose) = eose_rx.recv() => {
+                        let first_group = manager.pending_sync_index.read().await.get(&eose.relay_url)
+                            .into_iter().flatten().filter_map(|batch| batch.pagination_state.get(&eose.sub_id))
+                            .any(|page| page.filters().iter().any(|filter| filter.kinds.as_ref().is_some_and(|kinds| kinds.contains(&Kind::Custom(125)))));
+                        manager.handle_eose(&eose.relay_url, eose.sub_id).await;
+                        if first_group {
+                            assert!(!manager.relay_sync_index.read().await[&urls[1]].root_events.contains(&root));
+                            checked_first_group = true;
+                        }
+                    },
+                }
+                if manager.relay_sync_index.read().await[&urls[1]].root_events.contains(&root) { break; }
+            }
+            assert!(checked_first_group);
+        }).await.expect("relay B live coverage and history must not wait for relay A");
+        assert!(!manager.relay_sync_index.read().await[&urls[0]].announcements_synced);
+        assert!(!manager.pending_sync_index.read().await[&urls[0]].is_empty());
+        manager.shutdown().await;
+        assert!(manager.pending_sync_index.read().await.is_empty());
+        servers.abort_all();
+    }
+
+    #[tokio::test]
     async fn interrupted_historic_admission_does_not_confirm_partial_coverage() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
@@ -9392,6 +9046,8 @@ mod tests {
             None,
             None,
         );
+        let (history_tx, mut history_rx) = tokio::sync::mpsc::channel(8);
+        manager.history_result_tx = Some(history_tx);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let health = manager.health_tracker.clone();
@@ -9469,10 +9125,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            result.is_none(),
-            "partial admission cannot create a confirmable batch"
-        );
+        assert!(result.is_some(), "admission runs in the background");
+        let result = tokio::time::timeout(Duration::from_secs(5), history_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.outcome.is_err(), "partial admission must fail");
+        manager.handle_history_result(result).await;
         assert!(manager.pending_sync_index.read().await.get(&url).is_none());
         assert_eq!(connection.subscription_count().await, 0);
 
@@ -9494,7 +9153,7 @@ mod tests {
             result.is_some(),
             "all groups must remain retryable after the pause"
         );
-        tokio::time::timeout(Duration::from_secs(3), complete_rx)
+        tokio::time::timeout(Duration::from_secs(6), complete_rx)
             .await
             .unwrap()
             .unwrap();
@@ -11213,39 +10872,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_pagination_completes_only_a_fully_drained_batch() {
-        let relay_url = "wss://pagination.example";
-        let still_pending = SubscriptionId::new("still-pending");
-        let make_batch = |batch_id, outstanding_subs| PendingBatch {
-            batch_id,
-            purpose: PendingBatchPurpose::Core,
-            items: PendingItems::default(),
-            outstanding_subs,
-            sync_method: SyncMethod::ReqEose,
-            pagination_state: HashMap::new(),
-            requested_event_ids: None,
-            received_event_ids: None,
-            initial_hydration_counts: None,
-            retry_count: 0,
-            failed: false,
-        };
-        let mut pending = HashMap::from([(
-            relay_url.to_string(),
-            vec![
-                make_batch(41, HashSet::new()),
-                make_batch(42, HashSet::from([still_pending])),
-            ],
-        )]);
-
-        let completed = take_drained_batch_as_failed(&mut pending, relay_url, 41)
-            .expect("failed pagination must complete a drained batch");
-        assert!(completed.failed);
-        assert!(take_drained_batch_as_failed(&mut pending, relay_url, 42).is_none());
-        assert_eq!(pending[relay_url].len(), 1);
-        assert!(!pending[relay_url][0].failed);
-    }
-
-    #[test]
     fn rate_limit_classifier_covers_notice_and_closed_reason_forms() {
         for message in [
             "rate-limited: too many queries",
@@ -11382,34 +11008,6 @@ mod tests {
         take_batch_containing_subscription(&mut pending, relay_url, &accepted)
             .expect("last batch must also be removable");
         assert!(!pending.contains_key(relay_url));
-    }
-
-    #[test]
-    fn rate_limited_pagination_keeps_batch_pending_without_actor_wait() {
-        let relay_url = "wss://pagination.example";
-        let completed_sub = SubscriptionId::new("completed-page");
-        let mut batch = PendingBatch {
-            batch_id: 73,
-            purpose: PendingBatchPurpose::Core,
-            items: PendingItems::default(),
-            outstanding_subs: HashSet::new(),
-            sync_method: SyncMethod::ReqEose,
-            pagination_state: HashMap::new(),
-            requested_event_ids: None,
-            received_event_ids: None,
-            initial_hydration_counts: None,
-            retry_count: 0,
-            failed: false,
-        };
-
-        let deferred = mark_deferred_pagination(&mut batch, &completed_sub);
-        assert!(batch.outstanding_subs.contains(&deferred));
-
-        let mut pending = HashMap::from([(relay_url.to_string(), vec![batch])]);
-        assert!(
-            take_drained_batch_as_failed(&mut pending, relay_url, 73).is_none(),
-            "the deferred exact page must prevent a generic historic batch from being confirmed early"
-        );
     }
 
     #[test]

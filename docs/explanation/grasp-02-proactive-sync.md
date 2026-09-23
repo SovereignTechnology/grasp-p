@@ -1214,6 +1214,12 @@ session and falls back to paced REQs, because rust-nostr owns the internal
 - **Connection concurrency**: At most eight DNS/websocket attempts run at once;
   actual starts are spaced at least 250 ms apart, and queued attempts do not
   start health backoff until both capacity and pacing permit the attempt
+- **History concurrency**: Reconciliation, history admission, pagination and
+  hydration retries run outside the actor (eight jobs globally, one per relay).
+  A source with a large history cannot serialize other relays' live startup.
+  Request IDs are registered before sending, with an admission barrier that
+  prevents early EOSE from completing a partially admitted batch. Cancelled or
+  failed admission retires partial requests; reset/disconnect cancels workers
 
 ---
 

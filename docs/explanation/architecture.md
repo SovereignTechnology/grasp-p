@@ -680,6 +680,12 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
 - **Bounded connection workers** keep slow DNS and websocket handshakes out of
   the sync actor while limiting network pressure to eight concurrent attempts,
   with actual starts spaced at least 250 ms apart (no catch-up bursts)
+- **Background history admission** keeps reconciliation, paced history groups,
+  pagination and hydration retries outside the sync actor. At most eight jobs
+  run globally and one per relay; live startup on other relays proceeds while
+  a large source catches up. Pending batches register request IDs before sends
+  and retain an admission barrier until the worker finishes, so early EOSE
+  cannot confirm partial coverage. Reset/disconnect cancels stale jobs
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when incremental fragmentation exceeds the desired
   live-filter baseline by 70; rebuilds are deferred until in-flight batches

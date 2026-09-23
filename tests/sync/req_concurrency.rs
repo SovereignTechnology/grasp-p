@@ -36,7 +36,9 @@ use crate::common::purgatory_helpers::{
     create_state_event, create_test_repo_with_commit, push_to_relay, CommitVariant,
 };
 use crate::common::req_limiting_proxy::ReqLimitingProxy;
-use crate::common::sync_helpers::{repo_coord, send_to_relay, wait_for_event_on_relay, TestClient};
+use crate::common::sync_helpers::{
+    fetch_metrics, repo_coord, send_to_relay, wait_for_event_on_relay, TestClient,
+};
 use crate::common::{port, TestRelay};
 
 /// Concurrency limit enforced by the proxy.
@@ -54,34 +56,35 @@ const PROXY_REQ_LIMIT: usize = 5;
 /// so bounded scheduling is required to avoid rejections.
 const ISSUE_COUNT: usize = 2500;
 
-/// Wait until the proxy has seen at least `min_total` transient REQs
-/// (opened + rejected) and the count has been stable for `stable_for`.
-///
-/// Returns the final (opened, rejected) pair, or `None` on deadline.
-async fn wait_for_req_quiescence(
+/// Wait for confirmed historic coverage, not total network silence. The
+/// responsive actor continues NIP-65 discovery while history is complete.
+async fn wait_for_historic_completion(
+    syncing: &TestRelay,
     proxy: &ReqLimitingProxy,
     min_total: usize,
-    stable_for: Duration,
     deadline: Duration,
 ) -> Option<(usize, usize)> {
-    let end = tokio::time::Instant::now() + deadline;
-    let mut last_total = 0usize;
-    let mut stable_since = tokio::time::Instant::now();
-    loop {
-        let opened = proxy.opened_count();
-        let rejected = proxy.rejected_count();
-        let total = opened + rejected;
-        if total != last_total {
-            last_total = total;
-            stable_since = tokio::time::Instant::now();
-        } else if total >= min_total && stable_since.elapsed() >= stable_for {
-            return Some((opened, rejected));
+    let status_prefix = format!("ngit_sync_relay_connected{{relay=\"{}\"}} ", proxy.url());
+    tokio::time::timeout(deadline, async {
+        loop {
+            let opened = proxy.opened_count();
+            let rejected = proxy.rejected_count();
+            let confirmed = fetch_metrics(syncing.url())
+                .await
+                .ok()
+                .is_some_and(|metrics| {
+                    metrics
+                        .lines()
+                        .any(|line| line.strip_prefix(&status_prefix) == Some("3"))
+                });
+            if confirmed && opened + rejected >= min_total {
+                return (opened, rejected);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if tokio::time::Instant::now() >= end {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    })
+    .await
+    .ok()
 }
 
 /// Scenario:
@@ -245,27 +248,27 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
         );
     }
 
-    // 7. Let phase-1 REQ activity settle, then restart. Startup recomputes
+    // 7. Wait for confirmed phase-1 history, then restart. Startup recomputes
     //    sync filters from the full persisted index (2500 root events),
     //    producing one historic batch with ~8 byte-budgeted REQ groups —
     //    the production startup burst.
-    wait_for_req_quiescence(&proxy, 1, Duration::from_secs(3), Duration::from_secs(120))
+    wait_for_historic_completion(&syncing, &proxy, 1, Duration::from_secs(120))
         .await
-        .expect("phase-1 REQ activity should settle before restart");
+        .expect("phase-1 historic coverage should be confirmed before restart");
     let before_restart = proxy.opened_count() + proxy.rejected_count();
 
     let syncing = syncing.restart().await;
 
-    // 8. Wait for the startup burst to complete and settle: the restarted
+    // 8. Wait for confirmed startup history: the restarted
     //    relay re-syncs the repository batch and the ~8 root-event groups.
-    let (opened, rejected) = wait_for_req_quiescence(
+    let (opened, rejected) = wait_for_historic_completion(
+        &syncing,
         &proxy,
         before_restart + 7,
-        Duration::from_secs(3),
         Duration::from_secs(120),
     )
     .await
-    .expect("restart REQ burst should complete and settle");
+    .expect("restart historic coverage should be confirmed");
 
     // 9. The regression assertions (cumulative across both phases; the
     //    trickle-shaped phase 1 must stay within the bound too).

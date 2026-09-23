@@ -409,11 +409,17 @@ Permit release does not depend on that queue draining: a separate listener on
 rust-nostr's broadcast relay notifications consumes only EOSE/CLOSED terminals
 and closes/releases transient ownership. The processor-facing listener still
 delivers ordered EVENT and lifecycle work to the sync actor. EOSE and CLOSED
-use non-blocking actor inboxes: their production is bounded by the session
-subscription ledger, and a large paced historic batch can keep the actor busy
-longer than a fixed lifecycle inbox could safely absorb. This prevents actor
-backpressure from stopping the ordered EVENT processor, while the EVENT queue
-remains finite as the memory-safety boundary for non-conforming peers.
+use bounded actor inboxes; permit retirement is independent of actor progress.
+History reconciliation, paced group admission, pagination and hydration retries
+run in background jobs (eight globally, one per relay), without holding the
+manager or pending-index lock during network or pacing waits. Live startup for
+other relays can proceed immediately. Each batch pre-registers wire IDs and a
+local admission barrier, preventing fast EOSE from confirming partial coverage.
+Admission failure retires the incomplete set and leaves its coverage retryable;
+reset/disconnect cancels workers before the next session starts. Connection
+attempts retain their eight-worker cap and start at least 250 ms apart, measured
+from actual starts so a delayed executor does not emit a catch-up burst.
+
 
 The levers, in the order we reach for them:
 

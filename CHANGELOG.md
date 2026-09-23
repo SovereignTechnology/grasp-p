@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep slow history reconciliation and paced requests out of the shared sync
+  actor so other relays establish live sync promptly, with bounded background
+  history workers.
 - Space relay connection attempts at least 250 ms apart while retaining the
   eight-worker cap, preventing bursts when many discovered targets become ready.
 

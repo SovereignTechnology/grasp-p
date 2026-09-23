@@ -2033,6 +2033,22 @@ impl RelayConnection {
             .await
     }
 
+    /// Register grouped history with the manager before any response can arrive.
+    pub(super) async fn subscribe_filters_with_id(
+        &self,
+        filters: Vec<Filter>,
+        request_class: TransientRequestClass,
+        subscription_id: SubscriptionId,
+    ) -> Result<SubscriptionId, String> {
+        self.subscribe_filters_with_live_permit(
+            filters,
+            Some(request_class),
+            None,
+            Some(subscription_id),
+        )
+        .await
+    }
+
     /// Atomically reserve the complete live filter set before opening any REQ.
     /// This avoids partial coverage and prevents historic work from consuming
     /// slots between sequential live subscription sends.
