@@ -66,6 +66,13 @@ const MAX_PURGATORY_DEPENDENCY_IDS_PER_QUERY: usize = 100;
 const SEMANTIC_FALLBACK_MIN_REQUESTED_EVENTS: usize = 20;
 const SEMANTIC_FALLBACK_MAX_DELIVERED_PERCENT: usize = 10;
 const DESCENDANT_FALLBACK_OVERLAP_SECS: u64 = 15 * 60;
+fn descendant_fallback_refresh_interval() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
+    }
+}
 /// Maximum number of locally known parent/child generations expanded into a
 /// relay's related-event query frontier.
 const MAX_DESCENDANT_FRONTIER_DEPTH: usize = 8;
@@ -1031,6 +1038,7 @@ struct DescendantSyncRotation {
     filters: Vec<DescendantFilterCursor>,
     next_filter: usize,
     in_flight: Option<DescendantFilterInFlight>,
+    next_cycle_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -1097,10 +1105,22 @@ impl DescendantSyncRotation {
             .collect();
         self.next_filter = 0;
         self.in_flight = None;
+        // A changed frontier needs a baseline immediately. Retained groups
+        // still keep their successful overlap cursor above.
+        self.next_cycle_at = None;
     }
 
-    fn next_request(&self, now: Timestamp) -> Option<(usize, Vec<Filter>, Timestamp)> {
-        if self.in_flight.is_some() || self.filters.is_empty() {
+    fn next_request(
+        &self,
+        now: Timestamp,
+        monotonic_now: Instant,
+    ) -> Option<(usize, Vec<Filter>, Timestamp)> {
+        if self.in_flight.is_some()
+            || self.filters.is_empty()
+            || self
+                .next_cycle_at
+                .is_some_and(|deadline| monotonic_now < deadline)
+        {
             return None;
         }
         let filter_index = self.next_filter % self.filters.len();
@@ -1132,7 +1152,7 @@ impl DescendantSyncRotation {
         });
     }
 
-    fn mark_completed(&mut self, batch_id: u64, succeeded: bool) -> bool {
+    fn mark_completed(&mut self, batch_id: u64, succeeded: bool, now: Instant) -> bool {
         let Some(in_flight) = self
             .in_flight
             .filter(|request| request.batch_id == batch_id)
@@ -1143,6 +1163,9 @@ impl DescendantSyncRotation {
         if succeeded {
             self.filters[in_flight.filter_index].last_successful_until = Some(in_flight.until);
             self.next_filter = (in_flight.filter_index + 1) % self.filters.len();
+        }
+        if !succeeded || self.next_filter == 0 {
+            self.next_cycle_at = Some(now + descendant_fallback_refresh_interval());
         }
         true
     }
@@ -3881,9 +3904,9 @@ impl SyncManager {
         if batch.purpose == PendingBatchPurpose::Descendants {
             let succeeded = !batch.failed;
             if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
-                rotation.mark_completed(batch_id, succeeded);
+                rotation.mark_completed(batch_id, succeeded, Instant::now());
             }
-            tracing::info!(
+            tracing::debug!(
                 relay = %relay_url,
                 batch_id,
                 succeeded,
@@ -3957,7 +3980,7 @@ impl SyncManager {
                 );
             }
 
-            tracing::info!(
+            tracing::debug!(
                 relay = %relay_url,
                 batch_id = batch_id,
                 purpose = ?batch.purpose,
@@ -5224,7 +5247,7 @@ impl SyncManager {
         let Some((filter_index, filters, until)) = self
             .descendant_sync_rotations
             .get(relay_url)
-            .and_then(|rotation| rotation.next_request(Timestamp::now()))
+            .and_then(|rotation| rotation.next_request(Timestamp::now(), Instant::now()))
         else {
             return;
         };
@@ -8094,7 +8117,7 @@ impl SyncManager {
     fn release_removed_descendant_batch(&mut self, relay_url: &str, batch: &PendingBatch) {
         if batch.purpose == PendingBatchPurpose::Descendants {
             if let Some(rotation) = self.descendant_sync_rotations.get_mut(relay_url) {
-                rotation.mark_completed(batch.batch_id, false);
+                rotation.mark_completed(batch.batch_id, false, Instant::now());
             }
         }
     }
@@ -10453,6 +10476,41 @@ mod tests {
     }
 
     #[test]
+    fn descendant_rotation_paces_complete_cycles_but_admits_new_frontiers() {
+        let start = Instant::now();
+        let timestamp = Timestamp::from_secs(200_000);
+        let mut rotation = DescendantSyncRotation::default();
+        let mut filters = vec![
+            Filter::new().kind(Kind::TextNote),
+            Filter::new().kind(Kind::GitIssue),
+        ];
+        rotation.refresh(filters.clone(), 1);
+        for index in 0..2 {
+            let (actual, _, until) = rotation.next_request(timestamp, start).unwrap();
+            assert_eq!(actual, index);
+            rotation.mark_started(index as u64, actual, until);
+            assert!(rotation.mark_completed(index as u64, true, start));
+        }
+        // Advancing the wall clock alone cannot bypass the monotonic deadline.
+        assert!(rotation
+            .next_request(Timestamp::from_secs(900_000), start)
+            .is_none());
+        let due = start + descendant_fallback_refresh_interval();
+        assert!(rotation
+            .next_request(timestamp, due - Duration::from_nanos(1))
+            .is_none());
+        assert!(rotation.next_request(timestamp, due).is_some());
+
+        filters.push(Filter::new().kind(Kind::GitPatch));
+        rotation.refresh(filters, 1);
+        assert!(rotation.next_request(timestamp, start).is_some());
+        assert!(rotation.filters[..2]
+            .iter()
+            .all(|cursor| cursor.last_successful_until == Some(timestamp)));
+        assert!(rotation.filters[2].last_successful_until.is_none());
+    }
+
+    #[test]
     fn descendant_rotation_advances_cursor_only_after_successful_eose() {
         let member = EventId::from_byte_array([7; 32]);
         let frontier = DescendantFrontier {
@@ -10461,32 +10519,38 @@ mod tests {
             ..DescendantFrontier::default()
         };
         let now = Timestamp::from_secs(200_000);
+        let start = Instant::now();
+        let retry_at = start + descendant_fallback_refresh_interval();
         let mut rotation = DescendantSyncRotation::default();
 
         rotation.refresh(
             descendant_frontier_filters(&frontier, None),
             MAX_FILTERS_PER_REQ,
         );
-        let (filter_index, first, until) = rotation.next_request(now).unwrap();
+        let (filter_index, first, until) = rotation.next_request(now, start).unwrap();
         assert!(first
             .iter()
             .all(|filter| { serde_json::to_value(filter).unwrap().get("since").is_none() }));
         rotation.mark_started(41, filter_index, until);
-        assert!(rotation.next_request(now).is_none());
+        assert!(rotation.next_request(now, start).is_none());
 
-        assert!(rotation.mark_completed(41, false));
-        let (retry_index, retry, retry_until) = rotation.next_request(now).unwrap();
+        assert!(rotation.mark_completed(41, false, start));
+        assert!(rotation.next_request(now, start).is_none());
+        let (retry_index, retry, retry_until) = rotation.next_request(now, retry_at).unwrap();
         assert_eq!(retry_index, filter_index);
         assert!(retry
             .iter()
             .all(|filter| { serde_json::to_value(filter).unwrap().get("since").is_none() }));
         rotation.mark_started(42, retry_index, retry_until);
-        assert!(rotation.mark_completed(42, true));
+        assert!(rotation.mark_completed(42, true, retry_at));
 
         // All three e/E/q variants share one relay-compatible REQ, so the
         // next turn returns to that group with its successful overlap cursor.
         let (_, recent, _) = rotation
-            .next_request(Timestamp::from_secs(201_000))
+            .next_request(
+                Timestamp::from_secs(201_000),
+                retry_at + descendant_fallback_refresh_interval(),
+            )
             .unwrap();
         assert!(recent.iter().all(|filter| {
             serde_json::to_value(filter).unwrap()["since"]

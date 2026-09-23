@@ -752,6 +752,13 @@ is deliberately historical-only: owning or maintaining a repository never adds
 that author's inbox relays to ordinary persistent live repository targets.
 Private instances omit repository-coordinate mailbox expansion.
 
+Descendant fallback drains one group per maintenance turn, then waits 60
+seconds after completing the cycle (or a failed query) before starting again.
+The delay uses a monotonic clock; successful cursors retain the 15-minute
+overlap. A changed frontier is immediately eligible for its baseline. Routine
+batch-completion details are debug logs so successful background polling does
+not dominate the production journal.
+
 The final connection admission check enforces both rate-limit and policy
 pauses, including work queued by mailbox workers. Definitive policy CLOSED
 responses update the shared pause on the independent control stream, without

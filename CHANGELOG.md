@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pace descendant fallback cycles with a one-minute refresh delay while
+  retaining overlap and immediate baselines for changed frontiers. Move routine
+  batch-completion bookkeeping to debug logs.
 - Enforce relay policy-refusal pauses for queued sync and mailbox requests.
   Stop historic batch admission at the first failure, release started groups,
   and keep partial coverage unconfirmed for recovery after the pause.
