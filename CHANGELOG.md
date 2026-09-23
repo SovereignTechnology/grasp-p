@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Include repository, process exit status, and stream outcome in Git fetch
+  failure diagnostics; log client-cancelled upload-pack streams at debug level.
 - Pace descendant fallback cycles with a one-minute refresh delay while
   retaining overlap and immediate baselines for changed frontiers. Move routine
   batch-completion bookkeeping to debug logs.

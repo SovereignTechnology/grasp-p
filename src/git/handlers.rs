@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use super::protocol::{GitService, PktLine};
 use super::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
@@ -509,9 +509,13 @@ pub async fn handle_upload_pack(
     // until EOF so the request future can return the HTTP body immediately.
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
 
-    tokio::spawn(async move {
-        stream_upload_pack_output(git, stdout, stderr, tx, repo_lifecycle_guard, metrics).await;
-    });
+    let span = tracing::info_span!("git_upload_pack", repository = %repo_path.display());
+    tokio::spawn(
+        async move {
+            stream_upload_pack_output(git, stdout, stderr, tx, repo_lifecycle_guard, metrics).await;
+        }
+        .instrument(span),
+    );
 
     Ok(streaming_response(GitService::UploadPack, rx))
 }
@@ -554,6 +558,12 @@ async fn stream_upload_pack_output<S, E>(
         None => Vec::new(),
     };
 
+    if matches!(pump_result, PumpResult::ClientDisconnected) {
+        record_git_operation(&metrics, "clone", "error");
+        debug!(exit_status = %status, "Git upload-pack cancelled after client disconnected");
+        return;
+    }
+
     if !status.success() && matches!(pump_result, PumpResult::Eof { sent_stdout: false }) {
         record_git_operation(&metrics, "clone", "error");
         let stderr_str = String::from_utf8_lossy(&stderr_output);
@@ -575,7 +585,8 @@ async fn stream_upload_pack_output<S, E>(
                 stderr_str
             );
         } else {
-            error!("Git upload-pack failed: {}", stderr_str);
+            error!(exit_status = %status, stream_outcome = ?pump_result,
+                stderr = %stderr_str, "Git upload-pack failed");
         }
 
         // The streaming response headers have already been sent. If Git failed
@@ -600,8 +611,10 @@ async fn stream_upload_pack_output<S, E>(
             );
         } else {
             error!(
-                "Git upload-pack failed after streaming stdout: {}",
-                stderr_str
+                exit_status = %status,
+                stream_outcome = ?pump_result,
+                stderr = %stderr_str,
+                "Git upload-pack failed after streaming stdout"
             );
         }
     } else if matches!(pump_result, PumpResult::Eof { .. }) {

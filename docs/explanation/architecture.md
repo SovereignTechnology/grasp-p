@@ -204,6 +204,11 @@ pub async fn handle_receive_pack(
 
 See [`src/git/handlers.rs:22-98`](src/git/handlers.rs:22-98) for the info-refs implementation.
 
+The upload-pack streaming task retains a repository tracing span. Unexpected
+process failures include the exit status and stream outcome even when Git
+produces no stderr. A disconnected HTTP client cancels the child and is logged
+at debug level; the operation remains unsuccessful in clone metrics.
+
 #### [`authorization.rs`](src/git/authorization.rs) - Push Validation
 
 **Core Logic:**
