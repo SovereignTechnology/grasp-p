@@ -2230,12 +2230,24 @@ fn take_connect_attempt(
 
 async fn begin_connect_attempt(
     semaphore: Arc<Semaphore>,
+    pacer: Arc<Mutex<Option<tokio::time::Instant>>>,
     health_tracker: Arc<RelayHealthTracker>,
     relay_url: &str,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let permit = semaphore.acquire_owned().await.ok()?;
+    pace_connection_start(&pacer).await;
     health_tracker.record_attempt(relay_url);
     Some(permit)
+}
+
+/// Space actual starts, not reservations: a stalled executor never catches up
+/// with a burst of overdue dials. The concurrency permit remains held here.
+async fn pace_connection_start(pacer: &Mutex<Option<tokio::time::Instant>>) {
+    let mut previous = pacer.lock().await;
+    if let Some(last) = *previous {
+        tokio::time::sleep_until(last + Duration::from_millis(250)).await;
+    }
+    *previous = Some(tokio::time::Instant::now());
 }
 
 fn grouped_subscription_count(filters: &[Filter]) -> usize {
@@ -2689,6 +2701,7 @@ pub struct SyncManager {
     in_flight_connect_attempts: HashMap<String, ConnectAttemptToken>,
     /// Shared bound for DNS and websocket handshakes.
     connect_attempt_semaphore: Arc<Semaphore>,
+    connect_start_pacer: Arc<Mutex<Option<tokio::time::Instant>>>,
     /// Relays whose subscription consolidation waits for in-flight batches to drain.
     deferred_consolidations: DeferredConsolidations,
     /// Relays whose complete persistent filter set exceeds a learned remote
@@ -2819,6 +2832,7 @@ impl SyncManager {
             next_connect_attempt_token: 0,
             in_flight_connect_attempts: HashMap::new(),
             connect_attempt_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECT_ATTEMPTS)),
+            connect_start_pacer: Arc::new(Mutex::new(None)),
             deferred_consolidations: DeferredConsolidations::default(),
             byte_limited_live_relays: HashMap::new(),
             descendant_sync_rotations: HashMap::new(),
@@ -5642,6 +5656,7 @@ impl SyncManager {
 
         let health_tracker = Arc::clone(&self.health_tracker);
         let semaphore = Arc::clone(&self.connect_attempt_semaphore);
+        let start_pacer = self.connect_start_pacer.clone();
         let timeout = self.health_tracker.base_backoff_secs();
         let private_mode = self.config.private_mode;
         let Some(mut shutdown_rx) = self.shutdown_tx.as_ref().map(|sender| sender.subscribe())
@@ -5651,7 +5666,7 @@ impl SyncManager {
         };
         tokio::spawn(async move {
             let permit = tokio::select! {
-                permit = begin_connect_attempt(semaphore, health_tracker, &relay_url) => permit,
+                permit = begin_connect_attempt(semaphore, start_pacer, health_tracker, &relay_url) => permit,
                 _ = shutdown_rx.recv() => return,
             };
             let Some(_permit) = permit else {
@@ -9309,6 +9324,39 @@ impl SyncManager {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn connection_starts_are_spaced_without_catchup_bursts() {
+        let pacer = Arc::new(Mutex::new(None));
+        let semaphore = Arc::new(Semaphore::new(8));
+        let health = Arc::new(RelayHealthTracker::with_defaults());
+        let mut tasks = tokio::task::JoinSet::new();
+        for n in 0..12 {
+            let (pacer, semaphore, health) = (pacer.clone(), semaphore.clone(), health.clone());
+            tasks.spawn(async move {
+                let _permit = begin_connect_attempt(
+                    semaphore,
+                    pacer,
+                    health,
+                    &format!("wss://relay{n}.example"),
+                )
+                .await
+                .unwrap();
+                tokio::time::Instant::now()
+            });
+        }
+        let first = tasks.join_next().await.unwrap().unwrap();
+        // Simulate a long executor pause. Only one overdue attempt may start;
+        // remaining workers must space themselves from the actual new start.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let mut previous = tasks.join_next().await.unwrap().unwrap();
+        assert!(previous.duration_since(first) >= Duration::from_secs(30));
+        while let Some(start) = tasks.join_next().await {
+            let start = start.unwrap();
+            assert!(start.duration_since(previous) >= Duration::from_millis(250));
+            previous = start;
+        }
+    }
+
     #[tokio::test]
     async fn interrupted_historic_admission_does_not_confirm_partial_coverage() {
         use futures_util::{SinkExt, StreamExt};
@@ -10860,7 +10908,13 @@ mod tests {
         let worker_health = Arc::clone(&health_tracker);
 
         let worker = tokio::spawn(async move {
-            begin_connect_attempt(worker_semaphore, worker_health, relay).await
+            begin_connect_attempt(
+                worker_semaphore,
+                Arc::new(Mutex::new(None)),
+                worker_health,
+                relay,
+            )
+            .await
         });
         tokio::task::yield_now().await;
         assert!(

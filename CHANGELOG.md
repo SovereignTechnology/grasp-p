@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Space relay connection attempts at least 250 ms apart while retaining the
+  eight-worker cap, preventing bursts when many discovered targets become ready.
+
 - Include repository, process exit status, and stream outcome in Git fetch
   failure diagnostics; log client-cancelled upload-pack streams at debug level.
 - Pace descendant fallback cycles with a one-minute refresh delay while

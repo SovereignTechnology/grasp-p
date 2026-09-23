@@ -1212,7 +1212,8 @@ session and falls back to paced REQs, because rust-nostr owns the internal
   by a successful WebSocket connection; it is triggered by relay NOTICE messages
 - **Connection timeout**: Set to `base_backoff_secs` to ensure retry timing works correctly
 - **Connection concurrency**: At most eight DNS/websocket attempts run at once;
-  queued attempts do not start health backoff until a worker slot is available
+  actual starts are spaced at least 250 ms apart, and queued attempts do not
+  start health backoff until both capacity and pacing permit the attempt
 
 ---
 
