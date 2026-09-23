@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reuse already-installed core live filters during historic retries, preventing
+  duplicate subscriptions from exhausting tight relay budgets.
+
 - Pause deterministic oversized-filter refusals instead of retrying unchanged
   requests; regroup only explicit filter-count refusals.
 

@@ -341,7 +341,12 @@ one slot; otherwise it retires only the smallest useful subset which reduces
 the incremental slot cost. Thus byte-bound groups are not rebuilt merely
 because they contain fewer than the maximum filter count. Repository and
 identifier inputs are sorted before byte chunking so equivalent coverage has
-stable group identity.
+stable group identity. Before extending the tail, exact duplicates are removed
+against currently held core filters and within the incoming action. Historic
+retries therefore reuse successful live coverage instead of consuming more
+slots. Auxiliary subscriptions do not count toward this check because their
+owner can retire them independently. Historical bounds remain part of filter
+identity, and closed core filters become eligible for admission again.
 Historic repository batches union root and direct-descendant values into one
 `e`/`E`/`q` family, and repository and addressable-descendant coordinates into
 one `a`/`A`/`q` family, before ordinary count/byte grouping. This lets one REQ

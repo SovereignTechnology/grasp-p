@@ -352,7 +352,24 @@ fn plan_live_tail_extension(
     new_groups: Vec<Vec<Filter>>,
     max_filters: usize,
 ) -> LiveTailReplacement {
-    let mut new_filters: Vec<Filter> = new_groups.into_iter().flatten().collect();
+    // Historic retries can request the same core coverage again. Only
+    // core subscriptions count: auxiliary coverage can be retired separately.
+    let mut installed: std::collections::HashSet<String> = current
+        .iter()
+        .filter(|(id, _)| !protected.contains(id))
+        .flat_map(|(_, filters)| filters.iter().map(Filter::as_json))
+        .collect();
+    let mut new_filters: Vec<Filter> = new_groups
+        .into_iter()
+        .flatten()
+        .filter(|filter| installed.insert(filter.as_json()))
+        .collect();
+    if new_filters.is_empty() {
+        return LiveTailReplacement {
+            retired: Vec::new(),
+            replacement_groups: Vec::new(),
+        };
+    }
     new_filters.sort_unstable_by_key(|filter| filter.as_json());
 
     let max_filters = max_filters.max(1);
@@ -1406,6 +1423,10 @@ impl RelayConnection {
             filter_groups,
             self.max_filters_per_req(),
         );
+
+        if plan.retired.is_empty() && plan.replacement_groups.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let preserved_count = current.len().saturating_sub(plan.retired.len());
         let retired_count = plan.retired.len();
@@ -4170,6 +4191,72 @@ mod tests {
         assert!(error.contains("previous coverage restored"), "{error}");
         assert_eq!(connection.live_filter_groups(), vec![old_filters]);
         assert_eq!(connection.subscription_budget().available_permits(), 7);
+    }
+
+    #[test]
+    fn repeated_core_filters_do_not_rely_on_auxiliary_or_different_history_bounds() {
+        let filter = Filter::new().kind(Kind::GitIssue).limit(0);
+        let auxiliary_id = SubscriptionId::new("auxiliary");
+        let later = filter.clone().since(Timestamp::from(100));
+        let plan = plan_live_tail_extension(
+            vec![
+                (auxiliary_id.clone(), vec![filter.clone()]),
+                (SubscriptionId::new("later-core"), vec![later]),
+            ],
+            &std::collections::HashSet::from([auxiliary_id]),
+            vec![vec![filter.clone(), filter.clone()]],
+            1,
+        );
+        assert_eq!(plan.replacement_groups, vec![vec![filter]]);
+        assert!(plan.retired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn historic_retries_do_not_duplicate_live_subscriptions_within_tight_budget() {
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
+        let connection = permissive_connection(&relay.url().await.to_string(), Keys::generate());
+        connection.connect(3).await.unwrap();
+        connection.reset_subscription_budget(Some(20));
+        connection.reduce_max_filters_per_req(6); // Three filters per REQ.
+        let filters: Vec<_> = (0..9)
+            .map(|n| Filter::new().kind(Kind::Custom(24_000 + n)).limit(0))
+            .collect();
+        let groups = super::super::live_filter_groups(&filters, connection.max_filters_per_req());
+        let ids = connection
+            .extend_live_filter_groups_minimally(groups.clone(), &[])
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        for _ in 0..12 {
+            assert!(
+                connection
+                    .extend_live_filter_groups_minimally(groups.clone(), &[])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "historic retry must not open another live REQ"
+            );
+        }
+        assert_eq!(connection.subscription_count().await, 3);
+        assert_eq!(connection.subscription_budget().available_permits(), 15);
+        for id in &ids {
+            assert!(connection.holds_subscription_permit(id));
+        }
+        // Deduplication must use currently held coverage, not a remembered
+        // request: closed filters need to be admitted again.
+        connection
+            .close_live_subscriptions(&ids[..1])
+            .await
+            .unwrap();
+        let repaired = connection
+            .extend_live_filter_groups_minimally(groups, &[])
+            .await
+            .unwrap();
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(connection.subscription_count().await, 3);
+        assert_eq!(connection.subscription_budget().available_permits(), 15);
+        connection.disconnect().await;
+        relay.shutdown();
     }
 
     #[test]
