@@ -91,6 +91,10 @@ strfry reports the submitted count (`invalid number of filters: 8`), whereas
 rust-nostr reports its configured ceiling. The learned ceiling never rises in
 the session and resets on reconnect. A one-filter refusal is not recoverable
 by regrouping and uses the ordinary long `filter_incompatible` policy pause.
+Explicit invalid-filter and positive-limit-only refusals use that same policy
+pause for core coverage, rather than repeating an unchanged filter after each
+short rate-limit cooldown. Refused auxiliary descendant live coverage retains
+its existing historical fallback.
 
 ### Our own embedded relay (nostr-sdk `LocalRelay`, 0.45.3)
 

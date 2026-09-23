@@ -1844,7 +1844,11 @@ fn policy_refusal(message: &str) -> Option<PolicyRefusal> {
         return None;
     }
     let message = message.to_ascii_lowercase();
-    if message.contains("unsupported filter") || message.contains("filter validation failed") {
+    if message.contains("unsupported filter")
+        || message.contains("filter validation failed")
+        || message.contains("unsupported: invalid filters")
+        || message.contains("filter 'limit' must be a positive integer")
+    {
         Some(PolicyRefusal::FilterIncompatible)
     } else if message.contains("not a member") || message.contains("membership") {
         Some(PolicyRefusal::MembershipRequired)
@@ -11227,6 +11231,15 @@ mod tests {
             policy_refusal("rate-limited: REQ exceeds max filter count 3"),
             Some(PolicyRefusal::FilterIncompatible)
         );
+        for reason in [
+            "unsupported: invalid filters",
+            "invalid: Filter 'limit' must be a positive integer, got 0",
+        ] {
+            assert_eq!(
+                policy_refusal(reason),
+                Some(PolicyRefusal::FilterIncompatible)
+            );
+        }
         assert_eq!(policy_refusal("rate-limited: too many queries"), None);
         assert_eq!(policy_refusal("error: temporary backend failure"), None);
     }
