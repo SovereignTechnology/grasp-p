@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject PR and PR-update events missing commit metadata as terminal invalid
+  events, avoiding repeated recovery attempts for immutable malformed data.
+
 - Retire incomplete historic batches when transient requests time out or close
   before EOSE, and bound SDK subscription retention with an auto-close deadline.
 

@@ -551,6 +551,11 @@ impl Nip34WritePolicy {
     /// * `event` - The PR event to validate
     /// * `is_synced` - True if this event came from proactive sync (vs user-submitted)
     async fn handle_pr_event(&self, event: &Event, is_synced: bool) -> WritePolicyResult {
+        // Missing signed metadata cannot be repaired by fetching Git data or
+        // retrying another relay. Keep actual Git/database faults retryable.
+        if PrEventPolicy::commit(event).is_none() {
+            return reject_invalid(format!("PR event {} has no 'c' tag", event.id));
+        }
         let event_id_str = event.id.to_bech32().unwrap_or_else(|_| event.id.to_hex());
 
         // duplicate check in purgatory
@@ -1175,4 +1180,81 @@ pub async fn create_relay(
             history,
         },
     })
+}
+
+#[cfg(test)]
+mod pr_metadata_tests {
+    use super::*;
+    use crate::grasp06::receive::RepoInitLocks;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn missing_pr_commit_is_invalid_but_missing_git_data_enters_purgatory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        config.grasp06_enable = true;
+        config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(PathBuf::from(
+            &config.git_data_path,
+        )));
+        let runtime = create_relay(&config, purgatory, RepoInitLocks::default(), None)
+            .await
+            .unwrap();
+        let keys = Keys::generate();
+        let tags = vec![
+            Tag::custom("a", [format!("30617:{}:test", keys.public_key().to_hex())]),
+            Tag::custom(
+                "clone",
+                [format!(
+                    "https://{}/prs/{}/test.git",
+                    config.service_address(),
+                    keys.public_key().to_bech32().unwrap()
+                )],
+            ),
+        ];
+        for kind in [Kind::GitPullRequest, Kind::GitPullRequestUpdate] {
+            for empty_tag in [false, true] {
+                let mut event_tags = tags.clone();
+                if empty_tag {
+                    event_tags.push(Tag::custom("c", Vec::<String>::new()));
+                }
+                let event = EventBuilder::new(kind, "missing commit")
+                    .tags(event_tags)
+                    .finalize(&keys)
+                    .unwrap();
+                for synced in [false, true] {
+                    let result = runtime.write_policy.handle_pr_event(&event, synced).await;
+                    assert!(
+                        matches!(
+                            result,
+                            WritePolicyResult::Reject {
+                                prefix: MachineReadablePrefix::Invalid,
+                                status: false,
+                                ..
+                            }
+                        ),
+                        "missing immutable metadata must be a terminal validation failure"
+                    );
+                }
+            }
+            let event = EventBuilder::new(kind, "awaiting Git data")
+                .tags(tags.clone())
+                .tag(Tag::custom(
+                    "c",
+                    ["1111111111111111111111111111111111111111"],
+                ))
+                .finalize(&keys)
+                .unwrap();
+            let result = runtime.write_policy.handle_pr_event(&event, true).await;
+            assert!(
+                matches!(result, WritePolicyResult::Reject { status: true, .. }),
+                "valid metadata with unavailable Git objects must remain eligible for purgatory"
+            );
+        }
+    }
 }

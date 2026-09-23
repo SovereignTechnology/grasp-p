@@ -30,6 +30,16 @@ impl PrEventPolicy {
         }
     }
 
+    /// Extract required commit metadata separately from fallible Git I/O.
+    pub(crate) fn commit(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some("c"))
+                .then(|| values.get(1).cloned())
+                .flatten()
+        })
+    }
+
     /// Check if git data exists for a PR event
     ///
     /// This unified method checks for git data existence and handles:
@@ -46,15 +56,7 @@ impl PrEventPolicy {
     pub async fn git_data_check(&self, event: &Event) -> Result<bool> {
         let event_id = event.id.to_hex();
 
-        // Extract the `c` tag (commit hash) from the PR event
-        let commit = event.tags.iter().find_map(|tag| {
-            let tag_vec = tag.clone().to_vec();
-            if tag_vec.len() >= 2 && tag_vec[0] == "c" {
-                Some(tag_vec[1].clone())
-            } else {
-                None
-            }
-        });
+        let commit = Self::commit(event);
 
         let commit = match commit {
             Some(c) => c,

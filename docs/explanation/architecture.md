@@ -398,6 +398,12 @@ The purgatory system solves two related problems:
 
 **Design Document**: See [`purgatory-design.md`](purgatory-design.md) for complete design specifications.
 
+PR and PR-update events must include a commit value in their signed `c` tag.
+Missing metadata is rejected as `invalid` before Git checks, so sync treats the
+event as terminally accounted rather than repeatedly retrying an apparent
+server failure. Events with commit metadata but unavailable Git objects remain
+eligible for purgatory; Git and database failures remain retryable.
+
 #### Architecture
 
 ```rust
