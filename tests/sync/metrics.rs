@@ -679,3 +679,21 @@ async fn test_multi_source_aggregate_counts() {
 
     harness.stop_all().await;
 }
+
+#[test]
+fn full_repo_readiness_correlates_installation_with_its_relay() {
+    use crate::common::sync_helpers::has_full_repo_live_coverage;
+
+    let pending = "Processing AddFilters relay=ws://source new_full_repos=1\n";
+    assert!(!has_full_repo_live_coverage(&format!(
+        "{pending}Extended core live coverage relay=ws://unrelated\n"
+    )));
+    assert!(has_full_repo_live_coverage(&format!(
+        "{pending}Extended core live coverage relay=ws://source\n\
+         Processing AddFilters relay=ws://self new_full_repos=1\n"
+    )));
+    assert!(!has_full_repo_live_coverage(
+        "Extended core live coverage relay=ws://source\n\
+         Processing AddFilters relay=ws://source new_full_repos=1\n"
+    ));
+}

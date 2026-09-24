@@ -45,13 +45,31 @@ pub async fn wait_for_new_descendant_live_generation(
     }
 }
 
+/// Correlate installed coverage with the relay whose repository was promoted.
+pub fn has_full_repo_live_coverage(log: &str) -> bool {
+    let mut pending = std::collections::HashSet::new();
+    for line in log.lines() {
+        let Some(relay) = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("relay="))
+        else {
+            continue;
+        };
+        if line.contains("new_full_repos=1") {
+            pending.insert(relay);
+        }
+        if line.contains("Extended core live coverage") && pending.contains(relay) {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn wait_for_full_repo_live_coverage(relay: &TestRelay, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let log = std::fs::read_to_string(relay.log_path()).unwrap_or_default();
-        let installed = log
-            .rfind("new_full_repos=1")
-            .is_some_and(|offset| log[offset..].contains("Extended core live coverage"));
+        let installed = has_full_repo_live_coverage(&log);
         if installed {
             return;
         }
