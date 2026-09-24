@@ -543,8 +543,6 @@ When upgrading from 0.35 to 0.43:
 - [ ] Verify all builds pass
 - [ ] Run integration tests
 
-**Reference:** See `docs/archive/2025-11-04-nostr-sdk-upgrade.md`
-
 ---
 
 ## Useful Resources

@@ -51,8 +51,6 @@
 - ✅ **No deletion events**: Direct database cleanup, no KIND 5 events
 - ✅ **Production safe**: Won't interfere with real events
 
-**Reference:** See `docs/archive/2025-11-04-tag-migration.md`
-
 ---
 
 ### Standard "t" Tags vs Custom Tags
@@ -258,8 +256,6 @@ grasp-audit audit --relay ws://localhost:7000
 - ✅ Document migration clearly
 - ✅ Old events auto-expire via cleanup
 - ✅ No production deployments affected
-
-**Reference:** `docs/archive/2025-11-04-tag-migration.md`
 
 ---
 

@@ -98,9 +98,6 @@ WORKING       │  How-To        │    Reference     │
 
 ## 📂 Additional Resources
 
-### [Archive](archive/)
-Historical session notes and completed work. Useful for understanding project evolution but not required reading.
-
 ### [Learnings](learnings/)
 **DEPRECATED** - Being migrated to Diátaxis structure:
 - Gotchas → How-To Guides

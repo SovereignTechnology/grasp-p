@@ -27,8 +27,6 @@ nix-shell --run "cargo build"
 - `nix develop` looks for `flake.nix`
 - We migrated from `shell.nix` to `flake.nix` on November 4, 2025
 
-**Related:** See `docs/archive/2025-11-04-flake-migration.md`
-
 ---
 
 ## Flake Structure
@@ -191,8 +189,6 @@ pkgs.mkShell {
 4. Test that build works: `nix develop -c cargo build`
 5. Remove `shell.nix`
 6. Commit changes
-
-**Reference:** See `docs/archive/2025-11-04-flake-migration.md`
 
 ---
 
@@ -401,7 +397,6 @@ nix build
 - **Nix Flakes Manual**: https://nixos.org/manual/nix/stable/command-ref/new-cli/nix3-flake.html
 - **rust-overlay**: https://github.com/oxalica/rust-overlay
 - **flake-utils**: https://github.com/numtide/flake-utils
-- **Our Migration**: `docs/archive/2025-11-04-flake-migration.md`
 
 ---
 

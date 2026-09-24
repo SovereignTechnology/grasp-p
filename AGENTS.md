@@ -305,7 +305,8 @@ This was a key learning from GRASP-01: docs described plans, not implementation,
 
 **Session files go in `work/` (gitignored except README.md)**
 
-- Archive valuable content to `docs/archive/YYYY-MM-DD-*.md` at session end
+- Keep investigation reports, deployment checks, and soak notes in ignored `work/`; do not commit them.
+- Put lasting product documentation directly in the appropriate Diátaxis directory.
 - Delete temporary files
 - Keep root clean (only README.md, AGENTS.md)
 
