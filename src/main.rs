@@ -9,7 +9,7 @@ use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, EnvFilter, Lay
 use ngit_grasp::{
     cleanup_empty_repos,
     config::Config,
-    logging::{effective_log_filter, SuppressRoutineDisconnects},
+    logging::{effective_log_filter, RelayDiagnosticFields, SuppressRoutineDisconnects},
     nostr,
     server::RelayServer,
 };
@@ -122,6 +122,7 @@ async fn run_relay(config: Config) -> Result<()> {
     // logs corrupt journald/file output and break log-scraping consumers.
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
+            .fmt_fields(RelayDiagnosticFields)
             .with_ansi(std::io::stdout().is_terminal())
             .with_filter(filter),
     );

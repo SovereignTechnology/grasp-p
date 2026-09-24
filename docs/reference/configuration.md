@@ -1638,6 +1638,12 @@ equivalent standard NIP-11 field, so it remains documented configuration only.
 
 ### Logging Configuration
 
+The server omits the raw `msg` payload from outbound nostr-sdk relay diagnostics.
+The relay URL and rejection reason remain visible at the original severity,
+including when debug logging is enabled. This prevents large rejected events
+from filling logs or hiding the reason across journal fragments; it does not
+change event validation.
+
 #### `NGIT_LOG_LEVEL`
 
 **Description:** Application logging level or explicit tracing filter expression

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and
+  rejection reasons.
+
 - Back off repeatedly failed participant mailbox probes, preserving their pauses
   across reconnects and inventory changes.
 
