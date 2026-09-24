@@ -680,7 +680,7 @@ impl RelayConnection {
         }
         if self.health_tracker.is_subscription_paused(&self.url) {
             return Err(format!(
-                "Query start deferred for {}: relay policy cooldown active",
+                "Query start deferred for {}: subscription cooldown active",
                 self.url
             ));
         }
@@ -2574,6 +2574,7 @@ impl RelayConnection {
             &self.transient_req_permits_held,
             &sub_id,
             generation,
+            || self.health_tracker.record_request_failure(&self.url),
         ) {
             return;
         }
@@ -2626,12 +2627,16 @@ impl RelayConnection {
         held: &TransientReqPermitMap,
         sub_id: &SubscriptionId,
         generation: u64,
+        before_release: impl FnOnce(),
     ) -> bool {
         let mut permits = held.lock().expect("transient permit map poisoned");
         if permits
             .get(sub_id)
             .is_some_and(|permit| permit.generation == generation)
         {
+            // Pause admission before releasing capacity to queued workers.
+            // Stale timers and an EOSE winner must not record a failure.
+            before_release();
             permits.remove(sub_id);
             true
         } else {
@@ -4737,6 +4742,15 @@ mod tests {
         assert_eq!(notification.subscription_id, id);
         assert_eq!(notification.generation, Some(generation));
         assert!(!connection.holds_subscription_permit(&id));
+        assert!(connection.health_tracker.is_subscription_paused(&url));
+        assert!(connection
+            .subscribe_filter(
+                Filter::new().kind(Kind::GitIssue),
+                TransientRequestClass::HistoricPage,
+            )
+            .await
+            .unwrap_err()
+            .contains("cooldown"));
         tokio::time::timeout(Duration::from_secs(3), async {
             while relay.subscription(&id).await.is_some() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -4794,6 +4808,7 @@ mod tests {
                 &connection.transient_req_permits_held,
                 &sub_id,
                 generation.wrapping_add(1),
+                || panic!("stale timer must not apply a cooldown"),
             ),
             "a stale watchdog must not release a newer session's slot"
         );
@@ -4802,6 +4817,7 @@ mod tests {
                 &connection.transient_req_permits_held,
                 &sub_id,
                 generation,
+                || {},
             ),
             "the matching watchdog must release its closed subscription"
         );

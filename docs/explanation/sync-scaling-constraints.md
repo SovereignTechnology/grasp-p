@@ -501,7 +501,7 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   bounds application-visible starts, but cannot pace SDK-managed NIP-77
   `NEG-MSG` continuations. If a relay returns
   `rate-limited: too many queries`, the current connection
-  first rejects locally queued starts for the existing 65-second cooldown so
+  first rejects locally queued starts for a 65-second initial cooldown so
   their incomplete work can be re-derived in priority order, then learns a
   shared query-start interval: 600 ms initially (100 starts/minute, below the
   older rust-nostr 120/minute limit), doubling on a later rate-limit episode up to
@@ -514,6 +514,18 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   rust-nostr owns the internal `NEG-MSG` exchange, so the application cannot
   guarantee that each charged frame passes through its pacing gate. Historic
   recovery then uses the paced REQ path.
+- Failed rate-limit recovery probes double their pause from 65 seconds to
+  at most one hour. Repeated notices during a pause do not extend it. Five
+  unpaused minutes without another refusal reset the next delay; time spent
+  paused or a successful WebSocket handshake does not count as recovery.
+  Incomplete requests use an independent backoff with the same bounds,
+  including watchdog expiry and unexpected transient CLOSED before EOSE.
+  The watchdog records the pause before releasing its slot, preventing queued
+  work from immediately replacing a failed request. Existing live coverage
+  stays open, and history workers release global capacity while waiting.
+  Overlapping rate, policy and request pauses must all expire before recovery;
+  required live repair is remembered across overlapping pauses. Timeout-only
+  recovery does not rebuild successful live subscriptions.
 - Transient REQ+EOSE subscriptions — historic sync groups, fallback
   filters, exact-ID fetches, retries, and pagination pages — retain a
   five-request class cap inside the shared ledger: a slot is acquired when

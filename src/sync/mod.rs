@@ -2543,6 +2543,7 @@ async fn run_health_and_metrics_checker(
                         ("dependency_relays", manager.dependency_relay_deadlines.len()),
                         ("related_dependency_events", manager.rejected_events_index.related_len()),
                         ("deferred_consolidations", manager.deferred_consolidations.relays.len()),
+                        ("pending_live_repairs", manager.pending_live_repairs.len()),
                         ("descendant_rotations", manager.descendant_sync_rotations.len()),
                         (
                             "nip65_eligible_authors",
@@ -2673,6 +2674,8 @@ pub struct SyncManager {
     history_result_tx: Option<tokio::sync::mpsc::Sender<history::HistoryResult>>,
     /// Relays whose subscription consolidation waits for in-flight batches to drain.
     deferred_consolidations: DeferredConsolidations,
+    /// Remember refused live coverage until every overlapping pause expires.
+    pending_live_repairs: HashSet<String>,
     /// Relays whose complete persistent filter set exceeds a learned remote
     /// byte cap, mapped to their next bounded catch-up deadline.
     byte_limited_live_relays: HashMap<String, Instant>,
@@ -2805,6 +2808,7 @@ impl SyncManager {
             history_tasks: history::HistoryTasks::default(),
             history_result_tx: None,
             deferred_consolidations: DeferredConsolidations::default(),
+            pending_live_repairs: HashSet::new(),
             byte_limited_live_relays: HashMap::new(),
             descendant_sync_rotations: HashMap::new(),
             descendant_live_coverage: HashMap::new(),
@@ -7796,6 +7800,7 @@ impl SyncManager {
     }
 
     fn cancel_deferred_consolidation(&mut self, relay_url: &str, reason: &'static str) {
+        self.pending_live_repairs.remove(relay_url);
         if self.deferred_consolidations.cancel(relay_url) {
             tracing::debug!(
                 relay = %relay_url,
@@ -7928,6 +7933,9 @@ impl SyncManager {
         let Some(batch) = batch else {
             return;
         };
+        // Also covers an SDK deadline acknowledged by CLOSED before the
+        // watchdog fires. Duplicate failures within this pause are coalesced.
+        self.health_tracker.record_request_failure(relay_url);
         self.release_removed_descendant_batch(relay_url, &batch);
         for id in &batch.outstanding_subs {
             connection.retire_subscription(id).await;
@@ -8463,7 +8471,7 @@ impl SyncManager {
     /// Check for rate-limited relays that have exceeded cooldown
     ///
     /// This method is called by the health and metrics checker every 2 seconds.
-    /// For each relay in RateLimited state that has exceeded the 65-second cooldown:
+    /// For each relay whose adaptive subscription pause has expired:
     /// 1. Clears the rate limit state (sets to Healthy)
     /// 2. Recomputes required actions for that relay
     /// 3. Submits those actions
@@ -8479,6 +8487,13 @@ impl SyncManager {
             }
         }
 
+        self.pending_live_repairs
+            .extend(relays_to_recover.iter().cloned());
+        for relay in self.health_tracker.exit_expired_request_pauses() {
+            if !relays_to_recover.contains(&relay) {
+                relays_to_recover.push(relay);
+            }
+        }
         if relays_to_recover.is_empty() {
             return;
         }
@@ -8487,18 +8502,23 @@ impl SyncManager {
         let targets = self.derive_targets().await;
 
         for relay_url in relays_to_recover {
+            if self.health_tracker.is_subscription_paused(&relay_url) {
+                continue;
+            }
             tracing::info!(relay = %relay_url, "Subscription pause expired; probing coverage");
 
             // A rate-limited CLOSED deliberately leaves live coverage down so
             // it cannot immediately recreate the rejected request burst.
             // Restore persistent coverage first when the relay admits work again.
-            if let Some(generation) = self
-                .connections
-                .get(&relay_url)
-                .map(RelayConnection::current_subscription_generation)
-            {
-                self.restore_live_coverage_after_closed(&relay_url, generation)
-                    .await;
+            if self.pending_live_repairs.remove(&relay_url) {
+                if let Some(generation) = self
+                    .connections
+                    .get(&relay_url)
+                    .map(RelayConnection::current_subscription_generation)
+                {
+                    self.restore_live_coverage_after_closed(&relay_url, generation)
+                        .await;
+                }
             }
 
             // Only compute actions for this specific relay
@@ -8854,6 +8874,7 @@ impl SyncManager {
     ///
     /// After calling this method, the SyncManager is no longer usable.
     pub async fn shutdown(&mut self) {
+        self.pending_live_repairs.clear();
         self.history_tasks.clear();
         tracing::info!("Starting SyncManager shutdown");
 

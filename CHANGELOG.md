@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Back off repeated rate-limit refusals and incomplete requests exponentially,
+  while keeping live connections and unrelated relays available.
+
 - Reuse already-installed core live filters during historic retries, preventing
   duplicate subscriptions from exhausting tight relay budgets.
 

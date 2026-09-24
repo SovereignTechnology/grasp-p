@@ -4,7 +4,7 @@
 //! - Health state machine (Healthy -> Degraded -> Dead -> RateLimited)
 //! - Exponential backoff with configurable max delay
 //! - Dead relay detection after 24h of continuous failures
-//! - Rate limit detection and fixed cooldown period
+//! - Rate limit detection and bounded adaptive cooldown
 //! - Naughty list for persistent infrastructure issues (DNS, TLS, protocol errors)
 //!
 //! ## Health States
@@ -12,7 +12,7 @@
 //! - **Healthy**: Working connection, no recent failures
 //! - **Degraded**: Connection failed, retrying with backoff
 //! - **Dead**: 24h+ of continuous failures, minimal retry (once per day)
-//! - **RateLimited**: NOTICE-triggered 65-second cooldown to avoid rate limits
+//! - **RateLimited**: NOTICE-triggered 65-second initial cooldown to avoid rate limits
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +45,32 @@ pub(super) const RATE_LIMIT_COOLDOWN_SECS: u64 = 65;
 /// Stability period after recovery before marking relay as fully healthy (5 minutes)
 /// A relay must maintain connection for this duration after failures before being marked Healthy
 const STABILITY_PERIOD_SECS: u64 = 300;
+
+/// Repeated failed subscription probes back off independently of transport.
+const MAX_SUBSCRIPTION_BACKOFF: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, Clone, Default)]
+struct SubscriptionBackoff {
+    delay: Duration,
+    last_deadline: Option<Instant>,
+}
+
+impl SubscriptionBackoff {
+    fn next_delay(&mut self, now: Instant, initial: Duration) -> Duration {
+        // Time spent paused is not evidence of recovery. Require a complete
+        // stability window after the previous pause before resetting the pace.
+        self.delay = if self
+            .last_deadline
+            .is_none_or(|deadline| now >= deadline + Duration::from_secs(STABILITY_PERIOD_SECS))
+        {
+            initial
+        } else {
+            self.delay.saturating_mul(2).min(MAX_SUBSCRIPTION_BACKOFF)
+        };
+        self.last_deadline = Some(now + self.delay);
+        self.delay
+    }
+}
 
 /// Health state of a relay connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +109,9 @@ pub struct RelayHealth {
     pub connected: bool,
     /// Has this relay sent us a rate-limiting NOTICE recently
     pub rate_limited: bool,
+    rate_limit_backoff: SubscriptionBackoff,
+    request_backoff: SubscriptionBackoff,
+    request_retry_at: Option<Instant>,
     /// Deadline for retrying subscriptions refused by relay policy.
     pub policy_retry_at: Option<Instant>,
     /// Number of consecutive connection failures
@@ -146,6 +175,10 @@ impl RelayHealth {
             }
         }
 
+        if self.is_request_paused_now() {
+            return HealthState::Degraded;
+        }
+
         // Check if we have active failures (currently failing to connect)
         if self.consecutive_failures > 0 {
             return HealthState::Degraded;
@@ -200,6 +233,11 @@ impl RelayHealth {
             .is_some_and(|deadline| Instant::now() < deadline)
     }
 
+    fn is_request_paused_now(&self) -> bool {
+        self.request_retry_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     /// Get the consecutive failure count
     pub fn failure_count(&self) -> u32 {
         self.consecutive_failures
@@ -219,7 +257,11 @@ impl RelayHealth {
 
     /// Get remaining backoff/cooldown duration
     pub fn remaining_backoff(&self) -> Option<Duration> {
-        let next_retry = self.next_retry_at?;
+        let next_retry = self
+            .next_retry_at
+            .into_iter()
+            .chain(self.request_retry_at)
+            .max()?;
         let now = Instant::now();
         if now >= next_retry {
             None
@@ -460,7 +502,8 @@ impl RelayHealthTracker {
 
     /// Record a rate limit NOTICE from a relay
     ///
-    /// Sets the relay to RateLimited state with a fixed 65-second cooldown.
+    /// Sets RateLimited with a 65-second initial cooldown. Failed probes
+    /// double the pause up to one hour; five unpaused minutes reset it.
     /// This is distinct from connection failures (Degraded state) - it's triggered
     /// by NOTICE messages from the relay indicating we're sending too many requests.
     pub fn record_rate_limit(&self, relay_url: &str) {
@@ -475,12 +518,15 @@ impl RelayHealthTracker {
             return;
         }
 
+        let cooldown = health
+            .rate_limit_backoff
+            .next_delay(now, Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
         health.rate_limited = true;
-        health.next_retry_at = Some(now + Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
+        health.next_retry_at = Some(health.next_retry_at.unwrap_or(now).max(now + cooldown));
 
         tracing::warn!(
             relay = %relay_url,
-            cooldown_secs = RATE_LIMIT_COOLDOWN_SECS,
+            cooldown_secs = cooldown.as_secs(),
             "Relay rate limited, pausing new subscriptions"
         );
     }
@@ -503,9 +549,43 @@ impl RelayHealthTracker {
     }
 
     pub fn is_subscription_paused(&self, relay_url: &str) -> bool {
-        self.health
-            .get(relay_url)
-            .is_some_and(|entry| entry.is_rate_limited_now() || entry.is_policy_limited_now())
+        self.health.get(relay_url).is_some_and(|entry| {
+            entry.is_rate_limited_now()
+                || entry.is_policy_limited_now()
+                || entry.is_request_paused_now()
+        })
+    }
+
+    /// A missing terminal response is a request failure, not a transport
+    /// failure or proof of rate limiting. Keep live sockets and pause new work.
+    pub fn record_request_failure(&self, relay_url: &str) {
+        let now = Instant::now();
+        let mut health = self.health.entry(relay_url.to_string()).or_default();
+        if health.is_request_paused_now() {
+            return;
+        }
+        let delay = health
+            .request_backoff
+            .next_delay(now, Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS));
+        health.request_retry_at = Some(now + delay);
+        tracing::warn!(relay = %relay_url, cooldown_secs = delay.as_secs(),
+            "Incomplete request; pausing new subscriptions");
+    }
+
+    pub fn exit_expired_request_pauses(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut recovered = Vec::new();
+        for mut entry in self.health.iter_mut() {
+            let (url, health) = entry.pair_mut();
+            if health
+                .request_retry_at
+                .is_some_and(|deadline| now >= deadline)
+            {
+                health.request_retry_at = None;
+                recovered.push(url.clone());
+            }
+        }
+        recovered
     }
 
     /// Clear expired policy refusals and return relays due one recovery probe.
@@ -939,6 +1019,90 @@ mod tests {
         let tracker = RelayHealthTracker::with_defaults();
         let health = tracker.get_health("wss://nonexistent.example.com");
         assert!(health.is_none());
+    }
+
+    #[test]
+    fn request_failures_pause_admission_without_dropping_live_connection() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://silent.example";
+        tracker.record_success(relay);
+        tracker.record_request_failure(relay);
+        let first = tracker.get_health(relay).unwrap();
+        assert!(first.connected);
+        assert_eq!(first.state(), HealthState::Degraded);
+        assert!(!first.is_rate_limited_now());
+        assert!(tracker.is_subscription_paused(relay));
+        assert!(first.remaining_backoff().is_some());
+        tracker.record_request_failure(relay);
+        tracker.record_success(relay);
+        assert_eq!(
+            tracker.get_health(relay).unwrap().request_retry_at,
+            first.request_retry_at
+        );
+        tracker.health.get_mut(relay).unwrap().request_retry_at = Some(Instant::now());
+        assert_eq!(
+            tracker.exit_expired_request_pauses(),
+            vec![relay.to_string()]
+        );
+        assert!(!tracker.is_subscription_paused(relay));
+        tracker.record_request_failure(relay);
+        assert_eq!(
+            tracker.get_health(relay).unwrap().request_backoff.delay,
+            Duration::from_secs(130)
+        );
+        assert!(!tracker.is_subscription_paused("wss://healthy.example"));
+    }
+
+    #[test]
+    fn request_rate_and_policy_pauses_cannot_clear_one_another() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://limited.example";
+        tracker.record_request_failure(relay);
+        tracker.record_rate_limit(relay);
+        tracker.health.get_mut(relay).unwrap().next_retry_at = Some(Instant::now());
+        tracker.exit_expired_rate_limits();
+        assert!(tracker.is_subscription_paused(relay));
+        tracker.record_policy_refusal(relay);
+        tracker.health.get_mut(relay).unwrap().request_retry_at = Some(Instant::now());
+        tracker.exit_expired_request_pauses();
+        assert!(tracker.is_subscription_paused(relay));
+        assert_eq!(tracker.get_state(relay), HealthState::PolicyLimited);
+    }
+
+    #[test]
+    fn subscription_backoff_doubles_to_cap_and_resets_only_after_unpaused_stability() {
+        let mut backoff = SubscriptionBackoff::default();
+        let mut now = Instant::now();
+        for secs in [65, 130, 260, 520, 1040, 2080, 3600, 3600] {
+            let delay = backoff.next_delay(now, Duration::from_secs(65));
+            assert_eq!(delay, Duration::from_secs(secs));
+            now += delay;
+        }
+        now += Duration::from_secs(STABILITY_PERIOD_SECS);
+        assert_eq!(
+            backoff.next_delay(now, Duration::from_secs(65)),
+            Duration::from_secs(65)
+        );
+    }
+
+    #[test]
+    fn failed_rate_limit_probe_escalates_without_disconnect_or_burst_extension() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://limited.example";
+        tracker.record_success(relay);
+        tracker.record_rate_limit(relay);
+        tracker.health.get_mut(relay).unwrap().next_retry_at = Some(Instant::now());
+        assert_eq!(tracker.exit_expired_rate_limits(), vec![relay.to_string()]);
+        tracker.record_success(relay);
+        tracker.record_rate_limit(relay);
+        let health = tracker.get_health(relay).unwrap();
+        assert!(health.connected);
+        assert_eq!(health.rate_limit_backoff.delay, Duration::from_secs(130));
+        tracker.record_rate_limit(relay);
+        assert_eq!(
+            tracker.get_health(relay).unwrap().next_retry_at,
+            health.next_retry_at
+        );
     }
 
     #[test]
