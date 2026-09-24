@@ -9,53 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Back off repeatedly failed NIP-65 identity queries per source, including
-  discovery-only reconnects and authors added during the pause.
-
-- Ignore stale filter-count refusals from retired subscriptions so replacements
-  are not incorrectly paused for 24 hours.
-
-- Report missing semantic fallback metadata as scheduled recovery rather than a
-  subscription-creation error.
-
-- Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and
-  rejection reasons.
-
-- Back off repeatedly failed participant mailbox probes, preserving their pauses
-  across reconnects and inventory changes.
-
-- Honor policy and request-failure pauses when reconnecting, so refused peers
-  cannot bypass transport backoff through their policy-limited health state.
-
-- Back off repeated rate-limit refusals and incomplete requests exponentially,
-  while keeping live connections and unrelated relays available.
-
-- Reuse already-installed core live filters during historic retries, preventing
-  duplicate subscriptions from exhausting tight relay budgets.
-
-- Pause deterministic oversized-filter refusals instead of retrying unchanged
-  requests; regroup only explicit filter-count refusals.
-
+- Let relays establish live sync while other relays reconcile history, by moving
+  slow reconciliation and paced historic requests out of the shared sync actor
+  into bounded background workers. Space connection starts at least 250 ms apart
+  while retaining the eight-worker connection cap.
+- Apply independent exponential cooldowns to repeated rate-limit refusals and
+  incomplete sync requests, from 65 seconds up to one hour. Queued requests
+  respect active policy, rate-limit, and request-failure pauses; reconnects also
+  enforce transport backoff. A successful connection alone does not reset
+  recovery backoff.
+  Preserve working live subscriptions and pending live repairs while history
+  waits without occupying global worker capacity.
+- Back off failed participant mailbox fetches and NIP-65 identity queries
+  independently per source, from five minutes up to one hour. Apply their
+  deadlines to query admission and discovery-only reconnects, preserving pauses
+  across reconnects and inventory growth, including newly discovered authors.
+  Only a successful query of the corresponding type resets its failure delay;
+  independent repository and live-sync work remains eligible.
+- Pause deterministic invalid or oversized filters instead of retrying unchanged
+  requests. Regroup only explicit filter-count refusals, and ignore those for
+  already-retired subscriptions so late responses cannot incorrectly pause
+  replacement coverage for 24 hours.
+- Reuse installed core live filters during historic retries, preventing duplicate
+  subscriptions from exhausting relay budgets.
+- Retire partially admitted or incomplete historic batches on admission failure,
+  timeout, or closure before EOSE. Release their subscriptions, bound SDK
+  retention with an auto-close deadline, and leave coverage unconfirmed for
+  recovery instead of retaining stalled work or accepting partial history.
+- Pace descendant fallback cycles with a one-minute refresh delay, retaining
+  overlap and immediate baselines for changed frontiers. Report missing semantic
+  fallback metadata as scheduled recovery rather than a subscription-creation
+  error, and move routine batch-completion bookkeeping to debug logs.
 - Reject PR and PR-update events missing commit metadata as terminal invalid
   events, avoiding repeated recovery attempts for immutable malformed data.
-
-- Retire incomplete historic batches when transient requests time out or close
-  before EOSE, and bound SDK subscription retention with an auto-close deadline.
-
-- Keep slow history reconciliation and paced requests out of the shared sync
-  actor so other relays establish live sync promptly, with bounded background
-  history workers.
-- Space relay connection attempts at least 250 ms apart while retaining the
-  eight-worker cap, preventing bursts when many discovered targets become ready.
-
-- Include repository, process exit status, and stream outcome in Git fetch
-  failure diagnostics; log client-cancelled upload-pack streams at debug level.
-- Pace descendant fallback cycles with a one-minute refresh delay while
-  retaining overlap and immediate baselines for changed frontiers. Move routine
-  batch-completion bookkeeping to debug logs.
-- Enforce relay policy-refusal pauses for queued sync and mailbox requests.
-  Stop historic batch admission at the first failure, release started groups,
-  and keep partial coverage unconfirmed for recovery after the pause.
+- Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and
+  rejection reasons. Include repository, process exit status, and stream outcome
+  in Git fetch failure diagnostics, and log client-cancelled upload-pack streams
+  at debug level.
 
 ## [3.0.4] - 2026-09-21
 
