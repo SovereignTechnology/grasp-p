@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ignore stale filter-count refusals from retired subscriptions so replacements
+  are not incorrectly paused for 24 hours.
+
 - Report missing semantic fallback metadata as scheduled recovery rather than a
   subscription-creation error.
 

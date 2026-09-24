@@ -695,6 +695,11 @@ query-rate refusal and then drains work smoothly at a learned rate.
   serving-side counterpart.
 - [Monitoring Overview](monitoring.md) — metrics for observing sync health.
 
+A filter-count refusal for a subscription that has already been retired is
+ignored. Replacement live groups may be installed before the old group's
+CLOSED arrives; that stale response must not trigger a relay-wide policy pause.
+Owned requests still use the ordinary filter-count regrouping path.
+
 ### Failed participant mailbox probes
 
 Mailbox fetch failures, including rejected authentication, retry after five

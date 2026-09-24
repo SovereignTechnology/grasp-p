@@ -8164,6 +8164,19 @@ impl SyncManager {
         if is_filter_count_refusal(reason) {
             let pending_filter_count = {
                 let pending = self.pending_sync_index.read().await;
+                let owns_pending = pending.get(relay_url).is_some_and(|batches| {
+                    batches
+                        .iter()
+                        .any(|batch| batch.outstanding_subs.contains(&subscription_id))
+                });
+                // A minimum-churn replacement can retire the rejected group
+                // before its CLOSED reaches the actor. That stale response
+                // must not park the replacement's valid coverage for a day.
+                if live_generation.is_none() && live_filter_count.is_none() && !owns_pending {
+                    tracing::debug!(relay = %relay_url, sub_id = %subscription_id,
+                        "Ignoring filter-count CLOSED for a retired subscription");
+                    return;
+                }
                 pending.get(relay_url).and_then(|batches| {
                     batches.iter().find_map(|batch| {
                         batch
@@ -11110,6 +11123,59 @@ mod tests {
             assert!(is_rate_limit_message(message), "missed: {message}");
         }
         assert!(!is_rate_limit_message("blocked: unsupported filter"));
+    }
+
+    #[tokio::test]
+    async fn retired_filter_count_refusal_does_not_pause_replacement_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        config.sync_disable_negentropy = true;
+        config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let git_path = PathBuf::from(&config.git_data_path);
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut manager = SyncManager::new(
+            None,
+            "service.example".into(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path,
+            None,
+            None,
+            None,
+        );
+
+        let url = "wss://limited.example";
+        manager.health_tracker.record_success(url);
+        manager
+            .handle_subscription_closed(
+                url,
+                SubscriptionId::new("retired-live-group"),
+                "rate-limited: REQ exceeds max filter count 1",
+                None,
+                None,
+            )
+            .await;
+        assert!(!manager.health_tracker.is_subscription_paused(url));
+        assert_eq!(
+            manager.health_tracker.get_state(url),
+            health::HealthState::Healthy
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test]
