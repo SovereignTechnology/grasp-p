@@ -1952,6 +1952,8 @@ struct Nip65DiscoveryState {
     mailbox_probes_in_flight: HashSet<String>,
     in_flight: HashSet<(String, PublicKey)>,
     next_attempt_at: HashMap<(String, PublicKey), Instant>,
+    /// Failed identity queries pause the source, including newly discovered authors.
+    discovery_failure_backoff: HashMap<String, (Duration, Instant)>,
     next_inventory_at: Option<Instant>,
 }
 
@@ -1970,26 +1972,75 @@ impl Nip65DiscoveryState {
             .collect()
     }
 
-    /// Ownership survives a pause, but mailbox-only sockets should not be
-    /// redialed until their next probe. Other discovery work remains eligible.
-    fn due_connection_targets(&self, now: Instant) -> HashSet<String> {
-        self.author_sources
+    fn author_query_due(&self, source: &str, author: &PublicKey, now: Instant) -> bool {
+        self.discovery_failure_backoff
+            .get(source)
+            .is_none_or(|(_, due)| *due <= now)
+            && self
+                .next_attempt_at
+                .get(&(source.to_string(), *author))
+                .is_none_or(|due| *due <= now)
+    }
+
+    fn record_discovery_outcome(
+        &mut self,
+        source: &str,
+        succeeded: bool,
+        now: Instant,
+    ) -> Duration {
+        if succeeded {
+            self.discovery_failure_backoff.remove(source);
+            return Duration::ZERO;
+        }
+        if !self
+            .author_sources
             .values()
-            .flatten()
-            .chain(self.in_flight.iter().map(|(relay, _)| relay))
-            .chain(self.mailbox_probes_in_flight.iter())
-            .chain(
-                self.mailbox_roots
-                    .keys()
-                    .chain(self.mailbox_repositories.keys())
-                    .filter(|relay| {
-                        self.mailbox_probe_next_at
-                            .get(*relay)
-                            .is_none_or(|due| *due <= now)
-                    }),
-            )
-            .cloned()
-            .collect()
+            .any(|sources| sources.contains(source))
+        {
+            return Duration::ZERO;
+        }
+        let (delay, due) = self
+            .discovery_failure_backoff
+            .entry(source.to_string())
+            .and_modify(|(delay, _)| {
+                *delay = delay.saturating_mul(2).min(Duration::from_secs(3600))
+            })
+            .or_insert((nip65_discovery_retry_interval(), now));
+        *due = now + *delay;
+        *delay
+    }
+
+    fn retain_discovery_backoff(&mut self) {
+        let sources: HashSet<&String> = self.author_sources.values().flatten().collect();
+        self.discovery_failure_backoff
+            .retain(|source, _| sources.contains(source));
+    }
+
+    /// Ownership survives pauses; dialing requires due work from at least one
+    /// discovery lane. Repository/live work is admitted independently.
+    fn due_connection_targets(&self, now: Instant) -> HashSet<String> {
+        let mut due = HashSet::new();
+        for (author, sources) in &self.author_sources {
+            for source in sources {
+                if self.author_query_due(source, author, now) {
+                    due.insert(source.clone());
+                }
+            }
+        }
+        due.extend(self.in_flight.iter().map(|(relay, _)| relay.clone()));
+        due.extend(self.mailbox_probes_in_flight.iter().cloned());
+        due.extend(
+            self.mailbox_roots
+                .keys()
+                .chain(self.mailbox_repositories.keys())
+                .filter(|relay| {
+                    self.mailbox_probe_next_at
+                        .get(*relay)
+                        .is_none_or(|due| *due <= now)
+                })
+                .cloned(),
+        );
+        due
     }
 
     fn has_mailbox_scope(&self, relay: &str) -> bool {
@@ -5724,6 +5775,7 @@ impl SyncManager {
                         .get(author)
                         .is_some_and(|sources| sources.contains(relay))
                 });
+            self.nip65_discovery.retain_discovery_backoff();
             self.nip65_discovery.next_inventory_at = Some(now + nip65_inventory_interval());
             let fallback_relays = self.configured_nip65_fallback_relays();
             let inbox_overlay = discovery::build_inbox_root_overlay(
@@ -5778,11 +5830,7 @@ impl SyncManager {
             for source in sources {
                 let key = (source.clone(), *author);
                 if self.nip65_discovery.in_flight.contains(&key)
-                    || self
-                        .nip65_discovery
-                        .next_attempt_at
-                        .get(&key)
-                        .is_some_and(|due| *due > now)
+                    || !self.nip65_discovery.author_query_due(source, author, now)
                 {
                     continue;
                 }
@@ -6121,6 +6169,15 @@ impl SyncManager {
                 (Vec::new(), false)
             }
         };
+        let retry_after = self.nip65_discovery.record_discovery_outcome(
+            &result.source_relay,
+            query_succeeded,
+            Instant::now(),
+        );
+        if !query_succeeded {
+            tracing::warn!(relay = %result.source_relay, retry_secs = retry_after.as_secs_f64(),
+                "NIP-65 identity query failed; backing off this discovery source");
+        }
         let selected = discovery::latest_identity_events(events, &result.authors);
         let mut represented_by_source = HashSet::new();
         for event in selected {
@@ -6311,11 +6368,7 @@ impl SyncManager {
                             .nip65_discovery
                             .in_flight
                             .contains(&(source.to_string(), *author))
-                            || self
-                                .nip65_discovery
-                                .next_attempt_at
-                                .get(&(source.to_string(), *author))
-                                .is_none_or(|due| *due <= now))
+                            || self.nip65_discovery.author_query_due(source, author, now))
                 });
         let has_mailbox_work = self
             .nip65_discovery
@@ -10255,6 +10308,60 @@ mod tests {
         assert_eq!(
             select_due_mailbox_relay(&due, &HashSet::new()),
             Some(unavailable),
+        );
+    }
+
+    #[test]
+    fn failed_identity_source_backs_off_across_authors_without_blocking_other_work() {
+        let source = "wss://denied.example".to_string();
+        let healthy = "wss://healthy.example".to_string();
+        let author = Keys::generate().public_key();
+        let newcomer = Keys::generate().public_key();
+        let mut discovery = Nip65DiscoveryState::default();
+        discovery
+            .author_sources
+            .insert(author, HashSet::from([source.clone(), healthy.clone()]));
+        let mut now = Instant::now();
+        let mut expected = nip65_discovery_retry_interval();
+        for _ in 0..16 {
+            let delay = discovery.record_discovery_outcome(&source, false, now);
+            assert_eq!(delay, expected);
+            assert!(!discovery.author_query_due(&source, &author, now));
+            assert!(!discovery.due_connection_targets(now).contains(&source));
+            assert!(discovery.due_connection_targets(now).contains(&healthy));
+            discovery
+                .author_sources
+                .insert(newcomer, HashSet::from([source.clone()]));
+            discovery.retain_discovery_backoff();
+            assert!(!discovery.author_query_due(&source, &newcomer, now));
+            now += delay;
+            assert!(discovery.author_query_due(&source, &author, now));
+            expected = expected.saturating_mul(2).min(Duration::from_secs(3600));
+        }
+        discovery.record_discovery_outcome(&source, false, now);
+        discovery
+            .mailbox_roots
+            .insert(source.clone(), HashSet::new());
+        assert!(
+            discovery.due_connection_targets(now).contains(&source),
+            "due mailbox work remains independent"
+        );
+        discovery
+            .mailbox_probe_next_at
+            .insert(source.clone(), now + Duration::from_secs(3600));
+        assert!(!discovery.due_connection_targets(now).contains(&source));
+        discovery.record_discovery_outcome(&source, true, now);
+        assert!(discovery.author_query_due(&source, &author, now));
+        assert_eq!(
+            discovery.record_discovery_outcome(&source, false, now),
+            nip65_discovery_retry_interval()
+        );
+        discovery.author_sources.clear();
+        discovery.retain_discovery_backoff();
+        discovery.record_discovery_outcome(&source, false, now);
+        assert!(
+            discovery.discovery_failure_backoff.is_empty(),
+            "late results cannot recreate retired state"
         );
     }
 

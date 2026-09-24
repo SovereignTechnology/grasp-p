@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Back off repeatedly failed NIP-65 identity queries per source, including
+  discovery-only reconnects and authors added during the pause.
+
 - Ignore stale filter-count refusals from retired subscriptions so replacements
   are not incorrectly paused for 24 hours.
 

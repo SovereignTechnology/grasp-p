@@ -710,3 +710,18 @@ to that relay's mailbox work and does not close working live subscriptions.
 Mailbox-only reconnects wait for the next probe deadline; independent discovery
 or repository work can still connect. Removing a relay from the mailbox
 inventory retires its backoff state.
+
+### Failed NIP-65 identity discovery
+
+Identity-query failures, including authentication rejection, pause discovery
+from that source for five minutes, doubling to a one-hour cap. This source-wide
+delay also covers new authors added during the pause. Only a successful identity
+query resets escalation; reconnecting or refreshing inventory does not.
+Successful queries with missing relay lists retain the ordinary per-author
+retry cadence and fallback-author behavior.
+
+Both query admission and discovery-only reconnects respect the source pause and
+per-author deadlines. Due mailbox queries or repository/live work may still use
+the relay independently. Removing the source from all identity-discovery scope
+retires its backoff state. Failed queries log the selected delay so operators
+can distinguish identity retries from mailbox retries.
