@@ -3104,18 +3104,6 @@ impl SyncManager {
                             None,
                         );
 
-                        if fallback_filters.is_empty() {
-                            tracing::warn!(
-                                relay = %relay_url_for_fallback,
-                                batch_id = batch_id,
-                                full_repos = batch_full_repos.len(),
-                                state_only_repos = batch_state_only_repos.len(),
-                                root_events = batch_root_events.len(),
-                                "Cannot create semantic fallback filters - no repos or root_events in batch"
-                            );
-                            // Fall through to ID-based fallback as last resort
-                        }
-
                         let mut new_sub_ids = HashSet::new();
                         if let Some(conn) = self.connections.get(&relay_url_for_fallback) {
                             for filter_group in group_filters_for_req(&fallback_filters) {
@@ -3191,13 +3179,23 @@ impl SyncManager {
                                     relay_already_degraded,
                                     Instant::now(),
                                 );
-                            tracing::error!(
-                                relay = %relay_url_for_fallback,
-                                batch_id = batch_id,
-                                missing_count = missing_count,
-                                pending_recovery = register_outcome.pending_total,
-                                "Failed to create REQ+EOSE fallback subscriptions - completing batch with partial results; bounded missing-event recovery scheduled"
-                            );
+                            if fallback_filters.is_empty() {
+                                tracing::info!(
+                                    relay = %relay_url_for_fallback,
+                                    batch_id,
+                                    missing_count,
+                                    pending_recovery = register_outcome.pending_total,
+                                    "Batch has no semantic fallback filters; bounded missing-event recovery scheduled"
+                                );
+                            } else {
+                                tracing::error!(
+                                    relay = %relay_url_for_fallback,
+                                    batch_id,
+                                    missing_count,
+                                    pending_recovery = register_outcome.pending_total,
+                                    "Failed to create REQ+EOSE fallback subscriptions - completing batch with partial results; bounded missing-event recovery scheduled"
+                                );
+                            }
 
                             // Re-acquire lock to extract the batch
                             let mut pending = self.pending_sync_index.write().await;

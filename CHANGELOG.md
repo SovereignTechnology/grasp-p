@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Report missing semantic fallback metadata as scheduled recovery rather than a
+  subscription-creation error.
+
 - Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and
   rejection reasons.
 
