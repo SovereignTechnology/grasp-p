@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Honor policy and request-failure pauses when reconnecting, so refused peers
+  cannot bypass transport backoff through their policy-limited health state.
+
 - Back off repeated rate-limit refusals and incomplete requests exponentially,
   while keeping live connections and unrelated relays available.
 

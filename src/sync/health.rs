@@ -690,16 +690,19 @@ impl RelayHealthTracker {
             Some(entry) => {
                 let health = entry.value();
 
-                // Don't reconnect if currently rate-limited
-                if health.is_rate_limited_now() {
+                // A new socket cannot repair a refused subscription policy or
+                // a silent request. Preserve every active pause across dials.
+                if health.is_rate_limited_now()
+                    || health.is_policy_limited_now()
+                    || health.is_request_paused_now()
+                {
                     return false;
                 }
 
                 // Check state-based logic
                 match health.state() {
-                    HealthState::Healthy
-                    | HealthState::Disconnected
-                    | HealthState::PolicyLimited => true,
+                    HealthState::Healthy | HealthState::Disconnected => true,
+                    HealthState::PolicyLimited => false,
                     HealthState::Degraded | HealthState::Dead | HealthState::RateLimited => {
                         // Check if backoff/cooldown period has elapsed
                         match health.next_retry_at {
@@ -1147,6 +1150,30 @@ mod tests {
         assert!(health.is_rate_limited_now());
         assert_eq!(health.next_retry_at, deadline);
         assert!(health.connected);
+    }
+
+    #[test]
+    fn policy_refused_disconnect_does_not_bypass_transport_backoff() {
+        let tracker = RelayHealthTracker::with_defaults();
+        let relay = "wss://refusing.example";
+        tracker.record_success(relay);
+        tracker.record_policy_refusal(relay);
+        tracker.record_failure(relay);
+        assert_eq!(tracker.get_state(relay), HealthState::PolicyLimited);
+        assert!(!tracker.should_attempt_connection(relay));
+        tracker.health.get_mut(relay).unwrap().policy_retry_at = Some(Instant::now());
+        tracker.exit_expired_policy_refusals();
+        assert!(
+            !tracker.should_attempt_connection(relay),
+            "transport backoff still applies"
+        );
+        tracker.health.get_mut(relay).unwrap().next_retry_at = Some(Instant::now());
+        assert!(tracker.should_attempt_connection(relay));
+        tracker.record_request_failure(relay);
+        assert!(
+            !tracker.should_attempt_connection(relay),
+            "silent-peer pause survives disconnect"
+        );
     }
 
     #[test]

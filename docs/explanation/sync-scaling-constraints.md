@@ -526,6 +526,9 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   Overlapping rate, policy and request pauses must all expire before recovery;
   required live repair is remembered across overlapping pauses. Timeout-only
   recovery does not rebuild successful live subscriptions.
+  If the transport disconnects, dialing also waits for every active policy,
+  rate, or request pause before applying the ordinary transport backoff. A
+  policy-limited health label must not override an outstanding dial deadline.
 - Transient REQ+EOSE subscriptions — historic sync groups, fallback
   filters, exact-ID fetches, retries, and pagination pages — retain a
   five-request class cap inside the shared ledger: a slot is acquired when
