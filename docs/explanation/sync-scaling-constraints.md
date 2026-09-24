@@ -694,3 +694,14 @@ query-rate refusal and then drains work smoothly at a learned rate.
 - [Defensive Measures & Rate Limiting](defensive-measures.md) — the
   serving-side counterpart.
 - [Monitoring Overview](monitoring.md) — metrics for observing sync health.
+
+### Failed participant mailbox probes
+
+Mailbox fetch failures, including rejected authentication, retry after five
+minutes and double on each failed probe up to one hour. Only a successful fetch
+resets this delay; reconnects and inventory growth preserve it. The cursor still
+advances so one failed filter cannot monopolize the mailbox. Backoff is scoped
+to that relay's mailbox work and does not close working live subscriptions.
+Mailbox-only reconnects wait for the next probe deadline; independent discovery
+or repository work can still connect. Removing a relay from the mailbox
+inventory retires its backoff state.

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Back off repeatedly failed participant mailbox probes, preserving their pauses
+  across reconnects and inventory changes.
+
 - Honor policy and request-failure pauses when reconnecting, so refused peers
   cannot bypass transport backoff through their policy-limited health state.
 
