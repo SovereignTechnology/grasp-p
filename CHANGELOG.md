@@ -9,12 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fail interrupted push responses instead of completing a success report when
-  Git emits truncated status data or exits unsuccessfully.
-
-- Drain Git output while uploading push data, preventing pipe deadlocks when
-  receive-pack produces progress or diagnostics before consuming the full pack.
-
 - Let relays establish live sync while other relays reconcile history, by moving
   slow reconciliation and paced historic requests out of the shared sync actor
   into bounded background workers. Space connection starts at least 250 ms apart
@@ -67,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when mixed with new updates. Preserve per-ref outcomes for ordinary pushes
   and hold verified refs locked across atomic pushes. Keep rejected refs from
   being immediately overwritten by post-push state promotion.
+- Drain Git output while uploading push data, preventing pipe deadlocks when
+  receive-pack produces progress or diagnostics before consuming the full pack.
+  Require complete Git status reports and a successful subprocess exit before
+  completing merged push responses, avoiding false success after interruption.
 - Reject PR and PR-update events missing commit metadata as terminal invalid
   events, avoiding repeated recovery attempts for immutable malformed data.
 - Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and
