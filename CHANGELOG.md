@@ -55,7 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicting existing paths.
 - Accept Git pushes whose targets were already applied by background state
   promotion after ref advertisement, while retaining authorization for changed
-  targets and Git's protection against concurrent ref updates.
+  targets and Git's protection against concurrent ref updates. Validate PR refs
+  independently so mixed pushes do not require state authorization for unchanged
+  branches.
 - Reject PR and PR-update events missing commit metadata as terminal invalid
   events, avoiding repeated recovery attempts for immutable malformed data.
 - Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and

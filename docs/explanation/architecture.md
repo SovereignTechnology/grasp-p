@@ -446,6 +446,8 @@ pub struct Purgatory {
      Git still compares the current ref atomically; different targets still
      require authorization. Packet capabilities and pack data are preserved,
      and signed commands and `refs/nostr/` commands are not rewritten.
+   - State no-op checks consider only ordinary refs. PR refs retain their own
+     validation and cannot make an unchanged branch require a pending state.
    - Helper functions in [`helpers.rs`](../../src/purgatory/helpers.rs) handle ref extraction
 
 4. **Bidirectional Waiting**: Either side can arrive first

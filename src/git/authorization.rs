@@ -636,12 +636,23 @@ pub async fn get_state_authorization_for_selected_repo(
         selected_pubkey
     );
 
+    // Convert pushed refs to RefUpdate (filter out refs/nostr/* refs)
+    let pushed_updates: Vec<RefUpdate> = pushed_refs
+        .iter()
+        .filter(|(_, _, name)| !name.starts_with("refs/nostr/"))
+        .map(|(old_oid, new_oid, ref_name)| RefUpdate {
+            old_oid: old_oid.clone(),
+            new_oid: new_oid.clone(),
+            ref_name: ref_name.clone(),
+        })
+        .collect();
+
     // Accept pushes where all refs are already at the desired state (old_oid == new_oid)
     // This handles race conditions where state events are applied between fetch and push
-    if !pushed_refs.is_empty() {
-        let all_refs_unchanged = pushed_refs
+    if !pushed_updates.is_empty() {
+        let all_refs_unchanged = pushed_updates
             .iter()
-            .all(|(old_oid, new_oid, _)| old_oid == new_oid);
+            .all(|update| update.old_oid == update.new_oid);
 
         if all_refs_unchanged {
             debug!(
@@ -657,18 +668,6 @@ pub async fn get_state_authorization_for_selected_repo(
             });
         }
     }
-
-    // Check purgatory for matching state events
-    // Convert pushed refs to RefUpdate (filter out refs/nostr/* refs)
-    let pushed_updates: Vec<RefUpdate> = pushed_refs
-        .iter()
-        .filter(|(_, _, name)| !name.starts_with("refs/nostr/"))
-        .map(|(old_oid, new_oid, ref_name)| RefUpdate {
-            old_oid: old_oid.clone(),
-            new_oid: new_oid.clone(),
-            ref_name: ref_name.clone(),
-        })
-        .collect();
 
     // Get local refs from repository
     let local_refs_list = list_refs(repo_path).unwrap_or_default();

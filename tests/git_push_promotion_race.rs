@@ -35,6 +35,15 @@ fn push(repo: &Path, old: &str, new: &str) -> Bytes {
 
 #[tokio::test]
 async fn state_promoted_after_advertisement_does_not_reject_an_already_applied_push() {
+    promoted_push(false).await;
+}
+
+#[tokio::test]
+async fn already_applied_branch_does_not_require_state_for_a_pr_ref() {
+    promoted_push(true).await;
+}
+
+async fn promoted_push(with_pr: bool) {
     let dir = tempfile::tempdir().unwrap();
     let owner = Keys::generate();
     let identifier = "promotion-race";
@@ -83,7 +92,27 @@ async fn state_promoted_after_advertisement_does_not_reject_an_already_applied_p
 
     // The client saw an absent branch; background promotion installed it
     // before its upload arrived and removed the state from purgatory.
-    let request = push(&repo, &"0".repeat(40), &commit);
+    let request = if with_pr {
+        let command = format!(
+            "{} {commit} refs/heads/main\0report-status\n",
+            "0".repeat(40)
+        );
+        let pr = format!(
+            "{} {commit} refs/nostr/{}\n",
+            "0".repeat(40),
+            "a".repeat(64)
+        );
+        let mut raw = format!(
+            "{:04x}{command}{:04x}{pr}0000",
+            command.len() + 4,
+            pr.len() + 4
+        )
+        .into_bytes();
+        raw.extend(git(&repo, &["pack-objects", "--stdout"]));
+        Bytes::from(raw)
+    } else {
+        push(&repo, &"0".repeat(40), &commit)
+    };
     let response = tokio::time::timeout(
         Duration::from_secs(10),
         handle_receive_pack(
@@ -114,6 +143,22 @@ async fn state_promoted_after_advertisement_does_not_reject_an_already_applied_p
         result.contains("unpack ok") && result.contains("ok refs/heads/main"),
         "{result}"
     );
+
+    if with_pr {
+        assert!(
+            result.contains(&format!("ok refs/nostr/{}", "a".repeat(64))),
+            "{result}"
+        );
+        assert_eq!(
+            String::from_utf8(git(
+                &repo,
+                &["rev-parse", &format!("refs/nostr/{}", "a".repeat(64))]
+            ))
+            .unwrap()
+            .trim(),
+            commit
+        );
+    }
 
     // Existing objects are not authority to change a ref: a different target
     // still needs an authorizing state in purgatory.
