@@ -696,6 +696,10 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
   and is passed explicitly to the intended relay's NIP-77 dry run. The SDK's
   separate seen-ID tracker remains isolated: reconciliation neither persists
   incoming payloads nor publishes local events
+- **Hydration completion** accounts for local copies and retained dependencies
+  even when the SDK suppresses repeat event notifications. Local lookups use
+  bounded ID chunks without holding the pending-batch lock; absent IDs and
+  failed storage lookups remain eligible for recovery
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when incremental fragmentation exceeds the desired
   live-filter baseline by 70; rebuilds are deferred until in-flight batches

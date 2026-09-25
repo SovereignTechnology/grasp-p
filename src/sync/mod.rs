@@ -2991,6 +2991,47 @@ impl SyncManager {
                 .unwrap_or(false)
         };
 
+        // A local push or another relay can persist a requested event without
+        // another SDK Event notification. Snapshot only the last subscription's
+        // unaccounted IDs, then release the index lock before database I/O so the
+        // event processor can continue recording concurrent deliveries.
+        let locally_checkable: Vec<EventId> = {
+            let pending = self.pending_sync_index.read().await;
+            pending
+                .get(relay_url)
+                .and_then(|batches| {
+                    batches.iter().find(|batch| {
+                        batch.sync_method == SyncMethod::Negentropy
+                            && batch.outstanding_subs.len() == 1
+                            && batch.outstanding_subs.contains(&sub_id)
+                    })
+                })
+                .and_then(|batch| {
+                    batch
+                        .requested_event_ids
+                        .as_ref()
+                        .zip(batch.received_event_ids.as_ref())
+                })
+                .map(|(requested, received)| requested.difference(received).copied().collect())
+                .unwrap_or_default()
+        };
+        let mut locally_stored = HashSet::new();
+        // Bound each query's payload allocation, and never issue an empty ID
+        // filter (which would query the entire database).
+        for chunk in locally_checkable.chunks(1000) {
+            match self
+                .database
+                .query(Filter::new().ids(chunk.iter().copied()))
+                .await
+            {
+                Ok(events) => locally_stored.extend(events.into_iter().map(|event| event.id)),
+                Err(error) => {
+                    tracing::warn!(relay = %relay_url, %error,
+                        "Failed to check local storage for historic hydration; unresolved IDs remain pending");
+                }
+            }
+        }
+
         // 1. Find and update the pending batch
         let mut pending = self.pending_sync_index.write().await;
 
@@ -3102,6 +3143,7 @@ impl SyncManager {
             if let (Some(requested), Some(received)) =
                 (&batch.requested_event_ids, &mut batch.received_event_ids)
             {
+                received.extend(locally_stored);
                 // The SDK can suppress repeated Event notifications for payloads
                 // it already holds. Retained policy decisions still prove these
                 // IDs were delivered, even without another stream notification.
@@ -3559,6 +3601,7 @@ impl SyncManager {
             relay = %relay_url,
             attempt = attempt.attempt_number,
             requested = requested.len(),
+            missing_ids_sample = ?attempt.ids.iter().take(5).map(EventId::to_hex).collect::<Vec<_>>(),
             "Retrying events missing from an incomplete historic sync batch"
         );
         if let Some(metrics) = metrics.as_ref() {
@@ -9577,6 +9620,104 @@ mod tests {
             .await
             .expect("query fixture must finish after CLOSE")
             .expect("query fixture");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hydration_completion_accounts_for_local_storage_but_keeps_missing_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::for_testing();
+        let git_path = directory.path().join("git");
+        config.git_data_path = git_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            Arc::new(crate::purgatory::Purgatory::new(git_path.clone())),
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut manager = SyncManager::new(
+            None,
+            "service.example".into(),
+            runtime.stores.database.clone(),
+            runtime.write_policy,
+            runtime.relay,
+            &config,
+            git_path,
+            None,
+            None,
+            None,
+        );
+        let keys = Keys::generate();
+        let stored = EventBuilder::new(Kind::TextNote, "saved by a concurrent local push")
+            .finalize(&keys)
+            .unwrap();
+        let missing = EventBuilder::new(Kind::TextNote, "not delivered")
+            .finalize(&keys)
+            .unwrap();
+        let url = "wss://history.example";
+        for include_missing in [false, true] {
+            let sub = SubscriptionId::generate();
+            let mut requested = HashSet::from([stored.id]);
+            if include_missing {
+                requested.insert(missing.id);
+            }
+            manager.pending_sync_index.write().await.insert(
+                url.into(),
+                vec![PendingBatch {
+                    batch_id: u64::from(include_missing),
+                    purpose: PendingBatchPurpose::Core,
+                    items: PendingItems::default(),
+                    outstanding_subs: HashSet::from([sub.clone()]),
+                    sync_method: SyncMethod::Negentropy,
+                    pagination_state: HashMap::new(),
+                    requested_event_ids: Some(requested),
+                    received_event_ids: Some(HashSet::new()),
+                    initial_hydration_counts: Some((2, 1)),
+                    retry_count: 0,
+                    failed: false,
+                }],
+            );
+            // No stream notification: persistence can happen after reconciliation,
+            // outside the sync processor (for example, purgatory promotion).
+            manager.database.save_event(&stored).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), manager.handle_eose(url, sub))
+                .await
+                .unwrap();
+            if include_missing {
+                let retry_sub = {
+                    let pending = manager.pending_sync_index.read().await;
+                    let batch = &pending[url][0];
+                    assert_eq!(
+                        batch.requested_event_ids,
+                        Some(HashSet::from([missing.id])),
+                        "the retry must exclude the locally stored event"
+                    );
+                    assert_eq!(batch.outstanding_subs.len(), 1);
+                    batch.outstanding_subs.iter().next().unwrap().clone()
+                };
+                tokio::time::timeout(Duration::from_secs(5), manager.handle_eose(url, retry_sub))
+                    .await
+                    .unwrap();
+            }
+            assert!(!manager.pending_sync_index.read().await.contains_key(url));
+            let pending = manager
+                .missing_event_recovery
+                .lock()
+                .unwrap()
+                .pending_ids(url);
+            assert_eq!(
+                pending,
+                include_missing.then(|| vec![missing.id]),
+                "only an actually absent ID may enter missing-event recovery"
+            );
+        }
         manager.shutdown().await;
     }
 

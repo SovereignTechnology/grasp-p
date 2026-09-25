@@ -925,6 +925,14 @@ such metadata, so no semantic fallback exists for it: in production this
 finalized the batch with partial results and silently dropped the missing IDs
 until the next daily sync (23-25h later).
 
+Before declaring an ID missing at the final EOSE, the batch checks local
+storage and retained dependency decisions as well as its delivery notifications.
+This covers local pushes and concurrent sync that save an event after the
+reconciliation snapshot. The SDK may suppress duplicate event notifications,
+so absence from that stream alone does not establish missing history. Database
+lookups use chunks of at most 1,000 IDs outside the pending-batch lock; failed
+reads do not count as successful delivery.
+
 Missing IDs from a batch that finalizes incomplete are instead registered in a
 per-relay recovery index (`sync::missing_events`) and retried by the sync
 maintenance timer:
@@ -936,6 +944,8 @@ maintenance timer:
   (30s base doubling up to 15min; sub-second in `NGIT_TEST`), one in-flight
   attempt per relay, at most 300 IDs per fetch. One persistently incomplete
   relay cannot starve other relays or later batches.
+  Each attempt logs at most five requested IDs alongside its count, allowing
+  residual events to be inspected without dumping the whole inventory.
 - **Outcome-aware**: transport completion includes events saved, already stored,
   in purgatory, validly tombstoned, blocked, permanently invalid, or retained in
   the rejected-events dependency index. A delivered state awaiting maintainer
