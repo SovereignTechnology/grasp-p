@@ -329,7 +329,10 @@ impl ReceivePackPlan {
                 let mut header = [0; 4];
                 let first = stdout.read(&mut header[..1]).await?;
                 if first == 0 {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Git status ended before flush",
+                    ));
                 }
                 stdout.read_exact(&mut header[1..]).await?;
                 let len = std::str::from_utf8(&header)
@@ -337,6 +340,9 @@ impl ReceivePackPlan {
                     .and_then(|s| usize::from_str_radix(s, 16).ok())
                     .ok_or_else(|| io::Error::other("invalid Git status framing"))?;
                 if len == 0 {
+                    if !self.sideband {
+                        report.extend(b"0000");
+                    }
                     break;
                 }
                 if !(5..=65520).contains(&len) {
@@ -369,6 +375,21 @@ impl ReceivePackPlan {
                         .saturating_add(65536)
                 {
                     return Err(io::Error::other("Git status report exceeds command budget"));
+                }
+            }
+            // Sideband can split the inner report at any byte. Validate its
+            // complete framing before manufacturing a merged terminal response.
+            let mut remaining = report.as_slice();
+            loop {
+                let (packet, tail) = PktLine::parse(remaining).map_err(|_| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete Git status report")
+                })?;
+                remaining = tail;
+                if packet == PktLine::Flush {
+                    if !remaining.is_empty() {
+                        return Err(io::Error::other("trailing Git status data"));
+                    }
+                    break;
                 }
             }
             Ok(())
@@ -657,6 +678,46 @@ mod tests {
                 &oid,
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn truncated_reports_are_transport_errors_not_synthetic_successes() {
+        for sideband in [false, true] {
+            for missing_inner_flush in [false, true] {
+                let (dir, oid) = fixture();
+                let caps = if sideband {
+                    "report-status side-band-64k"
+                } else {
+                    "report-status"
+                };
+                let mut plan =
+                    ReceivePackPlan::prepare(&request(&oid, caps, false), &HashMap::new()).unwrap();
+                plan.verify(dir.path());
+                let mut report = native_report("ok refs/heads/feature\n");
+                if missing_inner_flush || !sideband {
+                    report.truncate(report.len() - 4);
+                }
+                let bytes = if sideband {
+                    let mut payload = vec![1];
+                    payload.extend(report);
+                    let mut bytes = PktLine::data(payload).encode();
+                    if missing_inner_flush {
+                        bytes.extend(b"0000");
+                    }
+                    bytes
+                } else {
+                    report
+                };
+                let (tx, mut rx) = mpsc::channel(4);
+                let (outcome, response) =
+                    timeout(Duration::from_secs(5), plan.pump(bytes.as_slice(), &tx))
+                        .await
+                        .expect("truncated report should terminate");
+                assert_eq!(outcome, PumpResult::ReadError);
+                assert!(response.is_none());
+                assert!(rx.try_recv().unwrap().is_err());
+            }
+        }
     }
 
     #[tokio::test]

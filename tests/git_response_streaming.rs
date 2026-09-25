@@ -61,6 +61,15 @@ impl Drop for PathOverride {
 
 #[tokio::test]
 async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
+    exercise_receive_pack_stream(false).await;
+}
+
+#[tokio::test]
+async fn receive_pack_failed_exit_does_not_emit_a_buffered_success_report() {
+    exercise_receive_pack_stream(true).await;
+}
+
+async fn exercise_receive_pack_stream(failed_exit: bool) {
     let _env_lock = PATH_ENV_LOCK.lock().await;
 
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
@@ -69,6 +78,11 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
     // Force output before consuming an upload larger than a pipe buffer.
     let script_path = fake_bin.path().join("git");
     let script = std::fs::read_to_string(&script_path).unwrap();
+    let script = if failed_exit {
+        script.replacen("exit 0", "exit 1", 1)
+    } else {
+        script
+    };
     std::fs::write(
         &script_path,
         script
@@ -110,6 +124,19 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
     let mut streamed = read_first_progress(&mut body).await;
     // Git cannot exit until this test releases it, regardless of scheduling.
     git_gate.release().await;
+    if failed_exit {
+        timeout(Duration::from_secs(3), async {
+            while let Ok(frame) = body.frame().await.expect("transport error before EOF") {
+                streamed.extend_from_slice(&frame_data(frame));
+            }
+        })
+        .await
+        .expect("failed Git exit should fail the response");
+        assert!(!streamed
+            .windows(b"unpack ok".len())
+            .any(|part| part == b"unpack ok"));
+        return;
+    }
     finish_body(&mut body, &mut streamed).await;
     assert_eq!(streamed, expected_git_output());
 }

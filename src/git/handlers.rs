@@ -950,6 +950,22 @@ async fn stream_receive_pack_output<S, E, I>(
     };
 
     if !status.success() {
+        if push_plan.is_some() {
+            // The merged report is still buffered. A failed process must not
+            // complete the push response, even if some ref updates succeeded.
+            record_git_operation(&metrics, "push", "error");
+            error!(
+                "Git receive-pack failed with {status}: {}",
+                String::from_utf8_lossy(&stderr_output)
+            );
+            let _ = tx
+                .send(Err(io::Error::other(format!(
+                    "git receive-pack failed with {status}"
+                ))))
+                .await;
+            return;
+        }
+
         if let Some(flush) = terminal_flush {
             sent_stdout = true;
             if send_body_bytes(&tx, flush).await.is_err() {

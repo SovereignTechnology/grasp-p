@@ -207,6 +207,8 @@ See [`src/git/handlers.rs:22-98`](src/git/handlers.rs:22-98) for the info-refs i
 Receive-pack feeds stdin while concurrently draining stdout and stderr, so
 progress or diagnostics cannot deadlock a large upload on full pipes. Its task
 reaps the child before releasing verification locks on cancellation or I/O error.
+Merged push reports require complete native status framing and a successful Git
+exit; transport failures cannot manufacture a terminal success report.
 
 The upload-pack streaming task retains a repository tracing span. Unexpected
 process failures include the exit status and stream outcome even when Git

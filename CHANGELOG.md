@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fail interrupted push responses instead of completing a success report when
+  Git emits truncated status data or exits unsuccessfully.
+
 - Drain Git output while uploading push data, preventing pipe deadlocks when
   receive-pack produces progress or diagnostics before consuming the full pack.
 
