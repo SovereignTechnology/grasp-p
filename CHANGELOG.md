@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout, or closure before EOSE. Release their subscriptions, bound SDK
   retention with an auto-close deadline, and leave coverage unconfirmed for
   recovery instead of retaining stalled work or accepting partial history.
+  Count delivered events retained for authorization/dependency recovery as
+  received, avoiding repeated payload fetches and false remote-history failures.
+  Preserve their cached IDs and relay hints for later maintainer changes without
+  fetching Git data before state authorization.
 - Pace descendant fallback cycles with a one-minute refresh delay, retaining
   overlap and immediate baselines for changed frontiers. Report missing semantic
   fallback metadata as scheduled recovery rather than a subscription-creation

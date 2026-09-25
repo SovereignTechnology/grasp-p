@@ -1009,8 +1009,9 @@ impl RejectedEventsIndex {
             || self.related_dependencies.contains(event_id)
     }
 
-    /// Whether an indexed event is waiting on a dependency and must not be
-    /// treated as a terminally accounted hydration outcome.
+    /// Whether an indexed event is waiting on a dependency and must remain
+    /// available for reprocessing. Its payload has already been delivered, so
+    /// transport recovery can finish without treating the event as accepted.
     pub fn is_dependency_pending(&self, event_id: &EventId) -> bool {
         self.related_dependencies.contains(event_id)
             || self

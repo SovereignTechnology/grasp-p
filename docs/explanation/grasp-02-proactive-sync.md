@@ -928,13 +928,15 @@ maintenance timer:
   (30s base doubling up to 15min; sub-second in `NGIT_TEST`), one in-flight
   attempt per relay, at most 300 IDs per fetch. One persistently incomplete
   relay cannot starve other relays or later batches.
-- **Outcome-aware**: a successful attempt clears only IDs with a durable
-  terminal explanation: saved, already stored, in purgatory, validly
-  tombstoned, blocked, or permanently invalid. Restricted, policy-error,
-  unknown, and persistence-error outcomes remain pending because a dependency
-  or transient fault may clear. Duplicate incomplete responses merge into the
-  existing pending set. IDs that arrive by other means (live sync, user
-  submission) are cleared on the next tick without consuming attempt budget.
+- **Outcome-aware**: transport completion includes events saved, already stored,
+  in purgatory, validly tombstoned, blocked, permanently invalid, or retained in
+  the rejected-events dependency index. A delivered state awaiting maintainer
+  authorization is not a remote delivery failure. Its dependency entry remains
+  available for later reprocessing; transport completion does not authorize it.
+  Untracked retryable policy failures and persistence errors remain pending.
+  Duplicate incomplete responses merge into the existing pending set. IDs
+  stored or retained by policy tracking through another path are cleared on the
+  next tick without consuming attempt budget.
 - **Explicit expiry**: after 12 consecutive zero-progress attempts the relay's
   pending IDs are dropped with a warning, and the relay stays in
   `ConnectedHistoricSyncFailures` until the daily sync re-discovers the gap.
@@ -1003,9 +1005,13 @@ outcome.
 This durable tier is relay-input bounded: at most 1,024 events, 8 MiB total,
 128 KiB per event, and 512 attempts in one triggered closure. Oldest entries
 are evicted first. Evicted or oversized events are not marked as locally held,
-so later broad synchronization may offer them again. Exact-ID hydration also
-keeps dependency-pending cached IDs unresolved rather than misclassifying a
-cached policy orphan as recovered.
+so later broad synchronization may offer them again. Exact-ID hydration counts
+retained dependency-pending events as delivered, including cached rejections,
+without clearing their dependency entries or treating them as locally accepted.
+Unrelated same-identifier state events therefore do not trigger repeated payload
+fetches or degrade the source relay's history status. Git fetching still requires
+normal state authorization; a future confirmed maintainer relationship can
+activate an older state through hot-cache reprocessing or cold-ID recovery.
 
 See [Architecture: Rejected Events Index](architecture.md#rejected-events-index)
 and [`src/sync/rejected_index.rs`](../../src/sync/rejected_index.rs) for the

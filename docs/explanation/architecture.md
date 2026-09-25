@@ -830,7 +830,8 @@ Exact-ID Recovery
 
 Negentropy Sync
     │
-    └──▶ Exclude Cold Index IDs from "missing events" calculation
+    ├──▶ Exclude Cold Index IDs from "missing events" calculation
+    └──▶ Count delivered dependency-pending events without removing their cache entries
 
 Related Event Rejected as an Orphan
     │
