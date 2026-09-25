@@ -525,7 +525,13 @@ See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:
 - Creates `Arc<Purgatory>` at startup
 - Passes purgatory to both write policy and git handlers
 - Passes `RepositoryLifecycle` directly to HTTP git serving and deletion/recovery
-- Spawns background cleanup task (60-second interval)
+- Spawns background cleanup task (60-second interval). Normal-endpoint PR
+  placeholders persist every pushed owner/identifier and commit. After 30 minutes
+  without the event, expiry takes repository lifecycle write locks, rechecks the
+  placeholder, and compare-and-deletes only those recorded refs. Failed deletions
+  keep the placeholder for retry. `/prs/` copies retain their separate cleanup.
+  Old unscoped placeholders cannot safely identify a repository for online cleanup;
+  the authorization-integrity checker preserves unmatched refs for inspection.
 
 #### Thread Safety
 

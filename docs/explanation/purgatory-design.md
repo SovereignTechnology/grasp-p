@@ -598,13 +598,21 @@ sequenceDiagram
             end
         else No PR event anywhere (git-data-first)
             GitHandler->>GitProcess: Execute push - accept any commit
-            GitHandler->>Purgatory: add_pr_placeholder(event_id, commit)
+            GitHandler->>Purgatory: add_standard_pr_placeholder(event_id, commit, owner, identifier)
             GitHandler->>GitClient: Push accepted - awaiting PR event
         end
     end
 ```
 
 ---
+
+Normal-endpoint git-first placeholders persist each destination owner, repository
+identifier, and pushed commit. The 60-second expiry task acquires those repositories'
+lifecycle write locks before checking the record again. If the event is still absent
+after 30 minutes, it compare-and-deletes the recorded refs, retaining the placeholder
+on failure for retry. A database check protects accepted events whose placeholders
+survived in an older checkpoint. Legacy records without destinations remain readable,
+but cannot safely drive scoped online ref deletion.
 
 ## Background Sync
 

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Remove abandoned normal-endpoint PR refs when their pending event expires,
+  retaining exact repository scopes across restarts and retrying failed cleanup.
+
 ## [3.0.5] - 2026-09-25
 
 Improve live sync startup, bound retries against unhealthy relays, fix Git push

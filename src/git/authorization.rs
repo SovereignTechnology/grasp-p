@@ -88,35 +88,38 @@ pub async fn authorize_push(
             // Standard endpoint passes `None` for prs_url: signer / a-tag
             // identifier are enforced by the surrounding maintainer-set
             // authorization, not by the URL.
-            match pre_validate_refs_nostr_push(database, purgatory, new_oid, ref_name, None).await {
-                NostrRefPreValidation::Rejected { reason } => {
-                    warn!("refs/nostr/ validation failed: {}", reason);
-                    return Ok(AuthorizationResult::denied(reason));
-                }
-                NostrRefPreValidation::Authorized {
-                    event_from_purgatory,
-                } => {
-                    if let Some(event) = event_from_purgatory {
-                        debug!("Found matching PR event in purgatory for ref {}", ref_name);
-                        purgatory_events.push(event);
-                    } else {
-                        debug!("Ref {} validated against existing record", ref_name);
+            let event_id = ref_name
+                .strip_prefix("refs/nostr/")
+                .expect("partitioned ref");
+            let track_placeholder =
+                match pre_validate_refs_nostr_push(database, purgatory, new_oid, ref_name, None)
+                    .await
+                {
+                    NostrRefPreValidation::Rejected { reason } => {
+                        warn!("refs/nostr/ validation failed: {}", reason);
+                        return Ok(AuthorizationResult::denied(reason));
                     }
-                }
-                NostrRefPreValidation::Unknown => {
-                    // No entry in DB or purgatory — create placeholder so
-                    // the 30-minute sweep can clean the ref up if the PR
-                    // event never arrives. Standard-endpoint placeholders
-                    // carry no /prs/ scope.
-                    let event_id_hex = ref_name
-                        .strip_prefix("refs/nostr/")
-                        .expect("shape validated in pre_validate_refs_nostr_push");
-                    purgatory.add_pr_placeholder(event_id_hex.to_string(), new_oid.clone());
-                    debug!(
-                        "Created placeholder for {} - awaiting PR event (will expire in 30min if event doesn't arrive)",
-                        event_id_hex
-                    );
-                }
+                    NostrRefPreValidation::Authorized {
+                        event_from_purgatory,
+                    } => {
+                        if let Some(event) = event_from_purgatory {
+                            purgatory_events.push(event);
+                            false
+                        } else {
+                            purgatory.find_pr_placeholder(event_id).is_some()
+                        }
+                    }
+                    NostrRefPreValidation::Unknown => true,
+                };
+            if track_placeholder {
+                // Remember every destination, including subsequent pushes of the
+                // same pending event, so expiry can delete only those exact refs.
+                purgatory.add_standard_pr_placeholder(
+                    event_id.to_string(),
+                    new_oid.clone(),
+                    PublicKey::from_hex(selected_pubkey)?,
+                    identifier.to_string(),
+                );
             }
         }
     }

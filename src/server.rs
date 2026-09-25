@@ -388,11 +388,15 @@ impl RelayServer {
 
         // Spawn background cleanup task for purgatory entries (60s interval)
         let cleanup_purgatory = purgatory.clone();
+        let cleanup_lifecycle = relay_runtime.lifecycle.clone();
+        let cleanup_database = relay_runtime.stores.database.clone();
         background_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                let standard_removed = cleanup_purgatory.cleanup_standard_pr_refs(&cleanup_lifecycle, &cleanup_database).await;
                 let (announcement_removed, state_removed, pr_removed) = cleanup_purgatory.cleanup();
+                let pr_removed = pr_removed + standard_removed;
                 if announcement_removed > 0 || state_removed > 0 || pr_removed > 0 {
                     info!(
                         "Purgatory cleanup: removed {} announcements, {} state events, {} PR events",
