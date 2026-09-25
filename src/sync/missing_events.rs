@@ -16,10 +16,10 @@
 //!
 //! - Attempts are scheduled per relay with exponential backoff
 //!   (30s base doubling up to 15min in production; sub-second in `NGIT_TEST`).
-//! - Any progress (at least one ID recovered) resets the backoff; the pending
-//!   set shrinks monotonically, so this cannot loop forever.
-//! - After [`MAX_ATTEMPTS_WITHOUT_PROGRESS`] consecutive attempts with zero
-//!   progress the relay's pending IDs are expired: they are dropped with an
+//! - Each ID has its own failed-fetch budget. Recovering newer IDs cannot
+//!   reset the delay or budget of older unresolved IDs.
+//! - After [`MAX_ATTEMPTS_PER_ID`] unsuccessful fetches an ID expires,
+//!   without dropping newer or unattempted IDs. Expiry is logged with an
 //!   explicit warning and the relay remains in
 //!   `ConnectedHistoricSyncFailures` until the next daily sync re-discovers
 //!   the gap. Nothing is persisted across restarts - a restart re-runs
@@ -31,7 +31,7 @@
 //!   observed for that relay (the entry is then marked as unable to restore
 //!   health, so the degraded status stays visible).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::EventId;
@@ -40,8 +40,8 @@ use nostr_sdk::prelude::EventId;
 /// used by historic sync. Larger pending sets recover across several attempts.
 pub const MAX_RECOVERY_IDS_PER_ATTEMPT: usize = 300;
 
-/// Consecutive zero-progress attempts before a relay's pending IDs expire.
-pub const MAX_ATTEMPTS_WITHOUT_PROGRESS: u32 = 12;
+/// Unsuccessful fetches before an individual pending ID expires.
+pub const MAX_ATTEMPTS_PER_ID: u32 = 12;
 
 /// Cap on remembered source batch IDs (for logging only).
 const MAX_TRACKED_SOURCE_BATCHES: usize = 16;
@@ -76,9 +76,11 @@ fn backoff_for(attempts_without_progress: u32) -> Duration {
 #[derive(Debug)]
 struct RelayRecoveryState {
     /// Event IDs the relay reported but has not yet delivered.
-    missing: HashSet<EventId>,
-    /// Consecutive attempts that recovered nothing. Reset on progress.
-    attempts_without_progress: u32,
+    missing: HashMap<EventId, u32>,
+    /// Round-robin admission prevents either old or newly arriving IDs starving.
+    queue: VecDeque<EventId>,
+    /// IDs in the current fetch; only these consume an attempt on failure.
+    attempted_ids: Vec<EventId>,
     /// Total attempts issued, for logging.
     total_attempts: u32,
     /// Earliest time the next attempt may run.
@@ -133,7 +135,14 @@ pub enum AttemptOutcome {
         remaining: usize,
         next_attempt_in: Duration,
     },
-    /// The zero-progress attempt budget is exhausted; pending IDs dropped.
+    /// Some IDs exhausted their budget; younger pending IDs keep recovering.
+    SomeExpired {
+        expired: usize,
+        remaining: usize,
+        attempts: u32,
+        next_attempt_in: Duration,
+    },
+    /// Every remaining ID exhausted its own fetch budget.
     Expired { remaining: usize, attempts: u32 },
 }
 
@@ -162,8 +171,9 @@ impl MissingEventRecoveryIndex {
             self.relays
                 .entry(relay_url.to_string())
                 .or_insert_with(|| RelayRecoveryState {
-                    missing: HashSet::new(),
-                    attempts_without_progress: 0,
+                    missing: HashMap::new(),
+                    queue: VecDeque::new(),
+                    attempted_ids: Vec::new(),
                     total_attempts: 0,
                     next_attempt_at: now + base_backoff(),
                     in_flight: false,
@@ -182,7 +192,12 @@ impl MissingEventRecoveryIndex {
         }
 
         let before = entry.missing.len();
-        entry.missing.extend(ids);
+        for id in ids {
+            if let std::collections::hash_map::Entry::Vacant(slot) = entry.missing.entry(id) {
+                slot.insert(0);
+                entry.queue.push_back(id);
+            }
+        }
         RegisterOutcome {
             newly_added: entry.missing.len() - before,
             pending_total: entry.missing.len(),
@@ -217,7 +232,7 @@ impl MissingEventRecoveryIndex {
         if entry.in_flight {
             return None;
         }
-        Some(entry.missing.iter().copied().collect())
+        Some(entry.missing.keys().copied().collect())
     }
 
     /// Remove IDs that were satisfied outside recovery (live sync, user
@@ -235,9 +250,7 @@ impl MissingEventRecoveryIndex {
         }
         let recovered = before - entry.missing.len();
         entry.total_recovered += recovered;
-        if recovered > 0 {
-            entry.attempts_without_progress = 0;
-        }
+        entry.queue.retain(|id| entry.missing.contains_key(id));
         if entry.missing.is_empty() {
             let entry = self
                 .relays
@@ -260,13 +273,15 @@ impl MissingEventRecoveryIndex {
         }
         entry.in_flight = true;
         entry.total_attempts += 1;
+        entry.attempted_ids = entry
+            .queue
+            .iter()
+            .take(MAX_RECOVERY_IDS_PER_ATTEMPT)
+            .copied()
+            .collect();
+        entry.queue.rotate_left(entry.attempted_ids.len());
         Some(RecoveryAttempt {
-            ids: entry
-                .missing
-                .iter()
-                .take(MAX_RECOVERY_IDS_PER_ATTEMPT)
-                .copied()
-                .collect(),
+            ids: entry.attempted_ids.clone(),
             attempt_number: entry.total_attempts,
         })
     }
@@ -297,7 +312,7 @@ impl MissingEventRecoveryIndex {
         entry.in_flight = false;
 
         let before = entry.missing.len();
-        entry.missing.retain(|id| !recovered.contains(id));
+        entry.missing.retain(|id, _| !recovered.contains(id));
         let recovered_count = before - entry.missing.len();
         entry.total_recovered += recovered_count;
 
@@ -313,30 +328,49 @@ impl MissingEventRecoveryIndex {
             });
         }
 
+        for id in entry.attempted_ids.drain(..) {
+            if let Some(failures) = entry.missing.get_mut(&id) {
+                *failures += 1;
+            }
+        }
+        let before_expiry = entry.missing.len();
+        entry
+            .missing
+            .retain(|_, failures| *failures < MAX_ATTEMPTS_PER_ID);
+        let expired = before_expiry - entry.missing.len();
+        entry.queue.retain(|id| entry.missing.contains_key(id));
+        if expired > 0 {
+            // Recovering the younger IDs cannot repair the abandoned gap.
+            entry.can_restore_health = false;
+        }
+        if entry.missing.is_empty() {
+            let entry = self
+                .relays
+                .remove(relay_url)
+                .expect("entry present just above");
+            return Some(AttemptOutcome::Expired {
+                remaining: expired,
+                attempts: entry.total_attempts,
+            });
+        }
+
+        let delay = backoff_for(entry.missing.values().copied().max().unwrap_or(0));
+        entry.next_attempt_at = now + delay;
+        if expired > 0 {
+            return Some(AttemptOutcome::SomeExpired {
+                expired,
+                remaining: entry.missing.len(),
+                attempts: entry.total_attempts,
+                next_attempt_in: delay,
+            });
+        }
         if recovered_count > 0 {
-            entry.attempts_without_progress = 0;
-            let delay = backoff_for(0);
-            entry.next_attempt_at = now + delay;
             return Some(AttemptOutcome::PartiallyRecovered {
                 recovered: recovered_count,
                 remaining: entry.missing.len(),
                 next_attempt_in: delay,
             });
         }
-
-        entry.attempts_without_progress += 1;
-        if entry.attempts_without_progress >= MAX_ATTEMPTS_WITHOUT_PROGRESS {
-            let entry = self
-                .relays
-                .remove(relay_url)
-                .expect("entry present just above");
-            return Some(AttemptOutcome::Expired {
-                remaining: entry.missing.len(),
-                attempts: entry.total_attempts,
-            });
-        }
-        let delay = backoff_for(entry.attempts_without_progress);
-        entry.next_attempt_at = now + delay;
         Some(AttemptOutcome::RetryScheduled {
             attempt: entry.total_attempts,
             remaining: entry.missing.len(),
@@ -420,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_attempt_clears_only_recovered_ids_and_resets_backoff() {
+    fn successful_attempt_preserves_unresolved_ids_backoff() {
         let mut index = MissingEventRecoveryIndex::default();
         let now = registered(&mut index, &[id(1), id(2), id(3)]);
 
@@ -441,13 +475,94 @@ mod tests {
             AttemptOutcome::PartiallyRecovered {
                 recovered: 1,
                 remaining: 2,
-                next_attempt_in: backoff_for(0),
+                next_attempt_in: backoff_for(3),
             },
-            "progress must clear only the recovered ID and reset the backoff"
+            "progress must not reset the unresolved IDs backoff"
         );
         let mut remaining = index.pending_ids("ws://relay").unwrap();
         remaining.sort();
         assert_eq!(remaining, vec![id(1), id(3)]);
+    }
+
+    #[test]
+    fn fresh_progress_cannot_renew_an_old_ids_budget() {
+        let mut index = MissingEventRecoveryIndex::default();
+        let now = registered(&mut index, &[id(1)]);
+        for attempt in 1..=MAX_ATTEMPTS_PER_ID {
+            index.register("ws://relay", 2, [id(2), id(3)], false, now);
+            index.clear_satisfied("ws://relay", &[id(2)]);
+            index.begin_attempt("ws://relay", due(now)).unwrap();
+            let outcome = index
+                .complete_attempt("ws://relay", &HashSet::from([id(3)]), now)
+                .unwrap();
+            if attempt == MAX_ATTEMPTS_PER_ID {
+                assert_eq!(
+                    outcome,
+                    AttemptOutcome::Expired {
+                        remaining: 1,
+                        attempts: attempt
+                    }
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    AttemptOutcome::PartiallyRecovered {
+                        recovered: 1,
+                        remaining: 1,
+                        next_attempt_in: backoff_for(attempt),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_preserves_younger_ids_without_restoring_health() {
+        let mut index = MissingEventRecoveryIndex::default();
+        let now = registered(&mut index, &[id(1)]);
+        for _ in 1..MAX_ATTEMPTS_PER_ID {
+            index.begin_attempt("ws://relay", due(now)).unwrap();
+            index.complete_attempt("ws://relay", &HashSet::new(), now);
+        }
+        index.begin_attempt("ws://relay", due(now)).unwrap();
+        // Registration during a fetch must not spend the new ID's budget.
+        index.register("ws://relay", 2, [id(2)], false, now);
+        assert_eq!(
+            index.complete_attempt("ws://relay", &HashSet::new(), now),
+            Some(AttemptOutcome::SomeExpired {
+                expired: 1,
+                remaining: 1,
+                attempts: MAX_ATTEMPTS_PER_ID,
+                next_attempt_in: backoff_for(0),
+            })
+        );
+        assert_eq!(index.pending_ids("ws://relay"), Some(vec![id(2)]));
+        index.begin_attempt("ws://relay", due(now)).unwrap();
+        assert!(matches!(
+            index.complete_attempt("ws://relay", &HashSet::from([id(2)]), now),
+            Some(AttemptOutcome::FullyRecovered {
+                can_restore_health: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn large_inventory_does_not_starve_unattempted_ids() {
+        let mut index = MissingEventRecoveryIndex::default();
+        let ids: Vec<_> = (0..MAX_RECOVERY_IDS_PER_ATTEMPT + 1)
+            .map(|n| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                EventId::from_slice(&bytes).unwrap()
+            })
+            .collect();
+        let now = registered(&mut index, &ids);
+        let first = index.begin_attempt("ws://relay", due(now)).unwrap();
+        let untouched = *ids.iter().find(|id| !first.ids.contains(id)).unwrap();
+        index.complete_attempt("ws://relay", &HashSet::new(), now);
+        let second = index.begin_attempt("ws://relay", due(now)).unwrap();
+        assert_eq!(second.ids[0], untouched);
     }
 
     #[test]
@@ -462,7 +577,7 @@ mod tests {
         let mut index = MissingEventRecoveryIndex::default();
         let now = registered(&mut index, &[id(1), id(2)]);
 
-        for attempt in 1..MAX_ATTEMPTS_WITHOUT_PROGRESS {
+        for attempt in 1..MAX_ATTEMPTS_PER_ID {
             index.begin_attempt("ws://relay", due(now)).unwrap();
             let outcome = index
                 .complete_attempt("ws://relay", &HashSet::new(), now)
@@ -481,7 +596,7 @@ mod tests {
             outcome,
             AttemptOutcome::Expired {
                 remaining: 2,
-                attempts: MAX_ATTEMPTS_WITHOUT_PROGRESS,
+                attempts: MAX_ATTEMPTS_PER_ID,
             }
         );
         assert!(

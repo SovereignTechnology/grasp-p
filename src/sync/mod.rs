@@ -3786,6 +3786,18 @@ impl SyncManager {
                     "No missing events recovered - retry scheduled with backoff"
                 );
             }
+            AttemptOutcome::SomeExpired {
+                expired,
+                remaining,
+                attempts,
+                next_attempt_in,
+            } => {
+                tracing::warn!(
+                    relay = %relay_url, expired, remaining, attempts,
+                    next_attempt_in_secs = next_attempt_in.as_secs_f64(),
+                    "Missing-event IDs exhausted their fetch budget; continuing recovery of younger IDs"
+                );
+            }
             AttemptOutcome::Expired {
                 remaining,
                 attempts,
@@ -3794,7 +3806,7 @@ impl SyncManager {
                     relay = %relay_url,
                     remaining,
                     attempts,
-                    "Missing-event recovery expired by policy after repeated zero-progress attempts - relay remains ConnectedHistoricSyncFailures until daily sync"
+                    "Missing-event recovery expired after per-ID fetch budgets were exhausted - relay remains ConnectedHistoricSyncFailures until daily sync"
                 );
             }
         }

@@ -942,8 +942,10 @@ maintenance timer:
   connection, outside the sync actor lock.
 - **Bounded and backed off**: attempts are per relay with exponential backoff
   (30s base doubling up to 15min; sub-second in `NGIT_TEST`), one in-flight
-  attempt per relay, at most 300 IDs per fetch. One persistently incomplete
-  relay cannot starve other relays or later batches.
+  attempt per relay, at most 300 IDs per fetch. Pending IDs rotate in FIFO
+  order so an unavailable chunk cannot starve other IDs, and new arrivals
+  cannot continually jump ahead of older work. The delay follows the highest
+  failed-fetch count among remaining IDs; unrelated recoveries cannot reset it.
   Each attempt logs at most five requested IDs alongside its count, allowing
   residual events to be inspected without dumping the whole inventory.
 - **Outcome-aware**: transport completion includes events saved, already stored,
@@ -955,8 +957,10 @@ maintenance timer:
   Duplicate incomplete responses merge into the existing pending set. IDs
   stored or retained by policy tracking through another path are cleared on the
   next tick without consuming attempt budget.
-- **Explicit expiry**: after 12 consecutive zero-progress attempts the relay's
-  pending IDs are dropped with a warning, and the relay stays in
+- **Explicit expiry**: each ID expires after 12 unsuccessful fetches of that
+  ID, regardless of progress on other IDs. Newer and unattempted IDs retain
+  their own budgets. Expiry is logged and prevents health restoration even
+  if the remaining IDs later recover; the relay stays in
   `ConnectedHistoricSyncFailures` until the daily sync re-discovers the gap.
   Attempts against a disconnected relay are deferred, not counted, so an
   unavailable relay neither expires its pending work nor loops tightly.

@@ -43,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery before declaring history incomplete, avoiding repeated payload
   fetches and false remote-history failures. Preserve dependency IDs and relay
   hints for later maintainer changes without fetching Git data before state
-  authorization. Include bounded ID samples in background recovery logs.
+  authorization. Bound recovery per event ID so progress on new events cannot
+  renew older failures' retry budgets, rotate pending IDs fairly, and include
+  bounded ID samples in background recovery logs.
 - Pace descendant fallback cycles with a one-minute refresh delay, retaining
   overlap and immediate baselines for changed frontiers. Report missing semantic
   fallback metadata as scheduled recovery rather than a subscription-creation

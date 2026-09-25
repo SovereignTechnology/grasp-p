@@ -700,6 +700,9 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
   even when the SDK suppresses repeat event notifications. Local lookups use
   bounded ID chunks without holding the pending-batch lock; absent IDs and
   failed storage lookups remain eligible for recovery
+- **Missing-ID budgets** expire each ID after twelve unsuccessful fetches.
+  Per-relay requests rotate pending IDs fairly and retain backoff for unresolved
+  IDs even when unrelated IDs recover; expiry cannot falsely restore health
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when incremental fragmentation exceeds the desired
   live-filter baseline by 70; rebuilds are deferred until in-flight batches
