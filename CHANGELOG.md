@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in Git fetch failure diagnostics, and log client-cancelled upload-pack streams
   at debug level.
 
+### Changed
+
+- Refresh compatible Cargo dependencies, including hyper-util 0.1.21 and
+  transitive library and build-tool updates. Keep the Nostr SDK/database and
+  WebSocket API versions unchanged.
+
 ## [3.0.4] - 2026-09-21
 
 ### Fixed
