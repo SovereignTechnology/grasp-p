@@ -35,15 +35,25 @@ fn push(repo: &Path, old: &str, new: &str) -> Bytes {
 
 #[tokio::test]
 async fn state_promoted_after_advertisement_does_not_reject_an_already_applied_push() {
-    promoted_push(false).await;
+    promoted_push(false, None).await;
 }
 
 #[tokio::test]
 async fn already_applied_branch_does_not_require_state_for_a_pr_ref() {
-    promoted_push(true).await;
+    promoted_push(true, None).await;
 }
 
-async fn promoted_push(with_pr: bool) {
+#[tokio::test]
+async fn already_applied_deletion_is_a_verified_noop() {
+    promoted_push(false, Some("report-status")).await;
+}
+
+#[tokio::test]
+async fn already_applied_deletion_supports_sideband_status_v2() {
+    promoted_push(false, Some("report-status-v2 side-band-64k")).await;
+}
+
+async fn promoted_push(with_pr: bool, deletion_caps: Option<&str>) {
     let dir = tempfile::tempdir().unwrap();
     let owner = Keys::generate();
     let identifier = "promotion-race";
@@ -92,7 +102,15 @@ async fn promoted_push(with_pr: bool) {
 
     // The client saw an absent branch; background promotion installed it
     // before its upload arrived and removed the state from purgatory.
-    let request = if with_pr {
+    let request = if let Some(caps) = deletion_caps {
+        let branch = format!("{} {commit} refs/heads/main\0{caps}\n", "0".repeat(40));
+        let deletion = format!("{commit} {} refs/heads/gone\n", "0".repeat(40));
+        Bytes::from(format!(
+            "{:04x}{branch}{:04x}{deletion}0000",
+            branch.len() + 4,
+            deletion.len() + 4
+        ))
+    } else if with_pr {
         let command = format!(
             "{} {commit} refs/heads/main\0report-status\n",
             "0".repeat(40)
@@ -144,6 +162,14 @@ async fn promoted_push(with_pr: bool) {
         "{result}"
     );
 
+    if deletion_caps.is_some() {
+        assert!(result.contains("ok refs/heads/gone"), "{result}");
+        assert!(
+            !String::from_utf8(git(&repo, &["for-each-ref", "refs/heads/gone"]))
+                .unwrap()
+                .contains("refs/heads/gone")
+        );
+    }
     if with_pr {
         assert!(
             result.contains(&format!("ok refs/nostr/{}", "a".repeat(64))),

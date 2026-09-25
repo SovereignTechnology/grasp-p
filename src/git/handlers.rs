@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn, Instrument};
 
+use super::completed_push::CompletedPush;
 use super::protocol::{GitService, PktLine};
 use super::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
 use super::subprocess::GitSubprocess;
@@ -688,10 +689,21 @@ pub async fn handle_receive_pack(
     // advertised and removed its state from purgatory. Normalize only commands
     // already satisfied by this view; keep ordinary authorization for changes
     // and Git's compare-and-swap protection against a later writer.
-    let request_body = match crate::git::list_refs(&repo_path) {
-        Ok(refs) => normalize_applied_ref_updates(&request_body, &refs.into_iter().collect()),
-        Err(_) => request_body,
+    let (request_body, completed) = match crate::git::list_refs(&repo_path) {
+        Ok(refs) => {
+            let refs = refs.into_iter().collect();
+            let completed = CompletedPush::prepare(&request_body, &refs);
+            (
+                normalize_applied_ref_updates(&request_body, &refs),
+                completed,
+            )
+        }
+        Err(_) => (request_body, None),
     };
+    let authorization_body = completed
+        .as_ref()
+        .map(|push| &push.authorization_body)
+        .unwrap_or(&request_body);
 
     // GRASP Authorization Check
     debug!(
@@ -704,7 +716,7 @@ pub async fn handle_receive_pack(
         &database,
         identifier,
         owner_pubkey,
-        &request_body,
+        authorization_body,
         &purgatory,
         &repo_path,
     )
@@ -739,6 +751,43 @@ pub async fn handle_receive_pack(
             ));
         }
     };
+
+    if let Some(completed) = completed {
+        let verify_path = repo_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            completed.verify(&verify_path)?;
+            Ok::<_, io::Error>(completed.response())
+        })
+        .await
+        .map_err(|error| GitError::Storage(error.to_string()))?;
+        return match result {
+            Ok(body) => {
+                info!(
+                    identifier,
+                    "Completed already-applied push with a verify-only ref transaction"
+                );
+                record_git_operation(&metrics, "push", "success");
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        "content-type",
+                        GitService::ReceivePack.result_content_type(),
+                    )
+                    .header("cache-control", "no-cache")
+                    .body(full_body(body))
+                    .unwrap())
+            }
+            Err(error) => {
+                warn!(identifier, %error, "Already-applied push failed ref verification");
+                record_git_operation(&metrics, "push", "error");
+                Ok(build_git_protocol_error_response(
+                    GitService::ReceivePack,
+                    "already-applied push no longer matches local refs",
+                    Some(&request_body),
+                ))
+            }
+        };
+    }
 
     // Ref updates remain in the selected view; receive-pack's quarantine and
     // final objects are installed directly in the shared family inventory.

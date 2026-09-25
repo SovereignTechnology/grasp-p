@@ -448,6 +448,14 @@ pub struct Purgatory {
      and signed commands and `refs/nostr/` commands are not rewritten.
    - State no-op checks consider only ordinary refs. PR refs retain their own
      validation and cannot make an unchanged branch require a pending state.
+   - Fully satisfied unsigned pushes containing ordinary-ref deletions pass
+     normal authorization and then verify every target in one Git ref
+     transaction. This checks both existing targets and absent refs without
+     writing refs or unpacking the redundant upload. A changed or recreated
+     ref rejects verification. The response honors report-status (including v2)
+     and sideband negotiation. Commands making changes still use receive-pack;
+     zero-to-zero deletions are never synthesized for that process because Git
+     can interpret them as unconditional deletes.
    - Helper functions in [`helpers.rs`](../../src/purgatory/helpers.rs) handle ref extraction
 
 4. **Bidirectional Waiting**: Either side can arrive first

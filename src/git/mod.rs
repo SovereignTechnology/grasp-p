@@ -19,6 +19,7 @@
 
 pub mod authorization;
 pub mod authorization_integrity;
+mod completed_push;
 pub mod handlers;
 pub mod integrity;
 pub mod migration;

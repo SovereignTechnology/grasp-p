@@ -1102,7 +1102,7 @@ fn parse_text_refs(data: &[u8]) -> Vec<(String, String, String)> {
 }
 
 /// Parse a single ref update line: "old_oid new_oid ref_name\0capabilities"
-fn parse_ref_line(payload: &[u8]) -> Option<(String, String, String)> {
+pub(super) fn parse_ref_line(payload: &[u8]) -> Option<(String, String, String)> {
     // Convert to string, handling potential invalid UTF-8
     let line = String::from_utf8_lossy(payload);
 
