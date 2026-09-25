@@ -235,10 +235,16 @@ impl LocalGitStorage {
         Ok(repo_path)
     }
 
-    /// Create a new thin bare repository without modifying an existing path.
+    /// Create a thin bare repository, or reuse a completed matching view.
+    /// Reuse never repairs or rewrites an existing view.
     pub fn create_thin_view(&self, key: &FamilyKey, view_path: &Path) -> Result<()> {
         self.ensure_family(key)?;
         if view_path.exists() {
+            if self.is_thin_view(key, view_path)
+                && ObjectFormat::detect(view_path)? == key.object_format
+            {
+                return Ok(());
+            }
             return Err(anyhow!(
                 "refusing to replace existing repository view {}",
                 view_path.display()
@@ -269,9 +275,23 @@ impl LocalGitStorage {
         )?;
         self.configure_thin_view(key, staging.path())?;
 
-        std::fs::rename(staging.path(), view_path)
-            .with_context(|| format!("install repository view at {}", view_path.display()))?;
-        let _ = staging.keep();
+        match std::fs::rename(staging.path(), view_path) {
+            Ok(()) => {
+                let _ = staging.keep();
+            }
+            Err(error) => {
+                // Another creator can publish a complete view between our
+                // existence check and rename. Only accept the same family;
+                // leave its refs/config intact and discard our staging tree.
+                if !(self.is_thin_view(key, view_path)
+                    && ObjectFormat::detect(view_path).ok() == Some(key.object_format))
+                {
+                    return Err(error).with_context(|| {
+                        format!("install repository view at {}", view_path.display())
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -481,6 +501,75 @@ mod tests {
             );
         }
         assert!(FamilyKey::sha1("my repository.git").is_ok());
+    }
+
+    #[test]
+    fn duplicate_thin_view_creation_preserves_refs_and_rejects_other_families() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(temp.path());
+        let key = FamilyKey::sha1("example").unwrap();
+        let family = storage.ensure_family(&key).unwrap();
+        let oid = seed_commit(&family);
+        let view = temp.path().join("owner/example.git");
+        storage.create_thin_view(&key, &view).unwrap();
+        run_git(
+            Some(&view),
+            &["update-ref", "refs/heads/main", &oid],
+            "seed view",
+        )
+        .unwrap();
+        storage
+            .create_thin_view(&key, &view)
+            .expect("duplicate creator must reuse the completed view");
+        assert_eq!(
+            crate::git::list_refs(&view).unwrap(),
+            vec![("refs/heads/main".into(), oid)]
+        );
+        let other = FamilyKey::sha1("other").unwrap();
+        assert!(storage.create_thin_view(&other, &view).is_err());
+        assert!(storage.is_thin_view(&key, &view));
+
+        let invalid = temp.path().join("not-a-repository");
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::write(invalid.join("keep"), "untouched").unwrap();
+        assert!(storage.create_thin_view(&key, &invalid).is_err());
+        assert_eq!(
+            std::fs::read_to_string(invalid.join("keep")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn simultaneous_thin_view_creators_share_one_completed_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let root = temp.path().to_path_buf();
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let storage = LocalGitStorage::new(&root);
+                let key = FamilyKey::sha1("example").unwrap();
+                barrier.wait();
+                tx.send(storage.create_thin_view(&key, &root.join("owner/example.git")))
+                    .unwrap();
+            }));
+        }
+        for _ in 0..4 {
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let storage = LocalGitStorage::new(temp.path());
+        assert!(storage.is_thin_view(
+            &FamilyKey::sha1("example").unwrap(),
+            &temp.path().join("owner/example.git")
+        ));
     }
 
     #[test]

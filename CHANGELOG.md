@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlap and immediate baselines for changed frontiers. Report missing semantic
   fallback metadata as scheduled recovery rather than a subscription-creation
   error, and move routine batch-completion bookkeeping to debug logs.
+- Make concurrent thin-repository creation idempotent for the same identifier
+  family and object format, preserving the winning view's refs and rejecting
+  conflicting existing paths.
 - Reject PR and PR-update events missing commit metadata as terminal invalid
   events, avoiding repeated recovery attempts for immutable malformed data.
 - Omit raw rejected relay payloads from SDK diagnostics while retaining URLs and

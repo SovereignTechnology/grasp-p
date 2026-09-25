@@ -430,6 +430,8 @@ pub struct Purgatory {
 
 2. **Announcement Purgatory**: New announcements are held until git data arrives
    - Bare repo created immediately so pushes can succeed
+   - Concurrent creators reuse an atomically installed thin view only when its
+     identifier family and object format match; existing refs are never replaced
    - Announcement promoted to database only when git data proves content exists
    - Two-phase soft expiry: bare repo deleted at 30 min, event retained 24h for revival
    - De-list replacements evict an owner's entry only when they win NIP-01

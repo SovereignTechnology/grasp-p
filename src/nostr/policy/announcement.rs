@@ -412,7 +412,7 @@ impl AnnouncementPolicy {
             .map_err(|error| error.to_string())?;
         storage
             .create_thin_view(&key, &repo_path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{error:#}"))?;
 
         tracing::info!("Created thin repository view at {}", repo_path.display());
         Ok(())
