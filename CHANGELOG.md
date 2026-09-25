@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Drain Git output while uploading push data, preventing pipe deadlocks when
+  receive-pack produces progress or diagnostics before consuming the full pack.
+
 - Let relays establish live sync while other relays reconcile history, by moving
   slow reconciliation and paced historic requests out of the shared sync actor
   into bounded background workers. Space connection starts at least 250 ms apart

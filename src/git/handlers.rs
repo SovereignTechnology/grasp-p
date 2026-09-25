@@ -830,23 +830,10 @@ pub async fn handle_receive_pack(
     tokio::spawn(async move {
         // Own the subprocess and verification locks together before the first
         // upload await. Cancellation must stop Git before those locks release.
-        if let Some(mut stdin) = stdin {
-            let written = tokio::select! {
-                result = stdin.write_all(&forwarded_body) => result,
-                _ = tx.closed() => Err(io::Error::new(io::ErrorKind::BrokenPipe, "push client disconnected")),
-            };
-            drop(stdin);
-            if let Err(error) = written {
-                let _ = git.kill().await;
-                let _ = git.wait().await;
-                record_git_operation(&metrics, "push", "error");
-                let _ = tx.send(Err(error)).await;
-                return;
-            }
-        }
-
         stream_receive_pack_output(
             git,
+            stdin,
+            forwarded_body,
             stdout,
             stderr,
             tx,
@@ -874,8 +861,10 @@ pub async fn handle_receive_pack(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stream_receive_pack_output<S, E>(
+async fn stream_receive_pack_output<S, E, I>(
     mut git: GitSubprocess,
+    stdin: Option<I>,
+    forwarded_body: Bytes,
     stdout: S,
     stderr: Option<E>,
     tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
@@ -896,19 +885,50 @@ async fn stream_receive_pack_output<S, E>(
     pushed_refs: Vec<(String, String, String)>,
     mut push_plan: Option<ReceivePackPlan>,
 ) where
+    I: tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
-    let (pump_result, terminal_flush) = if let Some(plan) = push_plan.as_mut() {
-        plan.pump(stdout, &tx).await
-    } else {
-        pump_receive_pack_stdout_to_channel(stdout, &tx).await
+    // Drain both output pipes while feeding the pack. Git can produce enough
+    // diagnostics during unpacking to block before it finishes reading stdin.
+    let upload = async {
+        if let Some(mut stdin) = stdin {
+            tokio::select! {
+                result = stdin.write_all(&forwarded_body) => result?,
+                _ = tx.closed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "push client disconnected")),
+            }
+        }
+        Ok::<_, io::Error>(())
     };
-
-    if !matches!(pump_result, PumpResult::Eof { .. }) {
-        let _ = git.kill().await;
-    }
+    let output = async {
+        let result = if let Some(plan) = push_plan.as_mut() {
+            plan.pump(stdout, &tx).await
+        } else {
+            pump_receive_pack_stdout_to_channel(stdout, &tx).await
+        };
+        match result {
+            (PumpResult::Eof { sent_stdout }, report) => Ok((sent_stdout, report)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "push output interrupted",
+            )),
+        }
+    };
+    let (mut sent_stdout, terminal_flush) = match tokio::try_join!(upload, output) {
+        Ok(((), result)) => result,
+        Err(error) => {
+            // Reap Git before releasing prepared ref locks or the family lease.
+            let _ = git.kill().await;
+            let _ = git.wait().await;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            record_git_operation(&metrics, "push", "error");
+            let _ = tx.send(Err(error)).await;
+            return;
+        }
+    };
 
     let status = match git.wait().await {
         Ok(status) => status,
@@ -927,15 +947,6 @@ async fn stream_receive_pack_output<S, E>(
     let stderr_output = match stderr_task {
         Some(task) => task.await.unwrap_or_default(),
         None => Vec::new(),
-    };
-
-    let mut sent_stdout = match pump_result {
-        PumpResult::Eof { sent_stdout } => sent_stdout,
-        PumpResult::ClientDisconnected | PumpResult::ReadError => {
-            drop(repo_lifecycle_guard);
-            record_git_operation(&metrics, "push", "error");
-            return;
-        }
     };
 
     if !status.success() {

@@ -66,6 +66,16 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
     let git_gate = GitGate::new().await;
     write_fake_git_script(fake_bin.path(), git_gate.port());
+    // Force output before consuming an upload larger than a pipe buffer.
+    let script_path = fake_bin.path().join("git");
+    let script = std::fs::read_to_string(&script_path).unwrap();
+    std::fs::write(
+        &script_path,
+        script
+            .replace("cat >/dev/null\n", "head -c 1048576 /dev/zero >&2\n")
+            .replace("exec 3<&-\n", "exec 3<&-\ncat >/dev/null\n"),
+    )
+    .unwrap();
     let _path = PathOverride::prepend(fake_bin.path());
 
     let repo = tempfile::tempdir().expect("repo tempdir");
@@ -74,7 +84,9 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
     let relay = LocalRelayBuilder::default().build();
     let purgatory = Arc::new(Purgatory::new(git_data.path().to_path_buf()));
     let owner_pubkey = "0".repeat(64);
-    let request_body = receive_pack_request_body();
+    let mut request_body = receive_pack_request_body().to_vec();
+    request_body.resize(2 * 1024 * 1024, 0);
+    let request_body = Bytes::from(request_body);
 
     let response = handle_receive_pack(
         repo.path().to_path_buf(),
