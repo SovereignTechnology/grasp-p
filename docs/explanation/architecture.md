@@ -441,6 +441,11 @@ pub struct Purgatory {
    - Enables flexible matching when pushes arrive out-of-order
    - Among matching states from authorized authors, push authorization selects
      the latest timestamp, breaking ties with the lowest event ID.
+   - If background promotion already installed a pushed target after ref
+     advertisement, normalize that command to a no-op before authorization.
+     Git still compares the current ref atomically; different targets still
+     require authorization. Packet capabilities and pack data are preserved,
+     and signed commands and `refs/nostr/` commands are not rewritten.
    - Helper functions in [`helpers.rs`](../../src/purgatory/helpers.rs) handle ref extraction
 
 4. **Bidirectional Waiting**: Either side can arrive first

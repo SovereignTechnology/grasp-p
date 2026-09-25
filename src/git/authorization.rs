@@ -1035,6 +1035,54 @@ fn parse_pktline_refs(mut data: &[u8]) -> Vec<(String, String, String)> {
     refs
 }
 
+/// Rewrite only stale commands whose target is already installed locally.
+/// Packet sizes, capabilities, and pack bytes are preserved. Git still compares
+/// the rewritten old OID atomically, so a later ref change causes a conflict
+/// instead of allowing a stale client to overwrite it.
+pub(crate) fn normalize_applied_ref_updates(
+    request: &Bytes,
+    local_refs: &HashMap<String, String>,
+) -> Bytes {
+    let mut rewritten: Option<Vec<u8>> = None;
+    let mut offset = 0;
+    while let Some(header) = request.get(offset..offset + 4) {
+        let Some(length) = std::str::from_utf8(header)
+            .ok()
+            .and_then(|s| usize::from_str_radix(s, 16).ok())
+        else {
+            break;
+        };
+        if length < 4 {
+            break;
+        }
+        let Some(payload) = request.get(offset + 4..offset + length) else {
+            break;
+        };
+        // Signed push certificates cover the command bytes. Leave their
+        // existing authorization/verification path untouched.
+        if payload.starts_with(b"push-cert") {
+            return request.clone();
+        }
+        if let Some((old, new, name)) = parse_ref_line(payload) {
+            if !name.starts_with("refs/nostr/")
+                && old != new
+                && local_refs.get(&name) == Some(&new)
+                && payload.get(..40) == Some(old.as_bytes())
+                && payload.get(40) == Some(&b' ')
+                && payload.get(41..81) == Some(new.as_bytes())
+                && payload.get(81) == Some(&b' ')
+            {
+                rewritten.get_or_insert_with(|| request.to_vec())[offset + 4..offset + 44]
+                    .copy_from_slice(new.as_bytes());
+            }
+        }
+        offset += length;
+    }
+    rewritten
+        .map(Bytes::from)
+        .unwrap_or_else(|| request.clone())
+}
+
 /// Parse refs from simple text format (for backward compatibility with tests)
 fn parse_text_refs(data: &[u8]) -> Vec<(String, String, String)> {
     let mut refs = Vec::new();
@@ -1384,6 +1432,63 @@ fn describe_known_event_mismatch(
 mod tests {
     use super::*;
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+
+    #[test]
+    fn noop_normalization_preserves_changes_nostr_refs_capabilities_and_pack() {
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        let names = ["refs/heads/main", "refs/heads/pending", "refs/nostr/event"];
+        let mut raw = Vec::new();
+        for (n, name) in names.iter().enumerate() {
+            let caps = if n == 0 {
+                "\0report-status side-band-64k"
+            } else {
+                ""
+            };
+            let line = format!("{old} {new} {name}{caps}\n");
+            raw.extend(format!("{:04x}{line}", line.len() + 4).as_bytes());
+        }
+        raw.extend_from_slice(b"0000PACK\xff\0payload");
+        let request = Bytes::from(raw);
+        let normalized = normalize_applied_ref_updates(
+            &request,
+            &HashMap::from([
+                (names[0].into(), new.clone()),
+                (names[1].into(), old.clone()),
+                (names[2].into(), new.clone()),
+            ]),
+        );
+        let refs = parse_pushed_refs(&normalized);
+        assert_eq!(refs[0], (new.clone(), new.clone(), names[0].into()));
+        assert_eq!(refs[1], (old.clone(), new.clone(), names[1].into()));
+        assert_eq!(refs[2], (old, new, names[2].into()));
+        assert_eq!(
+            &normalized[44..],
+            &request[44..],
+            "only the first old-OID field may change, including no pack/capability changes"
+        );
+        assert_eq!(normalized.len(), request.len());
+    }
+
+    #[test]
+    fn noop_normalization_does_not_rewrite_signed_commands() {
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        let certificate = "push-cert\0report-status\n";
+        let command = format!("{old} {new} refs/heads/main\n");
+        let request = Bytes::from(format!(
+            "{:04x}{certificate}{:04x}{command}0000",
+            certificate.len() + 4,
+            command.len() + 4
+        ));
+        assert_eq!(
+            normalize_applied_ref_updates(
+                &request,
+                &HashMap::from([("refs/heads/main".into(), new)])
+            ),
+            request
+        );
+    }
 
     #[tokio::test]
     async fn nip01_purgatory_state_selection_is_independent_of_arrival_order() {

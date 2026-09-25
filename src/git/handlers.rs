@@ -21,7 +21,7 @@ use super::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
 use super::subprocess::GitSubprocess;
 use super::{full_body, GitResponseBody};
 
-use crate::git::authorization::{authorize_push, parse_pushed_refs};
+use crate::git::authorization::{authorize_push, normalize_applied_ref_updates, parse_pushed_refs};
 use crate::git::sync::{process_newly_available_git_data, PurgatoryPromotionHooks};
 use crate::metrics::Metrics;
 use crate::nostr::lifecycle::LifecycleReadGuard;
@@ -668,6 +668,31 @@ pub async fn handle_receive_pack(
         return Err(GitError::RepositoryNotFound);
     }
 
+    let storage = LocalGitStorage::new(git_data_path);
+    let family_key = FamilyKey::sha1(identifier).map_err(|e| GitError::Storage(e.to_string()))?;
+    let family_lease = if storage.is_thin_view(&family_key, &repo_path) {
+        Some(
+            storage
+                .write_lease(&family_key)
+                .await
+                .map_err(|e| GitError::Storage(e.to_string()))?,
+        )
+    } else {
+        // Legacy repositories remain self-contained until startup migration.
+        // This fallback also keeps direct library callers safe: never point a
+        // ref at a family object database the view cannot read.
+        None
+    };
+
+    // A background fetch may have applied the client's target since refs were
+    // advertised and removed its state from purgatory. Normalize only commands
+    // already satisfied by this view; keep ordinary authorization for changes
+    // and Git's compare-and-swap protection against a later writer.
+    let request_body = match crate::git::list_refs(&repo_path) {
+        Ok(refs) => normalize_applied_ref_updates(&request_body, &refs.into_iter().collect()),
+        Err(_) => request_body,
+    };
+
     // GRASP Authorization Check
     debug!(
         "Authorizing push for {} owned by {} via database query",
@@ -713,22 +738,6 @@ pub async fn handle_receive_pack(
                 Some(&request_body),
             ));
         }
-    };
-
-    let storage = LocalGitStorage::new(git_data_path);
-    let family_key = FamilyKey::sha1(identifier).map_err(|e| GitError::Storage(e.to_string()))?;
-    let family_lease = if storage.is_thin_view(&family_key, &repo_path) {
-        Some(
-            storage
-                .write_lease(&family_key)
-                .await
-                .map_err(|e| GitError::Storage(e.to_string()))?,
-        )
-    } else {
-        // Legacy repositories remain self-contained until startup migration.
-        // This fallback also keeps direct library callers safe: never point a
-        // ref at a family object database the view cannot read.
-        None
     };
 
     // Ref updates remain in the selected view; receive-pack's quarantine and
