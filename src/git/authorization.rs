@@ -898,6 +898,28 @@ pub fn validate_push_refs(
     for (old_oid, new_oid, ref_name) in pushed_refs {
         debug!("Validating push: {} {} -> {}", ref_name, old_oid, new_oid);
 
+        // A deletion is authorized by absence from the signed state. Whole
+        // state matching above already checks all remaining branches and tags.
+        if new_oid == "0000000000000000000000000000000000000000"
+            && (ref_name.starts_with("refs/heads/") || ref_name.starts_with("refs/tags/"))
+        {
+            let declared = ref_name
+                .strip_prefix("refs/heads/")
+                .and_then(|name| state.get_branch_commit(name))
+                .or_else(|| {
+                    ref_name
+                        .strip_prefix("refs/tags/")
+                        .and_then(|name| state.get_tag_commit(name))
+                });
+            if declared.is_some() {
+                return Err(anyhow!(
+                    "Cannot delete ref still declared in state: {}",
+                    ref_name
+                ));
+            }
+            continue;
+        }
+
         // Handle branch updates
         if let Some(branch_name) = ref_name.strip_prefix("refs/heads/") {
             if let Some(expected_commit) = state.get_branch_commit(branch_name) {
@@ -2131,6 +2153,33 @@ mod tests {
         let membership = compute_membership(&announcements, &hex(&alice), identifier);
         assert!(membership.state_maintainers.contains(&hex(&bob)));
         assert!(!membership.invited.contains(&hex(&bob)));
+    }
+
+    #[test]
+    fn deletion_requires_absence_from_the_authorizing_state() {
+        let keys = create_test_keys();
+        let oid = "a".repeat(40);
+        let state = RepositoryState::from_event(
+            EventBuilder::new(Kind::RepoState, "")
+                .tags([
+                    Tag::identifier("deletion"),
+                    Tag::custom("refs/heads/main", [&oid]),
+                    Tag::custom("refs/tags/v1", [&oid]),
+                ])
+                .finalize(&keys)
+                .unwrap(),
+        )
+        .unwrap();
+        for name in ["refs/heads/main", "refs/tags/v1"] {
+            assert!(
+                validate_push_refs(&state, &[(oid.clone(), "0".repeat(40), name.into())]).is_err()
+            );
+        }
+        for name in ["refs/heads/gone", "refs/tags/gone"] {
+            assert!(
+                validate_push_refs(&state, &[(oid.clone(), "0".repeat(40), name.into())]).is_ok()
+            );
+        }
     }
 
     #[test]

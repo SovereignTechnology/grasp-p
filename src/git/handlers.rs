@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn, Instrument};
 
-use super::completed_push::CompletedPush;
 use super::protocol::{GitService, PktLine};
+use super::receive_pack_plan::ReceivePackPlan;
 use super::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
 use super::subprocess::GitSubprocess;
 use super::{full_body, GitResponseBody};
@@ -689,18 +689,16 @@ pub async fn handle_receive_pack(
     // advertised and removed its state from purgatory. Normalize only commands
     // already satisfied by this view; keep ordinary authorization for changes
     // and Git's compare-and-swap protection against a later writer.
-    let (request_body, completed) = match crate::git::list_refs(&repo_path) {
+    let (request_body, push_plan) = match crate::git::list_refs(&repo_path) {
         Ok(refs) => {
             let refs = refs.into_iter().collect();
-            let completed = CompletedPush::prepare(&request_body, &refs);
-            (
-                normalize_applied_ref_updates(&request_body, &refs),
-                completed,
-            )
+            let normalized = normalize_applied_ref_updates(&request_body, &refs);
+            let push_plan = ReceivePackPlan::prepare(&normalized, &refs);
+            (normalized, push_plan)
         }
         Err(_) => (request_body, None),
     };
-    let authorization_body = completed
+    let authorization_body = push_plan
         .as_ref()
         .map(|push| &push.authorization_body)
         .unwrap_or(&request_body);
@@ -752,42 +750,43 @@ pub async fn handle_receive_pack(
         }
     };
 
-    if let Some(completed) = completed {
+    let mut push_plan = if let Some(mut push_plan) = push_plan {
         let verify_path = repo_path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            completed.verify(&verify_path)?;
-            Ok::<_, io::Error>(completed.response())
-        })
-        .await
-        .map_err(|error| GitError::Storage(error.to_string()))?;
-        return match result {
-            Ok(body) => {
-                info!(
-                    identifier,
-                    "Completed already-applied push with a verify-only ref transaction"
-                );
-                record_git_operation(&metrics, "push", "success");
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "content-type",
-                        GitService::ReceivePack.result_content_type(),
-                    )
-                    .header("cache-control", "no-cache")
-                    .body(full_body(body))
-                    .unwrap())
-            }
-            Err(error) => {
-                warn!(identifier, %error, "Already-applied push failed ref verification");
-                record_git_operation(&metrics, "push", "error");
-                Ok(build_git_protocol_error_response(
-                    GitService::ReceivePack,
-                    "already-applied push no longer matches local refs",
-                    Some(&request_body),
-                ))
-            }
-        };
+        Some(
+            tokio::task::spawn_blocking(move || {
+                push_plan.verify(&verify_path);
+                push_plan
+            })
+            .await
+            .map_err(|error| GitError::Storage(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if let Some(plan) = push_plan.as_mut() {
+        if !plan.needs_git() {
+            let body = plan.response(&[]);
+            plan.release_locks();
+            record_git_operation(
+                &metrics,
+                "push",
+                if plan.failed { "error" } else { "success" },
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    "content-type",
+                    GitService::ReceivePack.result_content_type(),
+                )
+                .header("cache-control", "no-cache")
+                .body(full_body(body))
+                .unwrap());
+        }
     }
+    let forwarded_body = push_plan
+        .as_ref()
+        .map(|plan| &plan.forwarded_body)
+        .unwrap_or(&request_body);
 
     // Ref updates remain in the selected view; receive-pack's quarantine and
     // final objects are installed directly in the shared family inventory.
@@ -802,14 +801,8 @@ pub async fn handle_receive_pack(
     )
     .map_err(GitError::ProcessSpawnFailed)?;
 
-    // Write request to git's stdin
-    if let Some(mut stdin) = git.take_stdin() {
-        stdin.write_all(&request_body).await.map_err(|e| {
-            error!("Failed to write to git receive-pack stdin: {}", e);
-            GitError::IoError(e)
-        })?;
-        drop(stdin);
-    }
+    let stdin = git.take_stdin();
+    let forwarded_body = forwarded_body.clone();
 
     let stdout = git.take_stdout().ok_or_else(|| {
         GitError::IoError(io::Error::new(
@@ -835,6 +828,23 @@ pub async fn handle_receive_pack(
     let git_data_path = git_data_path.to_owned();
 
     tokio::spawn(async move {
+        // Own the subprocess and verification locks together before the first
+        // upload await. Cancellation must stop Git before those locks release.
+        if let Some(mut stdin) = stdin {
+            let written = tokio::select! {
+                result = stdin.write_all(&forwarded_body) => result,
+                _ = tx.closed() => Err(io::Error::new(io::ErrorKind::BrokenPipe, "push client disconnected")),
+            };
+            drop(stdin);
+            if let Err(error) = written {
+                let _ = git.kill().await;
+                let _ = git.wait().await;
+                record_git_operation(&metrics, "push", "error");
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        }
+
         stream_receive_pack_output(
             git,
             stdout,
@@ -855,6 +865,7 @@ pub async fn handle_receive_pack(
             family_key,
             family_lease,
             pushed_refs,
+            push_plan,
         )
         .await;
     });
@@ -883,12 +894,17 @@ async fn stream_receive_pack_output<S, E>(
     family_key: FamilyKey,
     family_lease: Option<FamilyWriteLease>,
     pushed_refs: Vec<(String, String, String)>,
+    mut push_plan: Option<ReceivePackPlan>,
 ) where
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let stderr_task = stderr.map(|stderr| tokio::spawn(read_stderr_to_end(stderr)));
-    let (pump_result, terminal_flush) = pump_receive_pack_stdout_to_channel(stdout, &tx).await;
+    let (pump_result, terminal_flush) = if let Some(plan) = push_plan.as_mut() {
+        plan.pump(stdout, &tx).await
+    } else {
+        pump_receive_pack_stdout_to_channel(stdout, &tx).await
+    };
 
     if !matches!(pump_result, PumpResult::Eof { .. }) {
         let _ = git.kill().await;
@@ -903,6 +919,10 @@ async fn stream_receive_pack_output<S, E>(
             return;
         }
     };
+
+    if let Some(plan) = push_plan.as_mut() {
+        plan.release_locks();
+    }
 
     let stderr_output = match stderr_task {
         Some(task) => task.await.unwrap_or_default(),
@@ -985,6 +1005,17 @@ async fn stream_receive_pack_output<S, E>(
     // recovery paths that take the lifecycle write lock, so holding this beyond
     // the subprocess boundary would deadlock.
     drop(repo_lifecycle_guard);
+
+    // A successful receive-pack exit can still contain rejected refs. Do not
+    // immediately apply the complete pending state over Git's partial result.
+    // The normal background state-recovery path remains responsible for it.
+    if push_plan.as_ref().is_some_and(|plan| plan.failed) {
+        record_git_operation(&metrics, "push", "error");
+        if let Some(report) = terminal_flush {
+            let _ = send_body_bytes(&tx, report).await;
+        }
+        return;
+    }
 
     // Git's receive-pack progress has already been streamed verbatim, but its
     // final flush remains withheld. Run GRASP follow-up work before releasing

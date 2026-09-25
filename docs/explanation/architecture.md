@@ -448,14 +448,21 @@ pub struct Purgatory {
      and signed commands and `refs/nostr/` commands are not rewritten.
    - State no-op checks consider only ordinary refs. PR refs retain their own
      validation and cannot make an unchanged branch require a pending state.
-   - Fully satisfied unsigned pushes containing ordinary-ref deletions pass
-     normal authorization and then verify every target in one Git ref
-     transaction. This checks both existing targets and absent refs without
-     writing refs or unpacking the redundant upload. A changed or recreated
-     ref rejects verification. The response honors report-status (including v2)
-     and sideband negotiation. Commands making changes still use receive-pack;
-     zero-to-zero deletions are never synthesized for that process because Git
-     can interpret them as unconditional deletes.
+   - Unsigned pushes containing already-completed ordinary-ref deletions verify
+     satisfied commands without writing refs, and forward remaining commands
+     and the original pack/options to receive-pack. Non-atomic verifications
+     succeed or fail independently. Atomic requests prepare one verify-only
+     transaction and hold its ref locks until receive-pack finishes; failed
+     verification prevents any Git updates. Never send synthesized zero-to-zero
+     deletions to receive-pack: Git can treat them as unconditional deletes.
+   - Native Git ref statuses are combined with verification outcomes in request
+     order, preserving report-status/v2 and sideband progress. Normal signed-state
+     authorization remains a whole-request check; ref execution follows Git's
+     negotiated atomic/non-atomic behavior. Ordinary unsigned pushes also inspect
+     per-ref statuses: receive-pack can exit successfully after rejecting a ref.
+     Such requests retain successful tips but defer immediate state promotion,
+     so the request's follow-up work cannot override Git's rejection. Normal
+     background recovery can still reconcile the signed state independently.
    - Helper functions in [`helpers.rs`](../../src/purgatory/helpers.rs) handle ref extraction
 
 4. **Bidirectional Waiting**: Either side can arrive first

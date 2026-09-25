@@ -11,6 +11,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes, Frame};
 use ngit_grasp::config::Config;
 use ngit_grasp::git::handlers::handle_receive_pack;
+use ngit_grasp::git::protocol::PktLine;
 use ngit_grasp::git::sync::PurgatoryPromotionHooks;
 use ngit_grasp::grasp06::endpoint::PrsUrl;
 use ngit_grasp::grasp06::paths::prs_repo_path;
@@ -64,7 +65,7 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
 
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
     let git_gate = GitGate::new().await;
-    write_fake_git_script(fake_bin.path(), false, git_gate.port());
+    write_fake_git_script(fake_bin.path(), git_gate.port());
     let _path = PathOverride::prepend(fake_bin.path());
 
     let repo = tempfile::tempdir().expect("repo tempdir");
@@ -98,7 +99,7 @@ async fn receive_pack_response_streams_stdout_before_subprocess_exit() {
     // Git cannot exit until this test releases it, regardless of scheduling.
     git_gate.release().await;
     finish_body(&mut body, &mut streamed).await;
-    assert_eq!(streamed, b"first-progress\nsecond-progress\n");
+    assert_eq!(streamed, expected_git_output());
 }
 
 #[derive(Clone)]
@@ -125,7 +126,7 @@ async fn receive_pack_terminal_flush_waits_for_purgatory_promotion() {
 
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
     let git_gate = GitGate::new().await;
-    write_fake_git_script(fake_bin.path(), true, git_gate.port());
+    write_fake_git_script(fake_bin.path(), git_gate.port());
     let _path = PathOverride::prepend(fake_bin.path());
 
     let keys = Keys::generate();
@@ -223,7 +224,13 @@ async fn receive_pack_terminal_flush_waits_for_purgatory_promotion() {
     finish_body(&mut body, &mut streamed).await;
 
     assert!(
-        streamed.starts_with(b"first-progress\nsecond-progress\n"),
+        streamed.starts_with(
+            &[
+                progress_packet("first-progress\n"),
+                progress_packet("second-progress\n")
+            ]
+            .concat()
+        ),
         "git progress should remain at the start of the response"
     );
     assert!(
@@ -247,7 +254,7 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
 
     let fake_bin = tempfile::tempdir().expect("fake git bin tempdir");
     let git_gate = GitGate::new().await;
-    write_fake_git_script(fake_bin.path(), true, git_gate.port());
+    write_fake_git_script(fake_bin.path(), git_gate.port());
     let _path = PathOverride::prepend(fake_bin.path());
 
     let keys = Keys::generate();
@@ -304,7 +311,7 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
     );
     git_gate.release().await;
     finish_body(&mut body, &mut streamed).await;
-    assert_eq!(streamed, b"first-progress\nsecond-progress\n0000");
+    assert_eq!(streamed, expected_git_output());
 
     assert!(
         !repo_path.exists(),
@@ -346,12 +353,12 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Debug,
 {
-    const FIRST: &[u8] = b"first-progress\n";
+    let first = progress_packet("first-progress\n");
     timeout(Duration::from_secs(3), async {
         let mut streamed = Vec::new();
         // Receive-pack can retain the last four bytes until further stdout
         // arrives, and pipe reads need not match writes or HTTP frames.
-        while streamed.len() < FIRST.len() - 4 {
+        while streamed.len() < first.len() - 4 {
             let frame = body
                 .frame()
                 .await
@@ -359,7 +366,7 @@ where
                 .expect("progress body frame");
             streamed.extend_from_slice(&frame_data(frame));
             assert!(
-                FIRST.starts_with(&streamed),
+                first.starts_with(&streamed),
                 "unexpected initial git progress"
             );
         }
@@ -430,13 +437,36 @@ fn test_write_policy(
     )
 }
 
-fn write_fake_git_script(bin_dir: &Path, terminal_flush: bool, gate_port: u16) {
+fn progress_packet(message: &str) -> Vec<u8> {
+    let mut payload = vec![2];
+    payload.extend(message.as_bytes());
+    PktLine::data(payload).encode()
+}
+
+fn git_status_packet() -> Vec<u8> {
+    let mut payload = vec![1];
+    payload.extend(PktLine::data(b"unpack ok\n".to_vec()).encode());
+    payload
+        .extend(PktLine::data(format!("ok refs/nostr/{}\n", "a".repeat(64)).into_bytes()).encode());
+    payload.extend(b"0000");
+    [PktLine::data(payload).encode(), b"0000".to_vec()].concat()
+}
+
+fn expected_git_output() -> Vec<u8> {
+    [
+        progress_packet("first-progress\n"),
+        progress_packet("second-progress\n"),
+        git_status_packet(),
+    ]
+    .concat()
+}
+
+fn shell_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("\\{byte:03o}")).collect()
+}
+
+fn write_fake_git_script(bin_dir: &Path, gate_port: u16) {
     let git_path = bin_dir.join("git");
-    let terminal_flush = if terminal_flush {
-        "printf '0000'\n"
-    } else {
-        ""
-    };
     std::fs::write(
         &git_path,
         r#"#!/usr/bin/env bash
@@ -452,12 +482,13 @@ done
 if [ "$is_receive_pack" = "1" ]; then
 cat >/dev/null
 exec 3<>/dev/tcp/127.0.0.1/__GATE_PORT__
-printf 'first-progress\n'
+printf '%b' '__FIRST__'
 IFS= read -r -t 10 release <&3
 [ "$release" = release ]
 exec 3<&-
-printf 'second-progress\n'
-__TERMINAL_FLUSH__exit 0
+printf '%b' '__SECOND__'
+printf '%b' '__STATUS__'
+exit 0
 fi
 
 if [ "$1" = "init" ]; then
@@ -486,7 +517,15 @@ fi
 echo "unsupported fake git invocation: $*" >&2
 exit 1
 "#
-        .replace("__TERMINAL_FLUSH__", terminal_flush)
+        .replace(
+            "__FIRST__",
+            &shell_bytes(&progress_packet("first-progress\n")),
+        )
+        .replace(
+            "__SECOND__",
+            &shell_bytes(&progress_packet("second-progress\n")),
+        )
+        .replace("__STATUS__", &shell_bytes(&git_status_packet()))
         .replace("__GATE_PORT__", &gate_port.to_string()),
     )
     .expect("write fake git executable");

@@ -225,3 +225,168 @@ async fn promoted_push(with_pr: bool, deletion_caps: Option<&str>) {
     );
     relay.shutdown();
 }
+
+#[tokio::test]
+async fn completed_deletion_and_new_branch_succeed_together() {
+    mixed_deletion_push(false, false, true).await;
+}
+
+#[tokio::test]
+async fn atomic_completed_deletion_and_new_branch_succeed_together() {
+    mixed_deletion_push(true, false, true).await;
+}
+
+#[tokio::test]
+async fn non_atomic_push_reports_success_and_rejection_per_ref() {
+    mixed_deletion_push(false, true, true).await;
+}
+
+#[tokio::test]
+async fn atomic_push_rejects_every_ref_when_one_update_fails() {
+    mixed_deletion_push(true, true, true).await;
+}
+
+#[tokio::test]
+async fn ordinary_non_atomic_push_preserves_partial_result() {
+    mixed_deletion_push(false, true, false).await;
+}
+
+#[tokio::test]
+async fn ordinary_atomic_push_preserves_rejection() {
+    mixed_deletion_push(true, true, false).await;
+}
+
+async fn mixed_deletion_push(atomic: bool, reject_branch: bool, include_deletion: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Keys::generate();
+    let identifier = "mixed-push";
+    let repo = dir
+        .path()
+        .join(owner.public_key().to_bech32().unwrap())
+        .join("mixed-push.git");
+    let storage = LocalGitStorage::new(dir.path());
+    let key = FamilyKey::sha1(identifier).unwrap();
+    storage.create_thin_view(&key, &repo).unwrap();
+    let family = storage.ensure_family(&key).unwrap();
+    let tree = String::from_utf8(git(&family, &["mktree"])).unwrap();
+    let oid = String::from_utf8(git(
+        &family,
+        &["commit-tree", tree.trim(), "-m", "available"],
+    ))
+    .unwrap()
+    .trim()
+    .to_owned();
+    let bad = oid.clone();
+    if reject_branch {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = repo.join("hooks/update");
+        std::fs::write(&hook, b"#!/bin/sh\n[ \"$1\" != refs/heads/unavailable ]\n").unwrap();
+        std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let db: SharedDatabase = Arc::new(nostr_memory::MemoryDatabase::unbounded());
+    db.save_event(
+        &EventBuilder::new(Kind::GitRepoAnnouncement, "")
+            .tags([
+                Tag::identifier(identifier),
+                Tag::custom("clone", ["https://service.example/mixed-push.git"]),
+            ])
+            .finalize(&owner)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut tags = vec![
+        Tag::identifier(identifier),
+        Tag::custom("refs/heads/feature", [&oid]),
+    ];
+    if reject_branch {
+        tags.push(Tag::custom("refs/heads/unavailable", [&bad]));
+    }
+    let state = EventBuilder::new(Kind::RepoState, "")
+        .tags(tags)
+        .finalize(&owner)
+        .unwrap();
+    let purgatory = Arc::new(Purgatory::new(dir.path().to_path_buf()));
+    purgatory.add_state(state, identifier.into(), owner.public_key(), false);
+    let relay = LocalRelayBuilder::default().database(db.clone()).build();
+    let caps = if atomic {
+        "report-status-v2 side-band-64k atomic"
+    } else {
+        "report-status"
+    };
+    // Capabilities begin on the omitted deletion and must move to the first
+    // actual Git update. Its pack must remain intact.
+    let mut commands = if include_deletion {
+        vec![
+            format!("{oid} {} refs/heads/gone\0{caps}\n", "0".repeat(40)),
+            format!("{} {oid} refs/heads/feature\n", "0".repeat(40)),
+        ]
+    } else {
+        vec![format!(
+            "{} {oid} refs/heads/feature\0{caps}\n",
+            "0".repeat(40)
+        )]
+    };
+    if reject_branch {
+        commands.push(format!("{} {bad} refs/heads/unavailable\n", "0".repeat(40)));
+    }
+    let mut raw = Vec::new();
+    for command in commands {
+        raw.extend(format!("{:04x}{command}", command.len() + 4).as_bytes());
+    }
+    raw.extend(b"0000");
+    raw.extend(git(&repo, &["pack-objects", "--stdout"]));
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle_receive_pack(
+            repo.clone(),
+            raw.into(),
+            db,
+            relay.clone(),
+            identifier,
+            &owner.public_key().to_hex(),
+            purgatory,
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(10), response.into_body().collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    let report = String::from_utf8_lossy(&body);
+    let rejected_all = atomic && reject_branch;
+    let names = if include_deletion {
+        vec!["gone", "feature"]
+    } else {
+        vec!["feature"]
+    };
+    for name in names {
+        assert!(
+            report.contains(&format!(
+                "{} refs/heads/{name}",
+                if rejected_all { "ng" } else { "ok" }
+            )),
+            "{report}"
+        );
+    }
+    if reject_branch {
+        assert!(report.contains("ng refs/heads/unavailable"), "{report}");
+    }
+    let refs = String::from_utf8(git(
+        &repo,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    ))
+    .unwrap();
+    assert_eq!(refs.contains("refs/heads/feature"), !rejected_all, "{refs}");
+    assert!(!refs.contains("refs/heads/gone"), "{refs}");
+    assert!(!refs.contains("refs/heads/unavailable"), "{refs}");
+    relay.shutdown();
+}

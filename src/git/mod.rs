@@ -19,12 +19,12 @@
 
 pub mod authorization;
 pub mod authorization_integrity;
-mod completed_push;
 pub mod handlers;
 pub mod integrity;
 pub mod migration;
 pub mod process;
 pub mod protocol;
+mod receive_pack_plan;
 pub mod storage;
 pub mod subprocess;
 pub mod sync;
