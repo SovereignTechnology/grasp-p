@@ -692,6 +692,10 @@ The ngit-grasp relay implements **Proactive Sync of Nostr Events**, which synchr
   a large source catches up. Pending batches register request IDs before sends
   and retain an admission barrier until the worker finishes, so early EOSE
   cannot confirm partial coverage. Reset/disconnect cancels stale jobs
+- **Local reconciliation inventory** comes from the policy-controlled database
+  and is passed explicitly to the intended relay's NIP-77 dry run. The SDK's
+  separate seen-ID tracker remains isolated: reconciliation neither persists
+  incoming payloads nor publishes local events
 - **Daily sync** with random 23-25h timer to detect state drift
 - **Filter consolidation** when incremental fragmentation exceeds the desired
   live-filter baseline by 70; rebuilds are deferred until in-flight batches

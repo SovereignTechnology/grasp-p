@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests. Regroup only explicit filter-count refusals, and ignore those for
   already-retired subscriptions so late responses cannot incorrectly pause
   replacement coverage for 24 hours.
+- Reconcile NIP-77 against the actual local event inventory on the intended
+  relay, avoiding downloads of already-stored history. Keep reconciliation
+  read-only and incoming payloads subject to the normal write policy.
 - Reuse installed core live filters during historic retries, preventing duplicate
   subscriptions from exhausting relay budgets.
 - Retire partially admitted or incomplete historic batches on admission failure,

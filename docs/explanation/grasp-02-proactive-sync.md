@@ -327,6 +327,14 @@ Each layer creates one or more `PendingBatch` entries tracked in `PendingSyncInd
 
 **Why the double-check?** There's an async gap between receiving EOSE and the self-subscriber processing events to create Layer 2/3 filters. The 6-second wait (5s batch window + 1s buffer) ensures we don't prematurely mark sync complete while Layer 2/3 batches are being created.
 
+NIP-77 compares the intended relay's inventory with matching IDs and timestamps
+from the local policy-controlled database. These items are passed explicitly to
+the relay's dry-run reconciliation API; the SDK's separate seen-ID tracker
+contains no inventory. Reconciliation does not upload local events or save
+remote payloads. Downloads still pass through the write policy. A local
+inventory read failure aborts reconciliation rather than pretending the
+database is empty.
+
 **Batch Failure Tracking**: Semantic REQ+EOSE fallback is reserved for a material first-pass hydration incompatibility: at least 20 IDs were advertised and exact-ID REQ delivered no more than 10%. This preserves the fallback for relays that advertise inventory but cannot substantially serve it by ID, without disabling NIP-77 for small residuals caused by expiry, indexing lag, or concurrent deletion. Other incomplete batches retry the residual IDs once. If that retry makes no progress, the batch is marked as `failed = true` and NIP-77 remains enabled. This causes the relay to transition to `ConnectedHistoricSyncFailures` instead of `Connected`, signaling that live sync is active but historic sync is incomplete. The event IDs the relay failed to deliver are not dropped with the batch: they are registered for bounded background recovery (see "Missing-Event Recovery for Incomplete Batches" below), and a relay whose pending IDs are all eventually recovered — with no unrelated batch failures — is promoted back to `Connected`.
 
 **Metrics tracking**: The `ngit_sync_relay_connected` metric shows:

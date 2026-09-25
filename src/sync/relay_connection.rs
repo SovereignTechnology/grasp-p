@@ -2903,20 +2903,47 @@ impl RelayConnection {
         self.ensure_query_admitted()?;
         // Use dry_run to only identify differences without downloading events
         self.ensure_current_session(&ledger_slot)?;
-        let sync_opts = SyncOptions::default().dry_run();
-        let client = self.client.clone();
+        // Keep the SDK's seen-ID tracker separate from policy-controlled storage.
+        // It has no reconciliation inventory; attaching the production database
+        // to the SDK would let incoming events bypass our write policy.
+        let items = match &self.database {
+            Some(database) => tokio::time::timeout(
+                NEGENTROPY_DIFF_TIMEOUT,
+                database.negentropy_items(filter.clone()),
+            )
+            .await
+            .map_err(|_| "Timed out loading local negentropy inventory".to_string())?
+            .map_err(|error| format!("Failed to load local negentropy inventory: {error}"))?,
+            None => Vec::new(),
+        };
+        let relay = self
+            .client
+            .relay(&self.url)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Relay is not registered: {}", self.url))?;
         let sync_task = async move {
             self.ensure_query_admitted()?;
-            match client.sync(filter).opts(sync_opts).await {
-                Ok(output) => {
-                    if !output.failed.is_empty() {
-                        Err(format!("Negentropy diff had failures: {:?}", output.failed))
-                    } else {
-                        Ok(output.value)
-                    }
-                }
-                Err(error) => Err(format!("Negentropy diff failed: {}", error)),
-            }
+            self.ensure_current_session(&ledger_slot)?;
+            let summary = relay
+                .sync(filter)
+                .items(items)
+                .opts(SyncOptions::default().dry_run())
+                .await
+                .map_err(|error| error.to_string())?;
+            let url = relay.url().clone();
+            let with_source = |ids: std::collections::HashSet<EventId>| {
+                ids.into_iter()
+                    .map(|id| (id, std::collections::HashSet::from([url.clone()])))
+                    .collect()
+            };
+            Ok(nostr_sdk::client::SyncSummary {
+                local: summary.local,
+                remote: with_source(summary.remote),
+                sent: with_source(summary.sent),
+                received: with_source(summary.received),
+                send_failures: std::collections::HashMap::from([(url, summary.send_failures)]),
+            })
         };
 
         self.run_negentropy_diff_with_timeout(sync_task, NEGENTROPY_DIFF_TIMEOUT)
@@ -3380,6 +3407,100 @@ mod tests {
                 "partial fetch without EOSE was accepted (disconnect={disconnect}): {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn negentropy_uses_local_inventory_without_bypassing_write_policy() {
+        use nostr_sdk::prelude::NostrDatabase;
+        use std::collections::HashSet;
+
+        let remote_database = std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let remote =
+            TestRelay::start(LocalRelayBuilder::default().database(remote_database.clone())).await;
+        let other = TestRelay::start(LocalRelayBuilder::default()).await;
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let keys = Keys::generate();
+        let event = |content| {
+            EventBuilder::new(Kind::TextNote, content)
+                .finalize(&keys)
+                .unwrap()
+        };
+        let common = event("already stored");
+        let remote_only = event("must pass write policy");
+        let local_only = event("must not be uploaded");
+        let unrelated = event("on another relay");
+        database.save_event(&common).await.unwrap();
+        database.save_event(&local_only).await.unwrap();
+        remote.add_event(common.clone()).await.unwrap();
+        remote.add_event(remote_only.clone()).await.unwrap();
+        other.add_event(unrelated.clone()).await.unwrap();
+        let connection = RelayConnection::new_with_database(
+            remote.url().await.to_string(),
+            database.clone(),
+            None,
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        );
+        connection.connect(3).await.unwrap();
+        let other_url = other.url().await;
+        connection
+            .client
+            .add_relay(other_url.clone())
+            .await
+            .unwrap();
+        connection
+            .client
+            .try_connect_relay(other_url, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        let diff = tokio::time::timeout(
+            Duration::from_secs(5),
+            connection.negentropy_sync_diff(Filter::new().kind(Kind::TextNote)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            diff.remote.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([remote_only.id])
+        );
+        assert_eq!(diff.local, HashSet::from([local_only.id]));
+        assert!(diff.sent.is_empty());
+        assert!(diff.received.is_empty());
+        assert!(
+            database
+                .event_by_id(&remote_only.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "reconciliation must not save remote payloads outside write policy"
+        );
+        assert!(
+            remote_database
+                .event_by_id(&local_only.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "dry-run reconciliation must not publish local events"
+        );
+
+        // Ordinary SDK fetching must also leave the production store untouched.
+        let fetched = connection
+            .fetch_events(Filter::new().id(remote_only.id), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(fetched, vec![remote_only.clone()]);
+        assert!(database
+            .event_by_id(&remote_only.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        connection.disconnect().await;
+        remote.shutdown();
+        other.shutdown();
     }
 
     #[tokio::test]
