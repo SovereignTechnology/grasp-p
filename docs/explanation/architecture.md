@@ -113,7 +113,7 @@ runtime:
   pair in check-only or repair mode
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
   resolves, then stop background mutation, persist a final state snapshot
-  (purgatory and rejected-events cache), and clean up placeholder refs
+  (purgatory and rejected-events cache), preserving pending PR refs for restart and expiry
 
 **Key Dependencies:**
 

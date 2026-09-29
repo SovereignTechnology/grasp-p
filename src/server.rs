@@ -579,15 +579,8 @@ impl RelayServer {
             info!("Rejected events cache saved to disk");
         }
 
-        // Cleanup placeholder refs on shutdown
-        let placeholder_ids = self.purgatory.get_placeholder_event_ids();
-        if !placeholder_ids.is_empty() {
-            info!(
-                "Cleaning up {} placeholder refs/nostr/ refs on shutdown",
-                placeholder_ids.len()
-            );
-            git::cleanup_placeholder_refs(&self.git_data_path, &placeholder_ids);
-        }
+        // Pending refs and their staged objects must survive shutdown together
+        // with the checkpoint. Expiry owns their removal after restart.
 
         result
     }

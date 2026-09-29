@@ -1120,6 +1120,23 @@ impl TestRelay {
     }
 
     /// Stop the relay
+    /// Stop with SIGTERM so the relay runs its shutdown path, then reap it.
+    pub async fn stop_gracefully(mut self) {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &self.process.id().to_string()])
+            .status()
+            .expect("send SIGTERM to relay");
+        assert!(status.success(), "SIGTERM delivery failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.process.try_wait().expect("poll relay").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "relay did not exit after SIGTERM"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub async fn stop(mut self) {
         // kill() sends SIGKILL; reap directly instead of guessing a grace period.
         let _ = self.process.kill();
