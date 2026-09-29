@@ -65,16 +65,49 @@ impl PrEventPolicy {
             }
         };
 
-        // Check for placeholder first (git-data-first scenario)
-        if let Some(placeholder_commit) = self.ctx.purgatory.find_pr_placeholder(&event_id) {
-            // Read the full entry so we can inspect any GRASP-06 scope
-            // recorded when the placeholder was created from a /prs/ push.
-            let prs_scope = self
-                .ctx
-                .purgatory
-                .find_pr(&event_id)
-                .and_then(|entry| entry.prs_scope);
-
+        // A crash may happen after Git installs the ref but before the
+        // purgatory checkpoint. Recover the /prs/ scope only from a signed,
+        // service-local clone URL for this signer and an exact event-id/OID ref.
+        let mut placeholder = self
+            .ctx
+            .purgatory
+            .find_pr_placeholder(&event_id)
+            .map(|commit| {
+                let scope = self
+                    .ctx
+                    .purgatory
+                    .find_pr(&event_id)
+                    .and_then(|entry| entry.prs_scope);
+                (commit, scope)
+            });
+        if placeholder.is_none() && self.ctx.config.grasp06_enable {
+            for identifier in crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
+                event,
+                &self.ctx.config.service_address(),
+            ) {
+                if !git::validate_repository_identifier(&identifier) {
+                    continue;
+                }
+                let path = crate::grasp06::paths::prs_repo_path(
+                    &self.ctx.git_data_path,
+                    &event.pubkey.to_hex(),
+                    &identifier,
+                );
+                if git::get_ref_commit(&path, &format!("refs/nostr/{event_id}")).as_deref()
+                    == Some(commit.as_str())
+                {
+                    placeholder = Some((
+                        commit.clone(),
+                        Some(crate::purgatory::PrsPlaceholderScope {
+                            submitter: event.pubkey,
+                            identifier,
+                        }),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some((placeholder_commit, prs_scope)) = placeholder {
             if let Some(scope) = prs_scope {
                 // The placeholder was created by a /prs/<submitter>/<id>.git
                 // push (06.md line 12). The arriving event MUST be signed by

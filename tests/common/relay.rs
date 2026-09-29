@@ -451,6 +451,24 @@ impl TestRelay {
         .await
     }
 
+    /// Persistent GRASP-06 storage for crash/restart tests.
+    pub async fn start_with_grasp_06_paths(
+        git_data_path: PathBuf,
+        relay_data_path: PathBuf,
+    ) -> Self {
+        Self::start_internal(
+            port::reserve_port(),
+            RelayOptions {
+                grasp06_enable: true,
+                lmdb_backend: true,
+                git_data_path: Some(git_data_path),
+                relay_data_path: Some(relay_data_path),
+                ..RelayOptions::default()
+            },
+        )
+        .await
+    }
+
     /// Start a relay on a port that the caller has already reserved.
     ///
     /// Use this when the test needs the port number *before* the relay

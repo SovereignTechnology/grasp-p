@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accept a GRASP-06 `/prs/` PR event whose pushed ref survived a crash that
+  lost its purgatory placeholder, matching it by the event's service-local
+  clone URL and exact `refs/nostr/<event-id>` ref.
+
 - Remove abandoned normal-endpoint PR refs when their pending event expires,
   retaining exact repository scopes across restarts and retrying failed cleanup.
 
