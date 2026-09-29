@@ -1186,8 +1186,13 @@ pub(crate) async fn stage_push(
         })
         .map(|(_, new_oid, name)| super::staging::Tip::new(name, new_oid))
         .collect();
+    let unsigned: Vec<_> = pushed_refs
+        .iter()
+        .filter(|(_, _, name)| unsigned_refs.contains(name))
+        .map(|(_, oid, name)| super::staging::Tip::new(name, oid))
+        .collect();
     let view = repo_path.to_owned();
-    tokio::task::spawn_blocking(move || super::staging::stage(&view, &owed))
+    tokio::task::spawn_blocking(move || super::staging::stage_upload(&view, &owed, &unsigned))
         .await
         .map_err(|error| GitError::Storage(error.to_string()))?
         .map_err(|error| GitError::Storage(format!("cannot stage push: {error:#}")))

@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
 
+mod recovery;
+pub use recovery::recover_placeholders;
 mod worker;
 pub use worker::{request_maintenance, run_worker};
 
@@ -56,6 +58,16 @@ struct Record {
     view: PathBuf,
     #[serde(default)]
     owed: Vec<Tip>,
+    /// Unsigned ref intentions persisted before receive-pack, independently of
+    /// the periodic purgatory checkpoint. Wall-clock deadlines survive restarts.
+    #[serde(default)]
+    pending: Vec<PendingUpload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingUpload {
+    tip: Tip,
+    expires_at: std::time::SystemTime,
 }
 
 /// Outcome of one compaction.
@@ -302,6 +314,11 @@ pub fn owes_history(view: &Path) -> bool {
 /// Returns `false` for a legacy repository without a family, which keeps its
 /// own objects and is never staged.
 pub fn stage(view: &Path, owed: &[Tip]) -> Result<bool> {
+    stage_upload(view, owed, &[])
+}
+
+/// Persist unsigned ref intentions and their expiry before receiving objects.
+pub fn stage_upload(view: &Path, owed: &[Tip], unsigned: &[Tip]) -> Result<bool> {
     let Some(view) = View::resolve(view)? else {
         return Ok(false);
     };
@@ -325,7 +342,25 @@ pub fn stage(view: &Path, owed: &[Tip]) -> Result<bool> {
             record.owed.push(tip.clone());
         }
     }
-    if before != record.owed.len() || !view.record.is_file() {
+    for tip in unsigned {
+        ensure!(valid_oid(&tip.oid), "invalid pending object ID");
+        let id = tip
+            .reference
+            .strip_prefix("refs/nostr/")
+            .context("invalid pending ref")?;
+        ensure!(
+            nostr_sdk::prelude::EventId::from_hex(id).is_ok(),
+            "invalid pending event ID"
+        );
+        record
+            .pending
+            .retain(|pending| pending.tip.reference != tip.reference);
+        record.pending.push(PendingUpload {
+            tip: tip.clone(),
+            expires_at: std::time::SystemTime::now() + crate::purgatory::DEFAULT_EXPIRY,
+        });
+    }
+    if before != record.owed.len() || !unsigned.is_empty() || !view.record.is_file() {
         view.save(&record)?;
     }
     Ok(true)
@@ -502,6 +537,21 @@ pub fn compact(view: &Path) -> Result<Compaction> {
     };
     if !view.record.is_file() {
         return Ok(Compaction::Done);
+    }
+    // Bound the journal to surviving refs. Failed or expired uploads must not
+    // accumulate metadata while a sibling keeps the view staged indefinitely.
+    if let Some(mut record) = view.load()? {
+        let refs: std::collections::HashMap<_, _> = super::list_refs(&view.path)
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .collect();
+        let before = record.pending.len();
+        record
+            .pending
+            .retain(|pending| refs.get(&pending.tip.reference) == Some(&pending.tip.oid));
+        if record.pending.len() != before {
+            view.save(&record)?;
+        }
     }
     let owed = settle_resolved(&view)?;
     if owed > 0 {

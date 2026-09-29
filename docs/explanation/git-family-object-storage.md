@@ -271,12 +271,20 @@ removed deliberately.
 
 ### Registry and maintenance worker
 
-`.grasp/staging/<digest>.json` records each staged view and its owed tips. It
-is written and fsynced before receive-pack can write an object. One worker
+`.grasp/staging/<digest>.json` records each staged view, its owed tips, and
+unsigned ref intentions with absolute expiry deadlines. It is written and
+fsynced before receive-pack can write an object. One worker
 processes maintenance requests, which come from staged pushes, promotions and
 ref deletions, including placeholder expiry. At startup it reads the registry,
-so interrupted work resumes. A view whose remaining staged objects belong to
-pending refs is parked until the next request rather than polled.
+so interrupted work resumes. Before cleanup, sync and request handling start,
+recovery reconstructs missing purgatory placeholders from surviving unsigned
+refs and their durable deadlines. Accepted events and signed events already in
+purgatory are preserved. Failed pushes with no matching ref create no
+placeholder. Legacy records without deadlines receive one grace period that
+is persisted before recovery proceeds, so repeated restarts do not extend it.
+This closes the window between receive-pack and the periodic purgatory
+checkpoint. A view whose remaining staged objects belong to pending refs is
+parked until the next request rather than polled.
 
 ### Limits
 

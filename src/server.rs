@@ -249,6 +249,15 @@ impl RelayServer {
             .await
             .context("failed deletion lifecycle startup reconciliation")?;
 
+        // Recover upload expiry before cleanup, integrity, sync or HTTP can run.
+        git::staging::recover_placeholders(
+            &git::storage::LocalGitStorage::new(config.effective_git_data_path()),
+            &purgatory,
+            &relay_runtime.stores.database,
+        )
+        .await
+        .context("failed to recover staged upload expiry")?;
+
         // Make the operator identity discoverable on this relay without
         // overwriting identity events the owner already published — locally
         // or on the configured user-index relays. Runs after deletion startup

@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub use sync::SyncQueueEntry;
 
 /// Default expiry duration for purgatory entries (30 minutes)
-const DEFAULT_EXPIRY: Duration = Duration::from_secs(1800);
+pub(crate) const DEFAULT_EXPIRY: Duration = Duration::from_secs(1800);
 
 /// Extended expiry for soft-expired announcements (24 hours).
 ///
@@ -564,6 +564,36 @@ impl Purgatory {
             commit,
         });
         entry.expires_at = now + DEFAULT_EXPIRY;
+    }
+
+    /// Restore a staged upload before serving requests. Never replace a signed
+    /// purgatory event or shorten a newer checkpoint's placeholder lifetime.
+    pub(crate) fn recover_upload_placeholder(
+        &self,
+        event_id: String,
+        commit: String,
+        destination: (PublicKey, String),
+        prs: bool,
+        expires_at: SystemTime,
+    ) {
+        let (owner, identifier) = destination;
+        let existing = self.find_pr(&event_id);
+        if existing.as_ref().is_some_and(|entry| entry.event.is_some()) {
+            return;
+        }
+        let deadline = Instant::now()
+            + expires_at
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+        let deadline = existing.map_or(deadline, |entry| deadline.max(entry.expires_at));
+        if prs {
+            self.add_prs_pr_placeholder(event_id.clone(), commit, owner, identifier);
+        } else {
+            self.add_standard_pr_placeholder(event_id.clone(), commit, owner, identifier);
+        }
+        if let Some(mut entry) = self.pr_events.get_mut(&event_id) {
+            entry.expires_at = deadline;
+        }
     }
 
     /// Expire normal-endpoint placeholders under the same lifecycle locks as pushes.

@@ -362,3 +362,44 @@ async fn arriving_state_promotes_an_existing_unsigned_upload() {
 async fn waiting_state_promotes_an_unsigned_upload_before_release() {
     state_adopts_unsigned_upload(true).await;
 }
+
+#[tokio::test]
+async fn crash_without_purgatory_checkpoint_still_expires_unsigned_upload() {
+    let served = Served::start("crash-expiry").await;
+    let local = tempfile::tempdir().unwrap();
+    let tip = common::create_test_repo_with_commit(local.path(), CommitVariant::PrTest).unwrap();
+    let pending = served.pr_event(&tip, "never published");
+    served.push(local.path(), &tip, &pending);
+    let family_before = family_objects(&served.family);
+    let git_data = served._persistent.path().join("git");
+    let relay_data = served._persistent.path().join("relay");
+    served.relay.stop().await;
+    // Reproduce the crash window deterministically: no checkpoint knows this
+    // upload, and its durable deadline has elapsed while the relay was down.
+    let checkpoint = git_data.join("purgatory-state.json");
+    if checkpoint.exists() {
+        std::fs::remove_file(checkpoint).unwrap();
+    }
+    for entry in std::fs::read_dir(git_data.join(".grasp/staging")).unwrap() {
+        let path = entry.unwrap().path();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for upload in record["pending"].as_array_mut().unwrap() {
+            upload["expires_at"] = serde_json::to_value(std::time::SystemTime::UNIX_EPOCH).unwrap();
+        }
+        std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+    let relay = TestRelay::start_with_existing_lmdb_paths(git_data, relay_data, None, false).await;
+    common::wait_for(
+        "recovered expired upload to be reclaimed",
+        DEADLINE,
+        || async { !ngit_grasp::git::oid_exists(&served.view, &tip) },
+    )
+    .await;
+    assert!(
+        ngit_grasp::git::get_ref_commit(&served.view, &format!("refs/nostr/{}", pending.id))
+            .is_none()
+    );
+    assert_eq!(family_objects(&served.family), family_before);
+    relay.stop().await;
+}
