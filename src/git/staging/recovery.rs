@@ -1,4 +1,5 @@
 //! Restore unsigned-upload expiry independently of the purgatory checkpoint.
+use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{ensure, Context, Result};
@@ -23,75 +24,96 @@ pub async fn recover_placeholders(
         Err(error) => return Err(error.into()),
     };
     for entry in entries {
-        let path = entry?.path();
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                tracing::error!(%error, "Cannot read staging registry entry; skipping expiry recovery for it");
+                continue;
+            }
+        };
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let mut record: Record = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(
-            !record.view.as_os_str().is_empty()
-                && record
-                    .view
-                    .components()
-                    .all(|part| matches!(part, std::path::Component::Normal(_))),
-            "invalid staging view path"
-        );
-        let view_path = storage.git_data_path().join(&record.view);
-        if !view_path.try_exists()? {
+        if let Err(error) = recover_record(&path, storage, purgatory, database).await {
+            tracing::error!(record = %path.display(), error = %format!("{error:#}"),
+                "Cannot recover staged upload expiry; leaving record and data for inspection");
+        }
+    }
+    Ok(())
+}
+
+// Failure is local to this record: without a recovered placeholder, its live
+// refs remain protected by compaction. Do not delete or rename suspect metadata.
+async fn recover_record(
+    path: &Path,
+    storage: &LocalGitStorage,
+    purgatory: &Purgatory,
+    database: &SharedDatabase,
+) -> Result<()> {
+    let mut record: Record = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(
+        !record.view.as_os_str().is_empty()
+            && record
+                .view
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "invalid staging view path"
+    );
+    let view_path = storage.git_data_path().join(&record.view);
+    if !view_path.try_exists()? {
+        return Ok(());
+    }
+    let view = View::resolve(&view_path)?.context("staged view has no family")?;
+    ensure!(
+        view.record == std::fs::canonicalize(path)?,
+        "staging registry path does not match view"
+    );
+    let parts: Vec<_> = record
+        .view
+        .iter()
+        .map(|part| part.to_str().context("non-UTF-8 view path"))
+        .collect::<Result<_>>()?;
+    let (owner, prs) = match parts.as_slice() {
+        [owner, _] => (PublicKey::from_bech32(owner)?, false),
+        ["prs", owner, _] => (PublicKey::from_hex(owner)?, true),
+        _ => anyhow::bail!("unsupported staged view path"),
+    };
+    let refs = crate::git::list_refs(&view.path).map_err(anyhow::Error::msg)?;
+    for (reference, oid) in refs {
+        let Some(id) = reference.strip_prefix("refs/nostr/") else {
+            continue;
+        };
+        let Ok(event_id) = EventId::from_hex(id) else {
+            continue;
+        };
+        if database.event_by_id(&event_id).await?.is_some()
+            || purgatory
+                .find_pr(id)
+                .is_some_and(|entry| entry.event.is_some())
+        {
             continue;
         }
-        let view = View::resolve(&view_path)?.context("staged view has no family")?;
-        ensure!(
-            view.record == std::fs::canonicalize(&path)?,
-            "staging registry path does not match view"
+        let tip = Tip::new(&reference, &oid);
+        let expires_at =
+            if let Some(pending) = record.pending.iter().find(|pending| pending.tip == tip) {
+                pending.expires_at
+            } else {
+                // Older registry versions recorded only the view and owed tips.
+                let expires_at = SystemTime::now() + crate::purgatory::DEFAULT_EXPIRY;
+                record
+                    .pending
+                    .retain(|pending| pending.tip.reference != reference);
+                record.pending.push(PendingUpload { tip, expires_at });
+                view.save(&record)?;
+                expires_at
+            };
+        purgatory.recover_upload_placeholder(
+            id.to_owned(),
+            oid,
+            (owner, view.key.identifier.clone()),
+            prs,
+            expires_at,
         );
-        let parts: Vec<_> = record
-            .view
-            .iter()
-            .map(|part| part.to_str().context("non-UTF-8 view path"))
-            .collect::<Result<_>>()?;
-        let (owner, prs) = match parts.as_slice() {
-            [owner, _] => (PublicKey::from_bech32(owner)?, false),
-            ["prs", owner, _] => (PublicKey::from_hex(owner)?, true),
-            _ => anyhow::bail!("unsupported staged view path"),
-        };
-        let refs = crate::git::list_refs(&view.path).map_err(anyhow::Error::msg)?;
-        for (reference, oid) in refs {
-            let Some(id) = reference.strip_prefix("refs/nostr/") else {
-                continue;
-            };
-            let Ok(event_id) = EventId::from_hex(id) else {
-                continue;
-            };
-            if database.event_by_id(&event_id).await?.is_some()
-                || purgatory
-                    .find_pr(id)
-                    .is_some_and(|entry| entry.event.is_some())
-            {
-                continue;
-            }
-            let tip = Tip::new(&reference, &oid);
-            let expires_at =
-                if let Some(pending) = record.pending.iter().find(|pending| pending.tip == tip) {
-                    pending.expires_at
-                } else {
-                    // Older registry versions recorded only the view and owed tips.
-                    let expires_at = SystemTime::now() + crate::purgatory::DEFAULT_EXPIRY;
-                    record
-                        .pending
-                        .retain(|pending| pending.tip.reference != reference);
-                    record.pending.push(PendingUpload { tip, expires_at });
-                    view.save(&record)?;
-                    expires_at
-                };
-            purgatory.recover_upload_placeholder(
-                id.to_owned(),
-                oid,
-                (owner, view.key.identifier.clone()),
-                prs,
-                expires_at,
-            );
-        }
     }
     Ok(())
 }
@@ -122,6 +144,48 @@ mod tests {
         stage_upload(&fixture.view, &[], &[Tip::new(PENDING, &oid)]).unwrap();
         reference(&fixture.view, PENDING, &oid);
         (fixture, owner, oid)
+    }
+
+    #[tokio::test]
+    async fn bad_records_do_not_block_healthy_recovery_or_delete_data() {
+        for corrupt in [true, false] {
+            let (fixture, _, _) = fixture(false);
+            let bad_path = fixture
+                .storage
+                .git_data_path()
+                .join("unexpected/nested/owner/repo.git");
+            std::fs::create_dir_all(bad_path.parent().unwrap()).unwrap();
+            fixture
+                .storage
+                .create_thin_view(&fixture.key, &bad_path)
+                .unwrap();
+            stage(&bad_path, &[]).unwrap();
+            let oid = commit(&bad_path, "bad record upload", None);
+            let bad_ref = super::super::tests::ABANDONED;
+            stage_upload(&bad_path, &[], &[Tip::new(bad_ref, &oid)]).unwrap();
+            reference(&bad_path, bad_ref, &oid);
+            let record_path = View::resolve(&bad_path).unwrap().unwrap().record;
+            if corrupt {
+                std::fs::write(&record_path, b"{broken json").unwrap();
+            }
+            let before = std::fs::read(&record_path).unwrap();
+            let purgatory = Purgatory::new(fixture.storage.git_data_path());
+            recover_placeholders(&fixture.storage, &purgatory, &database())
+                .await
+                .unwrap();
+            assert!(purgatory
+                .find_pr(PENDING.trim_start_matches("refs/nostr/"))
+                .is_some());
+            assert!(purgatory
+                .find_pr(bad_ref.trim_start_matches("refs/nostr/"))
+                .is_none());
+            assert_eq!(
+                crate::git::get_ref_commit(&bad_path, bad_ref),
+                Some(oid.clone())
+            );
+            assert!(object_exists(&bad_path, &oid).unwrap());
+            assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        }
     }
 
     #[tokio::test]

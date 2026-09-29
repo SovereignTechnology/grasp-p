@@ -403,3 +403,31 @@ async fn crash_without_purgatory_checkpoint_still_expires_unsigned_upload() {
     assert_eq!(family_objects(&served.family), family_before);
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn corrupt_staging_record_does_not_prevent_relay_restart() {
+    let mut served = Served::start("corrupt-staging-record").await;
+    let local = tempfile::tempdir().unwrap();
+    let tip = common::create_test_repo_with_commit(local.path(), CommitVariant::PrTest).unwrap();
+    let pending = served.pr_event(&tip, "pending with damaged metadata");
+    served.push(local.path(), &tip, &pending);
+    let registry = served._persistent.path().join("git/.grasp/staging");
+    let records: Vec<_> = std::fs::read_dir(&registry)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1);
+    let damaged = b"{broken json";
+    std::fs::write(&records[0], damaged).unwrap();
+
+    // restart() kills the process and waits for the new relay to be ready.
+    served.relay = served.relay.restart().await;
+    assert_eq!(std::fs::read(&records[0]).unwrap(), damaged);
+    assert_eq!(
+        ngit_grasp::git::get_ref_commit(&served.view, &format!("refs/nostr/{}", pending.id)),
+        Some(tip.clone())
+    );
+    assert!(holds_history(&served.view, &tip));
+    assert!(!holds_history(&served.family, &tip));
+    served.relay.stop().await;
+}

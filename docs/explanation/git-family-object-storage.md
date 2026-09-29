@@ -282,6 +282,10 @@ refs and their durable deadlines. Accepted events and signed events already in
 purgatory are preserved. Failed pushes with no matching ref create no
 placeholder. Legacy records without deadlines receive one grace period that
 is persisted before recovery proceeds, so repeated restarts do not extend it.
+Unreadable or invalid individual records are logged and skipped without
+removing their metadata, refs or objects; healthy records still recover. A
+skipped upload with no checkpoint placeholder remains retained for operator
+inspection. Failure to enumerate the registry itself still aborts startup.
 This closes the window between receive-pack and the periodic purgatory
 checkpoint. A view whose remaining staged objects belong to pending refs is
 parked until the next request rather than polled.
