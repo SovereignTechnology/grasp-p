@@ -601,6 +601,20 @@ fn build_expectation(
 
     for (event_id, entry) in pending_prs {
         let reference = format!("refs/nostr/{event_id}");
+        if entry.event.is_none() {
+            if let ViewIdentity::Owner { pubkey } = identity {
+                if let Some(record) = entry
+                    .standard_refs
+                    .iter()
+                    .find(|record| record.owner == *pubkey && record.identifier == identifier)
+                {
+                    expected
+                        .pending_pr_refs
+                        .insert(reference, record.commit.clone());
+                    continue;
+                }
+            }
+        }
         match &entry.event {
             Some(event)
                 if event_applies_to_view(
@@ -620,7 +634,10 @@ fn build_expectation(
                     .pending_pr_refs
                     .insert(reference, entry.commit.clone());
             }
-            None if entry.prs_scope.is_none() && matches!(identity, ViewIdentity::Owner { .. }) => {
+            None if entry.prs_scope.is_none()
+                && entry.standard_refs.is_empty()
+                && matches!(identity, ViewIdentity::Owner { .. }) =>
+            {
                 // Legacy standard-endpoint placeholders did not record their
                 // owner/identifier. Preserve a matching ref, but make the
                 // uncertainty visible rather than treating it as authority.
@@ -1572,6 +1589,41 @@ mod tests {
             Some(&pr_commit)
         );
         assert_eq!(expectation.pr_refs.len(), 1);
+    }
+
+    #[test]
+    fn standard_placeholder_authorizes_only_recorded_owner_and_identifier() {
+        let owner = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        let purgatory = crate::purgatory::Purgatory::new(PathBuf::new());
+        let id = "ab".repeat(32);
+        let commit = "cd".repeat(20);
+        purgatory.add_standard_pr_placeholder(id.clone(), commit.clone(), owner, "project".into());
+        let pending = vec![(id.clone(), purgatory.find_pr(&id).unwrap())];
+        let data = RepositoryData {
+            announcements: vec![],
+            states: vec![],
+        };
+        for (pubkey, identifier, matches) in [
+            (owner, "project", true),
+            (other, "project", false),
+            (owner, "other", false),
+        ] {
+            let expectation = build_expectation(
+                &ViewIdentity::Owner { pubkey },
+                identifier,
+                &data,
+                &[],
+                &pending,
+                &[],
+                None,
+            );
+            assert_eq!(
+                expectation.pending_pr_refs.get(&format!("refs/nostr/{id}")),
+                matches.then_some(&commit)
+            );
+            assert!(expectation.ambiguous_placeholders.is_empty());
+        }
     }
 
     #[test]

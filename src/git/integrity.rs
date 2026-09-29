@@ -629,7 +629,9 @@ pub fn inspect_family(storage: &LocalGitStorage, key: &FamilyKey) -> Result<Fami
         }
         for (reference, oid) in list_refs(view)? {
             refs_checked += 1;
-            if !oid_exists(&family, &oid)? {
+            // A pending upload is complete in its view's staging and is not
+            // family history until its event is accepted.
+            if !oid_exists(&family, &oid)? && !super::staging::holds_history(view, &oid) {
                 missing_oids.insert(oid.clone());
                 missing_ref_targets.push(MissingRefTarget {
                     view: view.clone(),

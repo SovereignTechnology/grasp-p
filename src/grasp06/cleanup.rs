@@ -110,6 +110,8 @@ pub fn scan_on_startup(git_data_path: &Path) -> (usize, usize) {
             }
 
             match list_refs(&repo_path) {
+                // Signed history still owed to the family outlives its refs.
+                Ok(refs) if refs.is_empty() && crate::git::staging::owes_history(&repo_path) => {}
                 Ok(refs) if refs.is_empty() => {
                     if let Err(e) = std::fs::remove_dir_all(&repo_path) {
                         warn!(

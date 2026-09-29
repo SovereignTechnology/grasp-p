@@ -369,3 +369,54 @@ isolated_test_with_grasp_06!(
     test_commit_mismatch_deletes_ref_and_blocks_promotion_with_grasp_06,
     PushValidationTests::test_commit_mismatch_deletes_ref_and_blocks_promotion
 );
+
+/// A crash can lose the purgatory checkpoint after a `/prs/` push installed
+/// its ref. The arriving PR event must still be matched to that push, using
+/// only its signed, service-local clone URL and the exact event-id ref.
+#[tokio::test]
+async fn pr_event_after_crash_recovers_prs_placeholder_scope() {
+    use nostr_sdk::prelude::*;
+    let persistent = tempfile::tempdir().unwrap();
+    let relay = TestRelay::start_with_grasp_06_paths(
+        persistent.path().join("git"),
+        persistent.path().join("relay"),
+    )
+    .await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .unwrap();
+    let keys = client.keys().clone();
+    let npub = keys.public_key().to_bech32().unwrap();
+    let identifier = "crash-recovered-pr";
+    let local = tempfile::tempdir().unwrap();
+    let commit =
+        common::create_test_repo_with_commit(local.path(), common::CommitVariant::PrTest).unwrap();
+    let clone_url = format!("http://{}/prs/{npub}/{identifier}.git", relay.domain());
+    let event = common::create_pr_event_with_clone(
+        &keys,
+        &format!("30617:{}:{identifier}", keys.public_key().to_hex()),
+        &commit,
+        "Crash-recovered PR",
+        &[&clone_url],
+    )
+    .unwrap();
+    common::push_ref_to_relay(
+        local.path(),
+        &relay.domain(),
+        &format!("prs/{npub}"),
+        identifier,
+        &commit,
+        &format!("refs/nostr/{}", event.id),
+    )
+    .unwrap();
+    // Killing the relay loses any placeholder not yet checkpointed.
+    let relay = relay.restart().await;
+    let client = AuditClient::new(relay.url(), AuditConfig::isolated())
+        .await
+        .unwrap();
+    client.send_event(event.clone()).await.unwrap();
+    common::wait_for_event_served(relay.url(), &event.id, std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    relay.stop().await;
+}

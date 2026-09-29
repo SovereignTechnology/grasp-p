@@ -249,6 +249,15 @@ impl RelayServer {
             .await
             .context("failed deletion lifecycle startup reconciliation")?;
 
+        // Recover upload expiry before cleanup, integrity, sync or HTTP can run.
+        git::staging::recover_placeholders(
+            &git::storage::LocalGitStorage::new(config.effective_git_data_path()),
+            &purgatory,
+            &relay_runtime.stores.database,
+        )
+        .await
+        .context("failed to recover staged upload expiry")?;
+
         // Make the operator identity discoverable on this relay without
         // overwriting identity events the owner already published — locally
         // or on the configured user-index relays. Runs after deletion startup
@@ -386,13 +395,22 @@ impl RelayServer {
             "Crash-safe sync-state checkpoint task started"
         );
 
+        background_tasks.push(tokio::spawn(git::staging::run_worker(
+            git::storage::LocalGitStorage::new(config.effective_git_data_path()),
+            repo_init_locks.clone(),
+        )));
+
         // Spawn background cleanup task for purgatory entries (60s interval)
         let cleanup_purgatory = purgatory.clone();
+        let cleanup_lifecycle = relay_runtime.lifecycle.clone();
+        let cleanup_database = relay_runtime.stores.database.clone();
         background_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
+                let standard_removed = cleanup_purgatory.cleanup_standard_pr_refs(&cleanup_lifecycle, &cleanup_database).await;
                 let (announcement_removed, state_removed, pr_removed) = cleanup_purgatory.cleanup();
+                let pr_removed = pr_removed + standard_removed;
                 if announcement_removed > 0 || state_removed > 0 || pr_removed > 0 {
                     info!(
                         "Purgatory cleanup: removed {} announcements, {} state events, {} PR events",
@@ -575,15 +593,8 @@ impl RelayServer {
             info!("Rejected events cache saved to disk");
         }
 
-        // Cleanup placeholder refs on shutdown
-        let placeholder_ids = self.purgatory.get_placeholder_event_ids();
-        if !placeholder_ids.is_empty() {
-            info!(
-                "Cleaning up {} placeholder refs/nostr/ refs on shutdown",
-                placeholder_ids.len()
-            );
-            git::cleanup_placeholder_refs(&self.git_data_path, &placeholder_ids);
-        }
+        // Pending refs and their staged objects must survive shutdown together
+        // with the checkpoint. Expiry owns their removal after restart.
 
         result
     }

@@ -113,7 +113,7 @@ runtime:
   pair in check-only or repair mode
 - Serve HTTP + WebSocket until a caller-supplied shutdown future
   resolves, then stop background mutation, persist a final state snapshot
-  (purgatory and rejected-events cache), and clean up placeholder refs
+  (purgatory and rejected-events cache), preserving pending PR refs for restart and expiry
 
 **Key Dependencies:**
 
@@ -525,7 +525,17 @@ See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:
 - Creates `Arc<Purgatory>` at startup
 - Passes purgatory to both write policy and git handlers
 - Passes `RepositoryLifecycle` directly to HTTP git serving and deletion/recovery
-- Spawns background cleanup task (60-second interval)
+- Spawns background cleanup task (60-second interval). Normal-endpoint PR
+  placeholders persist every pushed owner/identifier and commit. After 30 minutes
+  without the event, expiry takes repository lifecycle write locks, rechecks the
+  placeholder, and compare-and-deletes only those recorded refs. Failed deletions
+  keep the placeholder for retry. `/prs/` copies retain their separate cleanup.
+  Old unscoped placeholders cannot safely identify a repository for online cleanup;
+  the authorization-integrity checker preserves unmatched refs for inspection.
+- Spawns the staging maintenance worker. Uploads that no signed event names
+  are staged in their view; the worker promotes history owed to the family and
+  reclaims staged objects once their pending ref is gone. See
+  [Staging of unsigned uploads](git-family-object-storage.md#staging-of-unsigned-uploads).
 
 #### Thread Safety
 

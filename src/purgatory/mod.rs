@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub use sync::SyncQueueEntry;
 
 /// Default expiry duration for purgatory entries (30 minutes)
-const DEFAULT_EXPIRY: Duration = Duration::from_secs(1800);
+pub(crate) const DEFAULT_EXPIRY: Duration = Duration::from_secs(1800);
 
 /// Extended expiry for soft-expired announcements (24 hours).
 ///
@@ -101,6 +101,8 @@ struct SerializablePrPurgatoryEntry {
     /// deserialisable.
     #[serde(default)]
     prs_scope: Option<types::PrsPlaceholderScope>,
+    #[serde(default)]
+    standard_refs: Vec<types::StandardPrRef>,
 }
 
 /// Serializable wrapper for `AnnouncementPurgatoryEntry` with time offsets.
@@ -200,7 +202,7 @@ pub struct Purgatory {
     /// Stored as EventId (hex string) for efficient lookup.
     expired_events: Arc<DashMap<EventId, Instant>>,
 
-    _git_data_path: PathBuf,
+    git_data_path: PathBuf,
 
     /// Set once at startup by [`Purgatory::set_prs_cleanup_ctx`] to give
     /// [`Purgatory::cleanup`] enough information to remove abandoned
@@ -234,7 +236,7 @@ impl Purgatory {
             pr_events: Arc::new(DashMap::new()),
             sync_queue: Arc::new(DashMap::new()),
             expired_events: Arc::new(DashMap::new()),
-            _git_data_path: git_data_path.into(),
+            git_data_path: git_data_path.into(),
             prs_cleanup_ctx: std::sync::OnceLock::new(),
         }
     }
@@ -493,6 +495,7 @@ impl Purgatory {
             created_at: now,
             expires_at: now + DEFAULT_EXPIRY,
             source,
+            standard_refs: Vec::new(),
             prs_scope: None,
         };
 
@@ -521,10 +524,183 @@ impl Purgatory {
             created_at: now,
             expires_at: now + DEFAULT_EXPIRY,
             source: types::EventSource::Direct, // Git pushes are direct user actions
+            standard_refs: Vec::new(),
             prs_scope: None,
         };
 
         self.pr_events.insert(event_id, entry);
+    }
+
+    /// Record a normal-endpoint push without forgetting other copies of the ref.
+    pub fn add_standard_pr_placeholder(
+        &self,
+        event_id: String,
+        commit: String,
+        owner: PublicKey,
+        identifier: String,
+    ) {
+        let now = Instant::now();
+        let mut entry = self
+            .pr_events
+            .entry(event_id)
+            .or_insert_with(|| PrPurgatoryEntry {
+                event: None,
+                commit: commit.clone(),
+                created_at: now,
+                expires_at: now + DEFAULT_EXPIRY,
+                source: types::EventSource::Direct,
+                prs_scope: None,
+                standard_refs: Vec::new(),
+            });
+        if entry.event.is_some() {
+            return;
+        }
+        entry
+            .standard_refs
+            .retain(|r| r.owner != owner || r.identifier != identifier);
+        entry.standard_refs.push(types::StandardPrRef {
+            owner,
+            identifier,
+            commit,
+        });
+        entry.expires_at = now + DEFAULT_EXPIRY;
+    }
+
+    /// Restore a staged upload before serving requests. Never replace a signed
+    /// purgatory event or shorten a newer checkpoint's placeholder lifetime.
+    pub(crate) fn recover_upload_placeholder(
+        &self,
+        event_id: String,
+        commit: String,
+        destination: (PublicKey, String),
+        prs: bool,
+        expires_at: SystemTime,
+    ) {
+        let (owner, identifier) = destination;
+        let existing = self.find_pr(&event_id);
+        if existing.as_ref().is_some_and(|entry| entry.event.is_some()) {
+            return;
+        }
+        let deadline = Instant::now()
+            + expires_at
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+        let deadline = existing.map_or(deadline, |entry| deadline.max(entry.expires_at));
+        if prs {
+            self.add_prs_pr_placeholder(event_id.clone(), commit, owner, identifier);
+        } else {
+            self.add_standard_pr_placeholder(event_id.clone(), commit, owner, identifier);
+        }
+        if let Some(mut entry) = self.pr_events.get_mut(&event_id) {
+            entry.expires_at = deadline;
+        }
+    }
+
+    /// Expire normal-endpoint placeholders under the same lifecycle locks as pushes.
+    /// Recheck the entry after waiting: an event or a new push may have arrived.
+    /// Failed Git operations retain the record for the next sweep.
+    pub async fn cleanup_standard_pr_refs(
+        &self,
+        lifecycle: &crate::nostr::lifecycle::RepositoryLifecycle,
+        database: &crate::nostr::SharedDatabase,
+    ) -> usize {
+        let candidates: Vec<_> = self
+            .pr_events
+            .iter()
+            .filter(|e| {
+                e.event.is_none() && !e.standard_refs.is_empty() && e.expires_at <= Instant::now()
+            })
+            .map(|e| (e.key().clone(), e.standard_refs.clone()))
+            .collect();
+        let mut removed = 0;
+        for (id, refs) in candidates {
+            let _guards = lifecycle
+                .write_repositories(refs.iter().map(|r| crate::nostr::lifecycle::RecoveryScope {
+                    owner_pubkey_hex: r.owner.to_hex(),
+                    identifier: r.identifier.clone(),
+                }))
+                .await;
+            // A checkpoint can retain a placeholder after its event was accepted.
+            // Missing metadata must never cause us to delete a now-authorized ref.
+            let accepted = match EventId::from_hex(&id) {
+                Ok(event_id) => match database.event_by_id(&event_id).await {
+                    Ok(event) => event.is_some(),
+                    Err(error) => {
+                        tracing::warn!(%id, %error, "Cannot check PR acceptance; deferring ref expiry");
+                        continue;
+                    }
+                },
+                Err(_) => continue,
+            };
+            // Holding the map entry serializes event arrival/removal and placeholder refresh.
+            let dashmap::mapref::entry::Entry::Occupied(mut slot) =
+                self.pr_events.entry(id.clone())
+            else {
+                continue;
+            };
+            let entry = slot.get_mut();
+            let should_remove = (|| {
+                if entry.event.is_some()
+                    || entry.expires_at > Instant::now()
+                    || entry.standard_refs != refs
+                {
+                    return false;
+                }
+                if accepted {
+                    return true;
+                }
+                let mut ok = true;
+                for r in &refs {
+                    let path = self
+                        .git_data_path
+                        .join(r.owner.to_bech32().expect("public key"))
+                        .join(format!("{}.git", r.identifier));
+                    match path.try_exists() {
+                        Ok(false) => continue,
+                        Err(error) => {
+                            tracing::warn!(repo = %path.display(), %error, "Cannot inspect PR repository; deferring expiry");
+                            ok = false;
+                            continue;
+                        }
+                        Ok(true) => {}
+                    }
+                    let reference = format!("refs/nostr/{id}");
+                    // A previous partial sweep or a rejected push may leave no ref.
+                    match crate::git::list_refs(&path) {
+                        Ok(refs) if !refs.iter().any(|(name, _)| name == &reference) => continue,
+                        Err(error) => {
+                            tracing::warn!(repo = %path.display(), %error, "Cannot inspect PR refs; deferring expiry");
+                            ok = false;
+                            continue;
+                        }
+                        Ok(_) => {}
+                    }
+                    // Compare-and-delete prevents expiry from removing a replaced ref.
+                    let result = std::process::Command::new("git")
+                        .args(["update-ref", "-d", &reference, &r.commit])
+                        .current_dir(&path)
+                        .output();
+                    if !matches!(result, Ok(ref output) if output.status.success()) {
+                        tracing::warn!(repo = %path.display(), %reference,
+                            "Failed to expire normal PR ref; retaining placeholder for retry");
+                        ok = false;
+                    } else {
+                        // The abandoned upload's staged objects can now be reclaimed.
+                        crate::git::staging::request_maintenance(&path);
+                    }
+                }
+                if ok && entry.prs_scope.is_some() {
+                    entry.standard_refs.clear();
+                    return false; // The synchronous sweep still owns the /prs/ ref.
+                }
+                ok
+            })();
+            if should_remove {
+                slot.remove();
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// Add a PR placeholder created by a push to the GRASP-06 `/prs/`
@@ -552,19 +728,31 @@ impl Purgatory {
         identifier: String,
     ) {
         let now = Instant::now();
-        let entry = PrPurgatoryEntry {
+        let mut slot = self
+            .pr_events
+            .entry(event_id)
+            .or_insert_with(|| PrPurgatoryEntry {
+                event: None,
+                commit: commit.clone(),
+                created_at: now,
+                expires_at: now + DEFAULT_EXPIRY,
+                source: types::EventSource::Direct,
+                prs_scope: None,
+                standard_refs: Vec::new(),
+            });
+        let standard_refs = std::mem::take(&mut slot.standard_refs);
+        *slot = PrPurgatoryEntry {
             event: None,
             commit,
             created_at: now,
             expires_at: now + DEFAULT_EXPIRY,
             source: types::EventSource::Direct,
+            standard_refs,
             prs_scope: Some(types::PrsPlaceholderScope {
                 submitter,
                 identifier,
             }),
         };
-
-        self.pr_events.insert(event_id, entry);
     }
 
     /// Find state events waiting for a specific repository identifier.
@@ -977,7 +1165,7 @@ impl Purgatory {
         if let Some((repo_path, was_soft_expired)) = revival_info {
             if was_soft_expired {
                 if !repo_path.exists() {
-                    let storage = crate::git::storage::LocalGitStorage::new(&self._git_data_path);
+                    let storage = crate::git::storage::LocalGitStorage::new(&self.git_data_path);
                     let result = crate::git::storage::FamilyKey::sha1(identifier)
                         .and_then(|family| storage.create_thin_view(&family, &repo_path));
                     match result {
@@ -1301,7 +1489,8 @@ impl Purgatory {
             .iter()
             .filter(|entry| {
                 let value = entry.value();
-                value.expires_at <= now
+                value.standard_refs.is_empty()
+                    && value.expires_at <= now
                     && !value
                         .event
                         .as_ref()
@@ -1433,24 +1622,8 @@ impl Purgatory {
                             error = %e,
                             "Failed to delete dangling /prs/ ref during purgatory expiry",
                         );
-                    } else if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
-                        && matches!(
-                            crate::git::list_refs(&repo_path),
-                            Ok(refs) if refs.is_empty()
-                        )
-                    {
-                        if let Err(e) = std::fs::remove_dir_all(&repo_path) {
-                            tracing::warn!(
-                                repo = %repo_path.display(),
-                                error = %e,
-                                "Failed to remove zero-ref /prs/ repo during purgatory expiry",
-                            );
-                        } else {
-                            tracing::debug!(
-                                repo = %repo_path.display(),
-                                "Removed zero-ref /prs/ repo during purgatory expiry",
-                            );
-                        }
+                    } else {
+                        crate::grasp06::receive::remove_idle_empty_repo(&state, &repo_path);
                     }
                 }
             }
@@ -1658,6 +1831,7 @@ impl Purgatory {
                 expires_at_offset_secs: expires_offset.as_secs(),
                 source: e.source,
                 prs_scope: e.prs_scope.clone(),
+                standard_refs: e.standard_refs.clone(),
             };
             pr_events.insert(event_id, serializable);
         }
@@ -1830,6 +2004,7 @@ impl Purgatory {
                 expires_at,
                 source: e.source,
                 prs_scope: e.prs_scope,
+                standard_refs: e.standard_refs,
             };
 
             self.pr_events.insert(event_id, entry);
@@ -3547,3 +3722,6 @@ fn add_prs_pr_placeholder_does_not_overwrite_existing_scoped_placeholder() {
     assert_eq!(scope.submitter, submitter_b.public_key());
     assert_eq!(scope.identifier, "repo-b");
 }
+
+#[cfg(test)]
+mod standard_ref_tests;

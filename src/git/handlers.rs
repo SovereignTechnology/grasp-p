@@ -710,7 +710,7 @@ pub async fn handle_receive_pack(
     );
 
     // check push is authorised
-    let _auth_result = match authorize_push(
+    let auth_result = match authorize_push(
         &database,
         identifier,
         owner_pubkey,
@@ -788,8 +788,16 @@ pub async fn handle_receive_pack(
         .map(|plan| &plan.forwarded_body)
         .unwrap_or(&request_body);
 
-    // Ref updates remain in the selected view; receive-pack's quarantine and
-    // final objects are installed directly in the shared family inventory.
+    let pushed_refs = parse_pushed_refs(&request_body);
+    let staged = if family_lease.is_some() {
+        stage_push(&repo_path, &pushed_refs, &auth_result.unsigned_refs).await?
+    } else {
+        false
+    };
+
+    // Ref updates remain in the selected view. Objects of a push backed by
+    // signed events are installed directly in the shared family inventory;
+    // a staged push keeps them in the view until promotion.
     let mut git = GitSubprocess::spawn_with_object_directory(
         GitService::ReceivePack,
         &repo_path,
@@ -797,6 +805,7 @@ pub async fn handle_receive_pack(
         git_protocol,
         family_lease
             .as_ref()
+            .filter(|_| !staged)
             .map(|lease| lease.family_objects_path.as_path()),
     )
     .map_err(GitError::ProcessSpawnFailed)?;
@@ -817,7 +826,6 @@ pub async fn handle_receive_pack(
     // uploading. Streaming sideband progress keeps libgit2 clients from
     // hitting their per-recv timeout during that otherwise-silent window.
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(STREAM_CHANNEL_DEPTH);
-    let pushed_refs = parse_pushed_refs(&request_body);
     let new_oids: HashSet<String> = pushed_refs
         .iter()
         .filter(|(_, new_oid, _)| new_oid != "0000000000000000000000000000000000000000")
@@ -852,6 +860,7 @@ pub async fn handle_receive_pack(
             family_key,
             family_lease,
             pushed_refs,
+            staged,
             push_plan,
         )
         .await;
@@ -883,6 +892,7 @@ async fn stream_receive_pack_output<S, E, I>(
     family_key: FamilyKey,
     family_lease: Option<FamilyWriteLease>,
     pushed_refs: Vec<(String, String, String)>,
+    staged: bool,
     mut push_plan: Option<ReceivePackPlan>,
 ) where
     I: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1015,7 +1025,9 @@ async fn stream_receive_pack_output<S, E, I>(
 
     debug!("Git receive-pack stream completed successfully");
 
-    if family_lease.is_some() {
+    if staged {
+        settle_staged_push(&repo_path).await;
+    } else if family_lease.is_some() {
         retain_accepted_tips(&storage, &family_key, &repo_path, &pushed_refs);
     }
 
@@ -1151,6 +1163,62 @@ impl std::fmt::Display for GitError {
             Self::Storage(error) => write!(f, "Git storage error: {error}"),
         }
     }
+}
+
+/// Decide where a push to a thin view stores its objects, before Git runs.
+///
+/// A push is staged in the view when it carries a ref that no signed event
+/// names, or when the view already holds staged objects: the client may have
+/// omitted objects that only staging holds. Signed tips of a staged push are
+/// recorded as owed to the family first. The caller holds the family lease.
+pub(crate) async fn stage_push(
+    repo_path: &std::path::Path,
+    pushed_refs: &[(String, String, String)],
+    unsigned_refs: &HashSet<String>,
+) -> Result<bool, GitError> {
+    if unsigned_refs.is_empty() && !super::staging::is_staged(repo_path) {
+        return Ok(false);
+    }
+    let owed: Vec<_> = pushed_refs
+        .iter()
+        .filter(|(_, new_oid, name)| {
+            !unsigned_refs.contains(name) && new_oid.bytes().any(|digit| digit != b'0')
+        })
+        .map(|(_, new_oid, name)| super::staging::Tip::new(name, new_oid))
+        .collect();
+    let unsigned: Vec<_> = pushed_refs
+        .iter()
+        .filter(|(_, _, name)| unsigned_refs.contains(name))
+        .map(|(_, oid, name)| super::staging::Tip::new(name, oid))
+        .collect();
+    let view = repo_path.to_owned();
+    tokio::task::spawn_blocking(move || super::staging::stage_upload(&view, &owed, &unsigned))
+        .await
+        .map_err(|error| GitError::Storage(error.to_string()))?
+        .map_err(|error| GitError::Storage(format!("cannot stage push: {error:#}")))
+}
+
+/// Promote the signed tips of a staged push while the family lease is held.
+///
+/// A failure leaves the tips owed for staging maintenance to retry. The push
+/// has already succeeded, so it is not reported to the client.
+pub(crate) async fn settle_staged_push(repo_path: &std::path::Path) {
+    let view = repo_path.to_owned();
+    match tokio::task::spawn_blocking(move || super::staging::settle(&view)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(owed)) => warn!(
+            repo = %repo_path.display(),
+            owed,
+            "Signed history of a staged push is not yet in the family"
+        ),
+        Ok(Err(error)) => error!(
+            repo = %repo_path.display(),
+            error = %format!("{error:#}"),
+            "Failed to promote signed history of a staged push"
+        ),
+        Err(error) => error!(repo = %repo_path.display(), %error, "Staged push promotion panicked"),
+    }
+    super::staging::request_maintenance(repo_path);
 }
 
 pub(crate) fn retain_accepted_tips(

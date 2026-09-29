@@ -65,16 +65,52 @@ impl PrEventPolicy {
             }
         };
 
-        // Check for placeholder first (git-data-first scenario)
-        if let Some(placeholder_commit) = self.ctx.purgatory.find_pr_placeholder(&event_id) {
-            // Read the full entry so we can inspect any GRASP-06 scope
-            // recorded when the placeholder was created from a /prs/ push.
-            let prs_scope = self
-                .ctx
-                .purgatory
-                .find_pr(&event_id)
-                .and_then(|entry| entry.prs_scope);
-
+        // A standard-endpoint placeholder is released only once the event's
+        // history is durable or no local upload serves the event.
+        let mut standard_placeholder = false;
+        // A crash may happen after Git installs the ref but before the
+        // purgatory checkpoint. Recover the /prs/ scope only from a signed,
+        // service-local clone URL for this signer and an exact event-id/OID ref.
+        let mut placeholder = self
+            .ctx
+            .purgatory
+            .find_pr_placeholder(&event_id)
+            .map(|commit| {
+                let scope = self
+                    .ctx
+                    .purgatory
+                    .find_pr(&event_id)
+                    .and_then(|entry| entry.prs_scope);
+                (commit, scope)
+            });
+        if placeholder.is_none() && self.ctx.config.grasp06_enable {
+            for identifier in crate::grasp06::policy::prs_identifiers_named_by_event_clone_tags(
+                event,
+                &self.ctx.config.service_address(),
+            ) {
+                if !git::validate_repository_identifier(&identifier) {
+                    continue;
+                }
+                let path = crate::grasp06::paths::prs_repo_path(
+                    &self.ctx.git_data_path,
+                    &event.pubkey.to_hex(),
+                    &identifier,
+                );
+                if git::get_ref_commit(&path, &format!("refs/nostr/{event_id}")).as_deref()
+                    == Some(commit.as_str())
+                {
+                    placeholder = Some((
+                        commit.clone(),
+                        Some(crate::purgatory::PrsPlaceholderScope {
+                            submitter: event.pubkey,
+                            identifier,
+                        }),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some((placeholder_commit, prs_scope)) = placeholder {
             if let Some(scope) = prs_scope {
                 // The placeholder was created by a /prs/<submitter>/<id>.git
                 // push (06.md line 12). The arriving event MUST be signed by
@@ -146,29 +182,8 @@ impl PrEventPolicy {
                                 error = %e,
                                 "Failed to delete /prs/ ref while discarding scoped placeholder",
                             );
-                        } else if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
-                            && matches!(
-                                crate::git::list_refs(&prs_repo),
-                                Ok(refs) if refs.is_empty()
-                            )
-                        {
-                            // No refs left and no push in flight — the
-                            // repo is now an empty husk. Drop the bare
-                            // dir so /prs/ doesn't accumulate abandoned
-                            // repos. Equivalent to the cleanup the
-                            // receive handler does on push completion.
-                            if let Err(e) = std::fs::remove_dir_all(&prs_repo) {
-                                tracing::warn!(
-                                    repo = %prs_repo.display(),
-                                    error = %e,
-                                    "Failed to remove zero-ref /prs/ repo after discarding scoped placeholder",
-                                );
-                            } else {
-                                tracing::debug!(
-                                    repo = %prs_repo.display(),
-                                    "Removed zero-ref /prs/ repo after discarding scoped placeholder",
-                                );
-                            }
+                        } else {
+                            crate::grasp06::receive::remove_idle_empty_repo(&state, &prs_repo);
                         }
                     }
                     self.ctx.purgatory.remove_pr(&event_id);
@@ -210,6 +225,11 @@ impl PrEventPolicy {
                         &scope.identifier,
                     )
                     .await?;
+
+                    // The placeholder stays until the history is durable, so a
+                    // failure here leaves the upload to expire normally.
+                    self.promote_staged_history(&prs_repo, &event_id, &commit)
+                        .await?;
 
                     let process_result = crate::git::process::process_pr_with_git_data(
                         event,
@@ -267,7 +287,7 @@ impl PrEventPolicy {
                     event_id,
                     commit
                 );
-                self.ctx.purgatory.remove_pr(&event_id);
+                standard_placeholder = true;
             } else {
                 // Standard endpoint placeholder, mismatched commit — original
                 // behaviour: incoming event supersedes.
@@ -277,7 +297,7 @@ impl PrEventPolicy {
                     commit,
                     placeholder_commit
                 );
-                self.ctx.purgatory.remove_pr(&event_id);
+                standard_placeholder = true;
                 // Delete incorrect git data (refs/nostr/<event-id>) will be handled below
             }
         }
@@ -285,6 +305,9 @@ impl PrEventPolicy {
         let repo_paths = self.find_relevant_repo_paths(event).await?;
 
         if repo_paths.is_empty() {
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
             tracing::debug!("No repository paths found for PR event {}", event_id);
             return Ok(false);
         }
@@ -345,6 +368,14 @@ impl PrEventPolicy {
             )
             .unwrap_or_default();
 
+            // The placeholder stays until the history is durable, so a
+            // failure here leaves the upload to expire normally.
+            self.promote_staged_history(&source_repo, &event_id, &commit)
+                .await?;
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
+
             // Use unified processing function
             let result = crate::git::process::process_pr_with_git_data(
                 event,
@@ -376,6 +407,9 @@ impl PrEventPolicy {
 
             Ok(true)
         } else {
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
             tracing::debug!(
                 "No git data found for PR event {} with commit {}",
                 event_id,
@@ -383,6 +417,31 @@ impl PrEventPolicy {
             );
             Ok(false)
         }
+    }
+
+    /// Make the history of an accepted PR tip durable in the family.
+    ///
+    /// An upload received before its event was known is staged in its view.
+    /// The event may only be accepted once the family alone holds the history.
+    async fn promote_staged_history(
+        &self,
+        repo: &std::path::Path,
+        event_id: &str,
+        commit: &str,
+    ) -> Result<()> {
+        let tip = git::staging::Tip::new(format!("refs/nostr/{event_id}"), commit);
+        git::staging::promote_accepted(repo, tip)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    event_id = %event_id,
+                    commit = %commit,
+                    repo = %repo.display(),
+                    error = %format!("{error:#}"),
+                    "Cannot store PR history durably; event not accepted"
+                );
+                anyhow::anyhow!("PR history could not be stored durably")
+            })
     }
 
     async fn find_relevant_repo_paths(&self, event: &Event) -> Result<Vec<std::path::PathBuf>> {

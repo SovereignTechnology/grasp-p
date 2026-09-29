@@ -76,6 +76,7 @@ pub async fn authorize_push(
 
     // Collect all purgatory events that authorize this push
     let mut purgatory_events = Vec::new();
+    let mut unsigned_refs = HashSet::new();
 
     // Handle refs/nostr/ refs - validate and collect PR/PR-update events from purgatory
     if !nostr_refs.is_empty() {
@@ -88,35 +89,45 @@ pub async fn authorize_push(
             // Standard endpoint passes `None` for prs_url: signer / a-tag
             // identifier are enforced by the surrounding maintainer-set
             // authorization, not by the URL.
-            match pre_validate_refs_nostr_push(database, purgatory, new_oid, ref_name, None).await {
-                NostrRefPreValidation::Rejected { reason } => {
-                    warn!("refs/nostr/ validation failed: {}", reason);
-                    return Ok(AuthorizationResult::denied(reason));
-                }
-                NostrRefPreValidation::Authorized {
-                    event_from_purgatory,
-                } => {
-                    if let Some(event) = event_from_purgatory {
-                        debug!("Found matching PR event in purgatory for ref {}", ref_name);
-                        purgatory_events.push(event);
-                    } else {
-                        debug!("Ref {} validated against existing record", ref_name);
+            let event_id = ref_name
+                .strip_prefix("refs/nostr/")
+                .expect("partitioned ref");
+            let track_placeholder =
+                match pre_validate_refs_nostr_push(database, purgatory, new_oid, ref_name, None)
+                    .await
+                {
+                    NostrRefPreValidation::Rejected { reason } => {
+                        warn!("refs/nostr/ validation failed: {}", reason);
+                        return Ok(AuthorizationResult::denied(reason));
                     }
-                }
-                NostrRefPreValidation::Unknown => {
-                    // No entry in DB or purgatory — create placeholder so
-                    // the 30-minute sweep can clean the ref up if the PR
-                    // event never arrives. Standard-endpoint placeholders
-                    // carry no /prs/ scope.
-                    let event_id_hex = ref_name
-                        .strip_prefix("refs/nostr/")
-                        .expect("shape validated in pre_validate_refs_nostr_push");
-                    purgatory.add_pr_placeholder(event_id_hex.to_string(), new_oid.clone());
-                    debug!(
-                        "Created placeholder for {} - awaiting PR event (will expire in 30min if event doesn't arrive)",
-                        event_id_hex
-                    );
-                }
+                    NostrRefPreValidation::Authorized {
+                        event_from_purgatory,
+                        signed,
+                    } => {
+                        if !signed {
+                            unsigned_refs.insert(ref_name.clone());
+                        }
+                        if let Some(event) = event_from_purgatory {
+                            purgatory_events.push(event);
+                            false
+                        } else {
+                            purgatory.find_pr_placeholder(event_id).is_some()
+                        }
+                    }
+                    NostrRefPreValidation::Unknown => {
+                        unsigned_refs.insert(ref_name.clone());
+                        true
+                    }
+                };
+            if track_placeholder {
+                // Remember every destination, including subsequent pushes of the
+                // same pending event, so expiry can delete only those exact refs.
+                purgatory.add_standard_pr_placeholder(
+                    event_id.to_string(),
+                    new_oid.clone(),
+                    PublicKey::from_hex(selected_pubkey)?,
+                    identifier.to_string(),
+                );
             }
         }
     }
@@ -180,6 +191,7 @@ pub async fn authorize_push(
             state: auth_result.state,
             maintainers: auth_result.maintainers,
             purgatory_events,
+            unsigned_refs,
         });
     }
 
@@ -190,6 +202,7 @@ pub async fn authorize_push(
         state: None,
         maintainers: vec![],
         purgatory_events,
+        unsigned_refs,
     })
 }
 
@@ -665,6 +678,7 @@ pub async fn get_state_authorization_for_selected_repo(
                 state: None,
                 maintainers: authorized.into_iter().collect(),
                 purgatory_events: vec![],
+                unsigned_refs: HashSet::new(),
             });
         }
     }
@@ -736,6 +750,7 @@ pub async fn get_state_authorization_for_selected_repo(
                     state: Some(state),
                     maintainers: authorized.into_iter().collect(),
                     purgatory_events: vec![latest_authorized.clone()],
+                    unsigned_refs: HashSet::new(),
                 });
             } else {
                 warn!(
@@ -872,6 +887,9 @@ pub struct AuthorizationResult {
     pub maintainers: Vec<String>,
     /// Events from purgatory that authorized this push (state, PR, PR-update events)
     pub purgatory_events: Vec<Event>,
+    /// Pushed `refs/nostr/` refs that no signed event names yet. Their objects
+    /// are received into view staging instead of the family.
+    pub unsigned_refs: HashSet<String>,
 }
 
 impl AuthorizationResult {
@@ -883,6 +901,7 @@ impl AuthorizationResult {
             state: None,
             maintainers: vec![],
             purgatory_events: vec![],
+            unsigned_refs: HashSet::new(),
         }
     }
 }
@@ -1245,7 +1264,13 @@ pub enum NostrRefPreValidation {
     /// `authorize_push`) can collect it into `purgatory_events`. `None`
     /// means the match came from the DB or from a placeholder-only
     /// purgatory entry — nothing to collect.
-    Authorized { event_from_purgatory: Option<Event> },
+    ///
+    /// `signed` is false for a placeholder-only match: no signed event names
+    /// this commit yet, so its objects have not earned family storage.
+    Authorized {
+        event_from_purgatory: Option<Event>,
+        signed: bool,
+    },
     /// No event with that id is known to the relay yet. The caller may
     /// create a placeholder (with or without a `/prs/` scope) so the
     /// purgatory sweep can clean up the ref if the event never arrives.
@@ -1315,6 +1340,7 @@ pub async fn pre_validate_refs_nostr_push(
             }
             return NostrRefPreValidation::Authorized {
                 event_from_purgatory: None,
+                signed: true,
             };
         }
         Ok(None) => {}
@@ -1341,6 +1367,7 @@ pub async fn pre_validate_refs_nostr_push(
                 }
                 return NostrRefPreValidation::Authorized {
                     event_from_purgatory: Some(event),
+                    signed: true,
                 };
             }
             None => {
@@ -1364,6 +1391,7 @@ pub async fn pre_validate_refs_nostr_push(
                 }
                 return NostrRefPreValidation::Authorized {
                     event_from_purgatory: None,
+                    signed: false,
                 };
             }
         }

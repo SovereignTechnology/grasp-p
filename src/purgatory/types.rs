@@ -145,6 +145,10 @@ pub struct PrPurgatoryEntry {
     #[serde(default)]
     pub source: EventSource,
 
+    /// Exact normal-endpoint refs awaiting this event; persisted for expiry cleanup.
+    #[serde(default)]
+    pub standard_refs: Vec<StandardPrRef>,
+
     /// If set, this placeholder was created by a push to the GRASP-06
     /// `/prs/<submitter>/<identifier>.git` endpoint (06.md line 12). When
     /// the corresponding PR event arrives, its signer MUST equal
@@ -204,4 +208,12 @@ pub struct AnnouncementPurgatoryEntry {
 
     /// Whether the bare repo has been deleted (soft expiry)
     pub soft_expired: bool,
+}
+
+/// A pushed normal-endpoint ref, including the value cleanup may safely delete.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StandardPrRef {
+    pub owner: PublicKey,
+    pub identifier: String,
+    pub commit: String,
 }

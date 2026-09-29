@@ -25,6 +25,7 @@ pub mod migration;
 pub mod process;
 pub mod protocol;
 mod receive_pack_plan;
+pub mod staging;
 pub mod storage;
 pub mod subprocess;
 pub mod sync;
@@ -254,6 +255,7 @@ pub fn delete_ref(repo_path: &Path, ref_name: &str) -> Result<(), String> {
     }
 
     info!("Deleted ref {} from {}", ref_name, repo_path.display());
+    staging::request_maintenance(repo_path);
     Ok(())
 }
 

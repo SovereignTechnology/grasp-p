@@ -279,6 +279,9 @@ async fn mixed_deletion_push(atomic: bool, reject_branch: bool, include_deletion
     let bad = oid.clone();
     if reject_branch {
         use std::os::unix::fs::PermissionsExt;
+        // The server inherits ambient Git config, including CI's hostile
+        // hooksPath. Explicitly select this fixture's intentional rejection hook.
+        git(&repo, &["config", "--local", "core.hooksPath", "hooks"]);
         let hook = repo.join("hooks/update");
         std::fs::write(&hook, b"#!/bin/sh\n[ \"$1\" != refs/heads/unavailable ]\n").unwrap();
         std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();

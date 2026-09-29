@@ -361,6 +361,20 @@ impl LocalGitStorage {
         command.env("GIT_OBJECT_DIRECTORY", self.family_objects_path(key));
     }
 
+    /// Make a Git command run in `view` write objects to the view's family.
+    ///
+    /// A legacy repository without a family alternate keeps its own objects.
+    pub fn write_to_family_of(view: &Path, command: &mut Command) {
+        let alternates = std::fs::read_to_string(view.join("objects/info/alternates"));
+        if let Some(objects) = alternates
+            .ok()
+            .as_deref()
+            .and_then(|text| text.lines().next())
+        {
+            command.env("GIT_OBJECT_DIRECTORY", objects);
+        }
+    }
+
     /// Keep an accepted object tip reachable without exposing it as a view ref.
     pub fn retain_tip(&self, key: &FamilyKey, source_ref: &str, oid: &str) -> Result<String> {
         self.update_internal_tip(key, RETAINED_REFS_PREFIX, source_ref, oid)
