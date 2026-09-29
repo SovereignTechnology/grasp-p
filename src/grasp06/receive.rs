@@ -79,8 +79,8 @@ use crate::git::authorization::{
 use crate::git::handlers::{
     build_git_protocol_error_response, err_pktline_frame, is_git_protocol_error,
     pump_receive_pack_stdout_to_channel, read_stderr_to_end, record_git_operation,
-    retain_accepted_tips, send_body_bytes, streaming_response, GitError, PumpResult,
-    STREAM_CHANNEL_DEPTH,
+    retain_accepted_tips, send_body_bytes, settle_staged_push, stage_push, streaming_response,
+    GitError, PumpResult, STREAM_CHANNEL_DEPTH,
 };
 use crate::git::protocol::GitService;
 use crate::git::storage::{FamilyKey, FamilyWriteLease, LocalGitStorage};
@@ -231,6 +231,7 @@ pub async fn handle_prs_receive_pack(
         identifier: &prs.identifier,
         domain,
     };
+    let mut unsigned_refs = HashSet::new();
     for (_, new_oid, ref_name) in &pushed_refs {
         match pre_validate_refs_nostr_push(
             &database,
@@ -255,7 +256,11 @@ pub async fn handle_prs_receive_pack(
                     Some(&request_body),
                 ));
             }
-            NostrRefPreValidation::Authorized { .. } | NostrRefPreValidation::Unknown => {}
+            NostrRefPreValidation::Authorized { signed: true, .. } => {}
+            NostrRefPreValidation::Authorized { signed: false, .. }
+            | NostrRefPreValidation::Unknown => {
+                unsigned_refs.insert(ref_name.clone());
+            }
         }
     }
 
@@ -301,12 +306,24 @@ pub async fn handle_prs_receive_pack(
     //    write stdin here, then hand stdout/stderr and all follow-up state to a
     //    detached task that feeds the response body channel.
     let use_family = storage.is_thin_view(&family_key, &repo_path);
+    let staged = if use_family {
+        match stage_push(&repo_path, &pushed_refs, &unsigned_refs).await {
+            Ok(staged) => staged,
+            Err(e) => {
+                finish_prs_receive_pack(&state, &repo_path);
+                record_git_operation(&metrics, "push", "error");
+                return Err(e);
+            }
+        }
+    } else {
+        false
+    };
     let mut git = match GitSubprocess::spawn_with_object_directory(
         GitService::ReceivePack,
         &repo_path,
         false,
         git_protocol,
-        use_family.then_some(&family_lease.family_objects_path),
+        (use_family && !staged).then_some(&family_lease.family_objects_path),
     )
     .map_err(GitError::ProcessSpawnFailed)
     {
@@ -370,6 +387,7 @@ pub async fn handle_prs_receive_pack(
         storage,
         family_key,
         use_family.then_some(family_lease),
+        staged,
     ));
 
     Ok(streaming_response(GitService::ReceivePack, rx))
@@ -447,6 +465,7 @@ fn finish_prs_receive_pack(state: &PrsPathState, repo_path: &Path) {
 pub(crate) fn remove_idle_empty_repo(state: &PrsPathState, repo_path: &Path) -> bool {
     if state.in_flight.load(Ordering::Relaxed) != 0
         || !matches!(list_refs(repo_path), Ok(refs) if refs.is_empty())
+        || crate::git::staging::owes_history(repo_path)
     {
         return false;
     }
@@ -518,6 +537,7 @@ async fn stream_prs_receive_pack_output<S, E>(
     storage: LocalGitStorage,
     family_key: FamilyKey,
     family_lease: Option<FamilyWriteLease>,
+    staged: bool,
 ) where
     S: tokio::io::AsyncRead + Unpin + Send + 'static,
     E: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -637,9 +657,15 @@ async fn stream_prs_receive_pack_output<S, E>(
         .await;
     }
 
-    if family_lease.is_some() {
+    if staged {
+        settle_staged_push(&repo_path).await;
+    } else if family_lease.is_some() {
         retain_accepted_tips(&storage, &family_key, &repo_path, &pushed_refs);
     }
+
+    // Release the family writer before post-push processing: promoting a
+    // waiting event may need to re-enter this same identifier family.
+    drop(family_lease);
 
     finish_prs_receive_pack(&state, &repo_path);
 

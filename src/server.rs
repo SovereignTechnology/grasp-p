@@ -386,6 +386,11 @@ impl RelayServer {
             "Crash-safe sync-state checkpoint task started"
         );
 
+        background_tasks.push(tokio::spawn(git::staging::run_worker(
+            git::storage::LocalGitStorage::new(config.effective_git_data_path()),
+            repo_init_locks.clone(),
+        )));
+
         // Spawn background cleanup task for purgatory entries (60s interval)
         let cleanup_purgatory = purgatory.clone();
         let cleanup_lifecycle = relay_runtime.lifecycle.clone();

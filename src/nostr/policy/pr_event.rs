@@ -65,6 +65,9 @@ impl PrEventPolicy {
             }
         };
 
+        // A standard-endpoint placeholder is released only once the event's
+        // history is durable or no local upload serves the event.
+        let mut standard_placeholder = false;
         // A crash may happen after Git installs the ref but before the
         // purgatory checkpoint. Recover the /prs/ scope only from a signed,
         // service-local clone URL for this signer and an exact event-id/OID ref.
@@ -223,6 +226,11 @@ impl PrEventPolicy {
                     )
                     .await?;
 
+                    // The placeholder stays until the history is durable, so a
+                    // failure here leaves the upload to expire normally.
+                    self.promote_staged_history(&prs_repo, &event_id, &commit)
+                        .await?;
+
                     let process_result = crate::git::process::process_pr_with_git_data(
                         event,
                         &commit,
@@ -279,7 +287,7 @@ impl PrEventPolicy {
                     event_id,
                     commit
                 );
-                self.ctx.purgatory.remove_pr(&event_id);
+                standard_placeholder = true;
             } else {
                 // Standard endpoint placeholder, mismatched commit — original
                 // behaviour: incoming event supersedes.
@@ -289,7 +297,7 @@ impl PrEventPolicy {
                     commit,
                     placeholder_commit
                 );
-                self.ctx.purgatory.remove_pr(&event_id);
+                standard_placeholder = true;
                 // Delete incorrect git data (refs/nostr/<event-id>) will be handled below
             }
         }
@@ -297,6 +305,9 @@ impl PrEventPolicy {
         let repo_paths = self.find_relevant_repo_paths(event).await?;
 
         if repo_paths.is_empty() {
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
             tracing::debug!("No repository paths found for PR event {}", event_id);
             return Ok(false);
         }
@@ -357,6 +368,14 @@ impl PrEventPolicy {
             )
             .unwrap_or_default();
 
+            // The placeholder stays until the history is durable, so a
+            // failure here leaves the upload to expire normally.
+            self.promote_staged_history(&source_repo, &event_id, &commit)
+                .await?;
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
+
             // Use unified processing function
             let result = crate::git::process::process_pr_with_git_data(
                 event,
@@ -388,6 +407,9 @@ impl PrEventPolicy {
 
             Ok(true)
         } else {
+            if standard_placeholder {
+                self.ctx.purgatory.remove_pr(&event_id);
+            }
             tracing::debug!(
                 "No git data found for PR event {} with commit {}",
                 event_id,
@@ -395,6 +417,31 @@ impl PrEventPolicy {
             );
             Ok(false)
         }
+    }
+
+    /// Make the history of an accepted PR tip durable in the family.
+    ///
+    /// An upload received before its event was known is staged in its view.
+    /// The event may only be accepted once the family alone holds the history.
+    async fn promote_staged_history(
+        &self,
+        repo: &std::path::Path,
+        event_id: &str,
+        commit: &str,
+    ) -> Result<()> {
+        let tip = git::staging::Tip::new(format!("refs/nostr/{event_id}"), commit);
+        git::staging::promote_accepted(repo, tip)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    event_id = %event_id,
+                    commit = %commit,
+                    repo = %repo.display(),
+                    error = %format!("{error:#}"),
+                    "Cannot store PR history durably; event not accepted"
+                );
+                anyhow::anyhow!("PR history could not be stored durably")
+            })
     }
 
     async fn find_relevant_repo_paths(&self, event: &Event) -> Result<Vec<std::path::PathBuf>> {

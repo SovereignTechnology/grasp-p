@@ -76,6 +76,7 @@ pub async fn authorize_push(
 
     // Collect all purgatory events that authorize this push
     let mut purgatory_events = Vec::new();
+    let mut unsigned_refs = HashSet::new();
 
     // Handle refs/nostr/ refs - validate and collect PR/PR-update events from purgatory
     if !nostr_refs.is_empty() {
@@ -101,7 +102,11 @@ pub async fn authorize_push(
                     }
                     NostrRefPreValidation::Authorized {
                         event_from_purgatory,
+                        signed,
                     } => {
+                        if !signed {
+                            unsigned_refs.insert(ref_name.clone());
+                        }
                         if let Some(event) = event_from_purgatory {
                             purgatory_events.push(event);
                             false
@@ -109,7 +114,10 @@ pub async fn authorize_push(
                             purgatory.find_pr_placeholder(event_id).is_some()
                         }
                     }
-                    NostrRefPreValidation::Unknown => true,
+                    NostrRefPreValidation::Unknown => {
+                        unsigned_refs.insert(ref_name.clone());
+                        true
+                    }
                 };
             if track_placeholder {
                 // Remember every destination, including subsequent pushes of the
@@ -183,6 +191,7 @@ pub async fn authorize_push(
             state: auth_result.state,
             maintainers: auth_result.maintainers,
             purgatory_events,
+            unsigned_refs,
         });
     }
 
@@ -193,6 +202,7 @@ pub async fn authorize_push(
         state: None,
         maintainers: vec![],
         purgatory_events,
+        unsigned_refs,
     })
 }
 
@@ -668,6 +678,7 @@ pub async fn get_state_authorization_for_selected_repo(
                 state: None,
                 maintainers: authorized.into_iter().collect(),
                 purgatory_events: vec![],
+                unsigned_refs: HashSet::new(),
             });
         }
     }
@@ -739,6 +750,7 @@ pub async fn get_state_authorization_for_selected_repo(
                     state: Some(state),
                     maintainers: authorized.into_iter().collect(),
                     purgatory_events: vec![latest_authorized.clone()],
+                    unsigned_refs: HashSet::new(),
                 });
             } else {
                 warn!(
@@ -875,6 +887,9 @@ pub struct AuthorizationResult {
     pub maintainers: Vec<String>,
     /// Events from purgatory that authorized this push (state, PR, PR-update events)
     pub purgatory_events: Vec<Event>,
+    /// Pushed `refs/nostr/` refs that no signed event names yet. Their objects
+    /// are received into view staging instead of the family.
+    pub unsigned_refs: HashSet<String>,
 }
 
 impl AuthorizationResult {
@@ -886,6 +901,7 @@ impl AuthorizationResult {
             state: None,
             maintainers: vec![],
             purgatory_events: vec![],
+            unsigned_refs: HashSet::new(),
         }
     }
 }
@@ -1248,7 +1264,13 @@ pub enum NostrRefPreValidation {
     /// `authorize_push`) can collect it into `purgatory_events`. `None`
     /// means the match came from the DB or from a placeholder-only
     /// purgatory entry — nothing to collect.
-    Authorized { event_from_purgatory: Option<Event> },
+    ///
+    /// `signed` is false for a placeholder-only match: no signed event names
+    /// this commit yet, so its objects have not earned family storage.
+    Authorized {
+        event_from_purgatory: Option<Event>,
+        signed: bool,
+    },
     /// No event with that id is known to the relay yet. The caller may
     /// create a placeholder (with or without a `/prs/` scope) so the
     /// purgatory sweep can clean up the ref if the event never arrives.
@@ -1318,6 +1340,7 @@ pub async fn pre_validate_refs_nostr_push(
             }
             return NostrRefPreValidation::Authorized {
                 event_from_purgatory: None,
+                signed: true,
             };
         }
         Ok(None) => {}
@@ -1344,6 +1367,7 @@ pub async fn pre_validate_refs_nostr_push(
                 }
                 return NostrRefPreValidation::Authorized {
                     event_from_purgatory: Some(event),
+                    signed: true,
                 };
             }
             None => {
@@ -1367,6 +1391,7 @@ pub async fn pre_validate_refs_nostr_push(
                 }
                 return NostrRefPreValidation::Authorized {
                     event_from_purgatory: None,
+                    signed: false,
                 };
             }
         }

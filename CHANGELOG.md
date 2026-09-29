@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep Git uploads that no signed event names out of permanent storage. A push
+  to `refs/nostr/<event-id>` whose PR event is not yet known is staged in the
+  repository that received it, promoted into shared storage when the event is
+  accepted, and reclaimed after its pending ref expires. Pushes backed by a
+  signed State or PR event are stored as before.
+
 - Accept a GRASP-06 `/prs/` PR event whose pushed ref survived a crash that
   lost its purgatory placeholder, matching it by the event's service-local
   clone URL and exact `refs/nostr/<event-id>` ref.

@@ -654,6 +654,9 @@ impl Purgatory {
                         tracing::warn!(repo = %path.display(), %reference,
                             "Failed to expire normal PR ref; retaining placeholder for retry");
                         ok = false;
+                    } else {
+                        // The abandoned upload's staged objects can now be reclaimed.
+                        crate::git::staging::request_maintenance(&path);
                     }
                 }
                 if ok && entry.prs_scope.is_some() {

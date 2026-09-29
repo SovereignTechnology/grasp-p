@@ -1509,6 +1509,16 @@ async fn process_purgatory_pr_events(
         let owner_pubkey =
             extract_owner_from_repo_path(source_repo_path, git_data_path).unwrap_or_default();
 
+        // The event may only be accepted once the family holds its history.
+        let tip = crate::git::staging::Tip::new(format!("refs/nostr/{}", event.id), &entry.commit);
+        if let Err(error) = crate::git::staging::promote_accepted(source_repo_path, tip).await {
+            result.errors.push(format!(
+                "PR {} history could not be stored durably: {error:#}",
+                event.id
+            ));
+            continue;
+        }
+
         // Use unified processing function
         let process_result = crate::git::process::process_pr_with_git_data(
             event,

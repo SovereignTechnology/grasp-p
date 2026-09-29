@@ -158,19 +158,144 @@ authorization remain view-specific.
 
 For local writes, receive-pack writes its quarantine and final objects into the
 family object directory while it updates refs in the selected view. Other Git
-commands that can create objects, including proactive fetch and archive
-restore, must use the same family object directory. Read-only commands can use
-the view normally because its alternate resolves the inventory.
+commands that can create objects, including proactive fetch, copies between
+views and archive restore, must use the same family object directory. Read-only
+commands can use the view normally because its alternate resolves the
+inventory. The one exception is an upload that no signed event names yet,
+described next.
+
+## Staging of unsigned uploads
+
+**Added:** 2026-09-29
+
+A push to `refs/nostr/<event-id>` is accepted before its PR event is known.
+Until this change its objects went straight into the family, which is never
+garbage-collected, so anyone could fill permanent storage without signing
+anything. Such an upload is now **staged**: receive-pack writes its objects to
+the view's own object directory, and they reach the family only when a signed
+event accepts them.
+
+### What earns family storage
+
+A signed event earns family storage at push time. Push authorization already
+decides, for each pushed ref, whether a signed event names it:
+
+| Pushed ref                                                   | Objects go to |
+| ------------------------------------------------------------ | ------------- |
+| Branch or tag named by a State, accepted or in purgatory     | family        |
+| `refs/nostr/<id>` whose PR event is accepted or in purgatory | family        |
+| `refs/nostr/<id>` with no event, or only a placeholder       | view staging  |
+
+A push that carries any unsigned ref is staged as a whole, because one push is
+one pack. While a view holds staged objects, every push to it is staged too:
+the view advertises its pending refs, so a client may omit objects that only
+staging holds, and receive-pack could not check such a push against the family
+alone.
+
+Trade-off: a pack from a signed push is stored whole, including any object in
+it that the signed tip does not reach. This is accepted because a signer can
+make any object reachable from their own tip. Staging defends against uploads
+nobody signed for, not against a signer's choice of content. Purgatory sync
+fetches and integrity repair fetch history for signed events and keep writing
+to the family.
+
+### Promotion
+
+Promotion copies a tip's history from the view into the family with
+`git fetch`, checks that the family alone holds it, and installs the usual
+retained and base roots. The check walks from the tip down to existing retained
+roots. Those were complete when installed and the family is append-only, so the
+cost follows the new history instead of the whole repository. Detecting damage
+behind a root remains the integrity pass's job; a damaged root fails the check
+and therefore the promotion.
+
+Promotion happens in two places:
+
+- **PR acceptance.** A PR or PR Update event is accepted only after its tip is
+  promoted. On failure the event is rejected and its placeholder is kept, so
+  the upload expires normally and the client can send the event again.
+- **Signed push into a staged view.** Its signed tips are promoted when
+  receive-pack finishes, while the push still holds the family lease.
+
+State events never wait on promotion. Their history is in the family when the
+push that carries it completes.
+
+### Owed history
+
+Rollback after a State deletion depends on history that no current ref names.
+The absence of a ref therefore never proves that staged history is disposable.
+
+Before receive-pack runs, the signed tips of a staged push are recorded as
+**owed** in the view's registry record. A tip stays owed until its history is
+complete in the family alone. If promotion at the end of the push fails, or
+the server stops before it runs, the tip is still owed after restart and
+maintenance promotes it by object ID, whether or not a ref still names it. An
+owed tip whose object is in neither store belongs to a push that never
+completed and is dropped. An empty `/prs/` view is not removed while it owes
+history.
+
+A view that already holds objects when it is first staged has them moved into
+the family first. They predate staging and cannot be told apart from accepted
+history.
+
+### Compaction
+
+Staging is reclaimed by Git itself. For one view, maintenance:
+
+1. promotes owed tips, and stops if any remain owed;
+2. runs `git repack -a -d -l` and `git prune --expire=now`, which keep the
+   history live refs need and the family lacks, and drop everything else;
+3. removes loose objects the family also holds;
+4. removes the registry record if nothing is left, and the view itself if it
+   is an empty `/prs/` view.
+
+Every live ref is a root, so a pending upload keeps exactly its own history
+and an abandoned one disappears once its ref expires.
+
+Compaction must not overlap a push to the same view. Git can report a
+successful push and install a ref whose parent a concurrent repack has just
+removed; `tests/git_cruft_concurrency.rs` reproduces this. A grace period
+cannot prevent it, because the push may start after the repack has chosen
+what to keep. Compaction therefore takes the family write lease, which every
+push already holds from before receive-pack starts until its refs and roots
+are installed. The lease is fair: maintenance queues behind active writers for
+at most 250 ms, then gives way and retries with backoff from one second to five
+minutes, so it cannot hold up the pushes behind it.
+
+Fetches take no lease. A fetch of a pending ref that expires while it is being
+served may fail. That ref named an upload nobody signed for and is being
+removed deliberately.
+
+### Registry and maintenance worker
+
+`.grasp/staging/<digest>.json` records each staged view and its owed tips. It
+is written and fsynced before receive-pack can write an object. One worker
+processes maintenance requests, which come from staged pushes, promotions and
+ref deletions, including placeholder expiry. At startup it reads the registry,
+so interrupted work resumes. A view whose remaining staged objects belong to
+pending refs is parked until the next request rather than polled.
+
+### Limits
+
+- Staging is not a storage quota. It bounds how long an unsigned upload is
+  kept, not how much one may upload.
+- Archiving a repository stores its view directory as it is, staged objects
+  included. Restoring the archive imports them into the family.
+- Staged history exists in one view only. Other views cannot read it until it
+  is promoted.
 
 ## Durability and the success fence
 
 The invariant is:
 
 > When a client observes a successful push, every Git object needed by the
-> accepted ref updates is durable in the configured family backend.
+> accepted ref updates is durable in the configured family backend, or in the
+> view's staging for an upload that no signed event names yet.
 
 The local backend satisfies the fence when Git has atomically installed the
-objects in the family object directory and receive-pack has completed.
+objects in the family object directory, or in view staging, and receive-pack
+has completed. Accepting a PR event additionally requires its history to be
+complete in the family.
 
 The S3 backend cannot release receive-pack's terminal success immediately.
 The handler must retain the final protocol status until it has:
@@ -224,8 +349,12 @@ Consequences:
 
 - disable automatic Git maintenance and pruning for family repositories;
 - create retained roots for every accepted branch, tag, and PR tip;
+- unsigned uploads stay outside this inventory until a signed event accepts
+  them;
 - do not use S3 lifecycle deletion on family objects;
-- never compact by packing only the current visible ref closure;
+- never compact the family by packing only the current visible ref closure
+  (view staging is compacted this way because it is not part of the
+  inventory, and only once nothing in it is owed to the family);
 - if pack-count compaction becomes necessary, repack the union of every object
   in all selected packs, publish the replacement in addition to the old
   immutable packs, and leave physical deletion to future GC work.
@@ -243,8 +372,10 @@ view whose alternate is the identifier family. Therefore:
 - receive-pack may advertise family base tips as anonymous `.have` lines;
 - the first contributor push sends only objects the family does not have;
 - pushes remain restricted to `refs/nostr/<event-id>`;
+- a push whose PR event is not yet known is staged in the view;
 - placeholder and expiry cleanup removes view refs or an empty view, never
-  family objects or retained roots.
+  family objects or retained roots. An empty view that still owes history to
+  the family is kept.
 
 Mirroring a PR into an owner view becomes a ref update after an object
 availability check. It no longer copies the object graph.
@@ -384,9 +515,10 @@ local objects exist.
 
 Operations that mutate one family are serialized by a per-family lock. This
 covers pushes to different owner or `/prs/` views with the same identifier,
-proactive fetches, archive restores, retained/base ref updates, and S3 manifest
-publication. Read requests take a hydrated family lease; they do not hold the
-writer lock after their pack set has been pinned.
+proactive fetches, archive restores, retained/base ref updates, promotion and
+compaction of view staging, and S3 manifest publication. Read requests take a
+hydrated family lease; they do not hold the writer lock after their pack set
+has been pinned.
 
 View lifecycle locks remain responsible for “may this path be removed?” The
 family lock is responsible for “is this object inventory and manifest update
@@ -397,8 +529,9 @@ atomic?” Neither lock grants authorization.
 Storage integrity is defined for an object-format/identifier family, not for
 one owner path. The storage pass checks the family pack set and object graph,
 then checks every owner and `/prs/` view with the same identifier for the
-correct alternate and for refs whose targets are available in the family.
-Multiple independent histories in one identifier are valid, and unreachable
+correct alternate and for refs whose targets are available in the family. A
+ref of a staged view whose history is complete in that view's staging is a
+pending upload, not a fault. Multiple independent histories in one identifier are valid, and unreachable
 objects are not an error: retained delete-state and rollback data intentionally
 remain present.
 

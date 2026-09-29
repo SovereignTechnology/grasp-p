@@ -532,6 +532,10 @@ See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:
   keep the placeholder for retry. `/prs/` copies retain their separate cleanup.
   Old unscoped placeholders cannot safely identify a repository for online cleanup;
   the authorization-integrity checker preserves unmatched refs for inspection.
+- Spawns the staging maintenance worker. Uploads that no signed event names
+  are staged in their view; the worker promotes history owed to the family and
+  reclaims staged objects once their pending ref is gone. See
+  [Staging of unsigned uploads](git-family-object-storage.md#staging-of-unsigned-uploads).
 
 #### Thread Safety
 

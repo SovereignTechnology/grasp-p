@@ -614,6 +614,12 @@ on failure for retry. A database check protects accepted events whose placeholde
 survived in an older checkpoint. Legacy records without destinations remain readable,
 but cannot safely drive scoped online ref deletion.
 
+The objects of a git-first push are staged in the view that received them, not
+stored in the identifier family. Expiring the ref lets staging maintenance
+reclaim them. Accepting the PR event first promotes its history into the
+family; the placeholder is released only after that succeeds. See
+[Staging of unsigned uploads](git-family-object-storage.md#staging-of-unsigned-uploads).
+
 ## Background Sync
 
 Purgatory includes a background sync system that fetches git data from remote servers when events arrive before git data.
