@@ -188,9 +188,12 @@ impl DeletionService {
             };
 
             if !crate::git::oid_exists(target_repo, oid) {
-                let fetch_output = Command::new("git")
+                let mut fetch = Command::new("git");
+                fetch
                     .args(["fetch", source_repo_str, oid])
-                    .current_dir(target_repo)
+                    .current_dir(target_repo);
+                LocalGitStorage::write_to_family_of(target_repo, &mut fetch);
+                let fetch_output = fetch
                     .output()
                     .map_err(|e| anyhow::anyhow!("failed to fetch archived OID {oid}: {e}"))?;
                 if !fetch_output.status.success() {

@@ -333,13 +333,18 @@ pub(crate) fn copy_single_commit_between_repos(
         target_repo.display()
     );
 
-    let output = Command::new("git")
+    let mut fetch = Command::new("git");
+    fetch
         .args([
             "fetch",
             source_repo.to_str().ok_or("Invalid source path")?,
             commit_hash,
         ])
-        .current_dir(target_repo)
+        .current_dir(target_repo);
+    // Copied history is accepted history: it belongs to the family, never to
+    // the target view's own object directory.
+    crate::git::storage::LocalGitStorage::write_to_family_of(target_repo, &mut fetch);
+    let output = fetch
         .output()
         .map_err(|e| format!("Failed to execute git fetch: {}", e))?;
 
@@ -545,13 +550,16 @@ pub fn copy_missing_oids_between_repos(
 
     // Fetch each missing commit from source to target
     for commit in &missing_commits {
-        let output = Command::new("git")
+        let mut fetch = Command::new("git");
+        fetch
             .args([
                 "fetch",
                 source_repo.to_str().ok_or("Invalid source path")?,
                 commit,
             ])
-            .current_dir(target_repo)
+            .current_dir(target_repo);
+        crate::git::storage::LocalGitStorage::write_to_family_of(target_repo, &mut fetch);
+        let output = fetch
             .output()
             .map_err(|e| format!("Failed to execute git fetch: {}", e))?;
 
@@ -2410,5 +2418,68 @@ mod tests {
         // When the state being checked is also in the db_states, it should be considered latest
         let result = is_latest_authorized_state(&state, &maintainers, std::slice::from_ref(&state));
         assert!(result);
+    }
+
+    /// Commit written into `repo`'s own object directory.
+    fn local_commit(repo: &Path, content: &str) -> String {
+        let run = |args: &[&str], input: &str| {
+            use std::io::Write;
+            let mut child = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let blob = run(&["hash-object", "-w", "--stdin"], content);
+        let tree = run(&["mktree"], &format!("100644 blob {blob}\tfile\n"));
+        run(&["commit-tree", &tree, "-m", content], "")
+    }
+
+    #[test]
+    fn copied_commit_is_written_to_the_family_not_the_target_view() {
+        use crate::git::storage::{FamilyKey, LocalGitStorage};
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = LocalGitStorage::new(root.path().canonicalize().unwrap());
+        let key = FamilyKey::sha1("repo").unwrap();
+        storage.ensure_family(&key).unwrap();
+        let view = |owner: &str| {
+            let path = storage.git_data_path().join(owner).join("repo.git");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            storage.create_thin_view(&key, &path).unwrap();
+            path
+        };
+        let (source, target) = (view("source"), view("target"));
+        let commit = local_commit(&source, "only in the source view");
+        let family = storage.family_repo_path(&key);
+        assert!(!oid_exists(&family, &commit));
+
+        copy_single_commit_between_repos(&source, &target, &commit).unwrap();
+
+        assert!(oid_exists(&family, &commit));
+        let local: Vec<_> = std::fs::read_dir(target.join("objects"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name() != "info" && entry.file_name() != "pack")
+            .collect();
+        assert!(local.is_empty(), "target view holds objects: {local:?}");
+        assert!(std::fs::read_dir(target.join("objects/pack"))
+            .map(|mut packs| packs.next().is_none())
+            .unwrap_or(true));
     }
 }
