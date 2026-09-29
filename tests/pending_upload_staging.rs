@@ -286,3 +286,79 @@ async fn maintainer_push_into_a_staged_view_reaches_the_family() {
 
     served.relay.stop().await;
 }
+
+async fn state_adopts_unsigned_upload(state_first: bool) {
+    let served = Served::start("state-adopts-unsigned").await;
+    let original = ngit_grasp::git::get_ref_commit(&served.view, "refs/heads/main").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let tip = common::create_test_repo_with_commit(local.path(), CommitVariant::PrTest).unwrap();
+    let pending = served.pr_event(&tip, "never published");
+    let state = common::event_ordering::event_after(
+        common::create_state_event(
+            served.client.keys(),
+            &served.identifier,
+            &[("main", &tip)],
+            &[("staged-tag", &tip)],
+            &[],
+            &[],
+        )
+        .unwrap(),
+        served.client.keys(),
+        served.state.created_at,
+    );
+    if state_first {
+        served
+            .client
+            .send_event_and_note_purgatory(state.clone())
+            .await
+            .unwrap();
+    }
+    served.push(local.path(), &tip, &pending);
+    if !state_first {
+        served.accept(&state).await;
+    }
+    common::wait_for_event_served(served.relay.url(), &state.id, DEADLINE)
+        .await
+        .unwrap();
+    assert_eq!(
+        ngit_grasp::git::get_ref_commit(&served.view, "refs/heads/main"),
+        Some(tip.clone())
+    );
+    assert!(
+        holds_history(&served.family, &tip),
+        "accepted State history must leave staging"
+    );
+
+    let next = common::event_ordering::event_after(
+        common::create_state_event(
+            served.client.keys(),
+            &served.identifier,
+            &[("main", &original)],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap(),
+        served.client.keys(),
+        state.created_at,
+    );
+    served.accept(&next).await;
+    // Stop the writer before simulating expiry and compaction directly.
+    served.relay.stop().await;
+    ngit_grasp::git::delete_ref(&served.view, &format!("refs/nostr/{}", pending.id)).unwrap();
+    staging::compact(&served.view).unwrap();
+    assert!(
+        holds_history(&served.family, &tip),
+        "rollback history survives ref removal"
+    );
+}
+
+#[tokio::test]
+async fn arriving_state_promotes_an_existing_unsigned_upload() {
+    state_adopts_unsigned_upload(false).await;
+}
+
+#[tokio::test]
+async fn waiting_state_promotes_an_unsigned_upload_before_release() {
+    state_adopts_unsigned_upload(true).await;
+}

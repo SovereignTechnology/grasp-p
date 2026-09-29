@@ -218,6 +218,12 @@ impl StatePolicy {
                 event.id,
             );
 
+            // Ref alignment can consume staged history without another push.
+            // Make it durable before accepting the State or moving any refs.
+            git::staging::promote_state(&repo_with_git_data, &state)
+                .await
+                .context("State history could not be stored durably")?;
+
             // Use unified processing function
             let result = crate::git::process::process_state_with_git_data(
                 &state,

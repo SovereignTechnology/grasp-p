@@ -1169,6 +1169,16 @@ async fn process_purgatory_state_events(
             "State event author authorized via maintainer set"
         );
 
+        // An unsigned upload can satisfy a waiting State. Do not release it
+        // from purgatory until its history is durable independently of staging.
+        if let Err(error) = crate::git::staging::promote_state(source_repo_path, &state).await {
+            result.errors.push(format!(
+                "State {} history could not be stored durably: {error:#}",
+                entry.event.id
+            ));
+            continue;
+        }
+
         // Use unified processing function
         let process_result = crate::git::process::process_state_with_git_data(
             &state,

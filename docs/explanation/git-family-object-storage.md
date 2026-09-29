@@ -209,7 +209,7 @@ cost follows the new history instead of the whole repository. Detecting damage
 behind a root remains the integrity pass's job; a damaged root fails the check
 and therefore the promotion.
 
-Promotion happens in two places:
+Promotion happens at these boundaries:
 
 - **PR acceptance.** A PR or PR Update event is accepted only after its tip is
   promoted. On failure the event is rejected and its placeholder is kept, so
@@ -217,8 +217,11 @@ Promotion happens in two places:
 - **Signed push into a staged view.** Its signed tips are promoted when
   receive-pack finishes, while the push still holds the family lease.
 
-State events never wait on promotion. Their history is in the family when the
-push that carries it completes.
+- **State acceptance and purgatory release.** All concrete branch and tag tips
+  are promoted before ref alignment and acceptance. A State can adopt an
+  unsigned upload already in the view without another push. Failure rejects
+  a directly submitted State or leaves a waiting State in purgatory; its
+  history must become durable before later ref changes can make it disposable.
 
 ### Owed history
 

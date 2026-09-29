@@ -587,6 +587,31 @@ fn has_local_objects(view: &Path) -> Result<bool> {
 /// A view without staged objects received its history into the family, so
 /// there is nothing to copy and no lease is taken.
 pub async fn promote_accepted(view: &Path, tip: Tip) -> Result<()> {
+    promote_accepted_tips(view, vec![tip]).await
+}
+
+/// Promote every concrete State tip before accepting or releasing the event.
+/// A State can adopt an unsigned upload without a subsequent Git push.
+pub async fn promote_state(
+    view: &Path,
+    state: &crate::nostr::events::RepositoryState,
+) -> Result<()> {
+    let tips = state
+        .branches
+        .iter()
+        .map(|branch| Tip::new(format!("refs/heads/{}", branch.name), &branch.commit))
+        .chain(
+            state
+                .tags
+                .iter()
+                .map(|tag| Tip::new(format!("refs/tags/{}", tag.name), &tag.commit)),
+        )
+        .filter(|tip| !tip.oid.starts_with("ref: "))
+        .collect();
+    promote_accepted_tips(view, tips).await
+}
+
+async fn promote_accepted_tips(view: &Path, tips: Vec<Tip>) -> Result<()> {
     if !is_staged(view) {
         return Ok(());
     }
@@ -597,7 +622,7 @@ pub async fn promote_accepted(view: &Path, tip: Tip) -> Result<()> {
     let path = resolved.path.clone();
     tokio::task::spawn_blocking(move || {
         let _lease = lease;
-        promote(&path, std::slice::from_ref(&tip))
+        promote(&path, &tips)
     })
     .await??;
     request_maintenance(view);
