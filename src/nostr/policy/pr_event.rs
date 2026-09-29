@@ -179,29 +179,8 @@ impl PrEventPolicy {
                                 error = %e,
                                 "Failed to delete /prs/ ref while discarding scoped placeholder",
                             );
-                        } else if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
-                            && matches!(
-                                crate::git::list_refs(&prs_repo),
-                                Ok(refs) if refs.is_empty()
-                            )
-                        {
-                            // No refs left and no push in flight — the
-                            // repo is now an empty husk. Drop the bare
-                            // dir so /prs/ doesn't accumulate abandoned
-                            // repos. Equivalent to the cleanup the
-                            // receive handler does on push completion.
-                            if let Err(e) = std::fs::remove_dir_all(&prs_repo) {
-                                tracing::warn!(
-                                    repo = %prs_repo.display(),
-                                    error = %e,
-                                    "Failed to remove zero-ref /prs/ repo after discarding scoped placeholder",
-                                );
-                            } else {
-                                tracing::debug!(
-                                    repo = %prs_repo.display(),
-                                    "Removed zero-ref /prs/ repo after discarding scoped placeholder",
-                                );
-                            }
+                        } else {
+                            crate::grasp06::receive::remove_idle_empty_repo(&state, &prs_repo);
                         }
                     }
                     self.ctx.purgatory.remove_pr(&event_id);

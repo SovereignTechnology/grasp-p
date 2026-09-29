@@ -1589,24 +1589,8 @@ impl Purgatory {
                             error = %e,
                             "Failed to delete dangling /prs/ ref during purgatory expiry",
                         );
-                    } else if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
-                        && matches!(
-                            crate::git::list_refs(&repo_path),
-                            Ok(refs) if refs.is_empty()
-                        )
-                    {
-                        if let Err(e) = std::fs::remove_dir_all(&repo_path) {
-                            tracing::warn!(
-                                repo = %repo_path.display(),
-                                error = %e,
-                                "Failed to remove zero-ref /prs/ repo during purgatory expiry",
-                            );
-                        } else {
-                            tracing::debug!(
-                                repo = %repo_path.display(),
-                                "Removed zero-ref /prs/ repo during purgatory expiry",
-                            );
-                        }
+                    } else {
+                        crate::grasp06::receive::remove_idle_empty_repo(&state, &repo_path);
                     }
                 }
             }

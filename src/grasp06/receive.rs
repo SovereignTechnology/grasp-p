@@ -436,24 +436,49 @@ fn ensure_repo_initialised(
 fn finish_prs_receive_pack(state: &PrsPathState, repo_path: &Path) {
     let _g = state.mu.lock().expect("prs path mutex poisoned");
     state.in_flight.fetch_sub(1, Ordering::Relaxed);
-    if state.in_flight.load(Ordering::Relaxed) == 0 {
-        if let Ok(refs) = list_refs(repo_path) {
-            if refs.is_empty() {
-                if let Err(e) = std::fs::remove_dir_all(repo_path) {
-                    warn!(
-                        "/prs/ receive-pack: failed to clean up empty repo {}: {}",
-                        repo_path.display(),
-                        e
-                    );
-                } else {
-                    debug!(
-                        "/prs/ receive-pack: removed empty repo {} (no refs after push)",
-                        repo_path.display()
-                    );
-                }
-            }
+    remove_idle_empty_repo(state, repo_path);
+}
+
+/// Remove a `/prs/` repository that has no refs and no push in flight, so
+/// abandoned repositories do not accumulate. Returns whether it was removed.
+///
+/// The caller holds `state.mu`. That mutex also gates `in_flight` updates, so
+/// a repository is never removed while a push is being received.
+pub(crate) fn remove_idle_empty_repo(state: &PrsPathState, repo_path: &Path) -> bool {
+    if state.in_flight.load(Ordering::Relaxed) != 0
+        || !matches!(list_refs(repo_path), Ok(refs) if refs.is_empty())
+    {
+        return false;
+    }
+    match std::fs::remove_dir_all(repo_path) {
+        Ok(()) => {
+            debug!(repo = %repo_path.display(), "Removed zero-ref /prs/ repository");
+            true
+        }
+        Err(error) => {
+            warn!(
+                repo = %repo_path.display(),
+                %error,
+                "Failed to remove zero-ref /prs/ repository"
+            );
+            false
         }
     }
+}
+
+/// [`remove_idle_empty_repo`] for callers that do not already hold the path
+/// mutex. Paths outside `/prs/` are left alone.
+pub fn remove_prs_repo_if_empty(
+    locks: &RepoInitLocks,
+    git_data_path: &Path,
+    repo_path: &Path,
+) -> bool {
+    if !crate::grasp06::paths::is_prs_repo_path(repo_path, git_data_path) {
+        return false;
+    }
+    let state = path_state(locks, repo_path);
+    let _g = state.mu.lock().expect("prs path mutex poisoned");
+    remove_idle_empty_repo(&state, repo_path)
 }
 
 /// Own the live `/prs/` receive-pack after the request handler has returned its

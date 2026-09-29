@@ -93,34 +93,16 @@ impl DeletionPolicy {
         .collect()
     }
 
-    fn cleanup_zero_ref_grasp06_repo_if_idle(&self, repo_path: &PathBuf) {
-        if !crate::grasp06::paths::is_prs_repo_path(repo_path, &self.ctx.git_data_path) {
-            return;
-        }
-
-        let state = crate::grasp06::receive::path_state(&self.ctx.repo_init_locks, repo_path);
-        let _guard = state.mu.lock().expect("prs path mutex poisoned");
-
-        if state.in_flight.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            return;
-        }
-
-        let is_zero_ref = matches!(git::list_refs(repo_path), Ok(refs) if refs.is_empty());
-        if !is_zero_ref {
-            return;
-        }
-
-        if let Err(e) = std::fs::remove_dir_all(repo_path) {
-            tracing::warn!(
-                repo = %repo_path.display(),
-                error = %e,
-                "Failed to remove zero-ref /prs/ repo while processing deletion request"
-            );
-            return;
-        }
-
-        if let Some(parent) = repo_path.parent() {
-            let _ = std::fs::remove_dir(parent);
+    fn cleanup_zero_ref_grasp06_repo_if_idle(&self, repo_path: &std::path::Path) {
+        let removed = crate::grasp06::receive::remove_prs_repo_if_empty(
+            &self.ctx.repo_init_locks,
+            &self.ctx.git_data_path,
+            repo_path,
+        );
+        if removed {
+            if let Some(parent) = repo_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
     }
 
