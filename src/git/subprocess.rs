@@ -12,7 +12,8 @@ use super::protocol::GitService;
 
 /// Git subprocess wrapper
 pub struct GitSubprocess {
-    child: Child,
+    /// `None` once the child has been reaped.
+    child: Option<Child>,
 }
 
 impl GitSubprocess {
@@ -74,6 +75,7 @@ impl GitSubprocess {
         cmd.arg("--stateless-rpc");
         cmd.arg(repo_path);
 
+        cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -89,47 +91,68 @@ impl GitSubprocess {
 
         let child = cmd.spawn()?;
 
-        Ok(Self { child })
+        Ok(Self { child: Some(child) })
     }
 
     /// Get a mutable reference to stdin
     pub fn stdin(&mut self) -> Option<&mut (impl AsyncWrite + Unpin)> {
-        self.child.stdin.as_mut()
+        self.child.as_mut().expect("live child").stdin.as_mut()
     }
 
     /// Get a mutable reference to stdout
     pub fn stdout(&mut self) -> Option<&mut (impl AsyncRead + Unpin)> {
-        self.child.stdout.as_mut()
+        self.child.as_mut().expect("live child").stdout.as_mut()
     }
 
     /// Get a mutable reference to stderr
     pub fn stderr(&mut self) -> Option<&mut (impl AsyncRead + Unpin)> {
-        self.child.stderr.as_mut()
+        self.child.as_mut().expect("live child").stderr.as_mut()
     }
 
     /// Take ownership of stdin
     pub fn take_stdin(&mut self) -> Option<impl AsyncWrite> {
-        self.child.stdin.take()
+        self.child.as_mut().expect("live child").stdin.take()
     }
 
     /// Take ownership of stdout
     pub fn take_stdout(&mut self) -> Option<impl AsyncRead> {
-        self.child.stdout.take()
+        self.child.as_mut().expect("live child").stdout.take()
     }
 
     /// Take ownership of stderr  
     pub fn take_stderr(&mut self) -> Option<impl AsyncRead> {
-        self.child.stderr.take()
+        self.child.as_mut().expect("live child").stderr.take()
     }
 
     /// Wait for the subprocess to complete
     pub async fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        let result = self.child.as_mut().expect("live child").wait().await;
+        if result.is_ok() {
+            self.child.take();
+        }
+        result
     }
 
     /// Kill the subprocess
     pub async fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill().await
+        self.child.as_mut().expect("live child").kill().await
+    }
+}
+
+impl Drop for GitSubprocess {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Blocking tasks cannot be aborted by task cancellation or runtime
+            // shutdown, so the killed child is always reaped.
+            let reaper = runtime.clone();
+            runtime.spawn_blocking(move || {
+                let _ = reaper.block_on(child.wait());
+            });
+        }
     }
 }
 
@@ -148,6 +171,25 @@ mod tests {
             .expect("Failed to run git init");
         assert!(status.success());
         dir
+    }
+
+    #[tokio::test]
+    async fn dropped_subprocess_is_killed_and_reaped() {
+        let repo = create_bare_repo();
+        let child =
+            GitSubprocess::spawn(GitService::ReceivePack, repo.path(), false, None).unwrap();
+        let pid = child.child.as_ref().unwrap().id().unwrap();
+        let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+        assert!(process.exists());
+        drop(child);
+        // A killed but unreaped child remains visible as a zombie.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while process.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped child was not reaped");
     }
 
     #[tokio::test]
