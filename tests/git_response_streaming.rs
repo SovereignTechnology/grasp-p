@@ -318,6 +318,10 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
         subpath: "git-receive-pack".to_string(),
     };
     let repo_path = prs_repo_path(git_data.path(), &prs.submitter.to_hex(), &prs.identifier);
+    let maintenance = tokio::spawn(ngit_grasp::git::staging::run_worker(
+        ngit_grasp::git::storage::LocalGitStorage::new(git_data.path()),
+        repo_init_locks.clone(),
+    ));
 
     let response = handle_prs_receive_pack(
         &prs,
@@ -352,10 +356,22 @@ async fn prs_receive_pack_streams_stdout_before_cleanup_removes_empty_repo() {
     finish_body(&mut body, &mut streamed).await;
     assert_eq!(streamed, expected_git_output());
 
-    assert!(
-        !repo_path.exists(),
-        "/prs/ cleanup should remove zero-ref repo after receive-pack exits"
+    timeout(Duration::from_secs(5), async {
+        while repo_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("/prs/ maintenance should remove zero-ref repo after receive-pack exits");
+    assert_eq!(
+        std::fs::read_dir(git_data.path().join(".grasp/staging"))
+            .expect("staging registry")
+            .count(),
+        0,
+        "cleanup must also remove the staging record"
     );
+    maintenance.abort();
+    let _ = maintenance.await;
 }
 
 // Keep the listener bound until Git has observed the parent's release.
@@ -550,6 +566,11 @@ if [ "$1" = "cat-file" ]; then
 fi
 
 if [ "$1" = "for-each-ref" ]; then
+  exit 0
+fi
+
+# This streaming fixture never writes Git objects, so maintenance is a no-op.
+if [ "$1" = "repack" ] || [ "$1" = "prune" ]; then
   exit 0
 fi
 
