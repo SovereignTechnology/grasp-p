@@ -459,6 +459,8 @@ fn finish_prs_receive_pack(state: &PrsPathState, repo_path: &Path) {
 
 /// Remove a `/prs/` repository that has no refs and no push in flight, so
 /// abandoned repositories do not accumulate. Returns whether it was removed.
+/// Staged views are queued for maintenance, which unregisters staging before
+/// calling back here to remove the directory.
 ///
 /// The caller holds `state.mu`. That mutex also gates `in_flight` updates, so
 /// a repository is never removed while a push is being received.
@@ -467,6 +469,12 @@ pub(crate) fn remove_idle_empty_repo(state: &PrsPathState, repo_path: &Path) -> 
         || !matches!(list_refs(repo_path), Ok(refs) if refs.is_empty())
         || crate::git::staging::owes_history(repo_path)
     {
+        return false;
+    }
+    if crate::git::staging::is_staged(repo_path) {
+        // Deleting the view now would strand its registry record: maintenance
+        // cannot resolve or unregister a view after its directory is gone.
+        crate::git::staging::request_maintenance(repo_path);
         return false;
     }
     match std::fs::remove_dir_all(repo_path) {

@@ -263,4 +263,52 @@ mod tests {
         assert_eq!(outcome.unwrap(), Compaction::Done);
         assert!(!fixture.view.exists());
     }
+
+    #[tokio::test]
+    async fn prs_expiry_reclaims_the_registry_before_removing_the_view() {
+        use crate::purgatory::{PrsCleanupCtx, Purgatory};
+        use nostr_sdk::prelude::Keys;
+
+        let submitter = Keys::generate().public_key();
+        let fixture = Fixture::with_view(&format!("prs/{}", submitter.to_hex()));
+        stage(&fixture.view, &[]).unwrap();
+        let abandoned = commit(&fixture.view, "abandoned", None);
+        super::super::stage_upload(
+            &fixture.view,
+            &[],
+            &[super::super::Tip::new(PENDING, &abandoned)],
+        )
+        .unwrap();
+        reference(&fixture.view, PENDING, &abandoned);
+        let record = View::resolve(&fixture.view).unwrap().unwrap().record;
+        let locks = new_repo_init_locks();
+        let purgatory = Purgatory::new(fixture.storage.git_data_path());
+        purgatory.set_prs_cleanup_ctx(PrsCleanupCtx {
+            git_data_path: fixture.storage.git_data_path().to_owned(),
+            repo_init_locks: locks.clone(),
+        });
+        purgatory.recover_upload_placeholder(
+            PENDING.strip_prefix("refs/nostr/").unwrap().to_owned(),
+            abandoned.clone(),
+            (submitter, fixture.key.identifier.clone()),
+            true,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(purgatory.cleanup(), (0, 0, 1));
+        assert!(
+            fixture.view.exists(),
+            "expiry must leave the view for staging maintenance"
+        );
+        assert!(record.exists());
+
+        let worker = tokio::spawn(run_worker(fixture.storage.clone(), locks));
+        wait_until(
+            "expired PRS view and staging record to be reclaimed",
+            || !fixture.view.exists() && !record.exists(),
+        )
+        .await;
+        assert!(!object_exists(&fixture.family(), &abandoned).unwrap());
+        worker.abort();
+    }
 }

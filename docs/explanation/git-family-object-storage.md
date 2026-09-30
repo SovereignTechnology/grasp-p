@@ -290,6 +290,11 @@ This closes the window between receive-pack and the periodic purgatory
 checkpoint. A view whose remaining staged objects belong to pending refs is
 parked until the next request rather than polled.
 
+Runtime cleanup of an empty staged `/prs/` view also requests maintenance
+instead of deleting the directory directly. The worker reclaims its objects
+and unregisters staging before removing the empty view, so expiry and failed
+pushes cannot leave orphaned registry records.
+
 ### Limits
 
 - Staging is not a storage quota. It bounds how long an unsigned upload is

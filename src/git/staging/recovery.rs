@@ -216,9 +216,10 @@ mod tests {
                 }
             }
             let purgatory = Purgatory::new(fixture.storage.git_data_path());
+            let locks = crate::grasp06::receive::new_repo_init_locks();
             purgatory.set_prs_cleanup_ctx(crate::purgatory::PrsCleanupCtx {
                 git_data_path: fixture.storage.git_data_path().to_owned(),
-                repo_init_locks: Default::default(),
+                repo_init_locks: locks.clone(),
             });
             recover_placeholders(&fixture.storage, &purgatory, &db)
                 .await
@@ -231,11 +232,15 @@ mod tests {
                 .await;
             purgatory.cleanup();
             if prs {
+                super::super::worker::maintain(&fixture.view, &locks)
+                    .await
+                    .unwrap();
                 assert!(!fixture.view.exists());
             } else {
                 compact(&fixture.view).unwrap();
                 assert!(!object_exists(&fixture.view, &oid).unwrap());
             }
+            assert!(!view.record.exists());
         }
     }
 

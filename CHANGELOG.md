@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `refs/nostr/<event-id>` whose PR event is not yet known is staged in the
   repository that received it, promoted into shared storage when the event is
   accepted, and reclaimed after its pending ref expires. Pushes backed by a
-  signed State or PR event are stored as before.
+  signed State or PR event are stored as before. Empty staged `/prs/`
+  repositories are removed after their staging metadata is reclaimed.
 
 - Accept a GRASP-06 `/prs/` PR event whose pushed ref survived a crash that
   lost its purgatory placeholder, matching it by the event's service-local
