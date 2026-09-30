@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.6] - 2026-09-30
+
+Keep unsigned Git uploads temporary, reclaim abandoned PR data, and preserve
+pending uploads correctly across crashes.
+
 ### Fixed
 
 - Keep Git uploads that no signed event names out of permanent storage. A push
