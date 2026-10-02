@@ -425,6 +425,12 @@ what lets the live feed work under GRASP-08 private mode, where the NIP-42
 gate in the HTTP layer refuses a self-dial (see
 [GRASP-08 design](grasp-08-private-service.md))
 
+**Shutdown**: The subscriber exits when its shutdown signal arrives or the
+SyncManager action receiver closes. This covers startup reconstruction and
+blocked batch sends, not just the notification loop. Pending notifications
+are not flushed to a stopped consumer; startup reconstructs discovery from
+the persisted events on the next run.
+
 **Subscribed kinds**: 30617, 1617, 1618, 1621 (NOT 30618)
 
 **Batching**: 5-second window (configurable via `NGIT_SYNC_BATCH_WINDOW_MS`)
