@@ -973,6 +973,24 @@ impl RelayConnection {
         };
 
         let relay = tokio::time::timeout_at(connection_deadline, async {
+            // The manager rebuilds coverage under a new ledger after every
+            // connection. The SDK otherwise replays its previous live REQs,
+            // which no longer own permits and cannot be retired by consolidation.
+            // Replace the ended SDK session before dialing, including its queued
+            // messages and auto-closing requests; retain connection-level hints.
+            if self
+                .client
+                .relay(&self.url)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                self.client
+                    .remove_relay(&self.url)
+                    .force()
+                    .await
+                    .map_err(|e| format!("Failed to retire relay session {}: {e}", self.url))?;
+            }
             self.client
                 .add_relay(&self.url)
                 .reconnect(false)
@@ -3662,6 +3680,84 @@ mod tests {
         relay.shutdown();
         event_loop.abort();
         drain.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_does_not_replay_subscriptions_outside_the_new_ledger() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for session in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                while let Some(Ok(frame)) = ws.next().await {
+                    if frame.is_close() {
+                        break;
+                    }
+                    if !frame.is_text() {
+                        continue;
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    if request[0] == "REQ" {
+                        requests_tx
+                            .send((session, request[1].as_str().unwrap().to_owned()))
+                            .unwrap();
+                        ws.send(Message::Text(
+                            serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                        if session == 0 {
+                            ws.close(None).await.unwrap();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let connection = permissive_connection(&url, Keys::generate());
+        for session in 0..3 {
+            connection.connect(3).await.unwrap();
+            connection.reset_subscription_budget(Some(3));
+            let ids = connection
+                .subscribe_live_filter_groups(vec![vec![Filter::new()
+                    .kind(Kind::TextNote)
+                    .limit(0)]])
+                .await
+                .unwrap();
+            let (wire_session, wire_id) =
+                tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(wire_session, session);
+            assert_eq!(
+                wire_id,
+                ids[0].to_string(),
+                "only the new ledger's REQ may be sent"
+            );
+            assert_eq!(connection.subscription_count().await, 1);
+            if session == 0 {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while connection.is_connected().await {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("peer disconnect must become observable");
+            } else {
+                connection.disconnect().await;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
