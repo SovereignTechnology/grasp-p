@@ -520,14 +520,25 @@ impl FamilyRepairSource for crate::purgatory::sync::RealSyncContext {
         url: &str,
         oids: &[String],
     ) -> Result<Vec<String>> {
-        crate::purgatory::sync::SyncContext::fetch_oids_with_role(
-            self,
-            target_view,
-            url,
-            oids,
-            crate::purgatory::sync::GitFetchRole::Integrity,
-        )
-        .await
+        loop {
+            let result = crate::purgatory::sync::SyncContext::fetch_oids_with_role(
+                self,
+                target_view,
+                url,
+                oids,
+                crate::purgatory::sync::GitFetchRole::Integrity,
+            )
+            .await;
+            let Some(deferred) = result.as_ref().err().and_then(|error| {
+                error.downcast_ref::<crate::purgatory::sync::GitBudgetDeferred>()
+            }) else {
+                return result;
+            };
+            // Startup/manual repair is a one-shot caller, unlike purgatory's
+            // retry loop. Wait for admission with the fetch's family lease
+            // released, then re-check local objects before trying again.
+            tokio::time::sleep(deferred.retry_after).await;
+        }
     }
 }
 

@@ -22,7 +22,7 @@
 //! The scenario drives the real purgatory sync path end to end: a genuine
 //! ngit-grasp relay serves a repository with two real branch tips behind a
 //! counting proxy, and the relay under test holds a state event declaring
-//! those two tips plus eight tips that exist nowhere (mirroring `market`).
+//! those two tips plus missing tips that exist nowhere (mirroring `market`).
 //! The proxy records every upload-pack POST with its `want` lines, so the
 //! test can assert the shape of the outbound fetching, not just the result.
 
@@ -41,7 +41,7 @@ use crate::common::{port, MockRelay, TestRelay};
 
 /// Declared ref tips that exist on no reachable server, mirroring the
 /// `market` repository's unfetchable state event.
-const MISSING_TIP_COUNT: usize = 8;
+const MISSING_TIP_COUNT: usize = 2;
 
 /// Wait until every given oid exists in the bare repository at `repo_path`.
 async fn wait_for_oids_in_repo(repo_path: &Path, oids: &[&str], deadline: Duration) -> bool {
@@ -66,29 +66,25 @@ async fn wait_for_oids_in_repo(repo_path: &Path, oids: &[&str], deadline: Durati
     }
 }
 
-/// Wait until the proxy has observed at least `min_total` upload-pack
-/// exchanges and the count has been stable for `stable_for`.
-async fn wait_for_upload_pack_quiescence(
-    proxy: &UploadPackCountingProxy,
-    min_total: usize,
-    stable_for: Duration,
-    deadline: Duration,
-) -> bool {
-    let end = tokio::time::Instant::now() + deadline;
-    let mut last_total = 0usize;
-    let mut stable_since = tokio::time::Instant::now();
+/// Wait for the fetch summary, which is emitted after residual admission and
+/// object retention finish. Object arrival alone precedes those operations.
+async fn wait_for_completed_passes(relay: &TestRelay, minimum: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let total = proxy.exchanges().len();
-        if total != last_total {
-            last_total = total;
-            stable_since = tokio::time::Instant::now();
-        } else if total >= min_total && stable_since.elapsed() >= stable_for {
-            return true;
+        let log = std::fs::read_to_string(relay.log_path()).unwrap_or_default();
+        let passes: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains("Purgatory git fetch pass complete"))
+            .map(str::to_owned)
+            .collect();
+        if passes.len() >= minimum {
+            return passes;
         }
-        if tokio::time::Instant::now() >= end {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fetch pass should complete"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -99,7 +95,7 @@ async fn wait_for_upload_pack_quiescence(
 /// 2. A counting proxy fronts the source's git smart-HTTP endpoint.
 /// 3. The relay under test bootstrap-syncs from a MockRelay serving a
 ///    later announcement whose clone tag points at the proxy, plus a state
-///    event declaring the two real tips and eight tips that exist nowhere.
+///    event declaring the two real tips and missing tips that exist nowhere.
 ///    Both events sit in purgatory; the purgatory sync loop fetches
 ///    through the proxy.
 /// 4. The two real tips must arrive, and the outbound request shape must
@@ -110,6 +106,15 @@ async fn wait_for_upload_pack_quiescence(
 ///      single missing object must never fail a batch).
 #[tokio::test]
 async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
+    exercise_fetch_backlog(MISSING_TIP_COUNT, false).await;
+}
+
+#[tokio::test]
+async fn cold_archive_fetches_advertised_tips_without_crawling_missing_backlog() {
+    exercise_fetch_backlog(126, true).await;
+}
+
+async fn exercise_fetch_backlog(missing_tip_count: usize, archive: bool) {
     // 1. Source relay + counting proxy in front of its git endpoint, and
     //    the MockRelay that will carry the events for the relay under test.
     let source = TestRelay::start().await;
@@ -208,10 +213,10 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .finalize(&keys)
         .expect("sign syncing announcement");
 
-    let missing_tips: Vec<String> = (0..MISSING_TIP_COUNT)
+    let missing_tips: Vec<String> = (0..missing_tip_count)
         .map(|index| format!("beef{index:036x}"))
         .collect();
-    let missing_branch_names: Vec<String> = (0..MISSING_TIP_COUNT)
+    let missing_branch_names: Vec<String> = (0..missing_tip_count)
         .map(|index| format!("missing-{index}"))
         .collect();
     let mut branches: Vec<(&str, &str)> =
@@ -247,10 +252,12 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .expect("send state event to mock relay");
 
     // Negentropy is disabled because MockRelay does not support NIP-77.
-    let syncing = TestRelay::start_on_reservation_with_options(
+    let syncing = TestRelay::start_on_reservation_with_archive_and_sync(
         syncing_reservation,
         Some(mock.url().to_string()),
         true,
+        archive,
+        archive,
     )
     .await;
 
@@ -274,8 +281,7 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
 
     // 6. Let the sync pass finish so requests aimed at the missing tips
     //    (however the client shapes them) are all recorded.
-    wait_for_upload_pack_quiescence(&proxy, 1, Duration::from_secs(3), Duration::from_secs(60))
-        .await;
+    let first_passes = wait_for_completed_passes(&syncing, 1).await;
 
     // 7. Regression assertions on the outbound request shape.
     let exchanges = proxy.exchanges();
@@ -326,7 +332,8 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
 
     // 9. A fresh replaceable state event resets the queue backoff and
     //    deterministically triggers another pass. With an unchanged remote
-    //    advertisement, the miss memo must suppress every failed fetch.
+    //    advertisement, the miss memo must suppress attempted misses while
+    //    deferred OIDs remain eligible.
     let failed_after_first_pass = proxy
         .exchanges()
         .iter()
@@ -343,32 +350,54 @@ async fn purgatory_fetch_batches_available_tips_and_isolates_missing_oids() {
         .await
         .expect("send fresh state event to mock relay");
 
-    let second_pass_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while proxy.info_refs_count() <= info_refs_before_second_pass {
+    let passes = wait_for_completed_passes(&syncing, first_passes.len() + 1).await;
+    assert!(proxy.info_refs_count() > info_refs_before_second_pass);
+    for pass in &passes {
+        let attempted = pass
+            .split("residual_attempted=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
         assert!(
-            tokio::time::Instant::now() < second_pass_deadline,
-            "fresh state event should trigger a second ls-remote"
+            attempted <= 2,
+            "each pass must bound speculative work: {pass}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(
-        wait_for_upload_pack_quiescence(
-            &proxy,
-            proxy.exchanges().len(),
-            Duration::from_secs(3),
-            Duration::from_secs(60),
-        )
-        .await,
-        "second fetch pass should become quiescent"
-    );
     let failed_after_second_pass = proxy
         .exchanges()
         .iter()
         .filter(|exchange| !exchange.ok)
         .count();
+    if archive {
+        assert!(
+            failed_after_second_pass > failed_after_first_pass,
+            "deferred OIDs must remain eligible on the next pass"
+        );
+        assert!(
+            failed_after_second_pass <= 6,
+            "cold backlog must respect the shared speculative allowance"
+        );
+    } else {
+        assert_eq!(
+            failed_after_second_pass, failed_after_first_pass,
+            "unchanged advertisement must suppress already attempted missing OIDs"
+        );
+    }
+    let failed_oids: Vec<String> = proxy
+        .exchanges()
+        .iter()
+        .filter(|exchange| exchange.not_our_ref)
+        .flat_map(|exchange| exchange.wants.clone())
+        .collect();
+    let unique: std::collections::HashSet<_> = failed_oids.iter().collect();
     assert_eq!(
-        failed_after_second_pass, failed_after_first_pass,
-        "unchanged advertisement must produce no new failed upload-pack exchanges"
+        unique.len(),
+        failed_oids.len(),
+        "memoized misses must not be requested again"
     );
 
     source_client.disconnect().await;

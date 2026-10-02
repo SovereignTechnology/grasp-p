@@ -9,6 +9,7 @@
 
 mod context;
 mod functions;
+mod git_budget;
 mod r#loop;
 mod queue;
 mod throttle;
@@ -18,6 +19,7 @@ pub use functions::{
     get_throttled_domains_with_untried_urls, sync_identifier, sync_identifier_from_url,
     sync_identifier_next_url, ThrottledDomainInfo,
 };
+pub(crate) use git_budget::GitBudgetDeferred;
 pub use queue::SyncQueueEntry;
 pub use throttle::{DomainThrottle, ThrottleManager};
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Count individual outbound Git commands against a shared domain budget and
+  reserve capacity for advertised commits during cold archive sync. Bound
+  speculative OID fetches and report explicit Git rate-limit rejections.
+
 - Skip paused peers before scheduling purgatory dependency fetches, avoiding
   redundant retries and warnings while preserving retry eligibility on recovery.
 

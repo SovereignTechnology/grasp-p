@@ -1,4 +1,5 @@
-//! Domain-based rate limiting and identifier queue management.
+//! Domain-based fetch-pass admission and identifier queue management.
+//! Individual command accounting lives in `git_budget`, shared with repair.
 //!
 //! This module provides per-domain throttling to prevent overwhelming remote
 //! git servers during purgatory sync operations. Each domain has:

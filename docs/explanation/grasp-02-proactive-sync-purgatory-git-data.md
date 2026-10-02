@@ -35,7 +35,7 @@ The system scours git servers listed in repository announcements and PR events, 
 
 We respect remote server capacity with:
 
-- **Throttling**: Max 5 concurrent requests per domain, 30 requests/minute
+- **Throttling**: Max 5 concurrent requests per domain, 60 Git commands/minute
 - **Backoff**: Start at 20 seconds, double each attempt, cap at 2 minutes
 - **Round-robin**: Fair distribution across repositories waiting for the same domain
 - **Fresh start**: New events reset retry count—recent updates often mean fresh data
@@ -45,7 +45,7 @@ We respect remote server capacity with:
 ### Key Features
 
 ✅ **Proactive hunting** - Scours git servers every 2 min (backoff), finds data automatically  
-✅ **Respectful throttling** - 5 concurrent + 30/min per domain, plays nice with other implementations  
+✅ **Respectful throttling** - 5 concurrent + 60 commands/min per domain, plays nice with other implementations
 ✅ **Smart timing** - 3min delay for user pushes, 500ms for synced events  
 ✅ **30min expiry** - Auto-cleanup of events when data never arrives  
 ✅ **Soft expiry for announcements** - Bare repo deleted at 30min, event retained 24h to allow revival  
@@ -270,16 +270,16 @@ Git servers have finite resources. Without throttling:
 With throttling:
 
 - ✅ Respect server capacity (5 concurrent max per domain)
-- ✅ Stay under rate limits (30 requests/min per domain)
+- ✅ Bound outbound work (60 Git commands/min per domain)
 - ✅ Fair access for all clients
 
 ### Two-Level Limits
 
-Each domain has **two independent limits**:
+Concurrency and command rate are bounded independently:
 
-#### 1. Concurrent Request Limit (Default: 5)
+#### 1. Concurrent Fetch-Pass Limit (Default: 5)
 
-Maximum in-flight requests to a domain at any moment.
+Maximum in-flight purgatory fetch passes to a domain at any moment.
 
 **Example**:
 
@@ -292,23 +292,20 @@ fetch-3 completes → in-flight: 4
 Status: HAS CAPACITY (process next queued identifier)
 ```
 
-#### 2. Rate Limit (Default: 30/min)
+#### 2. Rate Limit (Default: 60 commands/min)
 
-Maximum requests in any 60-second sliding window.
+Maximum admitted Git commands in any 60-second sliding window, shared
+across URLs and including integrity repair. A successful advertised-tip pass
+normally spends two units (`ls-remote` and batch fetch). Speculative OIDs have
+a smaller allowance within that budget; see [fetch admission](#fetch-strategy-advertised-tips-first).
 
-**Example**:
+For example, 30 advertised-tip passes can consume all 60 command units.
+Further commands are deferred until earlier starts leave the window. This
+quota does not claim to match any particular server's HTTP request limit.
 
-```
-t=0s:   Request 1 → request_times: [0s]
-t=1s:   Request 2 → request_times: [0s, 1s]
-...
-t=30s:  Request 30 → request_times: [0s, 1s, ..., 30s]
-t=31s:  Request 31? → THROTTLED (30 requests in last 60s)
-t=61s:  Request at t=0s aged out → request_times: [1s, ..., 30s]
-t=61s:  Request 31 → ALLOWED (only 29 in last 60s)
-```
-
-**Implementation**: [`src/purgatory/sync/throttle.rs:DomainThrottle::has_capacity()`](../../src/purgatory/sync/throttle.rs)
+**Implementation**: [`git_budget.rs`](../../src/purgatory/sync/git_budget.rs).
+The existing [pass scheduler](../../src/purgatory/sync/throttle.rs) also retains
+its 60-pass/minute admission ceiling.
 
 ### Round-Robin Fairness
 
@@ -425,8 +422,8 @@ all through the same hardened/pinned git subprocess machinery:
 3. **Residual OIDs one at a time** — needed OIDs that were neither
    advertised nor discovered as ancestors of the fetched tips are
    requested individually. Some servers refuse arbitrary-SHA1 wants, so a
-   per-OID failure costs exactly one small round trip and never aborts the
-   rest of the pass.
+   missing-object rejection does not fail other OIDs. Speculative requests
+   are bounded as described below.
 
 Missing residual OIDs are memoized per clone URL against a fingerprint of
 the sorted advertised OID set. Later passes skip those OIDs while the
@@ -434,9 +431,42 @@ advertisement is unchanged; any ref-tip change clears that URL's memo and
 allows them to be retried. Entries expire lazily after 30 minutes and the
 memo is capped at 1,024 URLs, evicting the oldest entry when full.
 
-All three phases run beneath the pass's per-domain permit. Separating the
-comparison into its own helper in future must retain that permit; `ls-remote`
-is outbound work against the same Git server, not an unaccounted preflight.
+All three phases run beneath the pass's per-domain permit. That scheduler
+retains its five-concurrent-pass and 60-pass/minute limits. A separate shared
+command ledger admits **at most 60 Git commands per domain in a sliding
+60-second window**: every `ls-remote`, advertised batch, and individual fetch
+costs one unit, including failed attempts. Primary, hedge, and integrity-repair
+calls share this ledger on the service's `RealSyncContext`. These are Git
+commands, not HTTP requests: Git negotiation may perform multiple HTTP
+exchanges, so this is a conservative operational budget, not a measured server
+quota.
+
+Purgatory residual requests are speculative. They run after advertised tips,
+with at most **two per pass**, **six per domain per minute**, and only while
+fewer than **30 commands** have been admitted in that domain's current window.
+These limits reserve capacity without a new priority queue. They do not
+preempt an already-running speculative request or strictly order independent
+passes. A cold archive therefore cannot spend an entire command window
+crawling hundreds of unadvertised commits from a single event.
+
+Admission denial launches no subprocess and creates no missing-object memo.
+Purgatory returns any fetched objects and retries remaining demand through
+its existing backoff loop, subject to the ordinary purgatory expiry. It does
+not hold a fetch slot or storage lease waiting for the budget. Accepted-data
+integrity repairs use ordinary priority even for unadvertised OIDs; their
+one-shot caller retries admission after releasing the fetch's family lease.
+Integrity retries atomically reserve capacity for discovery and the first
+fetch together, preventing staggered expirations from being spent entirely
+on repeated advertisements. Starts are charged when commands launch; unused
+reservations are released when the pass exits or is cancelled.
+
+An explicit HTTP 429 (or an explicit remote rate-limit diagnostic) logs the
+domain, operation, and role and pauses further commands to that domain for
+60 seconds. Other failures, including `not our ref`, do not establish a rate
+limit. Already-running commands finish normally. This fixed cooldown does not
+infer a server quota or parse `Retry-After` headers. Quotas remain unchanged
+pending cold-start measurements; increasing them merely to restore the old
+unaccounted request volume would also restore its speculative bursts.
 
 ### Repository single-flight and delayed hedging
 
@@ -572,7 +602,7 @@ async fn test_sync_identifier_partial_success() {
         .with_fetch_result("https://server1.com/repo.git", Ok(vec!["oid1"]))
         .with_fetch_result("https://server2.com/repo.git", Ok(vec!["oid2"]));
 
-    let throttle = Arc::new(ThrottleManager::new(5, 30));
+    let throttle = Arc::new(ThrottleManager::new(5, 60));
     let complete = sync_identifier(&mock, "repo", &throttle).await;
 
     assert!(complete); // Both OIDs fetched
@@ -597,7 +627,7 @@ Purgatory sync behavior is configurable via CLI flags or environment variables:
 | Setting                 | CLI Flag | Environment Variable | Default | Description                                          |
 | ----------------------- | -------- | -------------------- | ------- | ---------------------------------------------------- |
 | Domain concurrent limit | (future) | (future)             | `5`     | Max concurrent requests per domain                   |
-| Domain rate limit       | (future) | (future)             | `30`    | Max requests per minute per domain                   |
+| Domain rate limit       | (future) | (future)             | `60`    | Max Git commands per minute per domain                   |
 | Sync loop interval      | N/A      | N/A                  | `1s`    | How often to check for ready identifiers (hardcoded) |
 | Default sync delay      | N/A      | N/A                  | `180s`  | Delay for user-submitted events (hardcoded)          |
 | Immediate sync delay    | N/A      | N/A                  | `500ms` | Delay for sync-triggered events (hardcoded)          |
@@ -701,7 +731,13 @@ Failed to fetch OIDs (url=https://server.com/repo.git, error=connection timeout)
 
 Implemented:
 
-- `ngit_purgatory_git_fetch_passes_total` - Outbound git fetch passes
+- `ngit_purgatory_git_deferred_total{operation,reason}` - Admission deferrals
+  (`command_budget`, `speculative_budget`, `pass_budget`, `remote_cooldown`);
+  counts denial decisions, not the number of unattempted OIDs
+- `ngit_purgatory_git_subprocess_total{operation,role,outcome}` - Completed
+  commands, with explicit rate-limit rejections classified as `rate_limited`
+  rather than generic failure; domain attribution is in the warning log
+- `ngit_purgatory_git_fetch_passes_total` - Completed outbound git fetch passes
   (one ls-remote comparison plus fetches per pass)
 - `ngit_purgatory_git_fetch_oids_total{kind}` - Per-pass OID outcomes
   (`advertised_tip`, `residual_attempted`, `residual_missing`,
@@ -776,7 +812,7 @@ End-to-end tests verify sync behavior with real relay instances:
 
 ### 1. Configurable Throttle Limits
 
-**Current**: Hardcoded to 5 concurrent, 30/min per domain  
+**Current**: Hardcoded to 5 concurrent, 60 commands/min per domain
 **Future**: CLI flags `--sync-domain-concurrent` and `--sync-domain-rate-limit`
 
 **Use case**: Operators might want stricter limits for public servers or looser limits for trusted servers.
@@ -820,7 +856,7 @@ The purgatory sync system is a sophisticated, production-ready implementation th
 
 ✅ **Batches intelligently** - Groups events by identifier for efficient fetching  
 ✅ **Retries smartly** - Exponential backoff with fresh start on new events  
-✅ **Throttles respectfully** - 5 concurrent + 30/min per domain, round-robin fairness  
+✅ **Throttles respectfully** - 5 concurrent + 60 commands/min per domain, round-robin fairness
 ✅ **Times strategically** - 3min for user events, 500ms for synced events  
 ✅ **Expires responsibly** - 30min auto-cleanup prevents memory leaks  
 ✅ **Soft-expires announcements** - Bare repo deleted at 30min, event retained 24h for revival  
