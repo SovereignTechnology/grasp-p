@@ -2702,11 +2702,10 @@ impl RelayConnection {
     /// the corresponding ledger slot is returned, keeping local and relay
     /// subscription accounting in lockstep.
     async fn close_and_release_live_req_permits(&self, sub_ids: &[SubscriptionId]) {
-        let relay = self.client.relay(&self.url).await.ok().flatten();
         for sub_id in sub_ids {
-            if let Some(relay) = &relay {
-                let _ = relay.send_msg(ClientMessage::close(sub_id.clone())).await;
-            }
+            // A raw CLOSE leaves the SDK's desired subscription registered,
+            // allowing authentication to replay a rolled-back live group.
+            let _ = self.client.unsubscribe(sub_id).await;
             let _ = self.release_live_req_permit(sub_id);
         }
     }
@@ -3758,6 +3757,26 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rolled_back_live_groups_are_removed_from_the_sdk_registry() {
+        let relay = TestRelay::start(LocalRelayBuilder::default()).await;
+        let connection = permissive_connection(&relay.url().await.to_string(), Keys::generate());
+        connection.connect(3).await.unwrap();
+        let ids = connection
+            .subscribe_live_filter_groups(vec![vec![Filter::new().kind(Kind::TextNote).limit(0)]])
+            .await
+            .unwrap();
+        connection.close_and_release_live_req_permits(&ids).await;
+        assert_eq!(
+            connection.subscription_count().await,
+            0,
+            "rollback must remove SDK replay eligibility, not just send CLOSE"
+        );
+        assert!(!connection.holds_subscription_permit(&ids[0]));
+        connection.disconnect().await;
+        relay.shutdown();
     }
 
     #[tokio::test]
