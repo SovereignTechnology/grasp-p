@@ -400,6 +400,14 @@ sent, so auxiliary coverage cannot silently consume capacity needed by newly
 required core filters. An auxiliary CLOSED retires its remaining group and
 falls back to EOSE-closing history without rebuilding healthy core coverage.
 
+Before reconnecting, the connection replaces the ended SDK relay session. The
+manager rebuilds live coverage under a fresh ledger; keeping the SDK's old
+subscriptions would let its automatic replay bypass that ledger and accumulate
+untracked remote subscriptions. Learned connection-level limits are preserved,
+while SDK subscriptions and queued messages belong only to their old session.
+Rolling back a partial live set also unregisters its SDK subscriptions, so an
+authentication retry cannot replay coverage whose local permits were released.
+
 Some relays additionally cap the cumulative serialized REQ state retained by
 one connection. NIP-11 has no field for this limit, so it cannot be negotiated
 before the first refusal. A CLOSED reason of the rust-nostr form `active

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Retire old relay subscriptions before reconnecting so SDK replay cannot
+  accumulate untracked subscriptions or exhaust peers' retained-filter limits.
+- Remove rolled-back live subscriptions from the SDK registry so authentication
+  cannot replay groups whose local permits have already been released.
+
 ## [3.0.6] - 2026-09-30
 
 Keep unsigned Git uploads temporary, reclaim abandoned PR data, and preserve
