@@ -480,8 +480,9 @@ impl RelayServer {
         ));
         info!("Git storage and authorization-integrity worker started");
 
-        // Create throttle manager for rate limiting remote git servers
-        // Default: 5 concurrent requests per domain, 60 requests per minute per domain
+        // Bound scheduled fetch passes (5 concurrent, 60 starts/minute/domain).
+        // RealSyncContext separately budgets every outbound Git command,
+        // including commands issued by integrity repair.
         let throttle_manager = Arc::new(ThrottleManager::new(5, 60));
         throttle_manager.set_context(sync_ctx.clone());
         throttle_manager.set_git_naughty_list(git_naughty_list.clone());

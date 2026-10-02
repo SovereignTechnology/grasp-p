@@ -497,6 +497,14 @@ pub struct Purgatory {
      service
    - Foreground Git requests do not draw from this background-only limit
 
+7. **Outbound Git Command Budget**: a shared ledger counts individual
+   `ls-remote` and fetch commands across purgatory and integrity repair, with
+   60 commands per domain per minute. Speculative purgatory OIDs get at most
+   two attempts per pass and six per domain per minute, only below half of
+   the ordinary command budget. Denied work retries without holding a storage
+   lease; explicit Git rate-limit rejections trigger a domain cooldown.
+   See [Git fetch admission](grasp-02-proactive-sync-purgatory-git-data.md#fetch-strategy-advertised-tips-first).
+
 #### Data Types
 
 See [`types.rs`](../../src/purgatory/types.rs) for complete definitions:

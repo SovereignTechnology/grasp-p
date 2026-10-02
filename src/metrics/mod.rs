@@ -261,6 +261,15 @@ lazy_static! {
         REGISTRY.register(Box::new(metric.clone())).expect("register metric");
         metric
     };
+    static ref PURGATORY_GIT_DEFERRED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new("ngit_purgatory_git_deferred_total",
+                "Outbound Git admission deferrals by operation and budget reason"),
+            &["operation", "reason"],
+        ).expect("build Git admission deferrals counter");
+        REGISTRY.register(Box::new(metric.clone())).expect("register metric");
+        metric
+    };
     static ref PURGATORY_GIT_SUBPROCESS_TOTAL: CounterVec = {
         let metric = CounterVec::new(
             Opts::new(
@@ -356,6 +365,12 @@ pub struct PurgatoryGitSubprocessGuard {
     role: &'static str,
     started: Instant,
     outcome: &'static str,
+}
+
+pub fn record_purgatory_git_deferred(operation: &'static str, reason: &'static str) {
+    PURGATORY_GIT_DEFERRED_TOTAL
+        .with_label_values(&[operation, reason])
+        .inc();
 }
 
 impl PurgatoryGitSubprocessGuard {

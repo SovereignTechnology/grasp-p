@@ -240,6 +240,10 @@ use crate::purgatory::Purgatory;
 use crate::sync::naughty_list::NaughtyListTracker;
 
 use super::functions::extract_domain;
+use super::git_budget::{
+    is_rate_limit_error, GitBudgetDeferred, GitCommandBudget, GitCommandReservation,
+    SPECULATIVE_PER_PASS,
+};
 
 /// Real implementation of `SyncContext` that connects to actual systems.
 ///
@@ -273,6 +277,9 @@ pub struct RealSyncContext {
     /// OIDs each URL has already reported missing, scoped to its current
     /// advertised ref tips.
     miss_memo: Arc<Mutex<HashMap<String, RemoteMissMemo>>>,
+
+    /// Counts individual Git commands across every URL, pass, and repair role.
+    git_budget: GitCommandBudget,
 
     /// Outbound target policy applied before every event-directed git fetch
     outbound_policy: OutboundTargetPolicy,
@@ -323,6 +330,7 @@ impl RealSyncContext {
             write_policy,
             git_naughty_list,
             miss_memo: Arc::new(Mutex::new(HashMap::new())),
+            git_budget: GitCommandBudget::default(),
             outbound_policy,
             grasp08_peers,
             credential_keys,
@@ -676,6 +684,44 @@ async fn drain_git_stream<R: AsyncRead + Unpin>(
     Ok(captured)
 }
 
+async fn run_budgeted_git_command(
+    budget: &GitCommandBudget,
+    reservation: Option<&mut GitCommandReservation<'_>>,
+    command: Command,
+    domain: &str,
+    operation: &'static str,
+    role: GitFetchRole,
+) -> Result<ObservedGitOutput> {
+    let admission = match reservation {
+        Some(reservation) => reservation.admit(),
+        None => budget.admit(
+            domain,
+            operation == "fetch_residual" && role != GitFetchRole::Integrity,
+        ),
+    };
+    if let Err(reason) = admission {
+        crate::metrics::record_purgatory_git_deferred(operation, reason);
+        debug!(domain, operation, reason, "Outbound Git command deferred");
+        return Err(GitBudgetDeferred {
+            retry_after: budget.retry_after(domain),
+            reason,
+        }
+        .into());
+    }
+    let output = run_observed_git_command(command, domain, operation, role).await?;
+    if !output.status.success() && is_rate_limit_error(&String::from_utf8_lossy(&output.stderr)) {
+        budget.rate_limited(domain);
+        tracing::warn!(
+            domain,
+            operation,
+            role = role.as_str(),
+            cooldown_secs = 60,
+            "Git server rate limited outbound requests; deferring this domain"
+        );
+    }
+    Ok(output)
+}
+
 async fn run_observed_git_command(
     command: Command,
     domain: &str,
@@ -846,6 +892,8 @@ async fn run_observed_git_command_with_policy(
     crate::metrics::record_purgatory_git_subprocess_output(operation, role, "stderr", stderr_bytes);
     if stalled {
         metric.finish_with_outcome("stalled");
+    } else if !status.success() && is_rate_limit_error(&String::from_utf8_lossy(&stderr)) {
+        metric.finish_with_outcome("rate_limited");
     } else {
         metric.finish(status.success());
     }
@@ -1151,8 +1199,21 @@ impl SyncContext for RealSyncContext {
         // advertisement tells us up front which OIDs the remote can
         // serve — instead of discovering each missing one through a
         // failed "not our ref" upload-pack round trip.
+        let mut reservation = if role == GitFetchRole::Integrity {
+            Some(self.git_budget.reserve_pair(&domain).map_err(|reason| {
+                crate::metrics::record_purgatory_git_deferred("ls_remote", reason);
+                GitBudgetDeferred {
+                    retry_after: self.git_budget.retry_after(&domain),
+                    reason,
+                }
+            })?)
+        } else {
+            None
+        };
         let ls_remote_args = vec!["ls-remote".to_string(), url.clone()];
-        let advertised = match run_observed_git_command(
+        let advertised = match run_budgeted_git_command(
+            &self.git_budget,
+            reservation.as_mut(),
             hardened_git_command(
                 &repo_path,
                 resolve_pin.as_deref(),
@@ -1189,13 +1250,7 @@ impl SyncContext for RealSyncContext {
                     stderr
                 ));
             }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "git ls-remote command error for {}: {}",
-                    url,
-                    e
-                ))
-            }
+            Err(e) => return Err(e.context(format!("git ls-remote command error for {url}"))),
         };
         let advert_fingerprint = advertised_oids_fingerprint(&advertised);
         let memoized_missing = {
@@ -1224,7 +1279,9 @@ impl SyncContext for RealSyncContext {
             ];
             args.extend(advertised_tips.iter().cloned());
 
-            match run_observed_git_command(
+            match run_budgeted_git_command(
+                &self.git_budget,
+                reservation.as_mut(),
                 hardened_git_command(
                     &repo_path,
                     resolve_pin.as_deref(),
@@ -1260,13 +1317,7 @@ impl SyncContext for RealSyncContext {
                         return Err(anyhow::anyhow!("git fetch failed for {}: {}", url, stderr));
                     }
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "git fetch command error for {}: {}",
-                        url,
-                        e
-                    ))
-                }
+                Err(e) => return Err(e.context(format!("git fetch command error for {url}"))),
             }
         }
 
@@ -1275,6 +1326,7 @@ impl SyncContext for RealSyncContext {
         // time. Arbitrary-SHA1 wants may still be refused by some
         // servers, so a per-OID failure must cost exactly one small
         // round trip and must not abort the rest.
+        let mut deferred = None;
         let mut residual_attempted = 0usize;
         let mut residual_missing = 0usize;
         let mut residual_skipped = 0usize;
@@ -1286,7 +1338,10 @@ impl SyncContext for RealSyncContext {
                 residual_skipped += 1;
                 continue;
             }
-            residual_attempted += 1;
+            if role != GitFetchRole::Integrity && residual_attempted >= SPECULATIVE_PER_PASS {
+                crate::metrics::record_purgatory_git_deferred("fetch_residual", "pass_budget");
+                break;
+            }
 
             let args = vec![
                 "fetch".to_string(),
@@ -1296,7 +1351,9 @@ impl SyncContext for RealSyncContext {
                 url.clone(),
                 oid.clone(),
             ];
-            match run_observed_git_command(
+            let result = run_budgeted_git_command(
+                &self.git_budget,
+                reservation.as_mut(),
                 hardened_git_command(
                     &repo_path,
                     resolve_pin.as_deref(),
@@ -1309,8 +1366,16 @@ impl SyncContext for RealSyncContext {
                 "fetch_residual",
                 role,
             )
-            .await
+            .await;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<GitBudgetDeferred>())
             {
+                deferred = result.err();
+                break;
+            }
+            residual_attempted += 1;
+            match result {
                 Ok(result) if result.status.success() => {}
                 Ok(result) => {
                     if result.stderr_truncated {
@@ -1397,6 +1462,11 @@ impl SyncContext for RealSyncContext {
             fetched.len(),
         );
 
+        if role == GitFetchRole::Integrity {
+            if let Some(error) = deferred {
+                return Err(error);
+            }
+        }
         Ok(fetched)
     }
 
@@ -1552,6 +1622,91 @@ mod fetch_helper_tests {
             path,
             String::from_utf8(oid.stdout).unwrap().trim().to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn command_budget_covers_primary_hedge_and_integrity_and_observes_429() {
+        fn command(script: &str) -> Command {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            command
+        }
+        let budget = GitCommandBudget::default();
+        for index in 0..60 {
+            let role = [
+                GitFetchRole::Primary,
+                GitFetchRole::Hedge,
+                GitFetchRole::Integrity,
+            ][index % 3];
+            let result = run_budgeted_git_command(
+                &budget,
+                None,
+                command("exit 0"),
+                "shared",
+                "ls_remote",
+                role,
+            )
+            .await
+            .unwrap();
+            assert!(result.status.success());
+        }
+        let denied = run_budgeted_git_command(
+            &budget,
+            None,
+            command("exit 99"),
+            "shared",
+            "fetch_batch",
+            GitFetchRole::Integrity,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            denied.downcast_ref::<GitBudgetDeferred>().unwrap().reason,
+            "command_budget"
+        );
+        let rejected = run_budgeted_git_command(
+            &budget,
+            None,
+            command("echo 'fatal: The requested URL returned error: 429' >&2; exit 1"),
+            "limited",
+            "fetch_batch",
+            GitFetchRole::Primary,
+        )
+        .await
+        .unwrap();
+        assert!(!rejected.status.success());
+        let cooled = run_budgeted_git_command(
+            &budget,
+            None,
+            command("exit 99"),
+            "limited",
+            "ls_remote",
+            GitFetchRole::Hedge,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            cooled.downcast_ref::<GitBudgetDeferred>().unwrap().reason,
+            "remote_cooldown"
+        );
+        assert!(run_budgeted_git_command(
+            &budget,
+            None,
+            command("exit 0"),
+            "unrelated",
+            "ls_remote",
+            GitFetchRole::Primary
+        )
+        .await
+        .unwrap()
+        .status
+        .success());
     }
 
     #[tokio::test]
