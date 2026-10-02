@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Skip paused peers before scheduling purgatory dependency fetches, avoiding
+  redundant retries and warnings while preserving retry eligibility on recovery.
+
 - Retire old relay subscriptions before reconnecting so SDK replay cannot
   accumulate untracked subscriptions or exhaust peers' retained-filter limits.
 - Remove rolled-back live subscriptions from the SDK registry so authentication

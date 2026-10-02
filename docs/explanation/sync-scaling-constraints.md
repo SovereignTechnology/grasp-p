@@ -522,6 +522,11 @@ So concurrency is not a free scaling axis; it is the residual of the ledger:
   rust-nostr owns the internal `NEG-MSG` exchange, so the application cannot
   guarantee that each charged frame passes through its pacing gate. Historic
   recovery then uses the paced REQ path.
+- Purgatory dependency polling excludes peers under rate-limit, policy, or
+  incomplete-request pauses before reserving event-ID retries. A paused-only
+  pass leaves those IDs immediately eligible when the pause ends; healthy
+  sources remain eligible for shared IDs. Connection admission still checks
+  pauses again before sending to cover changes after scheduling.
 - Failed rate-limit recovery probes double their pause from 65 seconds to
   at most one hour. Repeated notices during a pause do not extend it. Five
   unpaused minutes without another refusal reset the next delay; time spent
