@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.7] - 2026-10-02
+
+Reduce unnecessary sync traffic, reserve Git capacity for advertised commits,
+and stop subscription discovery promptly during shutdown.
+
 ### Fixed
+
+- Stop the self-subscriber when its sync-manager consumer exits or shutdown
+  arrives, including while a startup batch is blocked. Avoid repeated
+  channel-closed errors for every remaining relay.
 
 - Count individual outbound Git commands against a shared domain budget and
   reserve capacity for advertised commits during cold archive sync. Bound
