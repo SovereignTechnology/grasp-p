@@ -1,0 +1,98 @@
+# SovTech GRASP-P CI. Every job runs in a fresh Kata VM on ubuntu-server
+# (Debian bookworm, glibc 2.36, the image's Rust toolchain). Nothing is
+# cached between jobs and there are no CI/CD variables or secrets.
+#
+# Runners:
+#   ci-grasp       not protected: merge requests.
+#   ci-grasp-prot  protected refs only, run_untagged=false: main and
+#                  sovtech-v* tags, which build the deployable binary.
+#
+# Routing comes from ref protection alone: each workflow rule sets
+# GRASP_RUNNER_TAG, the protected runner's tag exactly when the rule
+# requires a protected ref. Anything else (upstream's v* tags, pushes to
+# unprotected branches) creates no pipeline. Runbook: kata/ci-grasp/README.md
+# in sovtech/platform.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp-prot
+    - if: $CI_COMMIT_TAG =~ /^sovtech-v/ && $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp-prot
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_COMMIT_REF_PROTECTED != "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp
+    - when: never
+
+default:
+  tags: [$GRASP_RUNNER_TAG]
+  # The runner VMs run at idle CPU priority and the host's governor may kill
+  # the largest CI VM under memory pressure; that ends as a runner system
+  # failure. Retry requeues it. Script failures are never retried.
+  retry:
+    max: 2
+    when: [runner_system_failure, stuck_or_timeout_failure]
+  before_script:
+    - rustc --version && cargo --version && git --version
+
+variables:
+  GIT_STRATEGY: clone
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # 12 vCPUs but a governed memory limit: cap rustc and test fan-out.
+  CARGO_BUILD_JOBS: "8"
+  RUST_TEST_THREADS: "6"
+
+stages:
+  - lint
+  - test
+  - release
+
+lint:
+  stage: lint
+  timeout: 45m
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+test:
+  stage: test
+  needs: []
+  timeout: 90m
+  script:
+    # Upstream runs its suite under a deliberately hostile global git config,
+    # to prove the tests do not depend on ambient settings. Same here; the VM
+    # is discarded after the job.
+    - mkdir -p /tmp/hostile-git/hooks /tmp/hostile-git/template/hooks
+    - printf '#!/bin/sh\necho "hostile hook - ambient git config leaked into a test" >&2\nexit 1\n' > /tmp/hostile-git/hooks/pre-commit
+    - cp /tmp/hostile-git/hooks/pre-commit /tmp/hostile-git/template/hooks/pre-commit
+    - chmod +x /tmp/hostile-git/hooks/pre-commit /tmp/hostile-git/template/hooks/pre-commit
+    - git config --global init.defaultBranch main
+    - git config --global core.hooksPath /tmp/hostile-git/hooks
+    - git config --global init.templateDir /tmp/hostile-git/template
+    - git config --global commit.gpgsign true
+    - git config --global core.autocrlf true
+    - cargo test --locked
+    - cargo test -p grasp-audit --locked
+
+# The deployable binary, built only on protected refs. bookworm's glibc
+# (2.36) is what the Kata guest image runs.
+release:
+  stage: release
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+  script:
+    - cargo build --release --locked -p ngit-grasp
+    - mkdir -p ci-out
+    - cp target/release/ngit-grasp ci-out/
+    - (cd ci-out && sha256sum ngit-grasp > SHA256SUMS && cat SHA256SUMS)
+    - ldd --version | head -n1 > ci-out/BUILD-INFO
+    - rustc --version >> ci-out/BUILD-INFO
+    - git rev-parse HEAD >> ci-out/BUILD-INFO
+  artifacts:
+    expire_in: 90 days
+    paths:
+      - ci-out/
