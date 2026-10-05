@@ -89,7 +89,8 @@ release:
     - mkdir -p ci-out
     - cp target/release/ngit-grasp ci-out/
     - (cd ci-out && sha256sum ngit-grasp > SHA256SUMS && cat SHA256SUMS)
-    - ldd --version | head -n1 > ci-out/BUILD-INFO
+    # Not "ldd --version | head -n1": under pipefail ldd dies of SIGPIPE at random.
+    - echo "glibc $(getconf GNU_LIBC_VERSION)" > ci-out/BUILD-INFO
     - rustc --version >> ci-out/BUILD-INFO
     - git rev-parse HEAD >> ci-out/BUILD-INFO
   artifacts:
