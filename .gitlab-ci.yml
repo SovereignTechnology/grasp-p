@@ -1,5 +1,6 @@
 # SovTech GRASP-P CI. Every job runs in a fresh Kata VM on ubuntu-server
-# (Debian bookworm, glibc 2.36, the image's Rust toolchain). Nothing is
+# (Debian bookworm, glibc 2.36). The Rust toolchain is the one rust-toolchain.toml
+# pins: rustup installs it at the first cargo call of each job. Nothing is
 # cached between jobs and there are no CI/CD variables or secrets.
 #
 # Runners:

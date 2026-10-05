@@ -1,0 +1,7 @@
+# The toolchain upstream builds and lints with: its flake.lock pins rust-overlay at 2026-06-16,
+# where stable is 1.96.0. A newer clippy rejects upstream code that is clean under this one.
+# Bump it together with an upstream sync.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
