@@ -618,8 +618,9 @@ async fn outbound_tls_clients_complete_or_refuse_a_real_handshake() {
             ("NO_PROXY", "127.0.0.1"),
             ("no_proxy", "127.0.0.1"),
             // A relay dial may take no longer than the base backoff (1 s in
-            // the fixture), and a peer that hosts no public repository is
-            // dialled once. Give that one attempt room on a loaded CI VM.
+            // the fixture). Give the first attempt room on a loaded CI VM: a
+            // transient failure is redialled with this backoff, a certificate
+            // failure is naughty-listed at once.
             ("NGIT_SYNC_BASE_BACKOFF_SECS", "10"),
         ],
     )

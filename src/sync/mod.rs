@@ -8637,13 +8637,19 @@ impl SyncManager {
     /// This method is called periodically by run_disconnect_checker.
     /// It identifies relays that:
     /// - Are currently disconnected
-    /// - Have repos or root events to sync (not empty)
+    /// - Have repos or root events to sync, or are wanted for another reason
+    ///   (announcement targets, due NIP-65 work, configured GRASP-P peers)
     /// - Have passed the exponential backoff period (respects health tracker)
     ///
     /// For each eligible relay, a reconnection is queued via schedule_connect_relay.
     async fn retry_disconnected_relays(&mut self) {
         let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.nip65_discovery.due_connection_targets(Instant::now()));
+        // GRASP-P peers carry no public repository, so without this a peer
+        // whose dial failed stays disconnected until a restart: the GRASP-P
+        // tick only dials peers that are missing from the index, and a
+        // failed dial leaves the peer in it.
+        desired_relays.extend(self.grasp_p_peer_relays());
 
         // Collect relays to reconnect
         let to_reconnect: Vec<String> = {

@@ -69,6 +69,10 @@ pub(super) struct GraspPSyncState {
     reissue_floor: ReissueFloor,
     /// Retries a floor-skipped index-change re-issue on a later tick.
     reissue_pending: bool,
+    /// Configured peers that could not be registered, and when to try each
+    /// again. Without it a peer that stays refused is vetted (a DNS lookup,
+    /// under the manager lock) and logged on every tick.
+    peer_retry_after: HashMap<String, Instant>,
 }
 
 /// `NGIT_TEST=1` shortens every GRASP-P timer so integration tests can
@@ -335,26 +339,49 @@ impl SyncManager {
 
         // Connect operator-allowlisted peers not yet registered. Their
         // filters arrive on connect through the generic filter set.
+        // A peer that cannot be registered is tried again after a pause and
+        // reported once, not on every tick.
+        let now = Instant::now();
+        let peer_retry_delay = Duration::from_secs(if test_mode() { 1 } else { 60 });
         let unknown_peers: Vec<String> = {
             let index = self.relay_sync_index.read().await;
             self.grasp_p_peer_relays()
                 .into_iter()
                 .filter(|url| !index.contains_key(url))
+                .filter(|url| {
+                    self.grasp_p
+                        .peer_retry_after
+                        .get(url)
+                        .is_none_or(|retry_at| now >= *retry_at)
+                })
                 .collect()
         };
         for url in unknown_peers {
+            let first_attempt = !self.grasp_p.peer_retry_after.contains_key(&url);
             if !crate::grasp_p::mirror::relay_peer_allowed(
                 &url,
                 self.config.private_mirror_allow_private_ips,
             )
             .await
             {
-                tracing::warn!(relay = %url, "Skipping private-repo peer relay: SSRF guard rejected URL");
+                if first_attempt {
+                    tracing::warn!(relay = %url, "Skipping private-repo peer relay: SSRF guard rejected URL");
+                }
+                self.grasp_p
+                    .peer_retry_after
+                    .insert(url, now + peer_retry_delay);
                 continue;
             }
-            tracing::info!(relay = %url, "Registering private-repo peer relay");
+            if first_attempt {
+                tracing::info!(relay = %url, "Registering private-repo peer relay");
+            }
             if self.register_relay(url.clone(), false, false).await {
+                self.grasp_p.peer_retry_after.remove(&url);
                 self.schedule_connect_relay(&url).await;
+            } else {
+                self.grasp_p
+                    .peer_retry_after
+                    .insert(url, now + peer_retry_delay);
             }
         }
 

@@ -2344,3 +2344,50 @@ async fn exit13_mixed_legacy_accept_pair() {
     b.stop().await;
     a.stop().await;
 }
+
+// ============================================================================
+// Peer redial: a configured peer that is not the bootstrap relay
+// ============================================================================
+
+/// A configured peer that is down at the first dial must be dialled again.
+/// The peer here is not the bootstrap relay and shares no public repository,
+/// so only the reconnect loop's knowledge of configured peers brings it back:
+/// before that, one failed dial left it disconnected for the life of the
+/// process.
+#[tokio::test]
+async fn exit14_peer_down_at_first_dial_is_redialled() {
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+
+    // B's port is bound by the reservation but nothing accepts on it yet, so
+    // A's first dial times out.
+    let a = TestRelay::start_grasp_p_pair_node(
+        res_a,
+        None,
+        true,
+        None,
+        None,
+        &[("NGIT_GRASP_P_SYNC_PEER_URLS", url_b.as_str())],
+    )
+    .await;
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("degraded") && line.contains(&url_b)
+        })
+        .await,
+        "A's first dial of {url_b} must fail while B is down"
+    );
+
+    let b = TestRelay::start_grasp_p_pair_node(res_b, None, true, None, None, &[]).await;
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("Connected to relay") && line.contains(&url_b)
+        })
+        .await,
+        "A must redial {url_b} once B is up"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
