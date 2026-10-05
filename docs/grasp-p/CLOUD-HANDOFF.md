@@ -9,7 +9,7 @@ file has the whole plan; this page is only the part a cloud session acts on.
 |---|---|
 | M0 spec and housekeeping | Done. `OVERVIEW.md` is the short spec. |
 | M1 repos and CI | Repos done. The CI runners are not deployed yet, so no pipeline has ever run. |
-| **M2 port the server onto v3.0.7** | **In progress on `sovtech/grasp-p-port`. Nothing has been compiled.** |
+| **M2 port the server onto v3.0.7** | **Ported and green in the cloud sandbox (fmt, clippy, upstream's suite, the four GRASP-P suites); see `PORTING.md`. Not yet run in CI.** |
 | M3 and later | Not started. |
 
 Two repositories:
@@ -30,9 +30,11 @@ Two repositories:
   (`one_unavailable_owed_tip_does_not_hold_back_another`,
   `promotion_makes_history_complete_in_the_family_alone`,
   `owed_history_survives_ref_deletion_until_the_family_holds_it`). The runner is Debian bookworm
-  with git 2.39.5 and jobs run as root; the cause is not diagnosed. Check whether they pass in
-  your sandbox and note the git version: if upstream needs a newer git than 2.39, that matters
-  for the production image too. Do not "fix" upstream's tests; find the environment difference.
+  with git 2.39.5 and jobs run as root. **Diagnosed:** upstream needs git >= 2.42, because
+  `git rev-list --stdin` only accepts pseudo-options such as `--glob=` from 2.42 on, and
+  upstream's promotion path (`complete_in_family` in `src/git/staging.rs`) relies on that. The
+  three tests fail identically with a git 2.39.5 build and pass with 2.43.0. The CI and production
+  images need git >= 2.42; details in `PORTING.md`.
 
 ## What is on the port branch
 
