@@ -65,9 +65,10 @@ BUD-11 MUSTs we satisfy today:
   requires it and requires it to be in the future, `blossom_auth.rs:156-165`.
 - `t` tag from the verb set — `events.rs:161` emits `upload`/`delete` (`events.rs:140-147`); server
   requires an exact match against the operation, `blossom_auth.rs:145-154`.
-- `x` tag, 64 lowercase hex, present on every authed verb we serve — `events.rs:162`; server
+- `x` tag, 64 lowercase hex, present on upload and delete — `events.rs:162`; server
   requires it *and* requires it to equal the sha256 actually being operated on
-  (`blossom_auth.rs:167-180`), which is stricter than BUD-11 requires.
+  (`verify_auth_shape` in `blossom_auth.rs`), which is stricter than BUD-11 requires. The `list`
+  authorization (2026-10) carries no `x`, as BUD-11 has it.
 - id + signature are verified server-side (`blossom_auth.rs:130-134`) — these routes sit outside the
   relay pipeline, so nothing else would.
 
@@ -79,14 +80,22 @@ BUD-11 MUSTs we **violate or omit**:
   looks for one. BUD-11's repeated lowercase-domain `server` tags are its replay-across-servers
   mitigation; absent on both sides, a 24242 minted for node A is replayable at node B for the same
   sha. Our `a` tag limits the blast radius to the same `(tenant, alias)` but not to the same host.
-- **Base64, not base64url.** Client encodes `BASE64_STANDARD` (`events.rs:174`); server decodes
-  `BASE64_STANDARD` only (`blossom_auth.rs:81`, `:117`). BUD-11's current header is
-  `Authorization: Nostr <base64url-no-padding>`, with servers accepting both. Today a conformant
-  third-party Blossom client whose payload contains `-`/`_` is rejected by us with a 401.
+  A `list` authorization has neither `x` nor `a`, so nothing narrows it: one signed by key K for
+  any Blossom server opens K's whole list on every GRASP-P node, as often as it is presented,
+  until its `expiration` passes or its `created_at` is 24 h old, whichever comes first (48 h
+  after signing at most, for an event post-dated by the full window). It is read-only, and only K
+  can mint one.
+- **Base64, not base64url (server half closed 2026-10, issue 14).** Client encodes
+  `BASE64_STANDARD` (`events.rs:174`), which BUD-11's `Authorization: Nostr <base64url-no-padding>`
+  does not allow. The server decoded `BASE64_STANDARD` only until 2026-10; it now accepts standard
+  base64 and base64url, padded or not (`decode_token` in `src/grasp_p/blossom_auth.rs`), so a
+  conformant third-party Blossom client is no longer refused over the alphabet. Still unmet: the
+  client emitting base64url.
 
 Extra requirements we impose beyond BUD-11 (interop hazards for third-party clients, not violations):
 
-- **Mandatory `a` tag `30640:<tenant-hex>:<alias>`** — `blossom_auth.rs:182-200`, emitted at
+- **Mandatory `a` tag `30640:<tenant-hex>:<alias>` on upload and delete** (the `list`
+  authorization carries none) — `blossom_auth.rs:182-200`, emitted at
   `events.rs:159,167`. This is what makes multi-tenancy work: it attributes the upload to a
   registration whose `w` set is then checked against the signing key — enforcement at
   `src/grasp_p/mod.rs:907-916` (tenant match `:907-911`, `w`-set membership `:912-916`; `:889-892`
@@ -94,6 +103,9 @@ Extra requirements we impose beyond BUD-11 (interop hazards for third-party clie
   **KEEP-BESPOKE**, documented as a GRASP-P extension.
 - **±24 h `created_at` window** — `blossom_auth.rs:15,136-143`. BUD-11 relies on `expiration` alone;
   a conformant client with a long-dated auth and a skewed clock gets a 401 from us.
+- **`list` signer must be the pubkey in the path** — `authorize_list` in
+  `src/grasp_p/blossom_auth.rs`. BUD-11 does not say whose token may list whose blobs; a client
+  listing another pubkey gets the same 401 as an anonymous one.
 - Scheme prefix accepted for exactly the two literal spellings `Nostr `/`nostr `
   (`blossom_auth.rs:77-79`, `:112-114`) — *not* case-insensitive: `NOSTR ` is rejected 401. Lenient
   enough to be harmless, strict enough to be worth stating.
@@ -106,18 +118,18 @@ Route coverage vs the BUD split:
 | `PUT /upload` | `src/http/blossom.rs:111` | BUD-02 |
 | `HEAD /upload` | `src/http/blossom.rs:67` | BUD-06 preflight |
 | `DELETE /<sha256>` | `src/http/blossom.rs:278` | **BUD-12** |
-| `GET /list/<pubkey>` | `src/http/blossom.rs:297-311` — **public, unauthenticated**, wired `src/http/mod.rs:707-717` | **BUD-12**, marked *unrecommended* |
+| `GET /list/<pubkey>` | `handle_blob_list` in `src/http/blossom.rs` — needs a kind-24242 `t=list` authorization signed by the listed pubkey (`authorize_list` in `src/grasp_p/blossom_auth.rs`); every refusal is one identical 401 | **BUD-12**, marked *unrecommended* |
 | `PUT /mirror`, `/media` | not implemented | BUD-04 / BUD-05 |
 
 DELETE and `/list` have moved to BUD-12 and `/list` is now marked unrecommended upstream; we should
-cite BUD-12 rather than BUD-02 for both. **Our `/list` takes no `Authorization` at all**
-(`blossom.rs:297-311`) — see gap C below.
+cite BUD-12 rather than BUD-02 for both. Our `/list` took no `Authorization` at all until
+2026-10 — see gap C below, now closed.
 
 Client-side coverage is narrower than the server's: `blob.rs` implements only `put`, `get`, and an
 `exists` that issues a **full GET** (`blob.rs:69-71`). No DELETE, no BUD-06 `HEAD /upload` preflight.
 
-**Verdict.** ADOPT: emit base64url-no-padding and accept both on the server; emit a human-readable
-`content`; emit and verify `server` tags. KEEP-BESPOKE: the `a` tag, as a documented GRASP-P
+**Verdict.** ADOPT: emit base64url-no-padding (the server accepts both since 2026-10); emit a
+human-readable `content`; emit and verify `server` tags. KEEP-BESPOKE: the `a` tag, as a documented GRASP-P
 extension for multi-tenant attribution.
 
 ## 2. Blob and manifest encryption vs NIP-44
@@ -627,7 +639,9 @@ Not NIP questions, but a standards reader will surface them.
   own comment (`repo.rs:278-279`) does nothing. Either wire it into admission or delete it — a
   documented safety control that is not enforced is worse than no control.
 - **B. `KIND_SEAL = 20013` — see item 5b.** Comment-only const; delete or annotate.
-- **C. `GET /list/<pubkey>` is fully unauthenticated.** `handle_blob_list`
+- **C. (closed 2026-10, issue 14: the route now answers only the listed pubkey, with one
+  identical refusal for everyone else. The text below is the finding as it stood.)
+  `GET /list/<pubkey>` is fully unauthenticated.** `handle_blob_list`
   (`src/http/blossom.rs:297-311`) takes no `Authorization` parameter at all, and the route is wired
   with no auth check at `src/http/mod.rs:707-717` (inside the private-subsystem route block, so the
   only precondition is that private repos are enabled). Anyone can enumerate every blob descriptor a
@@ -682,7 +696,8 @@ Not NIP questions, but a standards reader will surface them.
    the 30640, `CORD-git-v0-spec.md:45-47`). Repeated `server` tags covering every node in the repo's
    set is the obvious answer, but it re-widens the replay window to exactly that set — is that the
    intended granularity, or should each upload name a single target host?
-3. **Does `/list` survive?** BUD-12 marks it unrecommended and gap C shows ours is the widest leak on
+3. **Does `/list` survive?** (Decided 2026-10: it stays, behind the listed key's own authorization;
+   the watchdog, the only tooling that used it, no longer does.) BUD-12 marks it unrecommended and gap C shows ours is the widest leak on
    the private surface. Removing it is cheapest; the question is whether any operator tooling depends
    on it.
 4. **Phase labels.** The `Phase` column assumes `P3` = the GRASP-08-composition phase, where

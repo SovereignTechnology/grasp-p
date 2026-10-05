@@ -643,6 +643,23 @@ async fn exit1_replication_e2e() {
         "exit1: replication must complete within the design's 120s bound"
     );
 
+    // The mirror needed no blob listing: /list answers only the listed key,
+    // and a peer holds no such authorization (issue 14).
+    for node in [&a, &b] {
+        let status = reqwest::Client::new()
+            .get(format!(
+                "{}/list/{}",
+                http_base(node),
+                tenant.public_key().to_hex()
+            ))
+            .send()
+            .await
+            .expect("GET /list transport")
+            .status()
+            .as_u16();
+        assert_eq!(status, 401, "exit1: an anonymous /list must be refused");
+    }
+
     // The registration served by B is the exact accepted edition.
     let served_reg = fetch_from(
         b.url(),

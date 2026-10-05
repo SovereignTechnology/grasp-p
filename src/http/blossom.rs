@@ -4,7 +4,8 @@
 //! Accept check, and only when a `PrivateService` exists
 //! (`NGIT_GRASP_P_REPOS_ENABLE=true`). Unlike the git endpoints, these routes
 //! use real HTTP status codes (400/401/403/404/411/413/451/507) with the
-//! reason mirrored in an `X-Reason` header.
+//! reason mirrored in an `X-Reason` header. Upload, delete and list need a
+//! kind-24242 authorization; `GET`/`HEAD /<sha256>` are anonymous by design.
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::git::{empty_body, full_body, GitResponseBody};
+use crate::grasp_p::blossom_auth::authorize_list;
 use crate::grasp_p::{BlobError, BlossomOp, PrivateService};
 
 use futures_util::stream;
@@ -100,7 +102,7 @@ pub(super) async fn serve(
             handle_blob_delete(&service, &req, sha).await
         }
         BlobRoute::Blob(sha) => handle_blob_get(&service, sha, method == Method::HEAD).await,
-        BlobRoute::List(target) => handle_blob_list(&service, &target).await,
+        BlobRoute::List(target) => handle_blob_list(&service, &req, &target).await,
     }
 }
 
@@ -361,9 +363,18 @@ pub(crate) async fn handle_blob_delete(
     }
 }
 
-/// `GET /list/<pubkey-hex-or-npub>` — aggregate blob descriptors for a tenant.
+/// `GET /list/<pubkey-hex-or-npub>` — the blob descriptors of that pubkey's
+/// own aliases, served to that pubkey only: the request must carry a
+/// kind-24242 `list` authorization it signed.
+///
+/// The inventory (hashes, sizes, count) is metadata the encryption does not
+/// cover, and an open route was also a way to ask whether a pubkey is a
+/// tenant here. Authorization is checked before anything is looked up, and
+/// every refusal is the same 401, whether the pubkey has blobs, has none, or
+/// has never been seen.
 pub(crate) async fn handle_blob_list(
     private: &Arc<PrivateService>,
+    req: &Request<Incoming>,
     tenant: &str,
 ) -> Response<HttpBody> {
     let Ok(pubkey) = PublicKey::parse(tenant) else {
@@ -371,9 +382,18 @@ pub(crate) async fn handle_blob_list(
             "list target must be a pubkey (hex or npub)".into(),
         ));
     };
+    if let Err(e) = authorize_list(header_str(req, "authorization"), &pubkey.to_hex()) {
+        return error_response(&e);
+    }
     let descriptors = private.blob_list(&pubkey).await;
     match serde_json::to_string(&descriptors) {
-        Ok(json) => json_response(200, json),
+        // Per-key content: keep it out of shared caches.
+        Ok(json) => base_builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("cache-control", "no-store")
+            .body(full_body(json))
+            .unwrap(),
         Err(e) => error_response(&BlobError::Internal(format!("serialize failed: {e}"))),
     }
 }

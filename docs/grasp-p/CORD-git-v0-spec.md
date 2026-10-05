@@ -22,11 +22,16 @@ residual — store-now/decrypt-later). Membership, keys, invites, and revocation
 epoch lineage across rotations)`. Never on the server in plaintext: repo names, refs, file
 contents, contributor identities.
 
-**[N]** Enumerability of that set is part of the concession, not merely its observability: `GET
-/list/<pubkey>` is unauthenticated (§2.4), so **any anonymous party can enumerate the full
-alias→blob-descriptor mapping of a hosting npub in a single request** — hashes, sizes, counts and
-therefore push cadence — rather than having to observe pushes as they happen. Blob *content* stays
-encrypted. An implementation that wants the weaker leak must gate or drop `/list`.
+**[N]** `GET /list/<pubkey>` answers only the listed pubkey (§2.4), with one identical refusal
+for everyone else, so that route no longer hands an anonymous caller a hosting npub's stored
+inventory and does not say whether the npub is a tenant. That closes one route, not the leak
+above: the set stays public and enumerable through the events. Kind-30640 registrations are
+served to any anonymous REQ, so whether an npub is a tenant, its aliases and its registered keys
+are public; the kind-30641 state roots those keys sign name their manifest and packs by hash and
+size, and `GET /<sha256>` is open. Two anonymous queries therefore still yield the hashes, sizes
+and count of every blob a tenant's current state roots name, and watching the events yields push
+cadence. What `/list` alone showed, and now shows only to the listed key, is stored blobs that no
+currently served state root names. Blob *content* stays encrypted.
 
 ## 2. Server-visible wire kinds
 
@@ -148,11 +153,19 @@ stored at 1059 before the migration are invisible to it.
 ### 2.4 Blossom-subset blobs [N]
 Content-addressed encrypted blobs over HTTP: `PUT /upload` (kind-24242 authorization),
 `GET /<sha256>` (**public/unauthenticated**), `HEAD`, `DELETE`, `GET /list/<pubkey>`
-(**public/unauthenticated** — the route takes no `Authorization` at all, see §1).
-Auth event (kind 24242): tags
+(kind-24242 authorization signed by the listed pubkey).
+Auth event (kind 24242) for upload and delete: tags
 `t`∈{upload,delete}, `x`=<sha256>, `expiration`=<future>, `a`=`30640:<tenant>:<alias>`;
 `created_at` within ±24 h; id + signature verified by the route itself (no relay pipeline has seen
-it); signed by a `w`-set key. Header: `Authorization: Nostr <base64(event-json)>`.
+it); signed by a `w`-set key. For list the required tags are `t`=list and `expiration`=<future>
+(no `x` or `a`; other tags are ignored), with the same freshness and verification, and the signer
+MUST be the pubkey in the path; a write key does not qualify. A path segment that does not parse
+as a pubkey is a `400`. Every other refused list is the same `401` with the same `X-Reason` and no
+body, whether the pubkey has blobs, has none or is unknown to the node, and nothing is looked up
+before the authorization is checked. A list authorization names no server and no blob, so one
+that leaks opens that key's list on any node until it expires.
+Header: `Authorization: Nostr <token>`, where `<token>` is the event JSON in standard base64 or in
+base64url, padded or not; the server accepts all four forms.
 `blob sha256 = SHA256(exact PUT bytes)`. `/list` aggregates only that tenant's own aliases via the
 per-alias claim index (never a cross-tenant scan).
 
@@ -417,8 +430,8 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   values are logged (never the content) and metered; admission then runs the existing related-event
   rules unchanged. No automatic action in v1.
 - **`ngit-private-watchdog` [I]**: a separate binary that anonymously probes TWO nodes and alerts
-  on split-view divergence (NIP-11 fingerprint, registrations, state roots, blob existence, `/list`
-  sets). Holds no keys, signs nothing, publishes nothing. Exit 0 = parity, 1 = divergence, 2 =
+  on split-view divergence (NIP-11 fingerprint, registrations, state roots, blob existence).
+  Holds no keys, signs nothing, publishes nothing, and so cannot read `/list`. Exit 0 = parity, 1 = divergence, 2 =
   operational error; an unreachable node is never reported as divergence. Ops artifacts (runbook,
   nginx zones, Prometheus alerts) live in `docs/grasp-p/ops/`.
 
@@ -455,7 +468,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 |---|---|
 | Operator / disk / coercion | Ciphertext-only; server verifies signatures against opaque keys |
 | Scraper / negentropy harvest | Same encryption; ciphertext harvest CONCEDED (not PQ) |
-| Non-member npub | No keys ⇒ cannot read; blob PUT and 30641 gated by registered write key + PoP. **Not** gated: reads — `GET /<sha256>` and `GET /list/<pubkey>` are unauthenticated, so a non-member can enumerate and download every (encrypted) blob of any hosting npub (§1, §2.4) |
+| Non-member npub | No keys ⇒ cannot read; blob PUT and 30641 gated by registered write key + PoP. **Not** gated: `GET /<sha256>` is unauthenticated, so a non-member who learns a hash (state roots are public and name them) can download that (encrypted) blob. `GET /list/<pubkey>` answers only the listed pubkey (§1, §2.4) |
 | Malicious reader-member | Blobs content-addressed immutable; 30641 needs a `w` key; rekeys authenticated by the tenant signature, not by the derivable outer key |
 | Removed member | Forward-only: keeps old clone; post-rotation cannot push, learn new keys, or read new content |
 | Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat loses to the live+1 widen and is evicted); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
@@ -484,9 +497,13 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
   the `policy_fingerprint` moving in lockstep. What remains of it is not spec work but an operational
   step: closing the legacy window per node once every client on it has migrated. Kind numbers 3359 /
   23359 are still **unregistered** in the nips README table (see `nip-conformance.md` item 11).
+- **Landed after the `c5301bb` as-built (2026-10)**: `GET /list/<pubkey>` answers only the listed
+  pubkey, on its own `t`=list authorization, with one identical refusal (§1, §2.4, §6); the
+  authorization token is accepted in base64url as well as standard base64 (§2.4); the watchdog no
+  longer compares `/list` (§5.1). At `c5301bb` the route was unauthenticated.
 - **[D] remaining**: paid mode, flip-public, export/offboard tombstone worker, 30643
   snapshots, WASM viewer, Tier-H migration, Concord byte-conformance, padding defaults, AEAD nonce
-  width (§3), gated-GET / `/list` authorization, Cashu.
+  width (§3), gated-GET, Cashu.
 
 ## 8. Amendments since v0
 

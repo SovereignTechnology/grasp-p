@@ -144,7 +144,8 @@ impl Drop for UploadReservation {
 pub enum BlobError {
     /// 400 — malformed request / hash mismatch.
     BadRequest(String),
-    /// 401 — missing/malformed/expired authorization.
+    /// 401 — missing/malformed/expired authorization; also every refused
+    /// `GET /list/<pubkey>`, whatever the cause.
     Unauthorized(String),
     /// 403 — valid auth event signed by a key not authorized for the alias.
     Forbidden(String),
@@ -1276,8 +1277,9 @@ impl PrivateService {
     ///
     /// Iterates the per-alias claim index (prefix scans scoped to the
     /// tenant's own aliases) — never the whole cross-tenant `blob_claims`
-    /// table, so an anonymous `/list` flood cannot amplify into full-table
-    /// LMDB scans.
+    /// table, so a `/list` request costs only the caller's own aliases and
+    /// never a full-table LMDB scan. The route authorizes the caller before
+    /// this runs (`blossom_auth::authorize_list`).
     pub async fn blob_list(&self, tenant: &PublicKey) -> Vec<BlobDescriptor> {
         let tenant_hex = tenant.to_hex();
         let mut out = Vec::new();

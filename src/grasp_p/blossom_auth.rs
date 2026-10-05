@@ -1,10 +1,12 @@
 //! Blossom (BUD-01/BUD-02 subset) kind-24242 authorization for private blob
 //! routes.
 //!
-//! `Authorization: Nostr <base64(event-json)>`. Inbound auth events are NOT
+//! `Authorization: Nostr <base64(event-json)>`, in standard base64 or in the
+//! base64url form BUD-11 specifies, padded or not. Inbound auth events are NOT
 //! pre-verified by any relay pipeline, so this module verifies id + signature
 //! itself. Shape errors / expiry → 401; a valid event signed by a key that is
-//! not authorized for the attributed alias → 403.
+//! not authorized for the attributed alias → 403. `GET /list/<pubkey>` is the
+//! exception: every refusal there is the same 401 ([`authorize_list`]).
 
 use base64::Engine as _;
 use nostr::prelude::{Event, Timestamp};
@@ -19,6 +21,7 @@ const MAX_AUTH_AGE_SECS: u64 = 86_400;
 pub enum BlossomOp {
     Upload,
     Delete,
+    List,
 }
 
 impl BlossomOp {
@@ -26,9 +29,15 @@ impl BlossomOp {
         match self {
             Self::Upload => "upload",
             Self::Delete => "delete",
+            Self::List => "list",
         }
     }
 }
+
+/// The one reason every refused `GET /list/<pubkey>` carries. See
+/// [`authorize_list`].
+const LIST_REFUSAL: &str =
+    "list needs a kind 24242 authorization with a t tag of 'list', signed by the listed pubkey";
 
 /// A fully shape-verified (but not yet authorization-resolved) Blossom auth.
 ///
@@ -70,20 +79,7 @@ pub(crate) fn is_lower_hex_64(s: &str) -> bool {
 /// without full verification — used by `PUT /upload` when no `X-SHA-256`
 /// header names the target blob. Full verification still runs afterwards.
 pub fn sha_from_header(header: Option<&str>) -> Result<String, BlobError> {
-    let header = header.ok_or_else(|| {
-        BlobError::Unauthorized("missing Authorization: Nostr <base64-event> header".into())
-    })?;
-    let b64 = header
-        .strip_prefix("Nostr ")
-        .or_else(|| header.strip_prefix("nostr "))
-        .ok_or_else(|| BlobError::Unauthorized("Authorization scheme must be Nostr".into()))?
-        .trim();
-    let json = base64::prelude::BASE64_STANDARD
-        .decode(b64)
-        .map_err(|_| BlobError::Unauthorized("invalid base64 in Authorization header".into()))?;
-    let event = Event::from_json(&json).map_err(|_| {
-        BlobError::Unauthorized("Authorization payload is not a nostr event".into())
-    })?;
+    let event = event_from_header(header)?;
     let x = tag_value(&event, "x").ok_or_else(|| {
         BlobError::Unauthorized("authorization event must carry an x (sha256) tag".into())
     })?;
@@ -95,34 +91,46 @@ pub fn sha_from_header(header: Option<&str>) -> Result<String, BlobError> {
     Ok(x)
 }
 
-/// Parse + verify the `Authorization` header down to a shape-valid
-/// [`BlossomAuth`]. Does NOT resolve the registration (caller does that).
+/// Decode the event carried by an `Authorization: Nostr <token>` header.
 ///
-/// `expected_sha` is the sha256 the HTTP operation targets; a mismatch with
-/// the auth `x` tag is a 400 (client committed to a different blob).
-pub fn verify_auth_shape(
-    header: Option<&str>,
-    op: BlossomOp,
-    expected_sha: &str,
-) -> Result<BlossomAuth, BlobError> {
+/// BUD-11 encodes the event JSON as base64url without padding. This server
+/// and its client have always used standard base64. Both are accepted, with
+/// or without padding, so neither a stock Blossom client nor ours is refused
+/// over the alphabet.
+fn event_from_header(header: Option<&str>) -> Result<Event, BlobError> {
     let header = header.ok_or_else(|| {
         BlobError::Unauthorized("missing Authorization: Nostr <base64-event> header".into())
     })?;
-
-    let b64 = header
+    let token = header
         .strip_prefix("Nostr ")
         .or_else(|| header.strip_prefix("nostr "))
         .ok_or_else(|| BlobError::Unauthorized("Authorization scheme must be Nostr".into()))?
         .trim();
+    let json = decode_token(token)
+        .ok_or_else(|| BlobError::Unauthorized("invalid base64 in Authorization header".into()))?;
+    Event::from_json(&json)
+        .map_err(|_| BlobError::Unauthorized("Authorization payload is not a nostr event".into()))
+}
 
-    let json = base64::prelude::BASE64_STANDARD
-        .decode(b64)
-        .map_err(|_| BlobError::Unauthorized("invalid base64 in Authorization header".into()))?;
+/// Base64-decode an authorization token in any of the four common forms.
+fn decode_token(token: &str) -> Option<Vec<u8>> {
+    use base64::prelude::{
+        BASE64_STANDARD, BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE, BASE64_URL_SAFE_NO_PAD,
+    };
+    [
+        &BASE64_STANDARD,
+        &BASE64_STANDARD_NO_PAD,
+        &BASE64_URL_SAFE,
+        &BASE64_URL_SAFE_NO_PAD,
+    ]
+    .into_iter()
+    .find_map(|engine| engine.decode(token).ok())
+}
 
-    let event = Event::from_json(&json).map_err(|_| {
-        BlobError::Unauthorized("Authorization payload is not a nostr event".into())
-    })?;
-
+/// The checks every authorization event must pass, whatever it authorizes:
+/// kind, id and signature, freshness, the operation's `t` tag, and an
+/// `expiration` that has not passed.
+fn verify_event(event: &Event, op: BlossomOp) -> Result<(), BlobError> {
     if event.kind.as_u16() != 24242 {
         return Err(BlobError::Unauthorized(
             "authorization event must be kind 24242".into(),
@@ -145,7 +153,7 @@ pub fn verify_auth_shape(
     }
 
     // t tag must match the operation.
-    match tag_value(&event, "t") {
+    match tag_value(event, "t") {
         Some(t) if t == op.tag_value() => {}
         _ => {
             return Err(BlobError::Unauthorized(format!(
@@ -156,19 +164,48 @@ pub fn verify_auth_shape(
     }
 
     // expiration tag must exist and be in the future.
-    match tag_value(&event, "expiration").and_then(|v| v.parse::<u64>().ok()) {
-        Some(expiration) if expiration > now => {}
-        Some(_) => {
-            return Err(BlobError::Unauthorized(
-                "authorization event is expired".into(),
-            ))
-        }
-        None => {
-            return Err(BlobError::Unauthorized(
-                "authorization event must carry a numeric expiration tag".into(),
-            ))
-        }
+    match tag_value(event, "expiration").and_then(|v| v.parse::<u64>().ok()) {
+        Some(expiration) if expiration > now => Ok(()),
+        Some(_) => Err(BlobError::Unauthorized(
+            "authorization event is expired".into(),
+        )),
+        None => Err(BlobError::Unauthorized(
+            "authorization event must carry a numeric expiration tag".into(),
+        )),
     }
+}
+
+/// Authorize `GET /list/<pubkey>`: a `list` authorization signed by the
+/// listed pubkey itself. BUD-12's list carries no `x` tag, and the list is
+/// the signer's own, so there is no `a` tag to resolve either.
+///
+/// Every refusal is the same error. The route must not tell a caller whether
+/// `listed_hex` is a tenant of this node, so a missing header, a malformed or
+/// expired event and a valid event from another key are indistinguishable,
+/// and no registration is looked up to decide.
+pub fn authorize_list(header: Option<&str>, listed_hex: &str) -> Result<(), BlobError> {
+    let signed_by_listed = event_from_header(header)
+        .and_then(|event| verify_event(&event, BlossomOp::List).map(|()| event))
+        .is_ok_and(|event| event.pubkey.to_hex() == listed_hex);
+    if signed_by_listed {
+        Ok(())
+    } else {
+        Err(BlobError::Unauthorized(LIST_REFUSAL.into()))
+    }
+}
+
+/// Parse + verify the `Authorization` header down to a shape-valid
+/// [`BlossomAuth`]. Does NOT resolve the registration (caller does that).
+///
+/// `expected_sha` is the sha256 the HTTP operation targets; a mismatch with
+/// the auth `x` tag is a 400 (client committed to a different blob).
+pub fn verify_auth_shape(
+    header: Option<&str>,
+    op: BlossomOp,
+    expected_sha: &str,
+) -> Result<BlossomAuth, BlobError> {
+    let event = event_from_header(header)?;
+    verify_event(&event, op)?;
 
     // x tag: required, 64-lower-hex, and must equal the sha being operated on.
     let x = tag_value(&event, "x").ok_or_else(|| {

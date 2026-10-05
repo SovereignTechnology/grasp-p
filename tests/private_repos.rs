@@ -25,7 +25,9 @@ mod common;
 use std::num::NonZeroU8;
 use std::time::Duration;
 
-use base64::prelude::BASE64_STANDARD;
+use base64::prelude::{
+    BASE64_STANDARD, BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE, BASE64_URL_SAFE_NO_PAD,
+};
 use base64::Engine as _;
 use bitcoin_hashes::{sha256, Hash};
 use nostr::nips::nip13::SingleThreadPow;
@@ -248,6 +250,23 @@ fn blossom_auth_event(
 
 fn auth_header_value(event: &Event) -> String {
     format!("Nostr {}", BASE64_STANDARD.encode(event.as_json()))
+}
+
+/// Signed kind-24242 authorization for `GET /list/<pubkey>`: a `t` tag and
+/// an expiration, with no `x` and no `a` tag.
+fn list_auth_event(signer: &Keys, op: &str, expiration: u64) -> Event {
+    list_event(signer, 24242, op, expiration, "grasp-p test list auth")
+}
+
+/// The same event shape, with the kind and the content chosen by the caller.
+fn list_event(signer: &Keys, kind: u16, op: &str, expiration: u64, content: &str) -> Event {
+    EventBuilder::new(Kind::Custom(kind), content)
+        .tags(vec![
+            Tag::custom("t", vec![op.to_string()]),
+            Tag::custom("expiration", vec![expiration.to_string()]),
+        ])
+        .finalize(signer)
+        .expect("sign list event")
 }
 
 fn future_expiration() -> u64 {
@@ -4130,16 +4149,44 @@ async fn head_blob(relay: &TestRelay, sha: &str) -> u16 {
         .as_u16()
 }
 
-/// GET /list/<tenant-hex> → the descriptor sha256 list.
-async fn list_blob_shas(relay: &TestRelay, tenant: &PublicKey) -> Vec<String> {
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{}/list/{}", http_base(relay), tenant.to_hex()))
-        .send()
-        .await
-        .expect("GET /list transport")
-        .json()
-        .await
-        .expect("/list must be JSON");
+/// GET /list/<target> with an optional Authorization header value.
+/// Returns (status, X-Reason, body).
+async fn get_list(
+    relay: &TestRelay,
+    target: &str,
+    authorization: Option<&str>,
+) -> (u16, String, Vec<u8>) {
+    let mut request = reqwest::Client::new().get(format!("{}/list/{}", http_base(relay), target));
+    if let Some(value) = authorization {
+        request = request.header("Authorization", value);
+    }
+    let response = request.send().await.expect("GET /list transport");
+    let status = response.status().as_u16();
+    let reason = response
+        .headers()
+        .get("x-reason")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = response.bytes().await.expect("GET /list body").to_vec();
+    (status, reason, body)
+}
+
+/// GET /list/<tenant-hex>, authorized by the tenant itself → the descriptor
+/// sha256 list.
+async fn list_blob_shas(relay: &TestRelay, tenant: &Keys) -> Vec<String> {
+    let authorization = auth_header_value(&list_auth_event(tenant, "list", future_expiration()));
+    let (status, reason, body) = get_list(
+        relay,
+        &tenant.public_key().to_hex(),
+        Some(authorization.as_str()),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "GET /list signed by the listed key must succeed; X-Reason: {reason}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("/list must be JSON");
     body.as_array()
         .cloned()
         .unwrap_or_default()
@@ -4372,9 +4419,7 @@ async fn exit30_reload_purge_on_add() {
 
     // /list no longer carries the blob.
     assert!(
-        !list_blob_shas(&relay, &tenant.public_key())
-            .await
-            .contains(&sha),
+        !list_blob_shas(&relay, &tenant).await.contains(&sha),
         "exit30: purged blob must leave /list"
     );
 
@@ -5380,6 +5425,194 @@ async fn exit38_legacy_wrap_kind_can_be_disabled() {
     assert!(
         served.iter().any(|e| e.id == wrap.id),
         "exit38: the 3359 wrap must be stored and served"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// exit40 — GET /list/<pubkey> answers only the listed key (issue 14)
+// ============================================================================
+// A tenant's blob inventory (hashes, sizes, count) is metadata the encryption
+// does not cover, and an open /list also told anyone whether a pubkey is a
+// tenant here. The route needs a kind-24242 `list` authorization signed by the
+// listed pubkey, and every refusal is the same response: for a tenant with
+// blobs, a tenant with none, and a pubkey this node has never seen.
+
+#[tokio::test]
+async fn exit40_list_answers_only_the_listed_key() {
+    let tenant = Keys::generate();
+    let empty_tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant, &empty_tenant]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+    register_alias(&relay, &empty_tenant, &Keys::generate(), &random_alias()).await;
+
+    let data = blob_bytes(240, 512);
+    let sha = sha256_hex(&data);
+    let upload = blossom_auth_event(
+        &writer,
+        "upload",
+        &sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, data, &sha, &upload).await;
+    assert_eq!(status, 200, "exit40: PUT must succeed; X-Reason: {reason}");
+
+    // The listed key's own authorization gets its inventory.
+    assert_eq!(
+        list_blob_shas(&relay, &tenant).await,
+        vec![sha.clone()],
+        "exit40: the tenant must see its one blob"
+    );
+    // BUD-11's form of the token, base64url without padding, works as well as
+    // the standard base64 the helper sends, and so do the two forms in between.
+    // The helper's own event cannot show it: its JSON is ASCII whose length is
+    // a multiple of three, so every form of its token is the same text. This
+    // content forces the difference. Of three consecutive '?' one encodes to
+    // '_' and of three '>' one to '-' ('/' and '+' in the standard alphabet),
+    // and of three consecutive lengths two need padding.
+    let mut unpadded = 0;
+    for content in ["???>>>", "???>>>.", "???>>>.."] {
+        let json = list_event(&tenant, 24242, "list", future_expiration(), content).as_json();
+        let url_safe_no_pad = BASE64_URL_SAFE_NO_PAD.encode(json.as_bytes());
+        assert!(
+            url_safe_no_pad.contains('-') && url_safe_no_pad.contains('_'),
+            "exit40: the token must use the URL-safe alphabet: {url_safe_no_pad}"
+        );
+        if url_safe_no_pad.len() % 4 != 0 {
+            unpadded += 1;
+        }
+        for token in [
+            url_safe_no_pad,
+            BASE64_URL_SAFE.encode(json.as_bytes()),
+            BASE64_STANDARD_NO_PAD.encode(json.as_bytes()),
+        ] {
+            let authorization = format!("Nostr {token}");
+            let (status, reason, _) = get_list(
+                &relay,
+                &tenant.public_key().to_hex(),
+                Some(authorization.as_str()),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "exit40: the token {token} must be accepted; X-Reason: {reason}"
+            );
+        }
+    }
+    assert_eq!(
+        unpadded, 2,
+        "exit40: two of the three tokens must lack the padding base64 would add"
+    );
+    // A tenant with no blobs, and a key this node has never seen, each get
+    // their own empty list.
+    assert!(
+        list_blob_shas(&relay, &empty_tenant).await.is_empty(),
+        "exit40: a tenant with no blobs lists nothing"
+    );
+    assert!(
+        list_blob_shas(&relay, &Keys::generate()).await.is_empty(),
+        "exit40: an unknown key lists nothing of its own"
+    );
+
+    // Refusals: nobody else's authorization, and no malformed one, opens a
+    // list. The alias's own write key is not the listed key either.
+    let stranger = Keys::generate();
+    let by_writer = auth_header_value(&list_auth_event(&writer, "list", future_expiration()));
+    let by_stranger = auth_header_value(&list_auth_event(&stranger, "list", future_expiration()));
+    let wrong_verb = auth_header_value(&list_auth_event(&tenant, "upload", future_expiration()));
+    let expired = auth_header_value(&list_auth_event(
+        &tenant,
+        "list",
+        Timestamp::now().as_secs() - 60,
+    ));
+    // A stranger's valid authorization with the tenant's pubkey written over
+    // the stranger's: the id and the signature no longer cover the event.
+    let forged_event = Event::from_json(
+        list_auth_event(&stranger, "list", future_expiration())
+            .as_json()
+            .replace(
+                &stranger.public_key().to_hex(),
+                &tenant.public_key().to_hex(),
+            ),
+    )
+    .expect("forged JSON still parses");
+    assert_eq!(
+        forged_event.pubkey,
+        tenant.public_key(),
+        "exit40: the forged event must name the tenant"
+    );
+    let forged = auth_header_value(&forged_event);
+    // Signed by the tenant, `t` = list, unexpired, but a NIP-98 event (kind
+    // 27235) and not a Blossom authorization.
+    let wrong_kind = auth_header_value(&list_event(
+        &tenant,
+        27235,
+        "list",
+        future_expiration(),
+        "grasp-p test list auth",
+    ));
+    let targets = [
+        tenant.public_key().to_hex(),
+        empty_tenant.public_key().to_hex(),
+        Keys::generate().public_key().to_hex(),
+    ];
+    let attempts = [
+        None,
+        Some(by_writer.as_str()),
+        Some(by_stranger.as_str()),
+        Some(wrong_verb.as_str()),
+        Some(expired.as_str()),
+        Some(forged.as_str()),
+        Some(wrong_kind.as_str()),
+        Some("Nostr not-base64!"),
+        Some("Bearer anything"),
+    ];
+    let mut refusals = Vec::new();
+    for target in &targets {
+        for authorization in attempts {
+            refusals.push(get_list(&relay, target, authorization).await);
+        }
+    }
+    let first = refusals[0].clone();
+    assert_eq!(first.0, 401, "exit40: a refused list is a 401");
+    assert!(first.2.is_empty(), "exit40: a refused list has no body");
+    for (index, refusal) in refusals.iter().enumerate() {
+        assert_eq!(
+            refusal, &first,
+            "exit40: refusal {index} must be identical to the first (status, reason, body)"
+        );
+    }
+
+    // Headers too, not only X-Reason: one that appeared for real tenants
+    // alone would reopen the oracle. `date` is the only one that may differ.
+    let mut header_sets = Vec::new();
+    for target in &targets {
+        let response = reqwest::Client::new()
+            .get(format!("{}/list/{}", http_base(&relay), target))
+            .send()
+            .await
+            .expect("GET /list transport");
+        let mut headers: Vec<(String, Vec<u8>)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| name.as_str() != "date")
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect();
+        headers.sort();
+        header_sets.push(headers);
+    }
+    assert!(
+        header_sets.windows(2).all(|pair| pair[0] == pair[1]),
+        "exit40: refused lists must carry identical headers: {header_sets:?}"
     );
 
     relay.stop().await;

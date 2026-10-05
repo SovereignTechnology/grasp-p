@@ -37,8 +37,8 @@ Two repositories:
 
 ## The next task: M3
 
-`PLAN.md` lists the items. The first is the unauthenticated `GET /list/<pubkey>` route
-(issue 14). Before changing the sync or mirror code, read `SEAMS.md`: the pair tests run
+`PLAN.md` lists the items. Issue 14 is done: `GET /list/<pubkey>` answers only the listed
+key. Before changing the sync or mirror code, read `SEAMS.md`: the pair tests run
 with both SSRF guards switched off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`,
 `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), so the production peer path has no test yet.
 

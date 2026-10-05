@@ -64,9 +64,10 @@ push; `git status` before every commit.
   upstream's own suite, and cord-git e2e all green in CI.
 
 ### M3 - Server hardening (issues on project 12)
-- **#14** `/list/<pubkey>`: add `BlossomOp::List` (`src/grasp_p/blossom_auth.rs`), a shape
-  verifier without the `x` requirement, signer must be the tenant key; mirror
-  `verify_blossom_auth` in `mod.rs`. Resolve the base64 vs base64url spec/code divergence.
+- **#14** (done) `/list/<pubkey>` answers only the listed pubkey: `BlossomOp::List` and
+  `authorize_list` in `src/grasp_p/blossom_auth.rs` (no `x` or `a` tag needed, the signer must be
+  the pubkey in the path, every refusal is one identical 401). The server now accepts the
+  authorization token in standard base64 and in base64url; the client still sends standard.
 - **#24** `/metrics` off by default on GRASP-P nodes, loopback only, no relay URLs in labels.
 - **#25** per-tenant claim/file-count caps; **#26** mirror fairness; **#20** purgatory SSRF and
   **#3** DNS rebinding (both via `outbound.rs`); **#16** announcement-indexer pin + leak canary.

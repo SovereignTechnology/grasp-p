@@ -22,8 +22,8 @@ Two parts:
 | **CORD-git** | `cord-git` (`cord-core` library, `cord-git` CLI) | Client: keys, encryption, membership |
 
 This is a different model from GRASP-08. GRASP-08 puts an access gate in front of a server
-that still reads plaintext. GRASP-P has no read gate at all and relies only on encryption.
-One node runs one or the other, not both.
+that still reads plaintext. GRASP-P puts no gate in front of repository data (events and
+blobs are public) and relies only on encryption. One node runs one or the other, not both.
 
 ## What the host can and cannot see
 
@@ -69,7 +69,10 @@ outright, not passed to the public event path.
 
 **Blobs.** A subset of Blossom: `PUT /upload`, `GET` / `HEAD` / `DELETE /<sha256>`,
 `GET /list/<pubkey>`. Upload and delete need a kind `24242` authorization event signed by a
-registered write key and naming the registration. `GET /<sha256>` is unauthenticated.
+registered write key and naming the registration. `GET /list/<pubkey>` needs one signed by
+the listed pubkey itself, and every refusal is the same 401, so the route itself does not
+say whether a pubkey is a tenant (its public registration events do). `GET /<sha256>` is
+unauthenticated. The authorization token is accepted in standard base64 or in base64url.
 
 ## Keys the client holds
 
@@ -162,8 +165,6 @@ Design limits, which stay:
 
 Gaps being closed before production (tracked as issues on the two projects):
 
-- `GET /list/<pubkey>` needs no authorization, so anyone can list a tenant's whole blob
-  inventory in one request.
 - An operator can serve an **older** validly signed state root; the client has no
   monotonic floor yet.
 - Invite bundles do not prove who sent them.
