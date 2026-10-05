@@ -1,7 +1,9 @@
 # SovTech GRASP-P CI. Every job runs in a fresh Kata VM on ubuntu-server
 # (Debian bookworm, glibc 2.36). The Rust toolchain is the one rust-toolchain.toml
 # pins: rustup installs it at the first cargo call of each job. Nothing is
-# cached between jobs and there are no CI/CD variables or secrets.
+# cached between jobs and there are no CI/CD variables or secrets. The test job
+# builds its own git (see .server-git): the image's 2.39.5 is too old to run
+# the server.
 #
 # Runners:
 #   ci-grasp       not protected: merge requests.
@@ -51,6 +53,35 @@ stages:
   - test
   - release
 
+# Git for the jobs that RUN the server or its tests. The server shells out to
+# git, and upstream needs >= 2.42 since v3.0.6 (--not and --glob= on the stdin of
+# `rev-list --stdin`, src/git/staging.rs) and >= 2.41 (upload-pack capabilities
+# for an empty repository). The runner image has bookworm's 2.39.5 and Debian
+# has never backported git to bookworm, so these jobs build the version Debian
+# 13 ships from kernel.org's tarball, pinned by sha256, into /usr/local (ahead of
+# /usr/bin on PATH). The image and the release job are untouched.
+.server-git:
+  before_script:
+    - rustc --version && cargo --version
+    - |
+      git_v=2.47.3
+      git_sha=9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -q -o Acquire::Retries=3 update
+      apt-get -q -y --no-install-recommends install libcurl4-gnutls-dev
+      b=$(mktemp -d)
+      curl -fsSL --retry 3 --max-time 300 -o "$b/git.tar.xz" "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$git_v.tar.xz"
+      echo "$git_sha  $b/git.tar.xz" | sha256sum --strict --quiet -c -
+      tar -C "$b" -xJf "$b/git.tar.xz"
+      make -s -C "$b/git-$git_v" -j8 prefix=/usr/local CFLAGS=-O2 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_EXPAT=1 install > "$b/make.log" 2>&1 || { tail -n 60 "$b/make.log" >&2; exit 1; }
+      rm -rf "$b"; hash -r
+    # Fail here, with the reason, rather than in three staging tests.
+    - |
+      v=$(git --version); v=${v#git version }
+      [ "$(command -v git)" = /usr/local/bin/git ] || { echo "git on PATH is $(command -v git), not the one just built" >&2; exit 1; }
+      dpkg --compare-versions "$v" ge 2.42 || { echo "git $v: the server needs 2.42 or newer" >&2; exit 1; }
+      echo "git $v at /usr/local/bin/git"
+
 lint:
   stage: lint
   timeout: 45m
@@ -59,6 +90,7 @@ lint:
     - cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
+  extends: .server-git
   stage: test
   needs: []
   timeout: 90m
@@ -78,8 +110,11 @@ test:
     - cargo test --locked
     - cargo test -p grasp-audit --locked
 
-# The deployable binary, built only on protected refs. bookworm's glibc
-# (2.36) is what the Kata guest image runs.
+# The deployable binary, built only on protected refs. It is built on bookworm
+# on purpose: linked against glibc 2.36 and OpenSSL 3.0 it runs in a bookworm
+# guest and in a trixie one, and the other way round it would not. The guest
+# image that runs it must provide git 2.42 or newer on PATH (Debian 13 has
+# 2.47.3; bookworm's 2.39.5 is too old), libssl.so.3 and ca-certificates.
 release:
   stage: release
   timeout: 60m
@@ -94,6 +129,7 @@ release:
     - echo "glibc $(getconf GNU_LIBC_VERSION)" > ci-out/BUILD-INFO
     - rustc --version >> ci-out/BUILD-INFO
     - git rev-parse HEAD >> ci-out/BUILD-INFO
+    - echo "runtime needs git >= 2.42 on PATH, libssl.so.3, ca-certificates" >> ci-out/BUILD-INFO
   artifacts:
     expire_in: 90 days
     paths:
