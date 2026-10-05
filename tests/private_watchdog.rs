@@ -2,7 +2,7 @@
 //!
 //! Drives a real two-node private pair (helpers mirrored from
 //! `tests/private_two_node.rs`), asserts the watchdog reports full parity on
-//! a healthy pair (head + get blob probes, list-parity, JSON report), then
+//! a healthy pair (head + get blob probes, JSON report), then
 //! partitions the pair (B restarted on its persistent paths with no sync
 //! peer) and asserts the split-view findings: `reason=diverged` for the
 //! edition A has moved past, `reason=withheld-30641` for the alias B never
@@ -10,14 +10,14 @@
 //! stderr, and grace-window suppression via --max-skew-secs.
 //!
 //! Review-round-1 legs (FW-2): a dead node exits 2 (never divergence), and
-//! ambiguous blob-base derivation wedges ONLY the blob-dependent checks —
+//! ambiguous blob-base derivation wedges ONLY the blob-dependent check —
 //! checks 1-3 still print (human + json), exit 2 without divergence and
 //! exit 1 when a divergence FAIL is present (divergence dominates).
 //!
 //! Review-round-2 leg (R2-4): `server` tags differing ONLY by path resolve
 //! to the path-empty blob base (exit 0, no operator flags); genuine
 //! ambiguity (one endpoint spelled two ways, no unique path-empty
-//! candidate) still wedges only checks 4/5 per the FW-2 legs.
+//! candidate) still wedges only check 4 per the FW-2 legs.
 //!
 //! ```bash
 //! cargo test --test private_watchdog -- --nocapture --test-threads=1
@@ -453,28 +453,30 @@ async fn watchdog_e2e_happy_then_partitioned() {
         get.stdout, get.stderr
     );
 
-    // ---- happy path: list-parity + json ----
-    let mut list_args = base_args.clone();
-    list_args.extend([
-        "--tenant".to_string(),
-        tenant.public_key().to_hex(),
-        "--json".to_string(),
-    ]);
-    let list = run_watchdog(&list_args).await;
+    // ---- happy path: json report ----
+    // The watchdog holds no key, and GET /list answers only the listed key,
+    // so there is no list comparison: the report must not carry one.
+    let mut json_args = base_args.clone();
+    json_args.push("--json".to_string());
+    let json = run_watchdog(&json_args).await;
     assert_eq!(
-        list.code, 0,
-        "list run failed:\n{}\n{}",
-        list.stdout, list.stderr
+        json.code, 0,
+        "json run failed:\n{}\n{}",
+        json.stdout, json.stderr
     );
     let report: serde_json::Value =
-        serde_json::from_str(&list.stdout).expect("watchdog --json must emit JSON");
+        serde_json::from_str(&json.stdout).expect("watchdog --json must emit JSON");
     assert_eq!(report["ok"], true);
     assert_eq!(report["exit_code"], 0);
     let checks = report["checks"].as_array().expect("checks array");
     assert!(
         checks
             .iter()
-            .any(|c| c["check"] == "list-parity" && c["status"] == "PASS"),
+            .any(|c| c["check"] == "blob-existence" && c["status"] == "PASS"),
+        "{report}"
+    );
+    assert!(
+        !checks.iter().any(|c| c["check"] == "list-parity"),
         "{report}"
     );
 
@@ -624,7 +626,7 @@ async fn watchdog_dead_node_is_operational_error() {
 }
 
 /// FW-2 / review L3-F1: ambiguous blob-base derivation must wedge ONLY the
-/// blob-dependent checks (4/5) — checks 1-3 always print, in human AND json
+/// blob-dependent check (4) — checks 1-3 always print, in human AND json
 /// mode; exit 2 without divergence, exit 1 when a divergence FAIL is present
 /// (divergence dominates).
 #[tokio::test]
@@ -765,14 +767,10 @@ async fn watchdog_ambiguous_bases_do_not_mask_checks() {
     );
     assert!(!amb.stderr.contains("WATCHDOG ALERT"), "{}", amb.stderr);
 
-    // ---- leg 1b: --tenant + --json: check 5 errors per-tenant; all
-    // completed results are in the machine report too.
+    // ---- leg 1b: --json: all completed results are in the machine report
+    // too.
     let mut json_args = base_args.clone();
-    json_args.extend([
-        "--tenant".to_string(),
-        tenant.public_key().to_hex(),
-        "--json".to_string(),
-    ]);
+    json_args.push("--json".to_string());
     let amb_json = run_watchdog(&json_args).await;
     assert_eq!(
         amb_json.code, 2,
@@ -799,7 +797,6 @@ async fn watchdog_ambiguous_bases_do_not_mask_checks() {
     assert!(has("registration-parity", "PASS"), "{report}");
     assert!(has("manifest-parity", "PASS"), "{report}");
     assert!(has("blob-existence", "ERROR"), "{report}");
-    assert!(has("list-parity", "ERROR"), "{report}");
 
     // ---- leg 2: partition + divergence -> exit 1 (divergence dominates),
     // FAIL manifest-parity prints alongside ERROR blob-existence.

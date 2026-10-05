@@ -176,7 +176,7 @@ The watchdog prints both labels on the `fingerprint-parity` line
 one: a node that advertises NO label (`policy-a=unadvertised`) predates the
 `policy_version` field entirely, which is the same rolling-upgrade window
 seen from one side, so the watchdog calls it a version skew until both nodes
-are upgraded (src/bin/ngit-private-watchdog.rs:492–524).
+are upgraded (src/bin/ngit-private-watchdog.rs:484–516).
 
 ### Wire-kind migration (`NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND`)
 
@@ -191,7 +191,7 @@ Stream wraps moved from kind 1059/21059 to 3359/23359. Rules:
   one window, because every node's fingerprint moves on the bump.
 - **Stream-wrap divergence is NOT covered by the watchdog's data-parity
   checks.** `fingerprint-parity`, `registration-parity`, `manifest-parity`,
-  `blob-existence` and `list-parity` compare registrations, 30641 editions
+  and `blob-existence` compare registrations, 30641 editions
   and blobs — never wrap sets. `kinds-parity` tells you the nodes *disagree
   about which wrap kinds they admit*; nothing tells you which wraps actually
   diverged. Wrap-set reconciliation is not implemented.
@@ -501,7 +501,7 @@ blackbox/textfile patterns in prometheus-alerts.yaml:184–225.
 - Stale: the timer/cron died — restart it (watchdog.md §systemd).
 
 **Coverage limit — stream wraps.** The data-parity checks
-(`registration-parity`, `manifest-parity`, `blob-existence`, `list-parity`)
+(`registration-parity`, `manifest-parity`, `blob-existence`)
 compare kind-30640 registrations, kind-30641 editions and blobs. **No check
 compares stream-wrap sets**, so a wrap-set divergence is invisible as a data
 class. `kinds-parity` reports only that the two nodes disagree about which

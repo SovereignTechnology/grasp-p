@@ -4,14 +4,15 @@
 //! GRASP-P private-repo state diverge (e.g. one node withholding a kind-30641
 //! state-root manifest = split-view attack). Holds NO keys, signs NOTHING,
 //! publishes NOTHING — every input it compares is anonymously readable by
-//! design (NIP-11, kind-30640/30641 REQs, HEAD/GET blob routes, GET /list).
+//! design (NIP-11, kind-30640/30641 REQs, HEAD/GET blob routes). It does not
+//! compare `GET /list/<pubkey>`: that route answers only the listed key.
 //!
 //! Exit codes: 0 = all checks pass, 1 = divergence alert, 2 = operational
 //! error (unreachable node, timeout, unexpected response, underivable blob
 //! base, incomplete probe coverage). An unreachable node is NEVER reported
 //! as divergence. Completed
-//! check results are always emitted: an operational failure inside checks
-//! 4/5 (blob-dependent) produces per-check ERROR lines and never suppresses
+//! check results are always emitted: an operational failure inside check
+//! 4 (blob-dependent) produces per-check ERROR lines and never suppresses
 //! other checks; exit is 1 whenever any check FAILs (divergence dominates),
 //! 2 when operational errors occurred without divergence.
 
@@ -59,12 +60,6 @@ fn parse_alias(s: &str) -> Result<String, String> {
     }
 }
 
-fn parse_tenant(s: &str) -> Result<String, String> {
-    PublicKey::parse(s)
-        .map(|pk| pk.to_hex())
-        .map_err(|e| format!("tenant must be a pubkey (hex or npub): {e}"))
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "ngit-private-watchdog",
@@ -72,7 +67,7 @@ fn parse_tenant(s: &str) -> Result<String, String> {
     about = "External split-view watchdog for GRASP-P two-node deployments",
     long_about = "Anonymously compares two ngit-grasp nodes' views of GRASP-P private-repo \
                   state (NIP-11 policy fingerprint, kind-30640 registrations, kind-30641 \
-                  state roots, blob existence, /list sets) and alerts on divergence. \
+                  state roots, blob existence) and alerts on divergence. \
                   Exit 0 = parity, 1 = divergence alert, 2 = operational error."
 )]
 struct Cli {
@@ -86,9 +81,6 @@ struct Cli {
     /// aliases are discovered from the union of both nodes' kind-30640 events.
     #[arg(long, value_parser = parse_alias)]
     alias: Vec<String>,
-    /// Tenant pubkey (hex or npub) for /list parity. Repeatable.
-    #[arg(long, value_parser = parse_tenant)]
-    tenant: Vec<String>,
     /// Blob base URL for node A (default: derived from registrations' `server`
     /// tag matching node A's relay host).
     #[arg(long)]
@@ -131,9 +123,9 @@ const MAX_IN_FLIGHT_PROBES: usize = 32;
 /// clean PASS (exit 0) to automation gating on the exit code.
 const MAX_PROBE_TARGETS: usize = 10_000;
 
-/// Hard cap on NIP-11 and /list response bodies. Both are small JSON
-/// documents in any real deployment; a body past the cap means a broken or
-/// hostile HTTP peer, which is an operational error, not something to buffer.
+/// Hard cap on a NIP-11 response body. It is a small JSON document in any
+/// real deployment; a body past the cap means a broken or hostile HTTP peer,
+/// which is an operational error, not something to buffer.
 const MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Hard cap on events retained from a single REQ batch. The relay SDK
@@ -575,14 +567,6 @@ fn kinds_display(kinds: &BTreeSet<u64>) -> String {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(",")
-}
-
-/// Symmetric difference of two /list sha256 sets: (only-in-a, only-in-b).
-fn list_diff<'a>(a: &'a BTreeSet<String>, b: &'a BTreeSet<String>) -> (Vec<&'a str>, Vec<&'a str>) {
-    (
-        a.difference(b).map(String::as_str).collect(),
-        b.difference(a).map(String::as_str).collect(),
-    )
 }
 
 /// Per-node outcome of one blob probe.
@@ -1280,43 +1264,6 @@ async fn probe_blob(
     }
 }
 
-async fn fetch_list(
-    node: &NodeConn,
-    base: &str,
-    tenant_hex: &str,
-) -> Result<BTreeSet<String>, OpError> {
-    let url = format!("{base}/list/{tenant_hex}");
-    let response = node
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| op(node.side, format!("GET {url} failed: {e}")))?;
-    if response.status() != reqwest::StatusCode::OK {
-        return Err(op(
-            node.side,
-            format!("GET {url} returned HTTP {}", response.status().as_u16()),
-        ));
-    }
-    let body = read_body_capped(response, MAX_BODY_BYTES, node.side, &format!("GET {url}")).await?;
-    let body: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| op(node.side, format!("GET {url} returned invalid JSON: {e}")))?;
-    let items = body
-        .as_array()
-        .ok_or_else(|| op(node.side, format!("GET {url} did not return a JSON array")))?;
-    let mut shas = BTreeSet::new();
-    for item in items {
-        let sha = item.get("sha256").and_then(|v| v.as_str()).ok_or_else(|| {
-            op(
-                node.side,
-                format!("GET {url} array item lacks a sha256 string field"),
-            )
-        })?;
-        shas.insert(sha.to_string());
-    }
-    Ok(shas)
-}
-
 // ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
@@ -1325,8 +1272,8 @@ struct Report {
     lines: Vec<CheckLine>,
     json: serde_json::Value,
     failed: usize,
-    /// Operational errors accumulated by checks 4/5 (blob base resolution,
-    /// per-target probe failures, probe-target cap skips, /list failures).
+    /// Operational errors accumulated by check 4 (blob base resolution,
+    /// per-target probe failures, probe-target cap skips).
     /// Non-empty with zero FAILs
     /// -> exit 2; any FAIL -> exit 1 (divergence dominates).
     op_errors: Vec<String>,
@@ -1619,7 +1566,7 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
         lines.push(line);
     }
 
-    // -- Blob bases (resolved on demand by checks 4/5) ----------------------
+    // -- Blob bases (resolved on demand by check 4) --------------------------
     let all_servers = || {
         snap_a
             .registrations
@@ -1651,11 +1598,10 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
             one(&node_b, &cli.blob_base_b)?,
         ))
     };
-    // FW-2: a blob-base failure must wedge ONLY the blob-dependent checks
-    // (4/5), never the run. Resolve once (memoized) when any check needs
-    // bases; each dependent check emits its own ERROR line on failure.
-    let need_bases = !cli.tenant.is_empty()
-        || (cli.blob_probe != BlobProbeMode::None && !blob_targets.is_empty());
+    // FW-2: a blob-base failure must wedge ONLY the blob-dependent check
+    // (4), never the run. Resolve once (memoized) when the check needs
+    // bases; it emits its own ERROR line on failure.
+    let need_bases = cli.blob_probe != BlobProbeMode::None && !blob_targets.is_empty();
     let bases: Option<Result<(String, String), OpError>> = if need_bases {
         Some(resolve_bases())
     } else {
@@ -1664,7 +1610,7 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
     // Set when (and only when) a check actually resolved blob bases.
     let used_bases: Option<(String, String)> =
         bases.as_ref().and_then(|r| r.as_ref().ok().cloned());
-    // Operational errors accumulated by checks 4/5: echoed on stderr and in
+    // Operational errors accumulated by check 4: echoed on stderr and in
     // the JSON report; drive exit 2 only when no divergence was emitted
     // (divergence dominates).
     let mut op_errors: Vec<String> = Vec::new();
@@ -1791,68 +1737,6 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
         },
     }
 
-    // -- Check 5: list-parity ---------------------------------------------------
-    for tenant in &cli.tenant {
-        let (base_a, base_b) = match bases.as_ref().expect("needed above") {
-            Ok(pair) => pair.clone(),
-            Err(e) => {
-                lines.push(
-                    CheckLine::new("list-parity", Status::Error)
-                        .scope("tenant", short(tenant))
-                        .detail(format!("blob base unresolved: {e}")),
-                );
-                op_errors.push(format!(
-                    "list-parity tenant={}: blob base unresolved: {e}",
-                    short(tenant)
-                ));
-                continue;
-            }
-        };
-        let lists = tokio::try_join!(
-            fetch_list(&node_a, &base_a, tenant),
-            fetch_list(&node_b, &base_b, tenant),
-        );
-        let (la, lb) = match lists {
-            Ok(pair) => pair,
-            Err(e) => {
-                lines.push(
-                    CheckLine::new("list-parity", Status::Error)
-                        .scope("tenant", short(tenant))
-                        .detail(format!("list fetch failed: {e}")),
-                );
-                op_errors.push(format!("list-parity tenant={}: {e}", short(tenant)));
-                continue;
-            }
-        };
-        let (only_a, only_b) = list_diff(&la, &lb);
-        let line = if only_a.is_empty() && only_b.is_empty() {
-            CheckLine::new("list-parity", Status::Pass)
-                .scope("tenant", short(tenant))
-                .scope("blobs", la.len().to_string())
-        } else {
-            CheckLine::new("list-parity", Status::Fail)
-                .scope("tenant", short(tenant))
-                .scope("only-a", only_a.len().to_string())
-                .scope("only-b", only_b.len().to_string())
-                .detail(format!(
-                    "only on A: [{}]; only on B: [{}]",
-                    only_a
-                        .iter()
-                        .take(3)
-                        .map(|s| short(s))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    only_b
-                        .iter()
-                        .take(3)
-                        .map(|s| short(s))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ))
-        };
-        lines.push(line);
-    }
-
     node_a.relay.disconnect();
     node_b.relay.disconnect();
 
@@ -1908,7 +1792,6 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
             "max_skew_secs": cli.max_skew_secs,
             "blob_probe": format!("{:?}", cli.blob_probe).to_lowercase(),
             "aliases": aliases,
-            "tenants": cli.tenant,
         },
         "checks": lines.iter().map(CheckLine::json).collect::<Vec<_>>(),
         "operational_errors": op_errors,
@@ -1969,7 +1852,7 @@ async fn main() -> ExitCode {
                 }
                 eprintln!("WATCHDOG ALERT: {} check(s) failed", report.failed);
             }
-            // Operational errors (checks 4/5) also land on stderr so
+            // Operational errors (check 4) also land on stderr so
             // journal/cron consumers see them in all output modes.
             for e in &report.op_errors {
                 eprintln!("WATCHDOG OPERATIONAL ERROR: {e}");
@@ -2340,19 +2223,6 @@ mod tests {
         assert_eq!(neither, "mismatch");
     }
 
-    // -- list_diff --------------------------------------------------------------------
-
-    #[test]
-    fn list_diff_symmetric() {
-        let a: BTreeSet<String> = ["x", "y", "z"].iter().map(|s| s.to_string()).collect();
-        let b: BTreeSet<String> = ["y", "z", "w"].iter().map(|s| s.to_string()).collect();
-        let (only_a, only_b) = list_diff(&a, &b);
-        assert_eq!(only_a, vec!["x"]);
-        assert_eq!(only_b, vec!["w"]);
-        let (none_a, none_b) = list_diff(&a, &a);
-        assert!(none_a.is_empty() && none_b.is_empty());
-    }
-
     // -- blob probing -----------------------------------------------------------------
 
     #[test]
@@ -2588,11 +2458,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_bad_alias_and_tenant() {
+    fn cli_rejects_bad_alias() {
         assert!(parse_alias(&"ab".repeat(16)).is_ok());
         assert!(parse_alias(&"AB".repeat(16)).is_err());
         assert!(parse_alias("short").is_err());
-        assert!(parse_tenant(&"ab".repeat(32)).is_ok());
-        assert!(parse_tenant("not-a-key").is_err());
     }
 }

@@ -16,7 +16,13 @@ input it compares is anonymously readable by design:
   an operational error — GRASP-P anonymous reads must stay open)
 - Blob existence: `HEAD /<sha256>` (or `GET` with body verification) on each
   node's blob base URL
-- `GET /list/<tenant-pubkey>` blob sets (when `--tenant` is given)
+
+It does not compare `GET /list/<pubkey>`: that route answers only the listed
+key, and the watchdog holds none. Stored blobs that no currently served state
+root names (uploads not yet referenced, and blobs only superseded editions
+name) are therefore outside its view. No reader fetches such a blob, so no
+split view of repository content can hide there. The `--tenant` flag went with
+the check: a unit that still passes it exits 2 on a usage error.
 
 ## Build
 
@@ -29,7 +35,7 @@ cargo build --release --bin ngit-private-watchdog
 
 ```
 ngit-private-watchdog --relay-a wss://A --relay-b wss://B \
-  [--alias ALIAS]... [--tenant HEX_OR_NPUB]... \
+  [--alias ALIAS]... \
   [--blob-base-a URL] [--blob-base-b URL] \
   [--blob-probe head|get|none] \
   [--timeout-secs 30] [--max-skew-secs 300] [--json]
@@ -51,7 +57,7 @@ ngit-private-watchdog --relay-a wss://A --relay-b wss://B \
   Genuine ambiguity — one endpoint spelled two ways (e.g. `https://host`
   vs `https://host:443`), or a path-only tie with no unique path-empty
   candidate — still errors; pass `--blob-base-a`/`--blob-base-b` explicitly
-  (the blob-dependent checks error out with that guidance rather than
+  (the blob-dependent check errors out with that guidance rather than
   guessing — checks 1–3 are unaffected).
 - **kind-30641 author filters** are derived from each alias's `w` tag union
   across both nodes (aux keys cannot author state roots).
@@ -69,7 +75,7 @@ exit 2, so connection problems cannot be mistaken for a split view.
 
 **Completed check results are never suppressed.** Checks 1–3 (fingerprint,
 registration, manifest parity) are computed and printed even when the
-blob-dependent checks 4/5 fail operationally; those checks then emit their
+blob-dependent check 4 fails operationally; it then emits its
 own per-check `ERROR` lines (e.g. `ERROR blob-existence ... -- blob base
 unresolved: ...; pass --blob-base-a/--blob-base-b explicitly`) instead of
 aborting the run. Divergence dominates: the exit code is **1** whenever any
@@ -78,7 +84,7 @@ operational errors occurred with no divergence. In `--json` mode the
 accumulated operational errors are in `operational_errors` and the summary
 carries an `error` count. A genuine blob-base ambiguity (host-matching
 `server` tags with no unique path-empty candidate) therefore wedges ONLY
-checks 4/5, never the run.
+check 4, never the run.
 
 ### Checks
 
@@ -123,9 +129,6 @@ checks 4/5, never the run.
    (early-abort just past the largest declared size). Any other HTTP status
    or a transport failure is an operational error (exit 2), never a data
    verdict.
-5. **list-parity** — for each `--tenant`, the sha256 sets of
-   `GET /list/<tenant>` must be equal (descriptor `url` fields are
-   node-local and intentionally not compared).
 
 ### Output
 
@@ -158,7 +161,7 @@ go to stderr):
            "malformed_30640_ignored": 0, "malformed_30641_ignored": 0 }
   },
   "params": { "timeout_secs": 30, "max_skew_secs": 300, "blob_probe": "head",
-              "aliases": ["0123…"], "tenants": [] },
+              "aliases": ["0123…"] },
   "checks": [
     { "check": "manifest-parity", "status": "FAIL",
       "scope": { "alias": "0123…", "author": "deadbeef", "reason": "withheld-30641" },
@@ -227,8 +230,8 @@ systemctl enable --now ngit-private-watchdog.timer
     are skipped loudly: the check reports `ERROR` with `skipped=N` plus a
     "NOT probed this run" note and the run exits **2** — partial coverage
     never reads as a clean PASS (exit 0).
-  - NIP-11 and `/list` response bodies are read with a **4 MiB cap**; a
-    larger body is an operational error, not something to buffer.
+  - A NIP-11 response body is read with a **4 MiB cap**; a larger body is
+    an operational error, not something to buffer.
   - A single REQ batch returning more than **100 000 events** is refused as
     an operational error (ingress within the window is already bounded by
     `--timeout-secs`; this bounds what is retained and compared).
