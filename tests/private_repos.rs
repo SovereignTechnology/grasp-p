@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
-use nostr::hashes::{sha256, Hash};
+use bitcoin_hashes::{sha256, Hash};
 use nostr::nips::nip13::SingleThreadPow;
 use nostr_sdk::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -136,13 +136,9 @@ fn reg_coord(tenant: &PublicKey, alias: &str) -> String {
 /// Schnorr proof-of-possession for a claimed w/aux key, per the §2 audit
 /// amendment: sig by `key` over sha256("grasp-p key-claim:<tenant-hex>:<alias>").
 fn key_pop_sig(key: &Keys, tenant: &PublicKey, alias: &str) -> String {
-    let digest = sha256::Hash::hash(
-        format!("grasp-p key-claim:{}:{alias}", tenant.to_hex()).as_bytes(),
-    );
-    key.sign_schnorr(&nostr::secp256k1::Message::from_digest(
-        digest.to_byte_array(),
-    ))
-    .to_string()
+    let digest =
+        sha256::Hash::hash(format!("grasp-p key-claim:{}:{alias}", tenant.to_hex()).as_bytes());
+    key.sign_schnorr(digest.to_byte_array()).to_string()
 }
 
 /// A `w`/`aux` tag value list: [pubkey-hex, proof-of-possession sig].
@@ -182,8 +178,12 @@ fn registration_event(
     domain: &str,
     created_at: Option<u64>,
 ) -> Event {
-    let mut builder = EventBuilder::new(Kind::Custom(30640), "")
-        .tags(registration_tags(alias, w_entries, aux_entries, domain));
+    let mut builder = EventBuilder::new(Kind::Custom(30640), "").tags(registration_tags(
+        alias,
+        w_entries,
+        aux_entries,
+        domain,
+    ));
     if let Some(secs) = created_at {
         builder = builder.custom_created_at(Timestamp::from_secs(secs));
     }
@@ -279,7 +279,10 @@ async fn head_upload(
     auth: Option<&Event>,
 ) -> (u16, String) {
     let mut req = reqwest::Client::new()
-        .request(reqwest::Method::HEAD, format!("{}/upload", http_base(relay)))
+        .request(
+            reqwest::Method::HEAD,
+            format!("{}/upload", http_base(relay)),
+        )
         .header("x-sha-256", sha)
         .header("x-content-length", len.to_string());
     if let Some(auth) = auth {
@@ -386,7 +389,11 @@ async fn raw_http_exchange(port: u16, request: &[u8], truncate_after: bool) -> S
 /// Deterministic pseudo-random blob content of `len` bytes, unique per seed.
 fn blob_bytes(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
-        .map(|i| (seed as usize).wrapping_mul(31).wrapping_add(i.wrapping_mul(2654435761)) as u8)
+        .map(|i| {
+            (seed as usize)
+                .wrapping_mul(31)
+                .wrapping_add(i.wrapping_mul(2654435761)) as u8
+        })
         .collect()
 }
 
@@ -456,7 +463,10 @@ async fn exit1_disabled_is_noop() {
     let (put_status, _, _) = put_blob(&relay, data, &sha, &auth).await;
     assert_eq!(put_status, 404, "exit1: PUT /upload must 404 when disabled");
     let (head_status, _) = head_upload(&relay, &sha, 512, Some(&auth)).await;
-    assert_eq!(head_status, 404, "exit1: HEAD /upload must 404 when disabled");
+    assert_eq!(
+        head_status, 404,
+        "exit1: HEAD /upload must 404 when disabled"
+    );
 
     // NIP-11 must NOT advertise private repos.
     let doc = nip11_doc(&relay).await;
@@ -476,7 +486,7 @@ async fn exit1_disabled_is_noop() {
 async fn exit2_open_mode_e2e() {
     // Exercises OPEN mode specifically — opt in explicitly (the shipped
     // default is whitelist since WP-E).
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_REGISTRATION_MODE", "open")]).await;
+    let relay = TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_REGISTRATION_MODE", "open")]).await;
     let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
@@ -512,7 +522,11 @@ async fn exit2_open_mode_e2e() {
             .identifier(&alias),
     )
     .await;
-    assert_eq!(served.len(), 1, "exit2: registration must round-trip via REQ");
+    assert_eq!(
+        served.len(),
+        1,
+        "exit2: registration must round-trip via REQ"
+    );
     assert_eq!(served[0].id, reg.id);
     assert_eq!(served[0].tags, reg.tags, "exit2: served tags intact");
 
@@ -533,11 +547,17 @@ async fn exit2_open_mode_e2e() {
         future_expiration(),
     );
     let (status, reason) = head_upload(&relay, &sha1, blob1.len() as u64, Some(&auth1)).await;
-    assert_eq!(status, 200, "exit2: preflight must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit2: preflight must be 200; X-Reason: {reason}"
+    );
 
     // PUT both blobs; descriptors must carry the committed sha + size.
     let (status, descriptor, reason) = put_blob(&relay, blob1.clone(), &sha1, &auth1).await;
-    assert_eq!(status, 200, "exit2: PUT blob1 must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit2: PUT blob1 must be 200; X-Reason: {reason}"
+    );
     assert_eq!(descriptor["sha256"], sha1.as_str());
     assert_eq!(descriptor["size"], blob1.len() as u64);
     assert!(
@@ -554,7 +574,10 @@ async fn exit2_open_mode_e2e() {
         future_expiration(),
     );
     let (status, descriptor2, reason) = put_blob(&relay, blob2.clone(), &sha2, &auth2).await;
-    assert_eq!(status, 200, "exit2: PUT blob2 must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit2: PUT blob2 must be 200; X-Reason: {reason}"
+    );
     assert_eq!(descriptor2["sha256"], sha2.as_str());
 
     // GET both back, hash-verified, public (no auth).
@@ -577,7 +600,10 @@ async fn exit2_open_mode_e2e() {
         t0,
     );
     let (accepted, message) = publish_with_result(relay.url(), &edition1).await;
-    assert!(accepted, "exit2: first 30641 must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit2: first 30641 must be accepted; got {message:?}"
+    );
 
     // Second edition (strictly newer) referencing a NEW blob3 + blob2,
     // dropping blob1 from the live state.
@@ -592,7 +618,10 @@ async fn exit2_open_mode_e2e() {
         future_expiration(),
     );
     let (status, _, reason) = put_blob(&relay, blob3.clone(), &sha3, &auth3).await;
-    assert_eq!(status, 200, "exit2: PUT blob3 must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit2: PUT blob3 must be 200; X-Reason: {reason}"
+    );
 
     let edition2 = state_root_event(
         &writer,
@@ -603,7 +632,10 @@ async fn exit2_open_mode_e2e() {
         t0 + 5,
     );
     let (accepted, message) = publish_with_result(relay.url(), &edition2).await;
-    assert!(accepted, "exit2: second 30641 must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit2: second 30641 must be accepted; got {message:?}"
+    );
 
     // Addressable replacement: REQ serves ONLY the latest edition.
     let editions = fetch_from(
@@ -637,7 +669,9 @@ async fn exit2_open_mode_e2e() {
 async fn exit3_wrap_admission() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let writer = Keys::generate();
     let alias = random_alias();
     register_alias(&relay, &tenant, &writer, &alias).await;
@@ -755,7 +789,8 @@ async fn exit3_wrap_admission() {
     let want = ledger_after_wrap + control.as_json().len() as i64;
     let ledger_after_control = poll_until(want, || global_ledger_bytes(relay.url())).await;
     assert_eq!(
-        ledger_after_control, want,
+        ledger_after_control,
+        want,
         "exit3: the ledger must move by the STORED 1059 only — the ephemeral \
          21059 must never be quota-charged. before={ledger_after_wrap} \
          control_1059_bytes={} ephemeral_21059_bytes={}",
@@ -775,11 +810,17 @@ async fn exit3_wrap_admission() {
     // that references a STORED event must still be rejected (never the public
     // related-event path). This is what makes deregistered rekey addresses
     // unfloodable between rotations (§3.2: outer author must be registered).
+    // It carries exactly one `p` tag: since nostr-sdk 0.45 the relay refuses
+    // a 1059 without one before any write policy runs, and this case must
+    // reach the private arm to test it.
     let referenced_junk = EventBuilder::new(
         Kind::Custom(1059),
         "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
     )
-    .tags(vec![Tag::event(wrap.id)])
+    .tags(vec![
+        Tag::event(wrap.id),
+        Tag::public_key(Keys::generate().public_key()),
+    ])
     .finalize(&Keys::generate())
     .expect("sign junk wrap");
     let (accepted, message) = publish_with_result(relay.url(), &referenced_junk).await;
@@ -802,7 +843,7 @@ async fn exit4_quota_and_size_caps() {
     // still holds against the defaults.)
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "4096"),
         ("NGIT_GRASP_P_MAX_BLOB_BYTES", "8192"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
@@ -825,7 +866,10 @@ async fn exit4_quota_and_size_caps() {
         future_expiration(),
     );
     let (status, _, reason) = put_blob(&relay, blob1.clone(), &sha1, &auth1).await;
-    assert_eq!(status, 200, "exit4: blob1 must fit the quota; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit4: blob1 must fit the quota; X-Reason: {reason}"
+    );
 
     // Blob #2 (2 KiB) blows the repo quota: 507 at preflight AND on PUT.
     let blob2 = blob_bytes(42, 2048);
@@ -844,7 +888,10 @@ async fn exit4_quota_and_size_caps() {
         "exit4: over-quota preflight must be 507; X-Reason: {reason}"
     );
     let (status, _, reason) = put_blob(&relay, blob2, &sha2, &auth2).await;
-    assert_eq!(status, 507, "exit4: over-quota PUT must be 507; X-Reason: {reason}");
+    assert_eq!(
+        status, 507,
+        "exit4: over-quota PUT must be 507; X-Reason: {reason}"
+    );
     let (status, _) = get_blob(&relay, &sha2).await;
     assert_eq!(status, 404, "exit4: the 507'd blob must not be stored");
 
@@ -937,7 +984,10 @@ async fn exit4_quota_and_size_caps() {
         response.lines().next()
     );
     let (status, _) = get_blob(&relay, &short_sha).await;
-    assert_eq!(status, 404, "exit4: aborted upload must leave no blob behind");
+    assert_eq!(
+        status, 404,
+        "exit4: aborted upload must leave no blob behind"
+    );
 
     relay.stop().await;
 }
@@ -953,7 +1003,9 @@ async fn exit5_blossom_auth_failures() {
     // Alias B: a different tenant with its own write key.
     let tenant_b = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_a, &tenant_b]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
 
     let writer_a = Keys::generate();
     let aux_a = Keys::generate();
@@ -987,7 +1039,10 @@ async fn exit5_blossom_auth_failures() {
         future_expiration(),
     );
     let (status, reason) = head_upload(&relay, &sha, len, Some(&good)).await;
-    assert_eq!(status, 200, "exit5 baseline must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit5 baseline must be 200; X-Reason: {reason}"
+    );
 
     // (a) Missing Authorization header → 401.
     let (status, _) = head_upload(&relay, &sha, len, None).await;
@@ -999,7 +1054,10 @@ async fn exit5_blossom_auth_failures() {
     assert_ne!(tampered_json, good.as_json(), "tamper must change the JSON");
     let tampered = Event::from_json(&tampered_json).expect("tampered JSON still parses");
     let (status, reason) = head_upload(&relay, &sha, len, Some(&tampered)).await;
-    assert_eq!(status, 401, "exit5: bad sig must be 401; X-Reason: {reason}");
+    assert_eq!(
+        status, 401,
+        "exit5: bad sig must be 401; X-Reason: {reason}"
+    );
 
     // (c) Expired → 401: expiration tag in the past.
     let expired = blossom_auth_event(
@@ -1011,7 +1069,10 @@ async fn exit5_blossom_auth_failures() {
         Timestamp::now().as_secs() - 60,
     );
     let (status, reason) = head_upload(&relay, &sha, len, Some(&expired)).await;
-    assert_eq!(status, 401, "exit5: expired auth must be 401; X-Reason: {reason}");
+    assert_eq!(
+        status, 401,
+        "exit5: expired auth must be 401; X-Reason: {reason}"
+    );
 
     // (d) Wrong-alias key → 403: writer_b signs an auth attributed to alias A.
     let wrong_key = blossom_auth_event(
@@ -1023,7 +1084,10 @@ async fn exit5_blossom_auth_failures() {
         future_expiration(),
     );
     let (status, reason) = head_upload(&relay, &sha, len, Some(&wrong_key)).await;
-    assert_eq!(status, 403, "exit5: foreign w key must be 403; X-Reason: {reason}");
+    assert_eq!(
+        status, 403,
+        "exit5: foreign w key must be 403; X-Reason: {reason}"
+    );
 
     // (e) Aux keys cannot PUT → 403 (read-side publish keys only).
     let aux_auth = blossom_auth_event(
@@ -1035,7 +1099,10 @@ async fn exit5_blossom_auth_failures() {
         future_expiration(),
     );
     let (status, reason) = head_upload(&relay, &sha, len, Some(&aux_auth)).await;
-    assert_eq!(status, 403, "exit5: aux key upload must be 403; X-Reason: {reason}");
+    assert_eq!(
+        status, 403,
+        "exit5: aux key upload must be 403; X-Reason: {reason}"
+    );
 
     // (f) x-tag mismatch → 400: auth commits to a different sha than the
     // operation targets.
@@ -1049,7 +1116,10 @@ async fn exit5_blossom_auth_failures() {
         future_expiration(),
     );
     let (status, reason) = head_upload(&relay, &sha, len, Some(&mismatched)).await;
-    assert_eq!(status, 400, "exit5: x mismatch must be 400; X-Reason: {reason}");
+    assert_eq!(
+        status, 400,
+        "exit5: x mismatch must be 400; X-Reason: {reason}"
+    );
 
     relay.stop().await;
 }
@@ -1063,7 +1133,7 @@ async fn exit6_whitelist_and_pow_modes() {
     // --- whitelist mode -----------------------------------------------------
     let listed = Keys::generate();
     let listed_npub = listed.public_key().to_bech32().expect("npub");
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_MODE", "whitelist"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", listed_npub.as_str()),
     ])
@@ -1096,7 +1166,11 @@ async fn exit6_whitelist_and_pow_modes() {
     let reg = registration_event(
         &listed,
         &listed_alias,
-        &[key_entry(&listed_writer, &listed.public_key(), &listed_alias)],
+        &[key_entry(
+            &listed_writer,
+            &listed.public_key(),
+            &listed_alias,
+        )],
         &[],
         &relay.domain(),
         None,
@@ -1109,7 +1183,7 @@ async fn exit6_whitelist_and_pow_modes() {
     relay.stop().await;
 
     // --- pow mode (8 bits for test speed) -----------------------------------
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_MODE", "pow"),
         ("NGIT_GRASP_P_POW_BITS", "8"),
     ])
@@ -1174,7 +1248,9 @@ async fn exit7_key_conflicts_and_rotation() {
     let tenant1 = Keys::generate();
     let tenant2 = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant1, &tenant2]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
 
     let key_old = Keys::generate();
@@ -1266,7 +1342,10 @@ async fn exit7_key_conflicts_and_rotation() {
         Some(t0 + 2),
     );
     let (accepted, message) = publish_with_result(relay.url(), &steal_alias).await;
-    assert!(!accepted, "exit7: cross-tenant alias claim must be rejected");
+    assert!(
+        !accepted,
+        "exit7: cross-tenant alias claim must be rejected"
+    );
     assert!(
         message.contains("restricted:") && message.contains("alias already registered"),
         "exit7: alias-conflict message; got {message:?}"
@@ -1283,7 +1362,10 @@ async fn exit7_key_conflicts_and_rotation() {
         Some(t0 + 5),
     );
     let (accepted, message) = publish_with_result(relay.url(), &rotation).await;
-    assert!(accepted, "exit7: rotation must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit7: rotation must be accepted; got {message:?}"
+    );
 
     // (d) key_old is now free: tenant2 can claim it for alias2.
     let reclaim = registration_event(
@@ -1311,7 +1393,9 @@ async fn exit7_key_conflicts_and_rotation() {
 async fn exit8_registration_deletion_liveness() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let writer = Keys::generate();
     let alias = random_alias();
     register_alias(&relay, &tenant, &writer, &alias).await;
@@ -1355,7 +1439,10 @@ async fn exit8_registration_deletion_liveness() {
             break;
         }
     }
-    assert!(deleted, "exit8: 30640 still served 10s after NIP-09 deletion");
+    assert!(
+        deleted,
+        "exit8: 30640 still served 10s after NIP-09 deletion"
+    );
 
     // A new 30641 edition is now rejected by the liveness check.
     let state2 = state_root_event(
@@ -1398,7 +1485,9 @@ async fn exit9_registration_deletion_frees_key_claims() {
     let squatter = Keys::generate();
     let owner = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &owner]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let squat_key = Keys::generate();
     let owner_writer = Keys::generate();
     let domain = relay.domain();
@@ -1410,7 +1499,11 @@ async fn exit9_registration_deletion_frees_key_claims() {
     let squat = registration_event(
         &squatter,
         &squat_alias,
-        &[key_entry(&Keys::generate(), &squatter.public_key(), &squat_alias)],
+        &[key_entry(
+            &Keys::generate(),
+            &squatter.public_key(),
+            &squat_alias,
+        )],
         &[key_entry(&squat_key, &squatter.public_key(), &squat_alias)],
         &domain,
         Some(t0),
@@ -1430,7 +1523,10 @@ async fn exit9_registration_deletion_frees_key_claims() {
         Some(t0 + 1),
     );
     let (accepted, message) = publish_with_result(relay.url(), &widen).await;
-    assert!(!accepted, "exit9: registration listing the squatted key must be rejected");
+    assert!(
+        !accepted,
+        "exit9: registration listing the squatted key must be rejected"
+    );
     assert!(
         message.contains("write key already registered"),
         "exit9: key-conflict message; got {message:?}"
@@ -1475,7 +1571,9 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
     let tenant = Keys::generate();
     let other = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant, &other]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let w1 = Keys::generate();
     let w2 = Keys::generate();
     let alias = random_alias();
@@ -1612,7 +1710,9 @@ async fn exit11_registration_conflict_merge() {
     let early_tenant = Keys::generate();
     let third = Keys::generate();
     let whitelist = whitelist_npubs(&[&late_tenant, &early_tenant, &third]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
 
     let late_writer = Keys::generate();
@@ -1630,7 +1730,10 @@ async fn exit11_registration_conflict_merge() {
         Some(t0 + 100),
     );
     let (accepted, message) = publish_with_result(relay.url(), &late_reg).await;
-    assert!(accepted, "exit11: first-arriving registration failed: {message:?}");
+    assert!(
+        accepted,
+        "exit11: first-arriving registration failed: {message:?}"
+    );
 
     // (b) The EARLIER-created registration arrives second and must WIN the
     // deterministic merge (pre-!11 it was rejected as "alias already
@@ -1700,7 +1803,11 @@ async fn exit11_registration_conflict_merge() {
     let challenge = registration_event(
         &challenger,
         &alias,
-        &[key_entry(&Keys::generate(), &challenger.public_key(), &alias)],
+        &[key_entry(
+            &Keys::generate(),
+            &challenger.public_key(),
+            &alias,
+        )],
         &[],
         &domain,
         Some(t0 + 300),
@@ -1759,7 +1866,7 @@ async fn exit13_conflict_winner_exempt_from_node_local_quota() {
     let squatter = Keys::generate();
     let victim = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &victim]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "4096"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
@@ -1782,7 +1889,10 @@ async fn exit13_conflict_winner_exempt_from_node_local_quota() {
         Some(t0 + 100),
     );
     let (accepted, message) = publish_with_result(relay.url(), &squat).await;
-    assert!(accepted, "exit13: squatter registration failed: {message:?}");
+    assert!(
+        accepted,
+        "exit13: squatter registration failed: {message:?}"
+    );
 
     let mut saturated = false;
     for _ in 0..24 {
@@ -1797,7 +1907,10 @@ async fn exit13_conflict_winner_exempt_from_node_local_quota() {
             break;
         }
     }
-    assert!(saturated, "exit13: alias quota must saturate within the loop");
+    assert!(
+        saturated,
+        "exit13: alias quota must saturate within the loop"
+    );
 
     // The genuine earlier registration must STILL win the merge here —
     // pre-!11-fix this came back "restricted: quota exceeded" and the node
@@ -1832,7 +1945,7 @@ async fn exit13_conflict_winner_exempt_from_node_local_quota() {
 async fn exit12_speculative_blob_claims_charged_and_released() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         // One retained edition + immediate GC so a superseded edition's
         // speculative claim is collectable within the test bound.
         ("NGIT_GRASP_P_STATE_HISTORY_EDITIONS", "1"),
@@ -1863,7 +1976,14 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     // and the declared bytes are charged (speculative claim).
     let t0 = Timestamp::now().as_secs();
     let fake_sha = sha256_hex(&blob_bytes(91, 64));
-    let v1 = state_root_event(&writer, &tenant.public_key(), &alias, (&fake_sha, 4096), &[], t0);
+    let v1 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&fake_sha, 4096),
+        &[],
+        t0,
+    );
     let (accepted, message) = publish_with_result(relay.url(), &v1).await;
     assert!(accepted, "exit12: v1 must be accepted; got {message:?}");
     let v1_bytes = v1.as_json().len() as i64;
@@ -1902,7 +2022,14 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     // (c) v2 supersedes v1 (ring keeps 1 edition): v1's fake ref loses its
     // alias, GC (grace 0) deletes the claim and refunds the 4096.
     let sha2 = sha256_hex(&blob_bytes(93, 64));
-    let v2 = state_root_event(&writer, &tenant.public_key(), &alias, (&sha2, 100), &[], t0 + 2);
+    let v2 = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha2, 100),
+        &[],
+        t0 + 2,
+    );
     let (accepted, message) = publish_with_result(relay.url(), &v2).await;
     assert!(accepted, "exit12: v2 must be accepted; got {message:?}");
     let v2_bytes = v2.as_json().len() as i64;
@@ -1925,7 +2052,6 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     relay.stop().await;
 }
 
-
 // ============================================================================
 // Exit test 14 — rotation does not decay §3.2 conflict priority (verify FA)
 // ============================================================================
@@ -1941,7 +2067,9 @@ async fn exit14_rotation_preserves_conflict_anchor() {
     let victim = Keys::generate();
     let squatter = Keys::generate();
     let whitelist = whitelist_npubs(&[&victim, &squatter]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
 
     let victim_w1 = Keys::generate();
@@ -1972,7 +2100,10 @@ async fn exit14_rotation_preserves_conflict_anchor() {
         Some(t0 + 100),
     );
     let (accepted, _) = publish_with_result(relay.url(), &squat).await;
-    assert!(!accepted, "exit14: the later squatter registration must lose");
+    assert!(
+        !accepted,
+        "exit14: the later squatter registration must lose"
+    );
 
     // The victim rotates at t2 = t0+200 (new writer key, strictly newer).
     let reg2 = registration_event(
@@ -2004,8 +2135,15 @@ async fn exit14_rotation_preserves_conflict_anchor() {
         Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
     )
     .await;
-    assert_eq!(served.len(), 1, "exit14: exactly the victim's edition served");
-    assert_eq!(served[0].id, reg2.id, "exit14: the victim's rotation stays live");
+    assert_eq!(
+        served.len(),
+        1,
+        "exit14: exactly the victim's edition served"
+    );
+    assert_eq!(
+        served[0].id, reg2.id,
+        "exit14: the victim's rotation stays live"
+    );
 
     // …and the seat is fully functional: 30641 + 1059 still accepted.
     let sha = sha256_hex(&blob_bytes(61, 256));
@@ -2018,10 +2156,16 @@ async fn exit14_rotation_preserves_conflict_anchor() {
         t0 + 300,
     );
     let (accepted, message) = publish_with_result(relay.url(), &state).await;
-    assert!(accepted, "exit14: post-attack 30641 must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit14: post-attack 30641 must be accepted; got {message:?}"
+    );
     let wrap = wrap_event(&victim_w2, 1059);
     let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
-    assert!(accepted, "exit14: post-attack 1059 must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit14: post-attack 1059 must be accepted; got {message:?}"
+    );
 
     relay.stop().await;
 }
@@ -2037,7 +2181,9 @@ async fn exit15_same_second_conflict_tie_breaks_by_event_id() {
     let tenant_a = Keys::generate();
     let tenant_b = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_a, &tenant_b]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
     let t0 = Timestamp::now().as_secs() - 600;
 
@@ -2067,7 +2213,10 @@ async fn exit15_same_second_conflict_tie_breaks_by_event_id() {
     let alias1 = random_alias();
     let (loser1, winner1) = split(mk(&tenant_a, &alias1), mk(&tenant_b, &alias1));
     let (accepted, message) = publish_with_result(relay.url(), &loser1).await;
-    assert!(accepted, "exit15: first arrival must be accepted: {message:?}");
+    assert!(
+        accepted,
+        "exit15: first arrival must be accepted: {message:?}"
+    );
     let (accepted, message) = publish_with_result(relay.url(), &winner1).await;
     assert!(
         accepted,
@@ -2096,7 +2245,10 @@ async fn exit15_same_second_conflict_tie_breaks_by_event_id() {
     let alias2 = random_alias();
     let (loser2, winner2) = split(mk(&tenant_a, &alias2), mk(&tenant_b, &alias2));
     let (accepted, message) = publish_with_result(relay.url(), &winner2).await;
-    assert!(accepted, "exit15: winner-first must be accepted: {message:?}");
+    assert!(
+        accepted,
+        "exit15: winner-first must be accepted: {message:?}"
+    );
     let (accepted, message) = publish_with_result(relay.url(), &loser2).await;
     assert!(
         !accepted && message.contains("alias already registered"),
@@ -2108,7 +2260,10 @@ async fn exit15_same_second_conflict_tie_breaks_by_event_id() {
     )
     .await;
     assert_eq!(served.len(), 1);
-    assert_eq!(served[0].id, winner2.id, "exit15: same winner in both orders");
+    assert_eq!(
+        served[0].id, winner2.id,
+        "exit15: same winner in both orders"
+    );
 
     relay.stop().await;
 }
@@ -2128,7 +2283,7 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
     let squatter = Keys::generate();
     let winner = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &winner]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_MAX_ALIASES_PER_TENANT", "1"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
@@ -2154,7 +2309,10 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
         Some(t0 + 100),
     );
     let (accepted, message) = publish_with_result(relay.url(), &squat).await;
-    assert!(accepted, "exit16: squatter registration failed: {message:?}");
+    assert!(
+        accepted,
+        "exit16: squatter registration failed: {message:?}"
+    );
 
     // The winner is AT the limit with an unrelated alias.
     let filler = random_alias();
@@ -2192,7 +2350,11 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
     let genuine = registration_event(
         &winner,
         &contested,
-        &[key_entry(&contested_writer, &winner.public_key(), &contested)],
+        &[key_entry(
+            &contested_writer,
+            &winner.public_key(),
+            &contested,
+        )],
         &[],
         &domain,
         Some(t0),
@@ -2208,7 +2370,9 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
     for _ in 0..50 {
         let events = fetch_from(
             relay.url(),
-            Filter::new().kind(Kind::Custom(30640)).identifier(&contested),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .identifier(&contested),
         )
         .await;
         if events.len() == 1 && events[0].id == genuine.id {
@@ -2217,7 +2381,10 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(converged, "exit16: the contested alias must resolve to the winner");
+    assert!(
+        converged,
+        "exit16: the contested alias must resolve to the winner"
+    );
 
     // The accounting was NOT exempted: the winner's tenant now holds both
     // aliases (overshoot by exactly one) and both seats are live — a 30641
@@ -2257,7 +2424,7 @@ async fn exit17_eviction_releases_loser_footprint() {
     let squatter = Keys::generate();
     let victim = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &victim]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "16384"),
         // Short (non-zero) grace so the post-eviction spec-release sample is
         // race-free while GC still collects within the test bound.
@@ -2294,7 +2461,10 @@ async fn exit17_eviction_releases_loser_footprint() {
         Some(t0 + 100),
     );
     let (accepted, message) = publish_with_result(relay.url(), &squat).await;
-    assert!(accepted, "exit17: squatter registration failed: {message:?}");
+    assert!(
+        accepted,
+        "exit17: squatter registration failed: {message:?}"
+    );
 
     let stored_blob = blob_bytes(63, 512);
     let stored_sha = sha256_hex(&stored_blob);
@@ -2307,7 +2477,10 @@ async fn exit17_eviction_releases_loser_footprint() {
         future_expiration(),
     );
     let (status, _, reason) = put_blob(&relay, stored_blob.clone(), &stored_sha, &auth).await;
-    assert_eq!(status, 200, "exit17: squatter blob PUT failed; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit17: squatter blob PUT failed; X-Reason: {reason}"
+    );
 
     // The 30641 declares a never-uploaded 4096-byte blob (speculatively
     // charged) AND references the stored blob — an unreferenced PUT blob is
@@ -2339,7 +2512,10 @@ async fn exit17_eviction_releases_loser_footprint() {
             break;
         }
     }
-    assert!(saturated, "exit17: alias quota must saturate within the loop");
+    assert!(
+        saturated,
+        "exit17: alias quota must saturate within the loop"
+    );
     let g_before = global_ledger().await;
     assert!(g_before > 0);
 
@@ -2422,7 +2598,10 @@ async fn exit17_eviction_releases_loser_footprint() {
     // race-free against the GC collection.
     let wrap2 = wrap_event(&victim_writer, 1059);
     let (accepted, message) = publish_with_result(relay.url(), &wrap2).await;
-    assert!(accepted, "exit17: trailing wrap must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit17: trailing wrap must be accepted; got {message:?}"
+    );
     let wrap2_bytes = wrap2.as_json().len() as i64;
 
     // (c) The loser's stored-blob claim was stripped at eviction: after GC
@@ -2448,7 +2627,10 @@ async fn exit17_eviction_releases_loser_footprint() {
         );
     }
     let (status, _) = get_blob(&relay, &stored_sha).await;
-    assert_eq!(status, 404, "exit17: the loser's stripped blob must be GC'd");
+    assert_eq!(
+        status, 404,
+        "exit17: the loser's stripped blob must be GC'd"
+    );
     let (status, body) = get_blob(&relay, &winner_sha).await;
     assert_eq!(status, 200, "exit17: the winner's blob must survive GC");
     assert_eq!(body, winner_blob);
@@ -2470,7 +2652,9 @@ async fn exit17_eviction_releases_loser_footprint() {
 async fn exit18_kind5_death_releases_speculative_footprint() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
 
     let writer = Keys::generate();
@@ -2619,7 +2803,10 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(deleted, "exit18: the honored deletion must remove the 30640");
+    assert!(
+        deleted,
+        "exit18: the honored deletion must remove the 30640"
+    );
     let state2 = state_root_event(
         &writer,
         &tenant.public_key(),
@@ -2647,7 +2834,7 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
 async fn exit19_upload_preflight_nets_pending_spec_release() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "8192"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
@@ -2664,16 +2851,12 @@ async fn exit19_upload_preflight_nets_pending_spec_release() {
     let data = blob_bytes(68, 4096);
     let sha = sha256_hex(&data);
     let t0 = Timestamp::now().as_secs();
-    let declare = state_root_event(
-        &writer,
-        &tenant.public_key(),
-        &alias,
-        (&sha, 4096),
-        &[],
-        t0,
-    );
+    let declare = state_root_event(&writer, &tenant.public_key(), &alias, (&sha, 4096), &[], t0);
     let (accepted, message) = publish_with_result(relay.url(), &declare).await;
-    assert!(accepted, "exit19: declaration must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit19: declaration must be accepted; got {message:?}"
+    );
 
     // Preflight must net the pending spec release for the same (tenant,
     // alias): effective additional bytes = 4096 - 4096 = 0 → 200, not 507.
@@ -2717,7 +2900,9 @@ async fn exit20_conflict_alert_deduped_on_replay() {
     let winner = Keys::generate();
     let loser = Keys::generate();
     let whitelist = whitelist_npubs(&[&winner, &loser]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
     let t0 = Timestamp::now().as_secs() - 600;
 
@@ -2821,7 +3006,7 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     let tenant_v = Keys::generate();
     let tenant_a = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_v, &tenant_a]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         // One retained edition so v2 flushes v1's reference (cf. exit12).
         ("NGIT_GRASP_P_STATE_HISTORY_EDITIONS", "1"),
         ("NGIT_GRASP_P_GC_GRACE_SECS", "0"),
@@ -2874,7 +3059,11 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     let (accepted, message) = publish_with_result(relay.url(), &v1).await;
     assert!(accepted, "exit21: v1 must be accepted; got {message:?}");
     let g1 = poll_gauge(g0 + v1.as_json().len() as i64 + 4096).await;
-    assert_eq!(g1, g0 + v1.as_json().len() as i64 + 4096, "exit21: V charged");
+    assert_eq!(
+        g1,
+        g0 + v1.as_json().len() as i64 + 4096,
+        "exit21: V charged"
+    );
 
     // A references the same sha: NOT charged again (single-charge dedup —
     // second referrers stay free).
@@ -2956,7 +3145,9 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
     let tenant_b = Keys::generate();
     let tenant_c = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant1, &tenant2, &tenant_b, &tenant_c]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
     let t0 = Timestamp::now().as_secs() - 600;
 
@@ -3045,7 +3236,10 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
         Some(t0 + 200),
     );
     let (accepted, message) = publish_with_result(relay.url(), &reg_c).await;
-    assert!(accepted, "exit22: tenant_c registration failed: {message:?}");
+    assert!(
+        accepted,
+        "exit22: tenant_c registration failed: {message:?}"
+    );
 
     // tenant_b's alias_b: edition 1 (t2) then a live rotation (t4).
     let reg_b1 = registration_event(
@@ -3067,7 +3261,10 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
         Some(t0 + 240),
     );
     let (accepted, message) = publish_with_result(relay.url(), &reg_b2).await;
-    assert!(accepted, "exit22: tenant_b live edition failed: {message:?}");
+    assert!(
+        accepted,
+        "exit22: tenant_b live edition failed: {message:?}"
+    );
 
     // A STALE edition of alias_b (t3, between t2 and t4) that ALSO claims
     // tenant_c's key: it loses the key conflict (t1 < t3) and must NOT take
@@ -3099,7 +3296,10 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
     )
     .await;
     assert_eq!(served.len(), 1, "exit22: the live coordinate must survive");
-    assert_eq!(served[0].id, reg_b2.id, "exit22: the live edition is served");
+    assert_eq!(
+        served[0].id, reg_b2.id,
+        "exit22: the live edition is served"
+    );
 
     // …and the seat is fully functional: 30641 + 1059 still accepted.
     let sha = sha256_hex(&blob_bytes(71, 256));
@@ -3147,7 +3347,9 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
 async fn exit23_duplicate_sha_in_one_edition_charged_once() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
 
     let writer = Keys::generate();
     let alias = random_alias();
@@ -3175,7 +3377,10 @@ async fn exit23_duplicate_sha_in_one_edition_charged_once() {
         t0,
     );
     let (accepted, message) = publish_with_result(relay.url(), &edition).await;
-    assert!(accepted, "exit23: duplicate-sha edition must be accepted; got {message:?}");
+    assert!(
+        accepted,
+        "exit23: duplicate-sha edition must be accepted; got {message:?}"
+    );
 
     let mut g1 = -1;
     let want = g0 + edition.as_json().len() as i64 + 4096;
@@ -3211,7 +3416,7 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     let squatter = Keys::generate();
     let victim = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &victim]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "8192"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
@@ -3236,7 +3441,10 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     };
 
     // The squatter holds X (later created_at) and Y.
-    for (alias, writer, at) in [(&alias_x, &squat_wx, t0 + 100), (&alias_y, &squat_wy, t0 + 110)] {
+    for (alias, writer, at) in [
+        (&alias_x, &squat_wx, t0 + 100),
+        (&alias_y, &squat_wy, t0 + 110),
+    ] {
         let reg = registration_event(
             &squatter,
             alias,
@@ -3246,7 +3454,10 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
             Some(at),
         );
         let (accepted, message) = publish_with_result(relay.url(), &reg).await;
-        assert!(accepted, "exit24: squatter registration failed: {message:?}");
+        assert!(
+            accepted,
+            "exit24: squatter registration failed: {message:?}"
+        );
     }
 
     // X declares the never-uploaded 4096-byte sha (speculatively charged to
@@ -3373,7 +3584,9 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     let tenant_v = Keys::generate();
     let tenant_a = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_v, &tenant_a]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
 
     let writer_v = Keys::generate();
     let writer_a = Keys::generate();
@@ -3418,7 +3631,11 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     let (accepted, message) = publish_with_result(relay.url(), &v1).await;
     assert!(accepted, "exit25: v1 failed: {message:?}");
     let g1 = poll_gauge(g0 + v1.as_json().len() as i64 + 4096).await;
-    assert_eq!(g1, g0 + v1.as_json().len() as i64 + 4096, "exit25: V charged");
+    assert_eq!(
+        g1,
+        g0 + v1.as_json().len() as i64 + 4096,
+        "exit25: V charged"
+    );
 
     // A references the same sha: not charged again (dedup).
     let a1 = state_root_event(
@@ -3445,7 +3662,10 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
         future_expiration(),
     );
     let (status, reason) = delete_blob(&relay, &fake_sha, &delete_auth).await;
-    assert_eq!(status, 200, "exit25: DELETE must be 200; X-Reason: {reason}");
+    assert_eq!(
+        status, 200,
+        "exit25: DELETE must be 200; X-Reason: {reason}"
+    );
     let g3 = poll_gauge(g2 - 4096).await;
     assert_eq!(
         g3,
@@ -3488,7 +3708,7 @@ async fn exit26_client_write_rate_limit() {
     let tenant = Keys::generate();
     let tenant2 = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant, &tenant2]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_WRITE_RATE_CAPACITY", "3"),
         ("NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN", "1"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
@@ -3663,7 +3883,7 @@ async fn exit26_client_write_rate_limit() {
 async fn exit27_registration_replace_cadence() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY", "2"),
         ("NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR", "1"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
@@ -3794,7 +4014,9 @@ async fn exit28_exact_host_registration_tags() {
     let tenants: Vec<Keys> = (0..5).map(|_| Keys::generate()).collect();
     let tenant_refs: Vec<&Keys> = tenants.iter().collect();
     let whitelist = whitelist_npubs(&tenant_refs);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let domain = relay.domain();
 
     let mut tenant_iter = tenants.iter();
@@ -3991,7 +4213,7 @@ async fn exit29_denylisted_get_head_and_upload_preflight_are_451() {
     // boot (warn + empty) while the present file is enforced.
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         (
             "NGIT_GRASP_P_DENYLIST_PATH",
             &format!("{},/nonexistent/grasp-p-denylist.txt", deny_path.display()),
@@ -4077,7 +4299,7 @@ async fn exit30_reload_purge_on_add() {
     std::fs::write(&deny_path, "# initially empty\n").expect("write denylist");
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         (
             "NGIT_GRASP_P_DENYLIST_PATH",
             &deny_path.display().to_string(),
@@ -4180,7 +4402,7 @@ async fn exit31_reload_removal_unblocks_read_but_bytes_stay_gone() {
     std::fs::write(&deny_path, "# initially empty\n").expect("write denylist");
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         (
             "NGIT_GRASP_P_DENYLIST_PATH",
             &deny_path.display().to_string(),
@@ -4247,7 +4469,9 @@ async fn exit31_reload_removal_unblocks_read_but_bytes_stay_gone() {
 async fn exit32_kind1984_report_intake() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
     let writer = Keys::generate();
     let alias = random_alias();
     let registration = register_alias(&relay, &tenant, &writer, &alias).await;
@@ -4321,12 +4545,9 @@ async fn exit32_kind1984_report_intake() {
 async fn exit33_cadence_rejected_replacement_held_and_retried() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY", "1"),
-        (
-            "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR",
-            "3600",
-        ),
+        ("NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR", "3600"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
     .await;
@@ -4419,12 +4640,9 @@ async fn exit33_cadence_rejected_replacement_held_and_retried() {
 async fn exit34_cadence_rejected_newest_only_convergence() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY", "1"),
-        (
-            "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR",
-            "1800",
-        ),
+        ("NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR", "1800"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
     ])
     .await;
@@ -4568,7 +4786,7 @@ async fn exit35_sybil_soak_under_whitelist() {
     // ---- Leg 1: registration flood against a whitelist relay -------------
     let legit = Keys::generate();
     let legit_npub = legit.public_key().to_bech32().expect("npub");
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_REGISTRATION_MODE", "whitelist"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", legit_npub.as_str()),
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "1048576"),
@@ -4701,7 +4919,7 @@ async fn exit35_sybil_soak_under_whitelist() {
     // 51 tenants (50 flood + 1 post-flood probe), each capped at 8 KiB.
     let tenants: Vec<Keys> = (0..=SYBILS).map(|_| Keys::generate()).collect();
     let whitelist = whitelist_npubs(&tenants.iter().collect::<Vec<_>>());
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "8192"),
         ("NGIT_GRASP_P_QUOTA_TENANT_BYTES", "8192"),
@@ -4824,7 +5042,7 @@ async fn assert_tagless_wrap_admitted(wrap_kind: u16, extra_env: &[(&str, &str)]
     let whitelist = whitelist_npubs(&[&tenant]);
     let mut env: Vec<(&str, &str)> = vec![("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())];
     env.extend_from_slice(extra_env);
-    let relay = TestRelay::start_with_private_repos(&env).await;
+    let relay = TestRelay::start_with_grasp_p(&env).await;
 
     let writer = Keys::generate();
     let alias = random_alias();
@@ -4877,9 +5095,61 @@ async fn assert_tagless_wrap_admitted(wrap_kind: u16, extra_env: &[(&str, &str)]
 }
 
 /// The legacy wire kind, under the shipped dual-accept default.
+///
+/// Since nostr-sdk 0.45 (ngit-grasp v3) the relay itself refuses a kind-1059
+/// event without exactly one `p` tag, before any write policy runs. The
+/// tagless form clients sent before the 3359 migration therefore no longer
+/// reaches the private arm at all; a 1059 with one `p` tag from a registered
+/// key still does, and is admitted, charged and served exactly as before.
 #[tokio::test]
 async fn exit36_tagless_stream_wrap_legacy_kind() {
-    assert_tagless_wrap_admitted(1059, &[]).await;
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+
+    let tagless = tagless_wrap_event(&writer, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &tagless).await;
+    assert!(
+        !accepted && message.contains("GiftWrap must contain exactly one recipient"),
+        "kind 1059: a tagless wrap is refused by the relay's NIP-59 shape check; \
+         got accepted={accepted} {message:?}"
+    );
+
+    let before = global_ledger_bytes(relay.url()).await;
+    let wrap = wrap_event(&writer, 1059);
+    let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
+    assert!(
+        accepted,
+        "kind 1059: a p-tagged wrap from a registered write key must be admitted \
+         by the private arm; got {message:?}"
+    );
+    let wrap_bytes = wrap.as_json().len() as i64;
+    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(relay.url())).await;
+    assert_eq!(
+        after,
+        before + wrap_bytes,
+        "kind 1059: the stored wrap must be quota-charged its event bytes"
+    );
+    let anon = connect_anonymous_client(relay.url()).await;
+    let served: Vec<Event> = anon
+        .fetch_events(Filter::new().kind(Kind::Custom(1059)))
+        .timeout(Duration::from_secs(10))
+        .await
+        .expect("anonymous fetch failed")
+        .into_iter()
+        .collect();
+    assert!(
+        served.iter().any(|e| e.id == wrap.id),
+        "kind 1059: the stored wrap must be served to an anonymous REQ"
+    );
+    anon.disconnect().await;
+
+    relay.stop().await;
 }
 
 /// The new dedicated wire kind. This is the ordering-critical half of the
@@ -4901,7 +5171,7 @@ async fn exit37_new_wrap_kind_gating_and_ephemerality() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
     let relay =
-        TestRelay::start_with_private_repos(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
             .await;
     let writer = Keys::generate();
     let alias = random_alias();
@@ -4976,7 +5246,8 @@ async fn exit37_new_wrap_kind_gating_and_ephemerality() {
     let want = before + charged_bytes;
     let after = poll_until(want, || global_ledger_bytes(relay.url())).await;
     assert_eq!(
-        after, want,
+        after,
+        want,
         "exit37: the ledger must move by the STORED 3359 only — the \
          ephemeral 23359 must never be quota-charged (ephemeral wrap bytes \
          have no credit path, so charging them bricks the scope with zero \
@@ -4996,7 +5267,7 @@ async fn exit37_new_wrap_kind_gating_and_ephemerality() {
 async fn exit38_legacy_wrap_kind_can_be_disabled() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay = TestRelay::start_with_private_repos(&[
+    let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
         ("NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND", "false"),
     ])
@@ -5025,9 +5296,10 @@ async fn exit38_legacy_wrap_kind_can_be_disabled() {
         "exit38: the legacy wrap kinds must leave the advert; got {kinds:?}"
     );
 
-    // A tagless 1059 from the REGISTERED write key is no longer a stream
-    // wrap: the legacy kinds are RETIRED and refused outright.
-    let legacy = tagless_wrap_event(&writer, 1059);
+    // A 1059 from the REGISTERED write key is no longer a stream wrap: the
+    // legacy kinds are RETIRED and refused outright. (It carries one `p` tag
+    // so that nostr-sdk's own NIP-59 shape check lets it reach the policy.)
+    let legacy = wrap_event(&writer, 1059);
     let (accepted, message) = publish_with_result(relay.url(), &legacy).await;
     assert!(
         !accepted,
@@ -5062,7 +5334,10 @@ async fn exit38_legacy_wrap_kind_can_be_disabled() {
         Kind::Custom(1059),
         "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
     )
-    .tags(vec![Tag::custom("a", vec![coordinate.clone()])])
+    .tags(vec![
+        Tag::custom("a", vec![coordinate.clone()]),
+        Tag::public_key(Keys::generate().public_key()),
+    ])
     .finalize(&Keys::generate())
     .expect("sign a-tagged legacy wrap");
     let (accepted, message) = publish_with_result(relay.url(), &a_tagged).await;

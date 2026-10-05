@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
-use nostr::hashes::{sha256, Hash};
+use bitcoin_hashes::{sha256, Hash};
 use nostr_sdk::prelude::*;
 
 use common::port::reserve_port;
@@ -143,13 +143,9 @@ fn reg_coord(tenant: &PublicKey, alias: &str) -> String {
 
 /// Schnorr proof-of-possession for a claimed w/aux key (§2 audit amendment).
 fn key_pop_sig(key: &Keys, tenant: &PublicKey, alias: &str) -> String {
-    let digest = sha256::Hash::hash(
-        format!("grasp-p key-claim:{}:{alias}", tenant.to_hex()).as_bytes(),
-    );
-    key.sign_schnorr(&nostr::secp256k1::Message::from_digest(
-        digest.to_byte_array(),
-    ))
-    .to_string()
+    let digest =
+        sha256::Hash::hash(format!("grasp-p key-claim:{}:{alias}", tenant.to_hex()).as_bytes());
+    key.sign_schnorr(digest.to_byte_array()).to_string()
 }
 
 fn key_entry(key: &Keys, tenant: &PublicKey, alias: &str) -> Vec<String> {
@@ -259,12 +255,7 @@ async fn wait_for_exact_event(relay_url: &str, id: EventId, bound: Duration) -> 
 }
 
 /// Signed kind-24242 Blossom auth event.
-fn blossom_auth_event(
-    signer: &Keys,
-    sha: &str,
-    tenant: &PublicKey,
-    alias: &str,
-) -> Event {
+fn blossom_auth_event(signer: &Keys, sha: &str, tenant: &PublicKey, alias: &str) -> Event {
     EventBuilder::new(Kind::Custom(24242), "grasp-p two-node test auth")
         .tags(vec![
             Tag::custom("t", vec!["upload".to_string()]),
@@ -320,7 +311,11 @@ async fn delete_blob(relay: &TestRelay, sha: &str, auth: &Event) -> (u16, String
 /// Deterministic pseudo-random blob content of `len` bytes, unique per seed.
 fn blob_bytes(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
-        .map(|i| (seed as usize).wrapping_mul(31).wrapping_add(i.wrapping_mul(2654435761)) as u8)
+        .map(|i| {
+            (seed as usize)
+                .wrapping_mul(31)
+                .wrapping_add(i.wrapping_mul(2654435761)) as u8
+        })
         .collect()
 }
 
@@ -461,9 +456,9 @@ async fn start_pair_inner(
         Some((git, relay)) => (Some(git), Some(relay)),
         None => (None, None),
     };
-    let a = TestRelay::start_private_pair_node(res_a, Some(url_b), true, None, None, a_env).await;
+    let a = TestRelay::start_grasp_p_pair_node(res_a, Some(url_b), true, None, None, a_env).await;
     let b =
-        TestRelay::start_private_pair_node(res_b, Some(url_a), true, b_git, b_relay, b_env).await;
+        TestRelay::start_grasp_p_pair_node(res_b, Some(url_a), true, b_git, b_relay, b_env).await;
     (a, b)
 }
 
@@ -552,7 +547,10 @@ async fn exit1_replication_e2e() {
     );
     let replication_started = Instant::now();
     let (accepted, message) = publish_with_result(a.url(), &edition).await;
-    assert!(accepted, "exit1: 30641 must be accepted on A; got {message:?}");
+    assert!(
+        accepted,
+        "exit1: 30641 must be accepted on A; got {message:?}"
+    );
     // One wrap per accepted wire kind — dual-accept is only real if BOTH
     // cross the pair.
     let wraps = wrap_events(&writer);
@@ -593,7 +591,11 @@ async fn exit1_replication_e2e() {
         Filter::new().kind(Kind::Custom(30641)).identifier(&alias),
     )
     .await;
-    assert_eq!(served.len(), 1, "exit1: B serves exactly the latest edition");
+    assert_eq!(
+        served.len(),
+        1,
+        "exit1: B serves exactly the latest edition"
+    );
     assert_eq!(served[0].id, edition.id, "exit1: served 30641 id matches");
     assert_eq!(served[0].tags, edition.tags, "exit1: served tags intact");
 
@@ -743,7 +745,10 @@ async fn exit2_out_of_order_reprocess() {
     )
     .await;
     assert_eq!(served.len(), 1);
-    assert_eq!(served[0].id, edition.id, "exit2: served 30641 is the held one");
+    assert_eq!(
+        served[0].id, edition.id,
+        "exit2: served 30641 is the held one"
+    );
 
     b.stop().await;
     a.stop().await;
@@ -826,7 +831,7 @@ async fn exit3_kill_node_backfill() {
     // repair scan, not from A dialing in). Same whitelist as before the
     // kill — policy-fingerprint parity must survive the restart.
     let res_b2 = reserve_port();
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b2,
         Some(a.url().to_string()),
         true,
@@ -863,7 +868,10 @@ async fn exit3_kill_node_backfill() {
     assert_eq!(mirrored, blob2, "exit3: mirrored blob bytes intact");
     // The old blob survived the restart on the persistent paths.
     let (status, body) = get_blob(&b, &sha1).await;
-    assert_eq!(status, 200, "exit3: pre-kill blob still served after restart");
+    assert_eq!(
+        status, 200,
+        "exit3: pre-kill blob still served after restart"
+    );
     assert_eq!(body, blob1);
 
     b.stop().await;
@@ -1025,7 +1033,10 @@ async fn exit5_mirror_bounds_missing_blob() {
         "exit5: repair retries must not store a partial blob"
     );
     assert!(
-        !body.windows(32).any(|w| phantom.windows(32).next() == Some(w)) || body.is_empty(),
+        !body
+            .windows(32)
+            .any(|w| phantom.windows(32).next() == Some(w))
+            || body.is_empty(),
         "exit5: 404 body must not contain blob content"
     );
 
@@ -1070,7 +1081,10 @@ async fn exit6_registration_split_brain_merge() {
     // is accepted there — B now holds the future merge loser.
     let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(now));
     let (accepted, message) = publish_with_result(b.url(), &squat).await;
-    assert!(accepted, "exit6: squatter registration on B failed: {message:?}");
+    assert!(
+        accepted,
+        "exit6: squatter registration on B failed: {message:?}"
+    );
 
     // The victim's registration (LOWER created_at) is published to A.
     // Whether or not the squatter's edition already synced over, the
@@ -1131,7 +1145,10 @@ async fn exit6_registration_split_brain_merge() {
             >= 1
     })
     .await;
-    assert!(alerted, "exit6: stored_evicted conflict alert must fire on B");
+    assert!(
+        alerted,
+        "exit6: stored_evicted conflict alert must fire on B"
+    );
 
     a.stop().await;
     b.stop().await;
@@ -1182,9 +1199,18 @@ async fn exit7_rotation_skew_converges_on_anchor() {
     );
 
     // The squatter (t1) reaches B while it is pre-rotation: rejected there.
-    let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(t0 + 100));
+    let squat = registration_event(
+        &squatter,
+        &alias,
+        &squat_writer,
+        &domain_refs,
+        Some(t0 + 100),
+    );
     let (accepted, _) = publish_with_result(b.url(), &squat).await;
-    assert!(!accepted, "exit7: pre-rotation node must reject the squatter");
+    assert!(
+        !accepted,
+        "exit7: pre-rotation node must reject the squatter"
+    );
 
     // The victim rotates on A (t2 > t1). The SAME squatter event reaching
     // the rotated node must STILL lose — this is the pre-FA split-brain.
@@ -1217,7 +1243,10 @@ async fn exit7_rotation_skew_converges_on_anchor() {
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    assert!(rotation_synced, "exit7: the rotation (reg2) must replicate to B");
+    assert!(
+        rotation_synced,
+        "exit7: the rotation (reg2) must replicate to B"
+    );
     let (accepted, _) = publish_with_result(b.url(), &squat).await;
     assert!(
         !accepted,
@@ -1290,7 +1319,7 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
     let res_a = reserve_port();
     let res_b = reserve_port();
     let url_b = format!("ws://127.0.0.1:{}", res_b.port());
-    let a = TestRelay::start_private_pair_node(
+    let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_b.clone()),
         true,
@@ -1313,12 +1342,18 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
     let ed1 = registration_event(&victim, &alias, &victim_writer, &domain_refs, Some(t0));
     let (accepted, message) = publish_with_result(a.url(), &ed1).await;
     assert!(accepted, "exit8: edition 1 failed: {message:?}");
-    let ed2 = registration_event(&victim, &alias, &victim_writer, &domain_refs, Some(t0 + 200));
+    let ed2 = registration_event(
+        &victim,
+        &alias,
+        &victim_writer,
+        &domain_refs,
+        Some(t0 + 200),
+    );
     let (accepted, message) = publish_with_result(a.url(), &ed2).await;
     assert!(accepted, "exit8: edition 2 failed: {message:?}");
 
     // B joins now: it syncs ONLY edition 2 and anchors on it (t2).
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b,
         Some(a.url().to_string()),
         true,
@@ -1348,9 +1383,18 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
 
     // The squatter (t1, t0 < t1 < t2): LOSES on A (anchor = edition 1) but
     // WINS on mis-anchored B (anchor = edition 2) — the R2-B split-brain.
-    let squat = registration_event(&squatter, &alias, &squat_writer, &domain_refs, Some(t0 + 100));
+    let squat = registration_event(
+        &squatter,
+        &alias,
+        &squat_writer,
+        &domain_refs,
+        Some(t0 + 100),
+    );
     let (accepted, _) = publish_with_result(a.url(), &squat).await;
-    assert!(!accepted, "exit8: A (anchored on edition 1) must reject the squatter");
+    assert!(
+        !accepted,
+        "exit8: A (anchored on edition 1) must reject the squatter"
+    );
     let (accepted, message) = publish_with_result(b.url(), &squat).await;
     assert!(
         accepted,
@@ -1378,14 +1422,21 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
     // dependence on sync re-delivery after the eviction prune): both nodes
     // now serve edition 2 with the anchor at t0-50.
     let (accepted, message) = publish_with_result(b.url(), &ed2).await;
-    assert!(accepted, "exit8: edition 2 must land on healed B; got {message:?}");
+    assert!(
+        accepted,
+        "exit8: edition 2 must land on healed B; got {message:?}"
+    );
     for (name, node) in [("A", &a), ("B", &b)] {
         let served = fetch_from(
             node.url(),
             Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
         )
         .await;
-        assert_eq!(served.len(), 1, "exit8: node {name} serves exactly one 30640");
+        assert_eq!(
+            served.len(),
+            1,
+            "exit8: node {name} serves exactly one 30640"
+        );
         assert_eq!(served[0].id, ed2.id, "exit8: node {name} serves edition 2");
     }
 
@@ -1456,11 +1507,9 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
     let t0 = Timestamp::now().as_secs() - 600;
 
     let b_global = || async {
-        ParsedMetrics::parse(
-            &fetch_metrics(b.url()).await.expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        ParsedMetrics::parse(&fetch_metrics(b.url()).await.expect("metrics scrape"))
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
 
     // Registration (created at t0 so the later kind-5 honors the cutoff) on
@@ -1533,9 +1582,7 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
     // zero and the blob is never (re-)stored across several repair ticks.
     assert!(
         wait_for_metrics(&b, REPLICATION_BOUND, |m| {
-            m.gauge("ngit_private_mirror_lag_blobs", &[])
-                .unwrap_or(-1)
-                == 0
+            m.gauge("ngit_private_mirror_lag_blobs", &[]).unwrap_or(-1) == 0
         })
         .await,
         "exit9: mirror lag must be zero after the death"
@@ -1548,9 +1595,7 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
     );
     assert!(
         wait_for_metrics(&b, Duration::from_secs(5), |m| {
-            m.gauge("ngit_private_mirror_lag_blobs", &[])
-                .unwrap_or(-1)
-                == 0
+            m.gauge("ngit_private_mirror_lag_blobs", &[]).unwrap_or(-1) == 0
         })
         .await,
         "exit9: repair scans must not re-enqueue after the death"
@@ -1584,7 +1629,7 @@ fn registration_event_multi(
     for writer in writers {
         tags.push(Tag::custom(
             "w",
-            key_entry(*writer, &tenant.public_key(), alias),
+            key_entry(writer, &tenant.public_key(), alias),
         ));
     }
     let mut builder = EventBuilder::new(Kind::Custom(30640), "");
@@ -1695,8 +1740,8 @@ async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: b
         // TTL (the negentropy exclusion only learned to with FS-4).
         b_env.push(("NGIT_SYNC_DISABLE_NEGENTROPY", "true"));
     }
-    let a = TestRelay::start_private_pair_node(res_a, Some(url_b), true, None, None, &a_env).await;
-    let b = TestRelay::start_private_pair_node(res_b, Some(url_a), true, None, None, &b_env).await;
+    let a = TestRelay::start_grasp_p_pair_node(res_a, Some(url_b), true, None, None, &a_env).await;
+    let b = TestRelay::start_grasp_p_pair_node(res_b, Some(url_a), true, None, None, &b_env).await;
 
     // Both registrations land on B (the LAST registration changes of the
     // test — from here on B's index is fixed).
@@ -2012,17 +2057,14 @@ async fn exit12_open_registrations_survive_whitelist_flip() {
     // Persistent LMDB paths so the node reboots onto the same data.
     let git_dir = tempfile::tempdir().expect("git dir");
     let relay_dir = tempfile::tempdir().expect("relay dir");
-    let paths = (
-        git_dir.path().to_path_buf(),
-        relay_dir.path().to_path_buf(),
-    );
+    let paths = (git_dir.path().to_path_buf(), relay_dir.path().to_path_buf());
 
     // --- Boot 1: OPEN mode (the pre-WP-E default) --------------------------
     let tenant = Keys::generate();
     let writer = Keys::generate();
     let alias = random_alias();
     let res1 = reserve_port();
-    let node = TestRelay::start_private_pair_node(
+    let node = TestRelay::start_grasp_p_pair_node(
         res1,
         None,
         true,
@@ -2060,7 +2102,7 @@ async fn exit12_open_registrations_survive_whitelist_flip() {
     let boot2_log_offset = std::fs::metadata(&boot2_log_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let node = TestRelay::start_private_pair_node(
+    let node = TestRelay::start_grasp_p_pair_node(
         res2,
         None,
         true,

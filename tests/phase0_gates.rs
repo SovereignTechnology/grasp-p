@@ -155,11 +155,12 @@ fn wrap_shaped_giftwrap(receiver: &PublicKey, coord: &str) -> Event {
     let throwaway = Keys::generate();
     // Deterministic-ish backdate in (0, 2 days], mirroring nip59's
     // Timestamp::tweaked(RANGE_RANDOM_TIMESTAMP_TWEAK).
-    let backdate_secs = 1 + (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before epoch")
-        .subsec_nanos() as u64
-        % (2 * 24 * 60 * 60));
+    let backdate_secs = 1
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .subsec_nanos() as u64
+            % (2 * 24 * 60 * 60));
     let created_at = Timestamp::from_secs(Timestamp::now().as_secs() - backdate_secs);
     EventBuilder::new(
         Kind::GiftWrap,
@@ -311,7 +312,10 @@ async fn g2_lmdb_custom_and_giftwrap_negentropy_sync() {
     let (ok, msg) = publish_with_result(relay_a.url(), &doc).await;
     assert!(ok, "G2: relay A must accept the kind-30640; got: {msg:?}");
     let (ok, msg) = publish_with_result(relay_a.url(), &wrap).await;
-    assert!(ok, "G2: relay A must accept the kind-1059 wrap; got: {msg:?}");
+    assert!(
+        ok,
+        "G2: relay A must accept the kind-1059 wrap; got: {msg:?}"
+    );
 
     // A serves both: by authors, by #d (30640), and by kinds=[1059].
     let by_author = fetch_from(
@@ -460,7 +464,10 @@ async fn g3_no_hidden_giftwrap_read_guard() {
     let recipient = Keys::generate();
     let wrap = wrap_shaped_giftwrap(&recipient.public_key(), &coord);
     let (ok, msg) = publish_with_result(relay.url(), &wrap).await;
-    assert!(ok, "G3: relay must accept the a-ref'd 1059 wrap; got: {msg:?}");
+    assert!(
+        ok,
+        "G3: relay must accept the a-ref'd 1059 wrap; got: {msg:?}"
+    );
 
     // Fresh keys that are NOT the recipient and are never used to AUTH
     // (the client has no signer/authenticator at all).
@@ -512,13 +519,16 @@ async fn g3_no_hidden_giftwrap_read_guard() {
 }
 
 // ============================================================================
-// G4 — 128 KiB (and 1 MiB) events pass
+// G4 — 128 KiB events pass; the relay ceiling sits above GRASP-P's cap
 // ============================================================================
 
-/// No layer below tungstenite's 64 MiB frame cap enforces an event size
-/// ceiling: a 131072-byte-content event and a ~1 MiB-content event are both
-/// accepted and round-trip with content length preserved. GRASP-P's own
-/// 128 KiB check will therefore be the ONLY limit.
+/// A 131072-byte-content event is accepted and round-trips with its content
+/// length preserved, so GRASP-P's own 128 KiB check (the
+/// `NGIT_GRASP_P_MAX_EVENT_BYTES` default) is the binding limit for private
+/// kinds. Since v3 upstream enforces its own per-event ceiling,
+/// `NGIT_RELAY_MAX_EVENT_SIZE_BYTES` (default 192 KiB), ahead of any write
+/// policy: a ~1 MiB event is refused there. On v1.2 there was no such layer
+/// and this gate asserted that 1 MiB passed.
 #[tokio::test]
 async fn g4_large_events_pass() {
     let relay = TestRelay::start().await;
@@ -547,22 +557,17 @@ async fn g4_large_events_pass() {
         "G4: 128 KiB content length must be preserved"
     );
 
-    // ~1 MiB content: proves the ceiling is not somewhere between 128 KiB
-    // and 1 MiB either.
+    // ~1 MiB content: refused by upstream's relay-level size ceiling before
+    // the write policy runs.
     let content_1m = "y".repeat(1_048_576);
     let bigger = EventBuilder::new(Kind::Custom(4444), content_1m)
         .tags(vec![Tag::custom("a", vec![coord])])
         .finalize(&author)
         .expect("sign 1MiB event");
     let (ok, msg) = publish_with_result(relay.url(), &bigger).await;
-    assert!(ok, "G4: 1 MiB event must be accepted; got: {msg:?}");
-
-    let served = fetch_from(relay.url(), Filter::new().id(bigger.id)).await;
-    assert_eq!(served.len(), 1, "G4: 1 MiB event must round-trip");
-    assert_eq!(
-        served[0].content.len(),
-        1_048_576,
-        "G4: 1 MiB content length must be preserved"
+    assert!(
+        !ok && msg.contains("event size"),
+        "G4: a 1 MiB event must be refused by the relay size ceiling; got: {ok} {msg:?}"
     );
 
     relay.stop().await;

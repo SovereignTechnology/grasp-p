@@ -28,7 +28,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use nostr::hashes::{sha256, Hash};
+use bitcoin_hashes::{sha256, Hash};
 use nostr_sdk::prelude::*;
 
 use common::port::reserve_port;
@@ -97,10 +97,7 @@ fn reg_coord(tenant: &PublicKey, alias: &str) -> String {
 fn key_pop_sig(key: &Keys, tenant: &PublicKey, alias: &str) -> String {
     let digest =
         sha256::Hash::hash(format!("grasp-p key-claim:{}:{alias}", tenant.to_hex()).as_bytes());
-    key.sign_schnorr(&nostr::secp256k1::Message::from_digest(
-        digest.to_byte_array(),
-    ))
-    .to_string()
+    key.sign_schnorr(digest.to_byte_array()).to_string()
 }
 
 fn registration_event(
@@ -333,7 +330,7 @@ async fn watchdog_e2e_happy_then_partitioned() {
     // nodes before any registration is admitted.
     let tenant = Keys::generate();
     let whitelist = tenant.public_key().to_bech32().expect("npub");
-    let a = TestRelay::start_private_pair_node(
+    let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_b.clone()),
         true,
@@ -342,7 +339,7 @@ async fn watchdog_e2e_happy_then_partitioned() {
         &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
     )
     .await;
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b,
         Some(url_a.clone()),
         true,
@@ -515,7 +512,7 @@ async fn watchdog_e2e_happy_then_partitioned() {
     // v1 and never learns of v2/alias2. (Its fingerprint also changes —
     // asserted separately.)
     let res_b2 = reserve_port();
-    let b2 = TestRelay::start_private_pair_node(
+    let b2 = TestRelay::start_grasp_p_pair_node(
         res_b2,
         None,
         true,
@@ -597,7 +594,7 @@ async fn watchdog_e2e_happy_then_partitioned() {
 #[tokio::test]
 async fn watchdog_dead_node_is_operational_error() {
     let res_a = reserve_port();
-    let a = TestRelay::start_private_pair_node(res_a, None, true, None, None, &[]).await;
+    let a = TestRelay::start_grasp_p_pair_node(res_a, None, true, None, None, &[]).await;
     // Reserved but never started: connections are refused immediately.
     let dead = reserve_port();
     let out = run_watchdog(&[
@@ -647,7 +644,7 @@ async fn watchdog_ambiguous_bases_do_not_mask_checks() {
     let (b_git, b_relay) = paths("b");
     let tenant = Keys::generate();
     let whitelist = tenant.public_key().to_bech32().expect("npub");
-    let a = TestRelay::start_private_pair_node(
+    let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_b.clone()),
         true,
@@ -656,7 +653,7 @@ async fn watchdog_ambiguous_bases_do_not_mask_checks() {
         &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
     )
     .await;
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b,
         Some(url_a.clone()),
         true,
@@ -820,7 +817,7 @@ async fn watchdog_ambiguous_bases_do_not_mask_checks() {
     assert!(accepted, "30641 v2 rejected: {msg}");
 
     let res_b2 = reserve_port();
-    let b2 = TestRelay::start_private_pair_node(
+    let b2 = TestRelay::start_grasp_p_pair_node(
         res_b2,
         None,
         true,
@@ -878,7 +875,7 @@ async fn watchdog_path_tie_bases_resolve_to_empty_path() {
     let url_b = format!("ws://127.0.0.1:{}", res_b.port());
     let tenant = Keys::generate();
     let whitelist = tenant.public_key().to_bech32().expect("npub");
-    let a = TestRelay::start_private_pair_node(
+    let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_b.clone()),
         true,
@@ -887,7 +884,7 @@ async fn watchdog_path_tie_bases_resolve_to_empty_path() {
         &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
     )
     .await;
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b,
         Some(url_a.clone()),
         true,
@@ -982,7 +979,7 @@ async fn watchdog_reports_wrap_kind_split() {
     let whitelist = tenant.public_key().to_bech32().expect("npub");
 
     // The ONLY divergence is the legacy wrap-kind acceptance.
-    let a = TestRelay::start_private_pair_node(
+    let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_b),
         true,
@@ -991,7 +988,7 @@ async fn watchdog_reports_wrap_kind_split() {
         &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
     )
     .await;
-    let b = TestRelay::start_private_pair_node(
+    let b = TestRelay::start_grasp_p_pair_node(
         res_b,
         Some(url_a),
         true,
