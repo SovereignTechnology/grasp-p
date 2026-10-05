@@ -104,9 +104,15 @@ pushed history fails. With a git 2.39.5 built from kernel.org source, the three
 This is production code, not only tests: the CI image and the production image need git >= 2.42
 (Debian bookworm ships 2.39.5).
 
+**cord-git end-to-end.** `scripts/e2e.sh` from cord-git branch `sovtech/grasp-p-v3-server`
+(settings renamed to `NGIT_GRASP_P_*`, `ci/SERVER_REF` = `b0f9f7c`) against a release build of
+`b0f9f7c`: E2E ALL GREEN, 81 PASS, 0 FAIL.
+
 ## What is left
 
-- The cord-git end-to-end suite against this build (see the handoff).
+- A CI run of all of the above on the GitLab runners (with git >= 2.42 in the image).
+- Merging: this branch into `sovtech/grasp-p-port` / `main`, then the cord-git branch, whose
+  `SERVER_REF` the end-to-end job on `main` refuses until the server commit is on `main`.
 - M3 items that the port touched but did not do: address pinning in the mirror (#3),
   `GET /list/<pubkey>` authorization (#14), and an adversarial re-review of the ported sync and
   mirror (#10). One point for that review: as on the legacy line, the GRASP-P filters (including
