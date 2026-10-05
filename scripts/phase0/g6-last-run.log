@@ -1,0 +1,89 @@
+===== G6 RUN 1: 2026-07-18T08:58:57-06:00 =====
+== G6: nginx :18080 -> sink :18081 ==
+== generating 256 MiB random body ==
+   local sha256 = f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1
+== starting upstream sink on 127.0.0.1:18081 ==
+
+== PRIMARY RUN: proxy_request_buffering off (deploy shape) ==
+   curl rc=0 http=200 time_total=6.396631s
+   upstream first_chunk delay after transfer start: 0.006s
+   upstream saw bytes=268435456 sha256=f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1
+
+-- primary assertions --
+  [PASS] a. HTTP 200 -- curl rc=0 http_code=200
+  [PASS] b. sha256+bytes unmangled -- resp sha=f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1 bytes=268435456 (local f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1)
+  [PASS] c. streaming proof -- first_chunk after 0.006s while client transfer took 6.396631s (need <2s and >4s)
+  [PASS] d. clean nginx logs -- no too-large-body / error-level lines
+
+== NEGATIVE CONTROL: proxy_request_buffering on ==
+   curl rc=0 http=200 time_total=6.733132s
+   upstream first_chunk delay after transfer start: 6.400s (buffered path)
+
+-- control assertion --
+  [PASS] e. buffering detected -- first_chunk only after 6.400s (client transfer 6.733132s): methodology distinguishes buffered vs streamed
+
+== sink log ==
+   SINK req=0 listening t_mono=125122.081785 t_epoch=1784386738.954568 host=127.0.0.1 port=18081
+   SINK req=1 request_line t_mono=125122.594724 t_epoch=1784386739.467507 raw=PUT_/upload_HTTP/1.1
+   SINK req=1 first_chunk t_mono=125122.594940 t_epoch=1784386739.467720 n=8081
+   SINK req=1 body_complete t_mono=125128.990266 t_epoch=1784386745.863050 bytes=268435456 sha256=f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1
+   SINK req=2 request_line t_mono=125135.828705 t_epoch=1784386752.701487 raw=PUT_/upload_HTTP/1.1
+   SINK req=2 first_chunk t_mono=125135.828900 t_epoch=1784386752.701679 n=8081
+   SINK req=2 body_complete t_mono=125136.154383 t_epoch=1784386753.027168 bytes=268435456 sha256=f9e28d313c1fd8a2ec7a307c720a4c8c7e5d068659aa6be336ad35637bacbec1
+== nginx primary log (tail) ==
+   /docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+   /docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+   /docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+   /docker-entrypoint.sh: Configuration complete; ready for start up
+   127.0.0.1 - - [18/Jul/2026:14:59:05 +0000] "PUT /upload HTTP/1.1" 200 123 "-" "curl/8.5.0"
+
+== SUMMARY ==
+   streamed (buffering off): first_chunk +0.006s of 6.396631s transfer
+   buffered (buffering on):  first_chunk +6.400s of 6.733132s transfer
+G6 PASS
+RUN1_EXIT=0
+
+===== G6 RUN 2: 2026-07-18T08:59:13-06:00 =====
+== G6: nginx :18080 -> sink :18081 ==
+== generating 256 MiB random body ==
+   local sha256 = edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb
+== starting upstream sink on 127.0.0.1:18081 ==
+
+== PRIMARY RUN: proxy_request_buffering off (deploy shape) ==
+   curl rc=0 http=200 time_total=6.395701s
+   upstream first_chunk delay after transfer start: 0.006s
+   upstream saw bytes=268435456 sha256=edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb
+
+-- primary assertions --
+  [PASS] a. HTTP 200 -- curl rc=0 http_code=200
+  [PASS] b. sha256+bytes unmangled -- resp sha=edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb bytes=268435456 (local edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb)
+  [PASS] c. streaming proof -- first_chunk after 0.006s while client transfer took 6.395701s (need <2s and >4s)
+  [PASS] d. clean nginx logs -- no too-large-body / error-level lines
+
+== NEGATIVE CONTROL: proxy_request_buffering on ==
+   curl rc=0 http=200 time_total=6.725917s
+   upstream first_chunk delay after transfer start: 6.401s (buffered path)
+
+-- control assertion --
+  [PASS] e. buffering detected -- first_chunk only after 6.401s (client transfer 6.725917s): methodology distinguishes buffered vs streamed
+
+== sink log ==
+   SINK req=0 listening t_mono=125137.512131 t_epoch=1784386754.384913 host=127.0.0.1 port=18081
+   SINK req=1 request_line t_mono=125138.002131 t_epoch=1784386754.874914 raw=PUT_/upload_HTTP/1.1
+   SINK req=1 first_chunk t_mono=125138.002335 t_epoch=1784386754.875115 n=8081
+   SINK req=1 body_complete t_mono=125144.396608 t_epoch=1784386761.269393 bytes=268435456 sha256=edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb
+   SINK req=2 request_line t_mono=125151.228871 t_epoch=1784386768.101654 raw=PUT_/upload_HTTP/1.1
+   SINK req=2 first_chunk t_mono=125151.229065 t_epoch=1784386768.101845 n=8081
+   SINK req=2 body_complete t_mono=125151.548564 t_epoch=1784386768.421348 bytes=268435456 sha256=edf538f9188b1ed609d1abe90e1bf992ff2a21e136462c27e4d2858c9633e7bb
+== nginx primary log (tail) ==
+   /docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+   /docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+   /docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+   /docker-entrypoint.sh: Configuration complete; ready for start up
+   127.0.0.1 - - [18/Jul/2026:14:59:21 +0000] "PUT /upload HTTP/1.1" 200 123 "-" "curl/8.5.0"
+
+== SUMMARY ==
+   streamed (buffering off): first_chunk +0.006s of 6.395701s transfer
+   buffered (buffering on):  first_chunk +6.401s of 6.725917s transfer
+G6 PASS
+RUN2_EXIT=0
