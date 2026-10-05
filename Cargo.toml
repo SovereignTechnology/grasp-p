@@ -109,6 +109,17 @@ tempfile = "3"
 tokio = { version = "1.35", features = ["full", "test-util"] }
 tokio-tungstenite = "0.28.0"
 
+# GRASP-P TLS path test (tests/grasp_p_tls.rs): an in-process TLS front for a
+# plain test node, and a CA made at run time. Linux only, like the OpenSSL
+# trust-store override the test relies on. Both crates are already in the tree
+# with exactly these features (tokio-rustls through nostr-sdk, openssl through
+# reqwest's native-tls), so Cargo.lock gains two edges and nothing else. Keep
+# default-features off for tokio-rustls: its defaults enable aws-lc-rs, the
+# second crypto provider this test exists to keep out.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+openssl = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
 [lib]
 name = "ngit_grasp"
 path = "src/lib.rs"
