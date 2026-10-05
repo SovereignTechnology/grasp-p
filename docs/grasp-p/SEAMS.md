@@ -167,4 +167,6 @@ features. No package was added.
   It would fail on a binary that links two rustls crypto providers.
 - Upstream's own test files are unmodified, apart from `tests/common/relay.rs` above, one
   `grasp_p: None` field in the `HistoryJob` that the unit tests in `src/sync/history.rs`
-  build, and the two unit tests named under "Synced events are verified here".
+  build, the two unit tests named under "Synced events are verified here", and fixed commit
+  dates in the git helper of `src/git/staging/tests.rs`: one upstream test there builds the
+  same commit twice and compares the ids, which only match within one wall-clock second.

@@ -54,6 +54,13 @@ fn output(repo: &Path, args: &[&str], input: &[u8]) -> String {
         .env("GIT_AUTHOR_EMAIL", "test@example.com")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        // SovTech: fixed dates. `owed_history_survives_ref_deletion_until_
+        // the_family_holds_it` builds the same commit in two repositories
+        // and compares the ids, which otherwise only match when both
+        // `commit-tree` calls fall into one wall-clock second. On a slow CI
+        // VM they did not.
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

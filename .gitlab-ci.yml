@@ -110,7 +110,9 @@ test:
     - git config --global init.templateDir /tmp/hostile-git/template
     - git config --global commit.gpgsign true
     - git config --global core.autocrlf true
-    - cargo test --locked
+    # --no-fail-fast: run every test binary even after one has failed, so a
+    # single pipeline shows all the failures. The exit status is unchanged.
+    - cargo test --locked --no-fail-fast
     - cargo test -p grasp-audit --locked
 
 # The deployable binary, built only on protected refs. It is built on bookworm
