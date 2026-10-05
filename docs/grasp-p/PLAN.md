@@ -10,7 +10,7 @@ its client (`cord-git`) is the system built in July 2026 where the server holds 
 The goal is to make it production ready as the paid private tier of **sovdev.pro**, for external
 paying customers.
 
-State on 2026-10-05:
+State when this plan was written (2026-10-05):
 
 - No GRASP-P server is running anywhere.
 - **Server:** complete on upstream v1.2.0 (`legacy/v1.2-grasp-p`); upstream has since moved to
@@ -37,15 +37,16 @@ push; `git status` before every commit.
 ### M0 - Spec and housekeeping (done)
 `OVERVIEW.md` written; the client README rewritten.
 
-### M1 - Repositories and CI (repositories done, runners pending)
-- Two projects: this server fork and `cord-git`. Here, `main` is unmodified upstream v3.0.7 and
-  the old line is kept as `legacy/v1.2-grasp-p`.
-- CI is a GitLab pipeline (`.gitlab-ci.yml` on the `sovtech/ci` branches): fmt, clippy, tests, the
+### M1 - Repositories and CI (done)
+- Two projects: this server fork and `cord-git`. Here, `main` started as unmodified upstream
+  v3.0.7 (it carries GRASP-P since M2) and the old line is kept as `legacy/v1.2-grasp-p`.
+- CI is a GitLab pipeline (`.gitlab-ci.yml` in each project): fmt, clippy, tests, the
   client's end-to-end suite against a pinned server commit, and release binaries on protected
   refs. Jobs run in single-use VMs on two dedicated runners, one for merge requests and one for
-  protected refs. The runners are not deployed yet.
+  protected refs.
 
-### M2 - Port the server onto v3.0.7
+### M2 - Port the server onto v3.0.7 (done)
+`SEAMS.md` records the result: the seams, the decisions and what changed with v3.
 - Module renamed **`src/private/` -> `src/grasp_p/`** (upstream now owns `src/private/` for
   GRASP-08); env prefix `NGIT_PRIVATE_*` -> `NGIT_GRASP_P_*` (free now: nothing is deployed);
   rename `HttpService.private`, `TestRelay::start_with_private_repos`.
@@ -72,6 +73,68 @@ push; `git status` before every commit.
 - **#1** offboard: kind-5 tombstone frees alias, keys, ledger; retention purge (customers leave).
 - **#21** document every config var; **#10** adversarial re-review of the ported sync/mirror.
 
+**Found in the M2 review (2026-10-05).** Each was traced in the code by a reviewer and
+checked by a second one; none was run. Most were already on the v1.2 line. New with v3: the
+NIP-11 probe, the wider reach of #10, the base-path check, the second SSRF switch under
+"Peers", the git version and the stale runbook citations. They are not issues on the
+project yet.
+
+- **Report the unverified-sync flaw upstream** (ngit-grasp and nostr-sdk; `SEAMS.md`,
+  "Synced events are verified here"). The fork is fixed. Needs the maintainer's go-ahead,
+  and our seam goes when upstream verifies for itself.
+- **Upstream's NIP-11 probe follows redirects and reads an unbounded body**
+  (`src/sync/relay_connection.rs`), past the outbound target policy. Beside #20; offer
+  upstream.
+- **Alias takeover by backdating.** A cross-tenant alias conflict is won by the lowest
+  `created_at`, which has no lower bound, so any admitted tenant can evict another's alias,
+  and the loser's blobs are collected after the grace period. Bound the winner and do not
+  strip the loser's blob claims without an operator. The runbook understates this.
+- **Who may delete.** A kind 5 or a vanish request signed by a write key or a stream key is
+  honoured for state roots and stream wraps, so a read-only or revoked member can delete a
+  repository's stream history and block the shared stream key. Decide with #1.
+- **Offboarding (#1) is half there.** An accepted deletion of a registration already frees
+  the alias, the key claims and the blob claims. Missing: the tombstone and retention window
+  (`NGIT_GRASP_P_OFFBOARD_RETENTION_SECS` is read and unused) and removal of the stored
+  state roots and wraps. The text of issue 1 predates this.
+- **The hold for out-of-order events is capped by count only**, and an event is held before
+  its size is checked. One sync relay can pin about 4096 x 5 MB. Give it a byte budget and
+  do not hold what can never be admitted.
+- **Upload slots.** 64 for the whole node, no cap per tenant and no timeout on reading a
+  body, so one write key can hold them all and stall the mirror too. With #25 and #26.
+- **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the
+  charge on the uploader for good, at no cost to itself.
+- **Order of checks in registration.** Proofs of possession are verified before the key
+  count is capped and before the admission mode is consulted, and the admission mode is
+  consulted after the conflict merge, so an anonymous sender can cost CPU and raise the
+  conflict alert.
+- **Events of other kinds can attach to GRASP-P events** through upstream's related-event
+  rule: uncharged plaintext stored on a ciphertext node.
+- **Blob responses.** No `X-Content-Type-Options: nosniff` (matters once the web UI shares
+  the origin, M7); a taken-down blob stays in HTTP caches for a year; the operator's event
+  blacklist does not apply to the blob routes; stale upload temp files are never swept.
+- **Denylist reload** can drop the entries of a file that became unreadable after boot
+  (setups with two or more files).
+- **Peers.** A configured peer that fails a handshake is muted by the naughty list for 12
+  hours. A peer whose session drops (as opposed to a dial that fails) is retired and
+  redialled by the next tick with no backoff and a full resync; `handle_disconnect` should
+  keep configured peers. A peer on a private network needs both SSRF guards switched off for
+  the whole node (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`,
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), and a redial from the reconnect loop is vetted
+  by upstream's dial-time policy only. No test runs a peer with the guards on.
+- **#10 is wider on v3.** The GRASP-P filters go to every live relay, including upstream's
+  NIP-65 discovery connections, and count against each relay's subscription slots, so their
+  growth can cost a relay its public coverage. The watchdog's discovery filter does not page
+  past 500 events; the sync filters do, through upstream's historic sync.
+- **Base path.** The check that a registration names this node ignores `NGIT_BASE_PATH`,
+  and no test runs GRASP-P under one.
+- **Blob mirror peers** default to the `server` tags of accepted registrations when no
+  allowlist is set, so tenant events do choose hosts the node connects to (vetted by the
+  SSRF guard; see #3).
+- **Fail fast on old git.** The server does not check the git version at startup, and with
+  git older than 2.42 it fails quietly.
+- **Docs (#21).** The runbook cites `file:line` from the v1.2 line and names a deployment
+  that does not exist; the config reference still describes the tagless-1059 window.
+
 ### M4 - Protocol v0.2 and client correctness (`sovtech/cord-git`, `crates/cord-core`)
 No private repo is live anywhere, so v0.2 breaks compatibility freely. Decisions are the maintainer's,
 2026-10-05, after checking how Concord does it (CORD-02 section 8, CORD-05 section 4, CORD-06).
@@ -83,6 +146,9 @@ No private repo is live anywhere, so v0.2 breaks compatibility freely. Decisions
   content the server never sees. Members verify against the key committed in `community_id`.
   - The **hosting key** shrinks to a server-facing registration key: it signs kind 30640 only.
     The server is unchanged; it still sees only the hosting key.
+  - **One hosting key per customer, not per repository** (the maintainer, 2026-10-05; needed for
+    per-account storage, M9). It is the customer's account on the node, and the key list holds
+    it once. Design it in here, before the v0.2 wire format settles.
   - The write set stops being trusted from the registration alone: clients accept a state root
     only from a write key named in an **owner-signed epoch record** (this is roster-anchored
     sequencing, **#3**, and it also gives the monotonic floor against operator rollback). A
@@ -105,7 +171,7 @@ No private repo is live anywhere, so v0.2 breaks compatibility freely. Decisions
   pushed", **#27** publish to every relay with read-back, **#34/#33** rejection recovery, **#28**
   invite size ceiling, **#30** co-maintainer announcement leak, **#18** e2e false-pass.
 - Server follow-on in the same milestone: drop the legacy 1059/21059 stream-wrap window (nothing
-  deployed needs it), and bump `ci/SERVER_REF` to the ported server.
+  deployed needs it).
 
 ### M5 - cord-core as an embeddable library
 Three consumers need it: the CLI, the ngit fork (native) and the web UI (WebAssembly). Today it is
@@ -128,9 +194,9 @@ blocking (`reqwest` blocking, `tungstenite`) and reads keystore files directly.
   **#6** export/offboard, user guide, signed release binaries from CI.
 
 ### M6 - Fork ngit so private repos use `nostr://`
-the maintainer, 2026-10-05 (decided in a /btw side thread and relayed to this session; replaces the
-`git-remote-cord` / `cord://` helper; tracks cord-git #20). Git picks its helper from the URL
-scheme, so `nostr://` always runs `git-remote-nostr`, which ngit ships.
+the maintainer, 2026-10-05 (replaces the `git-remote-cord` / `cord://` helper; tracks cord-git
+#20). Git picks its helper from the URL scheme, so `nostr://` always runs `git-remote-nostr`,
+which ngit ships.
 
 - New fork **`sovtech/ngit`** (a new repository), same conventions as the other
   forks: `upstream` = ngit's Nostr repo with push DISABLED, merge-only sync, ff-only, `sovtech:`
@@ -184,6 +250,38 @@ watchdog pair.
 
 ### M9 - Paid tier and launch
 - A payment webhook drives the tenant allowlist and per-plan quotas; NIP-11 `fees`.
+- **Storage is sold per account, with any number of private repositories inside it, and paid
+  upgrades raise it** (the maintainer, 2026-10-05). An account is one hosting key; a plan is a
+  byte allowance for that key. Already there: the server keeps a ledger per hosting key
+  (`src/grasp_p/quota.rs`), and allowlist admission is enforced at registration. To build, and
+  where it lands:
+  - **Server, per-account limit (with M3 #25).** A limit record per hosting key in the meta
+    store (bytes, repository count, paid-until). `quota::check` and the alias-limit check in
+    `registration.rs` read it and fall back to the node default. The per-repository cap stops
+    binding (repository limit = account limit). The repository-count limit stays as an
+    anti-spam bound, raised per plan, not removed.
+  - **Server, set it without a restart.** The allowlist and the limits are read once at boot
+    today. Add a local-only admin path, or a file re-read the way the denylist is. Both nodes of
+    a pair must hold the same record, or one accepts a push the other refuses (the allowlist is
+    in `policy_fingerprint`; decide whether the limits join it or the hook writes both nodes).
+  - **Server, lapsed accounts (with M3 #1).** The admission mode gates NEW aliases only, so
+    leaving the allowlist does not stop existing repositories. A lapsed account goes read-only
+    (no new state roots or uploads, reads keep working), then offboards after the retention
+    window.
+  - **Client, one hosting key per customer (M4).** `cord-git create` mints a fresh hosting key
+    per repository by default, and the server treats each hosting key as a separate account.
+    All of a customer's repositories register under one account key. Cost, known when this was
+    added: the server and anyone watching it can link all of a customer's private repositories
+    to one key, where today each repository looks unrelated. Addresses become
+    `nostr://<account-npub>/<alias>` (M6).
+  - **Usage (M5 CLI, M7 web UI).** A hosting-key-signed usage request (bytes used, limit,
+    repository count) so the CLI and the web UI can show it. Nothing reports usage to a tenant
+    today.
+  - **Order.** Not before delta packs (M5 #4): today every push is one full pack and the last
+    16 editions stay charged, so an account pays for up to 16 copies of each repository, and a
+    repository cannot exceed the 256 MiB blob cap. Not before cross-tenant charge pinning is
+    fixed (issue 5, M3): one tenant can keep bytes charged to another.
+  - The allowance per plan is not decided.
 - Launch review: a full adversarial pass on the server, the client library, the ngit fork and the
   web UI, then tag `sovtech-v1.0.0` on each.
 
@@ -215,6 +313,10 @@ so it needs the maintainer's go-ahead at the time.
   `localStorage`/IndexedDB after the session.
 - M8: verified at deployment time by the maintainer (replication between two nodes, the
   watchdog parity checks, no plaintext on the data volume, a reboot).
+- M9: a key that is not on the allowlist cannot register. Two repositories under one account
+  share one allowance: the push that crosses it is refused, and raising the account's limit
+  through the hook lets it through with no restart, on both nodes. A lapsed account can read
+  and cannot push. The CLI and the web UI show the same usage figure as the server's ledger.
 
 ## Decisions already taken (2026-10-05)
 
@@ -234,3 +336,6 @@ Do not reopen these without the maintainer.
 - Private-key login and key generation stay in the web UI as upstream has them.
 - A standardisation track runs alongside the build. Nothing is published without the
   maintainer's go-ahead at the time.
+- Storage is sold per account, with any number of private repositories inside it. An account is
+  one hosting key, so all of a customer's repositories register under one key, which lets the
+  server link them.

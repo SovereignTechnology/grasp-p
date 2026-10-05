@@ -9,8 +9,9 @@
 //! - G2: LMDB stores/serves Custom + GiftWrap kinds; NIP-77 negentropy syncs
 //!   them across two independent relay instances (Down from A, Up to B)
 //! - G3: no hidden read guard on stored kind-1059 gift wraps
-//! - G4: 128 KiB and 1 MiB events pass every layer (no size ceiling below
-//!   tungstenite's 64 MiB — GRASP-P's own 128 KiB check will be the only limit)
+//! - G4: a 128 KiB event passes every layer and a 1 MiB one is refused by the
+//!   relay's own ceiling (`NGIT_RELAY_MAX_EVENT_SIZE_BYTES`, 192 KiB by
+//!   default, new in v3), which sits ahead of GRASP-P's 128 KiB check
 //! - G5: ephemeral kind 21059 routes through the write policy, broadcasts to
 //!   live subscribers when accepted, and is never stored
 //! - G7: ReplaceableHistoryStore multi-edition characterization (KNOWN

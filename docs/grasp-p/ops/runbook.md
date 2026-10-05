@@ -9,6 +9,15 @@
 > against the code at that revision; `file:line` citations are included so
 > reviewers can re-verify. If code and this runbook ever disagree, the code
 > wins — file a doc bug.
+>
+> **Since the port onto ngit-grasp v3.0.7 (2026-10-05):** the `file:line`
+> citations below still point at the v1.2 line and no longer match; search
+> for the symbol instead. No GRASP-P deployment exists at present: the host
+> names below show the shape of one and are not GRASP-P nodes. A tagless
+> kind-1059 wrap from a client is now refused by the relay before the
+> GRASP-P policy sees it. The host needs
+> git 2.42 or newer on `PATH` (Debian 13, or a newer git on Debian 12): see
+> [../SEAMS.md](../SEAMS.md).
 
 Audience: the operator of a public two-node GRASP-P deployment
 (`git.sovit.xyz` / `git.buildinelsalvador.com` shape): YunoHost boxes, nginx

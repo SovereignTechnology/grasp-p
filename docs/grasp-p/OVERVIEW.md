@@ -143,8 +143,11 @@ It advertises all of this in its NIP-11 document under `private_repos`, includin
 
 Two nodes can mirror each other. Sync is pull-only: a node subscribes to its peer's
 registrations, derives filters for the state roots and stream wraps that belong to them,
-and fetches missing blobs over the peer's public `GET`. Peers come from an operator
-allowlist only; URLs inside tenant events never trigger a connection.
+and fetches missing blobs over the peer's public `GET`. Connections opened for GRASP-P go to
+an operator allowlist only, but the same filters are also sent on every relay connection the
+node's public sync holds. Blob peers come from an operator allowlist when one is set;
+otherwise they are the `server` tags of accepted registrations, checked against the SSRF
+guard.
 
 `ngit-private-watchdog` is a separate binary that probes two nodes anonymously and reports
 when they disagree. It holds no keys.
@@ -167,6 +170,11 @@ Gaps being closed before production (tracked as issues on the two projects):
 - Every push uploads the full history as one pack. There is no fetch into an existing clone
   and no `git` remote helper; the working path is the `cord-git` CLI.
 - Member keys are passed as an nsec, and the keystore is unencrypted on disk.
-- No paid admission mode, and offboarding (tombstone and purge) is not implemented.
-- The server extension is based on ngit-grasp v1.2.0 and is being ported to v3.x, where the
-  module moves out of `src/grasp_p/` and the `NGIT_GRASP_P_*` settings are renamed.
+- No paid admission mode. Deleting a registration frees its alias and keys at once and drops
+  its claim on its blobs, which garbage collection removes after the grace period if nothing
+  else references them; the tombstone, the retention window and the purge of stored events
+  are not implemented.
+
+The server runs on ngit-grasp v3.0.7. Its code is in `src/grasp_p/` and its settings are
+`NGIT_GRASP_P_*`; `src/private/` and `NGIT_PRIVATE_*` belong to upstream's GRASP-08 mode,
+and the server refuses to start with both enabled.
