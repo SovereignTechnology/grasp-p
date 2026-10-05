@@ -290,6 +290,38 @@ impl EventBlacklistConfig {
     }
 }
 
+/// GRASP-P private-repo registration admission mode for NEW aliases.
+///
+/// The shipped default is Whitelist (locked operator decision, server issue
+/// !7: in open mode any fresh key receives the full per-tenant blob quota,
+/// so ~50 pseudonymous tenants can lawfully exhaust the 50 GiB global
+/// budget). Open is intended for staging/self-use only and must be selected
+/// explicitly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Accept any tenant's new alias registrations (staging/self-use only).
+    Open,
+    /// Only tenants in NGIT_GRASP_P_TENANT_WHITELIST may register new aliases.
+    #[default]
+    Whitelist,
+    /// New-alias 30640 events must carry NIP-13 proof of work.
+    Pow,
+    /// Paid registration (not yet available; selecting it fails validation).
+    Paid,
+}
+
+impl std::fmt::Display for RegistrationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Whitelist => write!(f, "whitelist"),
+            Self::Pow => write!(f, "pow"),
+            Self::Paid => write!(f, "paid"),
+        }
+    }
+}
+
 /// Database backend type for the relay
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -701,6 +733,248 @@ pub struct Config {
     /// Bare levels keep dependency logging at warn.
     #[arg(long, env = "NGIT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    // ------------------------------------------------------------------
+    // GRASP-P private repositories (all no-ops unless enable=true)
+    // ------------------------------------------------------------------
+    /// GRASP-P master switch: enable private repository hosting
+    /// (30640/30641 + stream wraps 3359/23359, and 1059/21059 while
+    /// NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND is on, + blob routes)
+    #[arg(long, env = "NGIT_GRASP_P_REPOS_ENABLE", default_value_t = false)]
+    pub private_repos_enable: bool,
+
+    /// Admission mode for NEW private-repo aliases (open|whitelist|pow|paid).
+    /// Defaults to whitelist (safe "accept nothing without an explicit
+    /// tenant list" posture); open is staging/self-use only.
+    #[arg(long, env = "NGIT_GRASP_P_REGISTRATION_MODE", value_enum, default_value_t = RegistrationMode::Whitelist)]
+    pub private_registration_mode: RegistrationMode,
+
+    /// NIP-13 bits required on kind-30640 registrations when mode=pow
+    #[arg(long, env = "NGIT_GRASP_P_POW_BITS", default_value_t = 20)]
+    pub private_pow_bits: u8,
+
+    /// Comma-separated npubs allowed to register new aliases when mode=whitelist
+    #[arg(long, env = "NGIT_GRASP_P_TENANT_WHITELIST", default_value = "")]
+    pub private_tenant_whitelist: String,
+
+    /// Per-blob size cap in bytes (enforced pre- and mid-stream)
+    #[arg(long, env = "NGIT_GRASP_P_MAX_BLOB_BYTES", default_value_t = 268_435_456)]
+    pub private_max_blob_bytes: u64,
+
+    /// Serialized-JSON size cap for private-repo events (30640/30641 +
+    /// stream wraps 3359/23359 and legacy 1059/21059)
+    #[arg(long, env = "NGIT_GRASP_P_MAX_EVENT_BYTES", default_value_t = 131_072)]
+    pub private_max_event_bytes: u64,
+
+    /// Per hosting-npub total quota in bytes (events + blobs)
+    #[arg(long, env = "NGIT_GRASP_P_QUOTA_TENANT_BYTES", default_value_t = 1_073_741_824)]
+    pub private_quota_tenant_bytes: u64,
+
+    /// Per-alias total quota in bytes (events + blobs)
+    #[arg(long, env = "NGIT_GRASP_P_QUOTA_REPO_BYTES", default_value_t = 536_870_912)]
+    pub private_quota_repo_bytes: u64,
+
+    /// Whole private-subsystem storage cap in bytes
+    #[arg(long, env = "NGIT_GRASP_P_GLOBAL_BUDGET_BYTES", default_value_t = 53_687_091_200)]
+    pub private_global_budget_bytes: u64,
+
+    /// Maximum registrations (aliases) per hosting npub
+    #[arg(long, env = "NGIT_GRASP_P_MAX_ALIASES_PER_TENANT", default_value_t = 64)]
+    pub private_max_aliases_per_tenant: u32,
+
+    /// Maximum `w` + `aux` keys per alias registration
+    #[arg(long, env = "NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS", default_value_t = 64)]
+    pub private_max_write_keys_per_alias: u32,
+
+    /// Kind-30641 edition ring depth kept in the private meta store (G7 amendment)
+    #[arg(long, env = "NGIT_GRASP_P_STATE_HISTORY_EDITIONS", default_value_t = 16)]
+    pub private_state_history_editions: u32,
+
+    /// Grace period in seconds before an unreferenced blob may be deleted by GC
+    #[arg(long, env = "NGIT_GRASP_P_GC_GRACE_SECS", default_value_t = 86_400)]
+    pub private_gc_grace_secs: u64,
+
+    /// Interval in seconds between private blob GC passes
+    #[arg(long, env = "NGIT_GRASP_P_GC_INTERVAL_SECS", default_value_t = 3_600)]
+    pub private_gc_interval_secs: u64,
+
+    /// Tombstoned-alias purge delay in seconds (stub in Phase 1)
+    #[arg(long, env = "NGIT_GRASP_P_OFFBOARD_RETENTION_SECS", default_value_t = 2_592_000)]
+    pub private_offboard_retention_secs: u64,
+
+    /// Blob store root (defaults to <relay_data_path>/blobs)
+    #[arg(long, env = "NGIT_GRASP_P_BLOB_DATA_PATH")]
+    pub private_blob_data_path: Option<String>,
+
+    /// Private meta store (heed env) root (defaults to <relay_data_path>/private-meta)
+    #[arg(long, env = "NGIT_GRASP_P_META_DATA_PATH")]
+    pub private_meta_data_path: Option<String>,
+
+    /// Optional denylist file(s): comma-separated paths, one sha256 per
+    /// line; matching blob GETs return 451. A missing file is tolerated
+    /// (warn + treated as empty) so per-jurisdiction lists can be mounted
+    /// per node; a present-but-unreadable file is a hard boot error. Each
+    /// file is capped (64 MiB / 1M lines); an over-cap file is a hard boot
+    /// error and keeps its last-known entries on reload. Writers MUST
+    /// update files atomically (write-temp-then-rename): the reload keys
+    /// off mtime and a torn write is a known staleness window.
+    #[arg(long, env = "NGIT_GRASP_P_DENYLIST_PATH")]
+    pub private_denylist_path: Option<String>,
+
+    /// Interval in seconds between denylist file reloads (0 = reload
+    /// disabled; the boot-time set is kept). Hashes newly present after a
+    /// reload trigger an immediate purge of the stored bytes; removed
+    /// hashes unblock reads but purged bytes stay gone (re-upload needed).
+    #[arg(long, env = "NGIT_GRASP_P_DENYLIST_RELOAD_SECS", default_value_t = 60)]
+    pub private_denylist_reload_secs: u64,
+
+    /// Private-repo mirroring (Phase 2; knob exists, unused in Phase 1)
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_ENABLE", default_value_t = false)]
+    pub private_mirror_enable: bool,
+
+    /// Comma-separated peer blob-server base URLs for the Phase-2 mirror.
+    /// Default (unset): derive peers from each registration's `server` tags
+    /// (minus this node's own domain).
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_PEER_URLS")]
+    pub private_mirror_peer_urls: Option<String>,
+
+    /// Maximum concurrent blob mirror fetches
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY", default_value_t = 4)]
+    pub private_mirror_max_concurrency: u32,
+
+    /// Per-blob mirror fetch timeout in seconds
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS", default_value_t = 120)]
+    pub private_mirror_fetch_timeout_secs: u64,
+
+    /// Comma-separated operator-approved peer relay URLs for private-repo
+    /// sync. Outbound private-sync WebSocket connections are made ONLY to
+    /// this allowlist — tenant 30640 `relays` tags are advisory metadata and
+    /// never trigger a connection (SSRF / membership-map-leak guard). Unset
+    /// (default): no private-sync peer connections are initiated (bootstrap
+    /// relays still carry the private filters).
+    #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
+    pub private_sync_peer_urls: Option<String>,
+
+    /// SSRF guard: allow the blob mirror to fetch from peers that resolve to
+    /// loopback/private/link-local IPs (and over plain http), and private-sync
+    /// peer relays over plain ws:// or on internal IPs. Default false —
+    /// production drops such peers and only fetches over https/wss from public
+    /// hosts. Set true only for local testing (e.g. a 127.0.0.1 node pair).
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS",
+        default_value_t = false
+    )]
+    pub private_mirror_allow_private_ips: bool,
+
+    /// Accept kind-3313 direct invites for storage (Phase 1 only honors =false)
+    #[arg(long, env = "NGIT_GRASP_P_ACCEPT_DIRECT_INVITES", default_value_t = false)]
+    pub private_accept_direct_invites: bool,
+
+    /// Also accept the LEGACY stream-wrap kinds 1059/21059 alongside the
+    /// dedicated CORD stream-wrap kinds 3359/23359. Default true: a node
+    /// must accept 3359 BEFORE any client emits it, and legacy wraps
+    /// already published (or held for out-of-order reprocess) must keep
+    /// draining. Set false only once every client on this node has
+    /// migrated — the legacy kinds are then RETIRED: while private repos
+    /// are enabled a 1059/21059 is refused outright ("restricted: legacy
+    /// stream-wrap kind is not accepted on this node"). It is deliberately
+    /// NOT reclassified onto the public related-event path: that path would
+    /// store an `a`/`e`-tagged 1059 from ANY key — no §3.2 registered-key
+    /// gate, no private_max_event_bytes cap, no private quota charge, never
+    /// swept by the private GC — i.e. WIDER than the default, which rejects
+    /// unregistered 1059s outright. Nodes with private repos disabled are
+    /// unaffected (1059 keeps its vanilla public handling).
+    /// Cross-node acceptance knob — part of the policy_fingerprint
+    /// preimage (v3).
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND",
+        default_value_t = true
+    )]
+    pub private_accept_legacy_wrap_kind: bool,
+
+    /// Opt in to per-tenant metric labels (default: aggregate metrics only)
+    #[arg(long, env = "NGIT_GRASP_P_PER_TENANT_METRICS", default_value_t = false)]
+    pub private_per_tenant_metrics: bool,
+
+    /// Per-write-key token bucket capacity for CLIENT-submitted private
+    /// writes (kind 30641 + stream-wrap events + blob PUTs). 0 = unlimited
+    /// (limiter disabled). The default is deliberately generous: legitimate
+    /// client flows — including cord-git widen→narrow key rotations — must
+    /// never trip it; only abuse floods (e.g. quota-uncharged ephemeral
+    /// stream-wrap spam) get capped. Node-local DoS protection only: synced/replayed traffic
+    /// bypasses it, so it has no cross-node convergence impact.
+    #[arg(long, env = "NGIT_GRASP_P_WRITE_RATE_CAPACITY", default_value_t = 120)]
+    pub private_write_rate_capacity: u32,
+
+    /// Refill rate (tokens per minute) for the per-write-key client write
+    /// bucket. Must be > 0 when NGIT_GRASP_P_WRITE_RATE_CAPACITY is non-zero.
+    #[arg(long, env = "NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN", default_value_t = 60)]
+    pub private_write_rate_refill_per_min: u32,
+
+    /// Per-(tenant, alias) token bucket capacity for same-tenant kind-30640
+    /// REPLACEMENTS (free addressable replacements re-trigger sync index
+    /// rebuilds + filter re-issues to all peers within seconds). 0 =
+    /// unlimited. The burst MUST stay >= 4: a §3.3 revocation rotation is
+    /// widen->narrow = 2 replacements in quick succession, plus client error
+    /// retries. A rejected replacement is HELD locally and retried after
+    /// bucket refill (the hourly re-issue is the backstop healer).
+    /// Cross-node acceptance knob — part of the policy_fingerprint
+    /// preimage (v3).
+    #[arg(long, env = "NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY", default_value_t = 8)]
+    pub private_registration_replace_capacity: u32,
+
+    /// Refill rate (replacements per hour) for the per-(tenant, alias)
+    /// replacement bucket — bounds SUSTAINED replacement floods. Must be > 0
+    /// when NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY is non-zero.
+    #[arg(long, env = "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR", default_value_t = 4)]
+    pub private_registration_replace_refill_per_hour: u32,
+
+    /// Interval (seconds) for the periodic since=None full re-issue of the
+    /// private sync filters (Layer-1 kind-30640 + the current derived
+    /// 30641/1059 filters) to every live peer, with a small random jitter to
+    /// avoid cross-node lockstep. Heals delivery gaps that otherwise only a
+    /// reconnect or daily_sync fixes: expired rejected-hot-cache entries,
+    /// negentropy blind spots, and cadence-limited 30640 rejections (WP-A
+    /// A2) that deliberately rely on redelivery. 0 = disabled. Node-local
+    /// recovery knob only — acceptance is unaffected, so it is NOT part of
+    /// the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS", default_value_t = 3600)]
+    pub private_full_reissue_interval_secs: u64,
+
+    /// Minimum interval (seconds) between private sync-filter re-issues to
+    /// the same peer, across BOTH triggers (PrivateSyncIndex-change-derived
+    /// filter pushes and the hourly full re-issue). Bounds how often a
+    /// churning derived-filter set can force a full consolidate
+    /// (unsubscribe-all + resubscribe + since=None backfill) on a peer:
+    /// past CONSOLIDATION_THRESHOLD derived filters, every index-dirty 5s
+    /// tick used to consolidate again (~near-continuous at 128 aliases x
+    /// 4/hour cadence). A re-issue skipped by this floor is retried once
+    /// the interval lapses (never dropped). 0 = unlimited (pre-FS-3
+    /// behavior). Node-local recovery knob only — acceptance is unaffected,
+    /// so it is NOT part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS", default_value_t = 30)]
+    pub private_reissue_min_interval_secs: u64,
+
+    /// Base delay (seconds) for the blob mirror's per-blob exponential
+    /// retry backoff: after n consecutive fetch failures the next attempt
+    /// waits base * 2^(n-1) (capped at NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS,
+    /// ±20% jitter). Applies to transient failure classes only (transport
+    /// errors, peer HTTP 5xx, no available peer, and 404-on-all-peers —
+    /// the latter always at the max interval for late uploads).
+    /// Deterministic failure classes (quota, too_large, verify/store/blocked,
+    /// reserve/sink) are NOT gated: they keep the flat repair-scan cadence
+    /// and only succeed once the underlying condition changes. Node-local
+    /// recovery knob — NOT part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS", default_value_t = 60)]
+    pub private_mirror_retry_base_secs: u64,
+
+    /// Cap (seconds) for the blob mirror retry backoff; also the fixed
+    /// retry interval for blobs the peers answer 404 (possible late
+    /// upload). Must be >= NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS.
+    #[arg(long, env = "NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS", default_value_t = 3600)]
+    pub private_mirror_retry_max_secs: u64,
 }
 
 impl Config {
@@ -1149,7 +1423,191 @@ impl Config {
             }
         }
 
+        // GRASP-P private repositories (only validated when enabled)
+        if self.private_repos_enable {
+            if self.private_registration_mode == RegistrationMode::Paid {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_REGISTRATION_MODE=paid: paid registration mode is not yet available"
+                ));
+            }
+            // Whitelist mode with an empty whitelist is a valid
+            // "accept nothing" posture (it is the shipped default), but an
+            // operator who expected open mode must see it immediately.
+            if self.private_registration_mode == RegistrationMode::Whitelist
+                && self.private_tenant_whitelist_entries().is_empty()
+            {
+                tracing::warn!(
+                    "NGIT_GRASP_P_REGISTRATION_MODE=whitelist with an empty \
+                     NGIT_GRASP_P_TENANT_WHITELIST: all new private-repo \
+                     registrations will be rejected (existing registrations \
+                     are unaffected)"
+                );
+            }
+            if !(1..=40).contains(&self.private_pow_bits) {
+                return Err(anyhow!("NGIT_GRASP_P_POW_BITS must be between 1 and 40"));
+            }
+            if self.private_state_history_editions < 1 {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_STATE_HISTORY_EDITIONS must be at least 1"
+                ));
+            }
+            for (value, name) in [
+                (self.private_max_blob_bytes, "NGIT_GRASP_P_MAX_BLOB_BYTES"),
+                (self.private_max_event_bytes, "NGIT_GRASP_P_MAX_EVENT_BYTES"),
+                (
+                    self.private_quota_tenant_bytes,
+                    "NGIT_GRASP_P_QUOTA_TENANT_BYTES",
+                ),
+                (
+                    self.private_quota_repo_bytes,
+                    "NGIT_GRASP_P_QUOTA_REPO_BYTES",
+                ),
+                (
+                    self.private_global_budget_bytes,
+                    "NGIT_GRASP_P_GLOBAL_BUDGET_BYTES",
+                ),
+            ] {
+                if value == 0 {
+                    return Err(anyhow!("{name} must be greater than 0"));
+                }
+            }
+            if self.private_quota_repo_bytes > self.private_quota_tenant_bytes {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_QUOTA_REPO_BYTES must not exceed NGIT_GRASP_P_QUOTA_TENANT_BYTES"
+                ));
+            }
+            if self.private_quota_tenant_bytes > self.private_global_budget_bytes {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_QUOTA_TENANT_BYTES must not exceed NGIT_GRASP_P_GLOBAL_BUDGET_BYTES"
+                ));
+            }
+            if self.effective_private_blob_path().trim().is_empty() {
+                return Err(anyhow!("NGIT_GRASP_P_BLOB_DATA_PATH must not be empty"));
+            }
+            if self.effective_private_meta_path().trim().is_empty() {
+                return Err(anyhow!("NGIT_GRASP_P_META_DATA_PATH must not be empty"));
+            }
+            if self.private_mirror_enable {
+                if self.private_mirror_max_concurrency == 0 {
+                    return Err(anyhow!(
+                        "NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY must be greater than 0"
+                    ));
+                }
+                if self.private_mirror_fetch_timeout_secs == 0 {
+                    return Err(anyhow!(
+                        "NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS must be greater than 0"
+                    ));
+                }
+                if self.private_mirror_retry_base_secs == 0 {
+                    return Err(anyhow!(
+                        "NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS must be greater than 0"
+                    ));
+                }
+                if self.private_mirror_retry_max_secs < self.private_mirror_retry_base_secs {
+                    return Err(anyhow!(
+                        "NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS must be greater than or equal to \
+                         NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS"
+                    ));
+                }
+            }
+            if self.private_write_rate_capacity > 0 && self.private_write_rate_refill_per_min == 0
+            {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN must be greater than 0 when \
+                     NGIT_GRASP_P_WRITE_RATE_CAPACITY is non-zero"
+                ));
+            }
+            if self.private_registration_replace_capacity > 0
+                && self.private_registration_replace_refill_per_hour == 0
+            {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR must be greater than 0 \
+                     when NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY is non-zero"
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Effective blob store root for GRASP-P private repos.
+    ///
+    /// Defaults to `<relay_data_path>/blobs` so TestRelay tempdir isolation
+    /// holds without extra env vars.
+    pub fn effective_private_blob_path(&self) -> String {
+        self.private_blob_data_path.clone().unwrap_or_else(|| {
+            PathBuf::from(&self.relay_data_path)
+                .join("blobs")
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Effective private meta store (heed env) root for GRASP-P private repos.
+    ///
+    /// Defaults to `<relay_data_path>/private-meta`.
+    pub fn effective_private_meta_path(&self) -> String {
+        self.private_meta_data_path.clone().unwrap_or_else(|| {
+            PathBuf::from(&self.relay_data_path)
+                .join("private-meta")
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Parsed NGIT_GRASP_P_TENANT_WHITELIST (npub bech32 strings, CSV).
+    pub fn private_tenant_whitelist_entries(&self) -> Vec<String> {
+        self.private_tenant_whitelist
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Parsed NGIT_GRASP_P_MIRROR_PEER_URLS (base URLs, CSV). `None` when
+    /// unset or empty — the mirror then derives peers from each
+    /// registration's `server` tags.
+    pub fn private_mirror_peer_url_entries(&self) -> Option<Vec<String>> {
+        let raw = self.private_mirror_peer_urls.as_ref()?;
+        let entries: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Parsed NGIT_GRASP_P_DENYLIST_PATH (file paths, CSV). Empty when
+    /// unset — the denylist is then empty and no reload task runs.
+    pub fn private_denylist_paths(&self) -> Vec<String> {
+        self.private_denylist_path
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Parsed NGIT_GRASP_P_SYNC_PEER_URLS (relay URLs, CSV). Empty when
+    /// unset — the sync layer then initiates NO private peer connections;
+    /// tenant 30640 `relays` tags are never a connection source.
+    pub fn private_sync_peer_url_entries(&self) -> Vec<String> {
+        self.private_sync_peer_urls
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Parse archive GRASP services from comma-separated string
@@ -1385,6 +1843,42 @@ impl Config {
             relay_max_event_size_bytes: 192 * 1024,
             relay_filter_limit: 500,
             log_level: "debug".to_string(),
+            private_repos_enable: false,
+            private_registration_mode: RegistrationMode::Open,
+            private_pow_bits: 20,
+            private_tenant_whitelist: String::new(),
+            private_max_blob_bytes: 268_435_456,
+            private_max_event_bytes: 131_072,
+            private_quota_tenant_bytes: 1_073_741_824,
+            private_quota_repo_bytes: 536_870_912,
+            private_global_budget_bytes: 53_687_091_200,
+            private_max_aliases_per_tenant: 64,
+            private_max_write_keys_per_alias: 64,
+            private_state_history_editions: 16,
+            private_gc_grace_secs: 86_400,
+            private_gc_interval_secs: 3_600,
+            private_offboard_retention_secs: 2_592_000,
+            private_blob_data_path: None,
+            private_meta_data_path: None,
+            private_denylist_path: None,
+            private_denylist_reload_secs: 60,
+            private_mirror_enable: false,
+            private_mirror_peer_urls: None,
+            private_sync_peer_urls: None,
+            private_mirror_max_concurrency: 4,
+            private_mirror_fetch_timeout_secs: 120,
+            private_mirror_allow_private_ips: false,
+            private_accept_direct_invites: false,
+            private_accept_legacy_wrap_kind: true,
+            private_per_tenant_metrics: false,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 60,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 4,
+            private_full_reissue_interval_secs: 3600,
+            private_reissue_min_interval_secs: 30,
+            private_mirror_retry_base_secs: 60,
+            private_mirror_retry_max_secs: 3600,
         }
     }
 }
@@ -1446,6 +1940,43 @@ mod tests {
         assert!(config.startup_integrity_identifiers.is_empty());
         // for_testing() uses Memory, but the actual default is Lmdb
         assert_eq!(config.database_backend, DatabaseBackend::Memory);
+    }
+
+    /// Wire-kind migration: legacy stream-wrap acceptance defaults ON (a
+    /// node must accept 3359 before any client emits it, and in-flight
+    /// 1059s must keep draining), and the env var must be able to turn it
+    /// OFF — a default-true clap bool silently ignoring `=false` would
+    /// make the migration's final step a no-op.
+    #[test]
+    fn test_private_accept_legacy_wrap_kind_default_and_env_override() {
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND";
+        let original = std::env::var_os(VARIABLE);
+        std::env::remove_var(VARIABLE);
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default configuration should parse");
+        assert!(
+            config.private_accept_legacy_wrap_kind,
+            "legacy wrap-kind acceptance must default to true"
+        );
+        assert!(
+            Config::for_testing().private_accept_legacy_wrap_kind,
+            "for_testing() must match the shipped default"
+        );
+
+        std::env::set_var(VARIABLE, "false");
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("env-disabled configuration should parse");
+        assert!(
+            !config.private_accept_legacy_wrap_kind,
+            "NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND=false must turn legacy accept off"
+        );
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
     }
 
     #[test]
@@ -1768,6 +2299,32 @@ mod tests {
         }
 
         assert_eq!(config.deletion_request_retention_unused_served_secs, 42);
+    }
+
+    #[test]
+    fn test_private_registration_mode_shipped_default_is_whitelist() {
+        // WP-E / server issue !7: the shipped default admission mode is
+        // whitelist (open is staging/self-use only and must be opted into).
+        // Pin it so a regression of the clap/derive default fails loudly.
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_GRASP_P_REGISTRATION_MODE";
+        let original = std::env::var_os(VARIABLE);
+        std::env::remove_var(VARIABLE);
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default private registration mode configuration should parse");
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
+
+        assert_eq!(
+            config.private_registration_mode,
+            RegistrationMode::Whitelist,
+            "shipped default registration mode must be whitelist (open is opt-in only)"
+        );
+        assert_eq!(RegistrationMode::default(), RegistrationMode::Whitelist);
     }
 
     #[test]
@@ -2782,5 +3339,242 @@ mod tests {
         assert!(
             !config.matches_grasp_services(&["github.com".to_string(), "gitlab.org".to_string(),])
         );
+    }
+
+    #[test]
+    fn test_private_write_rate_validation() {
+        // Defaults (enabled, generous) validate.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // capacity = 0 disables the limiter; refill is then unconstrained.
+        let config = Config {
+            private_repos_enable: true,
+            private_write_rate_capacity: 0,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Non-zero capacity with zero refill is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero refill must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN"),
+            "unexpected error: {error}"
+        );
+
+        // The knobs are only validated when the subsystem is enabled.
+        let config = Config {
+            private_repos_enable: false,
+            private_write_rate_capacity: 120,
+            private_write_rate_refill_per_min: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_registration_replace_validation() {
+        // Defaults (capacity 8, refill 4/hour) validate.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // capacity = 0 disables the cadence limiter; refill is then
+        // unconstrained.
+        let config = Config {
+            private_repos_enable: true,
+            private_registration_replace_capacity: 0,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Non-zero capacity with zero refill is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero refill must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR"),
+            "unexpected error: {error}"
+        );
+
+        // Only validated when the subsystem is enabled.
+        let config = Config {
+            private_repos_enable: false,
+            private_registration_replace_capacity: 8,
+            private_registration_replace_refill_per_hour: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_full_reissue_interval_validation() {
+        // Default (3600s) validates.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.private_full_reissue_interval_secs, 3600);
+
+        // 0 disables the timer and is always valid.
+        let config = Config {
+            private_repos_enable: true,
+            private_full_reissue_interval_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Any positive interval is valid (no constraint to violate).
+        let config = Config {
+            private_repos_enable: true,
+            private_full_reissue_interval_secs: 1,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_mirror_retry_validation() {
+        // Defaults (base 60, max 3600) validate.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Zero base is a misconfiguration (would hot-loop retries).
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            private_mirror_retry_base_secs: 0,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("zero base must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS"),
+            "unexpected error: {error}"
+        );
+
+        // max < base is a misconfiguration.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: true,
+            private_mirror_retry_base_secs: 120,
+            private_mirror_retry_max_secs: 60,
+            ..Config::for_testing()
+        };
+        let error = config.validate().expect_err("max < base must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS"),
+            "unexpected error: {error}"
+        );
+
+        // Only validated when the mirror is enabled.
+        let config = Config {
+            private_repos_enable: true,
+            private_mirror_enable: false,
+            private_mirror_retry_base_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_private_denylist_path_parsing() {
+        // Unset → no paths.
+        let config = Config::for_testing();
+        assert!(config.private_denylist_paths().is_empty());
+
+        // Single path.
+        let config = Config {
+            private_denylist_path: Some("/etc/ngit/denylist.txt".to_string()),
+            ..Config::for_testing()
+        };
+        assert_eq!(
+            config.private_denylist_paths(),
+            vec!["/etc/ngit/denylist.txt".to_string()]
+        );
+
+        // Comma-separated multi-path: whitespace trimmed, empty segments
+        // dropped. (Long line left as-is: rustfmt's 100-col split hurts
+        // the readability of this fixture.)
+        let config = Config {
+            private_denylist_path: Some(" /a/deny.txt ,/b/deny.txt,,  /c/deny.txt  ,".to_string()),
+            ..Config::for_testing()
+        };
+        assert_eq!(
+            config.private_denylist_paths(),
+            vec![
+                "/a/deny.txt".to_string(),
+                "/b/deny.txt".to_string(),
+                "/c/deny.txt".to_string()
+            ]
+        );
+
+        // Set-but-empty / all-separators → no paths.
+        for raw in ["", ",", " , , "] {
+            let config = Config {
+                private_denylist_path: Some(raw.to_string()),
+                ..Config::for_testing()
+            };
+            assert!(
+                config.private_denylist_paths().is_empty(),
+                "raw={raw:?} must yield no paths"
+            );
+        }
+    }
+
+    #[test]
+    fn test_private_denylist_reload_secs_validation() {
+        // Default (60s) validates.
+        let config = Config {
+            private_repos_enable: true,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(config.private_denylist_reload_secs, 60);
+
+        // 0 disables the reload task and is always valid.
+        let config = Config {
+            private_repos_enable: true,
+            private_denylist_reload_secs: 0,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // Any other u64 is valid (no constraint to violate).
+        let config = Config {
+            private_repos_enable: true,
+            private_denylist_reload_secs: u64::MAX,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
     }
 }

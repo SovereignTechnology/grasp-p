@@ -47,6 +47,12 @@ impl DeletionService {
         Self { ctx, policy }
     }
 
+    /// Does this relay action NIP-09 deletions locally (vs archival/
+    /// disrespector mode, where they are only recorded)?
+    pub fn actions_deletions(&self) -> bool {
+        !self.ctx.config.deletion_request_disrespector
+    }
+
     pub async fn gate(&self, event: &Event) -> Option<WritePolicyResult> {
         // The operator's current archival-mode policy governs every retained
         // request, regardless of how it was classified when received.

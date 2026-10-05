@@ -13,26 +13,33 @@ upstream v3.0.7. Delete this file when the port is merged.
 
 This does not compile yet: the seams below are not wired.
 
+## Carried by three-way apply (second commit)
+
+The legacy change to each of these applied onto v3.0.7 with the renames above; where both
+sides had added lines at the same place, both were kept.
+
+`src/config.rs`, `src/lib.rs`, `src/metrics/mod.rs`, `src/http/nip11.rs`,
+`src/nostr/lifecycle/deletion/service.rs`, `src/sync/filters.rs`,
+`src/sync/relay_connection.rs`, `Cargo.toml` (watchdog bin, `url`, `heed`; **not** the
+`rustls` switch), `nix/module.nix`, `.env.example`, `docs/reference/configuration.md`,
+`docs/how-to/prometheus-setup.md`.
+
+None of this has been compiled. `Cargo.lock` is untouched and must be regenerated.
+
 ## Still to do
 
-Seams in upstream files (legacy diff: `git diff cbf6f1d legacy/v1.2-grasp-p -- <file>`):
+These five conflicted too heavily and are still upstream's v3.0.7 versions. Port each by
+hand with the compiler; the legacy change is `git diff cbf6f1d legacy/v1.2-grasp-p -- <file>`.
 
-| File | Legacy change | Note |
-|---|---|---|
-| `src/lib.rs` | `pub mod private` | now `pub mod grasp_p` |
-| `src/config.rs` | +794 | all settings, renamed; add the GRASP-08 mutual-exclusion check |
-| `src/server.rs` | +28 | construct the service, thread it through |
-| `src/http/mod.rs` | +93 | blob routes; make them base-path aware (`strip_base_path`) |
-| `src/http/nip11.rs` | +9 | `private_repos` advert |
-| `src/nostr/builder.rs` | +234 | the admission arm in `Nip34WritePolicy::admit_event` |
-| `src/nostr/lifecycle/deletion/service.rs` | +6 | claim freeing on kind 5 / 62 |
-| `src/metrics/mod.rs` | +365 | additive |
-| `src/sync/filters.rs` | +157 | derived filters |
-| `src/sync/mod.rs` | +715 | **rewrite** against upstream's grouped subscriptions |
-| `src/sync/relay_connection.rs` | +28 | **rewrite**, small |
-| `tests/common/relay.rs` | +85 | the two `TestRelay` constructors, on `PortReservation` |
-| `nix/module.nix`, `.env.example`, `docs/reference/configuration.md` | | the four-source config rule |
-| `Cargo.toml` | | the watchdog bin; keep upstream's `native-tls` |
+| File | Legacy change | Conflicts | Note |
+|---|---|---|---|
+| `src/server.rs` | +28 | 3 | construct the service, thread it beside upstream's `private_access` |
+| `src/http/mod.rs` | +93 | 9 | blob routes; make them base-path aware (`strip_base_path`); rename the `private` field |
+| `src/nostr/builder.rs` | +234 | 4 | the admission arm in `Nip34WritePolicy::admit_event` |
+| `src/sync/mod.rs` | +715 | 12 | **rewrite** against upstream's grouped subscriptions |
+| `tests/common/relay.rs` | +85 | 5 | the two `TestRelay` constructors, on `PortReservation` |
+
+Also: config validation for the GRASP-08 exclusion, `grasp-audit/Cargo.toml` stays upstream's.
 
 API moves since nostr 0.45.0-alpha.3:
 

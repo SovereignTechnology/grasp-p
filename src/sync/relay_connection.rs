@@ -1879,6 +1879,34 @@ impl RelayConnection {
                     }
                 }
                 RelayNotification::Message { message } => match *message {
+                    // nostr-sdk dedups events already present in its
+                    // per-connection store: instead of RelayNotification::Event
+                    // they come back wrapped in RelayNotification::Message
+                    // (check_id == Saved in InnerRelay::handle_event_msg).
+                    // Forward them as regular events — ngit's own
+                    // `database.event_by_id` Duplicate check plus the
+                    // rejected-index pre-filters gate them at the processor.
+                    // Without this, since=None redelivery (daily sync, the
+                    // GRASP-P Phase-4b full re-issue timer) could never
+                    // resurrect an event this connection has already seen
+                    // once — e.g. rejected into the hot cache and healed
+                    // only after the hold expires.
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } => {
+                        if event_sender
+                            .send(RelayEvent::Event(
+                                Box::new(event.into_owned()),
+                                subscription_id.into_owned(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(relay = %url, "Event sender closed, stopping event loop");
+                            break;
+                        }
+                    }
                     RelayMessage::EndOfStoredEvents(sub_id) => {
                         let data_lane_arrival = std::time::Instant::now();
                         tracing::debug!(relay = %url, sub_id = ?sub_id, "Received EOSE");

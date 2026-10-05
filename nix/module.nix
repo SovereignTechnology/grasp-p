@@ -542,6 +542,404 @@ let
         type = types.ints.positive;
         default = 500;
         description = "Per-filter result cap, including when limit is omitted";
+      privateReposEnable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          GRASP-P master switch: enable private repository hosting
+          (kind-30640/30641/1059/21059 + blob routes). Every other
+          private* option is a no-op unless this is true.
+        '';
+      };
+
+      privateRegistrationMode = mkOption {
+        type = types.enum [ "open" "whitelist" "pow" "paid" ];
+        default = "whitelist";
+        description = ''
+          GRASP-P admission mode for NEW private-repo aliases. WP-E: the
+          shipped default is whitelist — open is staging/self-use only (in
+          open mode any fresh key receives the full per-tenant quota, so
+          ~50 pseudonymous tenants can exhaust the global budget). paid is
+          reserved and fails validation. Part of the policy_fingerprint
+          preimage (grasp-p-policy-v3): operators who never set the mode
+          will see their fingerprint change on upgrade — paired nodes must
+          run identical values.
+        '';
+      };
+
+      privatePowBits = mkOption {
+        type = types.int;
+        default = 20;
+        description = ''
+          GRASP-P: NIP-13 leading-zero bits required on kind-30640
+          registrations when privateRegistrationMode = "pow". Must be
+          1..=40.
+        '';
+      };
+
+      privateTenantWhitelist = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          GRASP-P: npubs (bech32) allowed to register new aliases when
+          privateRegistrationMode = "whitelist". Empty (default) rejects
+          ALL new registrations — a valid "accept nothing" posture;
+          startup warns loudly in that state. Part of the
+          policy_fingerprint preimage: paired nodes must run identical
+          lists.
+        '';
+      };
+
+      privateMaxBlobBytes = mkOption {
+        type = types.int;
+        default = 268435456;
+        description = ''
+          GRASP-P: per-blob size cap in bytes (enforced pre- and
+          mid-stream). Default 256 MiB.
+        '';
+      };
+
+      privateMaxEventBytes = mkOption {
+        type = types.int;
+        default = 131072;
+        description = ''
+          GRASP-P: serialized-JSON size cap in bytes for private-repo
+          events (30640/30641/1059/21059). Default 128 KiB.
+        '';
+      };
+
+      privateQuotaTenantBytes = mkOption {
+        type = types.int;
+        default = 1073741824;
+        description = ''
+          GRASP-P: per hosting-npub total quota in bytes (events + blobs).
+          Must be > 0 and <= privateGlobalBudgetBytes. Default 1 GiB.
+          policy_fingerprint preimage member.
+        '';
+      };
+
+      privateQuotaRepoBytes = mkOption {
+        type = types.int;
+        default = 536870912;
+        description = ''
+          GRASP-P: per-alias total quota in bytes (events + blobs). Must
+          be > 0 and <= privateQuotaTenantBytes. Default 512 MiB.
+          policy_fingerprint preimage member.
+        '';
+      };
+
+      privateGlobalBudgetBytes = mkOption {
+        type = types.int;
+        default = 53687091200;
+        description = ''
+          GRASP-P: whole private-subsystem storage cap in bytes. Default
+          50 GiB. policy_fingerprint preimage member.
+        '';
+      };
+
+      privateMaxAliasesPerTenant = mkOption {
+        type = types.int;
+        default = 64;
+        description = ''
+          GRASP-P: maximum registrations (aliases) per hosting npub.
+        '';
+      };
+
+      privateMaxWriteKeysPerAlias = mkOption {
+        type = types.int;
+        default = 64;
+        description = ''
+          GRASP-P: maximum `w` + `aux` keys per alias registration.
+        '';
+      };
+
+      privateStateHistoryEditions = mkOption {
+        type = types.int;
+        default = 16;
+        description = ''
+          GRASP-P: kind-30641 edition ring depth kept in the private meta
+          store. Must be >= 1.
+        '';
+      };
+
+      privateGcGraceSecs = mkOption {
+        type = types.int;
+        default = 86400;
+        description = ''
+          GRASP-P: grace period in seconds before an unreferenced blob may
+          be deleted by GC.
+        '';
+      };
+
+      privateGcIntervalSecs = mkOption {
+        type = types.int;
+        default = 3600;
+        description = ''
+          GRASP-P: interval in seconds between private blob GC passes.
+        '';
+      };
+
+      privateOffboardRetentionSecs = mkOption {
+        type = types.int;
+        default = 2592000;
+        description = ''
+          GRASP-P: tombstoned-alias purge delay in seconds (30 days).
+        '';
+      };
+
+      privateBlobDataPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          GRASP-P: blob store root. Null (default): the relay derives
+          <relay_data_path>/blobs (i.e. ''${dataDir}/relay/blobs under
+          this module).
+        '';
+      };
+
+      privateMetaDataPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          GRASP-P: private meta store (heed env) root. Null (default): the
+          relay derives <relay_data_path>/private-meta.
+        '';
+      };
+
+      privateMirrorEnable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          GRASP-P Phase 2: blob mirroring between paired nodes.
+        '';
+      };
+
+      privateMirrorPeerUrls = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          GRASP-P Phase 2: peer blob-server base URLs for the mirror.
+          Empty (default): derive peers from each registration's `server`
+          tags (minus this node's own domain).
+        '';
+      };
+
+      privateMirrorMaxConcurrency = mkOption {
+        type = types.int;
+        default = 4;
+        description = ''
+          GRASP-P Phase 2: maximum concurrent blob mirror fetches. Must
+          be > 0 when the mirror is enabled.
+        '';
+      };
+
+      privateMirrorFetchTimeoutSecs = mkOption {
+        type = types.int;
+        default = 120;
+        description = ''
+          GRASP-P Phase 2: per-blob mirror fetch timeout in seconds. Must
+          be > 0 when the mirror is enabled.
+        '';
+      };
+
+      privateSyncPeerUrls = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          GRASP-P Phase 2: operator-approved peer relay URLs for
+          private-repo sync. Outbound private-sync WebSocket connections
+          are made ONLY to this allowlist — tenant 30640 `relays` tags
+          never trigger a connection (SSRF / membership-map-leak guard).
+          Empty (default): no private-sync peer connections are initiated
+          (bootstrap relays still carry the private filters).
+        '';
+      };
+
+      privateMirrorAllowPrivateIps = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          GRASP-P Phase 2 SSRF guard: when false (default), mirror fetch
+          peers resolving to loopback/private/link-local IPs are dropped
+          and only https/wss public hosts are contacted. Set true only
+          for local testing (e.g. a 127.0.0.1 node pair).
+        '';
+      };
+
+      privateAcceptDirectInvites = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          GRASP-P: accept kind-3313 direct invites for storage (currently
+          only false is honored: invites are rejected).
+        '';
+      };
+
+      privateAcceptLegacyWrapKind = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          GRASP-P: also accept the LEGACY stream-wrap kinds 1059/21059
+          alongside the dedicated CORD stream-wrap kinds 3359/23359.
+          Default true: a node must accept 3359 BEFORE any client emits
+          it, and legacy wraps already published (or held for
+          out-of-order reprocess) must keep draining. Set false only once
+          every client on this node has migrated — the legacy kinds are
+          then RETIRED: while private repos are enabled a 1059/21059 is
+          refused outright, never reclassified onto the public
+          related-event path (which would store an a/e-tagged 1059 from
+          any key, uncharged and outside private quota/GC). Nodes with
+          private repos disabled are unaffected. Cross-node acceptance
+          knob: it feeds the policy_fingerprint (v3), so a node pair MUST
+          agree on it.
+        '';
+      };
+
+      privatePerTenantMetrics = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          GRASP-P: opt in to per-tenant metric labels (default: aggregate
+          metrics only, to keep label cardinality bounded).
+        '';
+      };
+
+      privateWriteRateCapacity = mkOption {
+        type = types.int;
+        default = 120;
+        description = ''
+          GRASP-P Phase-4b: per-write-key token bucket capacity for
+          CLIENT-submitted private writes (kind 30641/1059/21059 events +
+          blob PUTs). 0 = unlimited (limiter disabled). Deliberately generous
+          by default so legitimate flows (incl. cord-git widen-narrow
+          rotations) never trip it; only abuse floods are capped. Only has
+          an effect when private repos are enabled (NGIT_GRASP_P_REPOS_ENABLE).
+        '';
+      };
+
+      privateWriteRateRefillPerMin = mkOption {
+        type = types.int;
+        default = 60;
+        description = ''
+          GRASP-P Phase-4b: refill rate (tokens per minute) for the
+          per-write-key client write bucket. Must be > 0 when
+          privateWriteRateCapacity is non-zero.
+        '';
+      };
+
+      privateRegistrationReplaceCapacity = mkOption {
+        type = types.int;
+        default = 8;
+        description = ''
+          GRASP-P Phase-4b: per-(tenant, alias) token bucket capacity for
+          same-tenant kind-30640 REPLACEMENTS. 0 = unlimited. Keep >= 4: a
+          revocation rotation is widen-narrow = 2 replacements in quick
+          succession plus retries. Rejected replacements are HELD locally
+          and retried after bucket refill (the hourly re-issue is the
+          backstop healer). Cross-node acceptance knob (part of the
+          policy_fingerprint preimage, v3) — paired nodes must run
+          identical values.
+        '';
+      };
+
+      privateRegistrationReplaceRefillPerHour = mkOption {
+        type = types.int;
+        default = 4;
+        description = ''
+          GRASP-P Phase-4b: refill rate (replacements per hour) for the
+          per-(tenant, alias) replacement bucket — bounds sustained
+          replacement floods. Must be > 0 when
+          privateRegistrationReplaceCapacity is non-zero.
+        '';
+      };
+
+      privateFullReissueIntervalSecs = mkOption {
+        type = types.int;
+        default = 3600;
+        description = ''
+          GRASP-P Phase-4b B1: interval (seconds) for the periodic since=None
+          full re-issue of the private sync filters (Layer-1 kind-30640 +
+          the current derived 30641/1059 filters) to every live peer, with
+          small jitter to avoid cross-node lockstep. Heals delivery gaps
+          that otherwise only a reconnect or daily sync fixes (expired
+          rejected-hot-cache entries, negentropy blind spots,
+          cadence-limited 30640 rejections). 0 = disabled. Node-local
+          recovery knob — NOT part of the policy_fingerprint preimage.
+        '';
+      };
+
+      privateReissueMinIntervalSecs = mkOption {
+        type = types.int;
+        default = 30;
+        description = ''
+          GRASP-P Phase-4b FS-3: minimum interval (seconds) between private
+          sync-filter re-issues to the same peer, across BOTH triggers
+          (PrivateSyncIndex-change-derived filter pushes and the hourly
+          full re-issue). Bounds how often a churning derived-filter set
+          can force a full consolidate on a peer. A skipped re-issue is
+          retried once the interval lapses (never dropped). 0 = unlimited.
+          Node-local recovery knob — NOT part of the policy_fingerprint
+          preimage.
+        '';
+      };
+
+      privateMirrorRetryBaseSecs = mkOption {
+        type = types.int;
+        default = 60;
+        description = ''
+          GRASP-P Phase-4b B2: base delay (seconds) for the blob mirror's
+          per-blob exponential retry backoff (base * 2^(attempt-1), capped
+          at privateMirrorRetryMaxSecs, ±20% jitter). Applies to transient
+          failure classes only (transport, peer 5xx, no peer, and
+          404-on-all-peers at the max interval); deterministic classes
+          (quota, too_large, verify/store/blocked, reserve/sink) keep the
+          flat repair-scan cadence. Must be > 0. Node-local recovery knob —
+          NOT part of the policy_fingerprint preimage.
+        '';
+      };
+
+      privateMirrorRetryMaxSecs = mkOption {
+        type = types.int;
+        default = 3600;
+        description = ''
+          GRASP-P Phase-4b B2: cap (seconds) for the blob mirror retry
+          backoff; also the fixed retry interval for blobs the peers answer
+          404 (possible late upload). Must be >= privateMirrorRetryBaseSecs.
+        '';
+      };
+
+      privateDenylistPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          GRASP-P Phase-4b D1: comma-separated list of node-local legal
+          takedown denylist files (one blob sha256 hex digest per line).
+          Matching blobs are not served (GET/HEAD -> 451), not accepted
+          (upload preflight -> 451), not stored (in-flight uploads fail at
+          commit), and not mirrored. A missing file is tolerated (warning +
+          treated as empty); a present-but-unreadable file is a hard boot
+          error. Each file is capped (64 MiB / 1M lines): an over-cap file
+          is a hard boot error and keeps its last-known entries on reload.
+          Writers MUST update files atomically (write-temp-then-rename) —
+          the reload keys off mtime and a torn write is a known staleness
+          window. Node-local legal config — deliberately NOT part of the
+          policy_fingerprint. Only has an effect when private repos are
+          enabled (NGIT_GRASP_P_REPOS_ENABLE).
+        '';
+      };
+
+      privateDenylistReloadSecs = mkOption {
+        type = types.int;
+        default = 60;
+        description = ''
+          GRASP-P Phase-4b D1: interval (seconds) between denylist file
+          reloads. Only changed files are re-read; the live set is swapped
+          atomically. Hashes newly present after a reload are purged
+          immediately (claims freed, ledger charges released, bytes
+          unlinked); removed hashes unblock reads, but purged bytes stay
+          gone (clients must re-upload). 0 = reload disabled (boot-time
+          set kept).
+        '';
       };
 
       user = mkOption {
@@ -642,6 +1040,68 @@ let
       NGIT_USER_INDEX_RELAYS = concatStringsSep "," cfg.userIndexRelays;
       NGIT_SYNC_PLUS_FALLBACK_RELAYS =
         concatStringsSep "," cfg.syncPlusFallbackRelays;
+      NGIT_GRASP_P_REPOS_ENABLE =
+        if cfg.privateReposEnable then "true" else "false";
+      NGIT_GRASP_P_REGISTRATION_MODE = cfg.privateRegistrationMode;
+      NGIT_GRASP_P_POW_BITS = toString cfg.privatePowBits;
+      NGIT_GRASP_P_TENANT_WHITELIST =
+        concatStringsSep "," cfg.privateTenantWhitelist;
+      NGIT_GRASP_P_MAX_BLOB_BYTES = toString cfg.privateMaxBlobBytes;
+      NGIT_GRASP_P_MAX_EVENT_BYTES = toString cfg.privateMaxEventBytes;
+      NGIT_GRASP_P_QUOTA_TENANT_BYTES = toString cfg.privateQuotaTenantBytes;
+      NGIT_GRASP_P_QUOTA_REPO_BYTES = toString cfg.privateQuotaRepoBytes;
+      NGIT_GRASP_P_GLOBAL_BUDGET_BYTES =
+        toString cfg.privateGlobalBudgetBytes;
+      NGIT_GRASP_P_MAX_ALIASES_PER_TENANT =
+        toString cfg.privateMaxAliasesPerTenant;
+      NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS =
+        toString cfg.privateMaxWriteKeysPerAlias;
+      NGIT_GRASP_P_STATE_HISTORY_EDITIONS =
+        toString cfg.privateStateHistoryEditions;
+      NGIT_GRASP_P_GC_GRACE_SECS = toString cfg.privateGcGraceSecs;
+      NGIT_GRASP_P_GC_INTERVAL_SECS = toString cfg.privateGcIntervalSecs;
+      NGIT_GRASP_P_OFFBOARD_RETENTION_SECS =
+        toString cfg.privateOffboardRetentionSecs;
+      NGIT_GRASP_P_MIRROR_ENABLE =
+        if cfg.privateMirrorEnable then "true" else "false";
+      NGIT_GRASP_P_MIRROR_PEER_URLS =
+        concatStringsSep "," cfg.privateMirrorPeerUrls;
+      NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY =
+        toString cfg.privateMirrorMaxConcurrency;
+      NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS =
+        toString cfg.privateMirrorFetchTimeoutSecs;
+      NGIT_GRASP_P_SYNC_PEER_URLS = concatStringsSep "," cfg.privateSyncPeerUrls;
+      NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS =
+        if cfg.privateMirrorAllowPrivateIps then "true" else "false";
+      NGIT_GRASP_P_ACCEPT_DIRECT_INVITES =
+        if cfg.privateAcceptDirectInvites then "true" else "false";
+      NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND =
+        if cfg.privateAcceptLegacyWrapKind then "true" else "false";
+      NGIT_GRASP_P_PER_TENANT_METRICS =
+        if cfg.privatePerTenantMetrics then "true" else "false";
+      NGIT_GRASP_P_WRITE_RATE_CAPACITY = toString cfg.privateWriteRateCapacity;
+      NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN =
+        toString cfg.privateWriteRateRefillPerMin;
+      NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY =
+        toString cfg.privateRegistrationReplaceCapacity;
+      NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR =
+        toString cfg.privateRegistrationReplaceRefillPerHour;
+      NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS =
+        toString cfg.privateFullReissueIntervalSecs;
+      NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS =
+        toString cfg.privateReissueMinIntervalSecs;
+      NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS =
+        toString cfg.privateMirrorRetryBaseSecs;
+      NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS =
+        toString cfg.privateMirrorRetryMaxSecs;
+      NGIT_GRASP_P_DENYLIST_RELOAD_SECS =
+        toString cfg.privateDenylistReloadSecs;
+    } // optionalAttrs (cfg.privateDenylistPath != null) {
+      NGIT_GRASP_P_DENYLIST_PATH = cfg.privateDenylistPath;
+    } // optionalAttrs (cfg.privateBlobDataPath != null) {
+      NGIT_GRASP_P_BLOB_DATA_PATH = cfg.privateBlobDataPath;
+    } // optionalAttrs (cfg.privateMetaDataPath != null) {
+      NGIT_GRASP_P_META_DATA_PATH = cfg.privateMetaDataPath;
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.trustedProxyCidrs != [ ]) {

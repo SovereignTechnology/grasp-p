@@ -74,6 +74,27 @@ async-trait = "0.1"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 
+# GRASP-P private repos: meta store (same heed version nostr-lmdb pins),
+# small sync primitives, and temp-file names for streamed blob uploads.
+# sha256/hex come from the `nostr` re-export of bitcoin_hashes (already compiled).
+# NOTE (follow-up C3): these "serde"/"serde-json" features unify (Cargo feature
+# union) onto the heed that nostr-lmdb pins for the relay core store. This
+# assumes both crates continue to share one heed version; the features are
+# additive and unused by nostr-lmdb (benign today). If nostr-lmdb ever moves to
+# a different heed major, revisit rather than relying on this shared-version
+# assumption. Left as documentation only — no refactor.
+heed = { version = "0.20", default-features = false, features = ["serde", "serde-json"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+# GRASP-P blob mirror: uses the reqwest dependency above (native-tls, as upstream).
+# Do not switch it to rustls: with nostr-sdk's ring-backed rustls already in the
+# tree that links two crypto providers, and the first TLS connection panics.
+
+# GRASP-P Phase 4b: exact-host URL matching for domain references in 30640
+# tags / peer allowlists (already compiled transitively via reqwest).
+url = "2"
+
 # Git (for future use)
 # git-http-backend = "0.3"
 
@@ -91,6 +112,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "ngit-grasp"
 path = "src/main.rs"
+
+# Phase-4b WP-F: external split-view watchdog for GRASP-P two-node pairs.
+[[bin]]
+name = "ngit-private-watchdog"
+path = "src/bin/ngit-private-watchdog.rs"
 
 [[test]]
 name = "nip09_announcement_cascade"

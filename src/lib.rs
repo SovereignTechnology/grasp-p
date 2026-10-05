@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod nostr;
 pub mod outbound;
 pub mod private;
+pub mod grasp_p;
 pub mod purgatory;
 pub mod server;
 pub mod sync;
