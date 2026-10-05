@@ -296,7 +296,7 @@ pub fn build_private_derived_filters(
     for chunk in aliases.chunks(100) {
         let mut filter = Filter::new().kind(Kind::Custom(crate::grasp_p::KIND_STATE_ROOT));
         for alias in chunk {
-            filter = filter.custom_tag(SingleLetterTag::lowercase(Alphabet::D), alias.as_str());
+            filter = filter.custom_tag(SingleLetterTag::LOWERCASE_D, alias.as_str());
         }
         if let Some(ts) = since {
             filter = filter.since(ts);
@@ -891,12 +891,10 @@ mod tests {
         let mut filters = vec![build_private_registration_filter(None)];
         filters.extend(build_private_derived_filters(&empty, None, true));
         assert_eq!(filters.len(), 1);
-        assert!(
-            filters[0]
-                .kinds
-                .as_ref()
-                .is_some_and(|k| k.contains(&Kind::Custom(30640)))
-        );
+        assert!(filters[0]
+            .kinds
+            .as_ref()
+            .is_some_and(|k| k.contains(&Kind::Custom(30640))));
         assert_eq!(filters[0].since, None);
 
         // Populated index: 30640 + one 30641 #d chunk + one stream-wrap

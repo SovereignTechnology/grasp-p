@@ -660,6 +660,10 @@ pub struct RelayConnection {
     background_query_pacer: std::sync::Arc<BackgroundQueryPacer>,
     /// Per-session ceiling learned from explicit filter-count refusals.
     max_filters_per_req: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// GRASP-P: forward events the SDK reports as already seen (see the
+    /// `RelayMessage::Event` arm of the event loop). Off unless GRASP-P is
+    /// enabled, so a public node's sync is unchanged.
+    forward_duplicate_events: bool,
 }
 
 impl RelayConnection {
@@ -668,6 +672,13 @@ impl RelayConnection {
         health_tracker: std::sync::Arc<RelayHealthTracker>,
     ) -> Self {
         self.health_tracker = health_tracker;
+        self
+    }
+
+    /// GRASP-P: also forward events the SDK has already stored for this
+    /// connection, so a since=None re-issue can redeliver them.
+    pub(super) fn with_duplicate_event_forwarding(mut self, enabled: bool) -> Self {
+        self.forward_duplicate_events = enabled;
         self
     }
 
@@ -845,6 +856,7 @@ impl RelayConnection {
             max_filters_per_req: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 super::MAX_FILTERS_PER_REQ,
             )),
+            forward_duplicate_events: false,
         }
     }
 
@@ -921,6 +933,7 @@ impl RelayConnection {
             max_filters_per_req: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 super::MAX_FILTERS_PER_REQ,
             )),
+            forward_duplicate_events: false,
         }
     }
 
@@ -1879,8 +1892,9 @@ impl RelayConnection {
                     }
                 }
                 RelayNotification::Message { message } => match *message {
-                    // nostr-sdk dedups events already present in its
-                    // per-connection store: instead of RelayNotification::Event
+                    // GRASP-P only (`forward_duplicate_events`): nostr-sdk
+                    // dedups events already present in its per-connection
+                    // store: instead of RelayNotification::Event
                     // they come back wrapped in RelayNotification::Message
                     // (check_id == Saved in InnerRelay::handle_event_msg).
                     // Forward them as regular events — ngit's own
@@ -1894,11 +1908,13 @@ impl RelayConnection {
                     RelayMessage::Event {
                         subscription_id,
                         event,
-                    } => {
+                    } if self.forward_duplicate_events => {
+                        let data_lane_arrival = std::time::Instant::now();
                         if event_sender
                             .send(RelayEvent::Event(
                                 Box::new(event.into_owned()),
                                 subscription_id.into_owned(),
+                                data_lane_arrival,
                             ))
                             .await
                             .is_err()

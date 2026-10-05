@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ngit_grasp::grasp_p::{KIND_REGISTRATION, KIND_STATE_ROOT};
-use nostr::hashes::{sha256, Hash, HashEngine};
-use nostr::{Event, Filter, Kind, PublicKey, RelayUrl};
+use nostr::prelude::{Event, Filter, Kind, PublicKey, RelayUrl};
 use nostr_sdk::relay::{Relay, RelayStatus};
 
 // ---------------------------------------------------------------------------
@@ -1481,12 +1481,12 @@ async fn run(cli: Cli) -> Result<(Report, ExitCode), OpError> {
             CheckLine::new("kinds-parity", Status::Pass)
                 .scope("kinds", kinds_display(&snap_a.kinds)),
         ),
-        KindsParity::Unavailable => lines.push(
-            CheckLine::new("kinds-parity", Status::Skip).detail(
+        KindsParity::Unavailable => {
+            lines.push(CheckLine::new("kinds-parity", Status::Skip).detail(
                 "neither node advertises private_repos.kinds (private repos disabled?); \
                  see the fingerprint-parity line",
-            ),
-        ),
+            ))
+        }
         KindsParity::Mismatch { only_a, only_b } => {
             let fmt = |v: &[u64]| {
                 if v.is_empty() {

@@ -9,6 +9,7 @@
 //! (30640/30641 + the stream-wrap kinds 3359/23359 and, while legacy accept
 //! is on, 1059/21059) falls through to the existing admission handling.
 
+pub mod admission;
 pub mod blob_store;
 pub mod blossom_auth;
 pub mod denylist;
@@ -27,8 +28,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use nostr::{Event, Filter, Kind, PublicKey};
-use nostr_relay_builder::prelude::WritePolicyResult;
+use nostr::prelude::{Event, Filter, Kind, PublicKey};
+use nostr_sdk::local_relay::WritePolicyResult;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, RegistrationMode};
@@ -326,7 +327,7 @@ impl PrivateConfig {
 pub const POLICY_VERSION: &str = "grasp-p-policy-v3";
 
 pub fn policy_fingerprint(config: &Config) -> String {
-    use nostr::hashes::{sha256, Hash};
+    use bitcoin_hashes::{sha256, Hash};
 
     fn strip_url(value: &str) -> String {
         let v = value.trim().trim_end_matches('/');
@@ -401,7 +402,7 @@ pub(crate) const MAX_FUTURE_SKEW_SECS: u64 = 900;
 /// Reject events dated implausibly far in the future. Returns Some(rejection)
 /// when the event must be refused, None when it may proceed.
 pub(crate) fn check_not_future_dated(event: &Event) -> Option<WritePolicyResult> {
-    let now = nostr::Timestamp::now().as_secs();
+    let now = nostr::prelude::Timestamp::now().as_secs();
     if event.created_at.as_secs() > now + MAX_FUTURE_SKEW_SECS {
         Some(crate::nostr::policy::reject_invalid(
             "event created_at is too far in the future",
@@ -495,9 +496,9 @@ impl PrivateService {
                     config.private_registration_replace_refill_per_hour,
                 ),
             ),
-            conflict_alert_dedup: parking_lot::Mutex::new(
-                registration::ConflictAlertDedup::new(registration::CONFLICT_ALERT_DEDUP_TTL),
-            ),
+            conflict_alert_dedup: parking_lot::Mutex::new(registration::ConflictAlertDedup::new(
+                registration::CONFLICT_ALERT_DEDUP_TTL,
+            )),
             mirror_tx: std::sync::OnceLock::new(),
             mirror_retry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             mirror_failure_log: parking_lot::Mutex::new(mirror::FailureLogDedup::new()),
@@ -659,7 +660,10 @@ impl PrivateService {
     /// A registration that exists in meta, is not tombstoned, AND whose 30640
     /// coordinate still exists in the relay DB (self-healing vs missed
     /// deletes — see exit test 8).
-    pub(crate) async fn live_registration(&self, alias: &str) -> Result<Option<RegistrationRecord>> {
+    pub(crate) async fn live_registration(
+        &self,
+        alias: &str,
+    ) -> Result<Option<RegistrationRecord>> {
         let record = {
             let txn = self.meta.read_txn()?;
             self.meta.get_registration(&txn, alias)?
@@ -813,7 +817,7 @@ impl PrivateService {
         // otherwise every replay would inflate the ledger.
         if !ephemeral {
             match self.database.check_id(&event.id).await {
-                Ok(nostr_relay_builder::prelude::DatabaseEventStatus::NotExistent) => {}
+                Ok(nostr_sdk::prelude::DatabaseEventStatus::NotExistent) => {}
                 Ok(_) => {
                     // Already saved (the DB will answer Duplicate) or deleted
                     // (the deletion gate handles it): never re-charge.
@@ -940,7 +944,7 @@ impl PrivateService {
                     let Some(record) = meta.get_registration(txn, &alias)? else {
                         continue;
                     };
-                    if ids.iter().any(|id| *id == record.event_id) {
+                    if ids.contains(&record.event_id) {
                         n += free_registration_claims(meta, txn, &author_hex, &alias, deletion_at)?;
                     }
                 }
@@ -1097,17 +1101,11 @@ impl PrivateService {
             let tenant_entry = ledger(quota::tenant_key(&auth.tenant_hex))?;
             let alias_entry = ledger(quota::alias_key(&auth.alias))?;
             let global_entry = ledger(meta::LEDGER_GLOBAL_KEY.to_string())?;
-            let ok = alias_entry
-                .total()
-                .saturating_add(scoped_additional)
+            let ok = alias_entry.total().saturating_add(scoped_additional)
                 <= self.cfg.quota_repo_bytes
-                && tenant_entry
-                    .total()
-                    .saturating_add(scoped_additional)
+                && tenant_entry.total().saturating_add(scoped_additional)
                     <= self.cfg.quota_tenant_bytes
-                && global_entry
-                    .total()
-                    .saturating_add(global_additional)
+                && global_entry.total().saturating_add(global_additional)
                     <= self.cfg.global_budget_bytes;
             if !ok {
                 return Err(BlobError::QuotaExceeded);
@@ -1136,8 +1134,7 @@ impl PrivateService {
                 .meta
                 .read_txn()
                 .map_err(|e| BlobError::Internal(e.to_string()))?;
-            quota::global_total(&self.meta, &txn)
-                .map_err(|e| BlobError::Internal(e.to_string()))?
+            quota::global_total(&self.meta, &txn).map_err(|e| BlobError::Internal(e.to_string()))?
         };
         let mut guard = self.inflight.lock();
         if guard.count >= MAX_CONCURRENT_UPLOADS {
@@ -1249,7 +1246,8 @@ impl PrivateService {
                             quota::release_spec_charge(meta, txn, &spec)?;
                         }
                         if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
-                            claim.unreferenced_since = Some(nostr::Timestamp::now().as_secs());
+                            claim.unreferenced_since =
+                                Some(nostr::prelude::Timestamp::now().as_secs());
                         }
                         meta.put_blob_claim(txn, sha256, &claim)?;
                         meta.delete_alias_claim(txn, &alias, sha256)?;
@@ -1363,6 +1361,26 @@ impl PrivateService {
     }
 }
 
+/// Spawn every GRASP-P background loop for `RelayServer`: the blob GC, the
+/// pull-only blob mirror when `NGIT_GRASP_P_MIRROR_ENABLE=true`, and the
+/// periodic denylist reload when configured.
+pub fn spawn_background_tasks(
+    service: &Arc<PrivateService>,
+    config: &Config,
+) -> Vec<JoinHandle<()>> {
+    let mut tasks = vec![service.spawn_gc()];
+    tracing::info!("Private blob GC task started");
+    if config.private_mirror_enable {
+        tasks.push(service.spawn_mirror());
+        tracing::info!("Private blob mirror task started");
+    }
+    if let Some(reload) = service.spawn_denylist_reload() {
+        tasks.push(reload);
+        tracing::info!("Private denylist reload task started");
+    }
+    tasks
+}
+
 /// Free one registration's key claims and remove its record (and its slot
 /// in the tenant's alias list) iff it belongs to `author_hex` and its
 /// current edition is not newer than `max_created_at` (the NIP-09 cutoff:
@@ -1434,7 +1452,7 @@ pub(crate) fn free_registration_claims(
     aliases.retain(|a| a != alias);
     meta.put_tenant_aliases(txn, author_hex, &aliases)?;
 
-    let now = nostr::Timestamp::now().as_secs();
+    let now = nostr::prelude::Timestamp::now().as_secs();
     for sha in meta.alias_claim_shas(txn, alias)? {
         let Some(mut claim) = meta.get_blob_claim(txn, &sha)? else {
             meta.delete_alias_claim(txn, alias, &sha)?;
@@ -1746,7 +1764,8 @@ mod tests {
             KIND_EPHEMERAL_STREAM_WRAP,
             KIND_EPHEMERAL_WRAP,
         ] {
-            let admitted = is_stream_wrap_kind(kind, false) || is_ephemeral_stream_wrap_kind(kind, false);
+            let admitted =
+                is_stream_wrap_kind(kind, false) || is_ephemeral_stream_wrap_kind(kind, false);
             assert!(
                 !(admitted && is_legacy_wrap_kind(kind)),
                 "legacy-off: {kind} cannot be both admitted and retired"

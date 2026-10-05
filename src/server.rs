@@ -61,6 +61,9 @@ pub struct RelayServer {
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: crate::grasp06::receive::RepoInitLocks,
     private_access: Option<PrivateAccess>,
+    /// GRASP-P private-repo service (Some only when
+    /// `NGIT_GRASP_P_REPOS_ENABLE=true`).
+    grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
     deletion_cleanup: nostr::lifecycle::DeletionCleanupTask,
     /// Detached background loops (sync manager, purgatory cleanup, audit
     /// cleanup, purgatory sync loop). Aborted on shutdown so the host
@@ -497,6 +500,13 @@ impl RelayServer {
 
         let deletion_cleanup = deletion_runtime.spawn_cleanup_task();
 
+        // GRASP-P: blob GC, the pull-only blob mirror and the denylist reload,
+        // when the subsystem is enabled (the service is built in create_relay).
+        let grasp_p = relay_runtime.grasp_p.clone();
+        if let Some(ref service) = grasp_p {
+            background_tasks.extend(crate::grasp_p::spawn_background_tasks(service, &config));
+        }
+
         let git_data_path = config.effective_git_data_path();
 
         Ok(Self {
@@ -512,6 +522,7 @@ impl RelayServer {
             rejected_events_index,
             repo_init_locks,
             private_access,
+            grasp_p,
             deletion_cleanup,
             background_tasks,
             checkpoint,
@@ -553,6 +564,7 @@ impl RelayServer {
             self.rejected_events_index.clone(),
             self.repo_init_locks,
             self.private_access,
+            self.grasp_p,
         );
 
         let result = tokio::select! {

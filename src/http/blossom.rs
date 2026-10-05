@@ -26,10 +26,82 @@ const STREAM_CHANNEL_DEPTH: usize = 8;
 
 type HttpBody = GitResponseBody;
 
+/// CORS advertised only when the GRASP-P blob routes are live
+/// (`NGIT_GRASP_P_REPOS_ENABLE=true`): upstream's set plus PUT/DELETE/HEAD and
+/// the Blossom request headers. Used by the OPTIONS preflight and by the blob
+/// responses, so a disabled node's responses stay upstream's.
+const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, DELETE, HEAD";
+const CORS_ALLOW_HEADERS: &str =
+    "Content-Type, Authorization, Git-Protocol, X-SHA-256, X-Content-Length";
+
+/// Add the GRASP-P CORS headers to a response builder.
+pub(super) fn add_cors_headers(
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder
+        .header("Access-Control-Allow-Origin", super::CORS_ALLOW_ORIGIN)
+        .header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS)
+        .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
+        .header("Access-Control-Expose-Headers", super::CORS_EXPOSE_HEADERS)
+}
+
 fn base_builder() -> hyper::http::response::Builder {
     // These responses are only reachable when private repos are enabled, so
     // they carry the extended blob-method CORS set.
-    super::add_cors_headers_private(Response::builder().header("server", "ngit-grasp"))
+    add_cors_headers(Response::builder().header("server", "ngit-grasp"))
+}
+
+/// A GRASP-P Blossom-subset route. Paths are 1-2 segments after the base
+/// path is stripped, so they never collide with Git URLs (3+ segments) or
+/// the npub landing route.
+pub(super) enum BlobRoute {
+    /// `HEAD|PUT /upload`
+    Upload,
+    /// `GET|HEAD|DELETE /<64-lowercase-hex>`
+    Blob(String),
+    /// `GET /list/<pubkey-hex-or-npub>`
+    List(String),
+}
+
+/// Match a base-path-stripped request path against the blob routes.
+pub(super) fn match_route(path: &str, method: &Method) -> Option<BlobRoute> {
+    if matches_upload_route(path, method) {
+        return Some(BlobRoute::Upload);
+    }
+    let segment = path.strip_prefix('/').unwrap_or(path);
+    if is_sha256_path_segment(segment)
+        && (method == Method::GET || method == Method::HEAD || method == Method::DELETE)
+    {
+        return Some(BlobRoute::Blob(segment.to_string()));
+    }
+    if method == Method::GET {
+        if let Some(target) = path.strip_prefix("/list/") {
+            if !target.is_empty() && !target.contains('/') {
+                return Some(BlobRoute::List(target.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Serve a matched blob route.
+pub(super) async fn serve(
+    route: BlobRoute,
+    service: Arc<PrivateService>,
+    req: Request<Incoming>,
+) -> Response<HttpBody> {
+    let method = req.method().clone();
+    match route {
+        BlobRoute::Upload if method == Method::HEAD => {
+            handle_upload_preflight(&service, &req).await
+        }
+        BlobRoute::Upload => handle_upload_put(&service, req).await,
+        BlobRoute::Blob(sha) if method == Method::DELETE => {
+            handle_blob_delete(&service, &req, sha).await
+        }
+        BlobRoute::Blob(sha) => handle_blob_get(&service, sha, method == Method::HEAD).await,
+        BlobRoute::List(target) => handle_blob_list(&service, &target).await,
+    }
 }
 
 fn error_response(err: &BlobError) -> Response<HttpBody> {
@@ -192,9 +264,7 @@ pub(crate) async fn handle_upload_put(
                 }
             }
             Some(Err(e)) => {
-                return error_response(&BlobError::BadRequest(format!(
-                    "request body error: {e}"
-                )));
+                return error_response(&BlobError::BadRequest(format!("request body error: {e}")));
             }
             None => break,
         }
@@ -238,9 +308,7 @@ pub(crate) async fn handle_blob_get(
 
     let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
-        Err(e) => {
-            return error_response(&BlobError::Internal(format!("failed to open blob: {e}")))
-        }
+        Err(e) => return error_response(&BlobError::Internal(format!("failed to open blob: {e}"))),
     };
 
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(STREAM_CHANNEL_DEPTH);

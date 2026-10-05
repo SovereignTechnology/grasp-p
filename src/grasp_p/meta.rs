@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
-use nostr::Timestamp;
+use nostr::prelude::Timestamp;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -79,7 +79,10 @@ impl RegistrationRecord {
     pub fn anchor(&self) -> (Timestamp, &str) {
         match (&self.first_created_at, &self.first_event_id) {
             (Some(created_at), Some(event_id)) => (*created_at, event_id.as_str()),
-            _ => (Timestamp::from_secs(self.created_at), self.event_id.as_str()),
+            _ => (
+                Timestamp::from_secs(self.created_at),
+                self.event_id.as_str(),
+            ),
         }
     }
 }
@@ -434,9 +437,11 @@ impl MetaEnv {
         admitted_at: u64,
     ) -> Result<()> {
         self.inner.charged_wraps.put(txn, event_id_hex, "")?;
-        self.inner
-            .charged_wraps_gc
-            .put(txn, &Self::charged_wrap_gc_key(admitted_at, event_id_hex), "")?;
+        self.inner.charged_wraps_gc.put(
+            txn,
+            &Self::charged_wrap_gc_key(admitted_at, event_id_hex),
+            "",
+        )?;
 
         // Evict expired entries. GC keys are zero-padded-time-ordered, so a
         // plain forward scan stops at the first unexpired key.
@@ -466,7 +471,6 @@ impl MetaEnv {
         format!("{admitted_at:020}:{event_id_hex}")
     }
 }
-
 
 #[cfg(test)]
 mod tests {

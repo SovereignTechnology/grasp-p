@@ -2,8 +2,8 @@
 //! alias/key claims, and replay-safe application to the meta store.
 
 use nostr::nips::nip19::ToBech32;
-use nostr::Event;
-use nostr_relay_builder::prelude::WritePolicyResult;
+use nostr::prelude::Event;
+use nostr_sdk::local_relay::WritePolicyResult;
 
 use crate::config::RegistrationMode;
 use crate::nostr::policy::{reject_error, reject_restricted};
@@ -44,21 +44,30 @@ pub fn key_pop_input(tenant_hex: &str, alias: &str) -> String {
     format!("grasp-p key-claim:{tenant_hex}:{alias}")
 }
 
+/// Verification-only secp256k1 context for proof-of-possession checks
+/// (nostr 0.45.5 no longer exports its own global context).
+static VERIFY_CTX: std::sync::LazyLock<secp256k1::Secp256k1<secp256k1::VerifyOnly>> =
+    std::sync::LazyLock::new(secp256k1::Secp256k1::verification_only);
+
 /// Verify the schnorr proof-of-possession `sig_hex` for `key_hex`.
-fn verify_key_pop(key_hex: &str, sig_hex: &str, tenant_hex: &str, alias: &str) -> Result<(), String> {
+fn verify_key_pop(
+    key_hex: &str,
+    sig_hex: &str,
+    tenant_hex: &str,
+    alias: &str,
+) -> Result<(), String> {
     use std::str::FromStr;
 
-    use nostr::hashes::{sha256, Hash};
-    use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey};
+    use bitcoin_hashes::{sha256, Hash};
+    use secp256k1::{schnorr::Signature, XOnlyPublicKey};
 
     let pk = XOnlyPublicKey::from_str(key_hex)
         .map_err(|_| "w/aux key is not a valid x-only pubkey".to_string())?;
     let sig = Signature::from_str(sig_hex)
         .map_err(|_| "w/aux key proof-of-possession signature is malformed".to_string())?;
     let digest = sha256::Hash::hash(key_pop_input(tenant_hex, alias).as_bytes());
-    let message = Message::from_digest(digest.to_byte_array());
-    nostr::SECP256K1
-        .verify_schnorr(&sig, &message, &pk)
+    VERIFY_CTX
+        .verify_schnorr(&sig, &digest.to_byte_array(), &pk)
         .map_err(|_| "w/aux key proof-of-possession signature is invalid".to_string())
 }
 
@@ -117,8 +126,8 @@ struct ParsedRegistration {
 }
 
 fn parse_shape(event: &Event, cfg: &PrivateConfig) -> Result<ParsedRegistration, String> {
-    let alias = first_tag_value(event, "d")
-        .ok_or_else(|| "registration must carry a d tag".to_string())?;
+    let alias =
+        first_tag_value(event, "d").ok_or_else(|| "registration must carry a d tag".to_string())?;
     if !is_valid_alias(&alias) {
         return Err("registration d tag must be exactly 32 lowercase hex chars".to_string());
     }
@@ -462,10 +471,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
             match cfg.registration_mode {
                 RegistrationMode::Open => {}
                 RegistrationMode::Whitelist => {
-                    let npub = event
-                        .pubkey
-                        .to_bech32()
-                        .unwrap_or_default();
+                    let npub = event.pubkey.to_bech32().unwrap_or_default();
                     if !cfg.tenant_whitelist.iter().any(|entry| entry == &npub) {
                         return Ok(TxnOutcome::reject(reject_restricted(
                             "tenant is not on the registration whitelist",
@@ -530,7 +536,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
                 if incoming_wins_conflict(created_at, &event_id_hex, record) {
                     let mut repaired = record.clone();
                     repaired.first_created_at =
-                        Some(nostr::Timestamp::from_secs(created_at));
+                        Some(nostr::prelude::Timestamp::from_secs(created_at));
                     repaired.first_event_id = Some(event_id_hex.clone());
                     meta.put_registration(txn, &parsed.alias, &repaired)?;
                 }
@@ -608,13 +614,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         // all in this txn).
         let mut evicted: Vec<(String, String)> = Vec::new();
         for (loser_alias, loser) in &evict {
-            super::free_registration_claims(
-                meta,
-                txn,
-                &loser.tenant_hex,
-                loser_alias,
-                u64::MAX,
-            )?;
+            super::free_registration_claims(meta, txn, &loser.tenant_hex, loser_alias, u64::MAX)?;
             evicted.push((loser.tenant_hex.clone(), loser_alias.clone()));
         }
 
@@ -660,7 +660,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
                 (Some(anchor_created_at), Some(anchor_id.to_string()))
             }
             _ => (
-                Some(nostr::Timestamp::from_secs(created_at)),
+                Some(nostr::prelude::Timestamp::from_secs(created_at)),
                 Some(event_id_hex.clone()),
             ),
         };
@@ -676,7 +676,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
             quota_class: parsed.quota_class.clone(),
             registered_at: match (&stored, alias_takeover) {
                 (Some(r), false) => r.registered_at,
-                _ => nostr::Timestamp::now().as_secs(),
+                _ => nostr::prelude::Timestamp::now().as_secs(),
             },
             tombstoned_at: None,
             first_created_at,
@@ -706,14 +706,8 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
                     // "alert on any increase" counter on every replay
                     // re-alerts forever. A NEW conflict on the same alias is
                     // a different event id and still alerts.
-                    if svc
-                        .conflict_alert_dedup
-                        .lock()
-                        .should_alert(&event_id_hex)
-                    {
-                        crate::metrics::record_private_registration_conflict(
-                            "incoming_rejected",
-                        );
+                    if svc.conflict_alert_dedup.lock().should_alert(&event_id_hex) {
+                        crate::metrics::record_private_registration_conflict("incoming_rejected");
                     }
                     tracing::warn!(
                         alias = %parsed.alias,
@@ -820,12 +814,15 @@ mod tests {
         let mut r = record(2000, "bb");
         assert_eq!(
             r.anchor(),
-            (nostr::Timestamp::from_secs(2000), "bb"),
+            (nostr::prelude::Timestamp::from_secs(2000), "bb"),
             "pre-fix record: anchor falls back to the latest edition"
         );
-        r.first_created_at = Some(nostr::Timestamp::from_secs(1000));
+        r.first_created_at = Some(nostr::prelude::Timestamp::from_secs(1000));
         r.first_event_id = Some("aa".to_string());
-        assert_eq!(r.anchor(), (nostr::Timestamp::from_secs(1000), "aa"));
+        assert_eq!(
+            r.anchor(),
+            (nostr::prelude::Timestamp::from_secs(1000), "aa")
+        );
     }
 
     /// FA: the conflict comparator runs against the FIRST-edition anchor, so
@@ -837,7 +834,7 @@ mod tests {
     #[test]
     fn conflict_comparator_uses_first_edition_anchor() {
         let mut stored = record(2000, "bb");
-        stored.first_created_at = Some(nostr::Timestamp::from_secs(1000));
+        stored.first_created_at = Some(nostr::prelude::Timestamp::from_secs(1000));
         stored.first_event_id = Some("aa".to_string());
         // Squatter at t=1500: newer than the anchor, older than the latest
         // edition — must lose.
@@ -901,14 +898,11 @@ mod tests {
         tenant: &nostr_sdk::prelude::Keys,
         alias: &str,
     ) -> Vec<String> {
-        use nostr::hashes::{sha256, Hash};
+        use bitcoin_hashes::{sha256, Hash};
 
-        let digest = sha256::Hash::hash(
-            key_pop_input(&tenant.public_key().to_hex(), alias).as_bytes(),
-        );
-        let sig = key.sign_schnorr(&nostr::secp256k1::Message::from_digest(
-            digest.to_byte_array(),
-        ));
+        let digest =
+            sha256::Hash::hash(key_pop_input(&tenant.public_key().to_hex(), alias).as_bytes());
+        let sig = key.sign_schnorr(digest.to_byte_array());
         vec![key.public_key().to_hex(), sig.to_string()]
     }
 
@@ -930,7 +924,7 @@ mod tests {
         }
         EventBuilder::new(Kind::Custom(super::super::KIND_REGISTRATION), "")
             .tags(tags)
-            .custom_created_at(nostr::Timestamp::from_secs(created_at))
+            .custom_created_at(nostr::prelude::Timestamp::from_secs(created_at))
             .finalize(tenant)
             .expect("sign 30640")
     }
@@ -957,7 +951,7 @@ mod tests {
             let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
             assert_eq!(
                 r.first_created_at,
-                Some(nostr::Timestamp::from_secs(1000))
+                Some(nostr::prelude::Timestamp::from_secs(1000))
             );
             assert_eq!(r.first_event_id, Some(ed1.id.to_hex()));
         }
@@ -973,7 +967,7 @@ mod tests {
             assert_eq!(r.event_id, ed2.id.to_hex());
             assert_eq!(
                 r.first_created_at,
-                Some(nostr::Timestamp::from_secs(1000)),
+                Some(nostr::prelude::Timestamp::from_secs(1000)),
                 "anchor must survive same-tenant replacement"
             );
             assert_eq!(r.first_event_id, Some(ed1.id.to_hex()));
@@ -1039,7 +1033,10 @@ mod tests {
             assert_eq!(r.created_at, 4000);
             assert_eq!(
                 r.anchor(),
-                (nostr::Timestamp::from_secs(3000), ed_old.id.to_hex().as_str()),
+                (
+                    nostr::prelude::Timestamp::from_secs(3000),
+                    ed_old.id.to_hex().as_str()
+                ),
                 "pre-fix record must adopt its old latest edition as the anchor"
             );
         }
@@ -1159,7 +1156,10 @@ mod tests {
         let txn = svc.meta.read_txn().unwrap();
         // (4) Ring editions deleted — the winner starts a fresh ring.
         assert!(
-            svc.meta.state_ring_for_alias(&txn, &alias).unwrap().is_empty(),
+            svc.meta
+                .state_ring_for_alias(&txn, &alias)
+                .unwrap()
+                .is_empty(),
             "loser ring editions must be deleted at eviction"
         );
         // (1)+(2) Unstored spec-charged claim: stripped, marked for GC, and
@@ -1213,14 +1213,16 @@ mod tests {
         assert_eq!(r.tenant_hex, winner.public_key().to_hex());
         assert_eq!(
             r.anchor(),
-            (nostr::Timestamp::from_secs(1000), reg_w.id.to_hex().as_str())
+            (
+                nostr::prelude::Timestamp::from_secs(1000),
+                reg_w.id.to_hex().as_str()
+            )
         );
-        assert!(
-            svc.meta
-                .get_key_claim(&txn, &loser.public_key().to_hex())
-                .unwrap()
-                .is_none()
-        );
+        assert!(svc
+            .meta
+            .get_key_claim(&txn, &loser.public_key().to_hex())
+            .unwrap()
+            .is_none());
         assert_eq!(
             svc.meta
                 .get_key_claim(&txn, &winner.public_key().to_hex())
@@ -1294,7 +1296,7 @@ mod tests {
         ];
         EventBuilder::new(Kind::Custom(super::super::KIND_STATE_ROOT), "")
             .tags(tags)
-            .custom_created_at(nostr::Timestamp::from_secs(created_at))
+            .custom_created_at(nostr::prelude::Timestamp::from_secs(created_at))
             .finalize(tenant)
             .expect("sign 30641")
     }
@@ -1324,7 +1326,10 @@ mod tests {
             let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
             assert_eq!(
                 r.anchor(),
-                (nostr::Timestamp::from_secs(2000), ed2.id.to_hex().as_str())
+                (
+                    nostr::prelude::Timestamp::from_secs(2000),
+                    ed2.id.to_hex().as_str()
+                )
             );
         }
 
@@ -1340,7 +1345,10 @@ mod tests {
             assert_eq!(r.event_id, ed2.id.to_hex());
             assert_eq!(
                 r.anchor(),
-                (nostr::Timestamp::from_secs(1000), ed1.id.to_hex().as_str()),
+                (
+                    nostr::prelude::Timestamp::from_secs(1000),
+                    ed1.id.to_hex().as_str()
+                ),
                 "authentic older evidence must lower the anchor"
             );
         }
@@ -1357,7 +1365,10 @@ mod tests {
             let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
             assert_eq!(
                 r.anchor(),
-                (nostr::Timestamp::from_secs(1000), ed1.id.to_hex().as_str()),
+                (
+                    nostr::prelude::Timestamp::from_secs(1000),
+                    ed1.id.to_hex().as_str()
+                ),
                 "replay and non-beating stale editions must not move the anchor"
             );
         }
@@ -1396,7 +1407,10 @@ mod tests {
         let reg1 = registration_event(&loser, &alias, 2000);
         let outcome = handle(svc, &reg1);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
-        svc.database.save_event(&reg1).await.expect("save loser 30640");
+        svc.database
+            .save_event(&reg1)
+            .await
+            .expect("save loser 30640");
 
         // Liveness passes with the live record — the pre-txn admission view
         // the handler would have carried into its txn.
@@ -1435,7 +1449,10 @@ mod tests {
         );
         assert!(svc.meta.alias_claim_shas(&txn, &alias).unwrap().is_empty());
         assert!(
-            svc.meta.state_ring_for_alias(&txn, &alias).unwrap().is_empty(),
+            svc.meta
+                .state_ring_for_alias(&txn, &alias)
+                .unwrap()
+                .is_empty(),
             "no zombie ring edition"
         );
         let r = svc
@@ -1477,7 +1494,13 @@ mod tests {
             .meta
             .with_write(|meta, txn| {
                 super::super::apply_wrap_charge_txn(
-                    meta, txn, &svc.cfg, &loser_record, &alias, 350, "cc",
+                    meta,
+                    txn,
+                    &svc.cfg,
+                    &loser_record,
+                    &alias,
+                    350,
+                    "cc",
                 )
             })
             .unwrap();
@@ -1581,14 +1604,23 @@ mod tests {
 
         // New-alias registration: exempt, consumes no replacement budget.
         let ed1 = registration_event(&tenant, &alias, 1000);
-        assert!(matches!(handle(&svc, &ed1).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &ed1).result,
+            WritePolicyResult::Accept
+        ));
 
         // Rotation burst within capacity (2) is allowed — a §3.3 widen->
         // narrow rotation plus retries must never trip at sane defaults.
         let ed2 = registration_event(&tenant, &alias, 2000);
-        assert!(matches!(handle(&svc, &ed2).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &ed2).result,
+            WritePolicyResult::Accept
+        ));
         let ed3 = registration_event(&tenant, &alias, 3000);
-        assert!(matches!(handle(&svc, &ed3).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &ed3).result,
+            WritePolicyResult::Accept
+        ));
 
         // The flood beyond capacity is blocked, and the stored record is
         // untouched (rejection mutates nothing).
@@ -1623,7 +1655,10 @@ mod tests {
             3500,
             vec![key_entry(&writer2, &tenant, &alias2)],
         );
-        assert!(matches!(handle(&svc, &reg2).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &reg2).result,
+            WritePolicyResult::Accept
+        ));
 
         // boot_reconcile replay of the cadence-rejected edition: bypasses
         // the bucket entirely (replays must not consume budget).
@@ -1690,7 +1725,10 @@ mod tests {
         // anchors LATER (t=2000) and claims the shared key with a valid
         // proof-of-possession.
         let ed1 = registration_event(&tenant, &alias, 1000);
-        assert!(matches!(handle(&svc, &ed1).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &ed1).result,
+            WritePolicyResult::Accept
+        ));
         let reg_other = registration_event_with_w(
             &other,
             &other_alias,
@@ -1704,7 +1742,10 @@ mod tests {
 
         // Drain the tenant's single replacement token with a pure rotation.
         let rot = registration_event(&tenant, &alias, 1100);
-        assert!(matches!(handle(&svc, &rot).result, WritePolicyResult::Accept));
+        assert!(matches!(
+            handle(&svc, &rot).result,
+            WritePolicyResult::Accept
+        ));
 
         // The backdated key-conflict WINNER: a same-tenant NEWER edition
         // (1500 > 1100) that is OLDER than the other alias's anchor

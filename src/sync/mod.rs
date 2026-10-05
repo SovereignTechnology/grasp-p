@@ -15,12 +15,14 @@
 pub mod algorithms;
 pub mod discovery;
 pub mod filters;
+mod grasp_p_sync;
 pub mod health;
 mod history;
 pub mod in_process_transport;
 pub mod metrics;
 pub mod missing_events;
 pub mod naughty_list;
+pub mod private_index;
 pub mod rejected_index;
 pub mod relay_connection;
 pub mod self_subscriber;
@@ -2818,6 +2820,8 @@ pub struct SyncManager {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Prometheus metrics for sync operations (None if metrics disabled)
     metrics: Option<SyncMetrics>,
+    /// GRASP-P private-repo sync state (unused unless GRASP-P is enabled).
+    grasp_p: grasp_p_sync::GraspPSyncState,
 }
 
 impl SyncManager {
@@ -2937,6 +2941,7 @@ impl SyncManager {
             mailbox_probe_result_tx: None,
             shutdown_tx: None,
             metrics: sync_metrics,
+            grasp_p: grasp_p_sync::GraspPSyncState::default(),
         }
     }
 
@@ -4263,6 +4268,10 @@ impl SyncManager {
             run_purgatory_announcement_sync(purgatory_sync_manager, purgatory_sync_shutdown).await;
         });
 
+        // 11b. GRASP-P registration index and full re-issue timers (only when
+        // GRASP-P is enabled).
+        grasp_p_sync::spawn_timers(&sync_manager, &shutdown_tx).await;
+
         // 12. Main loop - handle actions, lifecycle notifications, and worker results
         loop {
             // Wait for an event without holding the lock
@@ -4626,9 +4635,10 @@ impl SyncManager {
 
                         // Cached decisions still account for delivery to this batch.
                         // Keep dependency entries available for later authorization changes.
-                        let result = if (event.kind == Kind::GitRepoAnnouncement
+                        let result = if ((event.kind == Kind::GitRepoAnnouncement
                             || event.kind == Kind::RepoState)
-                            && rejected_events_index.contains(&event.id)
+                            && rejected_events_index.contains(&event.id))
+                            || Self::grasp_p_previously_rejected(&write_policy, &event)
                         {
                             ProcessResult::Rejected(PolicyRejection::PreviouslyRejected)
                         } else {
@@ -4948,7 +4958,8 @@ impl SyncManager {
     }
 
     async fn sync_generic_filters(&mut self, relay_url: &str, since: Option<Timestamp>) {
-        let filters = vec![filters::build_announcement_filter(None)];
+        let mut filters = vec![filters::build_announcement_filter(None)];
+        filters.extend(self.grasp_p_filters());
 
         // Create live subscription for ongoing announcements
         if self.sync_live(relay_url, &filters).await.is_err() {
@@ -4971,7 +4982,8 @@ impl SyncManager {
     }
 
     async fn sync_generic_history(&mut self, relay_url: &str, since: Option<Timestamp>) {
-        let filters = vec![filters::build_announcement_filter(None)];
+        let mut filters = vec![filters::build_announcement_filter(None)];
+        filters.extend(self.grasp_p_filters());
         let _batch_id = self
             .historic_sync_with_options(
                 relay_url,
@@ -5257,6 +5269,7 @@ impl SyncManager {
         since: Option<Timestamp>,
     ) -> Vec<Filter> {
         let mut filters = vec![filters::build_announcement_filter(None)];
+        filters.extend(self.grasp_p_filters());
         let index = self.relay_sync_index.read().await;
         if let Some(state) = index.get(relay_url) {
             filters.extend(filters::build_essential_live_filters(
@@ -5435,7 +5448,8 @@ impl SyncManager {
                 source,
                 policy,
             )
-            .with_health_tracker(Arc::clone(&self.health_tracker));
+            .with_health_tracker(Arc::clone(&self.health_tracker))
+            .with_duplicate_event_forwarding(self.config.private_repos_enable);
             self.connections.insert(relay_url.clone(), connection);
             if nip65_discovery_only {
                 self.nip65_discovery_only_relays.insert(relay_url.clone());
@@ -7804,6 +7818,16 @@ impl SyncManager {
                     }
                 }
 
+                Self::grasp_p_after_saved(
+                    event,
+                    relay_url,
+                    database,
+                    write_policy,
+                    local_relay,
+                    rejected_events_index,
+                )
+                .await;
+
                 ProcessResult::Saved
             }
             WritePolicyResult::Reject {
@@ -7926,6 +7950,7 @@ impl SyncManager {
                             "Indexed dependency-sensitive related event for durable retry"
                         );
                     }
+                    Self::grasp_p_after_rejected(write_policy, event, &message);
 
                     process_result
                 }
@@ -8480,6 +8505,8 @@ impl SyncManager {
         let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
         desired_relays.extend(self.nip65_discovery.connection_targets());
+        // GRASP-P peers carry no public repositories; keep them connected.
+        desired_relays.extend(self.grasp_p_peer_relays());
 
         // Collect relays to disconnect
         let to_disconnect: Vec<String> = {
@@ -8939,6 +8966,7 @@ impl SyncManager {
                 pending: self.pending_sync_index.clone(),
                 purgatory: self.purgatory.clone(),
                 rejected: self.rejected_events_index.clone(),
+                grasp_p: self.write_policy.grasp_p().cloned(),
             },
             result_tx,
         );
@@ -8983,6 +9011,7 @@ impl SyncManager {
                 pending: self.pending_sync_index.clone(),
                 purgatory: self.purgatory.clone(),
                 rejected: self.rejected_events_index.clone(),
+                grasp_p: self.write_policy.grasp_p().cloned(),
             },
             result_tx,
         );

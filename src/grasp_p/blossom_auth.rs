@@ -7,7 +7,7 @@
 //! not authorized for the attributed alias → 403.
 
 use base64::Engine as _;
-use nostr::{Event, Timestamp};
+use nostr::prelude::{Event, Timestamp};
 
 use super::BlobError;
 
@@ -81,8 +81,9 @@ pub fn sha_from_header(header: Option<&str>) -> Result<String, BlobError> {
     let json = base64::prelude::BASE64_STANDARD
         .decode(b64)
         .map_err(|_| BlobError::Unauthorized("invalid base64 in Authorization header".into()))?;
-    let event = Event::from_json(&json)
-        .map_err(|_| BlobError::Unauthorized("Authorization payload is not a nostr event".into()))?;
+    let event = Event::from_json(&json).map_err(|_| {
+        BlobError::Unauthorized("Authorization payload is not a nostr event".into())
+    })?;
     let x = tag_value(&event, "x").ok_or_else(|| {
         BlobError::Unauthorized("authorization event must carry an x (sha256) tag".into())
     })?;
@@ -118,8 +119,9 @@ pub fn verify_auth_shape(
         .decode(b64)
         .map_err(|_| BlobError::Unauthorized("invalid base64 in Authorization header".into()))?;
 
-    let event = Event::from_json(&json)
-        .map_err(|_| BlobError::Unauthorized("Authorization payload is not a nostr event".into()))?;
+    let event = Event::from_json(&json).map_err(|_| {
+        BlobError::Unauthorized("Authorization payload is not a nostr event".into())
+    })?;
 
     if event.kind.as_u16() != 24242 {
         return Err(BlobError::Unauthorized(
@@ -156,7 +158,11 @@ pub fn verify_auth_shape(
     // expiration tag must exist and be in the future.
     match tag_value(&event, "expiration").and_then(|v| v.parse::<u64>().ok()) {
         Some(expiration) if expiration > now => {}
-        Some(_) => return Err(BlobError::Unauthorized("authorization event is expired".into())),
+        Some(_) => {
+            return Err(BlobError::Unauthorized(
+                "authorization event is expired".into(),
+            ))
+        }
         None => {
             return Err(BlobError::Unauthorized(
                 "authorization event must carry a numeric expiration tag".into(),

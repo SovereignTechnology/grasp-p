@@ -158,7 +158,6 @@ fn apply(entry: &mut LedgerEntry, bytes: u64, blob: bool, add: bool) {
     };
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

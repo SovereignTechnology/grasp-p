@@ -828,9 +828,7 @@ pub fn record_manual_ejection(
 
 /// Record an accepted private-repo registration (kind 30640) by admission mode.
 pub fn record_private_registration(mode: &str) {
-    PRIVATE_REGISTRATIONS_TOTAL
-        .with_label_values(&[mode])
-        .inc();
+    PRIVATE_REGISTRATIONS_TOTAL.with_label_values(&[mode]).inc();
 }
 
 /// Record an accepted private-repo event by kind.
@@ -904,9 +902,7 @@ pub fn record_private_registration_conflict(resolution: &str) {
 /// Record one client private write rejected by the per-write-key token
 /// bucket. `path` is `state_root`, `wrap`, `ewrap`, or `upload`.
 pub fn record_private_rate_limited(path: &str) {
-    PRIVATE_RATE_LIMITED_TOTAL
-        .with_label_values(&[path])
-        .inc();
+    PRIVATE_RATE_LIMITED_TOTAL.with_label_values(&[path]).inc();
 }
 
 /// Record one periodic since=None full re-issue round of the private sync

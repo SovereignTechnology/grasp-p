@@ -104,7 +104,7 @@ pub(crate) fn purge_blob(
 /// both the grace period and the unreferenced requirement). Public so
 /// tests / operators can trigger it deterministically later.
 pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
-    let now = nostr::Timestamp::now().as_secs();
+    let now = nostr::prelude::Timestamp::now().as_secs();
     let grace = svc.cfg.gc_grace_secs;
 
     let mut removed = 0_usize;
@@ -222,7 +222,7 @@ mod tests {
         let (_dir, svc) = harness().await;
         let data = vec![7u8; 512];
         let sha = {
-            use nostr::hashes::{sha256, Hash};
+            use bitcoin_hashes::{sha256, Hash};
             sha256::Hash::hash(&data).to_string()
         };
 

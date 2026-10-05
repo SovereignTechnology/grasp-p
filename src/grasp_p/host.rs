@@ -101,7 +101,10 @@ mod tests {
             "example.com"
         ));
         // No subdomain wildcards: even legitimate subdomains do not match.
-        assert!(!url_denotes_domain("wss://relay.example.com", "example.com"));
+        assert!(!url_denotes_domain(
+            "wss://relay.example.com",
+            "example.com"
+        ));
     }
 
     #[test]
@@ -145,10 +148,7 @@ mod tests {
         ));
         // Same host, different port: a DIFFERENT node (loopback test pairs
         // rely on this — each node is host:port-distinct).
-        assert!(!url_denotes_domain(
-            "ws://127.0.0.1:2222",
-            "127.0.0.1:1111"
-        ));
+        assert!(!url_denotes_domain("ws://127.0.0.1:2222", "127.0.0.1:1111"));
         // Scheme-default port counts as the effective port.
         assert!(url_denotes_domain("wss://example.com", "example.com:443"));
         assert!(!url_denotes_domain("wss://example.com", "example.com:8443"));

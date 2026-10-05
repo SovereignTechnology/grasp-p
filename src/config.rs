@@ -758,7 +758,11 @@ pub struct Config {
     pub private_tenant_whitelist: String,
 
     /// Per-blob size cap in bytes (enforced pre- and mid-stream)
-    #[arg(long, env = "NGIT_GRASP_P_MAX_BLOB_BYTES", default_value_t = 268_435_456)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MAX_BLOB_BYTES",
+        default_value_t = 268_435_456
+    )]
     pub private_max_blob_bytes: u64,
 
     /// Serialized-JSON size cap for private-repo events (30640/30641 +
@@ -767,27 +771,51 @@ pub struct Config {
     pub private_max_event_bytes: u64,
 
     /// Per hosting-npub total quota in bytes (events + blobs)
-    #[arg(long, env = "NGIT_GRASP_P_QUOTA_TENANT_BYTES", default_value_t = 1_073_741_824)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_QUOTA_TENANT_BYTES",
+        default_value_t = 1_073_741_824
+    )]
     pub private_quota_tenant_bytes: u64,
 
     /// Per-alias total quota in bytes (events + blobs)
-    #[arg(long, env = "NGIT_GRASP_P_QUOTA_REPO_BYTES", default_value_t = 536_870_912)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_QUOTA_REPO_BYTES",
+        default_value_t = 536_870_912
+    )]
     pub private_quota_repo_bytes: u64,
 
     /// Whole private-subsystem storage cap in bytes
-    #[arg(long, env = "NGIT_GRASP_P_GLOBAL_BUDGET_BYTES", default_value_t = 53_687_091_200)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_GLOBAL_BUDGET_BYTES",
+        default_value_t = 53_687_091_200
+    )]
     pub private_global_budget_bytes: u64,
 
     /// Maximum registrations (aliases) per hosting npub
-    #[arg(long, env = "NGIT_GRASP_P_MAX_ALIASES_PER_TENANT", default_value_t = 64)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MAX_ALIASES_PER_TENANT",
+        default_value_t = 64
+    )]
     pub private_max_aliases_per_tenant: u32,
 
     /// Maximum `w` + `aux` keys per alias registration
-    #[arg(long, env = "NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS", default_value_t = 64)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS",
+        default_value_t = 64
+    )]
     pub private_max_write_keys_per_alias: u32,
 
     /// Kind-30641 edition ring depth kept in the private meta store (G7 amendment)
-    #[arg(long, env = "NGIT_GRASP_P_STATE_HISTORY_EDITIONS", default_value_t = 16)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_STATE_HISTORY_EDITIONS",
+        default_value_t = 16
+    )]
     pub private_state_history_editions: u32,
 
     /// Grace period in seconds before an unreferenced blob may be deleted by GC
@@ -799,7 +827,11 @@ pub struct Config {
     pub private_gc_interval_secs: u64,
 
     /// Tombstoned-alias purge delay in seconds (stub in Phase 1)
-    #[arg(long, env = "NGIT_GRASP_P_OFFBOARD_RETENTION_SECS", default_value_t = 2_592_000)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_OFFBOARD_RETENTION_SECS",
+        default_value_t = 2_592_000
+    )]
     pub private_offboard_retention_secs: u64,
 
     /// Blob store root (defaults to <relay_data_path>/blobs)
@@ -843,7 +875,11 @@ pub struct Config {
     pub private_mirror_max_concurrency: u32,
 
     /// Per-blob mirror fetch timeout in seconds
-    #[arg(long, env = "NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS", default_value_t = 120)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS",
+        default_value_t = 120
+    )]
     pub private_mirror_fetch_timeout_secs: u64,
 
     /// Comma-separated operator-approved peer relay URLs for private-repo
@@ -868,7 +904,11 @@ pub struct Config {
     pub private_mirror_allow_private_ips: bool,
 
     /// Accept kind-3313 direct invites for storage (Phase 1 only honors =false)
-    #[arg(long, env = "NGIT_GRASP_P_ACCEPT_DIRECT_INVITES", default_value_t = false)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_ACCEPT_DIRECT_INVITES",
+        default_value_t = false
+    )]
     pub private_accept_direct_invites: bool,
 
     /// Also accept the LEGACY stream-wrap kinds 1059/21059 alongside the
@@ -910,7 +950,11 @@ pub struct Config {
 
     /// Refill rate (tokens per minute) for the per-write-key client write
     /// bucket. Must be > 0 when NGIT_GRASP_P_WRITE_RATE_CAPACITY is non-zero.
-    #[arg(long, env = "NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN", default_value_t = 60)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN",
+        default_value_t = 60
+    )]
     pub private_write_rate_refill_per_min: u32,
 
     /// Per-(tenant, alias) token bucket capacity for same-tenant kind-30640
@@ -922,13 +966,21 @@ pub struct Config {
     /// bucket refill (the hourly re-issue is the backstop healer).
     /// Cross-node acceptance knob — part of the policy_fingerprint
     /// preimage (v3).
-    #[arg(long, env = "NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY", default_value_t = 8)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY",
+        default_value_t = 8
+    )]
     pub private_registration_replace_capacity: u32,
 
     /// Refill rate (replacements per hour) for the per-(tenant, alias)
     /// replacement bucket — bounds SUSTAINED replacement floods. Must be > 0
     /// when NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY is non-zero.
-    #[arg(long, env = "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR", default_value_t = 4)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR",
+        default_value_t = 4
+    )]
     pub private_registration_replace_refill_per_hour: u32,
 
     /// Interval (seconds) for the periodic since=None full re-issue of the
@@ -940,7 +992,11 @@ pub struct Config {
     /// A2) that deliberately rely on redelivery. 0 = disabled. Node-local
     /// recovery knob only — acceptance is unaffected, so it is NOT part of
     /// the policy_fingerprint preimage.
-    #[arg(long, env = "NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS", default_value_t = 3600)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS",
+        default_value_t = 3600
+    )]
     pub private_full_reissue_interval_secs: u64,
 
     /// Minimum interval (seconds) between private sync-filter re-issues to
@@ -954,7 +1010,11 @@ pub struct Config {
     /// the interval lapses (never dropped). 0 = unlimited (pre-FS-3
     /// behavior). Node-local recovery knob only — acceptance is unaffected,
     /// so it is NOT part of the policy_fingerprint preimage.
-    #[arg(long, env = "NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS", default_value_t = 30)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS",
+        default_value_t = 30
+    )]
     pub private_reissue_min_interval_secs: u64,
 
     /// Base delay (seconds) for the blob mirror's per-blob exponential
@@ -967,13 +1027,21 @@ pub struct Config {
     /// reserve/sink) are NOT gated: they keep the flat repair-scan cadence
     /// and only succeed once the underlying condition changes. Node-local
     /// recovery knob — NOT part of the policy_fingerprint preimage.
-    #[arg(long, env = "NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS", default_value_t = 60)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS",
+        default_value_t = 60
+    )]
     pub private_mirror_retry_base_secs: u64,
 
     /// Cap (seconds) for the blob mirror retry backoff; also the fixed
     /// retry interval for blobs the peers answer 404 (possible late
     /// upload). Must be >= NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS.
-    #[arg(long, env = "NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS", default_value_t = 3600)]
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS",
+        default_value_t = 3600
+    )]
     pub private_mirror_retry_max_secs: u64,
 }
 
@@ -1425,6 +1493,16 @@ impl Config {
 
         // GRASP-P private repositories (only validated when enabled)
         if self.private_repos_enable {
+            // GRASP-08 puts a NIP-42 gate in front of every read, which
+            // breaks GRASP-P's anonymous-read design: one node runs one or
+            // the other.
+            if self.private_mode {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_REPOS_ENABLE=true cannot be combined with NGIT_PRIVATE_MODE=true: \
+                     GRASP-P private repositories rely on anonymous reads, which GRASP-08 \
+                     private mode gates behind NIP-42"
+                ));
+            }
             if self.private_registration_mode == RegistrationMode::Paid {
                 return Err(anyhow!(
                     "NGIT_GRASP_P_REGISTRATION_MODE=paid: paid registration mode is not yet available"
@@ -1441,6 +1519,16 @@ impl Config {
                      NGIT_GRASP_P_TENANT_WHITELIST: all new private-repo \
                      registrations will be rejected (existing registrations \
                      are unaffected)"
+                );
+            }
+            // Upstream's relay refuses any event above its own ceiling before
+            // GRASP-P sees it, so a larger GRASP-P cap could never apply.
+            if self.private_max_event_bytes > self.relay_max_event_size_bytes as u64 {
+                tracing::warn!(
+                    grasp_p_max_event_bytes = self.private_max_event_bytes,
+                    relay_max_event_size_bytes = self.relay_max_event_size_bytes,
+                    "NGIT_GRASP_P_MAX_EVENT_BYTES exceeds NGIT_RELAY_MAX_EVENT_SIZE_BYTES: \
+                     the relay ceiling is the effective limit"
                 );
             }
             if !(1..=40).contains(&self.private_pow_bits) {
@@ -1510,8 +1598,7 @@ impl Config {
                     ));
                 }
             }
-            if self.private_write_rate_capacity > 0 && self.private_write_rate_refill_per_min == 0
-            {
+            if self.private_write_rate_capacity > 0 && self.private_write_rate_refill_per_min == 0 {
                 return Err(anyhow!(
                     "NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN must be greater than 0 when \
                      NGIT_GRASP_P_WRITE_RATE_CAPACITY is non-zero"
@@ -3338,6 +3425,29 @@ mod tests {
         // Should not match if no domain matches
         assert!(
             !config.matches_grasp_services(&["github.com".to_string(), "gitlab.org".to_string(),])
+        );
+    }
+
+    #[test]
+    fn test_grasp_p_and_grasp08_private_mode_are_mutually_exclusive() {
+        let member = Keys::generate().public_key().to_bech32().unwrap();
+        let grasp08 = Config {
+            private_mode: true,
+            private_members: member,
+            ..Config::for_testing()
+        };
+        assert!(grasp08.validate().is_ok());
+
+        let both = Config {
+            private_repos_enable: true,
+            ..grasp08
+        };
+        let error = both
+            .validate()
+            .expect_err("GRASP-P with GRASP-08 must fail");
+        assert!(
+            error.to_string().contains("NGIT_PRIVATE_MODE"),
+            "unexpected error: {error}"
         );
     }
 

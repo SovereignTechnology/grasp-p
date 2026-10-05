@@ -1,6 +1,7 @@
 //! HTTP Server Module
 //!
 //! Provides hyper HTTP server with WebSocket upgrade support for the Nostr relay.
+mod blossom;
 mod client_ip;
 pub mod landing;
 pub mod nip05;
@@ -123,6 +124,10 @@ struct HttpService {
     repo_init_locks: RepoInitLocks,
     /// GRASP-08 access list. Present only when private mode is enabled.
     private_access: Option<PrivateAccess>,
+    /// GRASP-P private-repo service (blob routes). `None` unless
+    /// `NGIT_GRASP_P_REPOS_ENABLE=true`; then the blob routes do not exist
+    /// and fall through to upstream's routing.
+    grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
 }
 
 impl HttpService {
@@ -139,6 +144,7 @@ impl HttpService {
         rejected_events_index: Arc<RejectedEventsIndex>,
         repo_init_locks: RepoInitLocks,
         private_access: Option<PrivateAccess>,
+        grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
     ) -> Self {
         Self {
             relay,
@@ -152,6 +158,7 @@ impl HttpService {
             rejected_events_index,
             repo_init_locks,
             private_access,
+            grasp_p,
         }
     }
 }
@@ -194,13 +201,17 @@ impl Service<Request<Incoming>> for HttpService {
         // Handle OPTIONS preflight requests (CORS)
         // GRASP-01 spec line 51: Respond to OPTIONS with 204 No Content
         if method == Method::OPTIONS {
+            // GRASP-P widens the preflight to the blob methods; a node with
+            // it disabled answers exactly as upstream.
+            let grasp_p_enabled = self.grasp_p.is_some();
             return Box::pin(async move {
-                Ok(
-                    add_cors_headers(Response::builder().header("server", "ngit-grasp"))
-                        .status(204)
-                        .body(empty_body())
-                        .unwrap(),
-                )
+                let builder = Response::builder().header("server", "ngit-grasp");
+                let builder = if grasp_p_enabled {
+                    blossom::add_cors_headers(builder)
+                } else {
+                    add_cors_headers(builder)
+                };
+                Ok(builder.status(204).body(empty_body()).unwrap())
             });
         }
 
@@ -707,6 +718,15 @@ impl Service<Request<Incoming>> for HttpService {
             });
         }
 
+        // GRASP-P Blossom-subset blob routes, matched on the base-path
+        // stripped path. Only routed when GRASP-P is enabled.
+        if let Some(service) = &self.grasp_p {
+            if let Some(route) = blossom::match_route(&path, &method) {
+                let service = service.clone();
+                return Box::pin(async move { Ok(blossom::serve(route, service, req).await) });
+            }
+        }
+
         // Check for NIP-11 relay information request (Accept: application/nostr+json)
         if let ("/", Some(accept)) = (path.as_str(), req.headers().get("accept")) {
             if accept
@@ -1027,6 +1047,7 @@ pub async fn run_server(
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
     private_access: Option<PrivateAccess>,
+    grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
 ) -> anyhow::Result<()> {
     let bind_addr: SocketAddr = config.bind_address.parse()?;
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -1042,6 +1063,7 @@ pub async fn run_server(
         rejected_events_index,
         repo_init_locks,
         private_access,
+        grasp_p,
     )
     .await
 }
@@ -1071,6 +1093,7 @@ pub async fn run_server_on_listener(
     rejected_events_index: Arc<RejectedEventsIndex>,
     repo_init_locks: RepoInitLocks,
     private_access: Option<PrivateAccess>,
+    grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Starting HTTP server on {}", listener.local_addr()?);
     tracing::info!("Relay name: {}", config.relay_name());
@@ -1104,6 +1127,7 @@ pub async fn run_server_on_listener(
             rejected_events_index.clone(),
             repo_init_locks.clone(),
             private_access.clone(),
+            grasp_p.clone(),
         );
 
         tokio::spawn(async move {

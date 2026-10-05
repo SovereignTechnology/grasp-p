@@ -365,7 +365,7 @@ mod tests {
         let missing = dir.path().join("absent.txt").to_string_lossy().into_owned();
 
         // Missing file → warn + empty (multi-file semantics).
-        let set = load_boot(&[missing.clone()]).unwrap();
+        let set = load_boot(std::slice::from_ref(&missing)).unwrap();
         assert!(set.is_empty());
 
         // Present + readable mixed with missing → union of the readable.

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use nostr::hashes::{sha256, Hash, HashEngine};
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
@@ -42,7 +42,10 @@ impl BlobStore {
 
     /// Final sharded path for a (validated, 64-lowercase-hex) sha256.
     pub fn path_for(&self, sha256: &str) -> PathBuf {
-        self.root.join(&sha256[0..2]).join(&sha256[2..4]).join(sha256)
+        self.root
+            .join(&sha256[0..2])
+            .join(&sha256[2..4])
+            .join(sha256)
     }
 
     pub fn exists(&self, sha256: &str) -> bool {
@@ -51,7 +54,9 @@ impl BlobStore {
 
     /// Size of a stored blob, if present.
     pub fn size_of(&self, sha256: &str) -> Option<u64> {
-        std::fs::metadata(self.path_for(sha256)).ok().map(|m| m.len())
+        std::fs::metadata(self.path_for(sha256))
+            .ok()
+            .map(|m| m.len())
     }
 
     /// Remove a stored blob (idempotent).
@@ -64,9 +69,7 @@ impl BlobStore {
     }
 
     fn new_tmp_path(&self) -> PathBuf {
-        self.root
-            .join("tmp")
-            .join(uuid::Uuid::new_v4().to_string())
+        self.root.join("tmp").join(uuid::Uuid::new_v4().to_string())
     }
 }
 
@@ -122,6 +125,7 @@ pub struct UploadSink {
 }
 
 impl UploadSink {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create(
         meta: MetaEnv,
         store: BlobStore,
@@ -334,7 +338,7 @@ impl UploadSink {
                     url: format!("https://{}/{}", self.cfg.domain, sha),
                     sha256: sha,
                     size,
-                    uploaded: nostr::Timestamp::now().as_secs(),
+                    uploaded: nostr::prelude::Timestamp::now().as_secs(),
                 })
             }
             Err(e) => {
@@ -387,7 +391,6 @@ impl Drop for UploadSink {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -466,11 +469,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let meta = MetaEnv::open(&dir.path().join("meta")).unwrap();
             let store = BlobStore::open(&dir.path().join("blobs")).unwrap();
-            meta
-                .with_write(|m, txn| {
-                    m.put_registration(txn, "alias", &test_registration("tenant", "ed1"))
-                })
-                .unwrap();
+            meta.with_write(|m, txn| {
+                m.put_registration(txn, "alias", &test_registration("tenant", "ed1"))
+            })
+            .unwrap();
             Self {
                 _dir: dir,
                 meta,
@@ -667,7 +669,10 @@ mod tests {
         h.upload(&data).await.unwrap(); // adopts the orphan -> stored = true
 
         remove_placed_file(&h.meta, &h.store, &sha).unwrap();
-        assert!(h.store.exists(&sha), "an adopted file must survive the cleanup");
+        assert!(
+            h.store.exists(&sha),
+            "an adopted file must survive the cleanup"
+        );
     }
 
     /// Issue !12: a 30641-declared (speculatively charged) blob that is then

@@ -548,7 +548,9 @@ let
         description = ''
           GRASP-P master switch: enable private repository hosting
           (kind-30640/30641/1059/21059 + blob routes). Every other
-          private* option is a no-op unless this is true.
+          private* option is a no-op unless this is true. Cannot be
+          combined with GRASP-08 private mode (NGIT_PRIVATE_MODE): the
+          relay refuses to start.
         '';
       };
 

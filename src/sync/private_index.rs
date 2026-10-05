@@ -59,11 +59,8 @@ pub struct PrivateSyncIndex {
 impl PrivateSyncIndex {
     /// Replace the whole index with `entries`, returning what changed.
     pub fn replace_all(&mut self, entries: HashMap<String, PrivateRepoEntry>) -> PrivateIndexDiff {
-        let old_keys: HashSet<&String> = self
-            .entries
-            .values()
-            .flat_map(|e| e.keys.iter())
-            .collect();
+        let old_keys: HashSet<&String> =
+            self.entries.values().flat_map(|e| e.keys.iter()).collect();
         let added_aliases: Vec<String> = entries
             .keys()
             .filter(|alias| !self.entries.contains_key(*alias))
@@ -101,7 +98,6 @@ impl PrivateSyncIndex {
         out.sort();
         out
     }
-
 }
 
 /// Normalized ws(s):// private-sync peer relay URLs: EXCLUSIVELY the
@@ -656,10 +652,7 @@ mod tests {
         // Allowlist configured: exactly the allowlist, tenant values ignored.
         let allowlist: Vec<String> = vec!["wss://peer.example.com".into()];
         let peers = configured_peer_relay_urls(&allowlist, "thisnode.example.com");
-        assert_eq!(
-            peers,
-            HashSet::from(["wss://peer.example.com".to_string()])
-        );
+        assert_eq!(peers, HashSet::from(["wss://peer.example.com".to_string()]));
         assert!(!peers.contains("ws://169.254.169.254"));
         assert!(!peers.contains("wss://attacker.example.com"));
     }
@@ -670,7 +663,7 @@ mod tests {
 
         let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
         let keys = Keys::generate();
-        let event = EventBuilder::text_note("x")
+        let event = EventBuilder::new(Kind::TextNote, "x")
             .finalize(&keys)
             .expect("sign");
         let id = event.id;
@@ -749,14 +742,14 @@ mod tests {
 
         // Flood to the cap with bogus held events.
         for i in 0..MAX_HELD_EVENTS {
-            let event = EventBuilder::text_note(format!("flood {i}"))
+            let event = EventBuilder::new(Kind::TextNote, format!("flood {i}"))
                 .finalize(&keys)
                 .expect("sign");
             index.add_state_root(format!("flood-alias-{i}"), event);
         }
 
         // A legitimate event arriving over the cap is dropped...
-        let legit = EventBuilder::text_note("legit")
+        let legit = EventBuilder::new(Kind::TextNote, "legit")
             .finalize(&keys)
             .expect("sign");
         let id = legit.id;
@@ -966,7 +959,7 @@ mod tests {
         // Dependency holds (30641) still have MAX_HELD_EVENTS -
         // MAX_HELD_REGISTRATIONS slots: the registrations sub-cap leaves
         // 3072 for them.
-        let held_state = EventBuilder::text_note("30641-like")
+        let held_state = EventBuilder::new(Kind::TextNote, "30641-like")
             .finalize(&keys)
             .expect("sign");
         index.add_state_root("some-alias".into(), held_state.clone());
@@ -1000,7 +993,7 @@ mod tests {
         use nostr_sdk::prelude::*;
 
         let keys = Keys::generate();
-        let event = EventBuilder::text_note("x")
+        let event = EventBuilder::new(Kind::TextNote, "x")
             .finalize(&keys)
             .expect("sign");
         let id = event.id;

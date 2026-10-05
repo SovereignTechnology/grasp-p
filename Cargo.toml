@@ -76,7 +76,7 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 
 # GRASP-P private repos: meta store (same heed version nostr-lmdb pins),
 # small sync primitives, and temp-file names for streamed blob uploads.
-# sha256/hex come from the `nostr` re-export of bitcoin_hashes (already compiled).
+# sha256/hex come from bitcoin_hashes, which upstream already depends on.
 # NOTE (follow-up C3): these "serde"/"serde-json" features unify (Cargo feature
 # union) onto the heed that nostr-lmdb pins for the relay core store. This
 # assumes both crates continue to share one heed version; the features are
@@ -94,6 +94,10 @@ uuid = { version = "1", features = ["v4"] }
 # GRASP-P Phase 4b: exact-host URL matching for domain references in 30640
 # tags / peer allowlists (already compiled transitively via reqwest).
 url = "2"
+
+# GRASP-P proof-of-possession checks on 30640 key tags: the secp256k1 that
+# nostr already links (nostr 0.45.5 no longer re-exports it).
+secp256k1 = { version = "0.30", default-features = false, features = ["std"] }
 
 # Git (for future use)
 # git-http-backend = "0.3"

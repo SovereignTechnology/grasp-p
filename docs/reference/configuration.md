@@ -1669,7 +1669,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_REPOS_ENABLE`
 
-**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay is byte-identical to a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section.  
+**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay is byte-identical to a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section. Mutually exclusive with GRASP-08 private mode: startup fails when both `NGIT_GRASP_P_REPOS_ENABLE=true` and `NGIT_PRIVATE_MODE=true`, because GRASP-08 gates every read behind NIP-42 and GRASP-P relies on anonymous reads.  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No

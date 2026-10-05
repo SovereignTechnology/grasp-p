@@ -1,8 +1,8 @@
 //! Kind-30641 state root: validation, edition-ring append (G7 amendment), and
 //! blob claim maintenance.
 
-use nostr::{Event, Filter, Kind};
-use nostr_relay_builder::prelude::WritePolicyResult;
+use nostr::prelude::{Event, Filter, Kind};
+use nostr_sdk::local_relay::WritePolicyResult;
 
 use crate::nostr::policy::{reject_error, reject_invalid, reject_restricted};
 
@@ -49,7 +49,8 @@ pub(crate) struct ParsedStateRoot {
     blobs: Vec<BlobRef>,
 }
 
-pub(crate) fn parse_shape(event: &Event, max_blob_bytes: u64) -> Result<ParsedStateRoot, String> {    let mut alias: Option<String> = None;
+pub(crate) fn parse_shape(event: &Event, max_blob_bytes: u64) -> Result<ParsedStateRoot, String> {
+    let mut alias: Option<String> = None;
     let mut coordinate: Option<String> = None;
     let mut manifest: Option<BlobRef> = None;
     let mut packs: Vec<BlobRef> = Vec::new();
@@ -91,7 +92,8 @@ pub(crate) fn parse_shape(event: &Event, max_blob_bytes: u64) -> Result<ParsedSt
     }
     let coordinate = coordinate
         .ok_or_else(|| "state root must carry an a tag (30640:<tenant>:<alias>)".to_string())?;
-    let manifest = manifest.ok_or_else(|| "state root must carry an m (manifest) tag".to_string())?;
+    let manifest =
+        manifest.ok_or_else(|| "state root must carry an m (manifest) tag".to_string())?;
 
     let mut blobs = vec![manifest];
     blobs.extend(packs);
@@ -295,7 +297,7 @@ pub(crate) fn apply_state_root_txn(
     // Recompute the set of hashes referenced by ANY retained edition.
     let mut referenced = std::collections::HashSet::new();
     for (_, json) in &retained {
-        if let Ok(edition) = nostr::Event::from_json(json.as_bytes()) {
+        if let Ok(edition) = nostr::prelude::Event::from_json(json.as_bytes()) {
             for tag in edition.tags.iter() {
                 let v = tag.clone().to_vec();
                 if v.len() >= 2 && (v[0] == "m" || v[0] == "pack") {
@@ -305,7 +307,7 @@ pub(crate) fn apply_state_root_txn(
         }
     }
 
-    let now = nostr::Timestamp::now().as_secs();
+    let now = nostr::prelude::Timestamp::now().as_secs();
 
     // Claim the hashes of the new edition for this alias, attaching the
     // speculative charge to the ones computed above (issue !12).

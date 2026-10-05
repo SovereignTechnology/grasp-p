@@ -926,6 +926,7 @@ dependencies = [
  "lmdb-master-sys",
  "once_cell",
  "page_size",
+ "serde",
  "synchronoise",
  "url",
 ]
@@ -944,6 +945,8 @@ checksum = "9d3f528b053a6d700b2734eabcd0fd49cb8230647aa72958467527b0b7917114"
 dependencies = [
  "byteorder",
  "heed-traits",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1370,6 +1373,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "grasp-audit",
+ "heed",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1381,9 +1385,11 @@ dependencies = [
  "nostr-lmdb",
  "nostr-memory",
  "nostr-sdk",
+ "parking_lot",
  "prometheus",
  "rand 0.10.3",
  "reqwest",
+ "secp256k1",
  "serde",
  "serde_json",
  "tar",
@@ -1392,6 +1398,8 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]

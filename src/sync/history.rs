@@ -147,6 +147,8 @@ pub(super) struct HistoryJob {
     pub pending: PendingSyncIndex,
     pub purgatory: Arc<crate::purgatory::Purgatory>,
     pub rejected: Arc<rejected_index::RejectedEventsIndex>,
+    /// GRASP-P service, whose known-rejected events negentropy also skips.
+    pub grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
 }
 
 impl HistoryJob {
@@ -196,7 +198,10 @@ impl HistoryJob {
         let (groups, class) = if reconciled {
             let purgatory = self.purgatory.event_ids();
             let rejected = self.rejected.get_all_event_ids();
-            remote_ids.retain(|id| !purgatory.contains(id) && !rejected.contains(id));
+            let grasp_p_rejected = super::SyncManager::grasp_p_rejected_ids(self.grasp_p.as_ref());
+            remote_ids.retain(|id| {
+                !purgatory.contains(id) && !rejected.contains(id) && !grasp_p_rejected.contains(id)
+            });
             let ids: Vec<_> = remote_ids.iter().copied().collect();
             (
                 ids.chunks(300)
@@ -321,6 +326,7 @@ mod tests {
                     pending: Arc::new(RwLock::new(HashMap::new())),
                     purgatory: purgatory.clone(),
                     rejected: rejected.clone(),
+                    grasp_p: None,
                 },
                 tx.clone(),
             );

@@ -56,7 +56,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nostr::Event;
+use nostr::prelude::Event;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -167,61 +167,58 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// SSRF guard for a peer base URL. With `allow_private` (tests) any peer is
-/// allowed. Otherwise: require https, resolve the host, and reject if it does
-/// not resolve or if ANY resolved address is a disallowed (internal) IP. This
-/// defeats the trivial literal-IP / static-hostname SSRF via a hostile 30640
-/// `server` tag; DNS-rebinding at connection time remains a documented residual
+/// SSRF guard for a peer base URL. Production requires https; plaintext http
+/// is only permitted under `allow_private` (loopback tests). The URL then goes
+/// through upstream's outbound target policy (`crate::outbound`), which
+/// rejects credentials, local hostnames and non-global IP literals, resolves
+/// the host and fails closed unless every answer is globally reachable. This
+/// defeats the literal-IP / static-hostname SSRF via a hostile 30640 `server`
+/// tag; DNS rebinding at connection time remains a documented residual
 /// (production should set NGIT_GRASP_P_MIRROR_PEER_URLS to the known peer).
 async fn peer_allowed(peer_base: &str, allow_private: bool) -> bool {
-    if allow_private {
-        return true;
-    }
-    let Some(rest) = peer_base.strip_prefix("https://") else {
-        // Plaintext http is only permitted under allow_private (loopback tests).
-        return false;
-    };
-    host_resolves_public_only(rest).await
+    outbound_target_allowed(
+        peer_base,
+        crate::outbound::OutboundTargetKind::EventGit,
+        "https://",
+        allow_private,
+    )
+    .await
 }
 
 /// SSRF guard for a private-sync peer relay URL. Same policy as
-/// [`peer_allowed`] but for WebSocket peers: with `allow_private` (tests)
-/// any peer is allowed; otherwise require wss:// (plain ws:// rejected),
-/// resolve the host, and reject if it does not resolve or if ANY resolved
-/// address is a disallowed (internal) IP.
+/// [`peer_allowed`] for WebSocket peers: production requires wss://.
 pub(crate) async fn relay_peer_allowed(relay_url: &str, allow_private: bool) -> bool {
-    if allow_private {
-        return true;
-    }
-    let Some(rest) = relay_url.strip_prefix("wss://") else {
-        // Plaintext ws is only permitted under allow_private (loopback tests).
-        return false;
-    };
-    host_resolves_public_only(rest).await
+    outbound_target_allowed(
+        relay_url,
+        crate::outbound::OutboundTargetKind::EventRelay,
+        "wss://",
+        allow_private,
+    )
+    .await
 }
 
-/// Resolve the host of `rest` (a URL with scheme stripped) and require every
-/// resolved address to be a public, allowed IP.
-async fn host_resolves_public_only(rest: &str) -> bool {
-    let hostport = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h, p.parse::<u16>().unwrap_or(443))
-        }
-        _ => (hostport, 443u16),
+/// Shared body of the two guards. With `allow_private` the policy skips DNS
+/// vetting (upstream's `allow_non_global`) but still checks scheme and
+/// credentials. Every vetted address is also re-checked against
+/// [`is_disallowed_ip`], which additionally decodes the NAT64 / 6to4 /
+/// IPv4-compatible transition forms that can wrap an internal IPv4.
+async fn outbound_target_allowed(
+    url: &str,
+    kind: crate::outbound::OutboundTargetKind,
+    secure_scheme: &str,
+    allow_private: bool,
+) -> bool {
+    if !allow_private && !url.starts_with(secure_scheme) {
+        return false;
+    }
+    let policy = crate::outbound::OutboundTargetPolicy {
+        allow_non_global: allow_private,
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let mut resolved_any = false;
-            for a in addrs {
-                resolved_any = true;
-                if is_disallowed_ip(&a.ip()) {
-                    return false;
-                }
-            }
-            resolved_any
-        }
+    match policy.authorize_resolved(kind, url).await {
+        Ok(resolved) => resolved
+            .addresses
+            .iter()
+            .all(|address| !is_disallowed_ip(address)),
         Err(_) => false,
     }
 }
@@ -536,14 +533,12 @@ pub(crate) fn enqueue_for_state_root(svc: &PrivateService, event: &Event) {
                     alias = Some(v[1].clone());
                 }
             }
-            "m" | "pack" => {
-                if v.len() >= 3 && super::blossom_auth::is_lower_hex_64(&v[1]) {
-                    if let Ok(size) = v[2].parse::<u64>() {
-                        want.push(WantBlob {
-                            sha256: v[1].clone(),
-                            size,
-                        });
-                    }
+            "m" | "pack" if v.len() >= 3 && super::blossom_auth::is_lower_hex_64(&v[1]) => {
+                if let Ok(size) = v[2].parse::<u64>() {
+                    want.push(WantBlob {
+                        sha256: v[1].clone(),
+                        size,
+                    });
                 }
             }
             _ => {}
@@ -703,10 +698,12 @@ async fn fetch_from_peer(
     let pending = svc
         .pending_spec_release(&blob.sha256)
         .map_err(|e| format!("reserve: {}", e.reason()))?;
-    let reservation = svc.reserve_upload(blob.size, pending).map_err(|e| match e {
-        BlobError::QuotaExceeded => "quota".to_string(),
-        other => format!("reserve: {}", other.reason()),
-    })?;
+    let reservation = svc
+        .reserve_upload(blob.size, pending)
+        .map_err(|e| match e {
+            BlobError::QuotaExceeded => "quota".to_string(),
+            other => format!("reserve: {}", other.reason()),
+        })?;
     let mut sink = UploadSink::create(
         svc.meta.clone(),
         svc.blobs.clone(),
@@ -845,343 +842,6 @@ async fn fetch_blob(
     Some(last_error)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    #[test]
-    fn retry_class_taxonomy() {
-        // Transient classes → exponential backoff.
-        assert_eq!(classify_failure("no_peer"), RetryClass::Backoff);
-        assert_eq!(
-            classify_failure("network: connection refused"),
-            RetryClass::Backoff
-        );
-        assert_eq!(classify_failure("http_status: 500"), RetryClass::Backoff);
-        assert_eq!(classify_failure("http_status: 502"), RetryClass::Backoff);
-        // Unusual non-404 statuses are treated as transient edge oddities.
-        assert_eq!(classify_failure("http_status: 403"), RetryClass::Backoff);
-        // 404 on all peers → retry, but at the max interval (late upload).
-        assert_eq!(
-            classify_failure("http_status: 404"),
-            RetryClass::BackoffAtMax
-        );
-        // Deterministic classes → no hot retry.
-        for reason in [
-            "too_large",
-            "verify: size mismatch",
-            "verify: sha256 mismatch",
-            "store: forbidden",
-            "blocked",
-            "quota",
-            "reserve: cap reached",
-            "sink: io error",
-            "write: io error",
-            "anything-else",
-        ] {
-            assert_eq!(
-                classify_failure(reason),
-                RetryClass::NoRetry,
-                "{reason} must be NoRetry"
-            );
-        }
-    }
-
-    #[test]
-    fn retry_delay_schedule_cap_and_jitter_bounds() {
-        let base = Duration::from_secs(60);
-        let max = Duration::from_secs(3600);
-
-        // Exponential growth with jitter=1.0 (exact schedule, no jitter).
-        assert_eq!(retry_delay(1, base, max, 1.0), Duration::from_secs(60));
-        assert_eq!(retry_delay(2, base, max, 1.0), Duration::from_secs(120));
-        assert_eq!(retry_delay(3, base, max, 1.0), Duration::from_secs(240));
-        assert_eq!(retry_delay(4, base, max, 1.0), Duration::from_secs(480));
-
-        // Cap: attempt 7 would be 60 * 64 = 3840 > 3600 → capped at max.
-        assert_eq!(retry_delay(7, base, max, 1.0), max);
-        assert_eq!(retry_delay(100, base, max, 1.0), max);
-        // u32::MAX attempts (the BackoffAtMax path) is always the cap.
-        assert_eq!(retry_delay(u32::MAX, base, max, 1.0), max);
-
-        // Jitter bounds: 1000 samples per attempt stay within ±20% of the
-        // un-jittered value.
-        for attempt in 1..=8u32 {
-            let exact = retry_delay(attempt, base, max, 1.0).as_secs_f64();
-            for _ in 0..1000 {
-                let jitter = 0.8 + rand::random::<f64>() * 0.4;
-                let sampled = retry_delay(attempt, base, max, jitter).as_secs_f64();
-                assert!(
-                    (exact * 0.8..=exact * 1.2).contains(&sampled),
-                    "attempt {attempt}: {sampled} outside ±20% of {exact}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn retry_gate_skip_and_release() {
-        let base = Duration::from_secs(60);
-        let max = Duration::from_secs(3600);
-        let sha = "ab".repeat(32);
-        let mut retry: HashMap<String, RetryState> = HashMap::new();
-
-        // Ungated initially.
-        assert!(!retry_gated(&retry, &sha));
-
-        // First transient failure: gated, next-eligible in the future.
-        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
-        assert!(retry_gated(&retry, &sha));
-        assert_eq!(retry.get(&sha).unwrap().attempts, 1);
-
-        // Success clears the gate.
-        record_mirror_success(&mut retry, &sha);
-        assert!(!retry_gated(&retry, &sha));
-        assert!(retry.get(&sha).is_none());
-
-        // Deterministic failure: no gate is installed (flat repair-scan
-        // cadence preserved).
-        record_mirror_failure(&mut retry, &sha, "quota", base, max);
-        assert!(!retry_gated(&retry, &sha));
-        assert!(retry.get(&sha).is_none());
-
-        // A deterministic failure also CLEARS a stale transient gate: the
-        // blob drops back to the flat repair-scan cadence (the gate would
-        // otherwise delay a retry whose condition already changed).
-        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
-        assert!(retry_gated(&retry, &sha));
-        record_mirror_failure(&mut retry, &sha, "too_large", base, max);
-        assert!(!retry_gated(&retry, &sha));
-
-        // Backoff attempts accumulate while failures stay transient.
-        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
-        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
-        assert_eq!(retry.get(&sha).unwrap().attempts, 2);
-    }
-
-    /// FS-5: the failure warn dedups per (sha256, reason) — the first
-    /// failure logs, repeats inside the TTL are suppressed, a DIFFERENT
-    /// reason for the same sha logs, and the pair re-logs after the TTL.
-    #[test]
-    fn failure_log_dedup_per_sha_and_reason() {
-        let ttl = FailureLogDedup::TTL;
-        let mut dedup = FailureLogDedup::new();
-        let t0 = Instant::now();
-
-        assert!(dedup.should_log_at("sha1", "network: refused", t0));
-        assert!(
-            !dedup.should_log_at("sha1", "network: refused", t0 + Duration::from_secs(1)),
-            "repeat inside the TTL must be suppressed"
-        );
-        assert!(
-            dedup.should_log_at("sha1", "http_status: 500", t0 + Duration::from_secs(2)),
-            "a different reason for the same sha is a different pair"
-        );
-        assert!(
-            dedup.should_log_at("sha2", "network: refused", t0 + Duration::from_secs(3)),
-            "a different sha is a different pair"
-        );
-        assert!(
-            dedup.should_log_at("sha1", "network: refused", t0 + ttl + Duration::from_secs(1)),
-            "a still-failing pair re-logs after the TTL"
-        );
-    }
-
-    /// FS-5: at the cap the OLDEST entry is evicted to make room — a fresh
-    /// failure must always be able to log once. (Exercises the per-key
-    /// dedup gate directly: with K at/above the cap the global bucket is
-    /// exactly the R2-2 flood scenario and would bound the full gate.)
-    #[test]
-    fn failure_log_dedup_cap_evicts_oldest() {
-        let mut dedup = FailureLogDedup::new();
-        let t0 = Instant::now();
-        for i in 0..FailureLogDedup::MAX_ENTRIES {
-            assert!(dedup.dedup_pass_at(
-                &format!("flood-{i}"),
-                "network: refused",
-                t0 + Duration::from_millis(i as u64)
-            ));
-        }
-        assert!(
-            dedup.dedup_pass_at("fresh", "network: refused", t0 + Duration::from_secs(1)),
-            "a fresh failure must log even at the cap"
-        );
-        assert!(
-            !dedup.dedup_pass_at("flood-1", "network: refused", t0 + Duration::from_secs(2)),
-            "survivors stay suppressed"
-        );
-        assert!(
-            dedup.dedup_pass_at("flood-0", "network: refused", t0 + Duration::from_secs(3)),
-            "the oldest entry was evicted to make room"
-        );
-    }
-
-    /// R2-2: with K > MAX_ENTRIES distinct failing pairs, oldest-evict
-    /// keeps every per-key entry younger than the TTL, so the per-key
-    /// dedup alone passes every attempt; the GLOBAL bucket must bound the
-    /// warn rate to the burst, then the 1/s refill.
-    #[test]
-    fn failure_log_global_bucket_bounds_flood() {
-        let mut dedup = FailureLogDedup::new();
-        let t0 = Instant::now();
-        let k = FailureLogDedup::MAX_ENTRIES + 400;
-        let mut allowed = 0u32;
-        for i in 0..k {
-            if dedup.should_log_at(&format!("flood-{i}"), "network: refused", t0) {
-                allowed += 1;
-            }
-        }
-        assert_eq!(
-            allowed,
-            FailureLogDedup::BUCKET_CAPACITY as u32,
-            "the burst is bounded by the bucket capacity"
-        );
-        assert_eq!(
-            dedup.suppressed_total(),
-            (k - allowed as usize) as u64,
-            "every dropped warn is counted for the window summary"
-        );
-        // No token has refilled yet: a fresh failure in the same instant
-        // still drops.
-        assert!(!dedup.should_log_at("late", "network: refused", t0));
-        // Refill is 1 token/s: ten seconds later exactly ten more pass.
-        let mut allowed = 0u32;
-        for i in 0..100 {
-            if dedup.should_log_at(
-                &format!("later-{i}"),
-                "network: refused",
-                t0 + Duration::from_secs(10),
-            ) {
-                allowed += 1;
-            }
-        }
-        assert_eq!(allowed, 10, "the sustained rate is the 1/s refill");
-    }
-
-    /// R2-2: dropped warns are summarized once per window with per-reason
-    /// counts; the window then resets and stays quiet while nothing drops.
-    #[test]
-    fn failure_log_summary_counts_drops_per_reason() {
-        let mut dedup = FailureLogDedup::new();
-        let t0 = Instant::now();
-        // Drain the burst: these pass, nothing is counted yet.
-        for i in 0..16 {
-            assert!(dedup.should_log_at(&format!("burst-{i}"), "network: refused", t0));
-        }
-        assert_eq!(dedup.suppressed_total(), 0);
-        // The bucket is empty: further first-sightings drop and are counted
-        // per reason LABEL (the metric's bounded-cardinality prefix).
-        for i in 0..3 {
-            assert!(!dedup.should_log_at(&format!("net-{i}"), "network: refused", t0));
-        }
-        for i in 0..2 {
-            assert!(!dedup.should_log_at(&format!("http-{i}"), "http_status: 500", t0));
-        }
-        assert_eq!(dedup.suppressed_total(), 5);
-        // No summary before the interval elapses.
-        assert!(dedup
-            .summary_if_due_at(t0 + Duration::from_secs(30))
-            .is_none());
-        // At the window close: one summary with the total and per-reason
-        // counts.
-        let summary = dedup
-            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL)
-            .expect("a summary is due with drops pending");
-        assert!(summary.starts_with("5 failure warn(s)"), "{summary}");
-        assert!(summary.contains("http_status=2"), "{summary}");
-        assert!(summary.contains("network=3"), "{summary}");
-        // The window reset: with nothing new dropped there is nothing to
-        // say at the next close.
-        assert!(dedup
-            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL * 2)
-            .is_none());
-        assert_eq!(dedup.suppressed_total(), 0);
-    }
-
-    #[test]
-    fn disallowed_ip_covers_internal_ranges() {
-        for ip in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "192.168.0.1",
-            "172.16.5.5",
-            "169.254.169.254", // cloud metadata
-            "100.64.0.1",      // CGNAT
-            "0.0.0.0",
-            "224.0.0.1",
-        ] {
-            let ip: IpAddr = IpAddr::V4(ip.parse::<Ipv4Addr>().unwrap());
-            assert!(is_disallowed_ip(&ip), "{ip} should be disallowed");
-        }
-        assert!(is_disallowed_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_disallowed_ip(&IpAddr::V6("fe80::1".parse().unwrap())));
-        assert!(is_disallowed_ip(&IpAddr::V6("fc00::1".parse().unwrap())));
-        assert!(is_disallowed_ip(&IpAddr::V6("::ffff:127.0.0.1".parse().unwrap())));
-    }
-
-    #[test]
-    fn embedded_ipv4_transition_forms_are_disallowed() {
-        // NAT64 64:ff9b::/96 wrapping cloud-metadata 169.254.169.254.
-        let nat64: Ipv6Addr = "64:ff9b::a9fe:a9fe".parse().unwrap();
-        assert_eq!(
-            embedded_ipv4(&nat64),
-            Some(Ipv4Addr::new(169, 254, 169, 254))
-        );
-        assert!(is_disallowed_ip(&IpAddr::V6(nat64)));
-
-        // 6to4 2002::/16 wrapping internal 10.0.0.5 (v4 in bytes 2..6).
-        let sixtofour: Ipv6Addr = "2002:a00:5::".parse().unwrap();
-        assert_eq!(embedded_ipv4(&sixtofour), Some(Ipv4Addr::new(10, 0, 0, 5)));
-        assert!(is_disallowed_ip(&IpAddr::V6(sixtofour)));
-
-        // IPv4-compatible ::/96 wrapping 169.254.169.254.
-        let compat: Ipv6Addr = "::a9fe:a9fe".parse().unwrap();
-        assert_eq!(embedded_ipv4(&compat), Some(Ipv4Addr::new(169, 254, 169, 254)));
-        assert!(is_disallowed_ip(&IpAddr::V6(compat)));
-
-        // A transition form wrapping a *public* v4 stays allowed.
-        let public_6to4: Ipv6Addr = "2002:808:808::".parse().unwrap();
-        assert_eq!(embedded_ipv4(&public_6to4), Some(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!is_disallowed_ip(&IpAddr::V6(public_6to4)));
-    }
-
-    #[test]
-    fn public_ip_allowed() {
-        assert!(!is_disallowed_ip(&IpAddr::V4("8.8.8.8".parse().unwrap())));
-        assert!(!is_disallowed_ip(&IpAddr::V4("93.184.216.34".parse().unwrap())));
-        assert!(!is_disallowed_ip(&IpAddr::V6("2606:4700:4700::1111".parse().unwrap())));
-    }
-
-    #[tokio::test]
-    async fn peer_allowed_blocks_internal_and_http() {
-        // allow_private short-circuits (tests / loopback pairs).
-        assert!(peer_allowed("http://127.0.0.1:9999", true).await);
-        // Plaintext http rejected in production mode.
-        assert!(!peer_allowed("http://example.com", false).await);
-        // Literal internal IP rejected.
-        assert!(!peer_allowed("https://169.254.169.254", false).await);
-        assert!(!peer_allowed("https://127.0.0.1:8080", false).await);
-        assert!(!peer_allowed("https://10.0.0.5", false).await);
-        // Unresolvable host rejected (fails closed).
-        assert!(!peer_allowed("https://nonexistent.invalid", false).await);
-    }
-
-    #[tokio::test]
-    async fn relay_peer_allowed_blocks_internal_and_ws() {
-        // allow_private short-circuits (tests / loopback pairs).
-        assert!(relay_peer_allowed("ws://127.0.0.1:9999", true).await);
-        // Plaintext ws rejected in production mode.
-        assert!(!relay_peer_allowed("ws://example.com", false).await);
-        // Literal internal IP rejected.
-        assert!(!relay_peer_allowed("wss://169.254.169.254", false).await);
-        assert!(!relay_peer_allowed("wss://127.0.0.1:8080", false).await);
-        assert!(!relay_peer_allowed("wss://10.0.0.5", false).await);
-        // Unresolvable host rejected (fails closed).
-        assert!(!relay_peer_allowed("wss://nonexistent.invalid", false).await);
-    }
-}
-
 /// Spawn the mirror worker. Called once from `RelayServer::start` when
 /// private repos AND mirroring are enabled.
 pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
@@ -1316,4 +976,354 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn retry_class_taxonomy() {
+        // Transient classes → exponential backoff.
+        assert_eq!(classify_failure("no_peer"), RetryClass::Backoff);
+        assert_eq!(
+            classify_failure("network: connection refused"),
+            RetryClass::Backoff
+        );
+        assert_eq!(classify_failure("http_status: 500"), RetryClass::Backoff);
+        assert_eq!(classify_failure("http_status: 502"), RetryClass::Backoff);
+        // Unusual non-404 statuses are treated as transient edge oddities.
+        assert_eq!(classify_failure("http_status: 403"), RetryClass::Backoff);
+        // 404 on all peers → retry, but at the max interval (late upload).
+        assert_eq!(
+            classify_failure("http_status: 404"),
+            RetryClass::BackoffAtMax
+        );
+        // Deterministic classes → no hot retry.
+        for reason in [
+            "too_large",
+            "verify: size mismatch",
+            "verify: sha256 mismatch",
+            "store: forbidden",
+            "blocked",
+            "quota",
+            "reserve: cap reached",
+            "sink: io error",
+            "write: io error",
+            "anything-else",
+        ] {
+            assert_eq!(
+                classify_failure(reason),
+                RetryClass::NoRetry,
+                "{reason} must be NoRetry"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_schedule_cap_and_jitter_bounds() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(3600);
+
+        // Exponential growth with jitter=1.0 (exact schedule, no jitter).
+        assert_eq!(retry_delay(1, base, max, 1.0), Duration::from_secs(60));
+        assert_eq!(retry_delay(2, base, max, 1.0), Duration::from_secs(120));
+        assert_eq!(retry_delay(3, base, max, 1.0), Duration::from_secs(240));
+        assert_eq!(retry_delay(4, base, max, 1.0), Duration::from_secs(480));
+
+        // Cap: attempt 7 would be 60 * 64 = 3840 > 3600 → capped at max.
+        assert_eq!(retry_delay(7, base, max, 1.0), max);
+        assert_eq!(retry_delay(100, base, max, 1.0), max);
+        // u32::MAX attempts (the BackoffAtMax path) is always the cap.
+        assert_eq!(retry_delay(u32::MAX, base, max, 1.0), max);
+
+        // Jitter bounds: 1000 samples per attempt stay within ±20% of the
+        // un-jittered value.
+        for attempt in 1..=8u32 {
+            let exact = retry_delay(attempt, base, max, 1.0).as_secs_f64();
+            for _ in 0..1000 {
+                let jitter = 0.8 + rand::random::<f64>() * 0.4;
+                let sampled = retry_delay(attempt, base, max, jitter).as_secs_f64();
+                assert!(
+                    (exact * 0.8..=exact * 1.2).contains(&sampled),
+                    "attempt {attempt}: {sampled} outside ±20% of {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_gate_skip_and_release() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(3600);
+        let sha = "ab".repeat(32);
+        let mut retry: HashMap<String, RetryState> = HashMap::new();
+
+        // Ungated initially.
+        assert!(!retry_gated(&retry, &sha));
+
+        // First transient failure: gated, next-eligible in the future.
+        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
+        assert!(retry_gated(&retry, &sha));
+        assert_eq!(retry.get(&sha).unwrap().attempts, 1);
+
+        // Success clears the gate.
+        record_mirror_success(&mut retry, &sha);
+        assert!(!retry_gated(&retry, &sha));
+        assert!(!retry.contains_key(&sha));
+
+        // Deterministic failure: no gate is installed (flat repair-scan
+        // cadence preserved).
+        record_mirror_failure(&mut retry, &sha, "quota", base, max);
+        assert!(!retry_gated(&retry, &sha));
+        assert!(!retry.contains_key(&sha));
+
+        // A deterministic failure also CLEARS a stale transient gate: the
+        // blob drops back to the flat repair-scan cadence (the gate would
+        // otherwise delay a retry whose condition already changed).
+        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
+        assert!(retry_gated(&retry, &sha));
+        record_mirror_failure(&mut retry, &sha, "too_large", base, max);
+        assert!(!retry_gated(&retry, &sha));
+
+        // Backoff attempts accumulate while failures stay transient.
+        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
+        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
+        assert_eq!(retry.get(&sha).unwrap().attempts, 2);
+    }
+
+    /// FS-5: the failure warn dedups per (sha256, reason) — the first
+    /// failure logs, repeats inside the TTL are suppressed, a DIFFERENT
+    /// reason for the same sha logs, and the pair re-logs after the TTL.
+    #[test]
+    fn failure_log_dedup_per_sha_and_reason() {
+        let ttl = FailureLogDedup::TTL;
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+
+        assert!(dedup.should_log_at("sha1", "network: refused", t0));
+        assert!(
+            !dedup.should_log_at("sha1", "network: refused", t0 + Duration::from_secs(1)),
+            "repeat inside the TTL must be suppressed"
+        );
+        assert!(
+            dedup.should_log_at("sha1", "http_status: 500", t0 + Duration::from_secs(2)),
+            "a different reason for the same sha is a different pair"
+        );
+        assert!(
+            dedup.should_log_at("sha2", "network: refused", t0 + Duration::from_secs(3)),
+            "a different sha is a different pair"
+        );
+        assert!(
+            dedup.should_log_at(
+                "sha1",
+                "network: refused",
+                t0 + ttl + Duration::from_secs(1)
+            ),
+            "a still-failing pair re-logs after the TTL"
+        );
+    }
+
+    /// FS-5: at the cap the OLDEST entry is evicted to make room — a fresh
+    /// failure must always be able to log once. (Exercises the per-key
+    /// dedup gate directly: with K at/above the cap the global bucket is
+    /// exactly the R2-2 flood scenario and would bound the full gate.)
+    #[test]
+    fn failure_log_dedup_cap_evicts_oldest() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        for i in 0..FailureLogDedup::MAX_ENTRIES {
+            assert!(dedup.dedup_pass_at(
+                &format!("flood-{i}"),
+                "network: refused",
+                t0 + Duration::from_millis(i as u64)
+            ));
+        }
+        assert!(
+            dedup.dedup_pass_at("fresh", "network: refused", t0 + Duration::from_secs(1)),
+            "a fresh failure must log even at the cap"
+        );
+        assert!(
+            !dedup.dedup_pass_at("flood-1", "network: refused", t0 + Duration::from_secs(2)),
+            "survivors stay suppressed"
+        );
+        assert!(
+            dedup.dedup_pass_at("flood-0", "network: refused", t0 + Duration::from_secs(3)),
+            "the oldest entry was evicted to make room"
+        );
+    }
+
+    /// R2-2: with K > MAX_ENTRIES distinct failing pairs, oldest-evict
+    /// keeps every per-key entry younger than the TTL, so the per-key
+    /// dedup alone passes every attempt; the GLOBAL bucket must bound the
+    /// warn rate to the burst, then the 1/s refill.
+    #[test]
+    fn failure_log_global_bucket_bounds_flood() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        let k = FailureLogDedup::MAX_ENTRIES + 400;
+        let mut allowed = 0u32;
+        for i in 0..k {
+            if dedup.should_log_at(&format!("flood-{i}"), "network: refused", t0) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed,
+            FailureLogDedup::BUCKET_CAPACITY as u32,
+            "the burst is bounded by the bucket capacity"
+        );
+        assert_eq!(
+            dedup.suppressed_total(),
+            (k - allowed as usize) as u64,
+            "every dropped warn is counted for the window summary"
+        );
+        // No token has refilled yet: a fresh failure in the same instant
+        // still drops.
+        assert!(!dedup.should_log_at("late", "network: refused", t0));
+        // Refill is 1 token/s: ten seconds later exactly ten more pass.
+        let mut allowed = 0u32;
+        for i in 0..100 {
+            if dedup.should_log_at(
+                &format!("later-{i}"),
+                "network: refused",
+                t0 + Duration::from_secs(10),
+            ) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "the sustained rate is the 1/s refill");
+    }
+
+    /// R2-2: dropped warns are summarized once per window with per-reason
+    /// counts; the window then resets and stays quiet while nothing drops.
+    #[test]
+    fn failure_log_summary_counts_drops_per_reason() {
+        let mut dedup = FailureLogDedup::new();
+        let t0 = Instant::now();
+        // Drain the burst: these pass, nothing is counted yet.
+        for i in 0..16 {
+            assert!(dedup.should_log_at(&format!("burst-{i}"), "network: refused", t0));
+        }
+        assert_eq!(dedup.suppressed_total(), 0);
+        // The bucket is empty: further first-sightings drop and are counted
+        // per reason LABEL (the metric's bounded-cardinality prefix).
+        for i in 0..3 {
+            assert!(!dedup.should_log_at(&format!("net-{i}"), "network: refused", t0));
+        }
+        for i in 0..2 {
+            assert!(!dedup.should_log_at(&format!("http-{i}"), "http_status: 500", t0));
+        }
+        assert_eq!(dedup.suppressed_total(), 5);
+        // No summary before the interval elapses.
+        assert!(dedup
+            .summary_if_due_at(t0 + Duration::from_secs(30))
+            .is_none());
+        // At the window close: one summary with the total and per-reason
+        // counts.
+        let summary = dedup
+            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL)
+            .expect("a summary is due with drops pending");
+        assert!(summary.starts_with("5 failure warn(s)"), "{summary}");
+        assert!(summary.contains("http_status=2"), "{summary}");
+        assert!(summary.contains("network=3"), "{summary}");
+        // The window reset: with nothing new dropped there is nothing to
+        // say at the next close.
+        assert!(dedup
+            .summary_if_due_at(t0 + FailureLogDedup::SUMMARY_INTERVAL * 2)
+            .is_none());
+        assert_eq!(dedup.suppressed_total(), 0);
+    }
+
+    #[test]
+    fn disallowed_ip_covers_internal_ranges() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.5.5",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",
+            "224.0.0.1",
+        ] {
+            let ip: IpAddr = IpAddr::V4(ip.parse::<Ipv4Addr>().unwrap());
+            assert!(is_disallowed_ip(&ip), "{ip} should be disallowed");
+        }
+        assert!(is_disallowed_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_disallowed_ip(&IpAddr::V6("fe80::1".parse().unwrap())));
+        assert!(is_disallowed_ip(&IpAddr::V6("fc00::1".parse().unwrap())));
+        assert!(is_disallowed_ip(&IpAddr::V6(
+            "::ffff:127.0.0.1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn embedded_ipv4_transition_forms_are_disallowed() {
+        // NAT64 64:ff9b::/96 wrapping cloud-metadata 169.254.169.254.
+        let nat64: Ipv6Addr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert_eq!(
+            embedded_ipv4(&nat64),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        assert!(is_disallowed_ip(&IpAddr::V6(nat64)));
+
+        // 6to4 2002::/16 wrapping internal 10.0.0.5 (v4 in bytes 2..6).
+        let sixtofour: Ipv6Addr = "2002:a00:5::".parse().unwrap();
+        assert_eq!(embedded_ipv4(&sixtofour), Some(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(is_disallowed_ip(&IpAddr::V6(sixtofour)));
+
+        // IPv4-compatible ::/96 wrapping 169.254.169.254.
+        let compat: Ipv6Addr = "::a9fe:a9fe".parse().unwrap();
+        assert_eq!(
+            embedded_ipv4(&compat),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        assert!(is_disallowed_ip(&IpAddr::V6(compat)));
+
+        // A transition form wrapping a *public* v4 stays allowed.
+        let public_6to4: Ipv6Addr = "2002:808:808::".parse().unwrap();
+        assert_eq!(embedded_ipv4(&public_6to4), Some(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_disallowed_ip(&IpAddr::V6(public_6to4)));
+    }
+
+    #[test]
+    fn public_ip_allowed() {
+        assert!(!is_disallowed_ip(&IpAddr::V4("8.8.8.8".parse().unwrap())));
+        assert!(!is_disallowed_ip(&IpAddr::V4(
+            "93.184.216.34".parse().unwrap()
+        )));
+        assert!(!is_disallowed_ip(&IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
+    }
+
+    #[tokio::test]
+    async fn peer_allowed_blocks_internal_and_http() {
+        // allow_private short-circuits (tests / loopback pairs).
+        assert!(peer_allowed("http://127.0.0.1:9999", true).await);
+        // Plaintext http rejected in production mode.
+        assert!(!peer_allowed("http://example.com", false).await);
+        // Literal internal IP rejected.
+        assert!(!peer_allowed("https://169.254.169.254", false).await);
+        assert!(!peer_allowed("https://127.0.0.1:8080", false).await);
+        assert!(!peer_allowed("https://10.0.0.5", false).await);
+        // Unresolvable host rejected (fails closed).
+        assert!(!peer_allowed("https://nonexistent.invalid", false).await);
+    }
+
+    #[tokio::test]
+    async fn relay_peer_allowed_blocks_internal_and_ws() {
+        // allow_private short-circuits (tests / loopback pairs).
+        assert!(relay_peer_allowed("ws://127.0.0.1:9999", true).await);
+        // Plaintext ws rejected in production mode.
+        assert!(!relay_peer_allowed("ws://example.com", false).await);
+        // Literal internal IP rejected.
+        assert!(!relay_peer_allowed("wss://169.254.169.254", false).await);
+        assert!(!relay_peer_allowed("wss://127.0.0.1:8080", false).await);
+        assert!(!relay_peer_allowed("wss://10.0.0.5", false).await);
+        // Unresolvable host rejected (fails closed).
+        assert!(!relay_peer_allowed("wss://nonexistent.invalid", false).await);
+    }
 }

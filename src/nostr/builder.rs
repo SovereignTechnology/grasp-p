@@ -81,6 +81,10 @@ pub struct Nip34WritePolicy {
     proactive_participant_authors: SharedProactiveParticipantAuthorIndex,
     deletion: DeletionService,
     rejected_events_index: Arc<RwLock<Option<Arc<RejectedEventsIndex>>>>,
+    /// GRASP-P private-repo service. Unset unless
+    /// `NGIT_GRASP_P_REPOS_ENABLE=true`; shared across clones (set once in
+    /// `create_relay`, like `set_local_relay`).
+    grasp_p: Arc<std::sync::OnceLock<Arc<crate::grasp_p::PrivateService>>>,
 }
 
 impl std::fmt::Debug for Nip34WritePolicy {
@@ -141,8 +145,21 @@ impl Nip34WritePolicy {
                 crate::nostr::policy::ProactiveParticipantAuthorIndex::shared(),
             deletion: DeletionService::new(deletion_ctx),
             rejected_events_index: Arc::new(RwLock::new(None)),
+            grasp_p: Arc::new(std::sync::OnceLock::new()),
             ctx,
         }
+    }
+
+    /// Install the GRASP-P private-repo service. Must be called before the
+    /// relay starts admitting events (done in `create_relay`); shared with all
+    /// clones of this policy.
+    pub fn set_grasp_p(&self, service: Arc<crate::grasp_p::PrivateService>) {
+        let _ = self.grasp_p.set(service);
+    }
+
+    /// The GRASP-P private-repo service, when enabled.
+    pub fn grasp_p(&self) -> Option<&Arc<crate::grasp_p::PrivateService>> {
+        self.grasp_p.get()
     }
 
     pub fn proactive_participant_authors(&self) -> SharedProactiveParticipantAuthorIndex {
@@ -916,6 +933,18 @@ impl WritePolicy for Nip34WritePolicy {
             // Sync uses localhost:0 as a dummy address
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
+            // GRASP-P private-repo kinds (30640, 30641, the stream wraps).
+            // Routed only when the subsystem is enabled; otherwise they fall
+            // through to the dispatch below unchanged. Synced events
+            // (loopback:0) get the same handling as client submissions.
+            if let Some(service) = self.grasp_p.get() {
+                if let Some(result) =
+                    crate::grasp_p::admission::admit(service, event, is_synced).await
+                {
+                    return result;
+                }
+            }
+
             let result = match event.kind {
                 // The relay's own identity events are always welcome: the
                 // startup seeding path stores them directly, and the
@@ -946,8 +975,32 @@ impl WritePolicy for Nip34WritePolicy {
                     );
                     WritePolicyResult::Accept
                 }
-                Kind::EventDeletion => self.deletion.handle_nip09(event).await,
-                Kind::RequestToVanish => self.deletion.handle_vanish(event).await,
+                Kind::EventDeletion => {
+                    let result = self.deletion.handle_nip09(event).await;
+                    // GRASP-P: an honored deletion of a 30640 frees its key
+                    // claims, or they wedge future rotations.
+                    if let Some(service) = self.grasp_p.get() {
+                        if matches!(result, WritePolicyResult::Accept)
+                            && self.deletion.actions_deletions()
+                        {
+                            service.free_claims_for_deleted_registrations(event);
+                        }
+                    }
+                    result
+                }
+                Kind::RequestToVanish => {
+                    let result = self.deletion.handle_vanish(event).await;
+                    // GRASP-P: a vanish deletes the author's 30640s too.
+                    if let Some(service) = self.grasp_p.get() {
+                        if matches!(result, WritePolicyResult::Accept)
+                            && self.deletion.actions_deletions()
+                            && self.deletion.vanish_targets_this_relay(event)
+                        {
+                            service.free_claims_for_vanished_author(event);
+                        }
+                    }
+                    result
+                }
                 // Owner trust is scoped to kinds with no dedicated policy
                 // above: valid owner-signed events that would otherwise fall
                 // through to the generic related-event rejection — such as
@@ -963,6 +1016,12 @@ impl WritePolicy for Nip34WritePolicy {
                         "Accepted event from relay-owner identity"
                     );
                     WritePolicyResult::Accept
+                }
+                // GRASP-P: NIP-56 reports are logged (ids and digests only),
+                // then admitted by the related-event rules as before.
+                k if self.grasp_p.get().is_some() && k.as_u16() == crate::grasp_p::KIND_REPORT => {
+                    crate::grasp_p::admission::log_report(event);
+                    self.handle_related_event(event, "NIP-56 report").await
                 }
                 _ => self.handle_related_event(event, "Event").await,
             };
@@ -998,6 +1057,9 @@ pub struct RelayRuntime {
     pub lifecycle: RepositoryLifecycle,
     /// Storage handles used by the relay runtime.
     pub stores: RelayStores,
+    /// GRASP-P private-repo service (Some only when
+    /// `NGIT_GRASP_P_REPOS_ENABLE=true`).
+    pub grasp_p: Option<Arc<crate::grasp_p::PrivateService>>,
 }
 
 /// Create a configured LocalRelay with full GRASP-01 validation
@@ -1125,6 +1187,16 @@ pub async fn create_relay(
         private_access,
     );
 
+    // GRASP-P: construct and install the service before the relay builder
+    // clones the write policy, so every admission path sees it.
+    let grasp_p = if config.private_repos_enable {
+        let service = crate::grasp_p::PrivateService::new(config, database.clone()).await?;
+        write_policy.set_grasp_p(service.clone());
+        Some(service)
+    } else {
+        None
+    };
+
     let mut builder = LocalRelayBuilder::default()
         .database(database.clone())
         .write_policy(write_policy.clone())
@@ -1179,6 +1251,7 @@ pub async fn create_relay(
             holding,
             history,
         },
+        grasp_p,
     })
 }
 
