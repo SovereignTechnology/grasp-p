@@ -1080,6 +1080,18 @@ async fn fetch_events(
             )
         })?;
     check_event_volume(events.len(), what).map_err(|e| op(node.side, e))?;
+    // nostr-sdk admits a frame on the id it CLAIMS once that id is cached, so
+    // a node can follow a genuine event with other content under the same id.
+    // A node that does is not answering honestly: stop, do not compare.
+    if let Some(bad) = events.iter().find(|event| event.verify().is_err()) {
+        return Err(op(
+            node.side,
+            format!(
+                "{what} REQ returned event {} whose id or signature does not verify",
+                bad.id
+            ),
+        ));
+    }
     Ok(events.iter().cloned().collect())
 }
 

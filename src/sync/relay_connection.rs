@@ -1864,6 +1864,12 @@ impl RelayConnection {
 
         tracing::debug!(relay = %url, "Starting event loop with relay-level notifications");
 
+        // GRASP-P duplicate forwarding: the id last delivered through the
+        // Event arm. nostr-sdk follows RelayNotification::Event with a
+        // RelayNotification::Message carrying the same event, and that copy
+        // must not be forwarded a second time.
+        let mut last_event_arm_id: Option<EventId> = None;
+
         while let Some(notification) = notifications.next().await {
             match notification {
                 RelayNotification::Event {
@@ -1871,6 +1877,7 @@ impl RelayConnection {
                     subscription_id,
                 } => {
                     let data_lane_arrival = std::time::Instant::now();
+                    last_event_arm_id = Some(event.id);
                     self.record_transient_req_event(&subscription_id);
                     tracing::trace!(
                         relay = %url,
@@ -1905,10 +1912,29 @@ impl RelayConnection {
                     // resurrect an event this connection has already seen
                     // once — e.g. rejected into the hot cache and healed
                     // only after the hold expires.
+                    //
+                    // Two guards. The SDK sends this Message for every event,
+                    // right after RelayNotification::Event for a new one, so
+                    // the copy of an event just forwarded is skipped. And an
+                    // event that reaches this arm alone passed the SDK on its
+                    // CLAIMED id only (the verification cache is keyed on it),
+                    // so its id and signature are checked here: a relay may
+                    // replay a known id with other content and another author.
                     RelayMessage::Event {
                         subscription_id,
                         event,
                     } if self.forward_duplicate_events => {
+                        if last_event_arm_id.take() == Some(event.id) {
+                            continue;
+                        }
+                        if event.verify().is_err() {
+                            tracing::warn!(
+                                relay = %url,
+                                event_id = %event.id,
+                                "Dropping re-delivered event: id or signature does not verify"
+                            );
+                            continue;
+                        }
                         let data_lane_arrival = std::time::Instant::now();
                         if event_sender
                             .send(RelayEvent::Event(
@@ -2418,11 +2444,25 @@ impl RelayConnection {
                     item = stream.next(), if !drained => {
                         match item {
                             Some(Ok(event)) => {
-                                // Match the SDK fetch API's existing buffer cap.
-                                if events.len() >= 10_000 && !events.contains(&event) {
-                                    return Err("too many fetched events".to_string());
+                                // SovTech seam: the SDK stream yields every EVENT
+                                // frame of this subscription, including one it let
+                                // through on the id the event CLAIMS. Check id and
+                                // signature before the id-ordered set, so a forged
+                                // copy cannot stand in for the genuine event here
+                                // or in a caller's id-keyed dedupe.
+                                if event.verify().is_err() {
+                                    tracing::warn!(
+                                        relay = %self.url,
+                                        event_id = %event.id,
+                                        "Dropping fetched event: id or signature does not verify"
+                                    );
+                                } else {
+                                    // Match the SDK fetch API's existing buffer cap.
+                                    if events.len() >= 10_000 && !events.contains(&event) {
+                                        return Err("too many fetched events".to_string());
+                                    }
+                                    events.insert(event);
                                 }
-                                events.insert(event);
                             }
                             Some(Err(error)) => return Err(error.to_string()),
                             None => drained = true,
@@ -3723,6 +3763,88 @@ mod tests {
         relay.shutdown();
         event_loop.abort();
         drain.abort();
+    }
+
+    /// SovTech: pins the nostr-sdk behaviour the GRASP-P forwarding arm is
+    /// built on. A new event arrives as `Event` and again inside `Message`; a
+    /// later frame under the same id is passed on by the SDK unverified. The
+    /// arm forwards the new event once, drops the forged copy, and still
+    /// forwards a genuine re-delivery.
+    #[tokio::test]
+    async fn duplicate_forwarding_skips_the_paired_copy_and_drops_a_forged_redelivery() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let genuine = EventBuilder::new(Kind::TextNote, "genuine")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let mut forged = genuine.clone();
+        forged.content = "forged".to_string();
+        let frames = [genuine.clone(), forged, genuine.clone()];
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(frame)) = ws.next().await {
+                if !frame.is_text() {
+                    continue;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                for event in &frames {
+                    ws.send(Message::Text(
+                        serde_json::json!(["EVENT", request[1], event])
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                ws.send(Message::Text(
+                    serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let connection =
+            permissive_connection(&url, Keys::generate()).with_duplicate_event_forwarding(true);
+        connection.connect(3).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(RELAY_EVENT_BUFFER_CAPACITY);
+        let event_loop = tokio::spawn(connection.clone().run_event_loop(event_tx));
+        // Let the loop subscribe to relay notifications before the REQ is answered.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        connection
+            .subscribe_filter(
+                Filter::new().kind(Kind::TextNote),
+                TransientRequestClass::HistoricPage,
+            )
+            .await
+            .unwrap();
+
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(relay_event) = event_rx.recv().await {
+                match relay_event {
+                    RelayEvent::Event(event, ..) => forwarded.push(*event),
+                    RelayEvent::EndOfStoredEvents(..) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("EOSE must reach the processor lane");
+
+        assert_eq!(forwarded, vec![genuine.clone(), genuine]);
+
+        connection.disconnect().await;
+        event_loop.abort();
+        server.abort();
     }
 
     #[tokio::test]

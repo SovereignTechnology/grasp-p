@@ -7569,6 +7569,30 @@ impl SyncManager {
             Ok(None) => {} // Continue processing
         }
 
+        // SovTech seam: check the id and the signature here, where every synced,
+        // fetched and re-processed event crosses into admission. nostr-sdk's
+        // verification cache is keyed on the id an event CLAIMS, so a relay
+        // that first delivers a genuine event can then send other content
+        // under that id, with any author and any signature, and the SDK hands
+        // it on unverified. It arrives three ways: through the SDK's fetch
+        // streams, through GRASP-P's duplicate forwarding, and as an ordinary
+        // RelayNotification::Event once the SDK's seen-id tracker (35,000 ids)
+        // has dropped an id its verification cache (128,000 ids) still holds.
+        // The write policy trusts `event.pubkey`.
+        //
+        // The class is Other, not Invalid: Invalid is a final verdict on the
+        // id, and a forged copy says nothing about the genuine event that
+        // owns it. Nothing is written to the rejected index either.
+        if let Err(error) = event.verify() {
+            tracing::warn!(
+                event_id = %event.id,
+                relay = %relay_url,
+                error = %error,
+                "Rejecting synced event: id or signature does not verify"
+            );
+            return ProcessResult::Rejected(PolicyRejection::Other);
+        }
+
         // Apply write policy using a dummy address (sync events aren't from network clients)
         let dummy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let result = write_policy.admit_event(event, &dummy_addr).await;
@@ -10240,6 +10264,91 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// SovTech: nostr-sdk can hand sync an event it checked only by the id
+    /// the event claims (its verification cache is keyed on the id), and the
+    /// write policy trusts a synced event's author. Sync therefore checks id
+    /// and signature itself, and a refused forgery must not settle the fate
+    /// of the genuine event with that id.
+    #[tokio::test]
+    async fn synced_event_that_does_not_verify_is_refused_without_settling_its_id() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let git_data_path = directory.path().join("git");
+        let mut config = Config::for_testing();
+        config.git_data_path = git_data_path.to_string_lossy().into_owned();
+        config.relay_data_path = directory
+            .path()
+            .join("relay")
+            .to_string_lossy()
+            .into_owned();
+        let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_data_path));
+        let runtime = crate::nostr::builder::create_relay(
+            &config,
+            purgatory,
+            crate::grasp06::receive::RepoInitLocks::default(),
+            None,
+        )
+        .await
+        .expect("create test relay runtime");
+        let rejected = Arc::new(RejectedEventsIndex::new(
+            Duration::from_secs(120),
+            Duration::from_secs(604800),
+        ));
+        let genuine = EventBuilder::new(Kind::GitUserGraspList, "genuine")
+            .finalize(&Keys::generate())
+            .expect("build genuine event");
+        // What a relay can send once the SDK has cached the genuine id: the
+        // same id and signature under another author, other content, or the
+        // genuine content under a signature that is not the author's. The
+        // first two fail the id check; only the signature check stops the
+        // third, which would otherwise be stored unservable under the id.
+        let mut other_author = genuine.clone();
+        other_author.pubkey = Keys::generate().public_key();
+        let mut other_content = genuine.clone();
+        other_content.content = "forged".to_string();
+        let mut other_signature = genuine.clone();
+        other_signature.sig = EventBuilder::new(Kind::GitUserGraspList, "unrelated")
+            .finalize(&Keys::generate())
+            .expect("build unrelated event")
+            .sig;
+        assert!(other_signature.verify_id());
+        assert!(!other_signature.verify_signature());
+
+        for forged in [&other_author, &other_content, &other_signature] {
+            let result = SyncManager::process_event_static(
+                forged,
+                "wss://source.example",
+                &runtime.stores.database,
+                &runtime.write_policy,
+                &runtime.relay,
+                &rejected,
+                crate::nostr::persistence::SaveContext::RelaySync,
+            )
+            .await;
+            assert_eq!(result, ProcessResult::Rejected(PolicyRejection::Other));
+            assert!(!result.is_terminally_accounted());
+            assert!(!rejected.contains(&genuine.id));
+        }
+        assert!(runtime
+            .stores
+            .database
+            .event_by_id(&genuine.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let result = SyncManager::process_event_static(
+            &genuine,
+            "wss://source.example",
+            &runtime.stores.database,
+            &runtime.write_policy,
+            &runtime.relay,
+            &rejected,
+            crate::nostr::persistence::SaveContext::RelaySync,
+        )
+        .await;
+        assert_eq!(result, ProcessResult::Saved);
     }
 
     #[test]
