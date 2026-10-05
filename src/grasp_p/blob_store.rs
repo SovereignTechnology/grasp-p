@@ -335,7 +335,7 @@ impl UploadSink {
                     crate::metrics::record_private_blob_upload(size);
                 }
                 Ok(BlobDescriptor {
-                    url: format!("https://{}/{}", self.cfg.domain, sha),
+                    url: format!("https://{}/{}", self.cfg.service_address, sha),
                     sha256: sha,
                     size,
                     uploaded: nostr::prelude::Timestamp::now().as_secs(),
@@ -403,6 +403,7 @@ mod tests {
     fn test_cfg(quota_repo_bytes: u64) -> PrivateConfig {
         PrivateConfig {
             domain: "test.local".into(),
+            service_address: "test.local/base".into(),
             registration_mode: RegistrationMode::Open,
             pow_bits: 0,
             tenant_whitelist: vec![],
@@ -537,6 +538,9 @@ mod tests {
 
         let d = h.upload(&data).await.unwrap();
         assert_eq!(d.size, 512);
+        // The descriptor is built from the service address (domain plus
+        // mount path), not from the bare domain.
+        assert_eq!(d.url, format!("https://test.local/base/{sha}"));
         assert!(h.store.exists(&sha), "blob file must be placed");
 
         let claim = {

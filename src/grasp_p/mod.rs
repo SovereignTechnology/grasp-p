@@ -199,6 +199,11 @@ impl BlobError {
 #[derive(Debug, Clone)]
 pub struct PrivateConfig {
     pub domain: String,
+    /// This node's public address without a scheme: the domain, plus the
+    /// mount path when the server runs under `NGIT_BASE_PATH`
+    /// (`Config::service_address`). The blob routes live under the mount
+    /// path, so every URL handed to a client is built from this.
+    pub service_address: String,
     pub registration_mode: RegistrationMode,
     pub pow_bits: u8,
     pub tenant_whitelist: Vec<String>,
@@ -267,6 +272,7 @@ impl PrivateConfig {
     fn from_config(config: &Config) -> Self {
         Self {
             domain: config.domain.clone(),
+            service_address: config.service_address(),
             registration_mode: config.private_registration_mode,
             pow_bits: config.private_pow_bits,
             tenant_whitelist: config.private_tenant_whitelist_entries(),
@@ -310,7 +316,7 @@ impl PrivateConfig {
 /// silently rejected on the other (per-repo desync).
 ///
 /// The raw tenant whitelist feeds the hash but is never exposed. The domain
-/// set is `sorted({own domain} ∪ {bootstrap peer})` so a correctly-paired
+/// set is `sorted({own service address} ∪ {bootstrap peer})` so a correctly-paired
 /// two-node setup (each bootstrapped to the other) hashes the same set on
 /// both sides.
 /// Label of the `policy_fingerprint` PREIMAGE FORMAT, bumped whenever a
@@ -339,7 +345,11 @@ pub fn policy_fingerprint(config: &Config) -> String {
         v.to_string()
     }
 
-    let mut domains = vec![strip_url(&config.domain)];
+    // The service address, not the bare domain: under NGIT_BASE_PATH the
+    // peer names this node by a URL that carries the mount path, and the two
+    // nodes of a pair must hash the same set. Identical to the domain for a
+    // root deployment.
+    let mut domains = vec![strip_url(&config.service_address())];
     if let Some(ref bootstrap) = config.sync_bootstrap_relay_url {
         domains.push(strip_url(bootstrap));
     }
@@ -1294,7 +1304,7 @@ impl PrivateService {
                 }
                 seen.insert(sha.clone());
                 out.push(BlobDescriptor {
-                    url: format!("https://{}/{}", self.cfg.domain, sha),
+                    url: format!("https://{}/{}", self.cfg.service_address, sha),
                     sha256: sha,
                     size: claim.size,
                     uploaded: 0,
@@ -1586,7 +1596,7 @@ pub fn nip11_private_repos_value(
     max_event_bytes: u64,
     quota_tenant_bytes: u64,
     quota_repo_bytes: u64,
-    domain: &str,
+    service_address: &str,
     policy_fingerprint: &str,
     accept_legacy_wrap_kind: bool,
 ) -> serde_json::Value {
@@ -1602,7 +1612,7 @@ pub fn nip11_private_repos_value(
         "max_event_bytes": max_event_bytes,
         "quota_tenant_bytes": quota_tenant_bytes,
         "quota_repo_bytes": quota_repo_bytes,
-        "blob_endpoints": [format!("https://{domain}")],
+        "blob_endpoints": [format!("https://{service_address}")],
         // R6 parity: short hash of the admission-affecting config. Ops (and
         // `doctor --two-node`) compare this across a node pair; a mismatch
         // means silent per-repo replication desync. Never the raw whitelist.
@@ -1636,7 +1646,7 @@ pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Va
         config.private_max_event_bytes,
         config.private_quota_tenant_bytes,
         config.private_quota_repo_bytes,
-        &config.domain,
+        &config.service_address(),
         &policy_fingerprint(config),
         config.private_accept_legacy_wrap_kind,
     ))
@@ -1781,6 +1791,43 @@ mod tests {
         assert_eq!(
             ephemeral_stream_wrap_kinds(false),
             vec![KIND_EPHEMERAL_STREAM_WRAP]
+        );
+    }
+
+    /// A pair mounted under a base path names each other with the path, so
+    /// each node's own entry in the preimage has to carry it too, or the two
+    /// fingerprints can never match.
+    #[test]
+    fn fingerprint_is_symmetric_for_a_pair_under_a_base_path() {
+        let mut a = Config::for_testing();
+        a.domain = "a.example".to_string();
+        a.base_path = "/grasp".to_string();
+        a.sync_bootstrap_relay_url = Some("wss://b.example/grasp".to_string());
+        let mut b = Config::for_testing();
+        b.domain = "b.example".to_string();
+        b.base_path = "/grasp".to_string();
+        b.sync_bootstrap_relay_url = Some("wss://a.example/grasp".to_string());
+        assert_eq!(policy_fingerprint(&a), policy_fingerprint(&b));
+    }
+
+    /// The blob routes are matched below the mount path, so the advert has
+    /// to name it: a client that follows a bare-domain advert gets a 404.
+    #[test]
+    fn nip11_blob_endpoint_follows_the_base_path() {
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.domain = "example.com".to_string();
+        let at_root = nip11_private_repos_from_config(&config).expect("GRASP-P is enabled");
+        assert_eq!(
+            at_root["blob_endpoints"],
+            serde_json::json!(["https://example.com"])
+        );
+
+        config.base_path = "/grasp".to_string();
+        let mounted = nip11_private_repos_from_config(&config).expect("GRASP-P is enabled");
+        assert_eq!(
+            mounted["blob_endpoints"],
+            serde_json::json!(["https://example.com/grasp"])
         );
     }
 
