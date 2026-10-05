@@ -21,6 +21,19 @@ Two repositories:
   `scripts/e2e.sh`). Its `ci/SERVER_REF` pins the server commit the end-to-end suite runs against,
   currently the tip of `legacy/v1.2-grasp-p`.
 
+## First CI results (2026-10-05, unmodified upstream v3.0.7 on the new runners)
+
+- `cargo fmt` passes. `cargo clippy -D warnings` failed under Rust 1.98 on upstream's own
+  `src/config.rs` (`manual_filter`); upstream lints with 1.96.0, which `rust-toolchain.toml` now
+  pins. Not yet re-run.
+- `cargo test --locked`: 995 passed, **3 failed**, all in `git::staging::tests`
+  (`one_unavailable_owed_tip_does_not_hold_back_another`,
+  `promotion_makes_history_complete_in_the_family_alone`,
+  `owed_history_survives_ref_deletion_until_the_family_holds_it`). The runner is Debian bookworm
+  with git 2.39.5 and jobs run as root; the cause is not diagnosed. Check whether they pass in
+  your sandbox and note the git version: if upstream needs a newer git than 2.39, that matters
+  for the production image too. Do not "fix" upstream's tests; find the environment difference.
+
 ## What is on the port branch
 
 Read `PORTING.md` for the file-by-file list. In short:

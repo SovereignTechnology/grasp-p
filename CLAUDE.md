@@ -32,6 +32,8 @@ Do new work on `sovtech/grasp-p-port` or on a branch cut from it.
 - Commit subjects start with `sovtech:`. Never squash, never rebase or amend a pushed commit;
   fix forward.
 - Run `git status` immediately before every `git commit`.
+- Stage files by path. Never `git add -A` or `git add .`: tests and tools write key files and
+  keystores into the working directory.
 - **Overlay discipline:** GRASP-P code lives in `src/grasp_p/` and other files of its own. Changes
   to upstream's files are thin seams. Upstream owns `src/private/` (its GRASP-08 mode); never put
   GRASP-P code there. Settings are `NGIT_GRASP_P_*`; `NGIT_PRIVATE_*` belongs to upstream.
@@ -44,6 +46,8 @@ Do new work on `sovtech/grasp-p-port` or on a branch cut from it.
 
 ## Building and testing
 
+- `rust-toolchain.toml` pins Rust 1.96.0, the release upstream builds and lints with. Where
+  rustup is present it installs that version by itself; a newer clippy rejects upstream code.
 - In a cloud sandbox use plain `cargo` (there is no nix there, whatever `AGENTS.md` says):
   `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `cargo test --locked`, `cargo test -p grasp-audit --locked`.
