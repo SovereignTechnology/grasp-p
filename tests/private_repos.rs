@@ -5487,7 +5487,7 @@ async fn exit40_list_answers_only_the_listed_key() {
             url_safe_no_pad.contains('-') && url_safe_no_pad.contains('_'),
             "exit40: the token must use the URL-safe alphabet: {url_safe_no_pad}"
         );
-        if url_safe_no_pad.len() % 4 != 0 {
+        if !url_safe_no_pad.len().is_multiple_of(4) {
             unpadded += 1;
         }
         for token in [
