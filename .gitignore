@@ -26,3 +26,12 @@ data/
 
 # direnv directory - used by nix
 .direnv
+
+# SovTech: key material and local state that tests and tools write. Never commit these.
+*.nsec
+keystore*.json
+pending-epoch.json
+.env.*
+!.env.example
+*.pem
+*.key
