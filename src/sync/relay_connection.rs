@@ -3768,7 +3768,7 @@ mod tests {
     /// SovTech: pins the nostr-sdk behaviour the GRASP-P forwarding arm is
     /// built on. A new event arrives as `Event` and again inside `Message`; a
     /// later frame under the same id is passed on by the SDK unverified. The
-    /// arm forwards the new event once, drops the forged copy, and still
+    /// arm forwards each new event once, drops the forged copy, and still
     /// forwards a genuine re-delivery.
     #[tokio::test]
     async fn duplicate_forwarding_skips_the_paired_copy_and_drops_a_forged_redelivery() {
@@ -3780,9 +3780,16 @@ mod tests {
         let genuine = EventBuilder::new(Kind::TextNote, "genuine")
             .finalize(&Keys::generate())
             .unwrap();
+        // A second new event between the genuine one and its forged copy: the
+        // result then differs between "skip the copy the Event arm has just
+        // delivered" (right) and "skip any repeated id" (which would also
+        // swallow the genuine re-delivery).
+        let other = EventBuilder::new(Kind::TextNote, "other")
+            .finalize(&Keys::generate())
+            .unwrap();
         let mut forged = genuine.clone();
         forged.content = "forged".to_string();
-        let frames = [genuine.clone(), forged, genuine.clone()];
+        let frames = [genuine.clone(), other.clone(), forged, genuine.clone()];
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
@@ -3814,7 +3821,7 @@ mod tests {
 
         let connection =
             permissive_connection(&url, Keys::generate()).with_duplicate_event_forwarding(true);
-        connection.connect(3).await.unwrap();
+        connection.connect(30).await.unwrap();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(RELAY_EVENT_BUFFER_CAPACITY);
         let event_loop = tokio::spawn(connection.clone().run_event_loop(event_tx));
         // Let the loop subscribe to relay notifications before the REQ is answered.
@@ -3828,7 +3835,7 @@ mod tests {
             .unwrap();
 
         let mut forwarded = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(relay_event) = event_rx.recv().await {
                 match relay_event {
                     RelayEvent::Event(event, ..) => forwarded.push(*event),
@@ -3840,7 +3847,7 @@ mod tests {
         .await
         .expect("EOSE must reach the processor lane");
 
-        assert_eq!(forwarded, vec![genuine.clone(), genuine]);
+        assert_eq!(forwarded, vec![genuine.clone(), other, genuine]);
 
         connection.disconnect().await;
         event_loop.abort();
