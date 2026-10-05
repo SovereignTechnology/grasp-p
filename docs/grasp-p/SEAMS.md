@@ -147,7 +147,11 @@ features. No package was added.
   not synced with. Do not switch reqwest to rustls: that links a second crypto provider and
   every `wss://` dial panics.
 - **The release binary** is built by CI on Debian 12 (glibc 2.36, OpenSSL 3.0) so that it
-  runs in a Debian 12 or a Debian 13 guest; `ci-out/BUILD-INFO` repeats these needs.
+  runs in a Debian 12 or a Debian 13 guest; `ci-out/BUILD-INFO` repeats these needs. Besides
+  libc it links `libssl.so.3`, `libcrypto.so.3`, `libz.so.1` and `libzstd.so.1` dynamically
+  (checked with `ldd` on the first release, which starts in a `debian:trixie-slim` image with
+  git and ca-certificates added). `--version` prints upstream's version only, so the artifact's
+  sha256 is what identifies a build.
 
 ## Tests
 
