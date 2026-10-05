@@ -1,0 +1,139 @@
+# SovTech GRASP-P CI. Every job runs in a fresh Kata VM on ubuntu-server
+# (Debian bookworm, glibc 2.36). The Rust toolchain is the one rust-toolchain.toml
+# pins: rustup installs it at the first cargo call of each job. Nothing is
+# cached between jobs and there are no CI/CD variables or secrets. The test job
+# builds its own git (see .server-git): the image's 2.39.5 is too old to run
+# the server.
+#
+# Runners:
+#   ci-grasp       not protected: merge requests.
+#   ci-grasp-prot  protected refs only, run_untagged=false: main and
+#                  sovtech-v* tags, which build the deployable binary.
+#
+# Routing comes from ref protection alone: each workflow rule sets
+# GRASP_RUNNER_TAG, the protected runner's tag exactly when the rule
+# requires a protected ref. Anything else (upstream's v* tags, pushes to
+# unprotected branches) creates no pipeline. Runbook: kata/ci-grasp/README.md
+# in sovtech/platform.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp-prot
+    - if: $CI_COMMIT_TAG =~ /^sovtech-v/ && $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp-prot
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_COMMIT_REF_PROTECTED != "true"
+      variables:
+        GRASP_RUNNER_TAG: grasp
+    - when: never
+
+default:
+  tags: [$GRASP_RUNNER_TAG]
+  # The runner VMs run at idle CPU priority and the host's governor may stop
+  # the largest CI VM under memory pressure. GitLab records that as
+  # runner_interrupted (measured on this estate, not runner_system_failure).
+  # Retry requeues it. Script failures are never retried.
+  retry:
+    max: 2
+    when: [runner_system_failure, runner_interrupted, stuck_or_timeout_failure]
+  before_script:
+    - rustc --version && cargo --version && git --version
+
+variables:
+  GIT_STRATEGY: clone
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # 12 vCPUs but a governed memory limit on a host that also runs services:
+  # cap rustc and test fan-out. Lowered from 8 and 6 after the host stalled
+  # on 2026-10-05 while this job and another large CI job compiled together.
+  CARGO_BUILD_JOBS: "4"
+  RUST_TEST_THREADS: "4"
+
+stages:
+  - lint
+  - test
+  - release
+
+# Git for the jobs that RUN the server or its tests. The server shells out to
+# git, and upstream needs >= 2.42 since v3.0.6 (--not and --glob= on the stdin of
+# `rev-list --stdin`, src/git/staging.rs) and >= 2.41 (upload-pack capabilities
+# for an empty repository). The runner image has bookworm's 2.39.5 and Debian
+# has never backported git to bookworm, so these jobs build the version Debian
+# 13 ships from kernel.org's tarball, pinned by sha256, into /usr/local (ahead of
+# /usr/bin on PATH). The image and the release job are untouched.
+.server-git:
+  before_script:
+    - rustc --version && cargo --version
+    - |
+      git_v=2.47.3
+      git_sha=9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -q -o Acquire::Retries=3 update
+      apt-get -q -y --no-install-recommends install libcurl4-gnutls-dev
+      b=$(mktemp -d)
+      curl -fsSL --retry 3 --max-time 300 -o "$b/git.tar.xz" "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$git_v.tar.xz"
+      echo "$git_sha  $b/git.tar.xz" | sha256sum --strict --quiet -c -
+      tar -C "$b" -xJf "$b/git.tar.xz"
+      make -s -C "$b/git-$git_v" -j4 prefix=/usr/local CFLAGS=-O2 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_EXPAT=1 install > "$b/make.log" 2>&1 || { tail -n 60 "$b/make.log" >&2; exit 1; }
+      rm -rf "$b"; hash -r
+    # Fail here, with the reason, rather than in three staging tests.
+    - |
+      v=$(git --version); v=${v#git version }
+      [ "$(command -v git)" = /usr/local/bin/git ] || { echo "git on PATH is $(command -v git), not the one just built" >&2; exit 1; }
+      dpkg --compare-versions "$v" ge 2.42 || { echo "git $v: the server needs 2.42 or newer" >&2; exit 1; }
+      echo "git $v at /usr/local/bin/git"
+
+lint:
+  stage: lint
+  timeout: 45m
+  script:
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+test:
+  extends: .server-git
+  stage: test
+  needs: []
+  timeout: 90m
+  script:
+    # Upstream runs its suite under a deliberately hostile global git config,
+    # to prove the tests do not depend on ambient settings. Same here; the VM
+    # is discarded after the job.
+    - mkdir -p /tmp/hostile-git/hooks /tmp/hostile-git/template/hooks
+    - printf '#!/bin/sh\necho "hostile hook - ambient git config leaked into a test" >&2\nexit 1\n' > /tmp/hostile-git/hooks/pre-commit
+    - cp /tmp/hostile-git/hooks/pre-commit /tmp/hostile-git/template/hooks/pre-commit
+    - chmod +x /tmp/hostile-git/hooks/pre-commit /tmp/hostile-git/template/hooks/pre-commit
+    - git config --global init.defaultBranch main
+    - git config --global core.hooksPath /tmp/hostile-git/hooks
+    - git config --global init.templateDir /tmp/hostile-git/template
+    - git config --global commit.gpgsign true
+    - git config --global core.autocrlf true
+    - cargo test --locked
+    - cargo test -p grasp-audit --locked
+
+# The deployable binary, built only on protected refs. It is built on bookworm
+# on purpose: linked against glibc 2.36 and OpenSSL 3.0 it runs in a bookworm
+# guest and in a trixie one, and the other way round it would not. The guest
+# image that runs it must provide git 2.42 or newer on PATH (Debian 13 has
+# 2.47.3; bookworm's 2.39.5 is too old), libssl.so.3 and ca-certificates.
+release:
+  stage: release
+  timeout: 60m
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+  script:
+    - cargo build --release --locked -p ngit-grasp
+    - mkdir -p ci-out
+    - cp target/release/ngit-grasp ci-out/
+    - (cd ci-out && sha256sum ngit-grasp > SHA256SUMS && cat SHA256SUMS)
+    # Not "ldd --version | head -n1": under pipefail ldd dies of SIGPIPE at random.
+    - echo "glibc $(getconf GNU_LIBC_VERSION)" > ci-out/BUILD-INFO
+    - rustc --version >> ci-out/BUILD-INFO
+    - git rev-parse HEAD >> ci-out/BUILD-INFO
+    - echo "runtime needs git >= 2.42 on PATH, libssl.so.3, ca-certificates" >> ci-out/BUILD-INFO
+  artifacts:
+    expire_in: 90 days
+    paths:
+      - ci-out/
