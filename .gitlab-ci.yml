@@ -45,9 +45,11 @@ variables:
   GIT_STRATEGY: clone
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
-  # 12 vCPUs but a governed memory limit: cap rustc and test fan-out.
-  CARGO_BUILD_JOBS: "8"
-  RUST_TEST_THREADS: "6"
+  # 12 vCPUs but a governed memory limit on a host that also runs services:
+  # cap rustc and test fan-out. Lowered from 8 and 6 after the host stalled
+  # on 2026-10-05 while this job and another large CI job compiled together.
+  CARGO_BUILD_JOBS: "4"
+  RUST_TEST_THREADS: "4"
 
 stages:
   - lint
@@ -74,7 +76,7 @@ stages:
       curl -fsSL --retry 3 --max-time 300 -o "$b/git.tar.xz" "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$git_v.tar.xz"
       echo "$git_sha  $b/git.tar.xz" | sha256sum --strict --quiet -c -
       tar -C "$b" -xJf "$b/git.tar.xz"
-      make -s -C "$b/git-$git_v" -j8 prefix=/usr/local CFLAGS=-O2 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_EXPAT=1 install > "$b/make.log" 2>&1 || { tail -n 60 "$b/make.log" >&2; exit 1; }
+      make -s -C "$b/git-$git_v" -j4 prefix=/usr/local CFLAGS=-O2 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_EXPAT=1 install > "$b/make.log" 2>&1 || { tail -n 60 "$b/make.log" >&2; exit 1; }
       rm -rf "$b"; hash -r
     # Fail here, with the reason, rather than in three staging tests.
     - |
