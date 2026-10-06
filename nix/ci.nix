@@ -39,6 +39,12 @@ in {
     });
     ci-tests = rustPlatform.buildRustPackage (common // {
       pname = "ngit-grasp-ci-tests";
+      # This fixture generates an executable at runtime, so patchShebangs cannot
+      # see it. /usr/bin/env is deliberately absent from the build sandbox.
+      postPatch = ''
+        substituteInPlace tests/git_response_streaming.rs \
+          --replace-fail '#!/usr/bin/env bash' '#!${pkgs.bash}/bin/bash'
+      '';
       cargoBuildFlags = [ "--workspace" "--bins" "--tests" ];
       cargoTestFlags = [ "--workspace" "--locked" ];
       # Integration tests bind loopback sockets inside the network namespace.
