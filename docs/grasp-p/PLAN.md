@@ -83,9 +83,14 @@ project yet.
 - **Report the unverified-sync flaw upstream** (ngit-grasp and nostr-sdk; `SEAMS.md`,
   "Synced events are verified here"). The fork is fixed. Needs the maintainer's go-ahead,
   and our seam goes when upstream verifies for itself.
-- **Upstream's NIP-11 probe follows redirects and reads an unbounded body**
-  (`src/sync/relay_connection.rs`), past the outbound target policy. Beside #20; offer
-  upstream.
+- **Upstream's NIP-11 probe follows redirects and reads an unbounded body** (done)
+  (`src/sync/relay_connection.rs`), past the outbound target policy. The fork's probe
+  follows no redirect, uses no proxy, reads at most 256 KiB, and checks an event-directed
+  target on every call and, under the default target policy, connects only to the
+  addresses that check vetted; not behind the GRASP-P switch (`SEAMS.md`, "The NIP-11
+  probe is vetted, pinned and bounded here"). Beside #20. Still open: offering the change
+  upstream, which needs the maintainer's go-ahead; our seam goes when upstream hardens
+  the probe itself.
 - **Alias takeover by backdating.** A cross-tenant alias conflict is won by the lowest
   `created_at`, which has no lower bound, so any admitted tenant can evict another's alias,
   and the loser's blobs are collected after the grace period. Bound the winner and do not

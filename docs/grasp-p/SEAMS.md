@@ -22,7 +22,7 @@ Upstream's files carry thin seams only:
 | `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion |
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`; `register_relay` builds each connection with `with_duplicate_event_forwarding`; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; peers kept in `check_disconnects` and counted as desired in `retry_disconnected_relays`; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); the id and signature check in `process_event_static_inner` (see below) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
-| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only when GRASP-P is enabled, after checking their id and signature and skipping the SDK's second copy of a new event; `fetch_events` drops fetched events whose id or signature does not verify |
+| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only when GRASP-P is enabled, after checking their id and signature and skipping the SDK's second copy of a new event; `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
 | `src/sync/filters.rs`, `src/metrics/mod.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
 | `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p` / `start_grasp_p_pair_node` |
@@ -31,11 +31,12 @@ Upstream's files carry thin seams only:
 
 With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, blob
 routes, sync filters, timers and duplicate forwarding are all gated on it; the GRASP-P
-metrics register lazily on first use. One seam is deliberately not gated: the id and
-signature check on synced and fetched events, which fixes a flaw in upstream itself. Two
-more things differ from upstream with the switch unset, and neither changes what the
-server does: `--version` names the GRASP-P build, and a git older than 2.42, or no git,
-draws one warning at startup.
+metrics register lazily on first use. Two seams are deliberately not gated, because each
+fixes a flaw in upstream itself: the id and signature check on synced and fetched events,
+and the hardened NIP-11 probe. Both have a section below. Two more things differ from
+upstream with the switch unset, and neither changes what the server does: `--version`
+names the GRASP-P build, and a git older than 2.42, or no git, draws one warning at
+startup.
 
 ## Synced events are verified here
 
@@ -65,6 +66,85 @@ nothing of ours to scan.
 The flaw is in unmodified upstream v3.0.7 and in nostr-sdk. Reporting it to both is the
 maintainer's call. When upstream verifies on its own, drop this seam in the sync that
 brings the fix.
+
+## The NIP-11 probe is vetted, pinned and bounded here
+
+Sync fetches a relay's NIP-11 document over HTTP up to twice per connection attempt
+(`RelayConnection::fetch_limit_hints`): before the dial, unless the instance runs in
+GRASP-08 private mode, to recognise a GRASP-08 private service, and on the connected
+session for the page size, the subscription budget and the owner. Every relay that is not
+registered as the bootstrap relay is event-directed. Most of those URLs come from events
+anyone can publish; the index relays (`NGIT_USER_INDEX_RELAYS`), the Sync+ fallback
+relays (`NGIT_SYNC_PLUS_FALLBACK_RELAYS`) and the GRASP-P sync peers an operator
+configures are registered the same way.
+
+Upstream v3.0.7 makes that request with `reqwest::Client::new()`. It follows up to ten
+redirects, to plain `http` as well, honours the proxy variables of the environment, and
+reads the whole body, limited only by a 3 second timeout. Only the call before the dial
+(`preflight_limit_hints`) checks an event-directed target against the outbound target
+policy; the call on the connected session does not. Neither holds the HTTP connection to
+the addresses the policy vetted: reqwest resolves the name again. So a relay that passes
+the policy can redirect the probe to an internal address, a name can resolve to a public
+address for the check and to an internal one for the request, and a relay can send as
+much body as fits in 3 seconds, on eight attempts in parallel.
+
+The fork changes four things, all in `src/sync/relay_connection.rs`:
+
+- The probe's HTTP client follows no redirect and uses no proxy. It is built per probe.
+- The body is read up to 256 KiB, the figure upstream's own audit probe uses
+  (`grasp-audit/src/probe.rs`). A larger `Content-Length` is refused before any of the
+  body is read; a chunked body, or one that ends with the connection, is cut off when it
+  passes the limit.
+- An event-directed target is checked inside `fetch_limit_hints`, so on both calls. A
+  refusal returns default hints without any request. `preflight_limit_hints` keeps its
+  name and its caller and is now the same call.
+- Where the policy vetted addresses, the client's resolver (`VettedAddresses`) answers
+  every lookup with exactly those and never asks DNS, so there is no second answer to
+  follow. A host that is an IP literal is connected to as written, and it is the literal
+  the policy checked. Under `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true` the policy vets no
+  address, so nothing is pinned; that is how the test suites reach their loopback relays.
+
+An operator-configured target (the bootstrap relay) is still not vetted, as in upstream,
+and gets the first two changes. The 3 second budget now covers the check with its DNS
+lookup, the request and the body together. Anything that fails is default hints, as
+before. One case is new: a client that cannot be built is default hints too, where
+upstream's `Client::new()` panicked.
+
+None of this is behind `NGIT_GRASP_P_REPOS_ENABLE`. For an operator, with or without
+GRASP-P: a relay whose NIP-11 document is reachable only through a redirect, or is larger
+than 256 KiB, now gets default hints (upstream's fallback paging and subscription
+budget, no owner and no GRASP-08 flag: a public instance does not recognise a GRASP-08
+private service before the dial and syncs with it as with any relay, and a GRASP-08
+private instance derives no membership from that relay's owner and sends no credential
+with Git fetches from its host), and `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` no
+longer apply to the probe.
+
+Unit tests, in the same file: `nip11_probe_does_not_follow_redirects`,
+`nip11_probe_refuses_a_document_over_the_size_limit`,
+`event_directed_nip11_probe_never_contacts_a_refused_target` (these three fail on
+upstream's probe), `nip11_probe_reads_a_document_up_to_the_size_limit`,
+`nip11_probe_is_held_to_the_addresses_a_strict_policy_vetted`,
+`vetted_nip11_request_connects_to_the_vetted_address` and
+`vetted_nip11_request_never_falls_back_to_a_dns_lookup`. They connect to loopback
+listeners only; the one that names a public address checks it and connects to nothing.
+No test covers a pinned request over TLS, the 3 second budget, that a proxy variable is
+ignored, or one probe from vetting to connection: a target the production policy accepts
+cannot be a loopback listener, so the choice of addresses is tested on `vet_nip11_target`
+and the pinned client through `fetch_nip11_document`, each alone.
+
+The relay dial itself is unchanged: vetted before every attempt and not pinned, which
+upstream documents (`docs/explanation/defensive-measures.md`).
+
+The address check is upstream's too (`src/outbound.rs`), unchanged. It counts the NAT64
+prefixes (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 (`2002::/16`) as globally reachable,
+so an address there that wraps an internal IPv4 address passes it, for the probe as for
+the dial. The blob mirror decodes `64:ff9b::/96` and `2002::/16` and refuses such an
+address (`is_disallowed_ip` in `src/grasp_p/mirror.rs`). Aligning upstream's ranges is to
+be offered upstream, not carried here.
+
+The change and its tests need no other file, so they can be offered upstream as they
+are; offering them is the maintainer's call. When upstream hardens the probe itself, drop
+this seam in the sync that brings the fix.
 
 ## Decisions made during the port
 
@@ -209,6 +289,7 @@ features. No package was added.
   It would fail on a binary that links two rustls crypto providers.
 - Upstream's own test files are unmodified, apart from `tests/common/relay.rs` above, one
   `grasp_p: None` field in the `HistoryJob` that the unit tests in `src/sync/history.rs`
-  build, the two unit tests named under "Synced events are verified here", and fixed commit
-  dates in the git helper of `src/git/staging/tests.rs`: one upstream test there builds the
-  same commit twice and compares the ids, which only match within one wall-clock second.
+  build, the two unit tests named under "Synced events are verified here", the seven named
+  under "The NIP-11 probe is vetted, pinned and bounded here", and fixed commit dates in
+  the git helper of `src/git/staging/tests.rs`: one upstream test there builds the same
+  commit twice and compares the ids, which only match within one wall-clock second.
