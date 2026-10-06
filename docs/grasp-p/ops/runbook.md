@@ -847,10 +847,10 @@ Pointers, not procedures:
   inside a long-lived WS connection — the per-IP outer layer covers the
   HTTP blob routes only; the inner layer is the per-write-key bucket
   (nginx-upload-zones.conf, KNOWN GAP, lines 66–78).
-- **Stub knobs**: `NGIT_GRASP_P_PER_TENANT_METRICS` and
-  `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES` have no call sites
-  (plan-v2-fix-log.md S6); `ngit_private_ledger_bytes` has only
-  `scope="global"`.
+- **Stub knob**: `NGIT_GRASP_P_OFFBOARD_RETENTION_SECS` is read and not
+  enforced yet (issue 1). The two settings that had no call sites at all
+  (per-tenant metrics, direct invites; plan-v2-fix-log.md S6) were
+  removed. `ngit_private_ledger_bytes` has only `scope="global"`.
 - **Paid mode** is not built (boot-rejected, §1).
 - **Mirror DNS-rebinding** at connection time is a documented residual —
   set `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known peer in production

@@ -23,11 +23,23 @@ mod test_listener;
 /// With no subcommand the binary runs the relay (all relay flags apply).
 /// With a subcommand it runs the requested maintenance tool instead.
 #[derive(Debug, Parser)]
-#[command(author, version, about = "ngit-grasp GRASP relay", long_about = None)]
+// GRASP-P seam: the version also names the GRASP-P release and the commit, so
+// that the two nodes of a pair can be checked for the same build.
+#[command(
+    author,
+    version = ngit_grasp::grasp_p::build_info::version(),
+    about = "ngit-grasp GRASP relay",
+    long_about = None
+)]
 #[command(propagate_version = true)]
 enum Cli {
     /// Run the GRASP relay server (default when no subcommand is given).
-    #[command(name = "serve")]
+    // GRASP-P seam: `Config` sets upstream's version on this subcommand, and
+    // a subcommand's own version wins over the propagated one.
+    #[command(
+        name = "serve",
+        version = ngit_grasp::grasp_p::build_info::version()
+    )]
     Serve(Box<Config>),
 
     /// Remove kind 30617/30618 events whose bare git repository is empty or missing.

@@ -63,7 +63,7 @@ fn parse_alias(s: &str) -> Result<String, String> {
 #[derive(Debug, Parser)]
 #[command(
     name = "ngit-private-watchdog",
-    version,
+    version = ngit_grasp::grasp_p::build_info::version(),
     about = "External split-view watchdog for GRASP-P two-node deployments",
     long_about = "Anonymously compares two ngit-grasp nodes' views of GRASP-P private-repo \
                   state (NIP-11 policy fingerprint, kind-30640 registrations, kind-30641 \

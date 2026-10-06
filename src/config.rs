@@ -826,7 +826,7 @@ pub struct Config {
     #[arg(long, env = "NGIT_GRASP_P_GC_INTERVAL_SECS", default_value_t = 3_600)]
     pub private_gc_interval_secs: u64,
 
-    /// Tombstoned-alias purge delay in seconds (stub in Phase 1)
+    /// Tombstoned-alias purge delay in seconds; not enforced yet (issue 1)
     #[arg(
         long,
         env = "NGIT_GRASP_P_OFFBOARD_RETENTION_SECS",
@@ -903,14 +903,6 @@ pub struct Config {
     )]
     pub private_mirror_allow_private_ips: bool,
 
-    /// Accept kind-3313 direct invites for storage (Phase 1 only honors =false)
-    #[arg(
-        long,
-        env = "NGIT_GRASP_P_ACCEPT_DIRECT_INVITES",
-        default_value_t = false
-    )]
-    pub private_accept_direct_invites: bool,
-
     /// Also accept the LEGACY stream-wrap kinds 1059/21059 alongside the
     /// dedicated CORD stream-wrap kinds 3359/23359. Default true: a node
     /// must accept 3359 BEFORE any client emits it, and legacy wraps
@@ -933,10 +925,6 @@ pub struct Config {
         default_value_t = true
     )]
     pub private_accept_legacy_wrap_kind: bool,
-
-    /// Opt in to per-tenant metric labels (default: aggregate metrics only)
-    #[arg(long, env = "NGIT_GRASP_P_PER_TENANT_METRICS", default_value_t = false)]
-    pub private_per_tenant_metrics: bool,
 
     /// Per-write-key token bucket capacity for CLIENT-submitted private
     /// writes (kind 30641 + stream-wrap events + blob PUTs). 0 = unlimited
@@ -1955,9 +1943,7 @@ impl Config {
             private_mirror_max_concurrency: 4,
             private_mirror_fetch_timeout_secs: 120,
             private_mirror_allow_private_ips: false,
-            private_accept_direct_invites: false,
             private_accept_legacy_wrap_kind: true,
-            private_per_tenant_metrics: false,
             private_write_rate_capacity: 120,
             private_write_rate_refill_per_min: 60,
             private_registration_replace_capacity: 8,

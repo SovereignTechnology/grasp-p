@@ -1046,3 +1046,36 @@ async fn watchdog_reports_wrap_kind_split() {
     a.stop().await;
     b.stop().await;
 }
+
+/// An operator tells which build a node runs from `--version`, and the
+/// release job refuses a binary whose version does not name its commit. That
+/// job runs only after a merge, so the same line is checked here first, on
+/// both binaries and on the `serve` subcommand, which sets a version of its
+/// own.
+#[test]
+fn both_binaries_name_the_grasp_p_build_in_their_version() {
+    let build = ngit_grasp::grasp_p::build_info::version();
+    assert!(build.contains(" (grasp-p "), "{build}");
+
+    // Run from an empty directory: the server reads `.env` from where it is
+    // started, before it parses its arguments.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let server = env!("CARGO_BIN_EXE_ngit-grasp");
+    let watchdog = env!("CARGO_BIN_EXE_ngit-private-watchdog");
+    for (binary, args) in [
+        (server, &["--version"][..]),
+        (server, &["serve", "--version"][..]),
+        (watchdog, &["--version"][..]),
+    ] {
+        let out = std::process::Command::new(binary)
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("run the binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.trim_end().ends_with(&format!(" {build}")),
+            "{binary} {args:?} printed {stdout:?}, which does not end with {build:?}"
+        );
+    }
+}

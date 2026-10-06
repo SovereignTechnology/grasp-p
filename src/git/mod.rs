@@ -29,6 +29,8 @@ pub mod staging;
 pub mod storage;
 pub mod subprocess;
 pub mod sync;
+// SovTech: the startup check that git is new enough to promote pushes.
+pub mod version;
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};

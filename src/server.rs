@@ -135,6 +135,12 @@ impl RelayServer {
         }
         info!("Database backend: {}", config.database_backend);
 
+        // SovTech seam: upstream needs git 2.42 since v3.0.6 and checks
+        // nothing, and an older git accepts pushes without ever promoting
+        // them. Fatal only on a GRASP-P node, so that a node without GRASP-P
+        // still starts wherever upstream starts, with a warning.
+        git::version::ensure_supported(config.private_repos_enable)?;
+
         // Upgrade Git storage before any runtime component can inspect or
         // mutate repositories. Migration is resumable; each identifier
         // family's legacy backups are verified and retired before the next

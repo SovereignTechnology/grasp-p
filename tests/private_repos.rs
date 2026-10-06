@@ -5617,3 +5617,57 @@ async fn exit40_list_answers_only_the_listed_key() {
 
     relay.stop().await;
 }
+
+// ============================================================================
+// Startup: the git version check
+// ============================================================================
+
+/// The git check protects a node only while `RelayServer` calls it, and that
+/// call is one line in a file upstream owns. A GRASP-P node whose `git` says
+/// 2.39.5 has to refuse to start and say why. If the call is lost in a merge
+/// the node starts instead, and the time limit fails this test.
+#[cfg(unix)]
+#[tokio::test]
+async fn grasp_p_node_refuses_to_start_on_git_older_than_2_42() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("create the fake bin directory");
+    let fake_git = bin.join("git");
+    std::fs::write(&fake_git, "#!/bin/sh\necho 'git version 2.39.5'\n")
+        .expect("write the fake git");
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake git executable");
+    let mut path = vec![bin];
+    if let Some(inherited) = std::env::var_os("PATH") {
+        path.extend(std::env::split_paths(&inherited));
+    }
+    let path = std::env::join_paths(path).expect("join PATH");
+
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_ngit-grasp"));
+    server
+        // The server writes its owner key into the directory it starts in.
+        .current_dir(dir.path())
+        .env("PATH", path)
+        .env("NGIT_DOMAIN", "localhost")
+        .env("NGIT_BIND_ADDRESS", "127.0.0.1:0")
+        .env("NGIT_GIT_DATA_PATH", dir.path().join("git"))
+        .env("NGIT_RELAY_DATA_PATH", dir.path().join("relay"))
+        // Only a node that wrongly starts reads these two. It must not then
+        // reach the production discovery relays from a test.
+        .env("NGIT_USER_INDEX_RELAYS", "")
+        .env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", "")
+        .env("NGIT_GRASP_P_REPOS_ENABLE", "true")
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(60), server.output())
+        .await
+        .expect("the node kept running, so the git check did not stop it")
+        .expect("run the server");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the node must not start: {stderr}");
+    assert!(
+        stderr.contains("git 2.39.5 is older than 2.42.0") && stderr.contains("never promoted"),
+        "the refusal must name the version found, the minimum and the symptom: {stderr}"
+    );
+}

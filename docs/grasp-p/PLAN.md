@@ -131,8 +131,10 @@ project yet.
 - **Blob mirror peers** default to the `server` tags of accepted registrations when no
   allowlist is set, so tenant events do choose hosts the node connects to (vetted by the
   SSRF guard; see #3).
-- **Fail fast on old git.** The server does not check the git version at startup, and with
-  git older than 2.42 it fails quietly.
+- **Fail fast on old git** (done). The server checks `git --version` at startup, before the
+  storage migration (`src/git/version.rs`). With GRASP-P enabled a git older than 2.42 stops
+  it with a message that names the version found, the minimum and the symptom, and so does
+  a git that cannot be run; with GRASP-P off either is one warning.
 - **Docs (#21).** The runbook cites `file:line` from the v1.2 line and names a deployment
   that does not exist; the config reference still describes the tagless-1059 window.
 

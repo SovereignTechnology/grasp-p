@@ -244,8 +244,9 @@ are capped (64) and reserved against the global byte budget BEFORE any body byte
   relays/servers, channel keys, `write_secret` iff write role, role) to the invitee's OWN inbox
   relay — the client REFUSES to deliver to any configured git node. Join publishes a kind-3314
   guestbook rumor, sealed under the guestbook seal key, wrapped by the derived guestbook key.
-  **[I]** `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES` exists as a server knob but is not consulted by any
-  as-built admission path; the never-to-the-git-node rule is enforced client-side only.
+  **[I]** The server has no setting for this: the knob `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES` was
+  never consulted by any admission path and has been removed. The never-to-the-git-node rule is
+  enforced client-side only.
 - **#collab issues/PRs [N]**: author-signed inner rumors (1621 issue, 1111 comment, 1617 patch,
   1630/1631/1632/1633 status) carrying `a`/`channel`/`epoch` binding tags, sealed under the
   `#collab` seal key and wrapped in a 3359 signed by the derived stream key with a past-tweaked
@@ -367,7 +368,7 @@ rejected replay is non-destructive (no meta mutation, no pruning).
 
 Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
 Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
-aggregate metrics (per-tenant labels opt-in), NIP-11 `private_repos` advert (`kinds`,
+aggregate metrics (no per-tenant labels), NIP-11 `private_repos` advert (`kinds`,
 `registration_mode`, size caps, quotas, `blob_endpoints`, `policy_fingerprint`, `policy_version`,
 plus `pow_bits` only in pow mode) — `src/grasp_p/mod.rs:1564-1601`. `policy_version` is the
 `policy_fingerprint` PREIMAGE-FORMAT label published verbatim beside the digest, so a pair whose
@@ -410,7 +411,7 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   accept_legacy_wrap_kind, domains`
   (domains = sorted `{own domain} ∪ {bootstrap peer}`; the raw whitelist feeds the hash but is
   never exposed). Everything not named in that preimage is excluded; among the excluded knobs are
-  client-write-rate, denylist, sync-re-issue and mirror-retry, per-tenant metrics, GC grace/interval,
+  client-write-rate, denylist, sync-re-issue and mirror-retry, GC grace/interval,
   offboard retention, the mirror knobs, and **`state_history_editions`** (the §2.2 ring depth) —
   the rationale being that they are node-local and do not affect acceptance. **[N] That rationale
   does not fully hold for `state_history_editions`**: ring depth decides which editions are trimmed,

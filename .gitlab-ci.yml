@@ -122,21 +122,52 @@ test:
 # 2.47.3; bookworm's 2.39.5 is too old), ca-certificates, and the libraries
 # the binary links dynamically besides libc: libssl.so.3, libcrypto.so.3,
 # libz.so.1 and libzstd.so.1 (all in debian:trixie-slim plus ca-certificates).
+# The split-view watchdog is a second binary of the same package and ships
+# beside the server.
 release:
   stage: release
   timeout: 60m
   rules:
     - if: $CI_COMMIT_REF_PROTECTED == "true"
   script:
+    # The release the binaries name in --version: the tag, on a tag pipeline.
+    # On main it stays unset and they say "unreleased". It is read while
+    # compiling (src/grasp_p/build_info.rs), so it is exported before cargo
+    # runs.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export GRASP_P_BUILD_RELEASE="$CI_COMMIT_TAG"
+      fi
     - cargo build --release --locked -p ngit-grasp
     - mkdir -p ci-out
-    - cp target/release/ngit-grasp ci-out/
-    - (cd ci-out && sha256sum ngit-grasp > SHA256SUMS && cat SHA256SUMS)
+    - cp target/release/ngit-grasp target/release/ngit-private-watchdog ci-out/
+    - (cd ci-out && sha256sum ngit-grasp ngit-private-watchdog > SHA256SUMS && cat SHA256SUMS)
     # Not "ldd --version | head -n1": under pipefail ldd dies of SIGPIPE at random.
     - echo "glibc $(getconf GNU_LIBC_VERSION)" > ci-out/BUILD-INFO
     - rustc --version >> ci-out/BUILD-INFO
     - git rev-parse HEAD >> ci-out/BUILD-INFO
     - echo "runtime needs git >= 2.42 on PATH, ca-certificates, libssl.so.3, libcrypto.so.3, libz.so.1, libzstd.so.1" >> ci-out/BUILD-INFO
+    # What each binary says it is. A server that does not name the commit it
+    # was built from, or on a tag pipeline the tag, cannot be told from
+    # another build once it is deployed: fail here and publish nothing. The
+    # output is captured first and matched with case, not piped into grep -q,
+    # which under pipefail kills the writer at the first match.
+    - |
+      server_version=$(ci-out/ngit-grasp --version)
+      watchdog_version=$(ci-out/ngit-private-watchdog --version)
+      printf '%s\n%s\n' "$server_version" "$watchdog_version" >> ci-out/BUILD-INFO
+      cat ci-out/BUILD-INFO
+      commit=$(printf '%.12s' "$(git rev-parse HEAD)")
+      case "$server_version" in
+        *"commit $commit)"*) ;;
+        *) echo "ngit-grasp --version is '$server_version': it does not name commit $commit" >&2; exit 1 ;;
+      esac
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        case "$server_version" in
+          *"grasp-p $CI_COMMIT_TAG,"*) ;;
+          *) echo "ngit-grasp --version is '$server_version': it does not name the release $CI_COMMIT_TAG" >&2; exit 1 ;;
+        esac
+      fi
   artifacts:
     expire_in: 90 days
     paths:

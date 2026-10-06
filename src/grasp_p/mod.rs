@@ -7,11 +7,16 @@
 //! Everything here is inert unless `NGIT_GRASP_P_REPOS_ENABLE=true`: when the
 //! flag is off no [`PrivateService`] is constructed and every private kind
 //! (30640/30641 + the stream-wrap kinds 3359/23359 and, while legacy accept
-//! is on, 1059/21059) falls through to the existing admission handling.
+//! is on, 1059/21059) falls through to the existing admission handling. The
+//! one exception is [`build_info`]: both binaries name the build in
+//! `--version` whatever the flag says.
 
 pub mod admission;
 pub mod blob_store;
 pub mod blossom_auth;
+pub mod build_info;
+#[cfg(test)]
+mod config_sources;
 pub mod denylist;
 pub mod gc;
 pub mod host;
@@ -218,14 +223,13 @@ pub struct PrivateConfig {
     pub state_history_editions: u32,
     pub gc_grace_secs: u64,
     pub gc_interval_secs: u64,
+    /// Stored and not enforced yet (issue 1).
     pub offboard_retention_secs: u64,
-    pub accept_direct_invites: bool,
     /// Dual-accept the LEGACY stream-wrap kinds (1059/21059) alongside the
     /// dedicated 3359/23359. Default true: the server must accept 3359
     /// BEFORE any client emits it, and legacy wraps already in flight (or
     /// held for out-of-order reprocess) must keep draining.
     pub accept_legacy_wrap_kind: bool,
-    pub per_tenant_metrics: bool,
     // Phase 2 blob mirror knobs.
     pub mirror_enable: bool,
     pub mirror_peer_urls: Option<Vec<String>>,
@@ -288,9 +292,7 @@ impl PrivateConfig {
             gc_grace_secs: config.private_gc_grace_secs,
             gc_interval_secs: config.private_gc_interval_secs,
             offboard_retention_secs: config.private_offboard_retention_secs,
-            accept_direct_invites: config.private_accept_direct_invites,
             accept_legacy_wrap_kind: config.private_accept_legacy_wrap_kind,
-            per_tenant_metrics: config.private_per_tenant_metrics,
             mirror_enable: config.private_mirror_enable,
             mirror_peer_urls: config.private_mirror_peer_url_entries(),
             mirror_max_concurrency: config.private_mirror_max_concurrency,
@@ -530,6 +532,7 @@ impl PrivateService {
             policy_fingerprint = %svc.cfg.policy_fingerprint,
             mirror_enabled = svc.cfg.mirror_enable,
             configured_peer = ?config.sync_bootstrap_relay_url,
+            build = build_info::version(),
             "GRASP-P private repositories enabled"
         );
         Ok(svc)

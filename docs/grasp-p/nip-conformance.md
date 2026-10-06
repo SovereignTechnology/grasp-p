@@ -626,7 +626,9 @@ are registered regardless.
 
 Not NIP questions, but a standards reader will surface them.
 
-- **A. `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES` is a dead knob.** Declared at `src/config.rs:740-741`
+- **A. (closed 2026-10: the setting was removed; the never-to-the-git-node rule stays
+  client-side only. The text below is the finding as it stood.)
+  `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES` is a dead knob.** Declared at `src/config.rs:740-741`
   (`default_value_t = false` on the `#[arg]` at `:740` — `:1420` is only the `Config::for_testing()`
   literal, `for_testing` starting at `:1344`), plumbed into `PrivateConfig` at
   `src/grasp_p/mod.rs:152` and `:215` — and **never read by any admission path**. The only other

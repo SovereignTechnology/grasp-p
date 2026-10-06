@@ -542,6 +542,8 @@ let
         type = types.ints.positive;
         default = 500;
         description = "Per-filter result cap, including when limit is omitted";
+      };
+
       privateReposEnable = mkOption {
         type = types.bool;
         default = false;
@@ -685,7 +687,8 @@ let
         type = types.int;
         default = 2592000;
         description = ''
-          GRASP-P: tombstoned-alias purge delay in seconds (30 days).
+          GRASP-P: tombstoned-alias purge delay in seconds (30 days). Not
+          enforced yet (issue 1): the value is read and nothing acts on it.
         '';
       };
 
@@ -768,15 +771,6 @@ let
         '';
       };
 
-      privateAcceptDirectInvites = mkOption {
-        type = types.bool;
-        default = false;
-        description = ''
-          GRASP-P: accept kind-3313 direct invites for storage (currently
-          only false is honored: invites are rejected).
-        '';
-      };
-
       privateAcceptLegacyWrapKind = mkOption {
         type = types.bool;
         default = true;
@@ -794,15 +788,6 @@ let
           private repos disabled are unaffected. Cross-node acceptance
           knob: it feeds the policy_fingerprint (v3), so a node pair MUST
           agree on it.
-        '';
-      };
-
-      privatePerTenantMetrics = mkOption {
-        type = types.bool;
-        default = false;
-        description = ''
-          GRASP-P: opt in to per-tenant metric labels (default: aggregate
-          metrics only, to keep label cardinality bounded).
         '';
       };
 
@@ -1075,12 +1060,8 @@ let
       NGIT_GRASP_P_SYNC_PEER_URLS = concatStringsSep "," cfg.privateSyncPeerUrls;
       NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS =
         if cfg.privateMirrorAllowPrivateIps then "true" else "false";
-      NGIT_GRASP_P_ACCEPT_DIRECT_INVITES =
-        if cfg.privateAcceptDirectInvites then "true" else "false";
       NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND =
         if cfg.privateAcceptLegacyWrapKind then "true" else "false";
-      NGIT_GRASP_P_PER_TENANT_METRICS =
-        if cfg.privatePerTenantMetrics then "true" else "false";
       NGIT_GRASP_P_WRITE_RATE_CAPACITY = toString cfg.privateWriteRateCapacity;
       NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN =
         toString cfg.privateWriteRateRefillPerMin;

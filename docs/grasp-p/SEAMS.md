@@ -8,13 +8,16 @@ an upstream sync: every seam listed here has to survive the merge.
 ## Layout
 
 GRASP-P code lives in `src/grasp_p/`, `src/http/blossom.rs`, `src/sync/private_index.rs`,
-`src/sync/grasp_p_sync.rs` and `src/bin/ngit-private-watchdog.rs`. Upstream's files carry
-thin seams only:
+`src/sync/grasp_p_sync.rs` and `src/bin/ngit-private-watchdog.rs`. `src/git/version.rs` is
+ours as well: the startup check of the git version, which is not specific to GRASP-P.
+Upstream's files carry thin seams only:
 
 | Upstream file | Seam |
 |---|---|
 | `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` calls `grasp_p::admission::admit` after the blacklist and deletion gates, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
-| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP |
+| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled |
+| `src/git/mod.rs` | declares `version` |
+| `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11 |
 | `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion |
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`; `register_relay` builds each connection with `with_duplicate_event_forwarding`; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; peers kept in `check_disconnects` and counted as desired in `retry_disconnected_relays`; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); the id and signature check in `process_event_static_inner` (see below) |
@@ -29,7 +32,10 @@ thin seams only:
 With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, blob
 routes, sync filters, timers and duplicate forwarding are all gated on it; the GRASP-P
 metrics register lazily on first use. One seam is deliberately not gated: the id and
-signature check on synced and fetched events, which fixes a flaw in upstream itself.
+signature check on synced and fetched events, which fixes a flaw in upstream itself. Two
+more things differ from upstream with the switch unset, and neither changes what the
+server does: `--version` names the GRASP-P build, and a git older than 2.42, or no git,
+draws one warning at startup.
 
 ## Synced events are verified here
 
@@ -140,7 +146,13 @@ features. No package was added.
   repository, which git has from 2.41. With an older git nothing fails loudly: promotion of
   pushed history reports "promoted history is incomplete in the family" and staged pushes
   stay unpromoted. Debian 12 ships 2.39.5 and has no backport; Debian 13 ships 2.47.3. The
-  server does not check the version at startup.
+  server checks at startup, before the storage migration (`src/git/version.rs`). With
+  GRASP-P enabled a git older than 2.42 is a fatal error that names the version found, the
+  minimum and the symptom, and so is a git that cannot be run. With GRASP-P off the same
+  finding is one warning and the server starts wherever upstream starts. Output of
+  `git --version` that it cannot read a version from only ever warns. The check is not
+  specific to GRASP-P and could be offered upstream in unconditional form; that is the
+  maintainer's call, and the seam in `src/server.rs` goes when upstream checks for itself.
 - **`libssl.so.3` and CA certificates.** The blob mirror and upstream's NIP-11 probe use
   reqwest with native-tls (OpenSSL). Relay connections use rustls with ring and the
   compiled-in web PKI roots, so a relay peer behind a private CA can be mirrored from but
@@ -150,11 +162,33 @@ features. No package was added.
   runs in a Debian 12 or a Debian 13 guest; `ci-out/BUILD-INFO` repeats these needs. Besides
   libc it links `libssl.so.3`, `libcrypto.so.3`, `libz.so.1` and `libzstd.so.1` dynamically
   (checked with `ldd` on the first release, which starts in a `debian:trixie-slim` image with
-  git and ca-certificates added). `--version` prints upstream's version only, so the artifact's
-  sha256 is what identifies a build.
+  git and ca-certificates added).
+- **A build names itself.** `--version` on `ngit-grasp` and on `ngit-private-watchdog` prints
+  upstream's version, the GRASP-P release and the commit, for example
+  `3.0.7 (grasp-p sovtech-v1.0.0, commit 83b63ac0d1e2)` (`src/grasp_p/build_info.rs`). The
+  release is the tag the release job built, passed in the build-time variable
+  `GRASP_P_BUILD_RELEASE`; any other build says `grasp-p unreleased`. That variable is read by
+  the compiler, not by the server, so it is not one of the settings and is in none of the four
+  config sources. The commit is the `GIT_COMMIT` that upstream's `build.rs` already exports
+  (`commit unknown` when a build has neither `.git` nor `NGIT_BUILD_REVISION`). The startup log
+  line "GRASP-P private repositories enabled" carries the same text in its `build` field.
+  NIP-11 `version` is untouched: upstream's `3.0.7-<commit8>`. The release job ships both
+  binaries with their sha256 sums, appends both version lines to `ci-out/BUILD-INFO`, and
+  fails when the server's line lacks the first 12 characters of the commit or, on a tag
+  pipeline, the tag. Upstream's `scripts/verify-published-container.sh` expects `--version`
+  to print exactly `ngit-grasp <version>` and would refuse this binary; it belongs to
+  upstream's own release workflow (`.ngit/act/`), which this fork does not run. Because the
+  release job runs only after a merge, `tests/private_watchdog.rs` checks the line on both
+  binaries first.
 
 ## Tests
 
+- `src/grasp_p/config_sources.rs` (lib tests) holds the four config sources together. It
+  takes every `NGIT_GRASP_P_*` setting from clap and requires a section in
+  `docs/reference/configuration.md`, a `NAME=value` line in `.env.example` and an entry in
+  the environment map of `nix/module.nix`; it refuses a name in those files that the code
+  does not have; and it compares defaults where a file states one it can read. A setting
+  added to, renamed in or removed from fewer than four sources fails there.
 - `private_repos`, `private_two_node`, `private_watchdog`: the GRASP-P suites, on the
   fixture constructors `TestRelay::start_with_grasp_p` and `start_grasp_p_pair_node` in
   `tests/common/relay.rs` (upstream's file, with those two constructors and the `extra_env`
@@ -164,6 +198,10 @@ features. No package was added.
   are switched off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
   `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. No test
   runs a peer with the guards on.
+- `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
+  of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
+  that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync
+  drops that seam. The rules of the check have unit tests in `src/git/version.rs`.
 - `grasp_p_tls`: the one test with real TLS. A CA made at run time, two TLS fronts before a
   plain node, and a second node that mirrors a blob through `https://` (must succeed, with
   the CA passed in `SSL_CERT_FILE`) and dials a `wss://` peer (must reach certificate

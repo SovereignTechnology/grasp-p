@@ -1669,7 +1669,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_REPOS_ENABLE`
 
-**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay behaves as a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section. (One difference from upstream is not behind this switch: synced and fetched events are checked for a valid id and signature, see `docs/grasp-p/SEAMS.md`.) Mutually exclusive with GRASP-08 private mode: startup fails when both `NGIT_GRASP_P_REPOS_ENABLE=true` and `NGIT_PRIVATE_MODE=true`, because GRASP-08 gates every read behind NIP-42 and GRASP-P relies on anonymous reads.  
+**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay behaves as a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section. (Three differences from upstream are not behind this switch: synced and fetched events are checked for a valid id and signature, `--version` also names the GRASP-P build, and a git older than 2.42 draws one warning at startup, which is a fatal error once this switch is on; see `docs/grasp-p/SEAMS.md`.) Mutually exclusive with GRASP-08 private mode: startup fails when both `NGIT_GRASP_P_REPOS_ENABLE=true` and `NGIT_PRIVATE_MODE=true`, because GRASP-08 gates every read behind NIP-42 and GRASP-P relies on anonymous reads.  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No
@@ -1746,7 +1746,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_OFFBOARD_RETENTION_SECS`
 
-**Description:** Tombstoned-alias purge delay in seconds.  
+**Description:** Tombstoned-alias purge delay in seconds. Not enforced yet (issue 1): the value is read and nothing acts on it.  
 **Type:** Integer  
 **Default:** `2592000` (30 days)  
 **Required:** No
@@ -1807,13 +1807,6 @@ startup log line.
 **Default:** `false`  
 **Required:** No
 
-#### `NGIT_GRASP_P_ACCEPT_DIRECT_INVITES`
-
-**Description:** Accept kind-3313 direct invites for storage. Currently only `false` is honored (invites are rejected).  
-**Type:** Boolean  
-**Default:** `false`  
-**Required:** No
-
 #### `NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND`
 
 **Description:** Also accept the **legacy** stream-wrap kinds `1059`/`21059` alongside the dedicated CORD stream-wrap kinds `3359`/`23359`. GRASP-P stream wraps were never NIP-59 gift wraps (no `p` tag, no kind-13 seal, symmetric AEAD, derived deterministic signer), so they moved to their own kind. The default `true` is the migration window: a node must accept `3359` **before** any client emits it, and wraps already published on `1059` (or held for out-of-order reprocess) must keep draining. Set `false` only once every client writing to this node has migrated — the legacy kinds are then **retired**: while private repos are enabled, a `1059`/`21059` is refused outright with `restricted: legacy stream-wrap kind is not accepted on this node`. It is deliberately **not** reclassified onto the public related-event path. That path stores any event carrying an `a`/`e` tag that references accepted content, from **any** key — no §3.2 registered-key gate, no `NGIT_GRASP_P_MAX_EVENT_BYTES` cap, no private quota charge, and never swept by the private GC — which would make the `false` position of this knob *wider* than the default (where an unregistered `1059` is rejected outright). Nodes with `NGIT_GRASP_P_REPOS_ENABLE=false` are unaffected: `1059` keeps its vanilla public related-event handling there. Genuine NIP-59 gift-wrapped invites are unaffected either way: they go to inbox relays, not the git node. This is a **cross-node acceptance** knob — it feeds the `policy_fingerprint` (`v3`), so both nodes of a pair must agree on it or wraps accepted on one are rejected on the other; flip it on both nodes in a single maintenance window (see the ops runbook §2).
@@ -1821,13 +1814,6 @@ startup log line.
 **Clients must emit exactly one wrap kind per logical wrap.** Dual-accept exists so a client can *switch* kinds, not *duplicate* them: the quota charge is keyed on `event.id` and the kind is part of the id preimage, so the same plaintext published as both `1059` and `3359` is two ids — charged twice and stored twice, with no credit path (wrap event bytes are released only when the registration dies).  
 **Type:** Boolean  
 **Default:** `true`  
-**Required:** No
-
-#### `NGIT_GRASP_P_PER_TENANT_METRICS`
-
-**Description:** Opt in to per-tenant metric labels. The default `false` exposes aggregate metrics only, keeping Prometheus label cardinality bounded regardless of tenant count.  
-**Type:** Boolean  
-**Default:** `false`  
 **Required:** No
 
 ---
