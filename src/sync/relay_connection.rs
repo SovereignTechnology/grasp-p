@@ -36,7 +36,15 @@ use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy, RelayTargetSourc
 const NEGENTROPY_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// NIP-11 is advisory and must not hold up a connected relay indefinitely.
+///
+/// One budget for the whole probe: vetting the target (with its DNS lookup),
+/// the request and reading the body.
 const NIP11_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Largest NIP-11 document the probe reads. The relay chooses how much it
+/// sends, and the few fields read here fit many times over. The audit probe
+/// uses the same figure (`grasp-audit/src/probe.rs`).
+const NIP11_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Conservative subscription budget when NIP-11 omits `max_subscriptions`.
 const FALLBACK_SUBSCRIPTION_BUDGET: usize = 20;
@@ -495,6 +503,114 @@ fn parse_relay_limit_hints(body: &str) -> RelayLimitHints {
         owner: document.pubkey,
         grasp08,
     }
+}
+
+// SovTech seam: `NIP11_MAX_BODY_BYTES` above and everything from here to the end of
+// `fetch_nip11_document` harden the NIP-11 probe (`fetch_limit_hints`).
+
+/// Resolver of the NIP-11 client for a target the outbound policy has vetted.
+///
+/// It answers every lookup with the vetted addresses and never asks DNS, so a
+/// second, different DNS answer cannot move the request to another address
+/// (DNS rebinding). `ClientBuilder::resolve_to_addrs` would not do: it
+/// overrides one exact name and passes any other lookup to the system
+/// resolver.
+struct VettedAddresses(Vec<std::net::SocketAddr>);
+
+impl reqwest::dns::Resolve for VettedAddresses {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let addresses: reqwest::dns::Addrs = Box::new(self.0.clone().into_iter());
+        Box::pin(std::future::ready(Ok(addresses)))
+    }
+}
+
+/// Build the HTTP client of one NIP-11 probe.
+///
+/// Relay URLs can come from events anyone may publish, and the probe is an
+/// HTTP request to the host such a URL names. The client therefore never
+/// follows a redirect, which could lead to an internal address, and never
+/// uses a proxy from the environment, which would connect somewhere other
+/// than the vetted target. Given `vetted` addresses it connects to those and
+/// to nothing else; a host that is an IP literal is connected to directly,
+/// without any lookup.
+///
+/// The client is built per probe on purpose: a shared one would share its
+/// connection pool, and its resolver, between targets.
+fn nip11_client(vetted: Option<&[std::net::IpAddr]>) -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    let builder = match vetted {
+        // Port 0 leaves the port to the URL.
+        Some(addresses) => builder.dns_resolver(VettedAddresses(
+            addresses
+                .iter()
+                .map(|address| std::net::SocketAddr::new(*address, 0))
+                .collect(),
+        )),
+        None => builder,
+    };
+    builder.build()
+}
+
+/// Read a response body of at most `max_bytes`.
+///
+/// `Ok(None)` means the body is larger: refused up front when the response
+/// announces its length, otherwise as soon as the bytes read pass the limit,
+/// which covers chunked bodies and bodies that end with the connection.
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> reqwest::Result<Option<Vec<u8>>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Ok(None);
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
+/// Fetch the NIP-11 document at `document_url` with the probe's client.
+///
+/// `Ok(None)` means the relay answered but there is no usable document: a
+/// status other than success, which includes every redirect, or a body over
+/// [`NIP11_MAX_BODY_BYTES`].
+async fn fetch_nip11_document(
+    relay: &str,
+    document_url: reqwest::Url,
+    vetted: Option<&[std::net::IpAddr]>,
+) -> reqwest::Result<Option<String>> {
+    let response = nip11_client(vetted)?
+        .get(document_url)
+        .header(reqwest::header::ACCEPT, "application/nostr+json")
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            relay = %relay,
+            status = %response.status(),
+            "NIP-11 fetch returned a non-success status"
+        );
+        return Ok(None);
+    }
+    let Some(body) = read_limited_body(response, NIP11_MAX_BODY_BYTES).await? else {
+        tracing::debug!(
+            relay = %relay,
+            limit_bytes = NIP11_MAX_BODY_BYTES,
+            "NIP-11 document exceeds the size limit"
+        );
+        return Ok(None);
+    };
+    Ok(Some(String::from_utf8_lossy(&body).into_owned()))
 }
 
 /// How a failed negentropy diff should affect future NIP-77 attempts.
@@ -1052,6 +1168,13 @@ impl RelayConnection {
     /// `default_limit` sizes pagination and `max_subscriptions` configures the session ledger.
     /// `max_limit` describes explicit `limit` values and is not applicable to the historic
     /// filters we intentionally send without one.
+    ///
+    /// The fetch is an outbound HTTP request of its own, so it must not bypass the SSRF
+    /// gate. An event-directed target is authorized here, on every call: on rejection
+    /// default hints are returned without any HTTP request, and otherwise the request can
+    /// connect only to the addresses that authorization vetted (a permissive policy vets
+    /// none, so it pins none). For every target the request follows no redirect, uses no
+    /// proxy and reads a bounded body; a relay that answers otherwise gets default hints.
     pub async fn fetch_limit_hints(&self) -> RelayLimitHints {
         let Ok(mut document_url) = reqwest::Url::parse(&self.url) else {
             return RelayLimitHints::default();
@@ -1065,21 +1188,20 @@ impl RelayConnection {
             return RelayLimitHints::default();
         }
 
+        // SovTech seam: the vetting, the pinned addresses and the bounded client below.
         let fetch = async {
-            let response = reqwest::Client::new()
-                .get(document_url)
-                .header(reqwest::header::ACCEPT, "application/nostr+json")
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                tracing::debug!(
-                    relay = %self.url,
-                    status = %response.status(),
-                    "NIP-11 fetch returned a non-success status"
-                );
-                return Ok(None);
-            }
-            response.text().await.map(Some)
+            let vetted = match self.vet_nip11_target().await {
+                Ok(vetted) => vetted,
+                Err(reason) => {
+                    tracing::debug!(
+                        relay = %self.url,
+                        reason = %reason,
+                        "NIP-11 fetch skipped: outbound target policy rejected the relay"
+                    );
+                    return Ok(None);
+                }
+            };
+            fetch_nip11_document(&self.url, document_url, vetted.as_deref()).await
         };
         let body = match tokio::time::timeout(NIP11_FETCH_TIMEOUT, fetch).await {
             Ok(Ok(Some(body))) => body,
@@ -1096,23 +1218,36 @@ impl RelayConnection {
         parse_relay_limit_hints(&body)
     }
 
+    // SovTech seam: `vet_nip11_target` belongs to the hardened NIP-11 probe.
+    /// Vet this connection's target for a NIP-11 request.
+    ///
+    /// `Ok(Some(addresses))`: the request may connect to these addresses and
+    /// to no other. `Ok(None)`: nothing was vetted, because the operator
+    /// configured the target or the policy is permissive. `Err`: the outbound
+    /// target policy refuses the target.
+    async fn vet_nip11_target(&self) -> Result<Option<Vec<std::net::IpAddr>>, String> {
+        if self.source != RelayTargetSource::EventDirected {
+            return Ok(None);
+        }
+        let resolved = self
+            .policy
+            .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
+            .await?;
+        // A permissive policy vets no address, so it leaves nothing to hold
+        // the request to. Any other policy pins the request to exactly what
+        // it vetted.
+        Ok((!self.policy.allow_non_global).then_some(resolved.addresses))
+    }
+
     /// Fetch NIP-11 hints before the WebSocket dial.
     ///
     /// The pre-dial NIP-11 fetch is itself an outbound TCP connection, so it
-    /// must not bypass the SSRF gate: event-directed targets are authorized
-    /// first, and on rejection default hints are returned without any HTTP
-    /// request — the subsequent `connect()` then fails with the same policy
-    /// rejection through its own pre-dial check.
+    /// must not bypass the SSRF gate. [`Self::fetch_limit_hints`] applies that
+    /// gate to every probe, before and after the dial: on rejection default
+    /// hints are returned without any HTTP request — the subsequent
+    /// `connect()` then fails with the same policy rejection through its own
+    /// pre-dial check.
     pub async fn preflight_limit_hints(&self) -> RelayLimitHints {
-        if self.source == RelayTargetSource::EventDirected
-            && self
-                .policy
-                .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
-                .await
-                .is_err()
-        {
-            return RelayLimitHints::default();
-        }
         self.fetch_limit_hints().await
     }
 
@@ -3192,6 +3327,406 @@ mod tests {
         assert!(!parse_relay_limit_hints(r#"{"supported_grasps":"GRASP-08"}"#).grasp08);
         assert!(!parse_relay_limit_hints(r#"{"supported_grasps":8}"#).grasp08);
         assert!(!parse_relay_limit_hints("not json at all").grasp08);
+    }
+
+    // SovTech seam: tests of the hardened NIP-11 probe, from here to the end of
+    // `vetted_nip11_request_never_falls_back_to_a_dns_lookup`.
+
+    /// Document the NIP-11 probe tests serve. Hints carrying its figure can
+    /// only have come from the endpoint that served it.
+    const NIP11_TEST_DOCUMENT: &str = r#"{"limitation":{"max_subscriptions":77}}"#;
+
+    /// Loopback HTTP endpoint for the NIP-11 probe tests. It answers every
+    /// connection with the same bytes, counts the connections it accepted and
+    /// keeps the request heads it read.
+    struct Nip11Endpoint {
+        port: u16,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        request_heads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Nip11Endpoint {
+        async fn start(response: Vec<u8>) -> Self {
+            Self::serve(response, false).await
+        }
+
+        /// Like `start`, but every connection stays open once the bytes are
+        /// written, so the answer never ends by itself.
+        async fn start_held_open(response: Vec<u8>) -> Self {
+            Self::serve(response, true).await
+        }
+
+        async fn serve(response: Vec<u8>, hold_open: bool) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let request_heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let (accepted, heads) = (connections.clone(), request_heads.clone());
+            let server = tokio::spawn(async move {
+                let mut open_sockets = Vec::new();
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut head: Vec<u8> = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => head.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    heads
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    // The probe hangs up early on an answer it refuses, so a
+                    // failed write is not a failed test.
+                    let _ = socket.write_all(&response).await;
+                    if hold_open {
+                        // Kept until the endpoint goes away.
+                        open_sockets.push(socket);
+                    } else {
+                        let _ = socket.shutdown().await;
+                    }
+                }
+            });
+            Self {
+                port,
+                connections,
+                request_heads,
+                server,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("ws://127.0.0.1:{}", self.port)
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn request_heads(&self) -> Vec<String> {
+            self.request_heads.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Nip11Endpoint {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Head of a `200 OK` answer. `framing` holds the header lines that say
+    /// how the body is delimited, each with its line ending.
+    fn nip11_ok_head(framing: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/nostr+json\r\n\
+             {framing}\
+             Connection: close\r\n\
+             \r\n"
+        )
+    }
+
+    /// `200 OK` that announces the length of its body.
+    fn nip11_sized_response(body: &str) -> Vec<u8> {
+        let framing = format!("Content-Length: {}\r\n", body.len());
+        format!("{}{body}", nip11_ok_head(&framing)).into_bytes()
+    }
+
+    /// `200 OK` in chunked transfer coding: the length is never announced.
+    fn nip11_chunked_response(body: &str) -> Vec<u8> {
+        let mut response = nip11_ok_head("Transfer-Encoding: chunked\r\n").into_bytes();
+        for chunk in body.as_bytes().chunks(16 * 1024) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    /// `200 OK` with no framing at all: the body ends with the connection.
+    fn nip11_unframed_response(body: &str) -> Vec<u8> {
+        format!("{}{body}", nip11_ok_head("")).into_bytes()
+    }
+
+    /// A NIP-11 document of exactly `len` bytes that the parser accepts, so
+    /// that only its size can keep its hints from being read.
+    fn nip11_document_of_len(len: usize) -> String {
+        let head = r#"{"limitation":{"max_subscriptions":77},"description":""#;
+        let tail = r#""}"#;
+        let document = format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()));
+        assert_eq!(document.len(), len);
+        assert_eq!(
+            parse_relay_limit_hints(&document).max_subscriptions,
+            Some(77)
+        );
+        document
+    }
+
+    /// Connection to an operator-configured target, which is never vetted.
+    fn operator_connection(url: &str) -> RelayConnection {
+        RelayConnection::new(
+            url.to_string(),
+            None,
+            RelayTargetSource::OperatorConfigured,
+            OutboundTargetPolicy::default(),
+        )
+    }
+
+    fn assert_default_hints(hints: RelayLimitHints) {
+        assert_eq!(hints.default_limit, None);
+        assert_eq!(hints.max_subscriptions, None);
+        assert_eq!(hints.owner, None);
+        assert!(!hints.grasp08);
+    }
+
+    #[tokio::test]
+    async fn nip11_probe_reads_a_document_up_to_the_size_limit() {
+        let owner = Keys::generate().public_key();
+        let document = serde_json::json!({
+            "pubkey": owner.to_hex(),
+            "limitation": {"max_subscriptions": 40, "default_limit": 250},
+            "supported_grasps": ["GRASP-01", "GRASP-08"],
+        })
+        .to_string();
+        let relay = Nip11Endpoint::start(nip11_sized_response(&document)).await;
+
+        // An operator-configured target, and an event-directed loopback
+        // target under the permissive policy that test deployments run with.
+        for connection in [
+            operator_connection(&relay.url()),
+            permissive_connection(&relay.url(), Keys::generate()),
+        ] {
+            let hints = connection.fetch_limit_hints().await;
+            assert_eq!(hints.default_limit, Some(250));
+            assert_eq!(hints.max_subscriptions, Some(40));
+            assert_eq!(hints.owner, Some(owner));
+            assert!(hints.grasp08);
+        }
+        assert_eq!(relay.connections(), 2);
+
+        // A document of exactly the limit is read, however it is framed.
+        // Asked without the probe's deadline, which is not what this checks.
+        let largest = nip11_document_of_len(NIP11_MAX_BODY_BYTES);
+        for response in [
+            nip11_sized_response(&largest),
+            nip11_chunked_response(&largest),
+            nip11_unframed_response(&largest),
+        ] {
+            let relay = Nip11Endpoint::start(response).await;
+            let document_url =
+                reqwest::Url::parse(&format!("http://127.0.0.1:{}/", relay.port)).unwrap();
+            let document = fetch_nip11_document(&relay.url(), document_url, None)
+                .await
+                .expect("the request must succeed")
+                .expect("a document of exactly the limit must be read");
+            assert_eq!(document.len(), NIP11_MAX_BODY_BYTES);
+            assert_eq!(
+                parse_relay_limit_hints(&document).max_subscriptions,
+                Some(77)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nip11_probe_refuses_a_document_over_the_size_limit() {
+        // One byte too many, announced up front, sent in chunks, and sent
+        // with no framing.
+        let oversized = nip11_document_of_len(NIP11_MAX_BODY_BYTES + 1);
+        for response in [
+            nip11_sized_response(&oversized),
+            nip11_chunked_response(&oversized),
+            nip11_unframed_response(&oversized),
+        ] {
+            let relay = Nip11Endpoint::start(response).await;
+            let hints = operator_connection(&relay.url()).fetch_limit_hints().await;
+            assert_default_hints(hints);
+            assert_eq!(relay.connections(), 1);
+        }
+
+        // The limit bounds what is read, not only what is accepted. These
+        // answers never end: a length over the limit with no body behind it,
+        // chunks past the limit with no last chunk, and bytes past the limit
+        // on a connection that stays open. A probe that read a body to its
+        // end before looking at its size would wait on each of them.
+        let announced = nip11_ok_head(&format!("Content-Length: {}\r\n", oversized.len()));
+        let mut unfinished = nip11_chunked_response(&oversized);
+        unfinished.truncate(unfinished.len() - b"0\r\n\r\n".len());
+        for response in [
+            announced.into_bytes(),
+            unfinished,
+            nip11_unframed_response(&oversized),
+        ] {
+            let relay = Nip11Endpoint::start_held_open(response).await;
+            let document_url =
+                reqwest::Url::parse(&format!("http://127.0.0.1:{}/", relay.port)).unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(30),
+                fetch_nip11_document(&relay.url(), document_url, None),
+            )
+            .await
+            .expect("the probe must stop reading at the size limit");
+            // `Ok(None)` is the answer to a body over the limit; a failed
+            // request would be an error.
+            assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+            assert_eq!(relay.connections(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn nip11_probe_does_not_follow_redirects() {
+        let target = Nip11Endpoint::start(nip11_sized_response(NIP11_TEST_DOCUMENT)).await;
+        for (earlier, status) in [
+            "301 Moved Permanently",
+            "302 Found",
+            "303 See Other",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let redirect = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Location: http://127.0.0.1:{}/\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                target.port
+            );
+            let relay = Nip11Endpoint::start(redirect.into_bytes()).await;
+
+            let hints = operator_connection(&relay.url()).fetch_limit_hints().await;
+
+            assert_default_hints(hints);
+            assert_eq!(relay.connections(), 1, "{status}");
+            // Only the controls of the statuses before this one reached it.
+            assert_eq!(
+                target.connections(),
+                earlier,
+                "{status}: the redirect target must never be contacted"
+            );
+
+            // Control: a client that follows redirects is led to the target
+            // by the same answer, so it is the probe that declined to.
+            let followed = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://127.0.0.1:{}/", relay.port))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(followed, NIP11_TEST_DOCUMENT, "{status}");
+            assert_eq!(target.connections(), earlier + 1, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn event_directed_nip11_probe_never_contacts_a_refused_target() {
+        let internal = Nip11Endpoint::start(nip11_sized_response(NIP11_TEST_DOCUMENT)).await;
+        let connection = RelayConnection::new(
+            internal.url(),
+            None,
+            RelayTargetSource::EventDirected,
+            OutboundTargetPolicy::default(),
+        );
+
+        // Both entry points: the probe before the dial and the one on a
+        // connected session.
+        assert_default_hints(connection.preflight_limit_hints().await);
+        assert_default_hints(connection.fetch_limit_hints().await);
+
+        assert_eq!(
+            internal.connections(),
+            0,
+            "a target the outbound policy refuses must never be contacted"
+        );
+
+        // Control: the same endpoint answers an operator-configured
+        // connection, which is not vetted, and that is the first connection
+        // it has seen.
+        let hints = operator_connection(&internal.url())
+            .fetch_limit_hints()
+            .await;
+        assert_eq!(hints.max_subscriptions, Some(77));
+        assert_eq!(internal.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn nip11_probe_is_held_to_the_addresses_a_strict_policy_vetted() {
+        // An IP literal is vetted without a lookup, so nothing leaves the host.
+        let url = "wss://8.8.8.8";
+        let literal = std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let strict = RelayConnection::new(
+            url.to_string(),
+            None,
+            RelayTargetSource::EventDirected,
+            OutboundTargetPolicy::default(),
+        );
+
+        assert_eq!(strict.vet_nip11_target().await, Ok(Some(vec![literal])));
+        // A permissive policy vets nothing, and neither does an operator's own target.
+        assert_eq!(
+            permissive_connection(url, Keys::generate())
+                .vet_nip11_target()
+                .await,
+            Ok(None)
+        );
+        assert_eq!(operator_connection(url).vet_nip11_target().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn vetted_nip11_request_connects_to_the_vetted_address() {
+        let vetted = [std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        // `.test` names never resolve, so only the vetted address can lead
+        // to the endpoint. With its root label the name is spelled
+        // differently, and a table of names would not find it.
+        for host in ["relay.pin.test", "relay.pin.test."] {
+            let relay = Nip11Endpoint::start(nip11_sized_response(NIP11_TEST_DOCUMENT)).await;
+            let document_url =
+                reqwest::Url::parse(&format!("http://{host}:{}/", relay.port)).unwrap();
+
+            let document =
+                fetch_nip11_document("ws://relay.pin.test", document_url, Some(vetted.as_slice()))
+                    .await
+                    .expect("the request must reach the vetted address");
+
+            assert_eq!(document.as_deref(), Some(NIP11_TEST_DOCUMENT), "{host}");
+            assert_eq!(relay.connections(), 1, "{host}");
+            // The name still travels in the request; only the address is pinned.
+            let request_heads = relay.request_heads();
+            assert!(
+                request_heads[0]
+                    .to_ascii_lowercase()
+                    .contains(&format!("host: {host}:{}\r\n", relay.port)),
+                "{request_heads:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vetted_nip11_request_never_falls_back_to_a_dns_lookup() {
+        let relay = Nip11Endpoint::start(nip11_sized_response(NIP11_TEST_DOCUMENT)).await;
+        // `localhost` resolves to the endpoint's address. With no vetted
+        // address the request must fail, not look the name up.
+        let document_url =
+            reqwest::Url::parse(&format!("http://localhost:{}/", relay.port)).unwrap();
+        let vetted: Vec<std::net::IpAddr> = Vec::new();
+
+        let outcome =
+            fetch_nip11_document("ws://localhost", document_url, Some(vetted.as_slice())).await;
+
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(relay.connections(), 0);
     }
 
     /// Event-directed connection with the permissive policy used by tests
