@@ -2078,8 +2078,17 @@ when the setting below names its address. Without it the metrics are
 collected in memory and served nowhere, and one line in the startup log says
 so.
 
+The scrape of such a node names no relay by its URL. In the `ngit_sync_*`
+series the `relay` label holds an alias, `peer-1`, `peer-2` and so on, for
+the node's configured peers: the entries of `NGIT_GRASP_P_SYNC_PEER_URLS` in
+the order written, and then the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
+unless the list already names it. The per-relay series of every other relay
+the node dials are left out of the scrape, and the aggregate series still
+count those relays. See "Relays in the scrape" in
+`docs/grasp-p/ops/runbook.md`.
+
 With GRASP-P disabled none of this applies: the setting is ignored and
-`/metrics` is upstream's public route.
+`/metrics` is upstream's public route, with upstream's labels.
 
 #### `NGIT_GRASP_P_METRICS_BIND`
 

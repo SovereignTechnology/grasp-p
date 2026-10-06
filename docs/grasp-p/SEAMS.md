@@ -15,7 +15,7 @@ Upstream's files carry thin seams only:
 | Upstream file | Seam |
 |---|---|
 | `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` calls `grasp_p::admission::admit` after the blacklist and deletion gates, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
-| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled; one call to `grasp_p::metrics_endpoint::start` ahead of every other background task, whose error stops startup (see below) |
+| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled; one call to `grasp_p::metrics_endpoint::start` ahead of every other background task, whose error stops startup; where `Metrics` is built, the builder call `with_relay_labels(RelayLabels::from_config(..))`, which passes `None` unless GRASP-P is enabled (see below) |
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
@@ -23,21 +23,22 @@ Upstream's files carry thin seams only:
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`; `register_relay` builds each connection with `with_duplicate_event_forwarding`; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; peers kept in `check_disconnects` and counted as desired in `retry_disconnected_relays`; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); the id and signature check in `process_event_static_inner` (see below) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
 | `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only when GRASP-P is enabled, after checking their id and signature and skipping the SDK's second copy of a new event; `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
-| `src/sync/filters.rs`, `src/metrics/mod.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
+| `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
+| `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
 | `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p` / `start_grasp_p_pair_node`, which both set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
 With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, blob
-routes, sync filters, timers, duplicate forwarding and the metrics endpoint are all gated
-on it, and `/metrics` is upstream's public route; the GRASP-P metrics register lazily on
-first use. Two seams are deliberately not gated, because each
-fixes a flaw in upstream itself: the id and signature check on synced and fetched events,
-and the hardened NIP-11 probe. Both have a section below. Two more things differ from
-upstream with the switch unset, and neither changes what the server does: `--version`
-names the GRASP-P build, and a git older than 2.42, or no git, draws one warning at
-startup.
+routes, sync filters, timers, duplicate forwarding, the metrics endpoint and the rewrite of
+relay labels are all gated on it, and `/metrics` is upstream's public route with upstream's
+labels; the GRASP-P metrics register lazily on first use. Two seams are deliberately not
+gated, because each fixes a flaw in upstream itself: the id and signature check on synced
+and fetched events, and the hardened NIP-11 probe. Both have a section below. Two more
+things differ from upstream with the switch unset, and neither changes what the server
+does: `--version` names the GRASP-P build, and a git older than 2.42, or no git, draws one
+warning at startup.
 
 ## Synced events are verified here
 
@@ -152,7 +153,8 @@ this seam in the sync that brings the fix.
 Upstream serves `/metrics` on the public listener: to any client, for any method, with
 `Access-Control-Allow-Origin: *`. On a node that hosts private repositories the scrape
 counts those repositories, the bytes they hold, and the takedowns and reports received.
-That is not public, so a node with GRASP-P enabled does two things differently.
+That is not public, so a node with GRASP-P enabled serves it elsewhere, in the two ways
+below, and names no relay by its URL in it, which the second half of this section covers.
 
 - **The public listener has no `/metrics` route.** One condition in `src/http/mod.rs`:
   with `private_repos_enable` set the request falls through to the 404 page of any
@@ -181,13 +183,13 @@ started. That is why the call sits at the head of the list and not beside
 `spawn_background_tasks`. The task is aborted with the others at shutdown, and aborting
 it closes the listener and every open connection.
 
-Collection is untouched: the `Metrics` object is built where and how upstream builds it,
-because the server uses it for more than the scrape (the warning about one address
-holding too many connections is logged from it). A GRASP-P node with metrics on and no
-bind address collects in memory and serves nowhere; one line at startup says so and names
-the setting. Upstream's own line, "Metrics enabled on /metrics endpoint", is still
-printed on a GRASP-P node and is wrong there. The setting is node-local and not part of
-`policy_fingerprint`.
+Collection is untouched: the `Metrics` object is built where upstream builds it and
+records what upstream records, because the server uses it for more than the scrape (the
+warning about one address holding too many connections is logged from it). A GRASP-P node
+with metrics on and no bind address collects in memory and serves nowhere; one line at
+startup says so and names the setting. Upstream's own line, "Metrics enabled on /metrics
+endpoint", is still printed on a GRASP-P node and is wrong there. The setting is
+node-local and not part of `policy_fingerprint`.
 
 For an operator: loopback is not authentication, any local process can read the scrape;
 and upstream's `scripts/verify-deployment.sh` requests `/metrics` on the public listener,
@@ -195,9 +197,78 @@ so it needs `VERIFY_METRICS=false` against a GRASP-P node. Upstream's
 `docs/reference/deployment-contract.md` says to set that variable only when metrics are
 disabled; on a GRASP-P node it is needed with metrics on.
 
-Still open, as the second part of issue 24: six metric families of upstream's sync code
-carry the URL of each relay the node dials as a label value, and they are in this scrape
-unchanged.
+**No relay is named by its URL in that scrape.** Six metric families of upstream's sync
+code label each series with the URL of the relay it is about, and do so for every relay
+the node dials: `ngit_sync_relay_connected`, `ngit_sync_connection_attempts_total`,
+`ngit_sync_relay_status`, `ngit_sync_relay_failures`, `ngit_sync_policy_refusals_total`
+and `ngit_sync_hydration_events_total`. Most of those relays are named by customers'
+events, and a scrape is shipped off the host into a monitoring system. Upstream's
+`src/sync/metrics.rs` is left as it is, byte for byte; `src/grasp_p/relay_labels.rs`
+rewrites the gathered families before they are encoded.
+
+- **The seam** is in `Metrics::render` (`src/metrics/mod.rs`): one optional field,
+  `relay_labels`, set through the builder `with_relay_labels`, and one statement between
+  `REGISTRY.gather()` and the encoder. `src/server.rs` passes
+  `RelayLabels::from_config(&config)` where it builds `Metrics`. That is `None` unless
+  GRASP-P is enabled, and with `None` the render is upstream's. The registry and
+  upstream's recorders are untouched: the URLs stay in the process, as they do in
+  upstream, and are not written out.
+- **It goes by the name of the label**, `relay`, in whatever family that occurs, so a
+  family upstream labels with `relay` later is covered without a new seam. A label of
+  another name that held a relay URL would not be; the integration test below fails on
+  `ws://` or `wss://` anywhere in the scrape of a pair.
+- **A configured peer is renamed, every other relay is dropped.** A sample whose `relay`
+  is one of this node's peers gets an alias, `peer-1`, `peer-2` and so on; any other
+  sample that has the label is removed. The aggregate series have no relay label and
+  are untouched. The same process serves the node's public repositories, so the relays
+  those bring in lose their per-relay series as well.
+- **The peers** are the entries of `NGIT_GRASP_P_SYNC_PEER_URLS`, numbered in their
+  order, and then the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, unless the list already
+  names it. The bootstrap relay is one of them because a pair can be wired through it
+  alone: upstream dials it at startup, it is sent the private filters, and
+  `policy_fingerprint` takes the pair's other node from it. If only the list counted,
+  the peer of such a node would be dropped from its scrape and `NgitSyncPeerDisconnected`
+  would have nothing to read. Both settings are the operator's, so an alias tells nothing
+  a customer chose. Relays configured for another purpose (the user index, the Sync+
+  fallbacks) get no alias, which keeps the peer alert about the pair. On a pair the one
+  peer is `peer-1` on both nodes, whichever setting names it. A peer named by the
+  bootstrap setting alone is dialled at startup and not again after its session ends; the
+  missing-series half of the alert is what reports that.
+- **Each setting is read the way the sync code reads it**: a list entry through
+  `normalize_relay_url`, the own-address exclusion of `configured_peer_relay_urls` and
+  `canonical_relay_key`; the bootstrap URL through `canonical_relay_key` alone. The label
+  upstream writes is that key, and it is compared as it stands. A key has one alias, so
+  two series of one family cannot end up with the same labels; a label in any other
+  spelling is dropped, never folded in. The unit test
+  `aliases_exist_for_exactly_the_relays_sync_dials_as_peers` holds the two readings
+  together.
+- **A family left with no sample is removed.** The registry prunes empty families before
+  it hands them over, and the text encoder answers one with an error, which `render`
+  unwraps.
+
+At an upstream sync: upstream rewrote `Metrics::render` once before, so check that the
+statement still sits between gather and encode. If `register_relay` or the bootstrap
+registration in `src/sync/mod.rs` changes how a relay's key is formed, the labels stop
+matching and the peers' series drop out of the scrape: the integration test fails and
+nothing is disclosed.
+
+Check the label names as well: the rewrite knows `relay` and no other. In v3.0.7 no other
+label that reaches a scrape holds a relay, an address, a key or a repository; every other
+value the server sets is a fixed word, a build constant or an event kind number. Two
+things would change that, and each needs a decision before the sync is merged: a caller
+for `BandwidthTracker::record_transfer`, which would put up to ten repository identifiers
+in `ngit_git_top_repos_bytes{repo}` (it has none today), and a caller for a recorder that
+takes free text and has none today (`record_message_received`, `record_message_sent`,
+`record_event_rejected`). The pair test looks for `ws://`, `wss://` and the addresses of
+the relays it started, so it would not notice either.
+
+For an operator, the alias mapping and what can no longer be read per relay are in
+`docs/grasp-p/ops/runbook.md`, "Relays in the scrape", and the peer alert in
+`docs/grasp-p/ops/prometheus-alerts.yaml` selects the alias and also fires when `peer-1`
+has no series. One of the six families never reaches a scrape in the first place: upstream
+registers `ngit_sync_relay_failures` and nothing calls `record_failure_count`. The alert
+rule that read it is removed; upstream's `docs/explanation/monitoring.md` still lists
+the series.
 
 Tests: `metrics_are_not_served_on_the_public_listener` in `private_repos` fails when a
 sync drops either seam (the public half needs the condition in `src/http/mod.rs`, the
@@ -208,6 +279,21 @@ The rules of the address, the routing and the `Host` header have unit tests in
 `src/grasp_p/metrics_endpoint.rs` and `src/config.rs`. No test puts the node under a base
 path, none reaches the listener from an address that is not loopback, and none waits out
 the timeout.
+
+`scrape_never_names_a_relay` in `private_two_node` fails when a sync drops the relay-label
+seam in `src/metrics/mod.rs` or in `src/server.rs`: on both nodes of a replicating pair
+the scrape must show the peer as `relay="peer-1"`, connected, with a successful dial
+counted and a health state, and must hold neither the peer's address nor `ws://` nor
+`wss://`. One node also holds a public repository whose announcement names a third relay:
+that relay must be counted among the tracked relays and have neither a series nor its
+address in the scrape. It is the only test that puts a public repository on a node with
+GRASP-P enabled. The rules of the rewrite have unit tests in
+`src/grasp_p/relay_labels.rs`, on a registry of their own and never the global one. One
+of them reads upstream's `src/sync/metrics.rs` as text and fails when the number of
+families labelled with a relay, or of methods that take one, changes, because the lists
+the other tests drive are kept by hand. No test runs a pair wired through the bootstrap
+relay alone; the unit test `the_bootstrap_relay_is_a_peer_when_no_list_names_it` covers
+that mapping.
 
 ## Decisions made during the port
 

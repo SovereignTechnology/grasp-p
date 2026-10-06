@@ -15,9 +15,26 @@
 # 404. It serves the scrape on the loopback address set in
 # NGIT_GRASP_P_METRICS_BIND (for example 127.0.0.1:9464, path /metrics), and
 # on no address at all while that setting is unset, which is the default:
-# then none of the rules below can fire. Loopback is not authentication, so
-# run the collector on the node's host or in its network namespace. See the
-# runbook, §3 "Where the scrape comes from".
+# then no rule below has a series to read, and the only thing that can fire
+# is the absent() arm of NgitSyncPeerDisconnected, for want of the peer's
+# series. Loopback is not authentication, so run the collector on the node's
+# host or in its network namespace. See the runbook, §3 "Where the scrape
+# comes from".
+#
+# Relay labels: the scrape of a GRASP-P node names no relay by its URL. The
+# `relay` label of the ngit_sync_* series holds an alias, peer-1, peer-2,
+# ..., for the relays the operator configured as this node's peers: the
+# entries of NGIT_GRASP_P_SYNC_PEER_URLS in the order written, then the relay
+# in NGIT_SYNC_BOOTSTRAP_RELAY_URL unless the list already names it. On a
+# pair, peer-1 on node A is node B and peer-1 on node B is node A; the
+# `instance` label says which node a series came from, once each node's
+# scrape sets its own (each is scraped on a loopback address, which can be
+# the same on both). Every other relay the node dials has no series of its
+# own in the scrape and is counted only in the aggregates
+# (ngit_sync_relays_tracked_total, ngit_sync_relays_connected_total,
+# ngit_sync_naughty_relays_total; ngit_sync_relays_dead_total is never
+# updated by the server and reads 0). See the runbook, §3 "Relays in the
+# scrape".
 #
 # NOT scrapeable (covered at the bottom of this file):
 #   * NIP-11 private_repos.policy_fingerprint parity between peers
@@ -222,20 +239,47 @@ groups:
   - name: ngit-grasp-sync
     interval: 30s
     rules:
-      # A configured peer disconnected. ngit_sync_relay_connected is a state
-      # gauge per relay: 0=disconnected, 1=connecting, 2=syncing,
-      # 3=connected, 4=connected_historic_sync_failures. == 0 for 10m means
-      # the peer is down or unreachable, not just re-handshaking.
+      # A configured peer is disconnected, or the node has no series for it.
+      # ngit_sync_relay_connected is a state gauge per relay: 0=disconnected,
+      # 1=connecting, 2=syncing, 3=connected,
+      # 4=connected_historic_sync_failures. == 0 for 10m means the peer is
+      # down or unreachable, not just re-handshaking. The selector takes the
+      # peers only (see "Relay labels" at the top of this file).
+      #
+      # The absent() arm: `== 0` cannot fire on a series that is not there,
+      # and a peer has none while the node does not track it. Its URL is
+      # missing or wrong in both settings, or the node refused the address,
+      # or the node stopped tracking the relay. Without the arm each of those
+      # reads as a healthy peer.
+      #   * The arm names peer-1, the one peer of a pair. A node with more
+      #     peers repeats it per alias: `or absent(...{relay="peer-2"})`.
+      #   * absent() looks at all the series the evaluating server holds, not
+      #     at one node. With a collector per node, which is what a loopback
+      #     endpoint leads to, that is one node. Where a single server
+      #     evaluates these rules for both nodes, repeat the arm per node
+      #     with an `instance` matcher:
+      #     `or absent(...{relay="peer-1",instance="<node A>"})
+      #      or absent(...{relay="peer-1",instance="<node B>"})`.
+      #     Otherwise the arm fires only when both nodes lack the series.
+      #   * The alert from the arm carries the labels of its matchers only:
+      #     `relay`, and `instance` where the arm has that matcher.
+      #   * The arm also fires while the node is not scraped at all.
+      #   * A node that runs without a peer has no peer-1. A node with
+      #     GRASP-P off labels these series with relay URLs, so it has no
+      #     peer-1 either. On both the arm fires all the time: drop the
+      #     rule there.
+      # $value tells the two arms apart, and the description prints it: 0 is
+      # a tracked peer that is disconnected, 1 is a peer with no series.
       - alert: NgitSyncPeerDisconnected
-        expr: ngit_sync_relay_connected == 0
+        expr: ngit_sync_relay_connected{relay=~"peer-.+"} == 0 or absent(ngit_sync_relay_connected{relay="peer-1"})
         for: 10m
         labels:
           severity: warning
           service: ngit-grasp
           component: grasp-p-sync
         annotations:
-          summary: "Sync peer {{ $labels.relay }} disconnected for 10m"
-          description: "ngit_sync_relay_connected{relay={{ $labels.relay }}} == 0 for 10m. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog; check peer process, DNS/TLS (see ngit_sync_naughty_relay_info), and network path."
+          summary: "Sync peer {{ $labels.relay }} disconnected or missing from the scrape for 10m"
+          description: "Alert value {{ $value }}. For 10m, ngit_sync_relay_connected for {{ $labels.relay }} has been 0 (alert value 0: the peer is tracked and disconnected) or absent from the scrape (alert value 1: the node tracks no such peer, or is not scraped). {{ $labels.relay }} is an alias, not a URL: on a pair, peer-1 is the other node. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog. Value 0: check the peer process, DNS/TLS and the network path; the node's own log names the relay and its last error. Value 1: check NGIT_GRASP_P_SYNC_PEER_URLS and NGIT_SYNC_BOOTSTRAP_RELAY_URL on the node, and that the node is scraped."
           runbook: "docs/grasp-p/ops/runbook.md#sync-peer-disconnected"
 
       # All tracked peers disconnected simultaneously — almost always a LOCAL
@@ -252,21 +296,15 @@ groups:
           description: "ngit_sync_relays_connected_total == 0 while peers are configured, for 10m. The node is fully partitioned from its replication set; treat as a local outage until proven otherwise."
           runbook: "docs/grasp-p/ops/runbook.md#sync-all-disconnected"
 
-      # Consecutive-failure count growth. ngit_sync_relay_failures is a GAUGE
-      # (consecutive failures per relay, reset on success), so use delta() to
-      # detect growth — rate()/increase() are counter semantics and misreport
-      # on gauge resets.
-      - alert: NgitSyncPeerFailuresGrowing
-        expr: delta(ngit_sync_relay_failures[30m]) >= 3
-        for: 30m
-        labels:
-          severity: warning
-          service: ngit-grasp
-          component: grasp-p-sync
-        annotations:
-          summary: "Sync failures for {{ $labels.relay }} still climbing ({{ $value }} in 30m)"
-          description: "Consecutive failure count for {{ $labels.relay }} grew by >= 3 over 30m and kept growing for another 30m without a successful reset. Precedes the peer being marked dead (ngit_sync_relay_status == 4)."
-          runbook: "docs/grasp-p/ops/runbook.md#sync-failures-growing"
+      # No rule reads ngit_sync_relay_failures. The server registers that
+      # gauge and nothing sets it, so the series is in no scrape. The rule
+      # that stood here, NgitSyncPeerFailuresGrowing, read it and could never
+      # fire; with an absent() arm it would fire for good. A peer whose dials
+      # keep failing is disconnected, and NgitSyncPeerDisconnected covers
+      # that. The health of a peer is in
+      # ngit_sync_relay_status{relay="peer-N"} (1=healthy, 2=disconnected,
+      # 3=degraded, 4=dead, 5=rate_limited, 6=policy_limited), which the
+      # server sets on every health check.
 
 # =============================================================================
 # NOT SCRAPEABLE: policy_fingerprint parity + 30641 manifest parity

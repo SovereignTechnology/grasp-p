@@ -238,8 +238,10 @@ curl -s 127.0.0.1:9464/metrics | grep -c '^ngit_private_'
   still collected in memory, and the startup log says
   `Private metrics are collected and served nowhere`. Every rule in
   [prometheus-alerts.yaml](prometheus-alerts.yaml) reads this scrape, so
-  without the endpoint none of them can fire. The watchdog (below) covers
-  divergence between the two nodes and nothing else.
+  without the endpoint none of them has a series to read. The one thing that
+  then fires is the half of `NgitSyncPeerDisconnected` that reports a peer
+  with no series. The watchdog (below) covers divergence between the two
+  nodes and nothing else.
 - **One startup line is upstream's and reads wrong here.** `Metrics enabled on
   /metrics endpoint` is still logged on a GRASP-P node. It means only that
   metrics are collected; where they are served is in the two lines named
@@ -262,16 +264,84 @@ curl -s 127.0.0.1:9464/metrics | grep -c '^ngit_private_'
   put a reverse proxy in front of the endpoint; the nginx example
   ([nginx-upload-zones.conf](nginx-upload-zones.conf)) answers `/metrics`
   with 404.
-- **Relay URLs are still in the scrape.** Six `ngit_sync_*` families carry
-  the URL of each relay the node dials as the `relay` label. Removing them
-  is a separate change that follows this one; until then, treat the scrape
-  as naming the node's peers.
+- **No relay is named by its URL.** The `relay` label holds `peer-1`,
+  `peer-2`, … for the peers you configured and nothing for any other relay;
+  see [Relays in the scrape](#relays-in-the-scrape).
 - **`scripts/verify-deployment.sh`** (upstream's) requests `/metrics` on the
   public listener and fails against a GRASP-P node. Run it with
   `VERIFY_METRICS=false`, and check the endpoint with the `curl` above.
 
 With GRASP-P disabled none of this applies: the setting is ignored and
 `/metrics` is upstream's public route.
+
+### Relays in the scrape
+
+The scrape of a GRASP-P node names no relay by its URL. Upstream labels six
+families of sync series with the URL of the relay each one is about
+(`ngit_sync_relay_connected`, `ngit_sync_connection_attempts_total`,
+`ngit_sync_relay_status`, `ngit_sync_relay_failures`, which the server never
+sets, `ngit_sync_policy_refusals_total`, `ngit_sync_hydration_events_total`),
+and does so for every relay the node dials. Most of those relays are named by
+customers' repositories, and a scrape is shipped off the host into a
+monitoring system. So the `relay` label is rewritten before a scrape is sent:
+
+- **Your configured peers appear under an alias**: `peer-1`, `peer-2`, … The
+  peers are the entries of `NGIT_GRASP_P_SYNC_PEER_URLS`, numbered in the
+  order you wrote them, and then the relay in
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, which takes the next number unless the
+  list already names it. In the list, different spellings of one relay
+  (`relay.example/`, `https://relay.example`, `wss://relay.example`) are one
+  peer, and an entry that names the node itself takes no number. The
+  bootstrap setting takes a `ws://` or `wss://` URL or a bare host; an
+  `http://` or `https://` value there is never dialled (the startup log says
+  `Rejecting invalid bootstrap relay target`) and gets no alias.
+- **On a pair the alias is `peer-1` on both nodes.** `peer-1` on node A is
+  node B, and `peer-1` on node B is node A, whichever of the two settings
+  names the other node. Prometheus's `instance` label says which node a
+  series came from, and with that which node its `peer-1` is. Each node is
+  scraped on a loopback address, so where both use the same port the default
+  `instance` is the same on both: give each node its own `instance` (or
+  another label) in its scrape configuration.
+- **Every other relay has no series of its own in the scrape**: the relays
+  that customers' repositories name, the user-index relays, the Sync+
+  fallbacks. The node serves its public repositories from the same process,
+  so the relays those bring in are left out as well. All of them are still
+  counted in three aggregates, which carry no relay label:
+  `ngit_sync_relays_tracked_total`, `ngit_sync_relays_connected_total` and
+  `ngit_sync_naughty_relays_total`. `ngit_sync_relays_dead_total` is in the
+  scrape as well, but the server never updates it and it reads 0.
+- **What you can no longer read from the metrics**, for every relay that is
+  not a configured peer: whether it is connected, how its dials went, its
+  health state, which subscriptions it refused and how many events it
+  delivered. The sums over those relays go with them, because their samples
+  are left out whole: `ngit_sync_connection_attempts_total`,
+  `ngit_sync_policy_refusals_total` and `ngit_sync_hydration_events_total`
+  count the peers only, and so does any count of `ngit_sync_relay_status` or
+  `ngit_sync_relay_connected` by value. How many relays are degraded, dead,
+  rate limited or policy limited is therefore no longer in the scrape. Two
+  panels of upstream's Grafana dashboard
+  (`docs/grafana/ngit-grasp-dashboard.json`), "Relay Health Distribution" and
+  "Connection Attempts (5m)", are built on these series, and so are the
+  queries and example alerts in `docs/explanation/monitoring.md` that count
+  or sum them (the counts by `ngit_sync_relay_status`, the connection
+  success rate, `SyncManyDegraded`): on a GRASP-P node they show the peers
+  only. The node's log names every relay by its URL:
+  `journalctl -u ngit-grasp | grep -i relay`.
+- **Changing the list renumbers.** Insert, remove or reorder entries and the
+  aliases move with them, so the history of `peer-1` then belongs to another
+  relay. Add a new peer at the end of the list. The bootstrap relay is
+  numbered after the list unless the list names it: on a node whose peer is
+  named by `NGIT_SYNC_BOOTSTRAP_RELAY_URL` alone, write that peer into the
+  list first, or the first entry you add becomes `peer-1` and the bootstrap
+  relay moves to `peer-2`.
+
+```bash
+curl -s 127.0.0.1:9464/metrics | grep 'relay="'   # peer-N only, never a URL
+```
+
+The peer alert selects the alias (`relay=~"peer-.+"`); see
+[Sync peer disconnected](#sync-peer-disconnected). With GRASP-P disabled the
+scrape is upstream's, relay URLs included.
 
 ### Mirror lag
 
@@ -521,14 +591,57 @@ ToS posture).
 
 ### Sync peer disconnected
 
-**Alert:** `NgitSyncPeerDisconnected` — `ngit_sync_relay_connected == 0` for 10m.
+**Alert:** `NgitSyncPeerDisconnected` —
+`ngit_sync_relay_connected{relay=~"peer-.+"} == 0 or absent(ngit_sync_relay_connected{relay="peer-1"})`
+for 10m.
 
-For a two-node GRASP-P pair this halts 30640/30641 sync and grows the
-mirror backlog. Remediate: peer process (`systemctl status ngit-grasp` on
-the peer), DNS/TLS (`curl -sI https://<peer>/`), the relay's last error in
-`ngit_sync_naughty_relay_info`, egress firewall. Outbound private-sync
-connections are initiated ONLY to `NGIT_GRASP_P_SYNC_PEER_URLS`
-(src/config.rs:714–721) — verify it is set and correct on both nodes.
+The alert names the peer by its alias, never by its URL
+([Relays in the scrape](#relays-in-the-scrape)): on a pair `peer-1` is the
+other node. With value 0 the alert's `instance` label is the node that
+reports; with value 1 the alert has the `relay` label and no `instance`,
+unless you gave that half an `instance` matcher (below). For a two-node
+GRASP-P pair this halts 30640/30641 sync and grows the mirror backlog. The
+alert's value, which its description starts with, says which half fired:
+
+- **Value 0: the peer is tracked and disconnected.** Remediate: peer process
+  (`systemctl status ngit-grasp` on the peer), DNS/TLS
+  (`curl -sI https://<peer>/`), egress firewall, and the relay's last error
+  in this node's log, which names it by URL
+  (`journalctl -u ngit-grasp | grep '<peer host>'`). A DNS or certificate
+  failure also puts the relay on the naughty list: the log line
+  `added to naughty list` names it, and `ngit_sync_naughty_relays_total`
+  counts it by category.
+- **Value 1: the scrape has no `peer-1` series.** The node does not track the
+  peer, or is not scraped at all. The node dials the relays in
+  `NGIT_GRASP_P_SYNC_PEER_URLS` and the one in
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, and keeps dialling only those in the
+  list: verify that the list names the peer, correctly, on both nodes.
+  `Skipping private-repo peer relay` or
+  `Rejecting event-directed sync relay target` in the log means the node
+  refused the address: it is not `wss://`, it is not a public address, or
+  its name did not resolve when the node tried. The node tries again every
+  minute. Then check that the collector reaches the endpoint
+  ([Where the scrape comes from](#where-the-scrape-comes-from)). A node with
+  no peer configured, or with GRASP-P off, never has the series: remove the
+  rule there.
+
+A peer that only `NGIT_SYNC_BOOTSTRAP_RELAY_URL` names is dialled once, at
+startup. If that dial fails (value 0), or its session ends later and the node
+stops tracking it (value 1), the node does not dial it again until it
+restarts, unless a public repository on the node gives sync a reason to. Name
+the peer in `NGIT_GRASP_P_SYNC_PEER_URLS` as well, on both nodes, and restart.
+
+The half that fires on a missing series looks at everything the evaluating
+Prometheus holds. Where one server evaluates the rules for both nodes, repeat
+that half per node with an `instance` matcher, as the comment on the rule
+says; a node with more than one peer repeats the half per alias.
+
+There is no alert on a peer's consecutive failures. The gauge for it,
+`ngit_sync_relay_failures`, is registered by the server and never set, so it
+is in no scrape, and the former `NgitSyncPeerFailuresGrowing` could not
+fire. A peer whose dials keep failing is disconnected and raises this alert;
+its health is in `ngit_sync_relay_status{relay="peer-1"}` (1 healthy,
+2 disconnected, 3 degraded, 4 dead, 5 rate limited, 6 policy limited).
 
 ### Sync all disconnected
 
@@ -538,15 +651,6 @@ for 10m (critical).
 Almost always a LOCAL outage (network, DNS, sync subsystem), not a mass peer
 failure. Remediate: local egress, resolver, and sync logs:
 `journalctl -u ngit-grasp | grep -i sync`.
-
-### Sync failures growing
-
-**Alert:** `NgitSyncPeerFailuresGrowing` — `delta(ngit_sync_relay_failures[30m]) >= 3` and still growing.
-
-`ngit_sync_relay_failures` is a gauge of consecutive failures (reset on
-success) — `delta()`, not `rate()`, is correct. Precedes the peer being
-marked dead (`ngit_sync_relay_status == 4`). Same checks as
-[Sync peer disconnected](#sync-peer-disconnected).
 
 ### Watchdog
 

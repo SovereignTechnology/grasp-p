@@ -68,14 +68,19 @@ push; `git status` before every commit.
   `authorize_list` in `src/grasp_p/blossom_auth.rs` (no `x` or `a` tag needed, the signer must be
   the pubkey in the path, every refusal is one identical 401). The server now accepts the
   authorization token in standard base64 and in base64url; the client still sends standard.
-- **#24** `/metrics` off by default on GRASP-P nodes, loopback only, no relay URLs in labels.
-  Listener part done: with GRASP-P enabled the public listener answers `/metrics` like any
-  unknown path, and the scrape is served by a listener of its own, only on the loopback address
-  in `NGIT_GRASP_P_METRICS_BIND` (unset by default: collected, served nowhere), with no CORS
-  header (`src/grasp_p/metrics_endpoint.rs`; `SEAMS.md`, "Metrics leave a GRASP-P node on
-  loopback only"). The node that hosts private repositories serves public ones in the same
-  process, so their `/metrics` is closed with it. The label scrub follows as its own change:
-  until then the scrape still carries the URL of every relay the node dials.
+- **#24** (done) `/metrics` off by default on GRASP-P nodes, loopback only, no relay URLs in
+  labels. With GRASP-P enabled the public listener answers `/metrics` like any unknown path,
+  and the scrape is served by a listener of its own, only on the loopback address in
+  `NGIT_GRASP_P_METRICS_BIND` (unset by default: collected, served nowhere), with no CORS
+  header (`src/grasp_p/metrics_endpoint.rs`). The node that hosts private repositories serves
+  public ones in the same process, so their `/metrics` is closed with it. In that scrape no
+  relay is named by its URL (`src/grasp_p/relay_labels.rs`): the configured peers, which are
+  the entries of `NGIT_GRASP_P_SYNC_PEER_URLS` and the bootstrap relay, appear as `peer-1`,
+  `peer-2`, ..., and the per-relay series of every other relay are left out, those of the
+  public service included; the aggregates stay. The peer alert selects the alias and also
+  fires when the peer has no series. Both parts are in `SEAMS.md`, "Metrics leave a GRASP-P
+  node on loopback only". Found on the way: upstream never sets `ngit_sync_relay_failures`,
+  so the alert rule on it could not fire and is removed.
 - **#25** per-tenant claim/file-count caps; **#26** mirror fairness; **#20** purgatory SSRF and
   **#3** DNS rebinding (both via `outbound.rs`); **#16** announcement-indexer pin + leak canary.
 - **#1** offboard: kind-5 tombstone frees alias, keys, ledger; retention purge (customers leave).
@@ -314,9 +319,12 @@ so it needs the maintainer's go-ahead at the time.
 - Every MR: CI pipeline green on `ci-grasp` (fmt, clippy, unit, integration, e2e).
 - M2: the four GRASP-P suites + upstream's suite + cord-git e2e (81+) against the v3 binary.
 - M3 #14: anonymous and wrong-key `GET /list/<pk>` return identical 401; tenant-signed returns the list.
-- M3 #24, listener part: on a GRASP-P node `GET`, `HEAD` and `POST /metrics` on the public port
-  answer like an unknown path; the loopback endpoint serves the scrape with no CORS header; a
-  node whose metrics address is taken does not start.
+- M3 #24: on a GRASP-P node `GET`, `HEAD` and `POST /metrics` on the public port answer like an
+  unknown path; the loopback endpoint serves the scrape with no CORS header; a node whose
+  metrics address is taken does not start; on both nodes of a replicating pair the scrape shows
+  the peer as `relay="peer-1"`, connected, and holds neither the peer's address nor `ws://`
+  nor `wss://`; a relay that only a public repository on one of the nodes names is counted
+  there as tracked and has no series in the scrape.
 - M4: e2e scenarios that fail before each change. A hostile server serving an older state is
   refused. A stolen hosting key cannot add a writer that members accept. A second device with
   only the signer recovers every repo from the key list. A rotation killed mid-way is finished
