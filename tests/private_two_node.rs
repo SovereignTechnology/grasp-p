@@ -395,13 +395,25 @@ async fn wait_for_metrics(
     bound: Duration,
     check: impl Fn(&ParsedMetrics) -> bool,
 ) -> bool {
+    wait_for_scrape(relay, bound, check).await.is_some()
+}
+
+/// Like [`wait_for_metrics`], and hands back the scrape that passed, so
+/// that what a test asserts next is read from that answer and not from a
+/// later one.
+async fn wait_for_scrape(
+    relay: &TestRelay,
+    bound: Duration,
+    check: impl Fn(&ParsedMetrics) -> bool,
+) -> Option<String> {
     let deadline = Instant::now() + bound;
     loop {
-        if check(&ParsedMetrics::parse(&relay.grasp_p_metrics().await)) {
-            return true;
+        let scrape = relay.grasp_p_metrics().await;
+        if check(&ParsedMetrics::parse(&scrape)) {
+            return Some(scrape);
         }
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -2414,4 +2426,143 @@ async fn exit14_peer_down_at_first_dial_is_redialled() {
 
     a.stop().await;
     b.stop().await;
+}
+
+// ============================================================================
+// The scrape of a replicating pair names no relay
+// ============================================================================
+
+/// The value of every `relay` label in a scrape.
+fn relay_label_values(scrape: &str) -> Vec<&str> {
+    scrape
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once("relay=\"")?.1.split_once('"'))
+        .map(|(value, _)| value)
+        .collect()
+}
+
+/// Each node of a pair dials the other, so upstream's sync series would
+/// carry the other node's address as a label. The scrape of either node has
+/// to show that peer under its alias, connected, and no relay URL anywhere.
+/// The first half is what tells a working rewrite from a scrape that only
+/// lost its series; the second is what a family upstream labels with a relay
+/// later would break if it got past the rewrite. A also dials a relay that
+/// only a public repository names, as a customer's would: that relay must
+/// have no series in A's scrape and still be counted there.
+#[tokio::test]
+async fn scrape_never_names_a_relay() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    // One registration from A to B, so that the link whose series are read
+    // below has carried events.
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    assert!(
+        wait_for_event_on_relay(
+            b.url(),
+            Filter::new()
+                .kind(Kind::Custom(30640))
+                .author(tenant.public_key())
+                .identifier(&alias),
+            REPLICATION_BOUND,
+        )
+        .await,
+        "the 30640 must replicate to B within {REPLICATION_BOUND:?}"
+    );
+
+    // A relay that only an event names: a public repository on A lists a
+    // third relay, as any customer's announcement may. A files that relay
+    // like any other, so its series are in A's registry from the log line
+    // on, and their absence from the scrape below is the rewrite's doing.
+    let stranger = TestRelay::start().await;
+    let stranger_address = stranger.domain();
+    let maintainer = Keys::generate();
+    let (_announcement, _repository) = setup_announcement_on_relay(
+        &a,
+        &maintainer,
+        &[domain_refs[0], stranger_address.as_str()],
+        "scrape-names-no-relay",
+    )
+    .await;
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("Registered new relay for tracking") && line.contains(&stranger_address)
+        })
+        .await,
+        "A must track the relay at {stranger_address} that the announcement names"
+    );
+
+    // On each node the other one is its only configured peer, named by the
+    // peer list and by the bootstrap setting alike: `peer-1` on both.
+    for (name, node, peer, tracked_at_least) in [("B", &b, &a, 1), ("A", &a, &b, 2)] {
+        let Some(scrape) = wait_for_scrape(node, REPLICATION_BOUND, |m| {
+            m.relay_connected("peer-1") == Some(true)
+                && m.counter(
+                    "ngit_sync_connection_attempts_total",
+                    &[("relay", "peer-1"), ("result", "success")],
+                )
+                .is_some_and(|dials| dials >= 1)
+                && m.gauge("ngit_sync_relay_status", &[("relay", "peer-1")])
+                    .is_some()
+        })
+        .await
+        else {
+            // What the node did report tells a peer that never connected,
+            // whose series are there with other values, from a peer whose
+            // series were dropped, which only the aggregates still count.
+            let last = node.grasp_p_metrics().await;
+            let sync_series: Vec<&str> = last
+                .lines()
+                .filter(|line| {
+                    line.starts_with("ngit_sync_relay")
+                        || line.starts_with("ngit_sync_connection_attempts_total")
+                })
+                .collect();
+            panic!(
+                "node {name}: within {REPLICATION_BOUND:?} the scrape must show the peer as \
+                 relay=\"peer-1\", connected, with a successful dial counted and a health \
+                 state; it showed {sync_series:#?}"
+            );
+        };
+
+        let peer_address = peer.domain();
+        assert!(
+            !scrape.contains(&peer_address),
+            "node {name}: the scrape must not hold its peer's address {peer_address}"
+        );
+        assert!(
+            !scrape.contains(&stranger_address),
+            "node {name}: the scrape must not hold {stranger_address}, which only an event names"
+        );
+        for scheme in ["ws://", "wss://"] {
+            assert!(
+                !scrape.contains(scheme),
+                "node {name}: the scrape must not hold a relay URL ({scheme})"
+            );
+        }
+        let named = relay_label_values(&scrape);
+        assert!(
+            !named.is_empty() && named.iter().all(|value| *value == "peer-1"),
+            "node {name}: every relay label must be the alias of the one peer; got {named:?}"
+        );
+        // The aggregate series carry no relay label and stay as they were.
+        // On A the count covers the relay the announcement names, which has
+        // no series of its own in this scrape.
+        assert!(
+            ParsedMetrics::parse(&scrape)
+                .relays_tracked_total()
+                .is_some_and(|tracked| tracked >= tracked_at_least),
+            "node {name}: the scrape must still count {tracked_at_least} tracked relay(s) or more"
+        );
+    }
+
+    stranger.stop().await;
+    b.stop().await;
+    a.stop().await;
 }

@@ -26,6 +26,7 @@ pub mod mirror;
 pub mod quota;
 pub mod rate;
 pub mod registration;
+pub mod relay_labels;
 pub mod state_root;
 pub mod write_keys;
 

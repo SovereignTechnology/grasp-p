@@ -169,9 +169,15 @@ impl RelayServer {
         // Initialize metrics if enabled
         let metrics = if config.metrics_enabled {
             info!("Metrics enabled on /metrics endpoint");
-            let m = Arc::new(Metrics::new(
+            let m = Metrics::new(
                 config.metrics_connection_per_ip_abuse_threshold,
                 Some(config.effective_git_data_path()),
+            );
+            // GRASP-P seam: a node with GRASP-P enabled names no relay by
+            // its URL in the scrape. `None` on any other node, whose render
+            // is then upstream's.
+            let m = Arc::new(m.with_relay_labels(
+                crate::grasp_p::relay_labels::RelayLabels::from_config(&config),
             ));
             info!("Repository count will be updated on each metrics request");
             Some(m)

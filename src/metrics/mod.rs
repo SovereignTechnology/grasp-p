@@ -941,6 +941,9 @@ pub fn record_private_report_event() {
 pub struct Metrics {
     inner: Arc<MetricsInner>,
     render_permit: Arc<tokio::sync::Semaphore>,
+    /// GRASP-P seam: set on a node with GRASP-P enabled, whose scrape must
+    /// not name a relay by its URL (`grasp_p::relay_labels`).
+    relay_labels: Option<Arc<crate::grasp_p::relay_labels::RelayLabels>>,
 }
 
 struct MetricsInner {
@@ -1006,7 +1009,18 @@ impl Metrics {
         Self {
             inner: Arc::new(inner),
             render_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            relay_labels: None,
         }
+    }
+
+    /// GRASP-P seam: have every render rewrite the relay labels. With `None`
+    /// the render stays as it is.
+    pub fn with_relay_labels(
+        mut self,
+        relay_labels: Option<crate::grasp_p::relay_labels::RelayLabels>,
+    ) -> Self {
+        self.relay_labels = relay_labels.map(Arc::new);
+        self
     }
 
     /// Returns the sync metrics if registered.
@@ -1211,6 +1225,12 @@ impl Metrics {
         // Gather and encode metrics
         let encoder = TextEncoder::new();
         let metric_families = REGISTRY.gather();
+        // GRASP-P seam: the scrape of a node with GRASP-P enabled names no
+        // relay by its URL.
+        let metric_families = match &self.relay_labels {
+            Some(relay_labels) => relay_labels.scrub(metric_families),
+            None => metric_families,
+        };
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer).unwrap();
 
