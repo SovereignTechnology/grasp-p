@@ -22,7 +22,8 @@
 Audience: the operator of a public two-node GRASP-P deployment
 (`git.sovit.xyz` / `git.buildinelsalvador.com` shape): YunoHost boxes, nginx
 terminating TLS in front of `ngit-grasp` on `127.0.0.1:7334`, systemd units,
-Prometheus scraping `/metrics`.
+Prometheus scraping the node's loopback metrics endpoint (§3, "Where the
+scrape comes from"; examples below use `127.0.0.1:9464`).
 
 Sibling ops docs (read those first for install detail; this runbook does not
 duplicate them):
@@ -211,6 +212,67 @@ One subsection per rule in [prometheus-alerts.yaml](prometheus-alerts.yaml);
 anchors match the `runbook:` links in that file. Metrics are defined in
 src/metrics/mod.rs (`ngit_private_*`) and src/sync/metrics.rs (`ngit_sync_*`).
 
+### Where the scrape comes from
+
+A node with GRASP-P enabled does **not** serve `/metrics` on its public
+listener (`127.0.0.1:7334` above). That path is answered there like any
+unknown path: the 404 page, or for an `OPTIONS` request the 204 every path
+gets. The scrape counts private repositories, stored bytes, takedowns and
+reports, and upstream's route answers anyone, with a wildcard CORS header.
+The public repositories of the node are served by the same process, so their
+`/metrics` is closed with it.
+
+The scrape is served by a listener of its own, and only when
+`NGIT_GRASP_P_METRICS_BIND` names a loopback address. Its path is `/metrics`
+whatever `NGIT_BASE_PATH` is:
+
+```bash
+# unit env; an IP address on loopback, never a host name
+NGIT_GRASP_P_METRICS_BIND=127.0.0.1:9464
+systemctl restart ngit-grasp
+journalctl -u ngit-grasp --since -1m | grep 'Private metrics endpoint listening on'
+curl -s 127.0.0.1:9464/metrics | grep -c '^ngit_private_'
+```
+
+- **Unset is the default, and then nothing serves the scrape.** Metrics are
+  still collected in memory, and the startup log says
+  `Private metrics are collected and served nowhere`. Every rule in
+  [prometheus-alerts.yaml](prometheus-alerts.yaml) reads this scrape, so
+  without the endpoint none of them can fire. The watchdog (below) covers
+  divergence between the two nodes and nothing else.
+- **One startup line is upstream's and reads wrong here.** `Metrics enabled on
+  /metrics endpoint` is still logged on a GRASP-P node. It means only that
+  metrics are collected; where they are served is in the two lines named
+  above.
+- **Write the scrape target as the address, or as `localhost:<port>`.** The
+  endpoint answers the scrape only when the request's `Host` header is a
+  loopback address or `localhost`; under any other name for the host it
+  answers 404. This keeps a web page that points its own name at 127.0.0.1
+  from reading the scrape through a browser on the host. A connection that
+  sends no request for 30 seconds is closed, so a collector reconnects
+  between scrapes that are further apart.
+- **A bad value stops the node at startup**, with an error that names the
+  setting: an address that is not loopback, a host name, the setting
+  together with `NGIT_METRICS_ENABLED=false`, or an address that is already
+  in use. A port taken by another service is therefore a new way for a
+  restart to fail; check `journalctl -u ngit-grasp` first when one does.
+- **Loopback is not authentication.** Any process on the host can read the
+  scrape. Run the Prometheus collector on the host, or in the node's own
+  network namespace, and ship from there over a channel you control. Do not
+  put a reverse proxy in front of the endpoint; the nginx example
+  ([nginx-upload-zones.conf](nginx-upload-zones.conf)) answers `/metrics`
+  with 404.
+- **Relay URLs are still in the scrape.** Six `ngit_sync_*` families carry
+  the URL of each relay the node dials as the `relay` label. Removing them
+  is a separate change that follows this one; until then, treat the scrape
+  as naming the node's peers.
+- **`scripts/verify-deployment.sh`** (upstream's) requests `/metrics` on the
+  public listener and fails against a GRASP-P node. Run it with
+  `VERIFY_METRICS=false`, and check the endpoint with the `curl` above.
+
+With GRASP-P disabled none of this applies: the setting is ignored and
+`/metrics` is upstream's public route.
+
 ### Mirror lag
 
 **Alert:** `NgitPrivateMirrorLag` — `ngit_private_mirror_lag_blobs > 0` for 15m.
@@ -223,7 +285,7 @@ the gate suppresses re-enqueue, never the gauge (src/grasp_p/mirror.rs:45–47).
 Remediate:
 
 ```bash
-curl -s 127.0.0.1:7334/metrics | grep '^ngit_private_mirror_failed_total'   # reason mix
+curl -s 127.0.0.1:9464/metrics | grep '^ngit_private_mirror_failed_total'   # reason mix
 journalctl -u ngit-grasp --since -1h | grep 'private mirror'                # full reason strings
 curl -sI https://<peer-host>/<sha256>                                       # peer serves the blob?
 ```
@@ -340,7 +402,7 @@ not chase these to zero; budget headroom is the remedy.
 Remediate:
 
 ```bash
-curl -s 127.0.0.1:7334/metrics | grep '^ngit_private_events_rejected_total'
+curl -s 127.0.0.1:9464/metrics | grep '^ngit_private_events_rejected_total'
 ```
 
 Read the `kind` label mix: a single kind dominating = one misbehaving
@@ -558,7 +620,7 @@ Procedure — verify-then-denylist:
 
    ```bash
    curl -sI https://<node>/<sha256>     # expect HTTP 451
-   curl -s 127.0.0.1:7334/metrics | grep -E 'ngit_private_denylist_(entries|purged_total)'
+   curl -s 127.0.0.1:9464/metrics | grep -E 'ngit_private_denylist_(entries|purged_total)'
    journalctl -u ngit-grasp --since -10m | grep -E 'denylist purge-on-add|GC purged denylisted'
    ```
 

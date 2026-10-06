@@ -15,23 +15,24 @@ Upstream's files carry thin seams only:
 | Upstream file | Seam |
 |---|---|
 | `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` calls `grasp_p::admission::admit` after the blacklist and deletion gates, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
-| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled |
+| `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled; one call to `grasp_p::metrics_endpoint::start` ahead of every other background task, whose error stops startup (see below) |
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
-| `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11 |
+| `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
 | `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion |
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`; `register_relay` builds each connection with `with_duplicate_event_forwarding`; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; peers kept in `check_disconnects` and counted as desired in `retry_disconnected_relays`; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); the id and signature check in `process_event_static_inner` (see below) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
 | `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only when GRASP-P is enabled, after checking their id and signature and skipping the SDK's second copy of a new event; `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
 | `src/sync/filters.rs`, `src/metrics/mod.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
-| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p` / `start_grasp_p_pair_node` |
+| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p` / `start_grasp_p_pair_node`, which both set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
-| `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules |
+| `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
 With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, blob
-routes, sync filters, timers and duplicate forwarding are all gated on it; the GRASP-P
-metrics register lazily on first use. Two seams are deliberately not gated, because each
+routes, sync filters, timers, duplicate forwarding and the metrics endpoint are all gated
+on it, and `/metrics` is upstream's public route; the GRASP-P metrics register lazily on
+first use. Two seams are deliberately not gated, because each
 fixes a flaw in upstream itself: the id and signature check on synced and fetched events,
 and the hardened NIP-11 probe. Both have a section below. Two more things differ from
 upstream with the switch unset, and neither changes what the server does: `--version`
@@ -145,6 +146,68 @@ be offered upstream, not carried here.
 The change and its tests need no other file, so they can be offered upstream as they
 are; offering them is the maintainer's call. When upstream hardens the probe itself, drop
 this seam in the sync that brings the fix.
+
+## Metrics leave a GRASP-P node on loopback only
+
+Upstream serves `/metrics` on the public listener: to any client, for any method, with
+`Access-Control-Allow-Origin: *`. On a node that hosts private repositories the scrape
+counts those repositories, the bytes they hold, and the takedowns and reports received.
+That is not public, so a node with GRASP-P enabled does two things differently.
+
+- **The public listener has no `/metrics` route.** One condition in `src/http/mod.rs`:
+  with `private_repos_enable` set the request falls through to the 404 page of any
+  unknown path. The test is on the path with `NGIT_BASE_PATH` already stripped, so it
+  holds under any base path, and for every method that reaches it: `OPTIONS` is answered
+  earlier, with the 204 every path gets, as in upstream. The public repositories of such
+  a node are served by the same process, so their `/metrics` is closed with it.
+- **The scrape has a listener of its own**, `src/grasp_p/metrics_endpoint.rs`, and only
+  when `NGIT_GRASP_P_METRICS_BIND` names its address. The value must be an IP address on
+  loopback; a host name, any other address, or the setting together with
+  `NGIT_METRICS_ENABLED=false` is a startup error (`Config::validate`, inside the GRASP-P
+  block). The listener answers `GET /metrics` with the render upstream's route uses and
+  everything else with an empty 404, sends no CORS header, and closes a connection whose
+  peer is not loopback. `NGIT_BASE_PATH` does not apply to it. It answers the scrape only
+  when the `Host` header is a loopback address or `localhost`, or is absent: a page from
+  another site that points its own name at 127.0.0.1 is same-origin for a browser on the
+  host and needs no CORS header, and its requests carry that name. A connection that
+  sends no request head for 30 seconds is closed; there is no limit on how many
+  connections are open at once. Its startup line is `Private metrics endpoint listening
+  on <address>`.
+
+`RelayServer` calls `metrics_endpoint::start` once, as the first entry of its background
+tasks. The socket is bound inside that call, so an address already in use makes startup
+fail, and it fails before any other background task is spawned: nothing is left half
+started. That is why the call sits at the head of the list and not beside
+`spawn_background_tasks`. The task is aborted with the others at shutdown, and aborting
+it closes the listener and every open connection.
+
+Collection is untouched: the `Metrics` object is built where and how upstream builds it,
+because the server uses it for more than the scrape (the warning about one address
+holding too many connections is logged from it). A GRASP-P node with metrics on and no
+bind address collects in memory and serves nowhere; one line at startup says so and names
+the setting. Upstream's own line, "Metrics enabled on /metrics endpoint", is still
+printed on a GRASP-P node and is wrong there. The setting is node-local and not part of
+`policy_fingerprint`.
+
+For an operator: loopback is not authentication, any local process can read the scrape;
+and upstream's `scripts/verify-deployment.sh` requests `/metrics` on the public listener,
+so it needs `VERIFY_METRICS=false` against a GRASP-P node. Upstream's
+`docs/reference/deployment-contract.md` says to set that variable only when metrics are
+disabled; on a GRASP-P node it is needed with metrics on.
+
+Still open, as the second part of issue 24: six metric families of upstream's sync code
+carry the URL of each relay the node dials as a label value, and they are in this scrape
+unchanged.
+
+Tests: `metrics_are_not_served_on_the_public_listener` in `private_repos` fails when a
+sync drops either seam (the public half needs the condition in `src/http/mod.rs`, the
+endpoint half the call in `src/server.rs`), `metrics_are_off_without_a_bind` covers the
+node with no endpoint, and `grasp_p_node_refuses_to_start_when_its_metrics_address_is_taken`
+the failed bind. The first of them also sends the endpoint a `Host` that is not local.
+The rules of the address, the routing and the `Host` header have unit tests in
+`src/grasp_p/metrics_endpoint.rs` and `src/config.rs`. No test puts the node under a base
+path, none reaches the listener from an address that is not loopback, and none waits out
+the timeout.
 
 ## Decisions made during the port
 
@@ -269,15 +332,23 @@ features. No package was added.
   the environment map of `nix/module.nix`; it refuses a name in those files that the code
   does not have; and it compares defaults where a file states one it can read. A setting
   added to, renamed in or removed from fewer than four sources fails there.
-- `private_repos`, `private_two_node`, `private_watchdog`: the GRASP-P suites, on the
-  fixture constructors `TestRelay::start_with_grasp_p` and `start_grasp_p_pair_node` in
-  `tests/common/relay.rs` (upstream's file, with those two constructors and the `extra_env`
-  option added). `phase0_gates` runs the stock relay (`TestRelay::start`, `start_with_lmdb`)
-  with GRASP-P off: it checks what GRASP-P needs from upstream. In the pair tests the peer
-  is also the bootstrap relay, except `exit14` in `private_two_node`, and both SSRF guards
-  are switched off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
-  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. No test
-  runs a peer with the guards on.
+- `private_repos`, `private_two_node`, `private_watchdog`: the GRASP-P suites, on the fixture
+  constructors `TestRelay::start_with_grasp_p` and `start_grasp_p_pair_node` in
+  `tests/common/relay.rs` (upstream's file, with those two constructors, the `extra_env` option
+  and the two metrics accessors added). Both constructors set
+  `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0`, so a node they start has a metrics endpoint on a
+  port the kernel picks unless the test overrides the setting or switches GRASP-P off, and the
+  suites read metrics through `TestRelay::grasp_p_metrics`, which finds the port in the node's
+  log and panics unless the answer is a 200. Upstream's `fetch_metrics` returns the body of any
+  status, and several assertions read a missing series as 0, so on the public port of a GRASP-P
+  node they would pass on a 404 page. One use of it is left, in `exit4_disabled_is_noop` of
+  `private_two_node`: that node runs with GRASP-P off and serves upstream's `/metrics`.
+  `phase0_gates` runs the stock relay (`TestRelay::start`, `start_with_lmdb`) with GRASP-P off:
+  it checks what GRASP-P needs from upstream. In the pair tests the peer is also the bootstrap
+  relay, except `exit14` in `private_two_node`, and both SSRF guards are switched off
+  (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. No test runs a
+  peer with the guards on.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync

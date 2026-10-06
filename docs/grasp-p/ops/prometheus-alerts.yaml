@@ -7,9 +7,17 @@
 #     - /etc/prometheus/rules/ngit-grasp-private.yaml
 #
 # Metric sources: src/metrics/mod.rs (ngit_private_*), src/sync/metrics.rs
-# (ngit_sync_*). Scrape target: ngit-grasp /metrics (see
-# docs/how-to/prometheus-setup.md). Runbook anchors reference
-# docs/grasp-p/ops/runbook.md (§3 alert response playbook).
+# (ngit_sync_*). Runbook anchors reference docs/grasp-p/ops/runbook.md (§3
+# alert response playbook).
+#
+# Scrape target: the node's own metrics endpoint, NOT its public listener. A
+# node with GRASP-P enabled answers /metrics on the public listener with a
+# 404. It serves the scrape on the loopback address set in
+# NGIT_GRASP_P_METRICS_BIND (for example 127.0.0.1:9464, path /metrics), and
+# on no address at all while that setting is unset, which is the default:
+# then none of the rules below can fire. Loopback is not authentication, so
+# run the collector on the node's host or in its network namespace. See the
+# runbook, §3 "Where the scrape comes from".
 #
 # NOT scrapeable (covered at the bottom of this file):
 #   * NIP-11 private_repos.policy_fingerprint parity between peers

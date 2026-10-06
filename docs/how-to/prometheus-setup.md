@@ -157,7 +157,7 @@ is not running in a readable Linux cgroup v2 hierarchy.
 
 ## Example Alerts
 
-GRASP-P (private repos) alert rules ship separately: see `docs/grasp-p/ops/prometheus-alerts.yaml`.
+GRASP-P (private repos) alert rules ship separately: see `docs/grasp-p/ops/prometheus-alerts.yaml`. A node with GRASP-P enabled does not serve `/metrics` on its public listener: on such a node the ngit-grasp address in this guide's `curl` line and scrape targets (`localhost:7334`, `host.docker.internal:7334`) becomes the loopback address set in `NGIT_GRASP_P_METRICS_BIND`, with the path `/metrics` whatever `NGIT_BASE_PATH` is, and only a collector on the node's host or in its network namespace can reach it (see "GRASP-P Metrics Endpoint" in `docs/reference/configuration.md`).
 
 Add to your Prometheus alerting rules:
 
