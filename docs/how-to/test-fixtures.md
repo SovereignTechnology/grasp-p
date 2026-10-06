@@ -1,5 +1,39 @@
 # Reliable test fixtures
 
+## Reproduce the Nix CI checks
+
+Branch pushes and pull requests use `.ngit/nix/workflows/rust_ci.yaml`.
+The workflow builds the following root-flake checks independently:
+
+```sh
+nix build .#checks.x86_64-linux.ci-lint
+nix build .#checks.x86_64-linux.ci-tests
+```
+
+`ci-lint` checks formatting and runs Clippy for the whole workspace with
+warnings denied. `ci-tests` builds both binaries and runs workspace unit,
+integration and documentation tests with offline Cargo dependencies. It retains
+the deliberately hostile ambient Git settings used by the previous act CI.
+The fixtures bind local sockets; they do not need external relay access.
+The Nix sandbox isolates those sockets from the host network. PR execution
+adds a Firecracker boundary around the complete provider job.
+
+The test output contains `build/bin/`, test/version reports and `SHA256SUMS`.
+CI exports `build/` as the named `rust-build` archive package. After both checks
+pass, the `ci-verify` app consumes their verified predecessor artifacts,
+checks the binaries and reports against their checksums, and publishes a
+summary. It does not rebuild or execute the transported binaries. Providers
+may run the two checks concurrently on different machines; the consuming job
+receives the same file tree after transport ZIP extraction.
+
+The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
+unchanged. Release validation/crates.io publication and Docker deployment tests
+still use act; migrating their credentials and container daemon requirements
+is separate work. Version-tag pushes retain the existing act release checks
+and do not run the Nix workflow a second time.
+
+## Fixture rules
+
 Run tests through the repository development shell. Keep parallel checks
 enabled: each fixture owns its socket, tasks, subprocesses and temporary data.
 

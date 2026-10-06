@@ -1,0 +1,28 @@
+version: 1
+name: Rust CI
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "work/**"
+  pull_request:
+
+jobs:
+  lint:
+    build: checks.x86_64-linux.ci-lint
+    artifacts:
+      lint: lint.txt
+  tests:
+    build: checks.x86_64-linux.ci-tests
+    artifacts:
+      build:
+        path: build
+        storage: archive
+        package: rust-build
+  verify:
+    needs: [lint, tests]
+    run: apps.x86_64-linux.ci-verify
+    public-outputs:
+      summary: summary.txt

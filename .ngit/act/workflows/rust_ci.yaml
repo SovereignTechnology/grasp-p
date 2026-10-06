@@ -1,17 +1,11 @@
-# Docs-only pushes are skipped: a push runs only when at least one changed
-# file falls outside the ignore list, so mixed code+docs pushes still run.
-# Tag pushes always run regardless of path filters, and pull_request stays
-# unfiltered because ngit-ci does not evaluate PR path filters yet (filtered
-# PR triggers would run unconditionally anyway).
+# Ordinary push and PR checks live in .ngit/nix/workflows/rust_ci.yaml.
+# Retain release validation and credentialed crates.io publication on act until
+# the release workflow is migrated as one reviewed change.
 on:
   push:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - "work/**"
-  pull_request:
+    tags: ["v*"]
 
-name: Rust CI
+name: Rust release validation and crates.io publication
 
 jobs:
   ci:
