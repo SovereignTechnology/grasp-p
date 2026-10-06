@@ -708,7 +708,7 @@ async fn exit3_wrap_admission() {
     // (b) 1059 signed by the registered write key: accepted, stored,
     // quota-charged its event bytes, and served to a completely anonymous
     // client.
-    let ledger_before_wrap = global_ledger_bytes(relay.url()).await;
+    let ledger_before_wrap = global_ledger_bytes(&relay).await;
     assert!(
         ledger_before_wrap > 0,
         "exit3: the registration must already be on the ledger"
@@ -720,7 +720,7 @@ async fn exit3_wrap_admission() {
         "exit3: registered-key 1059 must be accepted; got {message:?}"
     );
     let want = ledger_before_wrap + wrap.as_json().len() as i64;
-    let ledger_after_wrap = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    let ledger_after_wrap = poll_until(want, || global_ledger_bytes(&relay)).await;
     assert_eq!(
         ledger_after_wrap, want,
         "exit3: the stored 1059 must be quota-charged its event bytes"
@@ -806,7 +806,7 @@ async fn exit3_wrap_admission() {
         "exit3: the control 1059 must be accepted; got {message:?}"
     );
     let want = ledger_after_wrap + control.as_json().len() as i64;
-    let ledger_after_control = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    let ledger_after_control = poll_until(want, || global_ledger_bytes(&relay)).await;
     assert_eq!(
         ledger_after_control,
         want,
@@ -1842,11 +1842,7 @@ async fn exit11_registration_conflict_merge() {
     );
 
     // (g) The conflict alert fired for both resolutions.
-    let metrics = common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay.url())
-            .await
-            .expect("metrics scrape"),
-    );
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert!(
         metrics
             .counter(
@@ -1980,13 +1976,9 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     register_alias(&relay, &tenant, &writer, &alias).await;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
     let g0 = global_ledger().await;
     assert!(g0 > 0, "exit12: registration must already be on the ledger");
@@ -2460,13 +2452,9 @@ async fn exit17_eviction_releases_loser_footprint() {
     let t0 = Timestamp::now().as_secs() - 600;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
 
     // The squatter takes the alias (later created_at), stores one real blob,
@@ -2681,13 +2669,9 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
     let t0 = Timestamp::now().as_secs() - 600;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
 
     // Edition 1 (t0) + a 30641 declaring a never-uploaded 4096-byte blob.
@@ -2926,16 +2910,12 @@ async fn exit20_conflict_alert_deduped_on_replay() {
     let t0 = Timestamp::now().as_secs() - 600;
 
     let conflicts = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .counter(
-            "ngit_private_registration_conflicts_total",
-            &[("resolution", "incoming_rejected")],
-        )
-        .unwrap_or(0)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .counter(
+                "ngit_private_registration_conflicts_total",
+                &[("resolution", "incoming_rejected")],
+            )
+            .unwrap_or(0)
     };
 
     let winner_writer = Keys::generate();
@@ -3042,13 +3022,9 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     register_alias(&relay, &tenant_a, &writer_a, &alias_a).await;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
     let poll_gauge = |want: i64| async move {
         for _ in 0..75 {
@@ -3375,13 +3351,9 @@ async fn exit23_duplicate_sha_in_one_edition_charged_once() {
     register_alias(&relay, &tenant, &writer, &alias).await;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
     let g0 = global_ledger().await;
 
@@ -3450,13 +3422,9 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     let alias_y = random_alias();
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
 
     // The squatter holds X (later created_at) and Y.
@@ -3615,13 +3583,9 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     register_alias(&relay, &tenant_a, &writer_a, &alias_a).await;
 
     let global_ledger = || async {
-        common::sync_helpers::ParsedMetrics::parse(
-            &common::sync_helpers::fetch_metrics(relay.url())
-                .await
-                .expect("metrics scrape"),
-        )
-        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-        .unwrap_or(-1)
+        common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+            .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+            .unwrap_or(-1)
     };
     let poll_gauge = |want: i64| async move {
         for _ in 0..75 {
@@ -4195,15 +4159,11 @@ async fn list_blob_shas(relay: &TestRelay, tenant: &Keys) -> Vec<String> {
         .collect()
 }
 
-/// Global-scope ledger gauge from the relay's /metrics endpoint.
-async fn global_ledger_bytes(relay_url: &str) -> i64 {
-    common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay_url)
-            .await
-            .expect("metrics scrape"),
-    )
-    .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
-    .unwrap_or(-1)
+/// Global-scope ledger gauge from the relay's GRASP-P metrics endpoint.
+async fn global_ledger_bytes(relay: &TestRelay) -> i64 {
+    common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await)
+        .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
+        .unwrap_or(-1)
 }
 
 /// Poll `probe` until it yields `want`, returning its last value (200ms step).
@@ -4359,7 +4319,7 @@ async fn exit30_reload_purge_on_add() {
     let writer = Keys::generate();
     let alias = random_alias();
     register_alias(&relay, &tenant, &writer, &alias).await;
-    let g0 = global_ledger_bytes(relay.url()).await;
+    let g0 = global_ledger_bytes(&relay).await;
     assert!(g0 > 0, "exit30: registration must be on the ledger");
 
     let data = blob_bytes(203, 512);
@@ -4395,13 +4355,9 @@ async fn exit30_reload_purge_on_add() {
         !relay_blob_path(&relay, &sha).exists(),
         "exit30: purge must unlink the bytes"
     );
-    let ledger = poll_until(g0, || global_ledger_bytes(relay.url())).await;
+    let ledger = poll_until(g0, || global_ledger_bytes(&relay)).await;
     assert_eq!(ledger, g0, "exit30: the blob charge must be released");
-    let metrics = common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay.url())
-            .await
-            .expect("metrics scrape"),
-    );
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert!(
         metrics
             .counter("ngit_private_denylist_purged_total", &[])
@@ -4559,11 +4515,7 @@ async fn exit32_kind1984_report_intake() {
     );
 
     // Both reports were observed by the intake arm.
-    let metrics = common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay.url())
-            .await
-            .expect("metrics scrape"),
-    );
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert_eq!(
         metrics
             .counter("ngit_private_report_events_total", &[])
@@ -4869,18 +4821,14 @@ async fn exit35_sybil_soak_under_whitelist() {
     }
 
     // Nothing landed: no aliases, no ledger bytes, nothing served.
-    let metrics = common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay.url())
-            .await
-            .expect("metrics scrape"),
-    );
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert_eq!(
         metrics.gauge("ngit_private_aliases_total", &[]),
         Some(0),
         "exit35: the flood must leave zero live aliases"
     );
     assert_eq!(
-        global_ledger_bytes(relay.url()).await,
+        global_ledger_bytes(&relay).await,
         0,
         "exit35: rejected registrations must charge nothing to the ledger"
     );
@@ -4944,18 +4892,14 @@ async fn exit35_sybil_soak_under_whitelist() {
     assert_eq!(status, 200, "exit35: legit blob must be GET-able");
     assert_eq!(body, blob, "exit35: legit blob bytes must round-trip");
 
-    let metrics = common::sync_helpers::ParsedMetrics::parse(
-        &common::sync_helpers::fetch_metrics(relay.url())
-            .await
-            .expect("metrics scrape"),
-    );
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert_eq!(
         metrics.gauge("ngit_private_aliases_total", &[]),
         Some(1),
         "exit35: exactly the legit alias must be live after the flood"
     );
     assert!(
-        global_ledger_bytes(relay.url()).await > 0,
+        global_ledger_bytes(&relay).await > 0,
         "exit35: the legit tenant's footprint must be charged"
     );
     relay.stop().await;
@@ -5014,7 +4958,7 @@ async fn exit35_sybil_soak_under_whitelist() {
 
     // Budget survival: 50 capped tenants consumed ~250 KiB of the 4 MiB
     // global budget — far from exhausted.
-    let global = global_ledger_bytes(relay.url()).await;
+    let global = global_ledger_bytes(&relay).await;
     assert!(
         global > 0 && global < 4_194_304 / 4,
         "exit35: the global budget must survive the capped flood; ledger: {global}"
@@ -5093,7 +5037,7 @@ async fn assert_tagless_wrap_admitted(wrap_kind: u16, extra_env: &[(&str, &str)]
     let alias = random_alias();
     register_alias(&relay, &tenant, &writer, &alias).await;
 
-    let before = global_ledger_bytes(relay.url()).await;
+    let before = global_ledger_bytes(&relay).await;
     assert!(
         before > 0,
         "kind {wrap_kind}: the registration must already be on the ledger"
@@ -5114,7 +5058,7 @@ async fn assert_tagless_wrap_admitted(wrap_kind: u16, extra_env: &[(&str, &str)]
 
     // Quota: a stored wrap is charged its serialized size, exactly once.
     let wrap_bytes = wrap.as_json().len() as i64;
-    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(relay.url())).await;
+    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(&relay)).await;
     assert_eq!(
         after,
         before + wrap_bytes,
@@ -5165,7 +5109,7 @@ async fn exit36_tagless_stream_wrap_legacy_kind() {
          got accepted={accepted} {message:?}"
     );
 
-    let before = global_ledger_bytes(relay.url()).await;
+    let before = global_ledger_bytes(&relay).await;
     let wrap = wrap_event(&writer, 1059);
     let (accepted, message) = publish_with_result(relay.url(), &wrap).await;
     assert!(
@@ -5174,7 +5118,7 @@ async fn exit36_tagless_stream_wrap_legacy_kind() {
          by the private arm; got {message:?}"
     );
     let wrap_bytes = wrap.as_json().len() as i64;
-    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(relay.url())).await;
+    let after = poll_until(before + wrap_bytes, || global_ledger_bytes(&relay)).await;
     assert_eq!(
         after,
         before + wrap_bytes,
@@ -5260,7 +5204,7 @@ async fn exit37_new_wrap_kind_gating_and_ephemerality() {
     // charged in the same window) so it cannot pass vacuously: the final
     // ledger must equal before + the 3359's bytes EXACTLY — a charged
     // ephemeral shows up as the extra term.
-    let before = global_ledger_bytes(relay.url()).await;
+    let before = global_ledger_bytes(&relay).await;
     assert!(
         before > 0,
         "exit37: the registration must already be on the ledger"
@@ -5289,7 +5233,7 @@ async fn exit37_new_wrap_kind_gating_and_ephemerality() {
     );
     let charged_bytes = charged.as_json().len() as i64;
     let want = before + charged_bytes;
-    let after = poll_until(want, || global_ledger_bytes(relay.url())).await;
+    let after = poll_until(want, || global_ledger_bytes(&relay)).await;
     assert_eq!(
         after,
         want,
@@ -5670,4 +5614,253 @@ async fn grasp_p_node_refuses_to_start_on_git_older_than_2_42() {
         stderr.contains("git 2.39.5 is older than 2.42.0") && stderr.contains("never promoted"),
         "the refusal must name the version found, the minimum and the symptom: {stderr}"
     );
+}
+
+// ============================================================================
+// Metrics: off the public listener, on a loopback endpoint
+// ============================================================================
+
+/// One request to the public port: (status, content type, body).
+async fn public_answer(
+    relay: &TestRelay,
+    method: reqwest::Method,
+    path: &str,
+) -> (u16, String, String) {
+    let response = reqwest::Client::new()
+        .request(method, format!("{}{path}", http_base(relay)))
+        .send()
+        .await
+        .expect("public listener transport");
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = response.text().await.unwrap_or_default();
+    (status, content_type, body)
+}
+
+/// Names of the CORS headers a response carries.
+fn cors_header_names(response: &reqwest::Response) -> Vec<String> {
+    response
+        .headers()
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .filter(|name| name.starts_with("access-control-"))
+        .collect()
+}
+
+/// The scrape of a GRASP-P node counts private repositories and stored
+/// bytes, so the public port must not serve it: `/metrics` there is one more
+/// unknown path, whatever the method. The scrape is on the loopback
+/// endpoint, which sends no CORS header and knows no other route. The public
+/// half fails when a merge drops the seam in `src/http/mod.rs`, the endpoint
+/// half when it drops the one in `src/server.rs`.
+#[tokio::test]
+async fn metrics_are_not_served_on_the_public_listener() {
+    let relay = TestRelay::start_with_grasp_p(&[]).await;
+
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::HEAD,
+        reqwest::Method::POST,
+    ] {
+        let unknown = public_answer(&relay, method.clone(), "/no-such-path").await;
+        let metrics = public_answer(&relay, method.clone(), "/metrics").await;
+        assert_eq!(unknown.0, 404, "{method} on an unknown path is a 404");
+        assert_eq!(
+            (metrics.0, metrics.1.as_str()),
+            (unknown.0, unknown.1.as_str()),
+            "{method} /metrics must answer like an unknown path (status, content type)"
+        );
+        // The page names the path that was asked for and differs in nothing
+        // else. HEAD has no body on either side.
+        assert_eq!(
+            metrics.2.replace("/metrics", "/no-such-path"),
+            unknown.2,
+            "{method} /metrics must send the page an unknown path gets"
+        );
+        assert!(
+            !metrics.2.contains("ngit_private_") && !metrics.2.contains("# TYPE "),
+            "{method} /metrics on the public port leaked a scrape: {}",
+            metrics.2
+        );
+    }
+
+    let scrape = relay.grasp_p_metrics().await;
+    assert!(
+        scrape.contains("ngit_private_aliases_total"),
+        "the endpoint must serve the GRASP-P series"
+    );
+
+    let endpoint = relay
+        .grasp_p_metrics_address()
+        .expect("the node announced its metrics endpoint");
+    assert!(
+        endpoint.ip().is_loopback(),
+        "the endpoint must be on loopback, not {endpoint}"
+    );
+    let client = reqwest::Client::new();
+
+    // A browser sends `Origin`; no answer to it may open the scrape to a
+    // page from another site.
+    let response = client
+        .get(format!("http://{endpoint}/metrics"))
+        .header("origin", "https://example.com")
+        .send()
+        .await
+        .expect("metrics endpoint transport");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        cors_header_names(&response),
+        Vec::<String>::new(),
+        "the endpoint must send no CORS header"
+    );
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/plain; version=0.0.4"),
+        "the scrape must be in the Prometheus text format, not {content_type:?}"
+    );
+
+    // A page from another site can point its own name at 127.0.0.1, and a
+    // browser then treats its requests as same-origin. They still carry
+    // that name as `Host`, and the endpoint answers the scrape only to a
+    // local name.
+    let rebound = client
+        .get(format!("http://{endpoint}/metrics"))
+        .header("host", "rebound.example")
+        .send()
+        .await
+        .expect("metrics endpoint transport");
+    assert_eq!(
+        rebound.status().as_u16(),
+        404,
+        "a Host that is not local must not be served the scrape"
+    );
+    let rebound_body = rebound.text().await.unwrap_or_default();
+    assert!(
+        rebound_body.is_empty(),
+        "a Host that is not local must get an empty body, not {rebound_body:?}"
+    );
+
+    for (method, path) in [
+        (reqwest::Method::POST, "/metrics"),
+        (reqwest::Method::HEAD, "/metrics"),
+        (reqwest::Method::OPTIONS, "/metrics"),
+        (reqwest::Method::GET, "/"),
+        (reqwest::Method::GET, "/metrics/"),
+        (reqwest::Method::GET, "/no-such-path"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("http://{endpoint}{path}"))
+            .header("origin", "https://example.com")
+            .send()
+            .await
+            .expect("metrics endpoint transport");
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "{method} {path} on the endpoint"
+        );
+        assert_eq!(
+            cors_header_names(&response),
+            Vec::<String>::new(),
+            "{method} {path} on the endpoint must send no CORS header"
+        );
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            body.is_empty(),
+            "{method} {path} on the endpoint must have an empty body, not {body:?}"
+        );
+    }
+
+    relay.stop().await;
+}
+
+/// Metrics are on by default and the bind address is not: a GRASP-P node
+/// without one collects in memory and serves nowhere. An empty value takes
+/// the fixture's default away again, which is also how the setting reads as
+/// unset.
+#[tokio::test]
+async fn metrics_are_off_without_a_bind() {
+    use ngit_grasp::grasp_p::metrics_endpoint::{LISTENING_LOG, NOT_SERVED_LOG};
+
+    let relay = TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_METRICS_BIND", "")]).await;
+
+    let (status, _, body) = public_answer(&relay, reqwest::Method::GET, "/metrics").await;
+    assert_eq!(status, 404, "the public port must not serve /metrics");
+    assert!(
+        !body.contains("ngit_private_"),
+        "the public port leaked a scrape: {body}"
+    );
+
+    // The node says at startup that it serves no scrape, at the point where
+    // it would otherwise announce the endpoint. With that line in the log,
+    // the missing announcement is final and not merely late.
+    let log = std::fs::read_to_string(relay.log_path()).expect("read the node's log");
+    assert!(
+        log.contains(NOT_SERVED_LOG) && log.contains("NGIT_GRASP_P_METRICS_BIND"),
+        "the node must say that its metrics are served nowhere, and name the setting"
+    );
+    assert!(
+        !log.contains(LISTENING_LOG),
+        "no endpoint may be announced without a bind address"
+    );
+    assert_eq!(relay.grasp_p_metrics_address(), None);
+
+    relay.stop().await;
+}
+
+/// The endpoint is bound while the node starts, and that call is a few lines
+/// in a file upstream owns. A node whose metrics address is taken has to
+/// refuse to start and name the setting: started without its endpoint, it
+/// would run with no alerts and nothing to show for it. If the call is lost
+/// in a merge the node starts instead, and the time limit fails this test.
+#[tokio::test]
+async fn grasp_p_node_refuses_to_start_when_its_metrics_address_is_taken() {
+    // Held for the whole test, so the node cannot bind it and no other test
+    // is handed the same port.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let address = taken.local_addr().expect("local address").to_string();
+
+    // This node gets as far as its storage before it reaches the endpoint,
+    // so it is given the directories the fixture gives every node.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let git_data = dir.path().join("git");
+    let relay_data = dir.path().join("relay");
+    std::fs::create_dir_all(&git_data).expect("create the git data directory");
+    std::fs::create_dir_all(&relay_data).expect("create the relay data directory");
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_ngit-grasp"));
+    server
+        // The server writes its owner key into the directory it starts in.
+        .current_dir(dir.path())
+        .env("NGIT_DOMAIN", "localhost")
+        .env("NGIT_BIND_ADDRESS", "127.0.0.1:0")
+        .env("NGIT_GIT_DATA_PATH", &git_data)
+        .env("NGIT_RELAY_DATA_PATH", &relay_data)
+        // No discovery relays: a node that wrongly starts must not reach
+        // the production ones from a test.
+        .env("NGIT_USER_INDEX_RELAYS", "")
+        .env("NGIT_SYNC_PLUS_FALLBACK_RELAYS", "")
+        .env("NGIT_GRASP_P_REPOS_ENABLE", "true")
+        .env("NGIT_GRASP_P_METRICS_BIND", &address)
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(60), server.output())
+        .await
+        .expect("the node kept running, so the taken address did not stop it")
+        .expect("run the server");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the node must not start: {stderr}");
+    assert!(
+        stderr.contains("NGIT_GRASP_P_METRICS_BIND") && stderr.contains(&address),
+        "the refusal must name the setting and the address: {stderr}"
+    );
+    drop(taken);
 }

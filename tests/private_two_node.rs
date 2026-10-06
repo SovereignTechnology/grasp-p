@@ -388,7 +388,8 @@ async fn wait_for_blob(relay: &TestRelay, sha: &str, bound: Duration) -> Option<
     }
 }
 
-/// Poll `relay`'s /metrics until `check` passes on the parsed scrape.
+/// Poll the metrics endpoint of `relay`, a GRASP-P node, until `check`
+/// passes on the parsed scrape. A scrape that is not a 200 panics.
 async fn wait_for_metrics(
     relay: &TestRelay,
     bound: Duration,
@@ -396,10 +397,8 @@ async fn wait_for_metrics(
 ) -> bool {
     let deadline = Instant::now() + bound;
     loop {
-        if let Ok(text) = fetch_metrics(relay.url()).await {
-            if check(&ParsedMetrics::parse(&text)) {
-                return true;
-            }
+        if check(&ParsedMetrics::parse(&relay.grasp_p_metrics().await)) {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;
@@ -952,12 +951,25 @@ async fn exit4_disabled_is_noop() {
         announcement.id
     );
 
-    // No private mirror activity is ever reported.
-    let metrics = ParsedMetrics::parse(
-        &fetch_metrics(b.url())
-            .await
-            .expect("exit4: B /metrics must be reachable"),
+    // No private mirror activity is ever reported. With GRASP-P off the
+    // scrape is upstream's, on the public port: the fixture still passes a
+    // metrics bind address, and a node without GRASP-P must ignore it.
+    assert_eq!(
+        b.grasp_p_metrics_address(),
+        None,
+        "exit4: a node without GRASP-P must not open a metrics endpoint"
     );
+    let scrape = fetch_metrics(b.url())
+        .await
+        .expect("exit4: B /metrics must be reachable");
+    // `fetch_metrics` returns the body of any status, and the two readings
+    // below take a missing series for 0. A series every scrape carries
+    // shows that this is a scrape and not an error page.
+    assert!(
+        scrape.contains("ngit_uptime_seconds"),
+        "exit4: B must still serve upstream's /metrics on its public port"
+    );
+    let metrics = ParsedMetrics::parse(&scrape);
     let fetched = metrics
         .counter("ngit_private_mirror_fetched_total", &[])
         .unwrap_or(0);
@@ -1524,7 +1536,7 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
     let t0 = Timestamp::now().as_secs() - 600;
 
     let b_global = || async {
-        ParsedMetrics::parse(&fetch_metrics(b.url()).await.expect("metrics scrape"))
+        ParsedMetrics::parse(&b.grasp_p_metrics().await)
             .gauge("ngit_private_ledger_bytes", &[("scope", "global")])
             .unwrap_or(-1)
     };
@@ -1968,7 +1980,7 @@ async fn exit11_mirror_retry_backoff() {
     let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
 
     let b_failed = || async {
-        ParsedMetrics::parse(&fetch_metrics(b.url()).await.expect("metrics scrape"))
+        ParsedMetrics::parse(&b.grasp_p_metrics().await)
             .counter(
                 "ngit_private_mirror_failed_total",
                 &[("reason", "http_status")],

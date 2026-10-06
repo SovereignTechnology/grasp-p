@@ -369,6 +369,16 @@ impl RelayServer {
 
         let mut background_tasks = Vec::new();
 
+        // GRASP-P seam: a node with GRASP-P enabled serves its scrape on a
+        // loopback listener of its own, when one is configured. It is bound
+        // here, ahead of every other background task, so that an address
+        // already in use stops startup while nothing else is running yet.
+        if let Some(endpoint) =
+            crate::grasp_p::metrics_endpoint::start(&config, metrics.as_ref()).await?
+        {
+            background_tasks.push(endpoint);
+        }
+
         if let Some(task) = relay_identity::spawn_user_index_publication(
             &config,
             relay_identity_plan,

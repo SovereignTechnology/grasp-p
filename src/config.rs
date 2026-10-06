@@ -1031,6 +1031,22 @@ pub struct Config {
         default_value_t = 3600
     )]
     pub private_mirror_retry_max_secs: u64,
+
+    /// Loopback address (IP:PORT, for example 127.0.0.1:9464) on which a
+    /// node with GRASP-P enabled serves its Prometheus scrape. Such a node
+    /// never answers /metrics on the public listener: the scrape counts
+    /// private repositories, stored bytes, takedowns and reports. Unset
+    /// (default) or empty: the metrics are collected and served nowhere.
+    /// Must be an IP literal on loopback, never a host name, and needs
+    /// NGIT_METRICS_ENABLED=true; anything else is a startup error, and so
+    /// is an address that cannot be bound. Ignored while GRASP-P is
+    /// disabled. Loopback is not authentication: any local process can read
+    /// the scrape. The scrape is answered only when the Host header of the
+    /// request is a loopback address or localhost, and a connection that
+    /// sends no request for 30 seconds is closed. Node-local, so it is NOT
+    /// part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_GRASP_P_METRICS_BIND")]
+    pub private_metrics_bind: Option<String>,
 }
 
 impl Config {
@@ -1600,6 +1616,15 @@ impl Config {
                      when NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY is non-zero"
                 ));
             }
+            // The scrape of a node with private repositories is not public,
+            // so its address has to be loopback, and a listener with no
+            // metrics behind it would only look like monitoring.
+            if self.private_metrics_bind_addr()?.is_some() && !self.metrics_enabled {
+                return Err(anyhow!(
+                    "NGIT_GRASP_P_METRICS_BIND is set while NGIT_METRICS_ENABLED=false: \
+                     there are no metrics to serve. Unset it, or enable metrics"
+                ));
+            }
         }
 
         Ok(())
@@ -1683,6 +1708,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect()
+    }
+
+    /// Parsed NGIT_GRASP_P_METRICS_BIND. `None` when unset or empty: the
+    /// node then has no metrics endpoint. A value that is not a loopback IP
+    /// address and port is an error that names the setting.
+    pub fn private_metrics_bind_addr(&self) -> Result<Option<std::net::SocketAddr>> {
+        match self.private_metrics_bind.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(value) => crate::grasp_p::metrics_endpoint::parse_bind(value)
+                .map(Some)
+                .map_err(anyhow::Error::msg),
+        }
     }
 
     /// Parse archive GRASP services from comma-separated string
@@ -1952,6 +1989,7 @@ impl Config {
             private_reissue_min_interval_secs: 30,
             private_mirror_retry_base_secs: 60,
             private_mirror_retry_max_secs: 3600,
+            private_metrics_bind: None,
         }
     }
 }
@@ -3672,5 +3710,125 @@ mod tests {
             ..Config::for_testing()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_grasp_p_metrics_bind_must_be_loopback() {
+        for accepted in ["127.0.0.1:9464", "[::1]:9464", "127.0.0.1:0"] {
+            let config = Config {
+                private_repos_enable: true,
+                private_metrics_bind: Some(accepted.to_string()),
+                ..Config::for_testing()
+            };
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{accepted} must validate: {error}"));
+            let address = config
+                .private_metrics_bind_addr()
+                .expect("a loopback address parses")
+                .expect("a set address is not unset");
+            assert_eq!(
+                address,
+                accepted
+                    .parse::<std::net::SocketAddr>()
+                    .expect("test address")
+            );
+        }
+
+        for refused in [
+            "0.0.0.0:9464",
+            "10.0.0.1:9464",
+            "[::]:9464",
+            "[::ffff:127.0.0.1]:9464",
+            "localhost:9464",
+            "127.0.0.1",
+        ] {
+            let config = Config {
+                private_repos_enable: true,
+                private_metrics_bind: Some(refused.to_string()),
+                ..Config::for_testing()
+            };
+            let error = config
+                .validate()
+                .expect_err("an address that is not loopback must fail");
+            assert!(
+                error.to_string().contains("NGIT_GRASP_P_METRICS_BIND"),
+                "{refused}: the error must name the setting: {error}"
+            );
+
+            // With GRASP-P off the value is never read: such a node keeps
+            // upstream's public route and has no endpoint of this kind.
+            let config = Config {
+                private_repos_enable: false,
+                private_metrics_bind: Some(refused.to_string()),
+                ..Config::for_testing()
+            };
+            assert!(config.validate().is_ok(), "{refused} with GRASP-P off");
+        }
+    }
+
+    #[test]
+    fn test_grasp_p_metrics_bind_requires_metrics_enabled() {
+        let config = Config {
+            private_repos_enable: true,
+            metrics_enabled: false,
+            private_metrics_bind: Some("127.0.0.1:9464".to_string()),
+            ..Config::for_testing()
+        };
+        let error = config
+            .validate()
+            .expect_err("an endpoint with no metrics to serve must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("NGIT_GRASP_P_METRICS_BIND")
+                && message.contains("NGIT_METRICS_ENABLED"),
+            "unexpected error: {message}"
+        );
+
+        // Metrics off with no endpoint is an ordinary configuration.
+        let config = Config {
+            private_repos_enable: true,
+            metrics_enabled: false,
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+
+        // The pair is not looked at while GRASP-P is off.
+        let config = Config {
+            private_repos_enable: false,
+            metrics_enabled: false,
+            private_metrics_bind: Some("127.0.0.1:9464".to_string()),
+            ..Config::for_testing()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_grasp_p_metrics_bind_empty_is_unset() {
+        assert!(Config::for_testing().private_metrics_bind.is_none());
+
+        for unset in [None, Some(""), Some("   ")] {
+            // Metrics off as well: an empty value must not count as a bind
+            // address there, or it would trip the check above.
+            for metrics_enabled in [true, false] {
+                let config = Config {
+                    private_repos_enable: true,
+                    metrics_enabled,
+                    private_metrics_bind: unset.map(str::to_string),
+                    ..Config::for_testing()
+                };
+                assert!(
+                    config.validate().is_ok(),
+                    "{unset:?} with metrics_enabled={metrics_enabled}"
+                );
+                assert!(
+                    config
+                        .private_metrics_bind_addr()
+                        .expect("an unset address is not an error")
+                        .is_none(),
+                    "{unset:?} must read as unset"
+                );
+            }
+        }
     }
 }

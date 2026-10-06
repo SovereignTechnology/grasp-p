@@ -21,6 +21,7 @@ pub mod denylist;
 pub mod gc;
 pub mod host;
 pub mod meta;
+pub mod metrics_endpoint;
 pub mod mirror;
 pub mod quota;
 pub mod rate;

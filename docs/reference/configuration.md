@@ -2061,6 +2061,50 @@ acceptance.
 
 ---
 
+### GRASP-P Metrics Endpoint
+
+A node with `NGIT_GRASP_P_REPOS_ENABLE=true` does not serve `/metrics` on its
+public listener. The scrape of such a node counts private repositories,
+stored bytes, takedowns and reports, and upstream's route answers anyone,
+with a wildcard CORS header. On a GRASP-P node that route does not exist:
+`/metrics` is answered like any unknown path, under any `NGIT_BASE_PATH`: the
+`404` page, or for an `OPTIONS` request the `204` every path gets. The public
+repositories of the node are served by the same process, so their `/metrics`
+is closed with it.
+
+Collection is unchanged and still follows `NGIT_METRICS_ENABLED`. What changes
+is where the scrape can be read: on a loopback listener of its own, and only
+when the setting below names its address. Without it the metrics are
+collected in memory and served nowhere, and one line in the startup log says
+so.
+
+With GRASP-P disabled none of this applies: the setting is ignored and
+`/metrics` is upstream's public route.
+
+#### `NGIT_GRASP_P_METRICS_BIND`
+
+**Description:** Address and port of the metrics endpoint of a GRASP-P node, for example `127.0.0.1:9464`. The listener answers `GET /metrics` in the Prometheus text format and everything else with an empty `404`; `NGIT_BASE_PATH` does not apply to it, so the path is `/metrics` even where the public listener is mounted under a prefix; it sends no CORS header, and it closes a connection that does not come from a loopback address. A request whose `Host` header names anything but a loopback address or `localhost` gets the `404` as well, so write the scrape target as the address set here or as `localhost:<port>`, not as another name for the host. A connection that sends no request for 30 seconds is closed. The value must be an IP address, never a host name, and the address must be loopback (`127.0.0.1` or `[::1]`). A value that is not is a startup error that names this setting. So is setting it together with `NGIT_METRICS_ENABLED=false`, and so is an address that cannot be bound, for example a port that is in use. An empty value counts as unset. Port `0` asks the kernel for a free port; the startup log line `Private metrics endpoint listening on <address>` shows the one in use. Node-local: **not** part of the `policy_fingerprint` preimage.  
+**Type:** String (`IP:PORT`, loopback only)  
+**Default:** unset (no endpoint)  
+**Required:** No
+
+Loopback is not authentication. Every process on the host can read the
+scrape, so on a host shared with other services, treat it as readable by all
+of them. To scrape from another machine, run the collector on the host, or in
+the network namespace of the node, and ship from there over a channel you
+control; do not put a reverse proxy in front of this address.
+
+```bash
+NGIT_GRASP_P_METRICS_BIND=127.0.0.1:9464
+curl -s http://127.0.0.1:9464/metrics | grep '^ngit_private_'
+```
+
+Upstream's `scripts/verify-deployment.sh` requests `/metrics` on the public
+listener and fails against a GRASP-P node. Run it with `VERIFY_METRICS=false`
+there.
+
+---
+
 ### Logging Configuration
 
 The server omits the raw `msg` payload from outbound nostr-sdk relay diagnostics.

@@ -929,6 +929,28 @@ let
         '';
       };
 
+      privateMetricsBind = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9464";
+        description = ''
+          GRASP-P: loopback address and port of the metrics endpoint. A
+          node with private repos enabled never answers /metrics on its
+          public listener, because the scrape counts private repositories,
+          stored bytes, takedowns and reports; it serves GET /metrics on
+          this address instead, and nothing else, with no CORS header. Must
+          be an IP address on loopback (127.0.0.1 or [::1]), never a host
+          name: anything else is a startup error, and so is an address
+          that is already in use. Null (default): the metrics are collected
+          and served nowhere. Ignored unless private repos are enabled.
+          Loopback is not authentication: every local process can read the
+          scrape. Node-local, NOT part of the policy_fingerprint.
+          The scrape is answered only when the Host header of the request
+          is a loopback address or localhost; a connection that sends no
+          request for 30 seconds is closed.
+        '';
+      };
+
       user = mkOption {
         type = types.str;
         default = "ngit-grasp-${name}";
@@ -1085,6 +1107,8 @@ let
       NGIT_GRASP_P_BLOB_DATA_PATH = cfg.privateBlobDataPath;
     } // optionalAttrs (cfg.privateMetaDataPath != null) {
       NGIT_GRASP_P_META_DATA_PATH = cfg.privateMetaDataPath;
+    } // optionalAttrs (cfg.privateMetricsBind != null) {
+      NGIT_GRASP_P_METRICS_BIND = cfg.privateMetricsBind;
     } // optionalAttrs (cfg.maxConnections != null) {
       NGIT_MAX_CONNECTIONS = toString cfg.maxConnections;
     } // optionalAttrs (cfg.trustedProxyCidrs != [ ]) {

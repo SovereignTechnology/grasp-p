@@ -726,9 +726,20 @@ impl TestRelay {
     /// additional `NGIT_GRASP_P_*` settings (memory backend).
     ///
     /// `NGIT_GRASP_P_REPOS_ENABLE=true` is always set; `extra_env` is applied
-    /// afterwards, so a caller can override it.
+    /// afterwards, so a caller can override it. The node also gets a metrics
+    /// endpoint on a kernel-assigned loopback port (see
+    /// [`Self::grasp_p_metrics`]), which `extra_env` can override as well.
     pub async fn start_with_grasp_p(extra_env: &[(&str, &str)]) -> Self {
-        let mut env = vec![("NGIT_GRASP_P_REPOS_ENABLE".to_string(), "true".to_string())];
+        let mut env = vec![
+            ("NGIT_GRASP_P_REPOS_ENABLE".to_string(), "true".to_string()),
+            // A GRASP-P node serves no scrape on its public port. Port 0:
+            // the kernel picks, and `grasp_p_metrics` reads the choice from
+            // the log, so no port is reserved and released for it.
+            (
+                "NGIT_GRASP_P_METRICS_BIND".to_string(),
+                "127.0.0.1:0".to_string(),
+            ),
+        ];
         env.extend(
             extra_env
                 .iter()
@@ -766,6 +777,12 @@ impl TestRelay {
             (
                 "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS".to_string(),
                 "true".to_string(),
+            ),
+            // See `start_with_grasp_p`: the scrape has a listener of its
+            // own, on a port the kernel picks.
+            (
+                "NGIT_GRASP_P_METRICS_BIND".to_string(),
+                "127.0.0.1:0".to_string(),
             ),
         ];
         // Private-sync peers come only from the operator allowlist: point
@@ -1114,6 +1131,66 @@ impl TestRelay {
     /// Get the subprocess log captured by the test harness.
     pub fn log_path(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/relay-{}.log", self.port))
+    }
+
+    /// Address of this node's GRASP-P metrics endpoint, or `None` when its
+    /// log announces none.
+    ///
+    /// The GRASP-P constructors ask for port 0, so the port is known only
+    /// from the node's own startup line. The last such line counts: every
+    /// spawn truncates the log, a restart included, so it belongs to the
+    /// process that is running now.
+    pub fn grasp_p_metrics_address(&self) -> Option<std::net::SocketAddr> {
+        let log = std::fs::read_to_string(self.log_path()).ok()?;
+        log.lines().rev().find_map(|line| {
+            let (_, rest) =
+                line.split_once(ngit_grasp::grasp_p::metrics_endpoint::LISTENING_LOG)?;
+            rest.split_whitespace()
+                .next()?
+                .parse::<std::net::SocketAddr>()
+                .ok()
+        })
+    }
+
+    /// Scrape the metrics endpoint of a GRASP-P node.
+    ///
+    /// Such a node answers `/metrics` on its public port with the 404 page
+    /// of any unknown path, and upstream's `fetch_metrics` returns the body
+    /// of any status. An assertion that reads a missing series as 0 would
+    /// pass on that page, so this panics unless the endpoint answers 200.
+    pub async fn grasp_p_metrics(&self) -> String {
+        // The node logs the address before it answers the readiness probe,
+        // so the line is there by the time a test holds this relay. The
+        // bounded wait only covers a log write still on its way to the file.
+        let deadline = Instant::now() + READY_TIMEOUT;
+        let address = loop {
+            if let Some(address) = self.grasp_p_metrics_address() {
+                break address;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay {} announced no metrics endpoint in {} (is GRASP-P off, or \
+                 NGIT_GRASP_P_METRICS_BIND overridden?)",
+                self.port,
+                self.log_path().display()
+            );
+            sleep(READY_POLL).await;
+        };
+        let url = format!("http://{address}/metrics");
+        let response = reqwest::get(&url)
+            .await
+            .unwrap_or_else(|error| panic!("GET {url} failed: {error}"));
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("GET {url}: unreadable body: {error}"));
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "GET {url} must answer 200; body: {body}"
+        );
+        body
     }
 
     /// Stop the relay process and start a fresh one on the same port with

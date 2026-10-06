@@ -939,7 +939,11 @@ impl Service<Request<Incoming>> for HttpService {
         }
 
         // Serve Prometheus metrics if enabled
-        if path == "/metrics" {
+        // GRASP-P seam: a node with GRASP-P enabled never serves its scrape
+        // here. The request falls through to the 404 any unknown path gets,
+        // and the scrape has a loopback listener of its own
+        // (`grasp_p::metrics_endpoint`).
+        if path == "/metrics" && !self.config.private_repos_enable {
             if let Some(ref metrics) = self.metrics {
                 let metrics = metrics.clone();
                 return Box::pin(async move {
