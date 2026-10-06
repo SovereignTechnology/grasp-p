@@ -2122,15 +2122,6 @@ async fn exit12_open_registrations_survive_whitelist_flip() {
 
     // --- Boot 2: shipped defaults — whitelist mode, EMPTY whitelist --------
     let res2 = reserve_port();
-    let boot2_port = res2.port();
-    // The relay log is opened APPEND-mode (/tmp/relay-<port>.log): a stale
-    // file from a prior run that happened to reuse this port could
-    // false-pass the warn assertion below. Record the length BEFORE boot 2
-    // and search only what this boot appended.
-    let boot2_log_path = format!("/tmp/relay-{boot2_port}.log");
-    let boot2_log_offset = std::fs::metadata(&boot2_log_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
     let node = TestRelay::start_grasp_p_pair_node(
         res2,
         None,
@@ -2141,11 +2132,15 @@ async fn exit12_open_registrations_survive_whitelist_flip() {
     )
     .await;
 
-    // The startup warn fired loudly for the empty-whitelist posture.
-    let log = std::fs::read_to_string(&boot2_log_path).expect("boot-2 relay log");
-    let log_tail = log.get(boot2_log_offset as usize..).unwrap_or("");
+    // The startup warn fired loudly for the empty-whitelist posture. Every
+    // spawn truncates the relay log (/tmp/relay-<port>.log), so the whole
+    // file belongs to this boot, whatever an earlier relay on the same port
+    // left there. Skipping the old file's length, as this test did while
+    // the log was opened in append mode, looked past the end of the new log
+    // whenever the port had been used before, and the warning was missed.
+    let log = std::fs::read_to_string(node.log_path()).expect("boot-2 relay log");
     assert!(
-        log_tail.contains("all new private-repo registrations will be rejected"),
+        log.contains("all new private-repo registrations will be rejected"),
         "exit12: boot 2 must warn about whitelist mode with an empty whitelist"
     );
 
