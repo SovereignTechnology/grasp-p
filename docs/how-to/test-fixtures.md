@@ -27,10 +27,39 @@ may run the two checks concurrently on different machines; the consuming job
 receives the same file tree after transport ZIP extraction.
 
 The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
-unchanged. Release validation/crates.io publication and Docker deployment tests
-still use act; migrating their credentials and container daemon requirements
-is separate work. Version-tag pushes retain the existing act release checks
-and do not run the Nix workflow a second time.
+unchanged. Release validation/crates.io publication still uses act; migrating
+its credentials is separate work. Version-tag pushes retain the existing act
+release checks and do not run the Nix workflow a second time.
+
+## Reproduce the container deployment check
+
+`.ngit/nix/workflows/container_deployment.yaml` runs the `ci-container-deployment`
+app when deployment-relevant files change and on pull requests. The app owns
+its container daemon: the flake pins Docker, containerd, runc, iptables and
+skopeo, and the app starts `dockerd` with its data, exec root and socket under
+`$HOME`, waits for readiness with a deadline, runs
+`scripts/test-container-release.sh` and stops the daemon. A Firecracker Nix
+provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
+modules. On any other provider the app stops before starting the daemon and
+names the missing requirement.
+
+The app needs root, so run it only in a disposable VM:
+
+```sh
+nix run .#ci-container-deployment
+```
+
+It reads `NGIT_CI_COMMIT_SHA` and `NGIT_CI_OUTPUT_DIR`. On a workstation with
+an existing Docker daemon, run the script directly instead; it honours
+`DOCKER_HOST`:
+
+```sh
+nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq nixpkgs#skopeo \
+  --command scripts/test-container-release.sh \
+  "$(nix eval --raw .#static.version)" "$(git rev-parse HEAD)"
+```
+
+The manual container release backfill remains an act workflow.
 
 ## Fixture rules
 
