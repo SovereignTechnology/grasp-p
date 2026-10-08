@@ -1,0 +1,28 @@
+version: 1
+name: Container deployment e2e
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".dockerignore"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "build.rs"
+      - "compose*.yaml"
+      - "deploy/**"
+      - "flake.lock"
+      - "nix/ci-container.nix"
+      - "scripts/build-container-layout.sh"
+      - "scripts/test-container-deployment.sh"
+      - "scripts/test-container-release.sh"
+      - "src/**"
+  pull_request:
+
+jobs:
+  container-deployment:
+    # Builds the release image with a job-owned Docker daemon inside the
+    # provider's disposable VM; see nix/ci-container.nix.
+    run: apps.x86_64-linux.ci-container-deployment
+    public-outputs:
+      summary: summary.txt

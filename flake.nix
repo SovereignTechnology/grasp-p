@@ -24,7 +24,14 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
+        ci = import ./nix/ci.nix {
+          inherit pkgs rustToolchain sourceRevision;
+          src = ./.;
+          version = ngitGraspVersion;
+        };
       in {
+        checks = ci.checks;
+        apps = ci.apps;
         devShells.default = pkgs.mkShell {
           # Single dev shell for the whole workspace (ngit-grasp + grasp-audit).
           buildInputs = with pkgs; [ rustToolchain pkg-config openssl git gitlint ];

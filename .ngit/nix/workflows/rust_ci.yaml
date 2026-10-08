@@ -1,0 +1,16 @@
+version: 1
+name: Rust CI
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "work/**"
+  pull_request:
+
+jobs:
+  lint:
+    build: checks.x86_64-linux.ci-lint
+  tests:
+    build: checks.x86_64-linux.ci-tests

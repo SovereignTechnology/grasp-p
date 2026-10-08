@@ -99,7 +99,17 @@ docker build \
 remove_image=true
 
 mkdir -p "$(dirname -- "${layout}")"
-skopeo --insecure-policy copy --format oci \
+# skopeo reads neither DOCKER_HOST nor TMPDIR, so forward them explicitly.
+# Its temporary image copies otherwise go to /var/tmp.
+set --
+if [ -n "${TMPDIR:-}" ]; then
+    set -- --tmpdir "${TMPDIR}"
+fi
+set -- "$@" copy --format oci
+if [ -n "${DOCKER_HOST:-}" ]; then
+    set -- "$@" --src-daemon-host "${DOCKER_HOST}"
+fi
+skopeo --insecure-policy "$@" \
     "docker-daemon:${image_name}" \
     "oci:${layout}:${version}"
 

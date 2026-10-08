@@ -71,7 +71,17 @@ trap cleanup EXIT HUP INT TERM
     "${revision}" \
     "${layout}"
 
-skopeo --insecure-policy copy --format v2s2 \
+# skopeo reads neither DOCKER_HOST nor TMPDIR, so forward them explicitly.
+# Its temporary image copies otherwise go to /var/tmp.
+set --
+if [ -n "${TMPDIR:-}" ]; then
+    set -- --tmpdir "${TMPDIR}"
+fi
+set -- "$@" copy --format v2s2
+if [ -n "${DOCKER_HOST:-}" ]; then
+    set -- "$@" --dest-daemon-host "${DOCKER_HOST}"
+fi
+skopeo --insecure-policy "$@" \
     "oci:${layout}:${version}" \
     "docker-daemon:${image_name}"
 

@@ -1,5 +1,64 @@
 # Reliable test fixtures
 
+## Reproduce the Nix CI checks
+
+Branch pushes and pull requests use `.ngit/nix/workflows/rust_ci.yaml`.
+The workflow builds the following root-flake checks independently:
+
+```sh
+nix build .#checks.x86_64-linux.ci-lint
+nix build .#checks.x86_64-linux.ci-tests
+```
+
+`ci-lint` checks formatting and runs Clippy for the whole workspace with
+warnings denied. `ci-tests` builds both binaries and runs workspace unit,
+integration and documentation tests with offline Cargo dependencies. It retains
+the deliberately hostile ambient Git settings used by the previous act CI.
+The fixtures bind local sockets; they do not need external relay access.
+The Nix sandbox isolates those sockets from the host network. PR execution
+adds a Firecracker boundary around the complete provider job.
+
+Each job succeeds when its checks exit successfully. These validation jobs do
+not publish artifacts or run a separate artifact-verification job. Providers
+may run the two checks concurrently on different machines.
+
+The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
+unchanged. Release validation/crates.io publication still uses act; migrating
+its credentials is separate work. Version-tag pushes retain the existing act
+release checks and do not run the Nix workflow a second time.
+
+## Reproduce the container deployment check
+
+`.ngit/nix/workflows/container_deployment.yaml` runs the `ci-container-deployment`
+app when deployment-relevant files change and on pull requests. The app owns
+its container daemon: the flake pins Docker, containerd, runc, iptables and
+skopeo, and the app starts `dockerd` with its data, exec root and socket under
+`$HOME`, waits for readiness with a deadline, runs
+`scripts/test-container-release.sh` and stops the daemon. A Firecracker Nix
+provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
+modules. On any other provider the app stops before starting the daemon and
+names the missing requirement.
+
+The app needs root, so run it only in a disposable VM:
+
+```sh
+nix run .#ci-container-deployment
+```
+
+It reads `NGIT_CI_COMMIT_SHA` and `NGIT_CI_OUTPUT_DIR`. On a workstation with
+an existing Docker daemon, run the script directly instead; it honours
+`DOCKER_HOST`:
+
+```sh
+nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq nixpkgs#skopeo \
+  --command scripts/test-container-release.sh \
+  "$(nix eval --raw .#static.version)" "$(git rev-parse HEAD)"
+```
+
+The manual container release backfill remains an act workflow.
+
+## Fixture rules
+
 Run tests through the repository development shell. Keep parallel checks
 enabled: each fixture owns its socket, tasks, subprocesses and temporary data.
 
