@@ -34,7 +34,6 @@ in {
       doCheck = false;
       installPhase = ''
         mkdir -p "$out"
-        printf '%s\n' 'fmt: passed' 'clippy: passed' > "$out/lint.txt"
       '';
     });
     ci-tests = rustPlatform.buildRustPackage (common // {
@@ -50,43 +49,13 @@ in {
       # Integration tests bind loopback sockets inside the network namespace.
       # Preserve the hostile ambient Git configuration from the act workflow.
       preCheck = builtins.readFile ./ci-hostile-git.sh;
-      postCheck = ''
-        mkdir -p "$out/reports"
-        printf '%s\n' 'workspace tests and doctests: passed' > "$out/reports/tests.txt"
-      '';
-      postInstall = ''
-        printf '%s\n' '${version}' > "$out/reports/version.txt"
-      '';
-      postFixup = ''
-        mkdir "$out/build"
-        mv "$out/bin" "$out/reports" "$out/build/"
-        cd "$out/build"
-        sha256sum bin/ngit-grasp bin/grasp-audit reports/tests.txt reports/version.txt \
-          > SHA256SUMS
+      installPhase = ''
+        mkdir -p "$out"
       '';
     });
   };
   apps.ci-container-deployment = {
     type = "app";
     program = "${import ./ci-container.nix { inherit pkgs version; }}/bin/ngit-grasp-ci-container-deployment";
-  };
-  apps.ci-verify = {
-    type = "app";
-    program = "${pkgs.writeShellApplication {
-      name = "ngit-grasp-ci-verify";
-      runtimeInputs = [ pkgs.coreutils pkgs.gnugrep ];
-      text = ''
-        tests="$NGIT_CI_INPUTS/tests/artifacts/build"
-        lint="$NGIT_CI_INPUTS/lint/artifacts/lint/lint.txt"
-        grep -Fx 'fmt: passed' "$lint"
-        grep -Fx 'clippy: passed' "$lint"
-        cd "$tests"
-        sha256sum --check SHA256SUMS
-        grep -Fx '${version}' reports/version.txt
-        grep -Fx 'workspace tests and doctests: passed' reports/tests.txt
-        printf '%s\n' 'Rust checks passed; build artifacts verified' \
-          > "$NGIT_CI_OUTPUT_DIR/summary.txt"
-      '';
-    }}/bin/ngit-grasp-ci-verify";
   };
 }

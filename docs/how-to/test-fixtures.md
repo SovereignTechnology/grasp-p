@@ -18,13 +18,9 @@ The fixtures bind local sockets; they do not need external relay access.
 The Nix sandbox isolates those sockets from the host network. PR execution
 adds a Firecracker boundary around the complete provider job.
 
-The test output contains `build/bin/`, test/version reports and `SHA256SUMS`.
-CI exports `build/` as the named `rust-build` archive package. After both checks
-pass, the `ci-verify` app consumes their verified predecessor artifacts,
-checks the binaries and reports against their checksums, and publishes a
-summary. It does not rebuild or execute the transported binaries. Providers
-may run the two checks concurrently on different machines; the consuming job
-receives the same file tree after transport ZIP extraction.
+Each job succeeds when its checks exit successfully. These validation jobs do
+not publish artifacts or run a separate artifact-verification job. Providers
+may run the two checks concurrently on different machines.
 
 The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
 unchanged. Release validation/crates.io publication still uses act; migrating
