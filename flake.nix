@@ -38,7 +38,10 @@
         release = import ./nix/release.nix {
           inherit pkgs rustToolchain;
           version = ngitGraspVersion;
-          ngit = release-ngit.packages.${system}.default;
+          ngit = import ./nix/release-ngit.nix {
+            inherit pkgs;
+            sourcePackage = release-ngit.packages.${system}.default;
+          };
         };
       in {
         checks = ci.checks // release.checks;

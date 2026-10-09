@@ -11,6 +11,13 @@ Dockerfile's existing update policy.
 Release apps pin Git, Python, ngit, Cargo and container tooling in the root
 flake. The separate `release-ngit` input must support both release and container
 publication; `checks.x86_64-linux.release-cli` verifies its required flags.
+Checks and publishers share `nix/release-ngit.nix`: on x86_64 Linux it installs
+the SHA-256-pinned static v3.0.3 release archive, avoiding a lengthy LTO rebuild
+in every fresh guest. The upstream source package disables its own tests, so
+recompiling it added no CLI test coverage. Other platforms retain the pinned
+source package. The archive pin trusts the upstream release build; it is not a
+claim of locally reproduced binaries. Keep the archive version/hash and source
+fallback revision aligned when updating this tooling.
 Container build and verification jobs reuse the deployment test's job-owned
 Docker daemon. They require a disposable root VM with the kernel facilities
 listed in their workflow requirements, and clean up the daemon on exit.
