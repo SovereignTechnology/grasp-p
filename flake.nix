@@ -4,10 +4,16 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    release-ngit = {
+      url = "git+https://relay.ngit.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit.git?rev=31e48be58ee3fa2e3c56b1df68b6358c385d5e91&allRefs=1";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+      inputs.flake-utils.follows = "flake-utils";
+    };
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, release-ngit }:
     let
       sourceRevision =
         if self ? rev then self.rev
@@ -29,9 +35,14 @@
           src = ./.;
           version = ngitGraspVersion;
         };
+        release = import ./nix/release.nix {
+          inherit pkgs rustToolchain;
+          version = ngitGraspVersion;
+          ngit = release-ngit.packages.${system}.default;
+        };
       in {
-        checks = ci.checks;
-        apps = ci.apps;
+        checks = ci.checks // release.checks;
+        apps = ci.apps // release.apps;
         devShells.default = pkgs.mkShell {
           # Single dev shell for the whole workspace (ngit-grasp + grasp-audit).
           buildInputs = with pkgs; [ rustToolchain pkg-config openssl git gitlint ];
@@ -96,6 +107,16 @@
             doCheck = false;
           };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          release-archive = pkgs.runCommand "ngit-grasp-release-archive" {
+            nativeBuildInputs = [ pkgs.gnutar pkgs.gzip ];
+          } ''
+            archive="ngit-grasp-${ngitGraspVersion}-${pkgs.pkgsStatic.stdenv.hostPlatform.rust.cargoShortTarget}"
+            mkdir -p "$archive" "$out/release"
+            cp ${self.packages.${system}.static}/bin/ngit-grasp "$archive/"
+            cp ${./LICENSE} "$archive/"
+            tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
+              -czf "$out/release/$archive.tar.gz" "$archive"
+          '';
           # Portable release binary used by the tag-triggered release workflow.
           static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
             pname = "ngit-grasp";
