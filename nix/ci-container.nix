@@ -1,4 +1,9 @@
-{ pkgs, version }:
+{ pkgs, version, name ? "ngit-grasp-ci-container-deployment", extraInputs ? [],
+  workload ? ''
+    RUNNER_TEMP="$state/tmp" \
+      scripts/test-container-release.sh "${version}" "$NGIT_CI_COMMIT_SHA"
+  ''
+}:
 let
   # The job owns its container daemon: these pinned binaries, not the
   # provider's guest image, decide the Docker, containerd, runc and firewall
@@ -12,8 +17,8 @@ let
   ];
 in
 pkgs.writeShellApplication {
-  name = "ngit-grasp-ci-container-deployment";
-  runtimeInputs = daemonInputs ++ [
+  inherit name;
+  runtimeInputs = daemonInputs ++ extraInputs ++ [
     pkgs.curl
     pkgs.jq
     pkgs.skopeo
@@ -97,11 +102,10 @@ pkgs.writeShellApplication {
     docker info --format 'storage {{.Driver}}, cgroup {{.CgroupVersion}} ({{.CgroupDriver}}), kernel {{.KernelVersion}}'
     echo "dockerd ready after $((ready - started))s"
 
-    RUNNER_TEMP="$state/tmp" \
-      scripts/test-container-release.sh "${version}" "$NGIT_CI_COMMIT_SHA"
+    ${workload}
     finished=$(date +%s)
 
-    summary="container release layout and deployment verified for ${version}
+    summary="${name} completed for ${version}
     revision $NGIT_CI_COMMIT_SHA
     daemon startup $((ready - started))s, workload $((finished - ready))s"
     printf '%s\n' "$summary"

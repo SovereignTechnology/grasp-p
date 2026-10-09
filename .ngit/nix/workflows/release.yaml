@@ -1,0 +1,64 @@
+version: 1
+name: release assets
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  archive:
+    build: packages.x86_64-linux.release-archive
+    artifacts:
+      release-archive: release
+  container:
+    run: apps.x86_64-linux.release-container
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+      environment:
+        /configuration/guest/job-uid: {eq: 0}
+        /configuration/guest/no-new-privileges: {eq: false}
+        /configuration/guest/module-autoload: {eq: true}
+        /configuration/guest/kernel-features/NAMESPACES: {eq: true}
+        /configuration/guest/kernel-features/PID_NS: {eq: true}
+        /configuration/guest/kernel-features/NET_NS: {eq: true}
+        /configuration/guest/kernel-features/CGROUPS: {eq: true}
+        /configuration/guest/kernel-features/MEMCG: {eq: true}
+        /configuration/guest/kernel-features/OVERLAY_FS: {eq: true}
+        /configuration/guest/kernel-features/BRIDGE: {eq: true}
+        /configuration/guest/kernel-features/VETH: {eq: true}
+        /configuration/guest/kernel-features/NETFILTER: {eq: true}
+        /configuration/guest/kernel-features/NF_NAT: {eq: true}
+        /configuration/guest/kernel-features/NF_TABLES: {eq: true}
+        /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
+    artifacts:
+      layout: layout
+      provenance: provenance.json
+  publish-container:
+    needs: [container]
+    run: apps.x86_64-linux.publish-container
+    secrets: [NGIT_PUBLISHER_NBUNKSEC]
+  verify-container:
+    needs: [publish-container]
+    run: apps.x86_64-linux.verify-container
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+      environment:
+        /configuration/guest/job-uid: {eq: 0}
+        /configuration/guest/no-new-privileges: {eq: false}
+        /configuration/guest/module-autoload: {eq: true}
+        /configuration/guest/kernel-features/NAMESPACES: {eq: true}
+        /configuration/guest/kernel-features/PID_NS: {eq: true}
+        /configuration/guest/kernel-features/NET_NS: {eq: true}
+        /configuration/guest/kernel-features/CGROUPS: {eq: true}
+        /configuration/guest/kernel-features/MEMCG: {eq: true}
+        /configuration/guest/kernel-features/OVERLAY_FS: {eq: true}
+        /configuration/guest/kernel-features/BRIDGE: {eq: true}
+        /configuration/guest/kernel-features/VETH: {eq: true}
+        /configuration/guest/kernel-features/NETFILTER: {eq: true}
+        /configuration/guest/kernel-features/NF_NAT: {eq: true}
+        /configuration/guest/kernel-features/NF_TABLES: {eq: true}
+        /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
+  publish-release:
+    needs: [archive, verify-container]
+    run: apps.x86_64-linux.publish-release
+    secrets: [NGIT_PUBLISHER_NBUNKSEC]

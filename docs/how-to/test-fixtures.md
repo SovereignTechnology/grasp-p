@@ -20,12 +20,13 @@ adds a Firecracker boundary around the complete provider job.
 
 Each job succeeds when its checks exit successfully. These validation jobs do
 not publish artifacts or run a separate artifact-verification job. Providers
-may run the two checks concurrently on different machines.
+may run the checks concurrently on different machines. The same workflow also
+runs `release-scripts` and `release-cli` to validate the publication guards
+and pinned CLI compatibility without publishing.
 
 The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
-unchanged. Release validation/crates.io publication still uses act; migrating
-its credentials is separate work. Version-tag pushes retain the existing act
-release checks and do not run the Nix workflow a second time.
+unchanged. Tag validation and publication also use native Nix workflows; see
+[publishing releases](publish-release.md).
 
 ## Reproduce the container deployment check
 
@@ -59,7 +60,8 @@ nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq nixpkgs#skopeo \
   "$(nix eval --raw .#static.version)" "$(git rev-parse HEAD)"
 ```
 
-The manual container release backfill remains an act workflow.
+Release and manual container backfill jobs use the same daemon wrapper; see
+[publishing releases](publish-release.md).
 
 ## Fixture rules
 

@@ -1,0 +1,14 @@
+version: 1
+name: Rust release validation and crates.io publication
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  lint:
+    build: checks.x86_64-linux.ci-lint
+  tests:
+    build: checks.x86_64-linux.ci-tests
+  publish:
+    needs: [lint, tests]
+    run: apps.x86_64-linux.publish-crates
+    secrets: [CARGO_REGISTRY_TOKEN]

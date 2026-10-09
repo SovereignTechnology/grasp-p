@@ -14,3 +14,7 @@ jobs:
     build: checks.x86_64-linux.ci-lint
   tests:
     build: checks.x86_64-linux.ci-tests
+  release-scripts:
+    build: checks.x86_64-linux.release-scripts
+  release-cli:
+    build: checks.x86_64-linux.release-cli
