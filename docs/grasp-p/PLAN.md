@@ -133,7 +133,12 @@ project yet.
   state roots and wraps. The text of issue 1 predates this.
 - **The hold for out-of-order events is capped by count only**, and an event is held before
   its size is checked. One sync relay can pin about 4096 x 5 MB. Give it a byte budget and
-  do not hold what can never be admitted.
+  do not hold what can never be admitted. **Done:** the size is checked first, only a
+  rejection a later registration can cure is held, the hold has a byte budget (32 MiB, or
+  64 events of the largest size) and the id skip-set a cap, and
+  `ngit_private_hold_dropped_total` counts what was not kept. See "The out-of-order hold"
+  in [`SEAMS.md`](SEAMS.md). Still open: the budget is one pool for the node, so a flood
+  can fill it and honest early events then wait for the full re-issue.
 - **Upload slots.** 64 for the whole node, no cap per tenant and no timeout on reading a
   body, so one write key can hold them all and stall the mirror too. With #25 and #26.
 - **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the

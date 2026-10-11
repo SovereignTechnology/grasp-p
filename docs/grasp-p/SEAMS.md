@@ -418,6 +418,55 @@ front of a node that caches must honour the origin's cache headers on blob paths
 - **Hold expiry.** Legacy expired held GRASP-P events inside upstream's rejected-index
   cleanup and shortened that cleanup's interval under `NGIT_TEST=1`. The expiry now runs on
   GRASP-P's own registration timer and upstream's cleanup is untouched.
+- **The out-of-order hold.** An event can reach a node before what it depends on: a state
+  root before its registration, a stream wrap before the registration that lists its key.
+  It is rejected, kept in memory (`PrivateRejectedIndex`, `src/sync/private_index.rs`) and
+  tried again when the registration is accepted. No upstream file changed for the rules
+  below, apart from the counter, which is one more additive `ngit_private_*` series and
+  recorder in `src/metrics/mod.rs`; the sync manager still calls the same three hooks (`grasp_p_previously_rejected`,
+  `grasp_p_after_saved`, `grasp_p_after_rejected`) and the negentropy exclusion.
+  - **Size first.** `grasp_p::admission::admit` compares the serialized event with
+    `NGIT_GRASP_P_MAX_EVENT_BYTES` before the rate bucket and before any lookup, for
+    30640, 30641 and every stream-wrap kind, from clients and from sync alike. A synced
+    event is otherwise bounded only by the transport's 5 MB message, and an event that
+    large can never be accepted, so it is never held.
+  - **One decision.** `PrivateService::note_rejected(event, message, synced)` is the only
+    code that puts a rejection into the index. The client path reaches it from
+    `admission::admit`; the sync path reaches it from `grasp_p_after_rejected`, which also
+    sees events refused before admission (blacklist, deletion gate). A full hold is given
+    only to a dependency rejection, one a later registration can turn into an acceptance:
+    for a 30641 `unregistered alias`, `event author is not a registered write key for this
+    alias`, `state root a tag does not match the live registration` and `alias registration
+    changed; retry`; for a stored stream wrap `unregistered key` and `registration changed;
+    retry`; for a 30640 the cadence rejection, which time cures. Each of these strings is a
+    constant in `src/grasp_p/admission.rs` (the cadence one in `registration.rs`), used
+    where the rejection is produced and where it is classified, and matched whole.
+    Any other rejection keeps only the event id on the sync path, so the node does not
+    fetch and validate the same event on every delivery, and keeps nothing on the client
+    path. **Rewording one of those messages, or adding a rejection that a registration
+    can cure without adding it to `is_dependency_rejection`, silently stops the hold for
+    it**: replicated events that arrive early are then not retried from memory and wait for
+    a re-issue of the sync filters, at the latest the next full one.
+    The table test `admission::tests::only_dependency_rejections_are_holdable` and
+    `grasp_p::tests::dependency_rejections_are_held_on_both_paths` are the guard.
+  - **Bounds.** At most 4096 held events, of which at most 1024 registrations; a byte
+    budget of 32 MiB, or 64 times `NGIT_GRASP_P_MAX_EVENT_BYTES` when that is more, of
+    which registrations may use a quarter; at most 65,536 remembered ids, 4096 of them
+    reserved for the ids of held events. An event that would exceed the count or the bytes
+    is dropped without entering the skip-set, so it can be fetched again, and what is
+    already held is untouched. A full skip-set refuses new ids and evicts none: the entries
+    it has keep their full TTL, and the cost is that some rejected events are validated
+    again. The charge is the serialized size plus the fixed memory cost of each tag and tag
+    element, so an event built from many tiny tags is charged for the memory it takes; the
+    budget is therefore room for about 64 events of the largest size, fewer when they are
+    tag-dense.
+  - **No setting, and nothing in `policy_fingerprint`.** The budget is derived from the
+    event size limit. None of this changes which events a node finally accepts, only
+    whether an early event is retried from memory or fetched again from the peer (a client's
+    own early event, when it is not kept, must be published again), so two nodes of a pair cannot disagree about a repository because of it and
+    the fingerprint has nothing to cover.
+  - **Counter.** `ngit_private_hold_dropped_total{reason}` with `count_cap`, `byte_budget`,
+    `not_holdable` and `skip_set_full`. No label carries a tenant, an alias or a key.
 - **Peers.** A configured peer is dialled when it is missing from the sync index, redialled
   by upstream's reconnect loop after a failed connection, and retried once a minute (and
   reported once) while it cannot be registered at all.
@@ -439,7 +488,9 @@ front of a node that caches must honour the origin's cache headers on blob paths
   enforced ahead of the write policy for events from clients. Phase-0 gate G4 asserts that
   128 KiB passes and 1 MiB is refused there. Config validation warns when
   `NGIT_GRASP_P_MAX_EVENT_BYTES` exceeds the relay ceiling. Synced events do not pass that
-  ceiling: only the SDK's 5 MB message limit bounds them.
+  ceiling. For the GRASP-P kinds `NGIT_GRASP_P_MAX_EVENT_BYTES` is checked first on the sync
+  path too (see "The out-of-order hold" above); synced events of every other kind are
+  bounded only by the SDK's 5 MB message limit.
 - **Relay filter limits.** `NGIT_RELAY_FILTER_LIMIT` and `NGIT_RELAY_MAX_SUBSCRIPTIONS` (500
   each) are new in v3. The watchdog's discovery filter does not page, so its view of a node
   is cut short after 500 events per filter (M3 #10). The GRASP-P sync filters are sent

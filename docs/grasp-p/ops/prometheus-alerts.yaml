@@ -154,6 +154,33 @@ groups:
           description: "Clients have been continuously rate-limited on {{ $labels.path }} for 30m. If paired with NgitPrivateAdmissionRejectionSpike, treat as a flood (tighten the nginx zone in docs/grasp-p/ops/nginx-upload-zones.conf); if isolated, a legit client is likely misconfigured — identify via access logs before relaxing limits."
           runbook: "docs/grasp-p/ops/runbook.md#rate-limited"
 
+      # Out-of-order hold saturated. An event that reaches a node before the
+      # registration it depends on is rejected, kept in memory and retried
+      # when the registration arrives. The hold is bounded (4096 events, a
+      # byte budget of at least 32 MiB, 65,536 remembered ids); when a bound
+      # is hit a new event is dropped. One that came from the peer comes back
+      # when its registration is accepted or, at the latest, with the next
+      # full re-issue, so replication of early events can slow from seconds
+      # to up to NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS. A synced event is
+      # not lost for good; a client's own early event must be published
+      # again.
+      # reason="not_holdable" is left out on purpose: it counts rejections
+      # no registration can cure (quota, shape, size), which is ordinary
+      # traffic and already covered by NgitPrivateAdmissionRejectionSpike.
+      # The series appear at their first increment, so the rule is inert on
+      # a node whose hold has never overflowed.
+      - alert: NgitPrivateHoldSaturated
+        expr: sum by (reason) (increase(ngit_private_hold_dropped_total{reason=~"count_cap|byte_budget|skip_set_full"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Out-of-order hold is dropping events (reason={{ $labels.reason }})"
+          description: "The in-memory hold for private events that arrive before their registration has been at a bound for 15m ({{ $labels.reason }}). Early events are dropped: one from the peer is fetched again when its registration is accepted or, at the latest, with the next full re-issue; one from a client must be published again. Usually a flood of events for unregistered aliases or keys; check the rejection mix and the source before anything else."
+          runbook: "docs/grasp-p/ops/runbook.md#hold-saturated"
+
       # Full re-issue silence (Phase-4b B1). The timer fires one since=None
       # re-issue round per NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS (default
       # 3600, +-10% jitter; first fire one interval after boot). FS-8: a

@@ -124,9 +124,14 @@ and rate gates below — membership is necessary, not sufficient. Contents are n
 - **[N]** An unregistered outer author is **rejected outright** — never routed to the public
   related-event path. Accepting referenced wraps from unregistered keys made every deregistered
   rekey address permanently floodable and charged to nobody, defeating the client's epoch-scoped
-  admission windows (plan §3.2). A rejected **3359** is held in the out-of-order index keyed by its
-  outer author, so a later 30640 registering that key reprocesses it; **23359** is never stored and
-  never held.
+  admission windows (plan §3.2). A **3359** rejected for this reason is held in the out-of-order
+  index keyed by its outer author, so a later 30640 registering that key reprocesses it; **23359**
+  is never stored and never held. The hold is a bounded best effort: a wrap larger than
+  `max_event_bytes` is refused before the key is looked up and never held, a wrap rejected for a
+  reason no registration can cure (quota, date) is not held, and the hold has a count cap and a
+  byte budget. A wrap that reached the node by sync and was not held is fetched again when the
+  registration is accepted or, at the latest, at the next full re-issue; a client that is told
+  `unregistered key` must be prepared to publish again.
 - **[N]** 3359 bytes are quota-charged once per event id (idempotent inside the serialized meta
   txn, so concurrent deliveries of one id cannot double-charge); 23359 is never charged — which is
   why the per-write-key rate bucket is its only cost.
@@ -424,7 +429,11 @@ and is built from the same helpers the admission arms use (`stream_wrap_kinds` /
 
 Two-node replication: 30640 L1 sync filter → registration-driven 30641 `#d` +
 3359 `authors` derived filters (plus 1059 while the legacy window is open — the same helper again,
-`src/sync/filters.rs:104`); out-of-order reprocess hold; hourly `since=None` full re-issue with
+`src/sync/filters.rs:104`); out-of-order reprocess hold (a 30641 or stream wrap that arrives before
+the registration it depends on is rejected, kept in memory and retried when that registration is
+accepted; only dependency rejections are kept, within a count cap and a byte budget, node-local
+and outside the policy fingerprint because it changes when an event is retried and never whether
+it is accepted); hourly `since=None` full re-issue with
 a per-peer minimum interval; **pull-only blob mirror** over the peer's public GET with per-blob
 exponential backoff. **[N]** Outbound private-sync connections are *initiated* ONLY to the operator
 allowlist `NGIT_GRASP_P_SYNC_PEER_URLS` — tenant `relays` tags are advisory metadata and never
@@ -499,6 +508,9 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
 | 30640: lost a key conflict | `write key already registered` | genuine (drives the squat-tolerant widen) |
 | whitelist / pow / alias limit / quota | `tenant is not on the registration whitelist` / `registration requires N bits of NIP-13 proof of work` / `tenant has reached the alias limit` / `quota exceeded` | genuine |
 | any private kind, created_at > now + 900 s | `event created_at is too far in the future` | genuine |
+| any private kind, serialized size > `max_event_bytes` (checked first, before any lookup) | `event exceeds private repo size limit` | genuine |
+| 30641: `a` tag names another tenant than the alias's holder | `state root a tag does not match the live registration` | genuine |
+| 30641: author is not a `w` key of the live registration | `event author is not a registered write key for this alias` | genuine |
 | 1059/21059 while the legacy window is CLOSED | `legacy stream-wrap kind is not accepted on this node` | genuine, **not** widenable |
 
 **[N]** The cord-git client treats any message containing the substring `unregistered` as its

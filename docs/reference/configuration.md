@@ -1683,10 +1683,14 @@ startup log line.
 
 #### `NGIT_GRASP_P_MAX_EVENT_BYTES`
 
-**Description:** Serialized-JSON size cap in bytes for private-repo events (30640/30641/1059/21059). Part of the `policy_fingerprint` preimage.  
+**Description:** Serialized-JSON size cap in bytes for private-repo events (30640/30641 and the stream wraps 3359/23359, plus 1059/21059 while the legacy kinds are accepted). Checked first, before any lookup, for events from clients and from sync peers alike; an event over the cap is refused with `event exceeds private repo size limit`. Part of the `policy_fingerprint` preimage. The in-memory hold for events that arrive before their registration takes its byte budget from this value (32 MiB, or 64 times this value when that is more); that budget is not a setting and not part of the fingerprint, because it changes when an early event is retried and never whether it is accepted.  
 **Type:** Integer  
 **Default:** `131072` (128 KiB)  
 **Required:** No
+
+**Metrics:**
+
+- `ngit_private_hold_dropped_total{reason}` — rejected private events the out-of-order hold did not keep: `count_cap` and `byte_budget` (the hold is full; a synced event is fetched again when its registration is accepted or at the next full re-issue, a client's must be sent again), `skip_set_full` (the id could not be remembered), `not_holdable` (the rejection is one no registration can cure; routine)
 
 #### `NGIT_GRASP_P_QUOTA_TENANT_BYTES`
 
@@ -1921,7 +1925,8 @@ wall-clock bucket has refilled (refill-aware eligibility: the per-token
 refill period, clamped to [60s, 1h], with ±20% per-hold jitter). The hold
 is bounded by a 1024-entry registrations sub-cap within the 4096-entry
 global rejected-event hold and drains at most 64 retries per tick (FIFO,
-oldest-insertion first). A retry still over cadence is re-held; an edition
+oldest-insertion first), and by a quarter of the hold's byte budget (see
+`NGIT_GRASP_P_MAX_EVENT_BYTES`). A retry still over cadence is re-held; an edition
 that went stale while held is absorbed by the anchor-repair accept-no-op;
 the hourly full re-issue (below) is the backstop healer for holds that
 expire or overflow.

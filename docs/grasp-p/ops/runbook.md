@@ -502,6 +502,59 @@ loop — identify it via nginx access logs before relaxing limits. Defaults
 are sized so honest cord-git flows, including widen→narrow rotations, never
 trip (src/config.rs:743–756).
 
+### Hold saturated
+
+**Alert:** `NgitPrivateHoldSaturated` —
+`sum by (reason) (increase(ngit_private_hold_dropped_total{reason=~"count_cap|byte_budget|skip_set_full"}[10m])) > 0`
+for 15m.
+
+What it means: a state root or a stream wrap can reach a node before the
+registration it depends on. The node rejects it, keeps it in memory, and
+tries it again when the registration is accepted; that is how a pair
+converges within seconds when events cross on the wire. The hold is
+bounded, and this alert says a bound has been in force for 15 minutes:
+
+| `reason` | bound | effect |
+| --- | --- | --- |
+| `count_cap` | 4096 held events, of which at most 1024 registrations | the new event is dropped and can be fetched again |
+| `byte_budget` | 32 MiB of held events, or 64 x `NGIT_GRASP_P_MAX_EVENT_BYTES` when that is more; registrations may use a quarter. An event is charged its serialized size plus the fixed memory cost of each tag and tag element, so one built from many tiny tags is charged for the memory it takes | the same |
+| `skip_set_full` | 65,536 remembered event ids, 4,096 of them reserved for held events, so 61,440 ids of events that were not kept | the id of a rejected event is not remembered, so the node validates it again when a peer offers it again |
+| `not_holdable` | none: the rejection is one no registration can cure (quota, size, shape, date, a store fault) | not alerted on; a synced event's id is remembered, a client's event leaves nothing |
+
+Nothing a peer holds is lost for good. A dropped event that came from the
+peer is still there and is fetched again when the registration it was
+waiting for is accepted (that changes the sync filters and triggers a
+re-issue), or at the latest with the next full re-issue
+(`NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS`, default one hour). A dropped
+event that came from a client is not kept anywhere: the client was told it
+was rejected and must publish again. The visible effect on replication is
+that pushes which arrive out of order can take up to the full re-issue
+interval to appear on the second node, where they normally take seconds. Held
+events expire after `NGIT_REJECTED_HOT_CACHE_DURATION_SECS` (default 120 s),
+so the hold empties by itself once the cause stops. There is no setting
+for the bounds; the byte budget follows `NGIT_GRASP_P_MAX_EVENT_BYTES`.
+
+Remediate:
+
+```bash
+curl -s 127.0.0.1:9464/metrics | grep -E '^ngit_private_(hold_dropped|events_rejected|rate_limited)_total'
+```
+
+- Rejections rising with it (see [Admission rejection spike](#admission-rejection-spike)):
+  someone is sending events for aliases or keys that are not registered.
+  From a client, the per-write-key bucket does not stop it, because each
+  unregistered key has a bucket of its own; tighten the connection and
+  request limits at the front proxy (§6). From the sync side, the events
+  come through the peer: look at the peer's own rejection counters and its
+  clients.
+- No rejection spike, and the peer was down or has just been restored: a
+  backlog is arriving out of order. It clears with the next full
+  re-issue; no action.
+- `skip_set_full` alone: many distinct rejected events are being offered
+  again and again. Find what the peer holds that this node refuses
+  (compare `policy_fingerprint`, §2: a pair that disagrees on policy
+  produces exactly this).
+
 ### Full re-issue silent
 
 **Alert:** `NgitPrivateFullReissueSilent` —
@@ -782,6 +835,20 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/grasp_p/mod.rs:176, 190) | genuine | DELETE blobs or ask for quota |
 | HTTP 401 + `WWW-Authenticate: Nostr` | blob routes: missing, malformed, expired or mis-addressed kind-24242 authorization. Its `created_at` must be at most 1 hour old and at most 15 minutes ahead of the node's clock; a `server` tag, when present, must name this node (`NGIT_DOMAIN`), and `GET /list` requires one (src/grasp_p/blossom_auth.rs) | genuine | sign a fresh authorization; check the client's clock, and the node's own (a node more than 15 minutes slow or an hour fast refuses every authorization; keep both nodes of a pair time-synchronised) |
 | HTTP 500 + `X-Reason: internal error` | any blob route; the client is never told more | node fault | read the node's log for `blob route internal error: <detail>` at the same time |
+
+An event refused with `unregistered alias`, `unregistered key`, `event
+author is not a registered write key for this alias`, `state root a tag
+does not match the live registration` or one of the two `registration
+changed; retry` messages may be accepted later without the client
+sending it again: the relay keeps such an event for
+`NGIT_REJECTED_HOT_CACHE_DURATION_SECS` and retries it when the
+registration it was waiting for arrives. This is a best effort within the
+hold's bounds (§3 Hold saturated), so a client must still be ready to
+publish again. Apart from the cadence case below, an event refused for
+any other reason is not kept. An
+event larger than `NGIT_GRASP_P_MAX_EVENT_BYTES` is refused with
+`restricted: event exceeds private repo size limit` before anything else
+is looked at.
 
 A cadence-rejected replacement (`replacement rate-limited; retry later`)
 may be accepted LATER without the client republishing anything: the relay
