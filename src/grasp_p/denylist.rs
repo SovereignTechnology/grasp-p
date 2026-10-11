@@ -24,7 +24,7 @@
 //!   immediately via [`gc::purge_blob`] — the same meta-`with_write`
 //!   primitive GC uses — freeing every claim (releasing ledger charges per
 //!   the established discipline) and unlinking the bytes. The swap happens
-//!   BEFORE the purge so the five mirror skip sites (which consult
+//!   BEFORE the purge so the mirror's skip sites (which consult
 //!   `is_denylisted`) can never re-enqueue a blob that is about to be
 //!   purged, and reads start returning 451 immediately.
 //! - **Removal**: a hash dropped from the files unblocks reads on the next
@@ -264,9 +264,10 @@ impl FileState {
         };
         // Swap BEFORE purging: reads 451 immediately, and the mirror skip
         // sites (which consult is_denylisted) can never re-enqueue a blob
-        // that is about to be purged. `update_lag` likewise excludes
-        // denylisted shas, and the purge deletes the claims outright, so
-        // purged blobs leave ngit_private_mirror_lag_blobs.
+        // that is about to be purged. The repair scan, which sets the lag
+        // gauge, likewise excludes denylisted shas, and the purge deletes
+        // the claims outright, so purged blobs leave
+        // ngit_private_mirror_lag_blobs at the next scan.
         let old_set = swap_set(&svc.denylist, new_set.clone());
         crate::metrics::set_private_denylist_entries(new_set.len());
 

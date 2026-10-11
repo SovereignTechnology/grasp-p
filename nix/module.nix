@@ -733,8 +733,9 @@ let
         type = types.int;
         default = 4;
         description = ''
-          GRASP-P Phase 2: maximum concurrent blob mirror fetches. Must
-          be > 0 when the mirror is enabled.
+          GRASP-P Phase 2: maximum concurrent blob mirror fetches. One
+          account holds at most half of them (rounded down, at least one).
+          Must be > 0 when the mirror is enabled.
         '';
       };
 
@@ -742,8 +743,11 @@ let
         type = types.int;
         default = 120;
         description = ''
-          GRASP-P Phase 2: per-blob mirror fetch timeout in seconds. Must
-          be > 0 when the mirror is enabled.
+          GRASP-P Phase 2: how long, in seconds, a mirror peer may take to
+          answer a request, and how long it may send nothing in the middle
+          of a body. One request as a whole gets this time plus the blob's
+          length divided by 256 KiB/s. Must be > 0 when the mirror is
+          enabled.
         '';
       };
 
@@ -903,12 +907,13 @@ let
         description = ''
           GRASP-P Phase-4b B2: base delay (seconds) for the blob mirror's
           per-blob exponential retry backoff (base * 2^(attempt-1), capped
-          at privateMirrorRetryMaxSecs, ±20% jitter). Applies to transient
-          failure classes only (transport, peer 5xx, no peer, and
-          404-on-all-peers at the max interval); deterministic classes
-          (quota, too_large, verify/store/blocked, reserve/sink) keep the
-          flat repair-scan cadence. Must be > 0. Node-local recovery knob —
-          NOT part of the policy_fingerprint preimage.
+          at privateMirrorRetryMaxSecs, ±20% jitter). Every failed fetch is
+          retried on a schedule. This one is for failures that may heal by
+          themselves or by a change on this node (transport, any peer status
+          but 404, no peer, quota, reserve, sink, write, store); the others
+          (404 from every peer, blocked, verify, too_large) always wait the
+          max interval. Must be > 0. Node-local recovery knob — NOT part of
+          the policy_fingerprint preimage.
         '';
       };
 
@@ -917,8 +922,22 @@ let
         default = 3600;
         description = ''
           GRASP-P Phase-4b B2: cap (seconds) for the blob mirror retry
-          backoff; also the fixed retry interval for blobs the peers answer
-          404 (possible late upload). Must be >= privateMirrorRetryBaseSecs.
+          backoff; also the fixed retry interval for the failures that do
+          not heal by themselves (404 from every peer, blocked, verify,
+          too_large). Must be >= privateMirrorRetryBaseSecs.
+        '';
+      };
+
+      privateMirrorMaxAttemptsPerMin = mkOption {
+        type = types.int;
+        default = 600;
+        description = ''
+          GRASP-P: blobs the mirror may start fetching per minute, over all
+          accounts together. One attempt is one missing blob tried against
+          its peers. The node may start that many at once after a quiet
+          spell and that many per minute from then on; a blob that has to
+          wait is fetched as soon as the budget allows, never dropped.
+          0 = unlimited. Node-local: not part of the policy fingerprint.
         '';
       };
 
@@ -1130,6 +1149,8 @@ let
         toString cfg.privateMirrorRetryBaseSecs;
       NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS =
         toString cfg.privateMirrorRetryMaxSecs;
+      NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN =
+        toString cfg.privateMirrorMaxAttemptsPerMin;
       NGIT_GRASP_P_DENYLIST_RELOAD_SECS =
         toString cfg.privateDenylistReloadSecs;
     } // optionalAttrs (cfg.privateDenylistPath != null) {

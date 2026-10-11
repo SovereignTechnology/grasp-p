@@ -511,6 +511,7 @@ mod tests {
             mirror_fetch_timeout_secs: 5,
             mirror_retry_base_secs: 1,
             mirror_retry_max_secs: 60,
+            mirror_max_attempts_per_min: 0,
             mirror_allow_private_ips: false,
             policy_fingerprint: String::new(),
             write_rate_capacity: 0,

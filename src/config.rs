@@ -870,11 +870,15 @@ pub struct Config {
     #[arg(long, env = "NGIT_GRASP_P_MIRROR_PEER_URLS")]
     pub private_mirror_peer_urls: Option<String>,
 
-    /// Maximum concurrent blob mirror fetches
+    /// Maximum concurrent blob mirror fetches. One account holds at most
+    /// half of them (rounded down, at least one).
     #[arg(long, env = "NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY", default_value_t = 4)]
     pub private_mirror_max_concurrency: u32,
 
-    /// Per-blob mirror fetch timeout in seconds
+    /// How long, in seconds, a mirror peer may take to answer a request,
+    /// and how long it may send nothing in the middle of a body. One
+    /// request as a whole gets this time plus the blob's length divided by
+    /// 256 KiB/s.
     #[arg(
         long,
         env = "NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS",
@@ -1033,12 +1037,11 @@ pub struct Config {
     /// Base delay (seconds) for the blob mirror's per-blob exponential
     /// retry backoff: after n consecutive fetch failures the next attempt
     /// waits base * 2^(n-1) (capped at NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS,
-    /// ±20% jitter). Applies to transient failure classes only (transport
-    /// errors, peer HTTP 5xx, no available peer, and 404-on-all-peers —
-    /// the latter always at the max interval for late uploads).
-    /// Deterministic failure classes (quota, too_large, verify/store/blocked,
-    /// reserve/sink) are NOT gated: they keep the flat repair-scan cadence
-    /// and only succeed once the underlying condition changes. Node-local
+    /// ±20% jitter). Every failed fetch is retried on a schedule. This one
+    /// is for failures that may heal by themselves or by a change on this
+    /// node (transport errors, any peer status but 404, no peer, quota,
+    /// reserve, sink, write, store); the others (404 from every peer,
+    /// blocked, verify, too_large) always wait the max interval. Node-local
     /// recovery knob — NOT part of the policy_fingerprint preimage.
     #[arg(
         long,
@@ -1048,14 +1051,31 @@ pub struct Config {
     pub private_mirror_retry_base_secs: u64,
 
     /// Cap (seconds) for the blob mirror retry backoff; also the fixed
-    /// retry interval for blobs the peers answer 404 (possible late
-    /// upload). Must be >= NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS.
+    /// retry interval for the failures that do not heal by themselves (404
+    /// from every peer, blocked, verify, too_large). Must be at least
+    /// NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS.
     #[arg(
         long,
         env = "NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS",
         default_value_t = 3600
     )]
     pub private_mirror_retry_max_secs: u64,
+
+    /// Blobs the mirror may start fetching per minute, over all accounts
+    /// together. One attempt is one missing blob tried against its peers.
+    /// The node may start that many at once after a quiet spell and that
+    /// many per minute from then on; a blob that has to wait is fetched as
+    /// soon as the budget allows, never dropped. 0 = unlimited. It bounds
+    /// what retries cost when many blobs keep failing; the retry backoff
+    /// bounds each blob by itself. Node-local: it decides when this node
+    /// fetches, never what it accepts, so it is NOT part of the
+    /// policy_fingerprint preimage.
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN",
+        default_value_t = 600
+    )]
+    pub private_mirror_max_attempts_per_min: u32,
 
     /// Loopback address (IP:PORT, for example 127.0.0.1:9464) on which a
     /// node with GRASP-P enabled serves its Prometheus scrape. Such a node
@@ -2029,6 +2049,7 @@ impl Config {
             private_reissue_min_interval_secs: 30,
             private_mirror_retry_base_secs: 60,
             private_mirror_retry_max_secs: 3600,
+            private_mirror_max_attempts_per_min: 600,
             private_metrics_bind: None,
         }
     }
@@ -3578,6 +3599,46 @@ mod tests {
         let defaults = Config::for_testing();
         assert_eq!(defaults.private_max_uploads_per_tenant, 8);
         assert_eq!(defaults.private_upload_min_bytes_per_sec, 16384);
+    }
+
+    /// The mirror's attempt budget has the documented default, is read from
+    /// the environment like its neighbours, and has no value that stops the
+    /// node: 0 turns it off.
+    #[test]
+    fn grasp_p_mirror_attempt_budget_default_and_env_override() {
+        let _environment_guard = CONFIG_ENV_LOCK.lock().expect("lock must not be poisoned");
+        const VARIABLE: &str = "NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN";
+        let original = std::env::var_os(VARIABLE);
+        std::env::remove_var(VARIABLE);
+
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("default configuration should parse");
+        assert_eq!(config.private_mirror_max_attempts_per_min, 600);
+        assert_eq!(
+            Config::for_testing().private_mirror_max_attempts_per_min,
+            600,
+            "for_testing() must match the shipped default"
+        );
+
+        std::env::set_var(VARIABLE, "0");
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "example.com"])
+            .expect("a budget of 0 should parse");
+        assert_eq!(config.private_mirror_max_attempts_per_min, 0);
+
+        match original {
+            Some(value) => std::env::set_var(VARIABLE, value),
+            None => std::env::remove_var(VARIABLE),
+        }
+
+        for budget in [0, 1, 600, u32::MAX] {
+            let config = Config {
+                private_repos_enable: true,
+                private_mirror_enable: true,
+                private_mirror_max_attempts_per_min: budget,
+                ..Config::for_testing()
+            };
+            assert!(config.validate().is_ok(), "attempt budget {budget}");
+        }
     }
 
     #[test]

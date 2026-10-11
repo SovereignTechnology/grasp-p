@@ -1889,7 +1889,8 @@ async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: b
 // ============================================================================
 
 /// A minimal flake-serving blob peer: 500s every GET while `serve` is
-/// false, then serves the seeded blobs (404 for unknown hashes).
+/// false, then serves the seeded blobs (404 for unknown hashes). A blob
+/// with a delay is answered that much later, every time.
 struct FlakyBlobServer {
     base_url: String,
     serve: Arc<std::sync::atomic::AtomicBool>,
@@ -1898,6 +1899,16 @@ struct FlakyBlobServer {
 
 impl FlakyBlobServer {
     async fn start(blobs: Vec<(String, Vec<u8>)>) -> Self {
+        Self::start_slow(blobs, std::collections::HashMap::new()).await
+    }
+
+    /// Like [`Self::start`], answering each hash in `delays` only after its
+    /// delay.
+    async fn start_slow(
+        blobs: Vec<(String, Vec<u8>)>,
+        delays: std::collections::HashMap<String, Duration>,
+    ) -> Self {
+        let delays = Arc::new(delays);
         let std_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind flaky blob server");
         let port = std_listener.local_addr().expect("local addr").port();
@@ -1918,6 +1929,7 @@ impl FlakyBlobServer {
                         let Ok((stream, _)) = accept_result else { continue };
                         let serve = serve_loop.clone();
                         let blobs = blobs.clone();
+                        let delays = delays.clone();
                         tokio::spawn(async move {
                             use http_body_util::Full;
                             use hyper::body::Bytes;
@@ -1925,9 +1937,13 @@ impl FlakyBlobServer {
                                 move |req: hyper::Request<hyper::body::Incoming>| {
                                     let serve = serve.clone();
                                     let blobs = blobs.clone();
+                                    let delays = delays.clone();
                                     async move {
                                         let sha =
                                             req.uri().path().trim_start_matches('/').to_string();
+                                        if let Some(delay) = delays.get(&sha).copied() {
+                                            tokio::time::sleep(delay).await;
+                                        }
                                         let (status, body) = if !serve
                                             .load(std::sync::atomic::Ordering::SeqCst)
                                         {
@@ -2079,6 +2095,126 @@ async fn exit11_mirror_retry_backoff() {
     assert_eq!(
         c2, c3,
         "exit11: failure counter must stop growing once the blob is mirrored"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
+// Exit test 15 — one account's slow backlog does not starve another account
+// ============================================================================
+
+/// Issue 26. One account has forty blobs that the peer serves slowly; a
+/// second account then declares one blob the peer serves at once. The
+/// second account's blob must be on the replica within seconds, while the
+/// first account is still far behind, and the first account must keep
+/// being served too.
+///
+/// Before the mirror kept one queue per account, its worker took the forty
+/// blobs as one job and waited for a fetch slot for each of them in turn,
+/// so the second account's blob waited for all forty: about 45 seconds
+/// with the numbers below.
+#[tokio::test]
+async fn exit15_one_tenants_backlog_does_not_starve_another() {
+    const SLOW_BLOBS: usize = 40;
+    const SLOW_DELAY: Duration = Duration::from_secs(5);
+
+    let slow_blobs: Vec<Vec<u8>> = (0..SLOW_BLOBS)
+        .map(|i| blob_bytes(100 + i as u8, 512))
+        .collect();
+    let slow_refs: Vec<(String, u64)> = slow_blobs
+        .iter()
+        .map(|blob| (sha256_hex(blob), blob.len() as u64))
+        .collect();
+    let quick_blob = blob_bytes(90, 512);
+    let quick_sha = sha256_hex(&quick_blob);
+
+    let mut served: Vec<(String, Vec<u8>)> = slow_refs
+        .iter()
+        .map(|(sha, _)| sha.clone())
+        .zip(slow_blobs.iter().cloned())
+        .collect();
+    served.push((quick_sha.clone(), quick_blob.clone()));
+    let delays: std::collections::HashMap<String, Duration> = slow_refs
+        .iter()
+        .map(|(sha, _)| (sha.clone(), SLOW_DELAY))
+        .collect();
+    let stub = FlakyBlobServer::start_slow(served, delays).await;
+    stub.serve.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // The stub is the only blob peer of both nodes, so every blob B ends
+    // up with came through B's mirror.
+    let slow_tenant = Keys::generate();
+    let quick_tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&slow_tenant, &quick_tenant]);
+    let (a, b) = start_pair(&[
+        ("NGIT_GRASP_P_MIRROR_PEER_URLS", &stub.base_url),
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+    ])
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    // Everything is published on B itself, so no step below waits for the
+    // pair to sync: the bounds measure B's mirror and nothing else.
+    let slow_writer = Keys::generate();
+    let slow_alias = random_alias();
+    register_on(&b, &domain_refs, &slow_tenant, &slow_writer, &slow_alias).await;
+    let quick_writer = Keys::generate();
+    let quick_alias = random_alias();
+    register_on(&b, &domain_refs, &quick_tenant, &quick_writer, &quick_alias).await;
+
+    // The slow account declares its forty blobs in one state root.
+    let slow_edition = state_root_event(
+        &slow_writer,
+        &slow_tenant.public_key(),
+        &slow_alias,
+        (&slow_refs[0].0, slow_refs[0].1),
+        &slow_refs[1..],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(b.url(), &slow_edition).await;
+    assert!(accepted, "exit15: the slow 30641 failed on B: {message:?}");
+    assert!(
+        wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+            m.gauge("ngit_private_mirror_lag_blobs", &[]).unwrap_or(0) >= 30
+        })
+        .await,
+        "exit15: B must be behind on the slow account's blobs"
+    );
+
+    // The quick account's one blob is not behind them.
+    let quick_edition = state_root_event(
+        &quick_writer,
+        &quick_tenant.public_key(),
+        &quick_alias,
+        (&quick_sha, quick_blob.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(b.url(), &quick_edition).await;
+    assert!(accepted, "exit15: the quick 30641 failed on B: {message:?}");
+    let mirrored = wait_for_blob(&b, &quick_sha, Duration::from_secs(20))
+        .await
+        .expect("exit15: the quick account's blob must not wait for the slow account's backlog");
+    assert_eq!(mirrored, quick_blob, "exit15: mirrored blob bytes intact");
+
+    let lag = ParsedMetrics::parse(&b.grasp_p_metrics().await)
+        .gauge("ngit_private_mirror_lag_blobs", &[])
+        .unwrap_or(0);
+    assert!(
+        lag > 0,
+        "exit15: the slow account must still be behind when the quick blob has arrived"
+    );
+
+    // The slow account is served as well: its first blob arrives.
+    let first_slow = wait_for_blob(&b, &slow_refs[0].0, Duration::from_secs(150))
+        .await
+        .expect("exit15: the slow account's blobs must keep arriving");
+    assert_eq!(
+        first_slow, slow_blobs[0],
+        "exit15: mirrored blob bytes intact"
     );
 
     a.stop().await;

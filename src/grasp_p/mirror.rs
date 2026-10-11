@@ -1,4 +1,4 @@
-//! GRASP-P Phase 2 blob mirror (pull-only).
+//! GRASP-P blob mirror (pull-only).
 //!
 //! On any accepted kind-30641 the referenced manifest/pack blobs must exist
 //! locally. On the origin node they already do (the client PUT them before
@@ -6,70 +6,129 @@
 //! over the peer's EXISTING public `GET /<sha256>` route — no new inbound
 //! surface.
 //!
-//! Design invariants:
-//! - Streamed to a temp file through the Phase-1 [`UploadSink`], which caps
-//!   bytes at `min(declared, max_blob_bytes)` mid-stream (a hostile peer
-//!   cannot stream unbounded), verifies the SHA-256 against the requested
-//!   hash, fsyncs + renames, and claims + charges the replicated tenant's
-//!   ledger atomically (same GC-TOCTOU-safe path as a client upload).
-//! - Over quota / global budget → skip; the blob stays missing and is
-//!   reflected in the `ngit_private_mirror_lag_blobs` gauge (alert on
-//!   sustained > 0 — silent-desync lesson F1).
-//! - Idempotent: a job whose blob is already local is a no-op; repair scans
-//!   re-derive want sets from blob claims (which 30641 handling maintains),
-//!   so a restart or a transiently unreachable peer heals automatically.
+//! What must hold: on a healthy pair every blob one node stores reaches the
+//! other, and a blob that failed is tried again until it arrives. Nothing
+//! here gives up on a blob; a referenced blob may legitimately appear late.
 //!
-//! ## Phase-4b B2: retry taxonomy (exponential backoff with jitter)
+//! ## Where work comes from
 //!
-//! Every fetch failure is classified from its reason string and either
-//! gated by the per-blob backoff schedule or left to the flat repair scan:
+//! - An accepted 30641 enqueues its missing blobs at once.
+//! - A repair scan (every 60 s; at boot) re-derives every missing blob from
+//!   the blob-claim table. It is the safety net: anything dropped, refused
+//!   for lack of room or lost in a restart comes back through it. The scan
+//!   also sets `ngit_private_mirror_lag_blobs`; nothing else does.
 //!
-//! | Reason                              | Class         | Retry behavior                                    |
-//! |-------------------------------------|---------------|---------------------------------------------------|
-//! | `network: …` (transport)            | transient     | backoff `base * 2^attempt` (capped, ±20% jitter)  |
-//! | `http_status: 5xx`                  | transient     | same backoff schedule                             |
-//! | `http_status: <other>`              | transient     | same backoff schedule (proxy/edge oddities)       |
-//! | `no_peer`                           | transient     | same backoff schedule (peer set may appear)       |
-//! | `http_status: 404` (all peers)      | late upload   | backoff retry but always at the MAX interval      |
-//! | `too_large`                         | deterministic | NO hot retry — flat repair-scan cadence only      |
-//! | `verify: …` (bad bytes/size)        | deterministic | NO hot retry (peer serves poison — content-fixed) |
-//! | `store: …` (incl. finish() 403)     | deterministic | NO hot retry (registration/quota state must move) |
-//! | `blocked` (SSRF guard)              | deterministic | NO hot retry (config must change)                 |
-//! | `quota`                             | deterministic | NO hot retry (GC/ledger must free space)          |
-//! | `reserve: …` / `sink: …` / `write: …` | deterministic | NO hot retry (local state must change)            |
+//! ## How work is ordered
 //!
-//! "NO hot retry" keeps the pre-B2 behavior exactly: the blob is not gated,
-//! so the flat repair scan re-enqueues it every tick and it succeeds as
-//! soon as the underlying condition changes (persist-skips like the
-//! denylist never reach this table at all — they are filtered earlier).
-//! Backoff-gated blobs stay counted in `ngit_private_mirror_lag_blobs`;
-//! the gate only suppresses re-ENQUEUE, never the gauge. There is no
-//! give-up: a referenced blob may legitimately appear late.
+//! Storage is sold per account (the tenant key), so the account is the unit
+//! of fairness. `FairQueue` keeps one backlog per account, serves the
+//! accounts in turn, and lets one account hold at most half of the
+//! concurrent fetches. One account whose blobs come slowly, or never, then
+//! cannot take every fetch. (Two such accounts can fill the default four
+//! between them; a third then waits for fetches of theirs to end.) An
+//! account's backlog is bounded; what does not fit is dropped and
+//! re-derived by the next scan.
 //!
-//! Retry state is per-blob `(attempt count, next-eligible Instant)` held
-//! in memory next to the worker's `inflight` set; a restart resets every
-//! blob to the base interval (documented behavior — the boot repair scan
-//! immediately re-derives all wants anyway).
+//! A blob that several accounts claim is fetched for the one with the
+//! fewest missing blobs. The other claimants are kept as fallbacks: when
+//! the first one's own state refuses the blob (its quota is full, its
+//! registration is gone), the fetch goes on for the next, so one account
+//! cannot stop a blob that another account can take.
+//!
+//! The worker loop never waits for a free fetch slot. It takes new jobs,
+//! starts and collects repair scans and collects finished fetches as they
+//! come, and after each of those starts every fetch that may start now.
+//!
+//! ## What a fetch may cost
+//!
+//! - `AttemptBudget` bounds how many fetches start per minute over all
+//!   accounts (`NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN`).
+//! - Every failure closes a per-blob gate (table below). No class is left
+//!   to the flat scan cadence, so no blob is fetched again every minute for
+//!   ever.
+//! - Within one fetch the cheap checks come first: the address guard, then
+//!   a quota check against local state, then the request; the peer's
+//!   announced length is judged before the first byte of the body is read.
+//!
+//! ## Failure classes
+//!
+//! | Reason                         | Retry                     | Ends the peer loop |
+//! |--------------------------------|---------------------------|--------------------|
+//! | `network: …` (also: no DNS)    | `base * 2^n`, capped      | no                 |
+//! | `http_status: <not 404>`       | `base * 2^n`, capped      | no                 |
+//! | `no_peer`                      | `base * 2^n`, capped      | (no peer to try)   |
+//! | `quota`                        | `base * 2^n`, capped      | yes                |
+//! | `reserve: …`                   | `base * 2^n`, capped      | yes                |
+//! | `sink: …`                      | `base * 2^n`, capped      | yes                |
+//! | `write: …`                     | `base * 2^n`, capped      | yes                |
+//! | `store: …`                     | `base * 2^n`, capped      | yes                |
+//! | `http_status: 404`             | the maximum interval      | no                 |
+//! | `blocked` (address guard)      | the maximum interval      | no                 |
+//! | `verify: …` (bad bytes/size)   | the maximum interval      | no                 |
+//! | `too_large`                    | the maximum interval      | no                 |
+//!
+//! The first group may heal by itself or by a change on this node (a peer
+//! comes back, space is freed), so it is retried soon and then less often.
+//! The second group needs someone else to act (an upload, a configuration
+//! change, a peer that serves other bytes), so it waits the maximum
+//! interval every time. All delays carry ±20% jitter.
+//!
+//! A peer whose name does not resolve is `network`, not `blocked`: a
+//! resolver that fails for a moment must not park every blob tried
+//! meanwhile for the maximum interval.
+//!
+//! A failure caused by this node's own state would repeat on every peer,
+//! so it ends the peer loop and is the reason recorded. Otherwise each peer
+//! is tried and the class with the soonest retry is recorded, whatever the
+//! order of the peers: one peer answering 404 must not park for an hour a
+//! blob that another peer failed to serve for a passing reason.
+//!
+//! A gated blob stays counted in `ngit_private_mirror_lag_blobs`; the gate
+//! stops it being queued, not being counted. Gates live in memory only: a
+//! restart forgets them and the boot scan queues every missing blob again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nostr::prelude::Event;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use super::blob_store::UploadSink;
 use super::{BlobError, PrivateService, UploadOrigin};
+
+/// Blobs one account may have waiting in the queue. What does not fit is
+/// dropped; the next repair scan derives it again from the claim table.
+const ACCOUNT_BACKLOG_CAP: usize = 1024;
+
+/// The slowest link a fetch is given time for, in bytes per second. The
+/// deadline of a fetch grows by the blob's length divided by this.
+const MIN_FETCH_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// No fetch is given longer than this, whatever the settings say. It keeps
+/// the deadline arithmetic far from overflow.
+const MAX_FETCH_DEADLINE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The reason recorded when a peer's name did not resolve.
+const UNRESOLVED_REASON: &str = "network: peer name did not resolve";
+
+/// The clock the worker, the retry gates and the attempt budget read: the
+/// runtime's, so a test can pause it. Outside tests it is the monotonic
+/// system clock.
+pub(crate) fn clock_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// One blob a mirror job wants locally.
 #[derive(Debug, Clone)]
 pub struct WantBlob {
     pub sha256: String,
-    /// Declared size from the 30641 tag / blob claim (upload-sink cap +
-    /// in-flight reservation size).
+    /// Declared size from the 30641 tag / blob claim.
     pub size: u64,
 }
 
@@ -81,6 +140,31 @@ pub struct MirrorJob {
     pub want: Vec<WantBlob>,
     /// Peer blob-server base URLs (this node's own domain already excluded).
     pub peer_servers: Vec<String>,
+    /// Whether `peer_servers` is the operator's list. A peer the operator
+    /// named is believed about a blob's length; a peer that only a
+    /// registration names is not.
+    pub peers_configured: bool,
+}
+
+/// What every blob of one job has in common.
+#[derive(Debug)]
+struct Route {
+    tenant_hex: String,
+    alias: String,
+    peer_servers: Vec<String>,
+    peers_configured: bool,
+}
+
+/// One blob to fetch: the unit the queue holds and a fetch slot runs.
+#[derive(Debug, Clone)]
+struct FetchTask {
+    route: Arc<Route>,
+    /// Other accounts' claims on the same blob, tried in order when this
+    /// node's own state refuses the blob for `route`. Empty for a job that
+    /// came from an event: the repair scan knows every claimant, an event
+    /// only its own.
+    fallbacks: Vec<Arc<Route>>,
+    blob: WantBlob,
 }
 
 /// Normalize a `server` tag value / configured peer URL into an HTTP base
@@ -175,7 +259,7 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
 /// defeats the literal-IP / static-hostname SSRF via a hostile 30640 `server`
 /// tag; DNS rebinding at connection time remains a documented residual
 /// (production should set NGIT_GRASP_P_MIRROR_PEER_URLS to the known peer).
-async fn peer_allowed(peer_base: &str, allow_private: bool) -> bool {
+async fn peer_allowed(peer_base: &str, allow_private: bool) -> PeerVerdict {
     outbound_target_allowed(
         peer_base,
         crate::outbound::OutboundTargetKind::EventGit,
@@ -195,7 +279,27 @@ pub(crate) async fn relay_peer_allowed(relay_url: &str, allow_private: bool) -> 
         allow_private,
     )
     .await
+        == PeerVerdict::Allowed
 }
+
+/// What the address guard says about a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerVerdict {
+    Allowed,
+    /// The policy refuses the target: its scheme, its credentials, a local
+    /// name, or an address that is not global. Only a change of
+    /// configuration or of the peer's DNS records heals it.
+    Refused,
+    /// The name did not resolve. Nothing is connected to, as for a refusal,
+    /// but a resolver that fails heals by itself.
+    Unresolved,
+}
+
+/// How the outbound policy's errors begin when the lookup itself failed
+/// (`OutboundTargetPolicy::authorize_resolved`). If upstream rewords them,
+/// a failed lookup reads as a refusal again: still nothing is connected
+/// to, and the test `guard_tells_a_failed_lookup_from_a_refusal` fails.
+const POLICY_DNS_ERROR_PREFIX: &str = "DNS resolution";
 
 /// Shared body of the two guards. With `allow_private` the policy skips DNS
 /// vetting (upstream's `allow_non_global`) but still checks scheme and
@@ -207,33 +311,45 @@ async fn outbound_target_allowed(
     kind: crate::outbound::OutboundTargetKind,
     secure_scheme: &str,
     allow_private: bool,
-) -> bool {
+) -> PeerVerdict {
     if !allow_private && !url.starts_with(secure_scheme) {
-        return false;
+        return PeerVerdict::Refused;
     }
     let policy = crate::outbound::OutboundTargetPolicy {
         allow_non_global: allow_private,
     };
     match policy.authorize_resolved(kind, url).await {
-        Ok(resolved) => resolved
-            .addresses
-            .iter()
-            .all(|address| !is_disallowed_ip(address)),
-        Err(_) => false,
+        Ok(resolved) => {
+            if resolved
+                .addresses
+                .iter()
+                .all(|address| !is_disallowed_ip(address))
+            {
+                PeerVerdict::Allowed
+            } else {
+                PeerVerdict::Refused
+            }
+        }
+        Err(e) if e.starts_with(POLICY_DNS_ERROR_PREFIX) => PeerVerdict::Unresolved,
+        Err(_) => PeerVerdict::Refused,
     }
 }
 
-/// Peer servers for an alias: the configured override when present,
-/// otherwise the registration's `server` tags minus this node's own domain.
-fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> Vec<String> {
-    let candidates: Vec<&String> = match svc.cfg.mirror_peer_urls {
-        Some(ref configured) => configured.iter().collect(),
-        None => registration_servers
-            .iter()
-            // Phase-4b A3: exact-host own-domain exclusion (host + port —
-            // loopback test pairs are host-equal but port-distinct).
-            .filter(|v| !is_own_server(v, &svc.cfg.domain))
-            .collect(),
+/// Peer servers for an alias, and whether they are the operator's: the
+/// configured list when there is one, otherwise the registration's `server`
+/// tags minus this node's own domain.
+fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> (Vec<String>, bool) {
+    let (candidates, configured): (Vec<&String>, bool) = match svc.cfg.mirror_peer_urls {
+        Some(ref configured) => (configured.iter().collect(), true),
+        None => (
+            registration_servers
+                .iter()
+                // Phase-4b A3: exact-host own-domain exclusion (host + port —
+                // loopback test pairs are host-equal but port-distinct).
+                .filter(|v| !is_own_server(v, &svc.cfg.domain))
+                .collect(),
+            false,
+        ),
     };
     let mut out = Vec::new();
     for value in candidates {
@@ -243,7 +359,7 @@ fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> Ve
             }
         }
     }
-    out
+    (out, configured)
 }
 
 /// Own-domain exclusion for a `server` tag value: exact-host match on the
@@ -261,7 +377,7 @@ fn is_own_server(value: &str, own_domain: &str) -> bool {
 }
 
 // =============================================================================
-// Phase-4b B2: per-blob retry state (exponential backoff with jitter)
+// Per-blob retry gates
 // =============================================================================
 
 /// Per-blob retry state: consecutive failure count + the Instant the blob
@@ -273,32 +389,61 @@ pub(crate) struct RetryState {
     pub next_eligible: Instant,
 }
 
-/// Failure classification for the retry taxonomy (module-doc table).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The two retry schedules, ordered by which retries sooner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RetryClass {
-    /// Transient: retry on the exponential schedule.
+    /// May heal by itself or by a change on this node: `base * 2^n`, capped.
     Backoff,
-    /// 404 on all peers — possibly a late upload: retry at the MAX interval.
-    BackoffAtMax,
-    /// Deterministic-given-state: do NOT hot-retry; the flat repair scan
-    /// keeps re-enqueueing and success requires the condition to change.
-    NoRetry,
+    /// Needs someone else to act: the maximum interval, every time.
+    AtMax,
 }
 
-/// Classify a `fetch_from_peer` reason string (module-doc table).
+/// The base and the cap of the backoff.
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    base: Duration,
+    max: Duration,
+}
+
+/// Classify a failure reason (module-doc table). A reason this function
+/// does not know backs off like a transient one: nothing may go ungated.
 fn classify_failure(reason: &str) -> RetryClass {
-    if reason == "no_peer" || reason.starts_with("network:") {
-        return RetryClass::Backoff;
-    }
     if let Some(rest) = reason.strip_prefix("http_status:") {
         return match rest.trim().parse::<u16>() {
-            Ok(404) => RetryClass::BackoffAtMax,
+            Ok(404) => RetryClass::AtMax,
             _ => RetryClass::Backoff,
         };
     }
-    // too_large / verify: / store: / blocked / quota / reserve: / sink: /
-    // write: and anything unrecognized — deterministic-given-state.
-    RetryClass::NoRetry
+    match reason_label(reason) {
+        "blocked" | "verify" | "too_large" => RetryClass::AtMax,
+        _ => RetryClass::Backoff,
+    }
+}
+
+/// Does this failure come from this node's own state (ledgers, disk, the
+/// registration)? Another peer would meet the same state, so the peer loop
+/// ends on it.
+fn stops_peer_loop(reason: &str) -> bool {
+    matches!(
+        reason_label(reason),
+        "quota" | "reserve" | "sink" | "write" | "store"
+    )
+}
+
+/// The one reason recorded for a blob whose peers all failed.
+///
+/// A failure from this node's own state wins: it is why the loop ended.
+/// Otherwise the class that retries soonest wins, and between two reasons
+/// of one class the one that sorts first, so the answer does not depend on
+/// the order in which the peers were tried.
+fn merge_peer_failures(reasons: &[String]) -> Option<&str> {
+    if let Some(local) = reasons.iter().find(|r| stops_peer_loop(r)) {
+        return Some(local.as_str());
+    }
+    reasons
+        .iter()
+        .map(String::as_str)
+        .min_by_key(|r| (classify_failure(r), *r))
 }
 
 /// Delay before the next retry after `attempts` consecutive failures
@@ -308,56 +453,367 @@ fn retry_delay(attempts: u32, base: Duration, max: Duration, jitter: f64) -> Dur
     // Shift capped so base * 2^shift cannot overflow before the max cap.
     let shift = attempts.saturating_sub(1).min(20);
     let capped = base.saturating_mul(1u32 << shift).min(max);
-    Duration::from_secs_f64((capped.as_secs_f64() * jitter).max(0.0))
+    // A cap too large to scale is used as it is, never a panic.
+    Duration::try_from_secs_f64((capped.as_secs_f64() * jitter).max(0.0)).unwrap_or(capped)
 }
 
-/// Is `sha` currently gated (its next-eligible Instant lies in the future)?
+/// One sample of the ±20% jitter.
+fn sample_jitter() -> f64 {
+    use ::rand::RngExt;
+
+    0.8 + ::rand::rng().random::<f64>() * 0.4
+}
+
+/// Is `sha` gated at `now` (its next-eligible Instant lies in the future)?
 /// Gated blobs stay counted in the lag gauge; only re-enqueue is suppressed.
-fn retry_gated(retry: &HashMap<String, RetryState>, sha: &str) -> bool {
+fn retry_gated(retry: &HashMap<String, RetryState>, sha: &str, now: Instant) -> bool {
     retry
         .get(sha)
-        .map(|state| state.next_eligible > Instant::now())
+        .map(|state| state.next_eligible > now)
         .unwrap_or(false)
 }
 
-/// Record one all-peers fetch failure for `sha`, updating the backoff gate
-/// per the taxonomy. `NoRetry` classes clear any stale gate so the flat
-/// repair-scan cadence applies (pre-B2 behavior).
+/// Record one failed attempt for `sha` and close its gate. Every reason
+/// closes it: a class left ungated would be fetched again by every scan.
 fn record_mirror_failure(
     retry: &mut HashMap<String, RetryState>,
     sha: &str,
     reason: &str,
-    base: Duration,
-    max: Duration,
+    policy: RetryPolicy,
+    now: Instant,
+    jitter: f64,
 ) {
-    use ::rand::RngExt;
-
-    let class = classify_failure(reason);
-    match class {
-        RetryClass::NoRetry => {
-            retry.remove(sha);
-        }
-        RetryClass::Backoff | RetryClass::BackoffAtMax => {
-            // ±20% jitter, sampled once per failure.
-            let jitter = 0.8 + ::rand::rng().random::<f64>() * 0.4;
-            let entry = retry.entry(sha.to_string()).or_insert(RetryState {
-                attempts: 0,
-                next_eligible: Instant::now(),
-            });
-            entry.attempts = entry.attempts.saturating_add(1);
-            let delay = match class {
-                RetryClass::BackoffAtMax => retry_delay(u32::MAX, base, max, jitter),
-                _ => retry_delay(entry.attempts, base, max, jitter),
-            };
-            entry.next_eligible = Instant::now() + delay;
-        }
-    }
+    let entry = retry.entry(sha.to_string()).or_insert(RetryState {
+        attempts: 0,
+        next_eligible: now,
+    });
+    entry.attempts = entry.attempts.saturating_add(1);
+    let delay = match classify_failure(reason) {
+        RetryClass::AtMax => retry_delay(u32::MAX, policy.base, policy.max, jitter),
+        RetryClass::Backoff => retry_delay(entry.attempts, policy.base, policy.max, jitter),
+    };
+    // A cap too large for the clock means "as late as the clock allows",
+    // never a panic in the worker loop.
+    entry.next_eligible = now
+        .checked_add(delay)
+        .unwrap_or(now + Duration::from_secs(365 * 24 * 3600));
 }
 
 /// Clear the retry gate for `sha` (successful fetch, or the blob turned up
 /// by other means).
 fn record_mirror_success(retry: &mut HashMap<String, RetryState>, sha: &str) {
     retry.remove(sha);
+}
+
+// =============================================================================
+// The fair queue
+// =============================================================================
+
+/// What [`FairQueue::push`] did with a blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pushed {
+    Queued,
+    /// The blob is already queued or being fetched.
+    Duplicate,
+    /// The account's backlog is full. The blob is dropped here and derived
+    /// again by the next repair scan.
+    BacklogFull,
+}
+
+/// A blob handed out by [`FairQueue::pop`]. It counts as running for its
+/// account until [`FairQueue::finish`] is called with the same two names.
+#[derive(Debug)]
+struct Popped<T> {
+    account: String,
+    sha: String,
+    item: T,
+}
+
+/// Blobs waiting to be fetched, one backlog per account.
+///
+/// Accounts are served in turn, and an account that already has
+/// `account_running_cap` blobs running is passed over, so one account's
+/// backlog, however long or slow, delays another account's blob by at most
+/// the fetches already running. A blob is in the queue or running at most
+/// once, whoever asked for it; while it waits, the repair scan may move it
+/// to the account it should be fetched for ([`Self::push_or_move`]).
+///
+/// No clock and no I/O: the worker loop owns one and is its only caller.
+#[derive(Debug)]
+struct FairQueue<T> {
+    /// Waiting blobs per account. An account has an entry only while it has
+    /// something waiting.
+    backlogs: HashMap<String, VecDeque<(String, T)>>,
+    /// The accounts of `backlogs`, each once, next to be served first.
+    ring: VecDeque<String>,
+    /// Blobs running per account. An entry exists only while above zero.
+    running: HashMap<String, usize>,
+    running_total: usize,
+    /// Hashes that are waiting or running: the account a hash waits for,
+    /// or `None` once it runs.
+    known: HashMap<String, Option<String>>,
+    account_running_cap: usize,
+    account_backlog_cap: usize,
+}
+
+impl<T> FairQueue<T> {
+    fn new(account_running_cap: usize, account_backlog_cap: usize) -> Self {
+        Self {
+            backlogs: HashMap::new(),
+            ring: VecDeque::new(),
+            running: HashMap::new(),
+            running_total: 0,
+            known: HashMap::new(),
+            account_running_cap: account_running_cap.max(1),
+            account_backlog_cap: account_backlog_cap.max(1),
+        }
+    }
+
+    fn push(&mut self, account: &str, sha: &str, item: T) -> Pushed {
+        if self.known.contains_key(sha) {
+            return Pushed::Duplicate;
+        }
+        let waiting = self.backlogs.get(account).map_or(0, VecDeque::len);
+        if waiting >= self.account_backlog_cap {
+            return Pushed::BacklogFull;
+        }
+        if waiting == 0 {
+            self.ring.push_back(account.to_string());
+        }
+        self.known
+            .insert(sha.to_string(), Some(account.to_string()));
+        self.backlogs
+            .entry(account.to_string())
+            .or_default()
+            .push_back((sha.to_string(), item));
+        Pushed::Queued
+    }
+
+    /// As [`Self::push`], but a blob that waits for another account is
+    /// moved to `account`, with `item` in place of what was queued.
+    ///
+    /// For the repair scan, which knows every claimant of a blob. A job
+    /// from an event queues a blob for the account that published the
+    /// event; if that account has a long backlog, the blob would wait
+    /// behind it although another claimant's queue is short. A blob that is
+    /// already running is left alone.
+    fn push_or_move(&mut self, account: &str, sha: &str, item: T) -> Pushed {
+        let holder = match self.known.get(sha) {
+            None => return self.push(account, sha, item),
+            Some(None) => return Pushed::Duplicate,
+            Some(Some(holder)) if holder == account => return Pushed::Duplicate,
+            Some(Some(holder)) => holder.clone(),
+        };
+        // No room where it should go: it keeps its place where it is.
+        if self.backlogs.get(account).map_or(0, VecDeque::len) >= self.account_backlog_cap {
+            return Pushed::Duplicate;
+        }
+        let emptied = match self.backlogs.get_mut(&holder) {
+            Some(backlog) => {
+                backlog.retain(|(waiting, _)| waiting != sha);
+                backlog.is_empty()
+            }
+            None => false,
+        };
+        if emptied {
+            self.backlogs.remove(&holder);
+            self.ring.retain(|waiting| waiting != &holder);
+        }
+        self.known.remove(sha);
+        self.push(account, sha, item)
+    }
+
+    /// The next blob to run, or `None` when nothing is waiting or every
+    /// account with something waiting is at its cap.
+    fn pop(&mut self) -> Option<Popped<T>> {
+        for _ in 0..self.ring.len() {
+            let account = self.ring.pop_front()?;
+            if self.running_for(&account) >= self.account_running_cap {
+                self.ring.push_back(account);
+                continue;
+            }
+            let (next, emptied) = match self.backlogs.get_mut(&account) {
+                Some(backlog) => (backlog.pop_front(), backlog.is_empty()),
+                None => (None, true),
+            };
+            if emptied {
+                self.backlogs.remove(&account);
+            } else {
+                self.ring.push_back(account.clone());
+            }
+            let Some((sha, item)) = next else {
+                continue;
+            };
+            *self.running.entry(account.clone()).or_insert(0) += 1;
+            self.running_total += 1;
+            self.known.insert(sha.clone(), None);
+            return Some(Popped { account, sha, item });
+        }
+        None
+    }
+
+    /// Give back what [`Self::pop`] handed out, fetched or not.
+    fn finish(&mut self, account: &str, sha: &str) {
+        self.known.remove(sha);
+        let emptied = match self.running.get_mut(account) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => return,
+        };
+        if emptied {
+            self.running.remove(account);
+        }
+        self.running_total = self.running_total.saturating_sub(1);
+    }
+
+    /// Blobs handed out and not yet given back.
+    fn running(&self) -> usize {
+        self.running_total
+    }
+
+    fn running_for(&self, account: &str) -> usize {
+        self.running.get(account).copied().unwrap_or(0)
+    }
+
+    /// Is there a waiting blob that [`Self::pop`] would hand out?
+    fn has_runnable(&self) -> bool {
+        self.ring
+            .iter()
+            .any(|account| self.running_for(account) < self.account_running_cap)
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.backlogs.values().map(VecDeque::len).sum()
+    }
+}
+
+/// How many fetches one account may have running: half of them, and at
+/// least one. One slow account then never holds every slot. Two slow
+/// accounts can, between them: with the default of four they hold two
+/// each. A third account then waits for their fetches to end and is served
+/// in its turn: each account ahead of it starts at most one more fetch
+/// first.
+fn account_share(max_concurrency: usize) -> usize {
+    (max_concurrency / 2).max(1)
+}
+
+// =============================================================================
+// The attempt budget
+// =============================================================================
+
+/// A token bucket over fetch attempts, all accounts together: holds up to
+/// one minute's worth, refills at the configured rate. One token is taken
+/// each time a fetch starts. `per_min == 0` means no limit.
+///
+/// No clock of its own: the caller says what time it is.
+#[derive(Debug)]
+struct AttemptBudget {
+    per_min: u32,
+    tokens: f64,
+    last: Instant,
+}
+
+impl AttemptBudget {
+    fn new(per_min: u32, now: Instant) -> Self {
+        Self {
+            per_min,
+            tokens: f64::from(per_min),
+            last: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last);
+        if elapsed.is_zero() {
+            // Also covers a reading earlier than the last one: the time
+            // already credited is never credited twice.
+            return;
+        }
+        let rate = f64::from(self.per_min) / 60.0;
+        self.tokens = (self.tokens + elapsed.as_secs_f64() * rate).min(f64::from(self.per_min));
+        self.last = now;
+    }
+
+    /// How long until a token is there: `None` when one can be taken now.
+    fn wait(&mut self, now: Instant) -> Option<Duration> {
+        if self.per_min == 0 {
+            return None;
+        }
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            return None;
+        }
+        let rate = f64::from(self.per_min) / 60.0;
+        let wait = Duration::from_secs_f64((1.0 - self.tokens) / rate);
+        // Never a zero wait: rounding could otherwise wake the loop a
+        // moment early, find no token and spin.
+        Some(wait.max(Duration::from_millis(1)))
+    }
+
+    /// Take one token if there is one.
+    fn try_take(&mut self, now: Instant) -> bool {
+        if self.per_min == 0 {
+            return true;
+        }
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// =============================================================================
+// What a fetch is given
+// =============================================================================
+
+/// How many bytes to read from a peer that answered 200, or why not to
+/// read any.
+///
+/// `announced` is the length the response states, if it states one.
+///
+/// - A peer the operator configured is the pair's other node. Its length is
+///   the length of the blob it stores, so it is believed even where the
+///   state root declared another: the replica then stores what the origin
+///   stores.
+/// - A peer that only a registration names is whatever host an account
+///   wrote there. It may serve exactly the declared number of bytes; any
+///   other announcement fails here, before the body is read.
+/// - With no announced length, the declared size bounds the read.
+///
+/// In every case nothing longer than the maximum blob size is read.
+fn expected_len(
+    announced: Option<u64>,
+    declared: u64,
+    peer_configured: bool,
+    max_blob_bytes: u64,
+) -> Result<u64, String> {
+    let expected = match announced {
+        Some(announced) if peer_configured => announced,
+        Some(announced) if announced != declared => {
+            return Err(format!(
+                "verify: peer announced {announced} bytes, the state root declared {declared}"
+            ));
+        }
+        _ => declared,
+    };
+    if expected > max_blob_bytes {
+        return Err("too_large".to_string());
+    }
+    Ok(expected)
+}
+
+/// How long one request for `len` bytes may take from its first byte sent
+/// to its last byte read: the configured timeout, plus the time the body
+/// needs on the slowest link the mirror allows for. A fixed limit would
+/// either cut every large blob on a slow link or let a small one hang.
+fn fetch_deadline(fetch_timeout: Duration, len: u64) -> Duration {
+    fetch_timeout.saturating_add(Duration::from_secs(len / MIN_FETCH_BYTES_PER_SEC))
 }
 
 /// FS-5 (review L2-F7): warn-log dedup for all-peers fetch failures. At
@@ -550,15 +1006,16 @@ pub(crate) fn enqueue_for_state_root(svc: &PrivateService, event: &Event) {
     }
 
     // Skip blobs already local (client-push path on the origin node),
-    // denylisted, or currently backoff-gated (B2): a gated blob stays
-    // missing until its next-eligible Instant and must not be hot-enqueued
-    // by every arriving 30641 edition.
+    // denylisted, or currently gated: a gated blob stays missing until its
+    // next-eligible Instant and must not be queued again by every arriving
+    // 30641 edition.
     {
+        let now = clock_now();
         let retry = svc.mirror_retry.lock();
         want.retain(|w| {
             !svc.blobs.exists(&w.sha256)
                 && !svc.is_denylisted(&w.sha256)
-                && !retry_gated(&retry, &w.sha256)
+                && !retry_gated(&retry, &w.sha256, now)
         });
     }
     if want.is_empty() {
@@ -573,128 +1030,304 @@ pub(crate) fn enqueue_for_state_root(svc: &PrivateService, event: &Event) {
         }
     };
 
+    let (peer_servers, peers_configured) = peer_servers_for(svc, &record.servers);
     let job = MirrorJob {
         tenant_hex: record.tenant_hex.clone(),
         alias,
         want,
-        peer_servers: peer_servers_for(svc, &record.servers),
+        peer_servers,
+        peers_configured,
     };
     let _ = tx.send(job);
 }
 
-/// Repair scan: derive mirror jobs for every referenced-but-missing blob
-/// from the blob-claim table, and update the mirror lag gauge. Covers boot
-/// (want sets re-derived from retained 30641 state), missed enqueues, and
-/// retries after peer failures.
-fn scan_missing(svc: &PrivateService) -> Vec<MirrorJob> {
-    let mut jobs: Vec<MirrorJob> = Vec::new();
-    let mut lag = 0_u64;
+// =============================================================================
+// The repair scan
+// =============================================================================
 
-    let Ok(txn) = svc.meta.read_txn() else {
-        return jobs;
-    };
-    let Ok(claims) = svc.meta.all_blob_claims(&txn) else {
-        return jobs;
-    };
-
-    // B2: prune retry gates for blobs that are no longer lagging (locally
-    // stored, denylisted, or fully unclaimed — e.g. after a registration
-    // death) so the map stays bounded by the live backlog.
-    {
-        let lagging: HashSet<&String> = claims
-            .iter()
-            .filter(|(sha, claim)| {
-                !claim.aliases.is_empty() && !svc.blobs.exists(sha) && !svc.is_denylisted(sha)
-            })
-            .map(|(sha, _)| sha)
-            .collect();
-        svc.mirror_retry
-            .lock()
-            .retain(|sha, _| lagging.contains(sha));
-    }
-
-    for (sha, claim) in claims {
-        if claim.aliases.is_empty() || svc.blobs.exists(&sha) || svc.is_denylisted(&sha) {
-            continue;
-        }
-        lag += 1;
-
-        // B2: backoff-gated blobs remain lag (the gauge is NOT hidden) but
-        // are not re-enqueued until their next-eligible Instant.
-        if retry_gated(&svc.mirror_retry.lock(), &sha) {
-            continue;
-        }
-
-        // First claiming alias with a live (non-tombstoned) registration.
-        let mut resolved = None;
-        for alias in &claim.aliases {
-            if let Ok(Some(record)) = svc.meta.get_registration(&txn, alias) {
-                if record.tombstoned_at.is_none() {
-                    resolved = Some((alias.clone(), record));
-                    break;
-                }
-            }
-        }
-        let Some((alias, record)) = resolved else {
-            continue;
-        };
-
-        let want = WantBlob {
-            sha256: sha,
-            size: claim.size,
-        };
-        if let Some(job) = jobs
-            .iter_mut()
-            .find(|j| j.alias == alias && j.tenant_hex == record.tenant_hex)
-        {
-            job.want.push(want);
-        } else {
-            jobs.push(MirrorJob {
-                tenant_hex: record.tenant_hex.clone(),
-                alias,
-                want: vec![want],
-                peer_servers: peer_servers_for(svc, &record.servers),
-            });
-        }
-    }
-
-    crate::metrics::set_private_mirror_lag_blobs(lag);
-    jobs
+/// What one repair scan found.
+#[derive(Debug, Default)]
+struct ScanOutcome {
+    /// Missing blobs that may be fetched now, each attributed to one alias.
+    tasks: Vec<FetchTask>,
+    /// Every referenced blob that is missing, gated ones included.
+    lag: u64,
 }
 
-/// Recompute + publish the lag gauge (referenced-but-missing blob count).
-fn update_lag(svc: &PrivateService) {
-    let Ok(txn) = svc.meta.read_txn() else { return };
-    let Ok(claims) = svc.meta.all_blob_claims(&txn) else {
-        return;
-    };
-    let lag = claims
+/// An alias with a live registration that claims a missing blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Claimant {
+    account: String,
+    alias: String,
+    /// Whether the blob's speculative charge is booked to this alias.
+    holds_charge: bool,
+}
+
+/// A missing blob as the scan sees it between its two passes.
+struct Wanted {
+    blob: WantBlob,
+    /// The alias the blob's speculative charge is booked to, if any.
+    charged_alias: Option<String>,
+    /// The live registrations that claim it.
+    live: Vec<Arc<Route>>,
+}
+
+/// How many accounts one fetch tries a blob for: the chosen claimant and
+/// this many less one as fallbacks.
+const MAX_ROUTES_PER_BLOB: usize = 4;
+
+/// Which claimants a missing blob is fetched for, best first: one alias
+/// per account, the account with the fewest missing blobs first, at most
+/// [`MAX_ROUTES_PER_BLOB`] of them. The values are indexes into
+/// `claimants`; `account_lag` counts the missing blobs per account.
+///
+/// A blob can be claimed by aliases of several accounts, and it waits in
+/// the queue of the account it is attributed to. Taking the first claimant
+/// would let an account with a huge backlog pull a blob it shares with
+/// another account into its own long queue; the shortest queue gets the
+/// blob to everyone who claims it soonest. Ties go to the account that
+/// sorts first, so the choice does not depend on claim order.
+///
+/// The rest are fallbacks. Without them the rule above could be turned
+/// round: an account with a short queue and no room left would be chosen
+/// for a blob every time, be refused every time, and keep the blob from
+/// the account that can take it.
+///
+/// Within one account the alias that holds the blob's speculative charge
+/// comes first, then the alias that sorts first. The quota forecast nets
+/// that charge only for the alias it is booked to; for a sibling alias it
+/// would count the blob twice against the account.
+fn rank_claimants(claimants: &[Claimant], account_lag: &HashMap<String, u64>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..claimants.len()).collect();
+    order.sort_by_key(|&index| {
+        let claimant = &claimants[index];
+        (
+            account_lag.get(&claimant.account).copied().unwrap_or(0),
+            claimant.account.as_str(),
+            !claimant.holds_charge,
+            claimant.alias.as_str(),
+        )
+    });
+    let mut accounts: HashSet<&str> = HashSet::new();
+    order.retain(|&index| accounts.insert(claimants[index].account.as_str()));
+    order.truncate(MAX_ROUTES_PER_BLOB);
+    order
+}
+
+/// Drop the gates of blobs that are no longer missing (stored, denylisted,
+/// or unclaimed after a registration died), so the map stays bounded by the
+/// live backlog. Returns the hashes whose gate is still shut at `now`.
+fn prune_gates(
+    retry: &mut HashMap<String, RetryState>,
+    missing: &HashSet<&str>,
+    now: Instant,
+) -> HashSet<String> {
+    retry.retain(|sha, _| missing.contains(sha.as_str()));
+    retry
         .iter()
-        .filter(|(sha, claim)| {
-            !claim.aliases.is_empty() && !svc.blobs.exists(sha) && !svc.is_denylisted(sha)
-        })
-        .count() as u64;
-    crate::metrics::set_private_mirror_lag_blobs(lag);
+        .filter(|(_, state)| state.next_eligible > now)
+        .map(|(sha, _)| sha.clone())
+        .collect()
 }
 
-/// Fetch one blob from one peer through the Phase-1 upload sink.
+/// Repair scan: derive a fetch for every referenced-but-missing blob from
+/// the blob-claim table, and count the missing ones. Covers boot, missed
+/// or dropped enqueues, and retries once a gate has opened.
+///
+/// Reads the whole claim table and asks the file system about every claim,
+/// so it must run on a blocking thread, never on the async runtime.
+///
+/// `None` when the claim table could not be read: that is not "nothing is
+/// missing", and the caller must not report it as such.
+fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
+    let mut outcome = ScanOutcome::default();
+
+    let txn = svc.meta.read_txn().ok()?;
+    let claims = svc.meta.all_blob_claims(&txn).ok()?;
+
+    // The one question put to the file system per claim. Everything below
+    // works from this list.
+    let missing: Vec<(String, super::meta::BlobClaim)> = claims
+        .into_iter()
+        .filter(|(sha, claim)| {
+            !claim.aliases.is_empty() && !svc.is_denylisted(sha) && !svc.blobs.exists(sha)
+        })
+        .collect();
+    outcome.lag = missing.len() as u64;
+
+    let missing_now: HashSet<&str> = missing.iter().map(|(sha, _)| sha.as_str()).collect();
+    let gated = prune_gates(&mut svc.mirror_retry.lock(), &missing_now, now);
+    // Ends the borrow of `missing`, which is taken apart below.
+    drop(missing_now);
+
+    // Each alias is looked up once, however many blobs it claims.
+    let mut routes: HashMap<String, Option<Arc<Route>>> = HashMap::new();
+    let mut route_for = |alias: &str| -> Option<Arc<Route>> {
+        if let Some(known) = routes.get(alias) {
+            return known.clone();
+        }
+        let route = match svc.meta.get_registration(&txn, alias) {
+            Ok(Some(record)) if record.tombstoned_at.is_none() => {
+                let (peer_servers, peers_configured) = peer_servers_for(svc, &record.servers);
+                Some(Arc::new(Route {
+                    tenant_hex: record.tenant_hex,
+                    alias: alias.to_string(),
+                    peer_servers,
+                    peers_configured,
+                }))
+            }
+            _ => None,
+        };
+        routes.insert(alias.to_string(), route.clone());
+        route
+    };
+
+    // First pass: who claims each missing blob, and how many missing blobs
+    // each account has. Gated blobs count: they are part of the backlog.
+    let mut account_lag: HashMap<String, u64> = HashMap::new();
+    let mut wanted: Vec<Wanted> = Vec::with_capacity(missing.len());
+    for (sha, claim) in missing {
+        let live: Vec<Arc<Route>> = claim
+            .aliases
+            .iter()
+            .filter_map(|alias| route_for(alias))
+            .collect();
+        // A blob counts once for an account, however many of the account's
+        // aliases claim it.
+        let accounts: HashSet<&str> = live.iter().map(|r| r.tenant_hex.as_str()).collect();
+        for account in accounts {
+            *account_lag.entry(account.to_string()).or_insert(0) += 1;
+        }
+        wanted.push(Wanted {
+            blob: WantBlob {
+                sha256: sha,
+                size: claim.size,
+            },
+            charged_alias: claim.spec_charge.map(|charge| charge.alias),
+            live,
+        });
+    }
+
+    // Second pass: one fetch per blob whose gate is open and which a live
+    // registration still claims. No more per account than its backlog
+    // holds: the queue would drop the rest, and the next scan derives them
+    // again.
+    let mut derived: HashMap<String, usize> = HashMap::new();
+    for Wanted {
+        blob,
+        charged_alias,
+        live,
+    } in wanted
+    {
+        if gated.contains(&blob.sha256) {
+            continue;
+        }
+        let claimants: Vec<Claimant> = live
+            .iter()
+            .map(|route| Claimant {
+                account: route.tenant_hex.clone(),
+                alias: route.alias.clone(),
+                holds_charge: charged_alias.as_deref() == Some(route.alias.as_str()),
+            })
+            .collect();
+        let ranked = rank_claimants(&claimants, &account_lag);
+        let Some((&chosen, others)) = ranked.split_first() else {
+            continue;
+        };
+        let route = live[chosen].clone();
+        let count = derived.entry(route.tenant_hex.clone()).or_insert(0);
+        if *count >= ACCOUNT_BACKLOG_CAP {
+            continue;
+        }
+        *count += 1;
+        outcome.tasks.push(FetchTask {
+            route,
+            fallbacks: others.iter().map(|&index| live[index].clone()).collect(),
+            blob,
+        });
+    }
+
+    Some(outcome)
+}
+
+// =============================================================================
+// One fetch
+// =============================================================================
+
+/// Would storing `len` bytes of this blob for the route's alias fit the
+/// ledgers as they stand? Local state only. Asked before any request is
+/// sent, so a blob the account has no room for costs no download.
+fn local_preflight(
+    svc: &PrivateService,
+    route: &Route,
+    blob: &WantBlob,
+    len: u64,
+) -> Result<(), String> {
+    svc.blob_quota_preflight(&route.tenant_hex, &route.alias, &blob.sha256, len)
+        .map_err(|e| match e {
+            BlobError::QuotaExceeded => "quota".to_string(),
+            other => format!("reserve: {}", other.reason()),
+        })
+}
+
+/// Fetch one blob from one peer through the upload sink, for one of the
+/// accounts that claim it.
+///
+/// The order is the point: each step is cheaper than the next, and a blob
+/// that a cheap step refuses never reaches a dearer one. Address guard,
+/// quota preflight, request, status, length, byte reservation, temp file,
+/// body.
 async fn fetch_from_peer(
     svc: &Arc<PrivateService>,
     client: &reqwest::Client,
-    job: &MirrorJob,
+    fetch_timeout: Duration,
+    route: &Route,
     blob: &WantBlob,
     peer_base: &str,
 ) -> Result<(), String> {
-    // SSRF guard: never let a tenant-controlled `server` tag point our fetch at
-    // an internal host. Checked before any reservation/connection.
-    if !peer_allowed(peer_base, svc.cfg.mirror_allow_private_ips).await {
-        return Err("blocked".to_string());
+    // Address guard: a `server` tag an account wrote must never point this
+    // node's fetch at an internal host. A name that does not resolve is
+    // not connected to either, but it is a passing failure, not a refusal.
+    match peer_allowed(peer_base, svc.cfg.mirror_allow_private_ips).await {
+        PeerVerdict::Allowed => {}
+        PeerVerdict::Refused => return Err("blocked".to_string()),
+        PeerVerdict::Unresolved => return Err(UNRESOLVED_REASON.to_string()),
     }
 
-    // Reserve in-flight capacity + open the temp-file sink (mirrors a client
-    // PUT: reservation → sink → stream → finish). finish() releases any
-    // pending speculative charge before its quota check, so the reserve nets
-    // it too (FF).
+    local_preflight(svc, route, blob, blob.size)?;
+
+    let started = tokio::time::Instant::now();
+    let url = format!("{}/{}", peer_base, blob.sha256);
+    let response = match tokio::time::timeout(fetch_timeout, client.get(&url).send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => return Err(format!("network: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "network: no response within {}s",
+                fetch_timeout.as_secs()
+            ));
+        }
+    };
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("http_status: {}", response.status().as_u16()));
+    }
+
+    let expected = expected_len(
+        response.content_length(),
+        blob.size,
+        route.peers_configured,
+        svc.cfg.max_blob_bytes,
+    )?;
+    // The preflight above used the declared size. A configured peer may
+    // have announced a larger one; ask again before reading it.
+    if expected > blob.size {
+        local_preflight(svc, route, blob, expected)?;
+    }
+
+    // Reserve in-flight bytes, then open the temp file (as a client PUT
+    // does: reservation, sink, stream, finish). finish() releases any
+    // pending speculative charge before its quota check, so the
+    // reservation nets it too.
     //
     // The reservation is for bytes only. A fetch takes none of the upload
     // slots clients share, so clients that fill or stall those slots cannot
@@ -704,7 +1337,7 @@ async fn fetch_from_peer(
         .pending_spec_release(&blob.sha256)
         .map_err(|e| format!("reserve: {}", e.reason()))?;
     let reservation = svc
-        .reserve_upload(UploadOrigin::Mirror, &job.tenant_hex, blob.size, pending)
+        .reserve_upload(UploadOrigin::Mirror, &route.tenant_hex, expected, pending)
         .map_err(|e| match e {
             BlobError::QuotaExceeded => "quota".to_string(),
             other => format!("reserve: {}", other.reason()),
@@ -713,45 +1346,58 @@ async fn fetch_from_peer(
         svc.meta.clone(),
         svc.blobs.clone(),
         svc.cfg.clone(),
-        job.tenant_hex.clone(),
-        job.alias.clone(),
+        route.tenant_hex.clone(),
+        route.alias.clone(),
         blob.sha256.clone(),
-        blob.size,
+        expected,
         reservation,
         svc.denylist.clone(),
     )
     .await
     .map_err(|e| format!("sink: {}", e.reason()))?;
 
-    let url = format!("{}/{}", peer_base, blob.sha256);
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("network: {e}"))?;
-    if response.status() != reqwest::StatusCode::OK {
-        return Err(format!("http_status: {}", response.status().as_u16()));
-    }
-
+    // Two limits on the body: the whole request must end by a deadline
+    // that grows with the length, and the peer may not go silent for
+    // longer than the configured timeout in between.
+    let body_limit = fetch_deadline(fetch_timeout, expected).min(MAX_FETCH_DEADLINE);
+    let deadline = started + body_limit;
     let mut response = response;
     loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                // write_chunk enforces min(declared, max_blob_bytes) and
-                // aborts mid-stream on overrun (hostile peer protection).
-                sink.write_chunk(&chunk).await.map_err(|e| match e {
-                    BlobError::TooLarge => "too_large".to_string(),
-                    other => format!("write: {}", other.reason()),
-                })?;
+        let next = tokio::time::timeout_at(
+            deadline,
+            tokio::time::timeout(fetch_timeout, response.chunk()),
+        )
+        .await;
+        let chunk = match next {
+            Err(_) => {
+                return Err(format!(
+                    "network: body not complete after {}s",
+                    body_limit.as_secs()
+                ));
             }
-            Ok(None) => break,
-            Err(e) => return Err(format!("network: {e}")),
-        }
+            Ok(Err(_)) => {
+                return Err(format!(
+                    "network: peer sent nothing for {}s",
+                    fetch_timeout.as_secs()
+                ));
+            }
+            Ok(Ok(Err(e))) => return Err(format!("network: {e}")),
+            Ok(Ok(Ok(chunk))) => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        // write_chunk stops at the expected length (a peer cannot stream
+        // without bound).
+        sink.write_chunk(&chunk).await.map_err(|e| match e {
+            BlobError::TooLarge => "too_large".to_string(),
+            other => format!("write: {}", other.reason()),
+        })?;
     }
 
-    // finish() verifies streamed-bytes == declared size and the SHA-256
-    // against the requested hash; on mismatch the temp file is deleted and
-    // nothing is stored (no poisoned blob).
+    // finish() verifies that the bytes read are as many as expected and
+    // hash to the requested name; on a mismatch the temp file is deleted
+    // and nothing is stored.
     sink.finish().await.map_err(|e| match e {
         BlobError::QuotaExceeded => "quota".to_string(),
         BlobError::BadRequest(reason) => format!("verify: {reason}"),
@@ -760,22 +1406,30 @@ async fn fetch_from_peer(
     Ok(())
 }
 
-/// Fetch one blob, trying each peer in order. Success is sticky (idempotent
-/// no-op when the blob landed via a concurrent job).
+/// Fetch one blob, trying each peer in turn, for each account that claims
+/// it in turn. Success is sticky (a no-op when the blob landed by other
+/// means).
 ///
 /// Returns `None` on success (or when no fetch was needed: already local /
-/// denylisted) and `Some(reason)` when every peer failed or no peer was
-/// available — the worker feeds the reason into the B2 backoff classifier.
+/// denylisted) and `Some(reason)` when no peer delivered it. The reason is
+/// the one [`merge_peer_failures`] picks; the worker closes the blob's
+/// retry gate from it.
 async fn fetch_blob(
     svc: &Arc<PrivateService>,
     client: &reqwest::Client,
-    job: &MirrorJob,
-    blob: &WantBlob,
+    fetch_timeout: Duration,
+    task: &FetchTask,
 ) -> Option<String> {
+    let blob = &task.blob;
     if svc.blobs.exists(&blob.sha256) || svc.is_denylisted(&blob.sha256) {
         return None;
     }
-    if job.peer_servers.is_empty() {
+    let mut routes: Vec<&Route> = Vec::with_capacity(1 + task.fallbacks.len());
+    routes.push(&task.route);
+    for fallback in &task.fallbacks {
+        routes.push(fallback);
+    }
+    if routes.iter().all(|route| route.peer_servers.is_empty()) {
         crate::metrics::record_private_mirror_failed("no_peer");
         // FS-5 + R2-2: deduped and globally rate-limited — the metric
         // carries the per-attempt count.
@@ -785,7 +1439,7 @@ async fn fetch_blob(
             .should_log(&blob.sha256, "no_peer")
         {
             tracing::warn!(
-                alias = %job.alias,
+                alias = %task.route.alias,
                 sha256 = %blob.sha256,
                 "private mirror: no peer server available for blob"
             );
@@ -793,72 +1447,422 @@ async fn fetch_blob(
         return Some("no_peer".to_string());
     }
 
-    let mut last_error = String::new();
-    for peer in &job.peer_servers {
-        match fetch_from_peer(svc, client, job, blob, peer).await {
-            Ok(()) => {
-                crate::metrics::record_private_mirror_fetched();
-                svc.refresh_gauges();
-                tracing::info!(
-                    alias = %job.alias,
-                    sha256 = %blob.sha256,
-                    peer = %peer,
-                    size = blob.size,
-                    "private mirror: blob fetched from peer"
-                );
-                return None;
+    let mut failures: Vec<String> = Vec::new();
+    // Peers that gave an answer of their own. It does not depend on which
+    // account asks, so they are not asked again for the next one.
+    let mut answered: HashSet<&str> = HashSet::new();
+    for &route in &routes {
+        for peer in &route.peer_servers {
+            if answered.contains(peer.as_str()) {
+                continue;
             }
-            Err(reason) => {
-                tracing::debug!(
-                    alias = %job.alias,
-                    sha256 = %blob.sha256,
-                    peer = %peer,
-                    reason = %reason,
-                    "private mirror: fetch attempt failed"
-                );
-                last_error = reason;
+            match fetch_from_peer(svc, client, fetch_timeout, route, blob, peer).await {
+                Ok(()) => {
+                    crate::metrics::record_private_mirror_fetched();
+                    svc.refresh_gauges();
+                    tracing::info!(
+                        alias = %route.alias,
+                        sha256 = %blob.sha256,
+                        peer = %peer,
+                        size = blob.size,
+                        "private mirror: blob fetched from peer"
+                    );
+                    return None;
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        alias = %route.alias,
+                        sha256 = %blob.sha256,
+                        peer = %peer,
+                        reason = %reason,
+                        "private mirror: fetch attempt failed"
+                    );
+                    // This node's own state refused the blob for this
+                    // account: the next peer would be refused the same
+                    // way, the next account perhaps not.
+                    let local = stops_peer_loop(&reason);
+                    failures.push(reason);
+                    if local {
+                        break;
+                    }
+                    answered.insert(peer.as_str());
+                }
             }
         }
     }
 
-    let reason_label = last_error
-        .split(':')
-        .next()
-        .unwrap_or("unknown")
+    let reason = merge_peer_failures(&failures)
+        .unwrap_or("no_peer")
         .to_string();
-    crate::metrics::record_private_mirror_failed(&reason_label);
+    crate::metrics::record_private_mirror_failed(reason_label(&reason));
     // FS-5 (review L2-F7) + R2-2: one warn per (sha256, reason) per 10
     // minutes, bounded globally to a 16-warn burst then 1 warn/s — not one
-    // per failed attempt. At attacker-sized lag sets the per-attempt warn
-    // was ~73 warns/s, drowning every other log line. The metric above
-    // keeps the full per-attempt count for alerting.
+    // per failed attempt. The metric above keeps the full per-attempt count
+    // for alerting.
     if svc
         .mirror_failure_log
         .lock()
-        .should_log(&blob.sha256, &last_error)
+        .should_log(&blob.sha256, &reason)
     {
         tracing::warn!(
-            alias = %job.alias,
+            alias = %task.route.alias,
             sha256 = %blob.sha256,
-            reason = %last_error,
-            "private mirror: blob fetch failed on all peers (will retry on repair scan)"
+            reason = %reason,
+            "private mirror: blob fetch failed on all peers (will retry after its backoff)"
         );
     }
-    Some(last_error)
+    Some(reason)
+}
+
+// =============================================================================
+// The worker
+// =============================================================================
+
+/// A fetch in progress: `None` when the blob is local now (or need not
+/// be), `Some(reason)` when it could not be fetched.
+type FetchFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
+
+/// What the worker loop needs from the node. The loop is written against
+/// this so that its scheduling can be tested with time paused and no
+/// network or disk.
+trait MirrorBackend: Send + Sync + 'static {
+    /// Derive the missing blobs. Called on a blocking thread.
+    fn scan(&self) -> ScanOutcome;
+    /// Is there nothing to fetch for this hash (already local, denylisted)?
+    fn settled(&self, sha256: &str) -> bool;
+    /// Fetch one blob.
+    fn fetch(self: Arc<Self>, task: FetchTask) -> FetchFuture;
+}
+
+/// The node itself as the worker's backend.
+struct LiveBackend {
+    svc: Arc<PrivateService>,
+    client: reqwest::Client,
+    fetch_timeout: Duration,
+}
+
+impl MirrorBackend for LiveBackend {
+    fn scan(&self) -> ScanOutcome {
+        let Some(outcome) = scan_missing(&self.svc, clock_now()) else {
+            // Queue nothing and leave the gauge as the last good scan set
+            // it: a zero here would read as "nothing is missing".
+            tracing::warn!("private mirror: repair scan could not read the claim table");
+            return ScanOutcome::default();
+        };
+        // The only place the gauge is set: one count per scan, taken from
+        // the same pass over the claims as the work it queues.
+        crate::metrics::set_private_mirror_lag_blobs(outcome.lag);
+        outcome
+    }
+
+    fn settled(&self, sha256: &str) -> bool {
+        self.svc.blobs.exists(sha256) || self.svc.is_denylisted(sha256)
+    }
+
+    fn fetch(self: Arc<Self>, task: FetchTask) -> FetchFuture {
+        Box::pin(
+            async move { fetch_blob(&self.svc, &self.client, self.fetch_timeout, &task).await },
+        )
+    }
+}
+
+/// The worker's numbers, fixed at start.
+#[derive(Debug, Clone, Copy)]
+struct WorkerSettings {
+    max_concurrency: usize,
+    attempts_per_min: u32,
+    retry: RetryPolicy,
+    repair_interval: Duration,
+}
+
+/// How a fetch ended.
+#[derive(Debug)]
+enum FetchEnd {
+    Fetched,
+    Failed(String),
+    /// The task ended without an answer (it panicked or was cancelled).
+    Lost,
+}
+
+/// A finished fetch, as reported to the worker loop.
+#[derive(Debug)]
+struct Finished {
+    account: String,
+    sha: String,
+    end: FetchEnd,
+}
+
+/// Reports a fetch to the worker loop when dropped, whatever ended the
+/// task. The loop frees the blob's slot only on this report, so a fetch
+/// that ended without one would hold its slot, and keep its blob marked as
+/// running, for as long as the node runs.
+struct FinishReport {
+    tx: UnboundedSender<Finished>,
+    finished: Option<Finished>,
+}
+
+impl Drop for FinishReport {
+    fn drop(&mut self) {
+        if let Some(finished) = self.finished.take() {
+            let _ = self.tx.send(finished);
+        }
+    }
+}
+
+/// Put the blobs of one job into the queue.
+fn queue_job(queue: &mut FairQueue<FetchTask>, job: MirrorJob) {
+    let route = Arc::new(Route {
+        tenant_hex: job.tenant_hex,
+        alias: job.alias,
+        peer_servers: job.peer_servers,
+        peers_configured: job.peers_configured,
+    });
+    queue_tasks(
+        queue,
+        job.want.into_iter().map(|blob| FetchTask {
+            route: route.clone(),
+            fallbacks: Vec::new(),
+            blob,
+        }),
+        Asked::ByEvent,
+    );
+}
+
+/// Who asked for a fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// An accepted event: it knows its own account only.
+    ByEvent,
+    /// The repair scan: it chose among every claimant, so its choice
+    /// replaces an event's while the blob still waits.
+    ByScan,
+}
+
+/// Put fetches into the queue. One that does not fit its account's backlog
+/// is dropped: the claim it came from is still there, and the next repair
+/// scan derives it again.
+fn queue_tasks(
+    queue: &mut FairQueue<FetchTask>,
+    tasks: impl IntoIterator<Item = FetchTask>,
+    asked: Asked,
+) {
+    let mut dropped = 0_u64;
+    for task in tasks {
+        let account = task.route.tenant_hex.clone();
+        let sha = task.blob.sha256.clone();
+        let pushed = match asked {
+            Asked::ByEvent => queue.push(&account, &sha, task),
+            Asked::ByScan => queue.push_or_move(&account, &sha, task),
+        };
+        if pushed == Pushed::BacklogFull {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "private mirror: account backlog full; the next repair scan queues these again"
+        );
+    }
+}
+
+/// Start every fetch that may start now.
+///
+/// Returns how long to wait for the attempt budget when the budget is the
+/// only thing holding a fetch back, and `None` otherwise. In every other
+/// case where something waits, a running fetch has to end first, and its
+/// report wakes the loop.
+fn dispatch_ready<B: MirrorBackend>(
+    backend: &Arc<B>,
+    retry: &parking_lot::Mutex<HashMap<String, RetryState>>,
+    queue: &mut FairQueue<FetchTask>,
+    budget: &mut AttemptBudget,
+    max_concurrency: usize,
+    done_tx: &UnboundedSender<Finished>,
+) -> Option<Duration> {
+    loop {
+        if queue.running() >= max_concurrency {
+            return None;
+        }
+        let now = clock_now();
+        if let Some(wait) = budget.wait(now) {
+            return queue.has_runnable().then_some(wait);
+        }
+        let next = queue.pop()?;
+        // Queued a while ago: it may have arrived by another path, or its
+        // gate may have been shut by a fetch that finished since. Neither
+        // costs an attempt.
+        if backend.settled(&next.sha) || retry_gated(&retry.lock(), &next.sha, now) {
+            queue.finish(&next.account, &next.sha);
+            continue;
+        }
+        // `wait` said a token is there, and nothing else takes one.
+        let _ = budget.try_take(now);
+
+        let report = FinishReport {
+            tx: done_tx.clone(),
+            finished: Some(Finished {
+                account: next.account,
+                sha: next.sha,
+                end: FetchEnd::Lost,
+            }),
+        };
+        let backend = backend.clone();
+        let task = next.item;
+        tokio::spawn(async move {
+            let mut report = report;
+            let outcome = backend.fetch(task).await;
+            if let Some(finished) = report.finished.as_mut() {
+                finished.end = match outcome {
+                    None => FetchEnd::Fetched,
+                    Some(reason) => FetchEnd::Failed(reason),
+                };
+            }
+        });
+    }
+}
+
+/// Take a finished fetch off the books: set or clear the blob's retry gate
+/// and free its slot.
+fn settle(
+    retry: &parking_lot::Mutex<HashMap<String, RetryState>>,
+    queue: &mut FairQueue<FetchTask>,
+    policy: RetryPolicy,
+    finished: Finished,
+) {
+    let now = clock_now();
+    {
+        let mut gates = retry.lock();
+        match &finished.end {
+            FetchEnd::Fetched => record_mirror_success(&mut gates, &finished.sha),
+            FetchEnd::Failed(reason) => record_mirror_failure(
+                &mut gates,
+                &finished.sha,
+                reason,
+                policy,
+                now,
+                sample_jitter(),
+            ),
+            FetchEnd::Lost => {
+                tracing::warn!(
+                    sha256 = %finished.sha,
+                    "private mirror: a fetch ended without an answer; it will be retried"
+                );
+                record_mirror_failure(
+                    &mut gates,
+                    &finished.sha,
+                    "lost",
+                    policy,
+                    now,
+                    sample_jitter(),
+                );
+            }
+        }
+    }
+    queue.finish(&finished.account, &finished.sha);
+}
+
+/// The worker loop.
+///
+/// It waits for four things and nothing else: a new job, the repair tick,
+/// a finished scan and a finished fetch (plus a timer, armed only while
+/// the attempt budget is what holds a fetch back). It never waits for a
+/// free fetch slot, so a full set of slow fetches delays neither the jobs
+/// nor the scans. After each event it starts every fetch that may start.
+///
+/// Why nothing runnable is left asleep: a queued blob does not start only
+/// if (a) every slot is taken, (b) its account is at its share, or (c) the
+/// budget is empty. In (a) and (b) at least one fetch is running, and its
+/// report wakes the loop; a report is sent however the fetch ends
+/// ([`FinishReport`]). In (c) the timer is armed for the next token. A
+/// gated blob is not queued at all: the scan after its gate opens queues
+/// it, and the tick that starts scans is always waited for.
+async fn run_worker<B: MirrorBackend>(
+    backend: Arc<B>,
+    mut jobs: UnboundedReceiver<MirrorJob>,
+    retry: Arc<parking_lot::Mutex<HashMap<String, RetryState>>>,
+    settings: WorkerSettings,
+) {
+    // The loop keeps a sender of each channel, so neither ever closes.
+    let (done_tx, mut done_rx) = unbounded_channel::<Finished>();
+    let (scan_tx, mut scan_rx) = unbounded_channel::<Option<ScanOutcome>>();
+
+    let mut queue: FairQueue<FetchTask> =
+        FairQueue::new(account_share(settings.max_concurrency), ACCOUNT_BACKLOG_CAP);
+    let mut budget = AttemptBudget::new(settings.attempts_per_min, clock_now());
+    // One scan at a time: a scan that outlasts the interval must not pile
+    // up behind itself.
+    let mut scanning = false;
+
+    // The first tick fires at once: the boot scan queues every missing
+    // blob of every live claim.
+    let mut repair = tokio::time::interval(settings.repair_interval);
+    repair.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        let budget_wait = dispatch_ready(
+            &backend,
+            &retry,
+            &mut queue,
+            &mut budget,
+            settings.max_concurrency,
+            &done_tx,
+        );
+
+        tokio::select! {
+            job = jobs.recv() => match job {
+                Some(job) => queue_job(&mut queue, job),
+                // Every sender is gone: the node is shutting down.
+                None => break,
+            },
+            _ = repair.tick() => {
+                if !scanning {
+                    scanning = true;
+                    let backend = backend.clone();
+                    let scan_tx = scan_tx.clone();
+                    tokio::spawn(async move {
+                        // `None` when the scan panicked. Sent either way,
+                        // or `scanning` would stay set and no scan would
+                        // ever run again.
+                        let outcome = tokio::task::spawn_blocking(move || backend.scan())
+                            .await
+                            .ok();
+                        let _ = scan_tx.send(outcome);
+                    });
+                }
+            }
+            outcome = scan_rx.recv() => {
+                scanning = false;
+                match outcome.flatten() {
+                    Some(outcome) => queue_tasks(&mut queue, outcome.tasks, Asked::ByScan),
+                    None => tracing::warn!(
+                        "private mirror: a repair scan did not finish; the next tick scans again"
+                    ),
+                }
+            }
+            finished = done_rx.recv() => {
+                if let Some(finished) = finished {
+                    settle(&retry, &mut queue, settings.retry, finished);
+                }
+            }
+            _ = tokio::time::sleep(budget_wait.unwrap_or_default()), if budget_wait.is_some() => {}
+        }
+    }
 }
 
 /// Spawn the mirror worker. Called once from `RelayServer::start` when
 /// private repos AND mirroring are enabled.
 pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
-    let (tx, mut rx) = unbounded_channel::<MirrorJob>();
+    let (tx, rx) = unbounded_channel::<MirrorJob>();
     let _ = svc.mirror_tx.set(tx);
 
+    let in_test = std::env::var("NGIT_TEST").as_deref() == Ok("1");
     let fetch_timeout = Duration::from_secs(svc.cfg.mirror_fetch_timeout_secs.max(1));
     let max_concurrency = svc.cfg.mirror_max_concurrency.max(1) as usize;
-    // B2 backoff knobs: base is clamped to 1s under NGIT_TEST (the existing
-    // repair-interval idiom below); max stays as configured.
+    // The backoff base and the repair interval are clamped to 1 s under
+    // NGIT_TEST; the backoff cap stays as configured.
     let retry_base = Duration::from_secs(svc.cfg.mirror_retry_base_secs.max(1));
-    let retry_base = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+    let retry_base = if in_test {
         retry_base.min(Duration::from_secs(1))
     } else {
         retry_base
@@ -868,15 +1872,26 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
             .mirror_retry_max_secs
             .max(svc.cfg.mirror_retry_base_secs.max(1)),
     );
-    let repair_interval = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+    let repair_interval = if in_test {
         Duration::from_secs(1)
     } else {
         Duration::from_secs(60)
     };
+    let settings = WorkerSettings {
+        max_concurrency,
+        attempts_per_min: svc.cfg.mirror_max_attempts_per_min,
+        retry: RetryPolicy {
+            base: retry_base,
+            max: retry_max,
+        },
+        repair_interval,
+    };
 
     tokio::spawn(async move {
+        // No total timeout on the client: a fetch sets its own limits,
+        // which depend on the blob's length (`fetch_from_peer`).
         let client = match reqwest::Client::builder()
-            .timeout(fetch_timeout)
+            .connect_timeout(fetch_timeout)
             // No redirect-chasing — a peer must not bounce us to an internal host.
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -887,16 +1902,14 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
                 return;
             }
         };
-        let semaphore = Arc::new(Semaphore::new(max_concurrency));
-        // Blobs currently being fetched — dedups queue jobs vs repair scans.
-        let inflight: Arc<parking_lot::Mutex<HashSet<String>>> =
-            Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        // B2: per-blob retry state (attempt count + next-eligible Instant),
-        // shared with scan_missing / enqueue_for_state_root via the service.
+        // Per-blob retry gates, shared with `enqueue_for_state_root` and
+        // the scan through the service.
         let retry = svc.mirror_retry.clone();
 
         tracing::info!(
             max_concurrency = max_concurrency,
+            max_concurrency_per_account = account_share(max_concurrency),
+            max_attempts_per_min = settings.attempts_per_min,
             fetch_timeout_secs = fetch_timeout.as_secs(),
             repair_interval_secs = repair_interval.as_secs(),
             retry_base_secs = retry_base.as_secs(),
@@ -904,82 +1917,12 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
             "private blob mirror worker started"
         );
 
-        let mut repair = tokio::time::interval(repair_interval);
-        // First tick fires immediately → boot repair pass re-enqueues
-        // missing blobs for all live 30641-referenced claims.
-        loop {
-            let jobs: Vec<MirrorJob> = tokio::select! {
-                job = rx.recv() => match job {
-                    Some(job) => vec![job],
-                    None => break,
-                },
-                _ = repair.tick() => scan_missing(&svc),
-            };
-
-            for job in jobs {
-                let job = Arc::new(job);
-                let mut handles = Vec::new();
-                for blob in job.want.clone() {
-                    if svc.blobs.exists(&blob.sha256) || svc.is_denylisted(&blob.sha256) {
-                        continue;
-                    }
-                    // B2: skip blobs whose backoff gate is still closed —
-                    // they were enqueued before the gate was set (or by a
-                    // racing job) and must wait for their next-eligible
-                    // Instant.
-                    if retry_gated(&retry.lock(), &blob.sha256) {
-                        continue;
-                    }
-                    if !inflight.lock().insert(blob.sha256.clone()) {
-                        continue; // already being fetched
-                    }
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return, // semaphore closed — shutting down
-                    };
-                    let svc = svc.clone();
-                    let client = client.clone();
-                    let job = job.clone();
-                    let inflight = inflight.clone();
-                    let retry = retry.clone();
-                    handles.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let outcome = fetch_blob(&svc, &client, &job, &blob).await;
-                        // B2: update the backoff gate from the outcome —
-                        // success clears it, failure classifies and schedules
-                        // the next-eligible Instant (or clears the gate for
-                        // deterministic failure classes).
-                        let mut guard = retry.lock();
-                        match outcome {
-                            None => record_mirror_success(&mut guard, &blob.sha256),
-                            Some(reason) => record_mirror_failure(
-                                &mut guard,
-                                &blob.sha256,
-                                &reason,
-                                retry_base,
-                                retry_max,
-                            ),
-                        }
-                        drop(guard);
-                        inflight.lock().remove(&blob.sha256);
-                    }));
-                }
-                // B5: recompute the lag gauge ONCE per job after all its blob
-                // fetches finish, instead of once per blob. `update_lag` scans
-                // the whole blob_claims table, so the per-blob call turned a
-                // full-table scan into a hot loop under load. A join task keeps
-                // the main loop free to accept the next job/repair tick.
-                if !handles.is_empty() {
-                    let svc = svc.clone();
-                    tokio::spawn(async move {
-                        for handle in handles {
-                            let _ = handle.await;
-                        }
-                        update_lag(&svc);
-                    });
-                }
-            }
-        }
+        let backend = Arc::new(LiveBackend {
+            svc,
+            client,
+            fetch_timeout,
+        });
+        run_worker(backend, rx, retry, settings).await;
     })
 }
 
@@ -988,40 +1931,73 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    /// The reasons a fetch can fail with, one of each label.
+    const BACKOFF_REASONS: [&str; 13] = [
+        "no_peer",
+        "network: connection refused",
+        UNRESOLVED_REASON,
+        "http_status: 500",
+        "http_status: 502",
+        // Unusual statuses are taken for a proxy's or an edge's oddity.
+        "http_status: 403",
+        "quota",
+        "reserve: cap reached",
+        "sink: io error",
+        "write: io error",
+        "store: forbidden",
+        "lost",
+        "anything-else",
+    ];
+    const AT_MAX_REASONS: [&str; 5] = [
+        "http_status: 404",
+        "blocked",
+        "verify: size mismatch",
+        "verify: sha256 mismatch",
+        "too_large",
+    ];
+
+    fn policy() -> RetryPolicy {
+        RetryPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(3600),
+        }
+    }
+
+    /// Every reason has one of two schedules, and the schedule is what the
+    /// table in the module documentation says.
     #[test]
     fn retry_class_taxonomy() {
-        // Transient classes → exponential backoff.
-        assert_eq!(classify_failure("no_peer"), RetryClass::Backoff);
-        assert_eq!(
-            classify_failure("network: connection refused"),
-            RetryClass::Backoff
-        );
-        assert_eq!(classify_failure("http_status: 500"), RetryClass::Backoff);
-        assert_eq!(classify_failure("http_status: 502"), RetryClass::Backoff);
-        // Unusual non-404 statuses are treated as transient edge oddities.
-        assert_eq!(classify_failure("http_status: 403"), RetryClass::Backoff);
-        // 404 on all peers → retry, but at the max interval (late upload).
-        assert_eq!(
-            classify_failure("http_status: 404"),
-            RetryClass::BackoffAtMax
-        );
-        // Deterministic classes → no hot retry.
-        for reason in [
-            "too_large",
-            "verify: size mismatch",
-            "verify: sha256 mismatch",
-            "store: forbidden",
-            "blocked",
-            "quota",
-            "reserve: cap reached",
-            "sink: io error",
-            "write: io error",
-            "anything-else",
-        ] {
+        let now = Instant::now();
+        let sha = "ab".repeat(32);
+
+        for reason in BACKOFF_REASONS {
+            assert_eq!(classify_failure(reason), RetryClass::Backoff, "{reason}");
+            // Without jitter: the base after the first failure, twice the
+            // base after the second.
+            let mut retry: HashMap<String, RetryState> = HashMap::new();
+            record_mirror_failure(&mut retry, &sha, reason, policy(), now, 1.0);
             assert_eq!(
-                classify_failure(reason),
-                RetryClass::NoRetry,
-                "{reason} must be NoRetry"
+                retry[&sha].next_eligible,
+                now + Duration::from_secs(60),
+                "{reason}"
+            );
+            record_mirror_failure(&mut retry, &sha, reason, policy(), now, 1.0);
+            assert_eq!(
+                retry[&sha].next_eligible,
+                now + Duration::from_secs(120),
+                "{reason}"
+            );
+        }
+
+        for reason in AT_MAX_REASONS {
+            assert_eq!(classify_failure(reason), RetryClass::AtMax, "{reason}");
+            // The maximum interval from the first failure on.
+            let mut retry: HashMap<String, RetryState> = HashMap::new();
+            record_mirror_failure(&mut retry, &sha, reason, policy(), now, 1.0);
+            assert_eq!(
+                retry[&sha].next_eligible,
+                now + Duration::from_secs(3600),
+                "{reason}"
             );
         }
     }
@@ -1040,8 +2016,24 @@ mod tests {
         // Cap: attempt 7 would be 60 * 64 = 3840 > 3600 → capped at max.
         assert_eq!(retry_delay(7, base, max, 1.0), max);
         assert_eq!(retry_delay(100, base, max, 1.0), max);
-        // u32::MAX attempts (the BackoffAtMax path) is always the cap.
+        // u32::MAX attempts (what the AtMax class passes) is always the cap.
         assert_eq!(retry_delay(u32::MAX, base, max, 1.0), max);
+        // A base and a cap no clock can hold are used as they are; nothing
+        // panics.
+        let never = Duration::from_secs(u64::MAX);
+        assert_eq!(retry_delay(u32::MAX, never, never, 1.2), never);
+        let mut retry: HashMap<String, RetryState> = HashMap::new();
+        let now = Instant::now();
+        let endless = RetryPolicy {
+            base: never,
+            max: never,
+        };
+        record_mirror_failure(&mut retry, "sha", "too_large", endless, now, 1.2);
+        assert!(retry_gated(
+            &retry,
+            "sha",
+            now + Duration::from_secs(30 * 24 * 3600)
+        ));
 
         // Jitter bounds: 1000 samples per attempt stay within ±20% of the
         // un-jittered value.
@@ -1058,44 +2050,443 @@ mod tests {
         }
     }
 
+    /// No reason leaves a blob ungated. A class without a gate is fetched
+    /// again by every repair scan, for ever.
     #[test]
-    fn retry_gate_skip_and_release() {
-        let base = Duration::from_secs(60);
-        let max = Duration::from_secs(3600);
+    fn retry_gate_never_leaves_a_failure_ungated() {
+        let now = Instant::now();
         let sha = "ab".repeat(32);
+
+        for reason in BACKOFF_REASONS.iter().chain(AT_MAX_REASONS.iter()) {
+            let mut retry: HashMap<String, RetryState> = HashMap::new();
+            assert!(!retry_gated(&retry, &sha, now));
+
+            // The shortest delay any class can get: the base less 20%.
+            record_mirror_failure(&mut retry, &sha, reason, policy(), now, 0.8);
+            assert!(retry_gated(&retry, &sha, now), "{reason} must gate");
+            assert!(
+                retry_gated(&retry, &sha, now + Duration::from_secs(47)),
+                "{reason} must stay gated for the base interval less its jitter"
+            );
+            // The gate opens: no class waits longer than the maximum plus
+            // its jitter, so no blob is given up on.
+            assert!(
+                !retry_gated(&retry, &sha, now + Duration::from_secs(3600)),
+                "{reason} must be retried"
+            );
+
+            // Success clears the gate.
+            record_mirror_success(&mut retry, &sha);
+            assert!(!retry_gated(&retry, &sha, now));
+            assert!(!retry.contains_key(&sha));
+        }
+
+        // A later failure of another class never opens a gate: the blob
+        // stays gated whatever follows what.
         let mut retry: HashMap<String, RetryState> = HashMap::new();
+        record_mirror_failure(&mut retry, &sha, "network: refused", policy(), now, 1.0);
+        record_mirror_failure(&mut retry, &sha, "too_large", policy(), now, 1.0);
+        assert!(retry_gated(&retry, &sha, now));
+        record_mirror_failure(&mut retry, &sha, "quota", policy(), now, 1.0);
+        assert!(retry_gated(&retry, &sha, now));
+        // Attempts count across classes, so the backoff keeps growing.
+        assert_eq!(retry[&sha].attempts, 3);
+        assert_eq!(
+            retry[&sha].next_eligible,
+            now + Duration::from_secs(240),
+            "third failure: four times the base"
+        );
+    }
 
-        // Ungated initially.
-        assert!(!retry_gated(&retry, &sha));
+    /// The scan forgets the gates of blobs that are no longer missing and
+    /// reports which of the others are still shut.
+    #[test]
+    fn scan_prunes_gates_and_reports_the_shut_ones() {
+        let now = Instant::now();
+        let mut retry: HashMap<String, RetryState> = HashMap::new();
+        record_mirror_failure(&mut retry, "arrived", "network: x", policy(), now, 1.0);
+        record_mirror_failure(&mut retry, "shut", "http_status: 404", policy(), now, 1.0);
+        record_mirror_failure(&mut retry, "open", "network: x", policy(), now, 1.0);
 
-        // First transient failure: gated, next-eligible in the future.
-        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
-        assert!(retry_gated(&retry, &sha));
-        assert_eq!(retry.get(&sha).unwrap().attempts, 1);
+        // "arrived" is no longer missing; 61 s on, the 60 s gate of "open"
+        // has opened and the hour-long gate of "shut" has not.
+        let later = now + Duration::from_secs(61);
+        let missing = HashSet::from(["shut", "open", "new"]);
+        let gated = prune_gates(&mut retry, &missing, later);
+        assert_eq!(gated, HashSet::from(["shut".to_string()]));
+        assert!(!retry.contains_key("arrived"), "its gate is forgotten");
+        // An opened gate keeps its failure count: the next failure backs
+        // off further.
+        assert_eq!(retry["open"].attempts, 1);
+    }
 
-        // Success clears the gate.
-        record_mirror_success(&mut retry, &sha);
-        assert!(!retry_gated(&retry, &sha));
-        assert!(!retry.contains_key(&sha));
+    fn reasons(list: &[&str]) -> Vec<String> {
+        list.iter().map(|reason| reason.to_string()).collect()
+    }
 
-        // Deterministic failure: no gate is installed (flat repair-scan
-        // cadence preserved).
-        record_mirror_failure(&mut retry, &sha, "quota", base, max);
-        assert!(!retry_gated(&retry, &sha));
-        assert!(!retry.contains_key(&sha));
+    /// The reason recorded for a blob does not depend on the order in
+    /// which its peers were tried, and one peer's 404 does not park a blob
+    /// that another peer failed to serve for a passing reason.
+    #[test]
+    fn merged_failure_prefers_the_soonest_retry() {
+        assert_eq!(
+            merge_peer_failures(&reasons(&["network: refused", "http_status: 404"])),
+            Some("network: refused")
+        );
+        assert_eq!(
+            merge_peer_failures(&reasons(&["http_status: 404", "network: refused"])),
+            Some("network: refused")
+        );
+        // Two reasons of one class: the same one either way round.
+        let one_way = reasons(&["http_status: 404", "blocked"]);
+        let other_way = reasons(&["blocked", "http_status: 404"]);
+        assert_eq!(merge_peer_failures(&one_way), Some("blocked"));
+        assert_eq!(merge_peer_failures(&other_way), Some("blocked"));
+        let one_way = reasons(&["http_status: 500", "network: refused"]);
+        let other_way = reasons(&["network: refused", "http_status: 500"]);
+        assert_eq!(
+            merge_peer_failures(&one_way),
+            merge_peer_failures(&other_way)
+        );
 
-        // A deterministic failure also CLEARS a stale transient gate: the
-        // blob drops back to the flat repair-scan cadence (the gate would
-        // otherwise delay a retry whose condition already changed).
-        record_mirror_failure(&mut retry, &sha, "network: refused", base, max);
-        assert!(retry_gated(&retry, &sha));
-        record_mirror_failure(&mut retry, &sha, "too_large", base, max);
-        assert!(!retry_gated(&retry, &sha));
+        // A failure from this node's own state is the answer, whatever the
+        // peers before it said.
+        assert_eq!(
+            merge_peer_failures(&reasons(&["network: refused", "quota"])),
+            Some("quota")
+        );
+        assert_eq!(
+            merge_peer_failures(&reasons(&["http_status: 404", "store: registration gone"])),
+            Some("store: registration gone")
+        );
+        for local in ["quota", "reserve: x", "sink: x", "write: x", "store: x"] {
+            assert!(stops_peer_loop(local), "{local} must end the peer loop");
+        }
+        for remote in [
+            "network: x",
+            "http_status: 404",
+            "http_status: 500",
+            "blocked",
+            "verify: x",
+            "too_large",
+        ] {
+            assert!(!stops_peer_loop(remote), "{remote} must try the next peer");
+        }
 
-        // Backoff attempts accumulate while failures stay transient.
-        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
-        record_mirror_failure(&mut retry, &sha, "http_status: 500", base, max);
-        assert_eq!(retry.get(&sha).unwrap().attempts, 2);
+        assert_eq!(merge_peer_failures(&[]), None);
+    }
+
+    /// The length a fetch reads: an operator's peer is believed up to the
+    /// maximum blob size, a peer from a registration only when it agrees
+    /// with the state root, and no announcement leaves the declared size.
+    #[test]
+    fn expected_len_trusts_only_a_configured_peer() {
+        const MAX: u64 = 1000;
+
+        // Configured peer: its length wins, smaller or larger.
+        assert_eq!(expected_len(Some(500), 500, true, MAX), Ok(500));
+        assert_eq!(expected_len(Some(700), 500, true, MAX), Ok(700));
+        assert_eq!(expected_len(Some(300), 500, true, MAX), Ok(300));
+        assert_eq!(expected_len(Some(MAX), 500, true, MAX), Ok(MAX));
+        assert_eq!(
+            expected_len(Some(MAX + 1), 500, true, MAX),
+            Err("too_large".to_string())
+        );
+
+        // A peer only a registration names: equal or refused.
+        assert_eq!(expected_len(Some(500), 500, false, MAX), Ok(500));
+        for announced in [0, 499, 501, MAX + 1] {
+            let refused = expected_len(Some(announced), 500, false, MAX)
+                .expect_err("another length must be refused before the body");
+            assert!(refused.starts_with("verify:"), "{refused}");
+            assert_eq!(classify_failure(&refused), RetryClass::AtMax);
+        }
+
+        // No announced length: the declared size bounds the read.
+        for configured in [true, false] {
+            assert_eq!(expected_len(None, 500, configured, MAX), Ok(500));
+            assert_eq!(
+                expected_len(None, MAX + 1, configured, MAX),
+                Err("too_large".to_string())
+            );
+        }
+        assert_eq!(classify_failure("too_large"), RetryClass::AtMax);
+    }
+
+    #[test]
+    fn fetch_deadline_grows_with_size() {
+        let base = Duration::from_secs(120);
+        assert_eq!(fetch_deadline(base, 0), base);
+        assert_eq!(fetch_deadline(base, MIN_FETCH_BYTES_PER_SEC - 1), base);
+        assert_eq!(
+            fetch_deadline(base, MIN_FETCH_BYTES_PER_SEC),
+            Duration::from_secs(121)
+        );
+        // A blob of the default maximum size (256 MiB) at 256 KiB/s.
+        assert_eq!(
+            fetch_deadline(base, 256 * 1024 * 1024),
+            Duration::from_secs(120 + 1024)
+        );
+        // No length and no timeout can overflow it.
+        assert!(fetch_deadline(Duration::MAX, u64::MAX) >= base);
+    }
+
+    fn claimant(account: &str, alias: &str) -> Claimant {
+        Claimant {
+            account: account.to_string(),
+            alias: alias.to_string(),
+            holds_charge: false,
+        }
+    }
+
+    /// A blob that two accounts claim waits in the shorter queue, and the
+    /// other account is kept as a fallback.
+    #[test]
+    fn claimant_choice_prefers_the_least_lagging_tenant() {
+        let lag: HashMap<String, u64> = [("flood".to_string(), 5000), ("small".to_string(), 1)]
+            .into_iter()
+            .collect();
+
+        let flood_first = [claimant("flood", "f-repo"), claimant("small", "s-repo")];
+        assert_eq!(rank_claimants(&flood_first, &lag), vec![1, 0]);
+        let small_first = [claimant("small", "s-repo"), claimant("flood", "f-repo")];
+        assert_eq!(rank_claimants(&small_first, &lag), vec![0, 1]);
+
+        // Equal lag: the account, then the alias, that sorts first, so the
+        // order of the claims does not matter.
+        let even: HashMap<String, u64> = HashMap::new();
+        let pair = [claimant("bb", "x"), claimant("aa", "y")];
+        assert_eq!(rank_claimants(&pair, &even), vec![1, 0]);
+        // One alias per account: a second alias of the same account would
+        // meet the same ledgers.
+        let same_account = [claimant("aa", "repo-2"), claimant("aa", "repo-1")];
+        assert_eq!(rank_claimants(&same_account, &even), vec![1]);
+
+        // Within an account, the alias the blob's charge is booked to.
+        let charged = [
+            claimant("aa", "repo-1"),
+            Claimant {
+                holds_charge: true,
+                ..claimant("aa", "repo-2")
+            },
+            claimant("bb", "repo-3"),
+        ];
+        assert_eq!(rank_claimants(&charged, &even), vec![1, 2]);
+        // The charge does not move a blob to a longer queue.
+        let lagging: HashMap<String, u64> = [("aa".to_string(), 9)].into_iter().collect();
+        assert_eq!(rank_claimants(&charged, &lagging), vec![2, 1]);
+
+        // No more accounts than a fetch may try.
+        let many: Vec<Claimant> = (0..10)
+            .map(|i| claimant(&format!("account{i}"), "repo"))
+            .collect();
+        assert_eq!(rank_claimants(&many, &even), vec![0, 1, 2, 3]);
+        assert_eq!(MAX_ROUTES_PER_BLOB, 4);
+
+        assert!(rank_claimants(&[], &lag).is_empty());
+    }
+
+    // ---- the fair queue ----------------------------------------------------
+
+    fn pop_account(queue: &mut FairQueue<u32>) -> Option<String> {
+        queue.pop().map(|popped| popped.account)
+    }
+
+    /// A hundred blobs of one account do not stand in front of another
+    /// account's one.
+    #[test]
+    fn fair_queue_round_robins_between_tenants() {
+        let mut queue: FairQueue<u32> = FairQueue::new(100, 1024);
+        for i in 0..100 {
+            assert_eq!(queue.push("a", &format!("a{i}"), i), Pushed::Queued);
+        }
+        assert_eq!(queue.push("b", "b0", 0), Pushed::Queued);
+
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("b"));
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+        // Within one account, first in is first out.
+        let mut queue: FairQueue<u32> = FairQueue::new(100, 1024);
+        for i in 0..3 {
+            queue.push("a", &format!("a{i}"), i);
+        }
+        let order: Vec<u32> =
+            std::iter::from_fn(|| queue.pop().map(|popped| popped.item)).collect();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    /// An account at its share gets nothing more until one of its blobs is
+    /// given back; other accounts are served meanwhile.
+    #[test]
+    fn fair_queue_caps_a_tenant_at_its_share() {
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1024);
+        for i in 0..5 {
+            queue.push("a", &format!("a{i}"), i);
+        }
+        let first = queue.pop().expect("a's first");
+        let second = queue.pop().expect("a's second");
+        assert_eq!(
+            (first.account.as_str(), second.account.as_str()),
+            ("a", "a")
+        );
+        assert_eq!(queue.running(), 2);
+        assert!(queue.pop().is_none(), "a is at its share");
+        assert!(!queue.has_runnable());
+
+        // Another account is not held back by a's cap.
+        queue.push("b", "b0", 0);
+        assert!(queue.has_runnable());
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("b"));
+        assert_eq!(queue.running(), 3);
+        assert!(queue.pop().is_none());
+
+        // Giving one back frees one place, no more.
+        queue.finish(&first.account, &first.sha);
+        assert_eq!(queue.running(), 2);
+        assert!(queue.has_runnable());
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+        assert!(queue.pop().is_none());
+
+        // The share is never below one.
+        assert_eq!(account_share(1), 1);
+        assert_eq!(account_share(2), 1);
+        assert_eq!(account_share(4), 2);
+        assert_eq!(account_share(9), 4);
+    }
+
+    /// A blob is queued or running once, whoever asks for it, and can be
+    /// queued again once it has been given back.
+    #[test]
+    fn fair_queue_dedups_a_blob_queued_or_running() {
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1024);
+        assert_eq!(queue.push("a", "sha", 1), Pushed::Queued);
+        // The same blob from the repair scan, and from another account.
+        assert_eq!(queue.push("a", "sha", 2), Pushed::Duplicate);
+        assert_eq!(queue.push("b", "sha", 3), Pushed::Duplicate);
+        assert_eq!(queue.waiting(), 1);
+
+        // Still known while it runs.
+        let running = queue.pop().expect("the blob");
+        assert_eq!(running.item, 1);
+        assert_eq!(queue.push("b", "sha", 4), Pushed::Duplicate);
+        assert!(queue.pop().is_none());
+
+        queue.finish(&running.account, &running.sha);
+        assert_eq!(queue.running(), 0);
+        assert_eq!(queue.push("b", "sha", 5), Pushed::Queued);
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("b"));
+    }
+
+    /// The repair scan's choice of account replaces an event's while the
+    /// blob waits: a blob queued behind one account's long backlog moves to
+    /// the account it should be fetched for.
+    #[test]
+    fn fair_queue_moves_a_waiting_blob_to_the_scans_account() {
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1024);
+        for i in 0..100 {
+            queue.push("a", &format!("a{i}"), i);
+        }
+        assert_eq!(queue.push("a", "shared", 1), Pushed::Queued);
+        assert_eq!(queue.push("b", "shared", 2), Pushed::Duplicate);
+
+        assert_eq!(queue.push_or_move("b", "shared", 3), Pushed::Queued);
+        assert_eq!(queue.waiting(), 101, "moved, not queued twice");
+        // Asked again for the account it waits for: nothing to do.
+        assert_eq!(queue.push_or_move("b", "shared", 4), Pushed::Duplicate);
+
+        let first = queue.pop().expect("a's first");
+        assert_eq!(first.account, "a");
+        let second = queue.pop().expect("the moved blob");
+        assert_eq!(
+            (second.account.as_str(), second.sha.as_str(), second.item),
+            ("b", "shared", 3)
+        );
+        // A running blob stays where it runs.
+        assert_eq!(queue.push_or_move("a", "shared", 5), Pushed::Duplicate);
+        queue.finish(&second.account, &second.sha);
+        assert_eq!(queue.running_for("b"), 0);
+
+        // Moving the only waiting blob of an account takes the account out
+        // of the turn order: nothing is handed out for it afterwards.
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1024);
+        queue.push("a", "only", 1);
+        assert_eq!(queue.push_or_move("b", "only", 2), Pushed::Queued);
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("b"));
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.waiting(), 0);
+        assert_eq!(queue.push("a", "next", 3), Pushed::Queued);
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+
+        // No room in the account it should move to: it keeps its place.
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1);
+        queue.push("a", "stays", 1);
+        queue.push("b", "other", 2);
+        assert_eq!(queue.push_or_move("b", "stays", 3), Pushed::Duplicate);
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+
+        // A blob nobody has queued is queued as by `push`.
+        let mut queue: FairQueue<u32> = FairQueue::new(2, 1);
+        assert_eq!(queue.push_or_move("a", "new", 1), Pushed::Queued);
+        assert_eq!(queue.push_or_move("a", "more", 2), Pushed::BacklogFull);
+    }
+
+    /// One account cannot fill memory: its backlog stops at the cap, and
+    /// the rest is left to the next repair scan.
+    #[test]
+    fn fair_queue_bounds_a_tenants_backlog() {
+        let mut queue: FairQueue<u32> = FairQueue::new(2, ACCOUNT_BACKLOG_CAP);
+        let mut refused = 0;
+        for i in 0..5000 {
+            if queue.push("a", &format!("a{i}"), i) == Pushed::BacklogFull {
+                refused += 1;
+            }
+        }
+        assert_eq!(queue.waiting(), ACCOUNT_BACKLOG_CAP);
+        assert_eq!(refused, 5000 - ACCOUNT_BACKLOG_CAP);
+
+        // Another account's backlog is its own.
+        assert_eq!(queue.push("b", "b0", 0), Pushed::Queued);
+
+        // A refused blob was not remembered: it fits once there is room.
+        assert_eq!(pop_account(&mut queue).as_deref(), Some("a"));
+        assert_eq!(queue.push("a", "a4999", 4999), Pushed::Queued);
+        assert_eq!(queue.push("a", "a4998", 4998), Pushed::BacklogFull);
+    }
+
+    // ---- the attempt budget ------------------------------------------------
+
+    /// A burst of one minute's worth, then the configured rate; 0 is no
+    /// limit.
+    #[test]
+    fn attempt_budget_limits_and_refills() {
+        let t0 = Instant::now();
+        let mut budget = AttemptBudget::new(60, t0);
+
+        let burst = (0..200).filter(|_| budget.try_take(t0)).count();
+        assert_eq!(burst, 60, "the burst is one minute's worth");
+        assert!(!budget.try_take(t0));
+        // The wait is to the next token, and a token is there after it.
+        let wait = budget.wait(t0).expect("an empty budget has a wait");
+        assert_eq!(wait, Duration::from_secs(1));
+        assert!(budget.wait(t0 + wait).is_none());
+
+        // 60 a minute is one a second: ten seconds on, ten more.
+        let later = t0 + Duration::from_secs(10);
+        let refilled = (0..200).filter(|_| budget.try_take(later)).count();
+        assert_eq!(refilled, 10, "the sustained rate is the configured one");
+
+        // A long quiet spell refills to the burst and no further.
+        let much_later = later + Duration::from_secs(3600);
+        let after_idle = (0..200).filter(|_| budget.try_take(much_later)).count();
+        assert_eq!(after_idle, 60);
+
+        // A clock that reads earlier than before takes nothing away and
+        // does not panic.
+        assert!(!budget.try_take(t0));
+
+        let mut unlimited = AttemptBudget::new(0, t0);
+        assert!((0..10_000).all(|_| unlimited.try_take(t0)));
+        assert!(unlimited.wait(t0).is_none());
     }
 
     /// FS-5: the failure warn dedups per (sha256, reason) — the first
@@ -1306,16 +2697,42 @@ mod tests {
 
     #[tokio::test]
     async fn peer_allowed_blocks_internal_and_http() {
+        use PeerVerdict::{Allowed, Refused};
+
         // allow_private short-circuits (tests / loopback pairs).
-        assert!(peer_allowed("http://127.0.0.1:9999", true).await);
+        assert_eq!(peer_allowed("http://127.0.0.1:9999", true).await, Allowed);
         // Plaintext http rejected in production mode.
-        assert!(!peer_allowed("http://example.com", false).await);
+        assert_eq!(peer_allowed("http://example.com", false).await, Refused);
         // Literal internal IP rejected.
-        assert!(!peer_allowed("https://169.254.169.254", false).await);
-        assert!(!peer_allowed("https://127.0.0.1:8080", false).await);
-        assert!(!peer_allowed("https://10.0.0.5", false).await);
-        // Unresolvable host rejected (fails closed).
-        assert!(!peer_allowed("https://nonexistent.invalid", false).await);
+        assert_eq!(
+            peer_allowed("https://169.254.169.254", false).await,
+            Refused
+        );
+        assert_eq!(peer_allowed("https://127.0.0.1:8080", false).await, Refused);
+        assert_eq!(peer_allowed("https://10.0.0.5", false).await, Refused);
+        // A name under a local-use suffix is refused without a lookup.
+        assert_eq!(
+            peer_allowed("https://nonexistent.invalid", false).await,
+            Refused
+        );
+    }
+
+    /// A name that does not resolve is not a refusal: it is retried on the
+    /// backoff of a network failure, not parked for the maximum interval.
+    /// This also pins the wording of the outbound policy's lookup error,
+    /// which is what tells the two apart.
+    #[tokio::test]
+    async fn guard_tells_a_failed_lookup_from_a_refusal() {
+        // A label of 64 characters is one more than DNS allows, so the
+        // lookup fails on any resolver, and without a network.
+        let unresolvable = format!("https://{}.example.com", "a".repeat(64));
+        assert_eq!(
+            peer_allowed(&unresolvable, false).await,
+            PeerVerdict::Unresolved
+        );
+        assert_eq!(classify_failure(UNRESOLVED_REASON), RetryClass::Backoff);
+        assert_eq!(reason_label(UNRESOLVED_REASON), "network");
+        assert_eq!(classify_failure("blocked"), RetryClass::AtMax);
     }
 
     #[tokio::test]
@@ -1330,5 +2747,438 @@ mod tests {
         assert!(!relay_peer_allowed("wss://10.0.0.5", false).await);
         // Unresolvable host rejected (fails closed).
         assert!(!relay_peer_allowed("wss://nonexistent.invalid", false).await);
+    }
+
+    // ---- the worker loop, with time paused ---------------------------------
+
+    /// What the fake peer does with one blob.
+    #[derive(Debug, Clone)]
+    struct FakeBlob {
+        account: String,
+        /// How long a fetch of it takes.
+        delay: Duration,
+        /// Fetches that fail before one succeeds.
+        failures_left: u32,
+        /// Fetches that panic before any other outcome.
+        panics_left: u32,
+        /// Whether the repair scan reports it while it is missing.
+        listed: bool,
+    }
+
+    impl FakeBlob {
+        fn of(account: &str) -> Self {
+            Self {
+                account: account.to_string(),
+                delay: Duration::ZERO,
+                failures_left: 0,
+                panics_left: 0,
+                listed: true,
+            }
+        }
+    }
+
+    /// A node without disk or network: blobs arrive after a set delay.
+    #[derive(Default)]
+    struct FakeBackend {
+        blobs: parking_lot::Mutex<HashMap<String, FakeBlob>>,
+        stored: parking_lot::Mutex<HashSet<String>>,
+        /// Every fetch started: which blob, and when.
+        attempts: parking_lot::Mutex<Vec<(String, Instant)>>,
+        /// Fetches running per account, and the most seen at once.
+        running: parking_lot::Mutex<HashMap<String, usize>>,
+        peak: parking_lot::Mutex<HashMap<String, usize>>,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    fn fake_task(account: &str, sha: &str) -> FetchTask {
+        FetchTask {
+            route: Arc::new(Route {
+                tenant_hex: account.to_string(),
+                alias: format!("{account}-repo"),
+                peer_servers: vec!["https://peer.example".to_string()],
+                peers_configured: true,
+            }),
+            fallbacks: Vec::new(),
+            blob: WantBlob {
+                sha256: sha.to_string(),
+                size: 1,
+            },
+        }
+    }
+
+    impl FakeBackend {
+        fn add(&self, sha: &str, blob: FakeBlob) {
+            self.blobs.lock().insert(sha.to_string(), blob);
+        }
+
+        fn has(&self, sha: &str) -> bool {
+            self.stored.lock().contains(sha)
+        }
+
+        fn stored_count(&self) -> usize {
+            self.stored.lock().len()
+        }
+
+        fn attempt_count(&self) -> usize {
+            self.attempts.lock().len()
+        }
+
+        fn attempts_of(&self, sha: &str) -> Vec<Instant> {
+            self.attempts
+                .lock()
+                .iter()
+                .filter(|(attempted, _)| attempted == sha)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+
+        fn peak_of(&self, account: &str) -> usize {
+            self.peak.lock().get(account).copied().unwrap_or(0)
+        }
+
+        fn scan_count(&self) -> usize {
+            self.scans.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl MirrorBackend for FakeBackend {
+        fn scan(&self) -> ScanOutcome {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stored = self.stored.lock().clone();
+            let blobs = self.blobs.lock();
+            let mut missing: Vec<(&String, &FakeBlob)> = blobs
+                .iter()
+                .filter(|(sha, blob)| blob.listed && !stored.contains(*sha))
+                .collect();
+            missing.sort_by_key(|(sha, _)| *sha);
+            ScanOutcome {
+                lag: missing.len() as u64,
+                tasks: missing
+                    .into_iter()
+                    .map(|(sha, blob)| fake_task(&blob.account, sha))
+                    .collect(),
+            }
+        }
+
+        fn settled(&self, sha256: &str) -> bool {
+            self.has(sha256)
+        }
+
+        fn fetch(self: Arc<Self>, task: FetchTask) -> FetchFuture {
+            Box::pin(async move {
+                let sha = task.blob.sha256.clone();
+                let account = task.route.tenant_hex.clone();
+                self.attempts.lock().push((sha.clone(), clock_now()));
+                let (delay, fails, panics) = {
+                    let mut blobs = self.blobs.lock();
+                    let blob = blobs.get_mut(&sha).expect("a blob the test added");
+                    let panics = blob.panics_left > 0;
+                    let fails = !panics && blob.failures_left > 0;
+                    if panics {
+                        blob.panics_left -= 1;
+                    } else if fails {
+                        blob.failures_left -= 1;
+                    }
+                    (blob.delay, fails, panics)
+                };
+                assert!(!panics, "a fetch that dies (wanted by the test)");
+                {
+                    let mut running = self.running.lock();
+                    let now_running = running.entry(account.clone()).or_insert(0);
+                    *now_running += 1;
+                    let mut peak = self.peak.lock();
+                    let seen = peak.entry(account.clone()).or_insert(0);
+                    *seen = (*seen).max(*now_running);
+                }
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if let Some(count) = self.running.lock().get_mut(&account) {
+                    *count -= 1;
+                }
+                if fails {
+                    Some("http_status: 500".to_string())
+                } else {
+                    self.stored.lock().insert(sha);
+                    None
+                }
+            })
+        }
+    }
+
+    /// A worker loop running against a fake backend.
+    struct TestWorker {
+        jobs: UnboundedSender<MirrorJob>,
+        retry: Arc<parking_lot::Mutex<HashMap<String, RetryState>>>,
+        handle: JoinHandle<()>,
+    }
+
+    /// Start the loop with a 1 s repair interval and a backoff of 1 s to
+    /// 60 s, the values a test node runs with.
+    fn start_worker(
+        backend: &Arc<FakeBackend>,
+        max_concurrency: usize,
+        attempts_per_min: u32,
+    ) -> TestWorker {
+        let (jobs, rx) = unbounded_channel::<MirrorJob>();
+        let retry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let settings = WorkerSettings {
+            max_concurrency,
+            attempts_per_min,
+            retry: RetryPolicy {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(60),
+            },
+            repair_interval: Duration::from_secs(1),
+        };
+        let handle = tokio::spawn(run_worker(backend.clone(), rx, retry.clone(), settings));
+        TestWorker {
+            jobs,
+            retry,
+            handle,
+        }
+    }
+
+    /// Issue 26, the starvation: one account's slow blobs hold at most
+    /// half of the fetch slots, so another account's blob is fetched at
+    /// once. Before, the worker waited for a slot with the first account's
+    /// whole backlog in hand.
+    #[tokio::test(start_paused = true)]
+    async fn worker_serves_a_second_account_while_the_first_is_slow() {
+        let backend = Arc::new(FakeBackend::default());
+        for i in 0..10 {
+            backend.add(
+                &format!("a{i:02}"),
+                FakeBlob {
+                    delay: Duration::from_secs(100),
+                    ..FakeBlob::of("slow")
+                },
+            );
+        }
+        backend.add(
+            "b00",
+            FakeBlob {
+                delay: Duration::from_secs(1),
+                ..FakeBlob::of("quick")
+            },
+        );
+        let worker = start_worker(&backend, 4, 0);
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            backend.has("b00"),
+            "the quick account's blob must not wait for the slow account's backlog"
+        );
+        assert_eq!(backend.stored_count(), 1, "the slow blobs are still coming");
+        assert_eq!(backend.peak_of("slow"), 2, "half of four slots, no more");
+
+        // The slow account is served too: ten blobs, two at a time, 100 s
+        // each.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(backend.stored_count(), 11);
+        assert_eq!(backend.peak_of("slow"), 2);
+        assert_eq!(backend.attempt_count(), 11, "no blob was fetched twice");
+
+        worker.handle.abort();
+    }
+
+    /// The replication guarantee: a blob that fails is fetched again until
+    /// it arrives, each time after a longer wait, and its gate is gone once
+    /// it has arrived.
+    #[tokio::test(start_paused = true)]
+    async fn worker_retries_a_failed_blob_until_it_arrives() {
+        let backend = Arc::new(FakeBackend::default());
+        backend.add(
+            "flaky",
+            FakeBlob {
+                failures_left: 3,
+                ..FakeBlob::of("account")
+            },
+        );
+        let worker = start_worker(&backend, 4, 0);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!backend.has("flaky"));
+        assert!(
+            worker.retry.lock().contains_key("flaky"),
+            "a failed blob is gated"
+        );
+
+        tokio::time::sleep(Duration::from_secs(58)).await;
+        assert!(backend.has("flaky"), "the blob must arrive in the end");
+        let attempts = backend.attempts_of("flaky");
+        assert_eq!(
+            attempts.len(),
+            4,
+            "three failures, then the fetch that worked"
+        );
+        // The backoff doubles from 1 s; jitter takes off 20% at most.
+        let gaps: Vec<Duration> = attempts
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect();
+        assert!(gaps[0] >= Duration::from_millis(800), "{gaps:?}");
+        assert!(gaps[1] >= Duration::from_millis(1600), "{gaps:?}");
+        assert!(gaps[2] >= Duration::from_millis(3200), "{gaps:?}");
+        assert!(worker.retry.lock().is_empty(), "success clears the gate");
+
+        worker.handle.abort();
+    }
+
+    /// The attempt budget holds fetches back and then lets every one of
+    /// them through: the loop wakes for each new token by itself.
+    #[tokio::test(start_paused = true)]
+    async fn worker_spends_no_more_than_the_attempt_budget() {
+        let backend = Arc::new(FakeBackend::default());
+        // 300 accounts with one blob each, so that no account's share is
+        // what limits them.
+        for i in 0..300 {
+            backend.add(
+                &format!("blob{i:03}"),
+                FakeBlob::of(&format!("account{i:03}")),
+            );
+        }
+        let worker = start_worker(&backend, 8, 120);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            backend.attempt_count(),
+            120,
+            "the burst is one minute's worth"
+        );
+
+        // The next token comes at 0.5 s, between two repair ticks: only the
+        // budget timer can wake the loop for it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            backend.attempt_count(),
+            121,
+            "the loop must wake for a token without waiting for a tick"
+        );
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let after_ten = backend.attempt_count();
+        assert!(
+            (140..=142).contains(&after_ten),
+            "two a second after the burst; saw {after_ten}"
+        );
+
+        // 180 blobs were left after the burst: 90 s at two a second.
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        assert_eq!(backend.stored_count(), 300, "every blob arrives in the end");
+        assert_eq!(backend.attempt_count(), 300);
+
+        worker.handle.abort();
+    }
+
+    /// With every fetch slot held by slow fetches the loop still scans and
+    /// still takes jobs; the job's blob is fetched when a slot frees.
+    #[tokio::test(start_paused = true)]
+    async fn worker_scans_and_takes_jobs_while_every_slot_is_held() {
+        let backend = Arc::new(FakeBackend::default());
+        for (sha, account) in [("a", "one"), ("b", "two")] {
+            backend.add(
+                sha,
+                FakeBlob {
+                    delay: Duration::from_secs(1000),
+                    ..FakeBlob::of(account)
+                },
+            );
+        }
+        // Known to the fake peer, but not reported by the scan: only a job
+        // can bring it in.
+        backend.add(
+            "c",
+            FakeBlob {
+                listed: false,
+                ..FakeBlob::of("three")
+            },
+        );
+        let worker = start_worker(&backend, 2, 0);
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(backend.attempt_count(), 2, "both slots are held");
+        assert!(
+            backend.scan_count() >= 5,
+            "the repair scan must keep running; ran {} times",
+            backend.scan_count()
+        );
+
+        worker
+            .jobs
+            .send(MirrorJob {
+                tenant_hex: "three".to_string(),
+                alias: "three-repo".to_string(),
+                want: vec![WantBlob {
+                    sha256: "c".to_string(),
+                    size: 1,
+                }],
+                peer_servers: vec!["https://peer.example".to_string()],
+                peers_configured: true,
+            })
+            .expect("the worker is running");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!backend.has("c"), "no slot is free yet");
+
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        assert!(
+            backend.has("c"),
+            "the job taken while the slots were held is fetched when one frees"
+        );
+
+        worker.handle.abort();
+    }
+
+    /// What does not fit an account's backlog is dropped, and the next
+    /// repair scan brings it back: nothing is lost.
+    #[tokio::test(start_paused = true)]
+    async fn worker_refetches_what_a_full_backlog_dropped() {
+        let backend = Arc::new(FakeBackend::default());
+        let total = ACCOUNT_BACKLOG_CAP + 50;
+        for i in 0..total {
+            backend.add(&format!("blob{i:05}"), FakeBlob::of("big"));
+        }
+        let worker = start_worker(&backend, 4, 0);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            backend.stored_count(),
+            ACCOUNT_BACKLOG_CAP,
+            "the first scan queued a full backlog and dropped the rest"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(backend.stored_count(), total);
+
+        worker.handle.abort();
+    }
+
+    /// A fetch that dies still reports, so its slot is freed and its blob
+    /// is fetched again. With a share of one, a slot that stayed taken
+    /// would stop the account for ever.
+    #[tokio::test(start_paused = true)]
+    async fn worker_frees_the_slot_of_a_fetch_that_died() {
+        let backend = Arc::new(FakeBackend::default());
+        backend.add(
+            "dies-once",
+            FakeBlob {
+                panics_left: 1,
+                ..FakeBlob::of("account")
+            },
+        );
+        // Sorts after the one that dies, so it queues behind it: it can only
+        // be fetched if the dead fetch gave its slot back.
+        backend.add("zz-after", FakeBlob::of("account"));
+        let worker = start_worker(&backend, 1, 0);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            backend.has("zz-after"),
+            "the account's slot must be free again"
+        );
+        assert!(backend.has("dies-once"), "the blob must be fetched again");
+        assert_eq!(backend.attempts_of("dies-once").len(), 2);
+
+        worker.handle.abort();
     }
 }

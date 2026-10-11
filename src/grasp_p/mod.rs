@@ -419,12 +419,17 @@ pub struct PrivateConfig {
     pub mirror_peer_urls: Option<Vec<String>>,
     pub mirror_max_concurrency: u32,
     pub mirror_fetch_timeout_secs: u64,
-    /// Phase-4b B2: base delay for the per-blob mirror retry backoff
-    /// (transient failure classes only — see mirror.rs taxonomy).
+    /// Base delay of the per-blob mirror retry backoff (see the class
+    /// table in mirror.rs).
     pub mirror_retry_base_secs: u64,
-    /// Phase-4b B2: backoff cap; also the fixed retry interval for
-    /// 404-on-all-peers (possible late upload).
+    /// Backoff cap; also the fixed retry interval of the failure classes
+    /// that do not heal by themselves (404 on every peer among them).
     pub mirror_retry_max_secs: u64,
+    /// Blobs the mirror may start fetching per minute, all accounts
+    /// together (0 = no limit). Node-local: it decides when this node
+    /// fetches, never what it accepts, so it is NOT part of
+    /// `policy_fingerprint`.
+    pub mirror_max_attempts_per_min: u32,
     /// SSRF guard: when false (default), mirror fetch peers resolving to
     /// loopback/private/link-local/unspecified/multicast IPs are dropped and
     /// only https peers are contacted. Tests set this true to mirror over
@@ -492,6 +497,7 @@ impl PrivateConfig {
             mirror_fetch_timeout_secs: config.private_mirror_fetch_timeout_secs,
             mirror_retry_base_secs: config.private_mirror_retry_base_secs,
             mirror_retry_max_secs: config.private_mirror_retry_max_secs,
+            mirror_max_attempts_per_min: config.private_mirror_max_attempts_per_min,
             mirror_allow_private_ips: config.private_mirror_allow_private_ips,
             policy_fingerprint: policy_fingerprint(config),
             write_rate_capacity: config.private_write_rate_capacity,
@@ -1327,6 +1333,25 @@ impl PrivateService {
         if len > self.cfg.max_blob_bytes {
             return Err(BlobError::TooLarge);
         }
+        self.blob_quota_preflight(&auth.tenant_hex, &auth.alias, sha256, len)
+    }
+
+    /// Would storing `len` bytes of blob `sha256` for (tenant, alias) fit
+    /// the alias, account and node ledgers as they stand?
+    ///
+    /// Reads the meta store and asks the blob store whether the file is
+    /// there; no network and no lock held on return. It is the quota half
+    /// of the upload preflight, shared with the blob mirror, which asks it
+    /// before it sends a request so that a blob there is no room for costs
+    /// no download. An answer of yes is a forecast: `finish()` decides,
+    /// inside the transaction that charges.
+    pub(crate) fn blob_quota_preflight(
+        &self,
+        tenant_hex: &str,
+        alias: &str,
+        sha256: &str,
+        len: u64,
+    ) -> Result<(), BlobError> {
         // Existing blobs re-upload for free (no double-charge).
         let claim = {
             let txn = self
@@ -1357,10 +1382,7 @@ impl PrivateService {
                 Some(meta::BlobClaim {
                     spec_charge: Some(spec),
                     ..
-                }) => (
-                    spec.tenant == auth.tenant_hex && spec.alias == auth.alias,
-                    spec.bytes,
-                ),
+                }) => (spec.tenant == tenant_hex && spec.alias == alias, spec.bytes),
                 _ => (false, 0),
             };
             let scoped_additional = if same_scope {
@@ -1374,8 +1396,8 @@ impl PrivateService {
                     .get_ledger_txn(&txn, &key)
                     .map_err(|e| BlobError::Internal(e.to_string()))
             };
-            let tenant_entry = ledger(quota::tenant_key(&auth.tenant_hex))?;
-            let alias_entry = ledger(quota::alias_key(&auth.alias))?;
+            let tenant_entry = ledger(quota::tenant_key(tenant_hex))?;
+            let alias_entry = ledger(quota::alias_key(alias))?;
             let global_entry = ledger(meta::LEDGER_GLOBAL_KEY.to_string())?;
             let ok = alias_entry.total().saturating_add(scoped_additional)
                 <= self.cfg.quota_repo_bytes

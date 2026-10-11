@@ -1785,14 +1785,14 @@ startup log line.
 
 #### `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY`
 
-**Description:** Maximum concurrent blob mirror fetches. Must be greater than `0` when the mirror is enabled.  
+**Description:** Maximum concurrent blob mirror fetches. One account (tenant key) holds at most half of them, rounded down and at least one, so that an account whose blobs come slowly cannot take every one. Must be greater than `0` when the mirror is enabled.  
 **Type:** Integer  
 **Default:** `4`  
 **Required:** No
 
 #### `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`
 
-**Description:** Per-blob mirror fetch timeout in seconds. Must be greater than `0` when the mirror is enabled.  
+**Description:** How long, in seconds, a mirror peer may take to answer a request, and how long it may send nothing in the middle of a body. One request as a whole gets this time plus the blob's length divided by 256 KiB/s, so a large blob on a slow link can finish. Must be greater than `0` when the mirror is enabled.  
 **Type:** Integer  
 **Default:** `120`  
 **Required:** No
@@ -2052,24 +2052,57 @@ a dead timer.
 
 ---
 
-### GRASP-P Blob Mirror Retry Backoff (Phase 4b)
+### GRASP-P Blob Mirror Retries and Scheduling
 
-The blob mirror classifies every fetch failure and gates **transient**
-classes per blob with an exponential backoff (`base * 2^(attempt-1)`,
-capped at `max`, ±20% jitter): transport errors, peer HTTP 5xx, no
-available peer, and `404` on all peers — the latter always retries at the
-max interval because a late upload is legitimate. **Deterministic**
-classes (`quota`, `too_large`, `verify:`, `store:`, `blocked`, `reserve:`,
-`sink:`, `write:`) are NOT gated: they keep the flat repair-scan cadence
-and only succeed once the underlying condition changes (GC frees space,
-config changes, …). Backoff-gated blobs stay counted in
-`ngit_private_mirror_lag_blobs` — the gate suppresses re-enqueue, never
-the gauge. There is no give-up: a referenced blob may legitimately appear
-late. Retry state is in-memory only; a restart resets every blob to the
-base interval (the boot repair scan re-derives all wants anyway).
+Every failed fetch closes a gate on its blob, and the blob is not fetched
+again until the gate opens. No failure class is exempt.
 
-These are node-local recovery knobs: they do not affect acceptance, so
-they are **not** part of the `policy_fingerprint` preimage.
+- Failures that may heal by themselves, or by a change on this node, back
+  off exponentially (`base * 2^(attempt-1)`, capped at `max`): transport
+  errors and a peer name that does not resolve (`network`), any peer status but `404` (`http_status`), no peer to
+  ask (`no_peer`), and the local ones: `quota`, `reserve`, `sink`, `write`,
+  `store`.
+- Failures that need someone else to act wait the `max` interval every
+  time: `404` from every peer (the blob may be uploaded late), `blocked` (the
+  address guard refused the peer), `verify` (wrong bytes, or a length that
+  does not match), `too_large`.
+
+All delays carry ±20% jitter. A gated blob stays counted in
+`ngit_private_mirror_lag_blobs`: the gate stops it being queued, not being
+counted. Nothing is given up on: a referenced blob may legitimately appear
+late. Gates are held in memory; a restart forgets them, and the scan at
+boot queues every missing blob again.
+
+When a blob has several peers, a failure caused by this node's own state
+(`quota`, `reserve`, `sink`, `write`, `store`) ends the attempt, since every
+peer would meet the same state. Otherwise every peer is tried and the
+reason recorded is the one that retries soonest, whatever the order of the
+peers.
+
+**After a change that should let a blob through** (a quota raised, space
+freed, a peer fixed), the blob is fetched when its gate opens: up to
+`NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` plus 20% jitter and one scan interval
+later. Restarting the node clears every
+gate at once.
+
+**Fairness between accounts.** Missing blobs wait in one queue per account
+(the tenant key) and the accounts are served in turn. One account may hold
+at most half of `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` (rounded down, at
+least one) fetches at a time, so one account whose blobs come slowly, or
+never, cannot take every fetch. Two such accounts can hold all of them at
+the default of four; other accounts then wait for fetches of theirs to end.
+The share is derived and has no setting. A node
+with one busy account therefore mirrors at half the configured concurrency;
+raise `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` if that is too slow.
+
+**How long one fetch may take.** `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS` is
+how long the peer may take to answer, and how long it may send nothing in
+the middle of a body. The whole request gets that time plus the blob's
+length divided by 256 KiB/s: about 19 minutes for a 256 MiB blob at the
+default of 120 seconds.
+
+These are node-local settings: they do not affect acceptance, so they are
+**not** part of the `policy_fingerprint` preimage.
 
 #### `NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS`
 
@@ -2080,9 +2113,16 @@ they are **not** part of the `policy_fingerprint` preimage.
 
 #### `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS`
 
-**Description:** Cap in seconds for the retry backoff; also the fixed retry interval for blobs the peers answer `404` (possible late upload). Must be greater than or equal to `NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS`.  
+**Description:** Cap in seconds for the retry backoff; also the fixed retry interval for the failures that do not heal by themselves (`404` from every peer, `blocked`, `verify`, `too_large`). Must be greater than or equal to `NGIT_GRASP_P_MIRROR_RETRY_BASE_SECS`.  
 **Type:** Integer  
 **Default:** `3600`  
+**Required:** No
+
+#### `NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN`
+
+**Description:** Blobs the mirror may start fetching per minute, over all accounts together. One attempt is one missing blob tried against its peers. The node may start that many at once after a quiet spell, and that many per minute from then on; a blob that has to wait is fetched as soon as the budget allows, never dropped. It bounds what retries cost when many blobs keep failing; the backoff above bounds each blob by itself. `0` = unlimited. Raise it if a healthy pair with many small blobs replicates too slowly.  
+**Type:** Integer  
+**Default:** `600`  
 **Required:** No
 
 ---
