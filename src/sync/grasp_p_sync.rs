@@ -12,7 +12,8 @@
 //!   replacements, expires holds and connects the operator's peers) and the
 //!   periodic full re-issue;
 //! - the event pipeline: skip known-rejected private events, reprocess held
-//!   events after a 30640 is accepted, and hold rejected private events;
+//!   events after a 30640 is accepted, and hand rejected private events to
+//!   the hold's decision point;
 //! - disconnect checks: configured peers carry no public repositories, so the
 //!   empty-relay heuristic must not drop them.
 //!
@@ -558,41 +559,21 @@ impl SyncManager {
         }
     }
 
-    /// Design 1.4: hold a rejected synced GRASP-P event in the dedicated
+    /// Design 1.4: record a rejected synced GRASP-P event in the dedicated
     /// index. Upstream's (pubkey, d-tag) index does not fit these kinds:
     /// stream wraps have no `d` tag, so 30641s are keyed by target alias and
     /// stream wraps by their outer author.
+    ///
+    /// What is kept is decided in one place, `PrivateService::note_rejected`:
+    /// the whole event when a later registration can make it acceptable,
+    /// otherwise its id, so it is not fetched again on every delivery.
     pub(super) fn grasp_p_after_rejected(
         write_policy: &Nip34WritePolicy,
         event: &Event,
         message: &str,
     ) {
-        let Some(service) = write_policy.grasp_p() else {
-            return;
-        };
-        match event.kind.as_u16() {
-            crate::grasp_p::KIND_REGISTRATION => {
-                // FS-2: a cadence-rejected same-tenant replacement is held as
-                // a full event and retried after the bucket refills; every
-                // other 30640 rejection is remembered by id only.
-                if message.contains(crate::grasp_p::registration::REPLACE_CADENCE_REJECT_MESSAGE) {
-                    service.sync_rejected().add_registration(event.clone());
-                } else {
-                    service.sync_rejected().add_id_only(event.id);
-                }
-            }
-            crate::grasp_p::KIND_STATE_ROOT => match tag_values(event, "d").next() {
-                Some(alias) => service
-                    .sync_rejected()
-                    .add_state_root(alias.clone(), event.clone()),
-                None => service.sync_rejected().add_id_only(event.id),
-            },
-            kind if service.accepts_stream_wrap_kind(kind) => {
-                service
-                    .sync_rejected()
-                    .add_wrap(event.pubkey.to_hex(), event.clone());
-            }
-            _ => {}
+        if let Some(service) = write_policy.grasp_p() {
+            service.note_rejected(event, message, true);
         }
     }
 }

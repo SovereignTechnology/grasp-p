@@ -125,7 +125,7 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
 
     let event_json = event.as_json();
     if event_json.len() as u64 > cfg.max_event_bytes {
-        return reject_restricted("event exceeds private repo size limit");
+        return reject_restricted(super::admission::OVERSIZE_REJECT_MESSAGE);
     }
 
     let parsed = match parse_shape(event, cfg.max_blob_bytes) {
@@ -142,7 +142,7 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
     // instead of recoverable.
     let record = match svc.live_registration(&parsed.alias).await {
         Ok(Some(record)) => record,
-        Ok(None) => return reject_restricted("unregistered alias"),
+        Ok(None) => return reject_restricted(super::admission::STATE_ROOT_UNREGISTERED_ALIAS),
         Err(e) => {
             tracing::warn!("private state-root liveness check failed: {e}");
             return reject_error("private liveness check failed");
@@ -152,13 +152,13 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
     // The a tag must match the live registration's coordinate.
     let expected = format!("30640:{}:{}", record.tenant_hex, parsed.alias);
     if parsed.coordinate != expected {
-        return reject_invalid("state root a tag does not match the live registration");
+        return reject_invalid(super::admission::STATE_ROOT_COORDINATE_MISMATCH);
     }
 
     // Signed by a registered WRITE key (aux keys cannot publish state roots).
     let author_hex = event.pubkey.to_hex();
     if !record.w_keys.contains(&author_hex) {
-        return reject_restricted("event author is not a registered write key for this alias");
+        return reject_restricted(super::admission::STATE_ROOT_AUTHOR_NOT_WRITE_KEY);
     }
 
     // §4b: apply meta changes (ring append + quota charge) ONLY when the relay
@@ -243,7 +243,9 @@ pub(crate) fn apply_state_root_txn(
     // race is TRANSIENT — a retry under the new record succeeds. Callers
     // must be able to tell the two apart (verify round 3).
     if !super::registration_identity_intact(meta, txn, alias, tenant_hex, &record.event_id)? {
-        return Ok(Some(reject_restricted("alias registration changed; retry")));
+        return Ok(Some(reject_restricted(
+            super::admission::STATE_ROOT_REGISTRATION_CHANGED,
+        )));
     }
 
     let ring_key = MetaEnv::state_ring_key(alias, created_at, &event_id_hex);

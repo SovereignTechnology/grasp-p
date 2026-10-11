@@ -11,7 +11,9 @@
 //!   ([`configured_peer_relay_urls`]).
 //! - [`PrivateRejectedIndex`]: a dedicated hot cache for 30641/stream-wrap
 //!   events rejected because their authorizing 30640 has not arrived yet
-//!   (out-of-order sync). Keyed by target alias (30641) and outer author
+//!   (out-of-order sync), bounded by count and by bytes. What enters it is
+//!   decided by `PrivateService::note_rejected`; this index only keeps,
+//!   accounts and releases. Keyed by target alias (30641) and outer author
 //!   pubkey (stream wraps) — wraps have an ephemeral pubkey and no `d` tag,
 //!   so the existing (pubkey, d-tag) `RejectedEventsIndex` keying cannot
 //!   apply. The author keying is deliberately KIND-AGNOSTIC: the 1059 ->
@@ -152,6 +154,101 @@ const MAX_HELD_EVENTS: usize = 4096;
 /// (tenant, alias) universe in practice; this cap is the flood backstop.
 const MAX_HELD_REGISTRATIONS: usize = 1024;
 
+/// Cap on the ids the index remembers in total: the ids of held events plus
+/// the ids kept without their event. Without it a peer, or anyone it relays
+/// for, could grow the id map without limit by sending rejected events of
+/// distinct ids faster than the TTL retires them.
+const MAX_SKIP_SET_IDS: usize = 65_536;
+
+/// The part of [`MAX_SKIP_SET_IDS`] open to ids kept WITHOUT their event. The
+/// rest is reserved for the ids of held events, so a full skip-set can never
+/// be the reason a dependency hold is refused.
+const MAX_ID_ONLY_IDS: usize = MAX_SKIP_SET_IDS - MAX_HELD_EVENTS;
+
+/// Floor of the hold's byte budget.
+pub const MIN_HOLD_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// The budget is never less than this many times the largest size admission
+/// lets through, however large that size is configured. That is room for
+/// about this many such events: one built from many tiny tags is charged
+/// more than its serialized size (see [`event_bytes`]).
+const HOLD_BUDGET_MAX_SIZE_EVENTS: u64 = 64;
+
+/// Held registrations may use at most one part in this many of the byte
+/// budget: the same quarter [`MAX_HELD_REGISTRATIONS`] is of
+/// [`MAX_HELD_EVENTS`].
+const REGISTRATION_BUDGET_DIVISOR: usize = MAX_HELD_EVENTS / MAX_HELD_REGISTRATIONS;
+
+/// Byte budget of the hold for a node whose GRASP-P event size limit is
+/// `max_event_bytes`: 32 MiB, or 64 times the largest admissible size when
+/// that is more. Derived, not a setting: the hold changes when an
+/// out-of-order event is retried, never whether it is finally accepted.
+pub fn hold_budget_bytes(max_event_bytes: u64) -> usize {
+    let scaled = max_event_bytes.saturating_mul(HOLD_BUDGET_MAX_SIZE_EVENTS);
+    usize::try_from(scaled)
+        .unwrap_or(usize::MAX)
+        .max(MIN_HOLD_BUDGET_BYTES)
+}
+
+/// What a held event costs against the byte budget: its serialized length
+/// plus the memory its tag list takes beyond that text. A tag costs a vector
+/// header and one string header per element however short its text is, so an
+/// event made of thousands of one-character tags would otherwise occupy
+/// about ten times what it is charged.
+pub(crate) fn event_bytes(event: &Event) -> usize {
+    let tag_headers: usize = event
+        .tags
+        .iter()
+        .map(|tag| {
+            std::mem::size_of::<nostr_sdk::prelude::Tag>()
+                + tag.len() * std::mem::size_of::<String>()
+        })
+        .sum();
+    event.as_json().len().saturating_add(tag_headers)
+}
+
+/// Why the index did not keep what it was offered. Also the fixed label set
+/// of `ngit_private_hold_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldDropReason {
+    /// The hold already carries its maximum number of events.
+    CountCap,
+    /// Keeping the event would exceed the hold's byte budget.
+    ByteBudget,
+    /// The rejection is not one a later registration can turn into an
+    /// acceptance, so the event itself was never offered to the hold.
+    NotHoldable,
+    /// The id could not be remembered: the skip-set is full.
+    SkipSetFull,
+}
+
+impl HoldDropReason {
+    /// Metric label value.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::CountCap => "count_cap",
+            Self::ByteBudget => "byte_budget",
+            Self::NotHoldable => "not_holdable",
+            Self::SkipSetFull => "skip_set_full",
+        }
+    }
+}
+
+/// What the index did with a rejected event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldOutcome {
+    /// The full event is held for a later retry and its id is skipped.
+    Held,
+    /// Only the id is remembered, so the event is not fetched again before
+    /// the TTL lapses.
+    IdOnly,
+    /// The id was already held or remembered. Nothing new was kept; at most
+    /// the time the id was last seen rejected was refreshed.
+    AlreadyTracked,
+    /// Nothing was kept, not even the id, so the event stays fetchable.
+    Dropped(HoldDropReason),
+}
+
 /// R2-1(c): per-tick drain cap for held-registration retries. Each retry
 /// pays FULL Live admission (parse, up to 64 PoP schnorr verifies ≈ 4-7ms,
 /// plus an LMDB write txn that commits even on reject), so an uncapped drain
@@ -187,6 +284,9 @@ pub fn registration_retry_period(refill_per_hour: u32) -> Duration {
 struct HeldEvent {
     event: Event,
     held_at: Instant,
+    /// What this entry was charged against the byte budget when it entered,
+    /// kept so leaving the hold returns exactly that amount.
+    bytes: usize,
 }
 
 /// R2-1: a held cadence-rejected 30640 replacement, one per (tenant, alias)
@@ -201,6 +301,8 @@ struct HeldRegistration {
     next_eligible: Instant,
     /// Insertion sequence — FIFO order for the per-tick drain cap.
     seq: u64,
+    /// As [`HeldEvent::bytes`].
+    bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -233,7 +335,58 @@ struct PrivateRejectedInner {
     /// and the ids of 30641/stream-wrap holds) with their rejection time — drives
     /// the sync pre-filter skip and the negentropy exclusion set.
     ids: HashMap<EventId, Instant>,
+    /// Held full events of every sort: 30641s, stream wraps, registrations.
     held_count: usize,
+    /// Bytes charged by every held full event, registrations included.
+    held_bytes: usize,
+    /// The part of `held_bytes` charged by held registrations.
+    registration_bytes: usize,
+}
+
+impl PrivateRejectedInner {
+    /// How many ids are remembered WITHOUT their event. Every held 30641 and
+    /// stream wrap has its id in `ids` for as long as it is held (both are
+    /// stamped with one instant and expire together), so the rest of `ids`
+    /// is id-only. Held registrations keep their ids in `registration_ids`.
+    fn id_only_len(&self) -> usize {
+        let held_in_ids = self.held_count.saturating_sub(self.registrations.len());
+        self.ids.len().saturating_sub(held_in_ids)
+    }
+
+    /// Remember `id` without its event, or refresh the time it was last seen
+    /// rejected.
+    ///
+    /// A full skip-set REFUSES a new id; it does not evict an old one. The
+    /// skip-set exists so a rejected event is not fetched and validated again
+    /// on every delivery. When ids arrive faster than the TTL retires them,
+    /// some rejected events will be validated again whichever policy is
+    /// used: eviction lets the flood push out the entries of other senders
+    /// and needs an ordered structure to find the oldest, while refusal is
+    /// constant time, leaves every existing entry its full TTL, and frees
+    /// room by itself as those entries expire.
+    fn remember_id(&mut self, id: EventId, now: Instant) -> HoldOutcome {
+        if let Some(at) = self.ids.get_mut(&id) {
+            // The id may belong to an event that is still held, so this is
+            // not reported as an event reduced to its id.
+            *at = now;
+            return HoldOutcome::AlreadyTracked;
+        }
+        if self.id_only_len() >= MAX_ID_ONLY_IDS {
+            return HoldOutcome::Dropped(HoldDropReason::SkipSetFull);
+        }
+        self.ids.insert(id, now);
+        HoldOutcome::IdOnly
+    }
+
+    fn uncharge(&mut self, bytes: usize) {
+        self.held_count = self.held_count.saturating_sub(1);
+        self.held_bytes = self.held_bytes.saturating_sub(bytes);
+    }
+
+    fn uncharge_registration(&mut self, bytes: usize) {
+        self.uncharge(bytes);
+        self.registration_bytes = self.registration_bytes.saturating_sub(bytes);
+    }
 }
 
 /// Drain result for the cadence-retry timer (R2-1).
@@ -249,6 +402,10 @@ pub struct RegistrationDrain {
 /// authorizing kind-30640 registration. TTL matches the existing rejected
 /// hot-cache duration (default 120s); raise
 /// `--rejected-hot-cache-duration-secs` if 30640/dependent ordering is slow.
+///
+/// Bounded three ways: by the number of held events, by their bytes, and by
+/// the number of ids remembered. Over the count cap or the byte budget a new
+/// event is dropped and existing entries are left alone.
 #[derive(Debug)]
 pub struct PrivateRejectedIndex {
     inner: parking_lot::Mutex<PrivateRejectedInner>,
@@ -257,15 +414,23 @@ pub struct PrivateRejectedIndex {
     /// cadence bucket, from [`registration_retry_period`]; per-hold ±20%
     /// jitter is sampled in [`Self::insert_registration`].
     registration_retry_period: Duration,
+    /// Byte budget for every held full event (see [`hold_budget_bytes`]).
+    max_bytes: usize,
 }
 
 impl PrivateRejectedIndex {
-    pub fn new(ttl: Duration, registration_retry_period: Duration) -> Self {
+    pub fn new(ttl: Duration, registration_retry_period: Duration, max_bytes: usize) -> Self {
         Self {
             inner: parking_lot::Mutex::new(PrivateRejectedInner::default()),
             ttl,
             registration_retry_period,
+            max_bytes,
         }
+    }
+
+    /// The share of the byte budget held registrations may use.
+    fn max_registration_bytes(&self) -> usize {
+        self.max_bytes / REGISTRATION_BUDGET_DIVISOR
     }
 
     /// Is this event id known-rejected (still within TTL)?
@@ -301,27 +466,28 @@ impl PrivateRejectedIndex {
         out
     }
 
-    /// Record an id-only rejection (30640s have no held-event semantics).
-    pub fn add_id_only(&self, id: EventId) {
-        self.inner.lock().ids.insert(id, Instant::now());
+    /// Remember a rejected event by id only, for the TTL. Refused when the
+    /// skip-set is full (see [`PrivateRejectedInner::remember_id`]).
+    pub fn add_id_only(&self, id: EventId) -> HoldOutcome {
+        self.inner.lock().remember_id(id, Instant::now())
     }
 
     /// Hold a rejected 30641 keyed by its target alias.
-    pub fn add_state_root(&self, alias: String, event: Event) {
+    pub fn add_state_root(&self, alias: String, event: Event) -> HoldOutcome {
         let mut inner = self.inner.lock();
-        Self::add_held(&mut inner, event, |inner, held| {
+        Self::add_held(&mut inner, self.max_bytes, event, |inner, held| {
             inner.by_alias.entry(alias).or_default().push(held);
-        });
+        })
     }
 
     /// Hold a rejected stream wrap keyed by its outer author pubkey. The
     /// wire kind is irrelevant to the hold: legacy 1059 and 3359 wraps
     /// share the author bucket and are released by the same 30640.
-    pub fn add_wrap(&self, author_hex: String, event: Event) {
+    pub fn add_wrap(&self, author_hex: String, event: Event) -> HoldOutcome {
         let mut inner = self.inner.lock();
-        Self::add_held(&mut inner, event, |inner, held| {
+        Self::add_held(&mut inner, self.max_bytes, event, |inner, held| {
             inner.by_author.entry(author_hex).or_default().push(held);
-        });
+        })
     }
 
     /// FS-2 + R2-1: hold a cadence-rejected same-tenant 30640 replacement
@@ -333,14 +499,16 @@ impl PrivateRejectedIndex {
     ///   equal created_at -> LOWER id wins) REPLACES the held edition.
     ///   Accepting the held newest edition later stales the displaced older
     ///   one into the harmless anchor-repair no-op, so the displaced
-    ///   edition keeps only an id-only skip-set entry (TTL'd);
+    ///   edition keeps only an id-only skip-set entry (TTL'd). The
+    ///   replacement is charged the DIFFERENCE in bytes; if that difference
+    ///   does not fit the budget the newer edition is dropped and the held
+    ///   one stays;
     /// - an older-or-equal edition for the same bucket is id-only dropped;
     /// - a NEW bucket is subject to the registrations sub-cap
     ///   ([`MAX_HELD_REGISTRATIONS`], so dependency holds keep their share
-    ///   of [`MAX_HELD_EVENTS`]) and the global hold cap — overflow drops
-    ///   WITHOUT poisoning the skip-set, exactly like [`Self::add_held`]
-    ///   (replacements of an existing bucket never grow the hold and are
-    ///   therefore never cap-dropped).
+    ///   of [`MAX_HELD_EVENTS`]), the global hold cap, the registrations'
+    ///   quarter of the byte budget and the budget itself — overflow drops
+    ///   WITHOUT poisoning the skip-set, exactly like [`Self::add_held`].
     ///
     /// While held, the event id keeps the pre-filter skip and negentropy
     /// exclusion out of refetch loops (no TTL — the refill-aware
@@ -348,7 +516,7 @@ impl PrivateRejectedIndex {
     /// leaves the hold on accept, on expiry (TTL past its eligibility —
     /// the hourly full re-issue is the backstop healer), or on sub-cap
     /// overflow.
-    pub fn add_registration(&self, event: Event) {
+    pub fn add_registration(&self, event: Event) -> HoldOutcome {
         let tenant_hex = event.pubkey.to_hex();
         let alias = event.tags.iter().find_map(|tag| {
             let v = tag.clone().to_vec();
@@ -362,49 +530,87 @@ impl PrivateRejectedIndex {
             // Shape-invalid 30640s cannot reach the cadence rejection
             // (parse_shape fails earlier with `invalid:`), but never hold
             // an event we cannot key into a bucket.
-            self.add_id_only(event.id);
-            return;
+            return self.add_id_only(event.id);
         };
+        let bytes = event_bytes(&event);
+        let max_bytes = self.max_bytes;
+        let max_registration_bytes = self.max_registration_bytes();
         let mut inner = self.inner.lock();
         if inner.registration_ids.contains(&event.id) || inner.ids.contains_key(&event.id) {
             // Already tracked (held, or id-only from an older-or-equal
             // drop) — don't hold duplicates.
-            return;
+            return HoldOutcome::AlreadyTracked;
         }
         let key = (tenant_hex, alias);
-        if let Some(held) = inner.registrations.get(&key) {
+        let held_edition = inner.registrations.get(&key).map(|held| {
             let newer = event.created_at.as_secs() > held.event.created_at.as_secs()
                 || (event.created_at == held.event.created_at && event.id < held.event.id);
+            (newer, held.bytes)
+        });
+        if let Some((newer, old_bytes)) = held_edition {
             if !newer {
                 // Older-or-equal: id-only drop (it would be absorbed by the
                 // accept-no-op anchor repair anyway).
-                inner.ids.insert(event.id, Instant::now());
-                return;
+                return inner.remember_id(event.id, Instant::now());
             }
-            // Strictly newer: replace — free the old full event (held_count
-            // nets to zero) and keep its id as an id-only skip-set entry.
+            // Strictly newer: the count does not change, the bytes may, so
+            // the budget is checked against the totals as they would be
+            // with the held edition gone and the newer one in its place.
+            let registration_bytes_after =
+                inner.registration_bytes.saturating_sub(old_bytes) + bytes;
+            let held_bytes_after = inner.held_bytes.saturating_sub(old_bytes) + bytes;
+            if registration_bytes_after > max_registration_bytes || held_bytes_after > max_bytes {
+                // Over budget: drop the newcomer, keep what is held, and
+                // leave the skip-set alone so the newer edition can be
+                // fetched again once there is room.
+                return HoldOutcome::Dropped(HoldDropReason::ByteBudget);
+            }
             let old = inner.registrations.remove(&key).expect("checked above");
             inner.registration_ids.remove(&old.event.id);
-            inner.ids.insert(old.event.id, Instant::now());
-            inner.held_count = inner.held_count.saturating_sub(1);
-            Self::insert_registration(&mut inner, key, event, self.registration_retry_period);
-            return;
+            inner.uncharge_registration(old.bytes);
+            // The displaced id is skipped for the TTL when the skip-set has
+            // room; when it does not, the worst case is one more fetch and
+            // validation of an edition the held one supersedes.
+            let _ = inner.remember_id(old.event.id, Instant::now());
+            Self::insert_registration(
+                &mut inner,
+                key,
+                event,
+                bytes,
+                self.registration_retry_period,
+            );
+            return HoldOutcome::Held;
         }
         if inner.registrations.len() >= MAX_HELD_REGISTRATIONS {
             // Sub-cap overflow: drop WITHOUT touching the skip-set.
-            return;
+            return HoldOutcome::Dropped(HoldDropReason::CountCap);
         }
         if inner.held_count >= MAX_HELD_EVENTS {
             // Global memory bound: same no-poison discipline as add_held.
-            return;
+            return HoldOutcome::Dropped(HoldDropReason::CountCap);
         }
-        Self::insert_registration(&mut inner, key, event, self.registration_retry_period);
+        if inner.registration_bytes.saturating_add(bytes) > max_registration_bytes
+            || inner.held_bytes.saturating_add(bytes) > max_bytes
+        {
+            // Byte budget (the registrations' quarter, or the whole): the
+            // same no-poison discipline again.
+            return HoldOutcome::Dropped(HoldDropReason::ByteBudget);
+        }
+        Self::insert_registration(
+            &mut inner,
+            key,
+            event,
+            bytes,
+            self.registration_retry_period,
+        );
+        HoldOutcome::Held
     }
 
     fn insert_registration(
         inner: &mut PrivateRejectedInner,
         key: (String, String),
         event: Event,
+        bytes: usize,
         period: Duration,
     ) {
         use rand::RngExt;
@@ -416,41 +622,58 @@ impl PrivateRejectedIndex {
         inner.next_reg_seq += 1;
         inner.registration_ids.insert(event.id);
         inner.held_count += 1;
+        inner.held_bytes += bytes;
+        inner.registration_bytes += bytes;
         inner.registrations.insert(
             key,
             HeldRegistration {
                 event,
                 next_eligible: now + period.mul_f64(jitter),
                 seq,
+                bytes,
             },
         );
     }
 
     fn add_held(
         inner: &mut PrivateRejectedInner,
+        max_bytes: usize,
         event: Event,
         insert: impl FnOnce(&mut PrivateRejectedInner, HeldEvent),
-    ) {
+    ) -> HoldOutcome {
         if inner.ids.contains_key(&event.id) {
             // Already tracked (skip-set or held) — don't hold duplicates.
-            return;
+            return HoldOutcome::AlreadyTracked;
         }
         if inner.held_count >= MAX_HELD_EVENTS {
             // Memory bound: drop the event WITHOUT touching the skip-set —
             // a skip-set entry for an event we are not actually holding
             // would block it from ever being refetched/replayed until TTL
             // expiry, letting a hold-cap flood starve legitimate events.
-            return;
+            return HoldOutcome::Dropped(HoldDropReason::CountCap);
         }
-        inner.ids.insert(event.id, Instant::now());
+        let bytes = event_bytes(&event);
+        if inner.held_bytes.saturating_add(bytes) > max_bytes {
+            // The count cap alone lets a few thousand maximum-size events
+            // pin memory; the byte budget is the bound that scales with
+            // what was sent. Same discipline: nothing enters the skip-set.
+            return HoldOutcome::Dropped(HoldDropReason::ByteBudget);
+        }
+        // One instant for the id and the event, so they expire in the same
+        // cleanup pass and `id_only_len` stays exact.
+        let now = Instant::now();
+        inner.ids.insert(event.id, now);
         inner.held_count += 1;
+        inner.held_bytes += bytes;
         insert(
             inner,
             HeldEvent {
                 event,
-                held_at: Instant::now(),
+                held_at: now,
+                bytes,
             },
         );
+        HoldOutcome::Held
     }
 
     /// Remove and return all held events for `alias` (30641s), clearing
@@ -498,7 +721,7 @@ impl PrivateRejectedIndex {
         for (_, key) in eligible {
             if let Some(h) = inner.registrations.remove(&key) {
                 inner.registration_ids.remove(&h.event.id);
-                inner.held_count = inner.held_count.saturating_sub(1);
+                inner.uncharge_registration(h.bytes);
                 events.push(h.event);
             }
         }
@@ -509,58 +732,143 @@ impl PrivateRejectedIndex {
     }
 
     fn release(inner: &mut PrivateRejectedInner, held: Vec<HeldEvent>) -> Vec<Event> {
-        inner.held_count = inner.held_count.saturating_sub(held.len());
         held.into_iter()
             .map(|h| {
                 inner.ids.remove(&h.event.id);
+                inner.uncharge(h.bytes);
                 h.event
             })
             .collect()
     }
 
-    /// Drop entries older than the TTL. Returns how many were removed.
+    /// Drop entries older than the TTL, returning their bytes to the
+    /// budget. Returns how many held events were removed.
     pub fn cleanup_expired(&self) -> usize {
         let ttl = self.ttl;
+        // One reading of the clock for the whole pass: a held event and its
+        // id carry the same instant and must be judged against the same now.
+        let now = Instant::now();
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let mut removed = 0_usize;
+        let mut freed = 0_usize;
 
         for map in [&mut inner.by_alias, &mut inner.by_author] {
             for events in map.values_mut() {
-                let before = events.len();
-                events.retain(|h| h.held_at.elapsed() < ttl);
-                removed += before - events.len();
+                events.retain(|h| {
+                    let keep = now.saturating_duration_since(h.held_at) < ttl;
+                    if !keep {
+                        removed += 1;
+                        freed += h.bytes;
+                    }
+                    keep
+                });
             }
             map.retain(|_, v| !v.is_empty());
         }
-        {
-            // Registrations expire TTL past their ELIGIBILITY, not past
-            // insertion: the refill-aware eligibility can sit up to 1h out
-            // (vs the 120s default TTL) and the entry must survive to its
-            // first retry. (Instant::elapsed saturates to zero for a
-            // future next_eligible.)
-            let mut expired_ids = Vec::new();
-            let before = inner.registrations.len();
-            inner.registrations.retain(|_, h| {
-                let keep = h.next_eligible.elapsed() < ttl;
-                if !keep {
-                    expired_ids.push(h.event.id);
-                }
-                keep
-            });
-            removed += before - inner.registrations.len();
-            for id in expired_ids {
-                inner.registration_ids.remove(&id);
-            }
-        }
-        inner.held_count = inner.held_count.saturating_sub(removed);
 
-        // Expire skip-set ids on the same TTL. Held events keep their ids
-        // alive because both were inserted at the same instant; held
-        // REGISTRATION ids live in `registration_ids` (dropped above with
-        // their hold entry) and never in `ids`.
-        inner.ids.retain(|_, at| at.elapsed() < ttl);
+        // Registrations expire TTL past their ELIGIBILITY, not past
+        // insertion: the refill-aware eligibility can sit up to 1h out
+        // (vs the 120s default TTL) and the entry must survive to its
+        // first retry. (The saturating difference is zero for a future
+        // next_eligible.)
+        let mut expired_ids = Vec::new();
+        let mut freed_registrations = 0_usize;
+        inner.registrations.retain(|_, h| {
+            let keep = now.saturating_duration_since(h.next_eligible) < ttl;
+            if !keep {
+                expired_ids.push(h.event.id);
+                freed_registrations += h.bytes;
+            }
+            keep
+        });
+        removed += expired_ids.len();
+        freed += freed_registrations;
+        for id in expired_ids {
+            inner.registration_ids.remove(&id);
+        }
+
+        inner.held_count = inner.held_count.saturating_sub(removed);
+        inner.held_bytes = inner.held_bytes.saturating_sub(freed);
+        inner.registration_bytes = inner.registration_bytes.saturating_sub(freed_registrations);
+
+        // Expire skip-set ids on the same TTL. A held event's id was
+        // stamped with the event's own instant (or refreshed later), so it
+        // never expires before the event; held REGISTRATION ids live in
+        // `registration_ids` (dropped above with their hold entry) and
+        // never in `ids`.
+        inner
+            .ids
+            .retain(|_, at| now.saturating_duration_since(*at) < ttl);
         removed
+    }
+
+    /// Bytes currently charged against the budget.
+    #[cfg(test)]
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.inner.lock().held_bytes
+    }
+
+    /// Held full events of every sort.
+    #[cfg(test)]
+    pub(crate) fn held_len(&self) -> usize {
+        self.inner.lock().held_count
+    }
+
+    /// Recompute the count and both byte totals from the entries and check
+    /// them against the running totals, and check every bound. Tests call
+    /// this after each step, so an insert, take, expiry, replacement or drop
+    /// that forgets its half of the accounting fails where it happens.
+    #[cfg(test)]
+    pub(crate) fn assert_accounting(&self) {
+        let inner = self.inner.lock();
+        let dependents: Vec<&HeldEvent> = inner
+            .by_alias
+            .values()
+            .chain(inner.by_author.values())
+            .flatten()
+            .collect();
+        let dependent_bytes: usize = dependents.iter().map(|h| h.bytes).sum();
+        let registration_bytes: usize = inner.registrations.values().map(|h| h.bytes).sum();
+
+        for h in &dependents {
+            assert_eq!(h.bytes, event_bytes(&h.event), "charge is the event's size");
+            assert!(
+                inner.ids.contains_key(&h.event.id),
+                "a held event's id is in the skip-set"
+            );
+        }
+        for h in inner.registrations.values() {
+            assert_eq!(h.bytes, event_bytes(&h.event), "charge is the event's size");
+            assert!(inner.registration_ids.contains(&h.event.id));
+        }
+        assert_eq!(inner.registration_ids.len(), inner.registrations.len());
+        assert_eq!(
+            inner.held_count,
+            dependents.len() + inner.registrations.len(),
+            "held_count matches the entries"
+        );
+        assert_eq!(
+            inner.held_bytes,
+            dependent_bytes + registration_bytes,
+            "held_bytes matches the entries"
+        );
+        assert_eq!(
+            inner.registration_bytes, registration_bytes,
+            "registration_bytes matches the entries"
+        );
+        assert_eq!(
+            inner.id_only_len(),
+            inner.ids.len() - dependents.len(),
+            "the id-only count is the ids that have no held event"
+        );
+
+        assert!(inner.held_count <= MAX_HELD_EVENTS);
+        assert!(inner.registrations.len() <= MAX_HELD_REGISTRATIONS);
+        assert!(inner.held_bytes <= self.max_bytes);
+        assert!(inner.registration_bytes <= self.max_registration_bytes());
+        assert!(inner.id_only_len() <= MAX_ID_ONLY_IDS);
+        assert!(inner.ids.len() + inner.registration_ids.len() <= MAX_SKIP_SET_IDS);
     }
 }
 
@@ -661,7 +969,11 @@ mod tests {
     fn test_rejected_index_hold_and_take() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::TextNote, "x")
             .finalize(&keys)
@@ -677,29 +989,35 @@ mod tests {
 
         // Wrap path keyed by author.
         index.add_wrap(keys.public_key().to_hex(), event);
+        index.assert_accounting();
         let taken = index.take_for_authors(&[keys.public_key().to_hex()]);
         assert_eq!(taken.len(), 1);
         assert!(!index.contains(&id));
+        index.assert_accounting();
+        assert_eq!(index.held_bytes(), 0);
     }
 
-    /// The hold's kind-AGNOSTIC author keying — the contract the sync
-    /// ingest dispatch arm (`sync/mod.rs`, `accepts_stream_wrap_kind`)
-    /// depends on across the 1059 -> 3359 migration: wraps of BOTH wire
+    /// The hold's kind-AGNOSTIC author keying — the contract
+    /// `PrivateService::note_rejected` depends on across the 1059 -> 3359
+    /// migration: wraps of BOTH wire
     /// kinds from one write key share a bucket and are released together by
     /// the single 30640 that registers that key, with the skip-set cleared
     /// so the reprocess is not pre-filtered.
     ///
-    /// Coverage note: this pins the INDEX, not the call site. That dispatch
-    /// arm is unreachable from the two-node harness by construction (a node
-    /// only asks a peer for wraps by an author whose 30640 it has already
-    /// accepted, so a synced wrap preceding its own registration is a race
-    /// the harness cannot order) and deleting it leaves the suite green; it
-    /// remains verified by inspection only.
+    /// Coverage note: this pins the INDEX. The decision that sends a
+    /// rejected wrap here is pinned by
+    /// `grasp_p::tests::dependency_rejections_are_held_on_both_paths`. A
+    /// synced wrap that precedes its own registration is still a race the
+    /// two-node harness cannot order.
     #[test]
     fn test_wrap_hold_is_kind_agnostic_per_author() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let writer = Keys::generate();
         let author = writer.public_key().to_hex();
 
@@ -737,7 +1055,11 @@ mod tests {
     fn test_held_cap_overflow_does_not_poison_skip_set() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
 
         // Flood to the cap with bogus held events.
@@ -753,7 +1075,11 @@ mod tests {
             .finalize(&keys)
             .expect("sign");
         let id = legit.id;
-        index.add_state_root("legit-alias".into(), legit.clone());
+        assert_eq!(
+            index.add_state_root("legit-alias".into(), legit.clone()),
+            HoldOutcome::Dropped(HoldDropReason::CountCap)
+        );
+        index.assert_accounting();
         assert!(index.take_for_alias("legit-alias").is_empty());
         // ...but must NOT be poisoned into the skip-set (it has to stay
         // refetchable — pre-filter skip and negentropy exclusion both key
@@ -763,9 +1089,13 @@ mod tests {
 
         // Once capacity frees up, the same event holds normally.
         assert_eq!(index.take_for_alias("flood-alias-0").len(), 1);
-        index.add_state_root("legit-alias".into(), legit);
+        assert_eq!(
+            index.add_state_root("legit-alias".into(), legit),
+            HoldOutcome::Held
+        );
         assert!(index.contains(&id));
         assert_eq!(index.take_for_alias("legit-alias").len(), 1);
+        index.assert_accounting();
     }
 
     /// FS-2 + R2-1: cadence-rejected 30640 replacements are held (not
@@ -776,7 +1106,11 @@ mod tests {
     fn test_registration_hold_take_and_expiry() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
         let event = registration_like(&keys, &alias_for(1), 100);
         let id = event.id;
@@ -797,7 +1131,8 @@ mod tests {
 
         // Expiry: a zero TTL drops the held registration on cleanup (it
         // expires TTL past its eligibility; TTL zero is immediately past).
-        let expiring = PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO);
+        let expiring =
+            PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO, MIN_HOLD_BUDGET_BYTES);
         expiring.add_registration(registration_like(&keys, &alias_for(1), 100));
         assert_eq!(expiring.cleanup_expired(), 1);
         assert!(expiring
@@ -815,7 +1150,11 @@ mod tests {
     fn test_registration_hold_newest_only_replacement() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
         let bucket = alias_for(7);
         let e2 = registration_like(&keys, &bucket, 200);
@@ -860,6 +1199,8 @@ mod tests {
             drain.events[0].id, newer_tie.id,
             "equal created_at must resolve to the lower id"
         );
+        index.assert_accounting();
+        assert_eq!(index.held_bytes(), 0, "every drained edition gave back");
     }
 
     /// R2-1(b): the drain skips not-yet-eligible registrations; they become
@@ -870,7 +1211,8 @@ mod tests {
         use nostr_sdk::prelude::*;
 
         let period = Duration::from_secs(60);
-        let index = PrivateRejectedIndex::new(Duration::from_secs(3600), period);
+        let index =
+            PrivateRejectedIndex::new(Duration::from_secs(3600), period, MIN_HOLD_BUDGET_BYTES);
         let keys = Keys::generate();
         let event = registration_like(&keys, &alias_for(2), 100);
         let id = event.id;
@@ -901,7 +1243,11 @@ mod tests {
     fn test_registration_drain_cap_fifo() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
         let mut want_order = Vec::new();
         for i in 0..100u64 {
@@ -934,7 +1280,11 @@ mod tests {
     fn test_registration_sub_cap_does_not_poison_skip_set() {
         use nostr_sdk::prelude::*;
 
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         let keys = Keys::generate();
         let first = registration_like(&keys, &alias_for(0), 100);
         index.add_registration(first);
@@ -945,7 +1295,10 @@ mod tests {
         // A NEW bucket at the sub-cap: dropped, and NOT skip-set tracked.
         let over = registration_like(&keys, &alias_for(MAX_HELD_REGISTRATIONS as u64), 100);
         let over_id = over.id;
-        index.add_registration(over);
+        assert_eq!(
+            index.add_registration(over),
+            HoldOutcome::Dropped(HoldDropReason::CountCap)
+        );
         assert!(!index.contains(&over_id));
         assert!(!index.all_event_ids().contains(&over_id));
 
@@ -964,6 +1317,7 @@ mod tests {
             .expect("sign");
         index.add_state_root("some-alias".into(), held_state.clone());
         assert!(index.contains(&held_state.id));
+        index.assert_accounting();
     }
 
     /// R2-1(b): the retry period maps the refill knob to the per-token
@@ -999,14 +1353,19 @@ mod tests {
         let id = event.id;
 
         // Within TTL: excluded (both the REQ-path check and the set).
-        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO);
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
         index.add_id_only(id);
         assert!(index.all_event_ids().contains(&id));
 
         // Past TTL (zero-TTL index): lazily absent from the exclusion set
         // even though no cleanup pass has run — the entry is still
         // physically present until cleanup_expired.
-        let expired = PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO);
+        let expired =
+            PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO, MIN_HOLD_BUDGET_BYTES);
         expired.add_id_only(id);
         assert!(
             !expired.all_event_ids().contains(&id),
@@ -1016,5 +1375,385 @@ mod tests {
             !expired.contains(&id),
             "the REQ-path pre-filter already honored the TTL"
         );
+    }
+
+    /// A text note of `content_len` content bytes: a stand-in for a held
+    /// 30641 or stream wrap whose serialized size is the same for every
+    /// call with the same length (ids, keys and signatures are fixed-width
+    /// hex), so byte budgets can be written in multiples of it. A counter
+    /// in a fixed-width tag keeps the ids distinct.
+    fn sized_event(keys: &nostr_sdk::prelude::Keys, content_len: usize) -> Event {
+        use nostr_sdk::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        EventBuilder::new(Kind::TextNote, "x".repeat(content_len))
+            .custom_created_at(Timestamp::from_secs(1_700_000_000))
+            .tag(Tag::custom("n", [format!("{n:016x}")]))
+            .finalize(keys)
+            .expect("sign")
+    }
+
+    /// A 30640-shaped event with a chosen content, for registrations of
+    /// different sizes in one (tenant, alias) bucket.
+    fn registration_sized(
+        keys: &nostr_sdk::prelude::Keys,
+        alias: &str,
+        created_at: u64,
+        content_len: usize,
+    ) -> Event {
+        use nostr_sdk::prelude::*;
+        EventBuilder::new(Kind::Custom(30640u16), "r".repeat(content_len))
+            .tag(Tag::custom("d", [alias.to_string()]))
+            .custom_created_at(Timestamp::from_secs(created_at))
+            .finalize(keys)
+            .expect("sign")
+    }
+
+    /// The budget is 32 MiB, or 64 events of the largest admissible size
+    /// when that is more, and never overflows.
+    #[test]
+    fn hold_budget_scales_with_the_event_size_limit() {
+        assert_eq!(hold_budget_bytes(131_072), MIN_HOLD_BUDGET_BYTES);
+        assert_eq!(hold_budget_bytes(0), MIN_HOLD_BUDGET_BYTES);
+        assert_eq!(hold_budget_bytes(524_288), MIN_HOLD_BUDGET_BYTES);
+        assert_eq!(hold_budget_bytes(1 << 20), 64 << 20);
+        assert_eq!(hold_budget_bytes(u64::MAX), usize::MAX);
+        assert_eq!(REGISTRATION_BUDGET_DIVISOR, 4);
+    }
+
+    /// The label values of the drop counter are a fixed set.
+    #[test]
+    fn hold_drop_reason_labels_are_fixed() {
+        let labels: Vec<&str> = [
+            HoldDropReason::CountCap,
+            HoldDropReason::ByteBudget,
+            HoldDropReason::NotHoldable,
+            HoldDropReason::SkipSetFull,
+        ]
+        .iter()
+        .map(|reason| reason.as_label())
+        .collect();
+        assert_eq!(
+            labels,
+            ["count_cap", "byte_budget", "not_holdable", "skip_set_full"]
+        );
+    }
+
+    /// The hold is bounded by bytes as well as by count: an event past the
+    /// budget is dropped without entering the skip-set and without
+    /// disturbing what is held, a smaller one that fits is still taken, and
+    /// a take or an expiry returns exactly the bytes it was charged.
+    #[test]
+    fn hold_is_bounded_by_bytes() {
+        use nostr_sdk::prelude::*;
+
+        let keys = Keys::generate();
+        let big = event_bytes(&sized_event(&keys, 1000));
+        let small = event_bytes(&sized_event(&keys, 0));
+        assert!(small < big / 2, "the small event fits the slack below");
+
+        // Room for three big events and a half.
+        let budget = 3 * big + big / 2;
+        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO, budget);
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let event = sized_event(&keys, 1000);
+            assert_eq!(event_bytes(&event), big, "same length, same size");
+            assert_eq!(
+                index.add_state_root(format!("alias-{i}"), event.clone()),
+                HoldOutcome::Held
+            );
+            held.push(event);
+            index.assert_accounting();
+        }
+        assert_eq!(index.held_bytes(), 3 * big);
+
+        // The fourth does not fit: dropped, and refetchable.
+        let over = sized_event(&keys, 1000);
+        assert_eq!(
+            index.add_wrap(keys.public_key().to_hex(), over.clone()),
+            HoldOutcome::Dropped(HoldDropReason::ByteBudget)
+        );
+        assert!(!index.contains(&over.id));
+        assert!(!index.all_event_ids().contains(&over.id));
+        assert_eq!(index.held_bytes(), 3 * big, "existing entries untouched");
+        assert_eq!(index.held_len(), 3);
+        for event in &held {
+            assert!(index.contains(&event.id));
+        }
+        index.assert_accounting();
+
+        // The limit is bytes, not a count: a small event still fits.
+        let little = sized_event(&keys, 0);
+        assert_eq!(
+            index.add_wrap(keys.public_key().to_hex(), little),
+            HoldOutcome::Held
+        );
+        assert_eq!(index.held_bytes(), 3 * big + small);
+        index.assert_accounting();
+
+        // A take returns its bytes, and the dropped event then fits.
+        assert_eq!(index.take_for_alias("alias-0").len(), 1);
+        assert_eq!(index.held_bytes(), 2 * big + small);
+        index.assert_accounting();
+        assert_eq!(
+            index.add_state_root("alias-0".into(), over),
+            HoldOutcome::Held
+        );
+        assert_eq!(index.held_bytes(), 3 * big + small);
+        index.assert_accounting();
+
+        // Taking everything returns the budget to zero.
+        for alias in ["alias-0", "alias-1", "alias-2"] {
+            assert_eq!(index.take_for_alias(alias).len(), 1);
+        }
+        assert_eq!(
+            index.take_for_authors(&[keys.public_key().to_hex()]).len(),
+            1
+        );
+        assert_eq!(index.held_bytes(), 0);
+        assert_eq!(index.held_len(), 0);
+        assert!(index.all_event_ids().is_empty());
+        index.assert_accounting();
+
+        // Expiry returns bytes too (a zero TTL is past at once).
+        let expiring = PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO, budget);
+        expiring.add_state_root("a".into(), sized_event(&keys, 1000));
+        expiring.add_wrap(keys.public_key().to_hex(), sized_event(&keys, 1000));
+        expiring.add_registration(registration_like(&keys, &alias_for(1), 100));
+        assert!(expiring.held_bytes() > 2 * big);
+        expiring.assert_accounting();
+        assert_eq!(expiring.cleanup_expired(), 3);
+        assert_eq!(expiring.held_bytes(), 0);
+        assert_eq!(expiring.held_len(), 0);
+        expiring.assert_accounting();
+    }
+
+    /// Held registrations may use a quarter of the byte budget and no more,
+    /// so a flood of them cannot take the room 30641s and stream wraps need;
+    /// and they are also bound by the whole budget when the others fill it.
+    #[test]
+    fn registration_hold_has_its_own_byte_share() {
+        use nostr_sdk::prelude::*;
+
+        let keys = Keys::generate();
+        let size = event_bytes(&registration_like(&keys, &alias_for(0), 100));
+        let budget = 8 * size;
+        let index = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO, budget);
+
+        // The quarter holds two.
+        for i in 0..2u64 {
+            let event = registration_like(&keys, &alias_for(i), 100);
+            assert_eq!(event_bytes(&event), size, "same shape, same size");
+            assert_eq!(index.add_registration(event), HoldOutcome::Held);
+            index.assert_accounting();
+        }
+        let third = registration_like(&keys, &alias_for(2), 100);
+        assert_eq!(
+            index.add_registration(third.clone()),
+            HoldOutcome::Dropped(HoldDropReason::ByteBudget)
+        );
+        assert!(
+            !index.contains(&third.id),
+            "dropped without entering the skip-set"
+        );
+        assert_eq!(index.held_bytes(), 2 * size);
+        index.assert_accounting();
+
+        // The other three quarters are still there for dependents.
+        for i in 0..6u64 {
+            let event = registration_like(&keys, &alias_for(100 + i), 100);
+            assert_eq!(
+                index.add_state_root(format!("dependent-{i}"), event),
+                HoldOutcome::Held,
+                "dependent {i} must fit beside a full registration share"
+            );
+        }
+        assert_eq!(index.held_bytes(), budget);
+        index.assert_accounting();
+        let one_more = registration_like(&keys, &alias_for(200), 100);
+        assert_eq!(
+            index.add_state_root("dependent-over".into(), one_more),
+            HoldOutcome::Dropped(HoldDropReason::ByteBudget)
+        );
+        index.assert_accounting();
+
+        // Draining the registrations frees their share and nothing else.
+        let drain = index.drain_registrations(Instant::now(), 64);
+        assert_eq!(drain.events.len(), 2);
+        assert_eq!(index.held_bytes(), 6 * size);
+        index.assert_accounting();
+
+        // When dependents fill the whole budget a registration is refused
+        // by the total, with its own share empty.
+        let full = PrivateRejectedIndex::new(Duration::from_secs(120), Duration::ZERO, budget);
+        for i in 0..8u64 {
+            let event = registration_like(&keys, &alias_for(300 + i), 100);
+            assert_eq!(
+                full.add_wrap(keys.public_key().to_hex(), event),
+                HoldOutcome::Held
+            );
+        }
+        assert_eq!(
+            full.add_registration(registration_like(&keys, &alias_for(400), 100)),
+            HoldOutcome::Dropped(HoldDropReason::ByteBudget)
+        );
+        full.assert_accounting();
+    }
+
+    /// Replacing a held registration by a newer edition charges the
+    /// difference, not the sum; a replacement whose difference does not fit
+    /// is dropped and the held edition stays.
+    #[test]
+    fn replacing_a_held_registration_nets_its_bytes() {
+        use nostr_sdk::prelude::*;
+
+        let keys = Keys::generate();
+        let bucket = alias_for(9);
+        let small = registration_sized(&keys, &bucket, 100, 8);
+        let large = registration_sized(&keys, &bucket, 200, 2000);
+        let smaller_again = registration_sized(&keys, &bucket, 300, 40);
+        let (small_bytes, large_bytes, again_bytes) = (
+            event_bytes(&small),
+            event_bytes(&large),
+            event_bytes(&smaller_again),
+        );
+
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
+        assert_eq!(index.add_registration(small.clone()), HoldOutcome::Held);
+        assert_eq!(index.held_bytes(), small_bytes);
+        index.assert_accounting();
+
+        // Grows: the total is the new edition's size alone.
+        assert_eq!(index.add_registration(large.clone()), HoldOutcome::Held);
+        assert_eq!(index.held_len(), 1);
+        assert_eq!(index.held_bytes(), large_bytes);
+        assert!(index.contains(&small.id), "the displaced id is skipped");
+        index.assert_accounting();
+
+        // Shrinks: the difference is returned.
+        assert_eq!(
+            index.add_registration(smaller_again.clone()),
+            HoldOutcome::Held
+        );
+        assert_eq!(index.held_len(), 1);
+        assert_eq!(index.held_bytes(), again_bytes);
+        index.assert_accounting();
+
+        let drain = index.drain_registrations(Instant::now(), 64);
+        assert_eq!(drain.events.len(), 1);
+        assert_eq!(drain.events[0].id, smaller_again.id);
+        assert_eq!(index.held_bytes(), 0);
+        index.assert_accounting();
+
+        // A registration share that fits the small edition but not the
+        // large one: the larger, newer edition is dropped, stays fetchable,
+        // and the held edition is untouched.
+        let tight = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            REGISTRATION_BUDGET_DIVISOR * (small_bytes + 16),
+        );
+        assert!(large_bytes > small_bytes + 16);
+        assert_eq!(tight.add_registration(small.clone()), HoldOutcome::Held);
+        assert_eq!(
+            tight.add_registration(large.clone()),
+            HoldOutcome::Dropped(HoldDropReason::ByteBudget)
+        );
+        assert!(!tight.contains(&large.id));
+        assert!(tight.contains(&small.id));
+        assert_eq!(tight.held_bytes(), small_bytes);
+        tight.assert_accounting();
+
+        // A newer edition of the same size fits only when the held one's
+        // bytes are netted off before the share is checked.
+        let same_size = registration_sized(&keys, &bucket, 400, 8);
+        assert_eq!(event_bytes(&same_size), small_bytes);
+        assert_eq!(tight.add_registration(same_size.clone()), HoldOutcome::Held);
+        assert_eq!(tight.held_len(), 1);
+        assert_eq!(tight.held_bytes(), small_bytes);
+        tight.assert_accounting();
+
+        let drain = tight.drain_registrations(Instant::now(), 64);
+        assert_eq!(drain.events.len(), 1);
+        assert_eq!(drain.events[0].id, same_size.id);
+        tight.assert_accounting();
+    }
+
+    /// The skip-set refuses a new id-only entry when full, keeps the ones it
+    /// has, always has room for the id of a held event, and takes new ids
+    /// again once entries expire.
+    #[test]
+    fn skip_set_is_capped() {
+        use nostr_sdk::prelude::*;
+
+        let id_for = |n: u64| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            EventId::from_byte_array(bytes)
+        };
+
+        let index = PrivateRejectedIndex::new(
+            Duration::from_secs(120),
+            Duration::ZERO,
+            MIN_HOLD_BUDGET_BYTES,
+        );
+        for n in 0..MAX_ID_ONLY_IDS as u64 {
+            assert_eq!(index.add_id_only(id_for(n)), HoldOutcome::IdOnly);
+        }
+        index.assert_accounting();
+
+        // Full: a new id is refused and stays fetchable.
+        let refused = id_for(MAX_ID_ONLY_IDS as u64);
+        assert_eq!(
+            index.add_id_only(refused),
+            HoldOutcome::Dropped(HoldDropReason::SkipSetFull)
+        );
+        assert!(!index.contains(&refused));
+        // An id already there is refreshed, not refused, and none was evicted.
+        assert_eq!(index.add_id_only(id_for(0)), HoldOutcome::AlreadyTracked);
+        assert!(index.contains(&id_for(0)));
+        assert!(index.contains(&id_for(MAX_ID_ONLY_IDS as u64 - 1)));
+
+        // A dependency hold is never refused for lack of skip-set room.
+        let keys = Keys::generate();
+        let held = sized_event(&keys, 10);
+        assert_eq!(
+            index.add_state_root("alias".into(), held.clone()),
+            HoldOutcome::Held
+        );
+        assert!(index.contains(&held.id));
+        assert_eq!(index.all_event_ids().len(), MAX_ID_ONLY_IDS + 1);
+        index.assert_accounting();
+
+        // A held registration displaced while the skip-set is full loses
+        // its id rather than its replacement.
+        let bucket = alias_for(3);
+        let older = registration_like(&keys, &bucket, 100);
+        let newer = registration_like(&keys, &bucket, 200);
+        assert_eq!(index.add_registration(older.clone()), HoldOutcome::Held);
+        assert_eq!(index.add_registration(newer.clone()), HoldOutcome::Held);
+        assert!(index.contains(&newer.id));
+        assert!(!index.contains(&older.id));
+        index.assert_accounting();
+
+        // Expiry makes room (a zero TTL is past at once).
+        let expiring = PrivateRejectedIndex::new(Duration::ZERO, Duration::ZERO, 1 << 20);
+        for n in 0..MAX_ID_ONLY_IDS as u64 {
+            expiring.add_id_only(id_for(n));
+        }
+        assert_eq!(
+            expiring.add_id_only(refused),
+            HoldOutcome::Dropped(HoldDropReason::SkipSetFull)
+        );
+        assert_eq!(expiring.cleanup_expired(), 0, "ids are not held events");
+        assert_eq!(expiring.add_id_only(refused), HoldOutcome::IdOnly);
+        expiring.assert_accounting();
     }
 }

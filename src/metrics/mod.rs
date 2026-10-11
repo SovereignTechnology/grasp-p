@@ -472,6 +472,29 @@ lazy_static! {
             .expect("register private report events metric");
         metric
     };
+    static ref PRIVATE_HOLD_DROPPED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_hold_dropped_total",
+                "Rejected private-repo events the out-of-order hold did not keep, by \
+                 reason: count_cap (the hold has its maximum number of events), \
+                 byte_budget (the hold has its maximum bytes), not_holdable (the \
+                 rejection is not one a later registration can change, so only the \
+                 id is remembered for a synced event and nothing for a client's), \
+                 skip_set_full (the id could not be remembered either). count_cap \
+                 and byte_budget mean early events are not retried from memory: \
+                 synced ones are fetched again when their registration is accepted \
+                 or at the next full re-issue, a client's must be sent again; \
+                 not_holdable is routine.",
+            ),
+            &["reason"],
+        )
+        .expect("build private hold dropped metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private hold dropped metric");
+        metric
+    };
     static ref PURGATORY_GIT_FETCH_PASSES_TOTAL: Counter = {
         let metric = Counter::with_opts(Opts::new(
             "ngit_purgatory_git_fetch_passes_total",
@@ -932,6 +955,24 @@ pub fn record_private_denylist_purged(n: u64) {
 /// Record one observed kind-1984 (NIP-56 report) event (Phase-4b D3).
 pub fn record_private_report_event() {
     PRIVATE_REPORT_EVENTS_TOTAL.inc();
+}
+
+/// Record one rejected private-repo event the out-of-order hold did not
+/// keep. `reason` is one of a fixed set (`count_cap`, `byte_budget`,
+/// `not_holdable`, `skip_set_full`); never pass anything derived from the
+/// event, so the series count stays fixed.
+pub fn record_private_hold_dropped(reason: &str) {
+    PRIVATE_HOLD_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Current value of the hold-drop counter for `reason`.
+#[cfg(test)]
+pub(crate) fn private_hold_dropped(reason: &str) -> f64 {
+    PRIVATE_HOLD_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .get()
 }
 
 /// Central metrics collection for ngit-grasp relay.

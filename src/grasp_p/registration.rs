@@ -377,7 +377,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
     // Size cap on serialized JSON.
     if event.as_json().len() as u64 > cfg.max_event_bytes {
         return RegistrationOutcome {
-            result: reject_restricted("event exceeds private repo size limit"),
+            result: reject_restricted(super::admission::OVERSIZE_REJECT_MESSAGE),
             prune: Vec::new(),
         };
     }

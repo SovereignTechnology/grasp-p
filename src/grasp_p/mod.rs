@@ -533,6 +533,10 @@ impl PrivateService {
                 crate::sync::private_index::registration_retry_period(
                     config.private_registration_replace_refill_per_hour,
                 ),
+                // Sized from the event limit so the budget always has room
+                // for a useful number of the largest events admission lets
+                // through.
+                crate::sync::private_index::hold_budget_bytes(config.private_max_event_bytes),
             ),
             conflict_alert_dedup: parking_lot::Mutex::new(registration::ConflictAlertDedup::new(
                 registration::CONFLICT_ALERT_DEDUP_TTL,
@@ -564,10 +568,68 @@ impl PrivateService {
     }
 
     /// Phase 2: the out-of-order rejected-event hold (30641 by alias, 1059
-    /// by outer author). Used by the sync layer's pre-filter, rejection
-    /// registration, and 30640-Accept reprocess hook.
+    /// by outer author). Used by the sync layer's pre-filter and
+    /// 30640-Accept reprocess hook. Rejections enter it through
+    /// [`Self::note_rejected`] only.
     pub fn sync_rejected(&self) -> &crate::sync::private_index::PrivateRejectedIndex {
         &self.sync_rejected
+    }
+
+    /// The one place that decides what the node keeps of a rejected 30640,
+    /// 30641 or stored stream wrap. Other kinds are ignored.
+    ///
+    /// - A DEPENDENCY rejection (`admission::is_dependency_rejection`: one a
+    ///   later registration can turn into an acceptance) holds the full
+    ///   event, so the registration's arrival can retry it. This is what
+    ///   keeps out-of-order replication whole, on both paths.
+    /// - Any other rejection of a SYNCED event keeps the id only: the event
+    ///   will not become acceptable by waiting for a registration, but
+    ///   without the id the node would fetch and validate it again on every
+    ///   delivery until the peer stops offering it.
+    /// - Any other rejection of a CLIENT's event keeps nothing: the client
+    ///   has its answer and decides whether to send again.
+    ///
+    /// The client path reaches this from `admission::admit`, the sync path
+    /// from the sync manager's rejection hook, which also sees the events
+    /// rejected before admission (blacklist, deletion gate). Each rejection
+    /// is noted once.
+    pub fn note_rejected(&self, event: &Event, message: &str, synced: bool) {
+        use crate::sync::private_index::{HoldDropReason, HoldOutcome};
+
+        let Some(held_kind) =
+            admission::held_kind(event.kind.as_u16(), self.cfg.accept_legacy_wrap_kind)
+        else {
+            return;
+        };
+        let full_hold = if admission::is_dependency_rejection(held_kind, message) {
+            match held_kind {
+                admission::HeldKind::Registration => {
+                    Some(self.sync_rejected.add_registration(event.clone()))
+                }
+                // A dependency rejection implies a d tag (the shape check
+                // comes first), so the `None` here is only a guard.
+                admission::HeldKind::StateRoot => admission::d_tag(event)
+                    .map(|alias| self.sync_rejected.add_state_root(alias, event.clone())),
+                admission::HeldKind::StreamWrap => Some(
+                    self.sync_rejected
+                        .add_wrap(event.pubkey.to_hex(), event.clone()),
+                ),
+            }
+        } else {
+            None
+        };
+        let outcome = match full_hold {
+            Some(outcome) => outcome,
+            None if synced => match self.sync_rejected.add_id_only(event.id) {
+                // The id is kept; what was not kept is the event.
+                HoldOutcome::IdOnly => HoldOutcome::Dropped(HoldDropReason::NotHoldable),
+                other => other,
+            },
+            None => HoldOutcome::Dropped(HoldDropReason::NotHoldable),
+        };
+        if let HoldOutcome::Dropped(reason) = outcome {
+            crate::metrics::record_private_hold_dropped(reason.as_label());
+        }
     }
 
     /// Phase-4b A1: spend one token from the CLIENT write bucket of
@@ -827,7 +889,7 @@ impl PrivateService {
         }
         let event_json_len = event.as_json().len() as u64;
         if event_json_len > self.cfg.max_event_bytes {
-            let result = reject_restricted("event exceeds private repo size limit");
+            let result = reject_restricted(admission::OVERSIZE_REJECT_MESSAGE);
             record_event_metric(kind, &result);
             return Some(result);
         }
@@ -836,7 +898,7 @@ impl PrivateService {
         match self.live_registration(&alias).await {
             Ok(Some(_)) => {}
             Ok(None) => {
-                let result = reject_restricted("unregistered key");
+                let result = reject_restricted(admission::WRAP_UNREGISTERED_KEY);
                 record_event_metric(kind, &result);
                 return Some(result);
             }
@@ -905,7 +967,7 @@ impl PrivateService {
                     // succeeds) — callers must be able to tell them apart
                     // (verify round 3); notably the cord-git client treats
                     // any "unregistered" message as its widenable case.
-                    let result = reject_restricted("registration changed; retry");
+                    let result = reject_restricted(admission::WRAP_REGISTRATION_CHANGED);
                     record_event_metric(kind, &result);
                     return Some(result);
                 }
@@ -1903,5 +1965,165 @@ mod tests {
             vec![30640, 30641, 3359, 23359],
             "legacy accept off must drop 1059/21059 from the advert"
         );
+    }
+
+    async fn hold_harness(accept_legacy: bool) -> (tempfile::TempDir, Arc<PrivateService>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_accept_legacy_wrap_kind = accept_legacy;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        (dir, svc)
+    }
+
+    /// An event of `kind` with a `d` tag, enough for the hold to key it. A
+    /// counter in the content keeps the ids distinct.
+    fn hold_event(signer: &nostr_sdk::prelude::Keys, kind: u16, alias: &str) -> Event {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Tag};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        EventBuilder::new(Kind::Custom(kind), format!("{n:016x}"))
+            .tags(vec![Tag::custom("d", vec![alias.to_string()])])
+            .finalize(signer)
+            .expect("sign")
+    }
+
+    /// A rejection no registration can cure: the sync path keeps the id so
+    /// the event is not fetched in a loop, and holds nothing; the client
+    /// path keeps nothing at all.
+    #[tokio::test]
+    async fn non_dependency_rejection_is_id_only_when_synced() {
+        let (_dir, svc) = hold_harness(true).await;
+        let hold = svc.sync_rejected();
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let author = keys.public_key().to_hex();
+        let alias = "cd".repeat(16);
+        let counted_before = crate::metrics::private_hold_dropped("not_holdable");
+
+        for kind in [
+            KIND_STATE_ROOT,
+            KIND_STREAM_WRAP,
+            KIND_WRAP,
+            KIND_REGISTRATION,
+        ] {
+            let synced = hold_event(&keys, kind, &alias);
+            svc.note_rejected(&synced, "quota exceeded", true);
+            assert!(hold.contains(&synced.id), "kind {kind}: the id is skipped");
+
+            let from_client = hold_event(&keys, kind, &alias);
+            svc.note_rejected(&from_client, "quota exceeded", false);
+            assert!(
+                !hold.contains(&from_client.id),
+                "kind {kind}: a client's rejection leaves nothing behind"
+            );
+        }
+        // Four kinds on two paths. The registry is shared with tests running
+        // at the same time, so this is a lower bound.
+        assert!(
+            crate::metrics::private_hold_dropped("not_holdable") >= counted_before + 8.0,
+            "each non-dependency rejection is counted once"
+        );
+        assert!(hold.take_for_alias(&alias).is_empty());
+        assert!(hold
+            .take_for_authors(std::slice::from_ref(&author))
+            .is_empty());
+        assert!(hold
+            .drain_registrations(
+                std::time::Instant::now() + std::time::Duration::from_secs(7200),
+                64
+            )
+            .events
+            .is_empty());
+        assert_eq!(hold.held_len(), 0);
+        assert_eq!(hold.held_bytes(), 0);
+        hold.assert_accounting();
+    }
+
+    /// Every dependency rejection holds the whole event, whichever path it
+    /// came by, and the hold gives back exactly that event. This is the
+    /// replication guarantee: what arrives before its registration is
+    /// retried when the registration arrives.
+    #[tokio::test]
+    async fn dependency_rejections_are_held_on_both_paths() {
+        let (_dir, svc) = hold_harness(true).await;
+        let hold = svc.sync_rejected();
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let author = keys.public_key().to_hex();
+        let alias = "ef".repeat(16);
+
+        for synced in [true, false] {
+            for message in [
+                admission::STATE_ROOT_UNREGISTERED_ALIAS,
+                admission::STATE_ROOT_COORDINATE_MISMATCH,
+                admission::STATE_ROOT_AUTHOR_NOT_WRITE_KEY,
+                admission::STATE_ROOT_REGISTRATION_CHANGED,
+            ] {
+                let event = hold_event(&keys, KIND_STATE_ROOT, &alias);
+                svc.note_rejected(&event, message, synced);
+                assert!(hold.contains(&event.id), "{message:?} synced={synced}");
+                hold.assert_accounting();
+                let taken = hold.take_for_alias(&alias);
+                assert_eq!(taken.len(), 1, "{message:?} synced={synced}");
+                assert_eq!(taken[0].id, event.id);
+            }
+            for message in [
+                admission::WRAP_UNREGISTERED_KEY,
+                admission::WRAP_REGISTRATION_CHANGED,
+            ] {
+                for kind in [KIND_STREAM_WRAP, KIND_WRAP] {
+                    let event = hold_event(&keys, kind, &alias);
+                    svc.note_rejected(&event, message, synced);
+                    assert!(hold.contains(&event.id), "{message:?} synced={synced}");
+                    let taken = hold.take_for_authors(std::slice::from_ref(&author));
+                    assert_eq!(taken.len(), 1, "{message:?} kind={kind} synced={synced}");
+                    assert_eq!(taken[0].id, event.id);
+                }
+            }
+            let event = hold_event(&keys, KIND_REGISTRATION, &alias);
+            svc.note_rejected(&event, registration::REPLACE_CADENCE_REJECT_MESSAGE, synced);
+            assert!(hold.contains(&event.id), "cadence synced={synced}");
+            hold.assert_accounting();
+            let drained = hold.drain_registrations(
+                std::time::Instant::now() + std::time::Duration::from_secs(7200),
+                64,
+            );
+            assert_eq!(drained.events.len(), 1, "cadence synced={synced}");
+            assert_eq!(drained.events[0].id, event.id);
+        }
+        assert_eq!(hold.held_bytes(), 0);
+        hold.assert_accounting();
+    }
+
+    /// Kinds the hold does not know are left alone on both paths: ephemeral
+    /// wraps always, and the legacy wrap kind once the node has retired it.
+    #[tokio::test]
+    async fn rejections_of_other_kinds_are_not_noted() {
+        let (_dir, svc) = hold_harness(false).await;
+        let hold = svc.sync_rejected();
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let alias = "0a".repeat(16);
+        for kind in [
+            KIND_EPHEMERAL_STREAM_WRAP,
+            KIND_EPHEMERAL_WRAP,
+            KIND_WRAP,
+            1,
+        ] {
+            for synced in [true, false] {
+                let event = hold_event(&keys, kind, &alias);
+                svc.note_rejected(&event, admission::WRAP_UNREGISTERED_KEY, synced);
+                assert!(!hold.contains(&event.id), "kind {kind} synced={synced}");
+            }
+        }
+        assert_eq!(hold.held_len(), 0);
     }
 }

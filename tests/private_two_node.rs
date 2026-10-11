@@ -212,16 +212,18 @@ fn state_root_event(
 /// is invisible to a single-node test.
 ///
 /// Scope note: exit2 pins the CLIENT-submission hold
-/// (`nostr/builder.rs`, the wrap arm's `None` branch). Its twin in the sync
-/// ingest path (`sync/mod.rs`, the `accepts_stream_wrap_kind` arm of the
-/// rejection hold) is UNCOVERED and stays so: B only asks a peer for wraps
+/// (`grasp_p/admission.rs`, the wrap arm's `None` branch). Its twin in the
+/// sync ingest path (`sync/grasp_p_sync.rs`, `grasp_p_after_rejected`) is
+/// UNCOVERED by this suite and stays so: B only asks a peer for wraps
 /// by an author it has already accepted a 30640 for, so a synced wrap
 /// preceding its own registration is a race, not something the harness can
 /// order — deleting that arm leaves this suite green. What IS pinned is the
 /// contract it depends on: `PrivateRejectedIndex` holds both wire kinds
 /// under one author bucket and releases them together
-/// (`sync::private_index::tests::test_wrap_hold_is_kind_agnostic_per_author`).
-/// The dispatch arm itself is verified by inspection only.
+/// (`sync::private_index::tests::test_wrap_hold_is_kind_agnostic_per_author`),
+/// and that both paths reach the hold through one decision that holds
+/// every dependency rejection
+/// (`grasp_p::tests::dependency_rejections_are_held_on_both_paths`).
 const STREAM_WRAP_KINDS: [u16; 2] = [1059, 3359];
 
 /// Opaque wrap-shaped event of the given wire `kind`, signed by `signer`.
@@ -1687,11 +1689,12 @@ fn registration_event_multi(
 /// B's registration set never changes after boot, so neither the inline
 /// take_for_alias reprocess (which fires on every 30640 accept) nor the
 /// index-change re-issue can fire. B quota-rejects the 30641 on its first
-/// (live) delivery — a TRANSIENT rejection under a fixed registration —
-/// which holds it and poisons the skip-set; A's one live push is spent, so
-/// only a since=None historic redelivery can bring it back. Freeing the
-/// quota (blob DELETE, not a registration change) plus the skip-set TTL
-/// lapse leaves the re-issue timer as the sole path.
+/// (live) delivery — a TRANSIENT rejection under a fixed registration, and
+/// not one a registration could cure, so the event is not held: only its id
+/// goes into the skip-set. A's one live push is spent, so only a since=None
+/// historic redelivery can bring it back. Freeing the quota (blob DELETE,
+/// not a registration change) plus the skip-set TTL lapse leaves the
+/// re-issue timer as the sole path.
 ///
 /// Run on both historic transports: REQ+EOSE (negentropy disabled) and
 /// negentropy (FS-4: the rejected-id exclusion now filters TTL-expired
@@ -1807,7 +1810,8 @@ async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: b
     assert_eq!(m_sha, manifest_sha);
 
     // The 30641 is accepted on A (default quotas) and live-delivered to B,
-    // which quota-rejects it: held by alias + id into the skip-set.
+    // which quota-rejects it: its id goes into the skip-set (a quota
+    // rejection is not held, no registration can cure it).
     let (accepted, message) = publish_with_result(a.url(), &edition).await;
     assert!(accepted, "exit10: 30641 must be accepted on A: {message:?}");
     assert!(
@@ -1832,7 +1836,7 @@ async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: b
     // Free the quota WITHOUT any registration change: writer3 deletes the
     // filler from B (unreferences the claim; the instant GC pass releases
     // the stored charge). Still no healer: the skip-set blocks redelivery
-    // for the TTL, and no 30640 ever lands to drain the hold.
+    // for the TTL, and no 30640 ever lands.
     let delete_auth =
         blossom_delete_auth_event(&writer3, &filler_sha, &tenant.public_key(), &alias2);
     let (status, reason) = delete_blob(&b, &filler_sha, &delete_auth).await;
