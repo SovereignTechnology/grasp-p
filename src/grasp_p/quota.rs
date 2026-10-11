@@ -171,6 +171,7 @@ mod tests {
             charged_tenant: tenant.map(str::to_string),
             charged_alias: alias.map(str::to_string),
             spec_charge: None,
+            stored_at: None,
         }
     }
 

@@ -32,9 +32,32 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
+    /// Open the store, creating it if needed, and clear what earlier runs
+    /// left in `<root>/tmp`.
+    ///
+    /// The sweep is safe only because nothing can be uploading yet: the
+    /// service opens the store while it is being constructed, before the
+    /// mirror task is spawned and before the HTTP listener serves a request,
+    /// and one process owns a data directory. Opening a second handle on a
+    /// store that is in use would delete uploads in flight. A `tmp` that is
+    /// a link to some other directory is left unswept.
     pub fn open(root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(root.join("tmp"))
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp)
             .with_context(|| format!("failed to create blob store at {}", root.display()))?;
+        // The entries are judged without following links, and so is the
+        // directory: a tmp that is a link leads somewhere this store does
+        // not own.
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                sweep_tmp(&tmp);
+            }
+            Ok(_) => tracing::warn!(
+                "{} is not a plain directory; old temp files were not cleared",
+                tmp.display()
+            ),
+            Err(e) => tracing::warn!("could not inspect {}: {e}", tmp.display()),
+        }
         Ok(Self {
             root: root.to_path_buf(),
         })
@@ -71,6 +94,65 @@ impl BlobStore {
     fn new_tmp_path(&self) -> PathBuf {
         self.root.join("tmp").join(uuid::Uuid::new_v4().to_string())
     }
+}
+
+/// Remove the temp files of uploads that an earlier run never finished (a
+/// crash or a kill leaves them behind, and nothing else ever deletes them).
+///
+/// Only the directory's own entries are judged, each by `symlink_metadata`:
+/// a regular file or a symlink is unlinked, so a link is removed and never
+/// followed, and a directory is left alone and never entered. A failure is
+/// logged and the sweep moves on: leftover temp files must not stop a node
+/// from starting. Returns the number of entries and bytes removed.
+fn sweep_tmp(tmp: &Path) -> (u64, u64) {
+    let entries = match std::fs::read_dir(tmp) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                "could not read {} to clear old temp files: {e}",
+                tmp.display()
+            );
+            return (0, 0);
+        }
+    };
+    let mut removed = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                tracing::warn!("could not read an entry of {}: {e}", tmp.display());
+                continue;
+            }
+        };
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!("could not inspect {}: {e}", path.display());
+                continue;
+            }
+        };
+        let kind = meta.file_type();
+        if !(kind.is_file() || kind.is_symlink()) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                removed += 1;
+                bytes = bytes.saturating_add(meta.len());
+            }
+            Err(e) => tracing::warn!("could not remove old temp file {}: {e}", path.display()),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            entries = removed,
+            bytes,
+            "removed temp files left by earlier runs from {}",
+            tmp.display()
+        );
+    }
+    (removed, bytes)
 }
 
 /// Best-effort removal of a blob file that `finish()` placed but whose claim
@@ -227,6 +309,7 @@ impl UploadSink {
         let cfg = self.cfg.clone();
         let tmp_path = self.tmp_path.clone();
         let denylist = self.denylist.clone();
+        let now = nostr::prelude::Timestamp::now().as_secs();
 
         // Existence check, rename, and claim/charge ALL inside the one meta
         // write txn. GC unlinks blob files under the same write lock, so the
@@ -243,7 +326,7 @@ impl UploadSink {
         // error path below unlinks the file we just placed (`renamed` flag) so
         // no unclaimed orphan is left on disk.
         let renamed = std::cell::Cell::new(false);
-        let charged = self.meta.with_write(|meta, txn| {
+        let outcome = self.meta.with_write(|meta, txn| {
             // R2-C (verify round 2): FIRST fallible statement — re-verify
             // the uploader's registration inside the charge txn, before the
             // file-existence check (so the rename stays the last fallible
@@ -279,6 +362,7 @@ impl UploadSink {
                 charged_tenant: None,
                 charged_alias: None,
                 spec_charge: None,
+                stored_at: None,
             });
 
             // Issue !12: the claim is transitioning to stored — the upload
@@ -311,6 +395,10 @@ impl UploadSink {
                 meta.put_alias_claim(txn, &alias, &sha)?;
             }
             claim.unreferenced_since = None;
+            // Kept from the first time the bytes were stored here: a repeat
+            // upload, or one that restores a lost file, reports that time
+            // and does not move it.
+            let stored_at = *claim.stored_at.get_or_insert(now);
             meta.put_blob_claim(txn, &sha, &claim)?;
             // Last fallible step: place the bytes. Skip when the file is
             // already there (idempotent re-upload / adopt); when the claim
@@ -321,11 +409,11 @@ impl UploadSink {
                     .map_err(|e| anyhow::anyhow!("rename failed: {e}"))?;
                 renamed.set(true);
             }
-            Ok(charged)
+            Ok((charged, stored_at))
         });
 
-        match charged {
-            Ok(charged) => {
+        match outcome {
+            Ok((charged, stored_at)) => {
                 self.finished = true;
                 if !renamed.get() {
                     // Blob was already present: discard our tmp copy.
@@ -338,7 +426,7 @@ impl UploadSink {
                     url: format!("https://{}/{}", self.cfg.service_address, sha),
                     sha256: sha,
                     size,
-                    uploaded: nostr::prelude::Timestamp::now().as_secs(),
+                    uploaded: stored_at,
                 })
             }
             Err(e) => {
@@ -709,6 +797,7 @@ mod tests {
                             alias: "alias".to_string(),
                             bytes: 500,
                         }),
+                        stored_at: None,
                     },
                 )
             })
@@ -766,6 +855,7 @@ mod tests {
                             alias: "alias".to_string(),
                             bytes: 500,
                         }),
+                        stored_at: None,
                     },
                 )
             })
@@ -814,6 +904,7 @@ mod tests {
                             alias: "alias".to_string(),
                             bytes: 128,
                         }),
+                        stored_at: None,
                     },
                 )
             })
@@ -862,6 +953,7 @@ mod tests {
                         charged_tenant: None,
                         charged_alias: None,
                         spec_charge: None,
+                        stored_at: None,
                     },
                 )
             })
@@ -1003,5 +1095,182 @@ mod tests {
         h.upload(&ok_data)
             .await
             .expect("non-denylisted upload must succeed");
+    }
+
+    /// The descriptor's `uploaded` is the time this node first stored the
+    /// bytes. It is written with the claim, and a repeat upload reports it
+    /// unchanged instead of the time of the repeat.
+    #[tokio::test]
+    async fn stored_at_is_set_once_and_survives_reupload() {
+        let h = Harness::new(1 << 20);
+        let data = vec![51u8; 200];
+        let sha = sha256::Hash::hash(&data).to_string();
+        let stored_at = |h: &Harness| {
+            let txn = h.meta.read_txn().unwrap();
+            h.meta
+                .get_blob_claim(&txn, &sha)
+                .unwrap()
+                .unwrap()
+                .stored_at
+        };
+
+        let before = nostr::prelude::Timestamp::now().as_secs();
+        let first = h.upload(&data).await.unwrap();
+        assert!(
+            first.uploaded >= before,
+            "the first upload must report the time it was stored"
+        );
+        assert_eq!(stored_at(&h), Some(first.uploaded));
+
+        // Move the recorded time into the past, so that a repeat upload
+        // which took the current time instead would be seen to differ.
+        h.meta
+            .with_write(|m, txn| {
+                let mut claim = m.get_blob_claim(txn, &sha)?.unwrap();
+                claim.stored_at = Some(1_000);
+                m.put_blob_claim(txn, &sha, &claim)
+            })
+            .unwrap();
+
+        let again = h.upload(&data).await.unwrap();
+        assert_eq!(
+            again.uploaded, 1_000,
+            "a repeat upload reports the kept time"
+        );
+        assert_eq!(stored_at(&h), Some(1_000), "and does not move it");
+
+        // The same holds when the repeat has to put the bytes back.
+        std::fs::remove_file(h.store.path_for(&sha)).unwrap();
+        let restored = h.upload(&data).await.unwrap();
+        assert_eq!(restored.uploaded, 1_000);
+        assert!(h.store.exists(&sha));
+    }
+
+    /// A blob that was only declared has no storing time; the upload that
+    /// stores it sets one.
+    #[tokio::test]
+    async fn declared_claim_gets_its_time_when_the_bytes_arrive() {
+        let h = Harness::new(1 << 20);
+        let data = vec![52u8; 64];
+        let sha = sha256::Hash::hash(&data).to_string();
+        h.meta
+            .with_write(|m, txn| {
+                m.put_blob_claim(
+                    txn,
+                    &sha,
+                    &BlobClaim {
+                        size: 64,
+                        aliases: vec!["alias".to_string()],
+                        unreferenced_since: None,
+                        stored: false,
+                        charged_tenant: None,
+                        charged_alias: None,
+                        spec_charge: None,
+                        stored_at: None,
+                    },
+                )?;
+                m.put_alias_claim(txn, "alias", &sha)
+            })
+            .unwrap();
+
+        let descriptor = h.upload(&data).await.unwrap();
+        assert!(descriptor.uploaded > 0);
+        let txn = h.meta.read_txn().unwrap();
+        let claim = h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
+        assert!(claim.stored);
+        assert_eq!(claim.stored_at, Some(descriptor.uploaded));
+    }
+
+    /// Opening the store removes the temp files earlier runs left behind and
+    /// nothing else: stored blobs stay.
+    #[test]
+    fn open_sweeps_stale_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        let store = BlobStore::open(&root).unwrap();
+
+        let sha = "aabb".repeat(16);
+        let stored = store.path_for(&sha);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, b"stored blob").unwrap();
+        let tmp = root.join("tmp");
+        std::fs::write(tmp.join("left-by-a-crash"), vec![0_u8; 300]).unwrap();
+        std::fs::write(tmp.join("another"), vec![0_u8; 200]).unwrap();
+
+        assert_eq!(sweep_tmp(&tmp), (2, 500), "two entries, 500 bytes");
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+
+        // The same through `open`, which is what a restart runs.
+        std::fs::write(tmp.join("left-again"), b"x").unwrap();
+        let reopened = BlobStore::open(&root).unwrap();
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+        assert!(
+            reopened.exists(&sha),
+            "a stored blob must survive the sweep"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), b"stored blob");
+    }
+
+    /// A `tmp` that is itself a link is not swept: what it points at is not
+    /// this store's to clear.
+    #[cfg(unix)]
+    #[test]
+    fn open_does_not_sweep_through_a_linked_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("not-a-temp-file"), b"keep me").unwrap();
+        let root = dir.path().join("blobs");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("tmp")).unwrap();
+
+        BlobStore::open(&root).unwrap();
+
+        assert_eq!(
+            std::fs::read(elsewhere.join("not-a-temp-file")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    /// The sweep unlinks a symlink without touching what it points at, and
+    /// leaves a directory and everything under it alone.
+    #[cfg(unix)]
+    #[test]
+    fn open_sweep_does_not_follow_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        BlobStore::open(&root).unwrap();
+        let tmp = root.join("tmp");
+
+        let outside_file = dir.path().join("outside-file");
+        std::fs::write(&outside_file, b"keep me").unwrap();
+        let outside_dir = dir.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("inner"), b"keep me too").unwrap();
+        std::os::unix::fs::symlink(&outside_file, tmp.join("link-to-file")).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, tmp.join("link-to-dir")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), tmp.join("dangling")).unwrap();
+        let subdir = tmp.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("nested"), b"not ours to judge").unwrap();
+
+        BlobStore::open(&root).unwrap();
+
+        for link in ["link-to-file", "link-to-dir", "dangling"] {
+            assert!(
+                std::fs::symlink_metadata(tmp.join(link)).is_err(),
+                "{link} must be unlinked"
+            );
+        }
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"keep me");
+        assert_eq!(
+            std::fs::read(outside_dir.join("inner")).unwrap(),
+            b"keep me too"
+        );
+        assert!(subdir.is_dir(), "a directory is left alone");
+        assert_eq!(
+            std::fs::read(subdir.join("nested")).unwrap(),
+            b"not ours to judge"
+        );
     }
 }

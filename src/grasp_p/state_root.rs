@@ -322,6 +322,7 @@ pub(crate) fn apply_state_root_txn(
                 charged_tenant: None,
                 charged_alias: None,
                 spec_charge: None,
+                stored_at: None,
             });
         if spec_shas.remove(&blob.sha256) && !claim.stored && claim.spec_charge.is_none() {
             claim.spec_charge = Some(SpecCharge {

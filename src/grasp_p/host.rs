@@ -65,9 +65,14 @@ fn split_authority(domain: &str) -> (String, Option<u16>) {
     }
 }
 
-/// Case-insensitive, trailing-dot-normalized host comparison form.
+/// Case-insensitive, trailing-dot-normalized host comparison form. The
+/// brackets of an IPv6 literal go too: a parsed URL keeps them and
+/// `split_authority` drops them, and the two sides have to meet.
 fn normalize_host(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -153,6 +158,13 @@ mod tests {
         assert!(url_denotes_domain("wss://example.com", "example.com:443"));
         assert!(!url_denotes_domain("wss://example.com", "example.com:8443"));
         assert!(url_denotes_domain("ws://example.com:80", "example.com:80"));
+    }
+
+    #[test]
+    fn ipv6_literal_domain_is_matched_without_its_brackets() {
+        assert!(url_denotes_domain("https://[::1]:7334", "[::1]:7334"));
+        assert!(!url_denotes_domain("https://[::2]:7334", "[::1]:7334"));
+        assert!(!url_denotes_domain("https://[::1]:7335", "[::1]:7334"));
     }
 
     #[test]

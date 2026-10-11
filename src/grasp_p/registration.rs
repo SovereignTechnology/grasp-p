@@ -1104,6 +1104,7 @@ mod tests {
                             alias: alias.clone(),
                             bytes: 4096,
                         }),
+                        stored_at: None,
                     },
                 )?;
                 m.put_alias_claim(txn, &alias, &sha_spec)?;
@@ -1118,6 +1119,7 @@ mod tests {
                         charged_tenant: Some(loser_hex.clone()),
                         charged_alias: Some(alias.clone()),
                         spec_charge: None,
+                        stored_at: None,
                     },
                 )?;
                 m.put_alias_claim(txn, &alias, &sha_stored)?;
@@ -1136,6 +1138,7 @@ mod tests {
                             alias: alias.clone(),
                             bytes: 100,
                         }),
+                        stored_at: None,
                     },
                 )?;
                 m.put_alias_claim(txn, &alias, &sha_shared)?;

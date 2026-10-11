@@ -6,6 +6,21 @@
 //! use real HTTP status codes (400/401/403/404/411/413/451/507) with the
 //! reason mirrored in an `X-Reason` header. Upload, delete and list need a
 //! kind-24242 authorization; `GET`/`HEAD /<sha256>` are anonymous by design.
+//!
+//! What every response of these routes says to a browser or a cache:
+//!
+//! - `X-Content-Type-Options: nosniff` on all of them, the `OPTIONS`
+//!   preflight that `mod.rs` answers included. The bytes are
+//!   whatever a client uploaded, and a browser must not guess a type.
+//! - A served blob adds a `Content-Security-Policy` that makes the bytes
+//!   inert if a browser is pointed at them, and `Cache-Control: no-cache`
+//!   with a strong `ETag` of the sha256. A cache may keep the bytes but has
+//!   to ask this node before each reuse, so a blob that was taken down
+//!   stops being served from caches too. The question is answered `304`
+//!   only after the denylist and the existence checks ([`decide_blob_read`]).
+//! - Errors and `404`s say `Cache-Control: no-store`: `404` and `451` are
+//!   cacheable by default, and a cached one would outlive its cause.
+//! - `WWW-Authenticate: Nostr` on a `401` and on no other status.
 
 use std::sync::Arc;
 
@@ -23,6 +38,9 @@ use crate::grasp_p::{BlobError, BlossomOp, PrivateService};
 use futures_util::stream;
 use http_body_util::StreamBody;
 
+/// What a client is told when its upload body could not be read.
+const BODY_ERROR_REASON: &str = "request body error";
+
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 const STREAM_CHANNEL_DEPTH: usize = 8;
 
@@ -35,8 +53,21 @@ type HttpBody = GitResponseBody;
 const CORS_ALLOW_METHODS: &str = "GET, POST, PUT, DELETE, HEAD";
 const CORS_ALLOW_HEADERS: &str =
     "Content-Type, Authorization, Git-Protocol, X-SHA-256, X-Content-Length";
+/// Upstream's exposed header, plus the two a browser client needs to read to
+/// tell why a blob request failed and when to try again.
+const CORS_EXPOSE_HEADERS: &str = "WWW-Authenticate, X-Reason, Retry-After";
 
-/// Add the GRASP-P CORS headers to a response builder.
+/// Makes a browser treat a blob it is pointed at as inert: nothing in it
+/// may load or run, and it gets an origin of its own.
+const BLOB_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; sandbox";
+/// A cache may keep a blob, but must ask this node before each reuse.
+const BLOB_CACHE_CONTROL: &str = "no-cache";
+/// For responses no cache may keep: errors, `404`s and per-key listings.
+const NO_STORE: &str = "no-store";
+
+/// Add the GRASP-P CORS headers to a response builder, and the `nosniff`
+/// every response of these routes carries, the preflight included (the
+/// `OPTIONS` answer in `mod.rs` is built from this function alone).
 pub(super) fn add_cors_headers(
     builder: hyper::http::response::Builder,
 ) -> hyper::http::response::Builder {
@@ -44,9 +75,11 @@ pub(super) fn add_cors_headers(
         .header("Access-Control-Allow-Origin", super::CORS_ALLOW_ORIGIN)
         .header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS)
         .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
-        .header("Access-Control-Expose-Headers", super::CORS_EXPOSE_HEADERS)
+        .header("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)
+        .header("X-Content-Type-Options", "nosniff")
 }
 
+/// The start of every response of the blob routes.
 fn base_builder() -> hyper::http::response::Builder {
     // These responses are only reachable when private repos are enabled, so
     // they carry the extended blob-method CORS set.
@@ -101,22 +134,147 @@ pub(super) async fn serve(
         BlobRoute::Blob(sha) if method == Method::DELETE => {
             handle_blob_delete(&service, &req, sha).await
         }
-        BlobRoute::Blob(sha) => handle_blob_get(&service, sha, method == Method::HEAD).await,
+        BlobRoute::Blob(sha) => {
+            let conditional = if_none_match(&req);
+            handle_blob_get(
+                &service,
+                sha,
+                method == Method::HEAD,
+                conditional.as_deref(),
+            )
+            .await
+        }
         BlobRoute::List(target) => handle_blob_list(&service, &req, &target).await,
     }
 }
 
 fn error_response(err: &BlobError) -> Response<HttpBody> {
+    if let BlobError::Internal(detail) = err {
+        // The one place the detail of an internal failure is recorded: the
+        // client is told only that there was one.
+        tracing::error!("blob route internal error: {detail}");
+    }
     let builder = base_builder()
         .status(err.status())
-        .header("X-Reason", err.reason().replace(['\r', '\n'], " "));
+        .header("cache-control", NO_STORE)
+        .header(
+            "X-Reason",
+            // A control character is not allowed in a header value.
+            err.public_reason().replace(char::is_control, " "),
+        );
     let builder = match err {
+        BlobError::Unauthorized(_) => builder.header("WWW-Authenticate", "Nostr"),
         BlobError::RateLimited { retry_after_secs } => {
             builder.header("Retry-After", retry_after_secs.to_string())
         }
         _ => builder,
     };
     builder.body(empty_body()).unwrap()
+}
+
+/// The `404` of a blob this node does not hold.
+fn not_found() -> Response<HttpBody> {
+    base_builder()
+        .status(404)
+        .header("cache-control", NO_STORE)
+        .body(empty_body())
+        .unwrap()
+}
+
+/// The validators a served blob and the `304` that confirms it share: a
+/// `304` has to repeat the `ETag` and `Cache-Control` of the `200`.
+fn blob_validators(
+    builder: hyper::http::response::Builder,
+    sha: &str,
+) -> hyper::http::response::Builder {
+    builder
+        .header("cache-control", BLOB_CACHE_CONTROL)
+        .header("etag", format!("\"{sha}\""))
+}
+
+/// The head of a `200` for a stored blob, shared by `GET` and `HEAD`.
+fn blob_ok_builder(sha: &str, size: u64) -> hyper::http::response::Builder {
+    blob_validators(base_builder().status(200), sha)
+        .header("content-type", "application/octet-stream")
+        .header("content-security-policy", BLOB_CONTENT_SECURITY_POLICY)
+        .header("content-length", size)
+}
+
+/// The `304` for a conditional request whose blob is still served.
+fn blob_not_modified(sha: &str) -> Response<HttpBody> {
+    blob_validators(base_builder().status(304), sha)
+        .body(empty_body())
+        .unwrap()
+}
+
+/// Does an `If-None-Match` header value match the blob named `sha`?
+///
+/// The value is `*` or a comma-separated list of entity tags. The
+/// comparison is the weak one RFC 9110 prescribes for this header, so a
+/// tag marked weak (`W/"..."`) matches as well. The only tag this node
+/// ever gives a blob is its sha256 in quotes.
+fn etag_matches(header: &str, sha: &str) -> bool {
+    header.split(',').map(str::trim).any(|candidate| {
+        if candidate == "*" {
+            return true;
+        }
+        let tag = candidate.strip_prefix("W/").unwrap_or(candidate);
+        tag.strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .is_some_and(|opaque| opaque == sha)
+    })
+}
+
+/// The request's `If-None-Match` value. A list may be split over several
+/// header lines, which mean the same as one line joined by commas.
+fn if_none_match(req: &Request<Incoming>) -> Option<String> {
+    let values: Vec<&str> = req
+        .headers()
+        .get_all("if-none-match")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// How a `GET` or `HEAD` of a blob is answered.
+#[derive(Debug, PartialEq, Eq)]
+enum BlobRead {
+    /// `451`: the hash is on the denylist.
+    Denylisted,
+    /// `404`: this node does not hold the bytes.
+    Missing,
+    /// `304`: the caller's copy is the blob this node would serve.
+    NotModified,
+    /// `200`, with the size of the stored file.
+    Serve { size: u64 },
+}
+
+/// Decide the answer from the three facts, in the one order that is safe:
+/// denylist, then existence, then the conditional request.
+///
+/// The order is the point. A `304` tells a cache to go on serving its
+/// copy, so it must never be given for a blob that has been taken down or
+/// removed: a cache that revalidates such a blob has to get the `451` or
+/// the `404`. Keeping the decision in one function, apart from the code
+/// that gathers the facts and builds the responses, is what stops a later
+/// edit from moving the conditional answer ahead of the other two.
+fn decide_blob_read(
+    denylisted: bool,
+    stored_size: Option<u64>,
+    if_none_match: Option<&str>,
+    sha: &str,
+) -> BlobRead {
+    if denylisted {
+        return BlobRead::Denylisted;
+    }
+    let Some(size) = stored_size else {
+        return BlobRead::Missing;
+    };
+    if if_none_match.is_some_and(|header| etag_matches(header, sha)) {
+        return BlobRead::NotModified;
+    }
+    BlobRead::Serve { size }
 }
 
 fn json_response(status: u16, json: String) -> Response<HttpBody> {
@@ -266,7 +424,9 @@ pub(crate) async fn handle_upload_put(
                 }
             }
             Some(Err(e)) => {
-                return error_response(&BlobError::BadRequest(format!("request body error: {e}")));
+                // The transport's own error text stays in the log.
+                tracing::debug!("blob upload body could not be read: {e}");
+                return error_response(&BlobError::BadRequest(BODY_ERROR_REASON.into()));
             }
             None => break,
         }
@@ -282,27 +442,38 @@ pub(crate) async fn handle_upload_put(
 }
 
 /// `GET|HEAD /<sha256>` — public unauthenticated blob fetch (v1 by design).
+///
+/// `if_none_match` is the request's `If-None-Match` value, if it sent one.
 pub(crate) async fn handle_blob_get(
     private: &Arc<PrivateService>,
     sha: String,
     is_head: bool,
+    if_none_match: Option<&str>,
 ) -> Response<HttpBody> {
-    if private.is_denylisted(&sha) {
-        return error_response(&BlobError::Denylisted);
-    }
-    let Some(path) = private.blob_path(&sha) else {
-        return base_builder().status(404).body(empty_body()).unwrap();
+    // Gather the facts, then let `decide_blob_read` order them.
+    // A denylisted hash is not looked up on disk at all.
+    let denylisted = private.is_denylisted(&sha);
+    let path = if denylisted {
+        None
+    } else {
+        private.blob_path(&sha)
     };
-    let size = match tokio::fs::metadata(&path).await {
-        Ok(meta) => meta.len(),
-        Err(_) => return base_builder().status(404).body(empty_body()).unwrap(),
+    let stored_size = match &path {
+        Some(path) => tokio::fs::metadata(path).await.ok().map(|meta| meta.len()),
+        None => None,
+    };
+    let (path, size) = match decide_blob_read(denylisted, stored_size, if_none_match, &sha) {
+        BlobRead::Denylisted => return error_response(&BlobError::Denylisted),
+        BlobRead::Missing => return not_found(),
+        BlobRead::NotModified => return blob_not_modified(&sha),
+        BlobRead::Serve { size } => match path {
+            Some(path) => (path, size),
+            // A size is only ever read from a path that was found.
+            None => return not_found(),
+        },
     };
 
-    let builder = base_builder()
-        .status(200)
-        .header("content-type", "application/octet-stream")
-        .header("cache-control", "public, max-age=31536000, immutable")
-        .header("content-length", size);
+    let builder = blob_ok_builder(&sha, size);
 
     if is_head {
         return builder.body(empty_body()).unwrap();
@@ -382,7 +553,11 @@ pub(crate) async fn handle_blob_list(
             "list target must be a pubkey (hex or npub)".into(),
         ));
     };
-    if let Err(e) = authorize_list(header_str(req, "authorization"), &pubkey.to_hex()) {
+    if let Err(e) = authorize_list(
+        header_str(req, "authorization"),
+        &pubkey.to_hex(),
+        &private.cfg.domain,
+    ) {
         return error_response(&e);
     }
     let descriptors = private.blob_list(&pubkey).await;
@@ -391,7 +566,7 @@ pub(crate) async fn handle_blob_list(
         Ok(json) => base_builder()
             .status(200)
             .header("content-type", "application/json")
-            .header("cache-control", "no-store")
+            .header("cache-control", NO_STORE)
             .body(full_body(json))
             .unwrap(),
         Err(e) => error_response(&BlobError::Internal(format!("serialize failed: {e}"))),
@@ -402,4 +577,224 @@ pub(crate) async fn handle_blob_list(
 /// generic 404, so `matches_upload_route` only claims what we serve.
 pub(crate) fn matches_upload_route(path: &str, method: &Method) -> bool {
     path == "/upload" && (*method == Method::PUT || *method == Method::HEAD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const DETAIL: &str = "mdb_put: MDB_MAP_FULL at /var/lib/node/meta";
+
+    fn header<'a>(response: &'a Response<HttpBody>, name: &str) -> Option<&'a str> {
+        response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// One error of every kind the routes can answer with.
+    fn every_error() -> Vec<BlobError> {
+        vec![
+            BlobError::BadRequest("bad".into()),
+            BlobError::Unauthorized("who".into()),
+            BlobError::Forbidden("no".into()),
+            BlobError::LengthRequired,
+            BlobError::TooLarge,
+            BlobError::Denylisted,
+            BlobError::QuotaExceeded,
+            BlobError::RateLimited {
+                retry_after_secs: 7,
+            },
+            BlobError::Internal(DETAIL.into()),
+        ]
+    }
+
+    #[test]
+    fn error_response_challenges_only_on_401() {
+        let mut statuses = Vec::new();
+        for err in every_error() {
+            let response = error_response(&err);
+            let status = response.status().as_u16();
+            statuses.push(status);
+            if status == 401 {
+                assert_eq!(header(&response, "www-authenticate"), Some("Nostr"));
+            } else {
+                assert_eq!(
+                    header(&response, "www-authenticate"),
+                    None,
+                    "a {status} must not carry a challenge"
+                );
+            }
+        }
+        assert_eq!(statuses, [400, 401, 403, 411, 413, 451, 507, 429, 500]);
+        assert_eq!(header(&not_found(), "www-authenticate"), None);
+        assert_eq!(header(&blob_not_modified(SHA), "www-authenticate"), None);
+    }
+
+    #[test]
+    fn internal_error_reason_is_generic() {
+        let response = error_response(&BlobError::Internal(DETAIL.into()));
+        assert_eq!(response.status().as_u16(), 500);
+        assert_eq!(header(&response, "x-reason"), Some("internal error"));
+        for (name, value) in response.headers() {
+            let value = value.to_str().unwrap_or_default();
+            assert!(
+                !value.contains("MDB") && !value.contains("/var/lib"),
+                "{name} leaks the detail: {value}"
+            );
+        }
+        // The detail is still there for code inside the node.
+        assert_eq!(BlobError::Internal(DETAIL.into()).reason(), DETAIL);
+        // Every other error tells the client what it tells the node.
+        for err in every_error() {
+            if !matches!(err, BlobError::Internal(_)) {
+                assert_eq!(err.public_reason(), err.reason());
+            }
+        }
+    }
+
+    #[test]
+    fn every_error_response_is_no_store_and_nosniff() {
+        let mut responses: Vec<Response<HttpBody>> =
+            every_error().iter().map(error_response).collect();
+        responses.push(not_found());
+        for response in &responses {
+            let status = response.status();
+            assert_eq!(
+                header(response, "cache-control"),
+                Some("no-store"),
+                "{status}"
+            );
+            assert_eq!(
+                header(response, "x-content-type-options"),
+                Some("nosniff"),
+                "{status}"
+            );
+        }
+        assert_eq!(not_found().status().as_u16(), 404);
+    }
+
+    #[test]
+    fn rate_limited_response_says_when_to_retry() {
+        let response = error_response(&BlobError::RateLimited {
+            retry_after_secs: 7,
+        });
+        assert_eq!(header(&response, "retry-after"), Some("7"));
+        assert_eq!(
+            header(&error_response(&BlobError::QuotaExceeded), "retry-after"),
+            None
+        );
+    }
+
+    #[test]
+    fn reason_with_control_characters_still_makes_a_header() {
+        let response = error_response(&BlobError::BadRequest("one\r\ntwo\u{7}three".into()));
+        assert_eq!(header(&response, "x-reason"), Some("one  two three"));
+    }
+
+    #[test]
+    fn browser_clients_can_read_the_reason_and_the_retry_hint() {
+        let response = not_found();
+        let exposed = header(&response, "access-control-expose-headers").unwrap_or_default();
+        for name in ["WWW-Authenticate", "X-Reason", "Retry-After"] {
+            assert!(
+                exposed.split(", ").any(|listed| listed == name),
+                "{name} missing from {exposed}"
+            );
+        }
+    }
+
+    #[test]
+    fn etag_matches_handles_quotes_weak_lists_and_star() {
+        let quoted = format!("\"{SHA}\"");
+        assert!(etag_matches(&quoted, SHA));
+        assert!(etag_matches(&format!("W/{quoted}"), SHA));
+        assert!(etag_matches("*", SHA));
+        assert!(etag_matches(&format!("\"other\", {quoted}"), SHA));
+        assert!(etag_matches(
+            &format!("\"other\" ,W/{quoted} , \"more\""),
+            SHA
+        ));
+        assert!(etag_matches(&format!("  {quoted}  "), SHA));
+
+        assert!(!etag_matches("", SHA));
+        assert!(!etag_matches("\"other\"", SHA));
+        assert!(!etag_matches("\"other\", W/\"more\"", SHA));
+        // Not an entity tag without its quotes, and not ours in another case.
+        assert!(!etag_matches(SHA, SHA));
+        assert!(!etag_matches(&format!("\"{}\"", SHA.to_uppercase()), SHA));
+        assert!(!etag_matches(&format!("\"{SHA}"), SHA));
+        assert!(!etag_matches(&format!("w/{quoted}"), SHA));
+    }
+
+    /// The security property of the conditional request: a blob that was
+    /// taken down or is gone is never confirmed to a cache, whatever the
+    /// request says it already has.
+    #[test]
+    fn conditional_answer_comes_after_denylist_and_existence() {
+        let matching = format!("\"{SHA}\"");
+        let conditionals = [None, Some(matching.as_str()), Some("*"), Some("\"other\"")];
+
+        for conditional in conditionals {
+            for stored in [None, Some(5)] {
+                assert_eq!(
+                    decide_blob_read(true, stored, conditional, SHA),
+                    BlobRead::Denylisted,
+                    "denylisted, stored {stored:?}, If-None-Match {conditional:?}"
+                );
+            }
+            assert_eq!(
+                decide_blob_read(false, None, conditional, SHA),
+                BlobRead::Missing,
+                "absent, If-None-Match {conditional:?}"
+            );
+        }
+
+        assert_eq!(
+            decide_blob_read(false, Some(5), Some(matching.as_str()), SHA),
+            BlobRead::NotModified
+        );
+        assert_eq!(
+            decide_blob_read(false, Some(5), Some("*"), SHA),
+            BlobRead::NotModified
+        );
+        assert_eq!(
+            decide_blob_read(false, Some(5), Some("\"other\""), SHA),
+            BlobRead::Serve { size: 5 }
+        );
+        assert_eq!(
+            decide_blob_read(false, Some(5), None, SHA),
+            BlobRead::Serve { size: 5 }
+        );
+    }
+
+    #[test]
+    fn served_blob_is_inert_and_must_be_revalidated() {
+        let response = blob_ok_builder(SHA, 5).body(empty_body()).unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let etag = format!("\"{SHA}\"");
+        assert_eq!(header(&response, "cache-control"), Some("no-cache"));
+        assert_eq!(header(&response, "etag"), Some(etag.as_str()));
+        assert_eq!(header(&response, "x-content-type-options"), Some("nosniff"));
+        assert_eq!(
+            header(&response, "content-security-policy"),
+            Some("default-src 'none'; sandbox")
+        );
+        assert_eq!(
+            header(&response, "content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(header(&response, "content-length"), Some("5"));
+    }
+
+    #[test]
+    fn not_modified_repeats_the_validators_of_the_200() {
+        let ok = blob_ok_builder(SHA, 5).body(empty_body()).unwrap();
+        let not_modified = blob_not_modified(SHA);
+        assert_eq!(not_modified.status().as_u16(), 304);
+        for name in ["etag", "cache-control", "x-content-type-options"] {
+            assert!(header(&ok, name).is_some(), "{name} missing from the 200");
+            assert_eq!(header(&not_modified, name), header(&ok, name), "{name}");
+        }
+        // A length here would have to be the blob's, and nothing reads it.
+        assert_eq!(header(&not_modified, "content-length"), None);
+    }
 }

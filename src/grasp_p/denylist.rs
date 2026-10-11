@@ -14,7 +14,8 @@
 //!   a hard boot error (fail loud on misconfig). During reload an
 //!   unreadable file keeps its last-known entries (a transient read error
 //!   must not silently unblock taken-down content) and is retried every
-//!   tick.
+//!   tick. The reload starts from what the boot load read, file by file,
+//!   so "last-known" includes the entries a file had at boot.
 //! - **Atomic swap**: the live set sits behind an `RwLock`; a reload
 //!   builds the new union off-lock and swaps it in one write critical
 //!   section. Reads (GET/HEAD 451, upload preflight, finish() race
@@ -109,35 +110,47 @@ fn swap_set(lock: &RwLock<HashSet<String>>, new: HashSet<String>) -> HashSet<Str
 /// (warn + treated as empty — per-node / per-jurisdiction lists may simply
 /// not be mounted here), but a present-but-unreadable or over-cap file is
 /// a hard boot error (fail loud on misconfig).
-pub(crate) fn load_boot(paths: &[String]) -> Result<HashSet<String>> {
-    let mut set = HashSet::new();
-    for path in paths {
-        match read_file_capped(path) {
-            Ok(contents) => set.extend(
-                parse_contents(&contents)
-                    .with_context(|| format!("failed to parse private denylist at {path}"))?,
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!("private denylist file {path} not found; treating it as empty");
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read private denylist at {path}"));
-            }
-        }
+///
+/// Returns one state per configured file, in order. Their [`union`] is the
+/// set the node enforces from boot, and the states themselves are what the
+/// periodic reload starts from ([`spawn`]): a reload that began from empty
+/// states forgot the boot entries of any file it could not read again.
+pub(crate) fn load_boot(paths: &[String]) -> Result<Vec<FileState>> {
+    paths
+        .iter()
+        .map(|path| FileState::load_boot(path))
+        .collect()
+}
+
+/// Every hash listed by any of `files`: the set the node enforces.
+pub(crate) fn union(files: &[FileState]) -> HashSet<String> {
+    files
+        .iter()
+        .flat_map(|file| file.hashes.iter().cloned())
+        .collect()
+}
+
+/// The file's modification time. `Ok(None)` when the file does not exist.
+fn modified_time(path: &str) -> std::io::Result<Option<SystemTime>> {
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => Ok(Some(mtime)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(set)
 }
 
 /// Per-file reload state: the last observed mtime and the last parsed set,
 /// so a tick only re-reads files that actually changed.
-struct FileState {
+#[derive(Debug)]
+pub(crate) struct FileState {
     path: String,
     mtime: Option<SystemTime>,
     hashes: HashSet<String>,
 }
 
 impl FileState {
+    /// A state that has read nothing yet.
+    #[cfg(test)]
     fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
@@ -146,12 +159,51 @@ impl FileState {
         }
     }
 
+    /// Read one file at boot (see [`load_boot`] for what fails the boot).
+    fn load_boot(path: &str) -> Result<Self> {
+        // Taken before the read: if the file is rewritten between the two,
+        // the first reload sees a newer time and reads it again. Taken
+        // after, that rewrite would be missed until the next one. A time
+        // that cannot be read is treated as unknown, which also makes the
+        // first reload read the file again.
+        let mtime = modified_time(path).ok().flatten();
+        match read_file_capped(path) {
+            Ok(contents) => Ok(Self {
+                path: path.to_string(),
+                mtime,
+                hashes: parse_contents(&contents)
+                    .with_context(|| format!("failed to parse private denylist at {path}"))?,
+            }),
+            // Open decision (maintainer): a missing file counts as empty, as in `refresh`.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("private denylist file {path} not found; treating it as empty");
+                Ok(Self {
+                    path: path.to_string(),
+                    mtime: None,
+                    hashes: HashSet::new(),
+                })
+            }
+            Err(e) => Err(e).with_context(|| format!("failed to read private denylist at {path}")),
+        }
+    }
+
     /// Re-stat + re-read when the file changed since the last call.
     /// Returns true when the parsed set may have changed.
     fn refresh(&mut self) -> bool {
-        let mtime = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = match modified_time(&self.path) {
+            Ok(mtime) => mtime,
+            Err(e) => {
+                // The file may well be there, but it cannot be inspected
+                // (a directory in its path lost its permissions, say). Same
+                // rule as a file that cannot be read: keep, and retry.
+                tracing::error!(
+                    "private denylist file {} cannot be inspected ({e}); \
+                     keeping last-known entries",
+                    self.path
+                );
+                return false;
+            }
+        };
         if mtime == self.mtime {
             return false;
         }
@@ -175,6 +227,7 @@ impl FileState {
                     false
                 }
             },
+            // Open decision (maintainer): a missing file counts as empty, as in `load_boot`.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Disappeared (or still absent): treat as empty. Warn only
                 // on the transition (mtime Some -> None), not every tick.
@@ -206,17 +259,9 @@ impl FileState {
     /// One reload tick: re-read changed files; on any change, swap the live
     /// set and purge blobs whose sha is NEWLY denylisted.
     fn reload_once(svc: &PrivateService, files: &mut [FileState]) {
-        let mut any_change = false;
-        for file in files.iter_mut() {
-            any_change |= file.refresh();
-        }
-        if !any_change {
+        let Some(new_set) = refresh_all(files) else {
             return;
-        }
-        let new_set: HashSet<String> = files
-            .iter()
-            .flat_map(|f| f.hashes.iter().cloned())
-            .collect();
+        };
         // Swap BEFORE purging: reads 451 immediately, and the mirror skip
         // sites (which consult is_denylisted) can never re-enqueue a blob
         // that is about to be purged. `update_lag` likewise excludes
@@ -254,14 +299,43 @@ impl FileState {
     }
 }
 
+/// Refresh every file, and return the new union when any of them may have
+/// changed. A file that could not be read or parsed keeps the entries it
+/// had, so they are in the union whatever happened to the other files.
+///
+/// Kept apart from the swap and the purge so that the rule can be tested
+/// without a service or a timer.
+fn refresh_all(files: &mut [FileState]) -> Option<HashSet<String>> {
+    let mut any_change = false;
+    for file in files.iter_mut() {
+        any_change |= file.refresh();
+    }
+    if any_change {
+        Some(union(files))
+    } else {
+        None
+    }
+}
+
 /// Spawn the periodic reload task. Returns `None` (no task) when reloading
 /// is disabled (`NGIT_GRASP_P_DENYLIST_RELOAD_SECS=0`) or no denylist
 /// files are configured.
+///
+/// The task starts from the per-file states of the boot load, which it
+/// takes from the service. With reloading disabled they are dropped here:
+/// the live set already holds every entry.
 pub(crate) fn spawn(svc: Arc<PrivateService>) -> Option<JoinHandle<()>> {
+    let boot_files = svc.take_denylist_boot_files();
     let secs = svc.cfg.denylist_reload_secs;
     if svc.cfg.denylist_paths.is_empty() || secs == 0 {
         return None;
     }
+    let Some(mut files) = boot_files else {
+        // A second reload task would have to start from empty states and
+        // would drop the boot entries of a file it cannot read.
+        tracing::error!("private denylist reload was already started; not starting another");
+        return None;
+    };
     // NGIT_TEST=1 clamps the interval small (the mirror's repair-interval
     // idiom) so integration tests observe a reload within seconds.
     let interval_secs = if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
@@ -269,12 +343,6 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> Option<JoinHandle<()>> {
     } else {
         secs
     };
-    let mut files: Vec<FileState> = svc
-        .cfg
-        .denylist_paths
-        .iter()
-        .map(|p| FileState::new(p))
-        .collect();
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         // First tick fires immediately; skip it so boot isn't a reload pass.
@@ -365,13 +433,13 @@ mod tests {
         let missing = dir.path().join("absent.txt").to_string_lossy().into_owned();
 
         // Missing file → warn + empty (multi-file semantics).
-        let set = load_boot(std::slice::from_ref(&missing)).unwrap();
+        let set = union(&load_boot(std::slice::from_ref(&missing)).unwrap());
         assert!(set.is_empty());
 
         // Present + readable mixed with missing → union of the readable.
         let present = dir.path().join("present.txt");
         std::fs::write(&present, format!("{}\n", "c".repeat(64))).unwrap();
-        let set = load_boot(&[missing, present.to_string_lossy().into_owned()]).unwrap();
+        let set = union(&load_boot(&[missing, present.to_string_lossy().into_owned()]).unwrap());
         assert_eq!(set.len(), 1);
 
         // Present but unreadable (a directory is not readable as a file) →
@@ -424,5 +492,146 @@ mod tests {
         assert!(f.refresh());
         assert!(f.hashes.is_empty());
         assert!(!f.refresh());
+    }
+
+    /// Write `contents` and move the file's time forward, so that a refresh
+    /// sees a change even where the filesystem keeps coarse times.
+    fn rewrite(path: &std::path::Path, contents: &str, previous: Option<SystemTime>) {
+        std::fs::write(path, contents).unwrap();
+        let base = previous.unwrap_or_else(SystemTime::now);
+        let file = std::fs::File::open(path).unwrap();
+        file.set_modified(base + Duration::from_secs(2)).unwrap();
+    }
+
+    fn path_string(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn load_boot_seeds_per_file_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sha_a, sha_b) = ("a".repeat(64), "b".repeat(64));
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        let missing = dir.path().join("absent.txt");
+        std::fs::write(&path_a, format!("{sha_a}\n")).unwrap();
+        std::fs::write(&path_b, format!("{sha_b}\n# note\n")).unwrap();
+
+        let files = load_boot(&[
+            path_string(&path_a),
+            path_string(&missing),
+            path_string(&path_b),
+        ])
+        .unwrap();
+
+        assert_eq!(files.len(), 3, "one state per configured file, in order");
+        assert_eq!(files[0].hashes, HashSet::from([sha_a.clone()]));
+        assert!(files[0].mtime.is_some(), "a file that was read has a time");
+        assert!(files[1].hashes.is_empty());
+        assert!(files[1].mtime.is_none(), "a missing file has none");
+        assert_eq!(files[2].hashes, HashSet::from([sha_b.clone()]));
+        assert_eq!(union(&files), HashSet::from([sha_a, sha_b]));
+    }
+
+    #[test]
+    fn first_reload_after_boot_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.txt");
+        let missing = dir.path().join("absent.txt");
+        std::fs::write(&path, format!("{}\n", "a".repeat(64))).unwrap();
+
+        let mut files = load_boot(&[path_string(&path), path_string(&missing)]).unwrap();
+        let boot = union(&files);
+
+        assert!(
+            refresh_all(&mut files).is_none(),
+            "nothing changed on disk, so the first reload must not swap the set"
+        );
+        assert_eq!(union(&files), boot);
+    }
+
+    /// The fault this pins: the reload used to start from empty states, so
+    /// a file it could not read again had no entries to keep, and the next
+    /// change to any other file swapped in a set without them.
+    #[test]
+    fn reload_keeps_boot_entries_of_file_that_became_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sha_a, sha_a2, sha_b) = ("a".repeat(64), "c".repeat(64), "b".repeat(64));
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        std::fs::write(&path_a, format!("{sha_a}\n")).unwrap();
+        std::fs::write(&path_b, format!("{sha_b}\n")).unwrap();
+        let mut files = load_boot(&[path_string(&path_a), path_string(&path_b)]).unwrap();
+
+        // B can no longer be read as a file (a directory in its place fails
+        // for root too, which a permission change would not), and A gains
+        // an entry.
+        std::fs::remove_file(&path_b).unwrap();
+        std::fs::create_dir(&path_b).unwrap();
+        rewrite(&path_a, &format!("{sha_a}\n{sha_a2}\n"), files[0].mtime);
+
+        let reloaded = refresh_all(&mut files).expect("A changed, so the set is rebuilt");
+        assert_eq!(
+            reloaded,
+            HashSet::from([sha_a, sha_a2, sha_b.clone()]),
+            "B's boot entries must survive a reload that could not read B"
+        );
+        assert!(
+            refresh_all(&mut files).is_none(),
+            "and nothing changes while B stays unreadable"
+        );
+        assert!(files[1].hashes.contains(&sha_b));
+    }
+
+    #[test]
+    fn reload_keeps_boot_entries_when_file_stops_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sha_a, sha_a2, sha_b, sha_b2) = (
+            "a".repeat(64),
+            "c".repeat(64),
+            "b".repeat(64),
+            "d".repeat(64),
+        );
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        std::fs::write(&path_a, format!("{sha_a}\n")).unwrap();
+        std::fs::write(&path_b, format!("{sha_b}\n")).unwrap();
+        let mut files = load_boot(&[path_string(&path_a), path_string(&path_b)]).unwrap();
+
+        // B grows past the line cap, which is the one way a file that can
+        // be read fails to parse. A gains an entry.
+        rewrite(&path_b, &"x\n".repeat(MAX_LINES + 1), files[1].mtime);
+        rewrite(&path_a, &format!("{sha_a}\n{sha_a2}\n"), files[0].mtime);
+
+        let reloaded = refresh_all(&mut files).expect("A changed, so the set is rebuilt");
+        assert_eq!(
+            reloaded,
+            HashSet::from([sha_a.clone(), sha_a2.clone(), sha_b]),
+            "B's boot entries must survive a reload that could not parse B"
+        );
+
+        // Once B parses again its new contents replace the kept ones. The
+        // time B was last read with is still the boot one, so the base for
+        // the new time is taken from the file itself.
+        let unparsable = modified_time(&path_string(&path_b)).unwrap();
+        rewrite(&path_b, &format!("{sha_b2}\n"), unparsable);
+        assert_eq!(
+            refresh_all(&mut files),
+            Some(HashSet::from([sha_a, sha_a2, sha_b2]))
+        );
+    }
+
+    /// What a file that disappears means is not changed here: its entries
+    /// are dropped, as before. Pinned so that a change to it is deliberate.
+    #[test]
+    fn reload_still_treats_a_file_that_disappeared_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.txt");
+        std::fs::write(&path, format!("{}\n", "a".repeat(64))).unwrap();
+        let mut files = load_boot(&[path_string(&path)]).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(refresh_all(&mut files), Some(HashSet::new()));
+        assert!(refresh_all(&mut files).is_none());
     }
 }

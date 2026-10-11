@@ -228,7 +228,8 @@ fn wrap_event(signer: &Keys, kind: u16) -> Event {
     .expect("sign wrap")
 }
 
-/// Signed kind-24242 Blossom auth event.
+/// Signed kind-24242 Blossom auth event, as the client sends it today:
+/// without a `server` tag.
 fn blossom_auth_event(
     signer: &Keys,
     op: &str,
@@ -237,34 +238,72 @@ fn blossom_auth_event(
     alias: &str,
     expiration: u64,
 ) -> Event {
+    blossom_auth_event_with(signer, op, sha, tenant, alias, expiration, Vec::new())
+}
+
+/// The same event with further tags, a BUD-11 `server` tag for one.
+fn blossom_auth_event_with(
+    signer: &Keys,
+    op: &str,
+    sha: &str,
+    tenant: &PublicKey,
+    alias: &str,
+    expiration: u64,
+    extra: Vec<Tag>,
+) -> Event {
+    let mut tags = vec![
+        Tag::custom("t", vec![op.to_string()]),
+        Tag::custom("x", vec![sha.to_string()]),
+        Tag::custom("expiration", vec![expiration.to_string()]),
+        Tag::custom("a", vec![reg_coord(tenant, alias)]),
+    ];
+    tags.extend(extra);
     EventBuilder::new(Kind::Custom(24242), "grasp-p test auth")
-        .tags(vec![
-            Tag::custom("t", vec![op.to_string()]),
-            Tag::custom("x", vec![sha.to_string()]),
-            Tag::custom("expiration", vec![expiration.to_string()]),
-            Tag::custom("a", vec![reg_coord(tenant, alias)]),
-        ])
+        .tags(tags)
         .finalize(signer)
         .expect("sign 24242")
+}
+
+/// A BUD-11 `server` tag: the domain of the server an authorization is for.
+fn server_tag(domain: &str) -> Tag {
+    Tag::custom("server", vec![domain.to_string()])
 }
 
 fn auth_header_value(event: &Event) -> String {
     format!("Nostr {}", BASE64_STANDARD.encode(event.as_json()))
 }
 
-/// Signed kind-24242 authorization for `GET /list/<pubkey>`: a `t` tag and
-/// an expiration, with no `x` and no `a` tag.
-fn list_auth_event(signer: &Keys, op: &str, expiration: u64) -> Event {
-    list_event(signer, 24242, op, expiration, "grasp-p test list auth")
+/// Signed kind-24242 authorization for `GET /list/<pubkey>`: a `t` tag, an
+/// expiration and the `server` tag a list needs, with no `x` and no `a` tag.
+/// `server` is the domain of the node the list is asked of.
+fn list_auth_event(signer: &Keys, op: &str, expiration: u64, server: &str) -> Event {
+    list_event(
+        signer,
+        24242,
+        op,
+        expiration,
+        "grasp-p test list auth",
+        Some(server),
+    )
 }
 
-/// The same event shape, with the kind and the content chosen by the caller.
-fn list_event(signer: &Keys, kind: u16, op: &str, expiration: u64, content: &str) -> Event {
+/// The same event shape, with the kind and the content chosen by the caller,
+/// and with or without a `server` tag.
+fn list_event(
+    signer: &Keys,
+    kind: u16,
+    op: &str,
+    expiration: u64,
+    content: &str,
+    server: Option<&str>,
+) -> Event {
+    let mut tags = vec![
+        Tag::custom("t", vec![op.to_string()]),
+        Tag::custom("expiration", vec![expiration.to_string()]),
+    ];
+    tags.extend(server.map(server_tag));
     EventBuilder::new(Kind::Custom(kind), content)
-        .tags(vec![
-            Tag::custom("t", vec![op.to_string()]),
-            Tag::custom("expiration", vec![expiration.to_string()]),
-        ])
+        .tags(tags)
         .finalize(signer)
         .expect("sign list event")
 }
@@ -290,13 +329,13 @@ fn relay_port(relay: &TestRelay) -> u16 {
         .expect("domain always host:port")
 }
 
-/// HEAD /upload preflight → (status, X-Reason header if any).
-async fn head_upload(
+/// HEAD /upload preflight → the whole response.
+async fn head_upload_response(
     relay: &TestRelay,
     sha: &str,
     len: u64,
     auth: Option<&Event>,
-) -> (u16, String) {
+) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .request(
             reqwest::Method::HEAD,
@@ -307,7 +346,17 @@ async fn head_upload(
     if let Some(auth) = auth {
         req = req.header("authorization", auth_header_value(auth));
     }
-    let resp = req.send().await.expect("HEAD /upload transport");
+    req.send().await.expect("HEAD /upload transport")
+}
+
+/// HEAD /upload preflight → (status, X-Reason header if any).
+async fn head_upload(
+    relay: &TestRelay,
+    sha: &str,
+    len: u64,
+    auth: Option<&Event>,
+) -> (u16, String) {
+    let resp = head_upload_response(relay, sha, len, auth).await;
     let reason = resp
         .headers()
         .get("x-reason")
@@ -353,6 +402,36 @@ async fn get_blob(relay: &TestRelay, sha: &str) -> (u16, Vec<u8>) {
     let status = resp.status().as_u16();
     let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
     (status, body)
+}
+
+/// One response header as text, or "" when it is absent.
+fn response_header(response: &reqwest::Response, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// GET /<sha> with an `If-None-Match` header → (status, Cache-Control, ETag,
+/// body length).
+async fn get_blob_if_none_match(
+    relay: &TestRelay,
+    sha: &str,
+    if_none_match: &str,
+) -> (u16, String, String, usize) {
+    let response = reqwest::Client::new()
+        .get(format!("{}/{sha}", http_base(relay)))
+        .header("if-none-match", if_none_match)
+        .send()
+        .await
+        .expect("conditional GET /<sha> transport");
+    let status = response.status().as_u16();
+    let cache_control = response_header(&response, "cache-control");
+    let etag = response_header(&response, "etag");
+    let body = response.bytes().await.map(|b| b.len()).unwrap_or_default();
+    (status, cache_control, etag, body)
 }
 
 /// DELETE /<sha> → (status, X-Reason).
@@ -1139,6 +1218,79 @@ async fn exit5_blossom_auth_failures() {
         status, 400,
         "exit5: x mismatch must be 400; X-Reason: {reason}"
     );
+
+    // (g) An authorization signed for another server → 401. One that names
+    // this node, alone or among others, passes like one without the tag.
+    let for_another = blossom_auth_event_with(
+        &writer_a,
+        "upload",
+        &sha,
+        &tenant_a.public_key(),
+        &alias_a,
+        future_expiration(),
+        vec![server_tag("blobs.other.example")],
+    );
+    let (status, reason) = head_upload(&relay, &sha, len, Some(&for_another)).await;
+    assert_eq!(
+        status, 401,
+        "exit5: an authorization for another server must be 401; X-Reason: {reason}"
+    );
+    let for_this_node = blossom_auth_event_with(
+        &writer_a,
+        "upload",
+        &sha,
+        &tenant_a.public_key(),
+        &alias_a,
+        future_expiration(),
+        vec![
+            server_tag("blobs.other.example"),
+            server_tag(&relay.domain()),
+        ],
+    );
+    let (status, reason) = head_upload(&relay, &sha, len, Some(&for_this_node)).await;
+    assert_eq!(
+        status, 200,
+        "exit5: an authorization naming this node must pass; X-Reason: {reason}"
+    );
+
+    // (h) `WWW-Authenticate: Nostr` goes with every 401 and with no other
+    // status: it tells a client to authenticate, which is the wrong advice
+    // for a key that is not allowed, or for a malformed request.
+    let cases = [
+        ("no authorization", None, 401),
+        ("bad signature", Some(&tampered), 401),
+        ("expired", Some(&expired), 401),
+        ("another server", Some(&for_another), 401),
+        ("foreign write key", Some(&wrong_key), 403),
+        ("aux key", Some(&aux_auth), 403),
+        ("x mismatch", Some(&mismatched), 400),
+        ("accepted", Some(&good), 200),
+    ];
+    for (case, auth, expected) in cases {
+        let response = head_upload_response(&relay, &sha, len, auth).await;
+        assert_eq!(
+            response.status().as_u16(),
+            expected,
+            "exit5: status of the '{case}' case"
+        );
+        let challenge = response_header(&response, "www-authenticate");
+        if expected == 401 {
+            assert_eq!(
+                challenge, "Nostr",
+                "exit5: the '{case}' 401 must carry the challenge"
+            );
+        } else {
+            assert_eq!(
+                challenge, "",
+                "exit5: the '{case}' {expected} must not carry a challenge"
+            );
+        }
+        assert_eq!(
+            response_header(&response, "x-content-type-options"),
+            "nosniff",
+            "exit5: the '{case}' response must carry nosniff"
+        );
+    }
 
     relay.stop().await;
 }
@@ -4139,7 +4291,12 @@ async fn get_list(
 /// GET /list/<tenant-hex>, authorized by the tenant itself → the descriptor
 /// sha256 list.
 async fn list_blob_shas(relay: &TestRelay, tenant: &Keys) -> Vec<String> {
-    let authorization = auth_header_value(&list_auth_event(tenant, "list", future_expiration()));
+    let authorization = auth_header_value(&list_auth_event(
+        tenant,
+        "list",
+        future_expiration(),
+        &relay.domain(),
+    ));
     let (status, reason, body) = get_list(
         relay,
         &tenant.public_key().to_hex(),
@@ -4288,6 +4445,80 @@ async fn exit29_denylisted_get_head_and_upload_preflight_are_451() {
     assert_eq!(status, 200, "exit29: control GET must be 200");
     assert_eq!(body, ok_data, "exit29: control bytes must round-trip");
 
+    // What a served blob tells a browser and a cache, on GET and on HEAD:
+    // do not guess a type, treat the bytes as inert, and ask this node
+    // before every reuse.
+    let ok_url = format!("{}/{ok_sha}", http_base(&relay));
+    let ok_etag = format!("\"{ok_sha}\"");
+    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+        let response = reqwest::Client::new()
+            .request(method.clone(), &ok_url)
+            .send()
+            .await
+            .expect("blob transport");
+        assert_eq!(response.status().as_u16(), 200, "exit29: {method} status");
+        for (name, expected) in [
+            ("x-content-type-options", "nosniff"),
+            ("cache-control", "no-cache"),
+            ("etag", ok_etag.as_str()),
+            ("content-security-policy", "default-src 'none'; sandbox"),
+            ("content-type", "application/octet-stream"),
+            ("content-length", "256"),
+        ] {
+            assert_eq!(
+                response_header(&response, name),
+                expected,
+                "exit29: {name} of the {method} response"
+            );
+        }
+    }
+
+    // A cache that holds the blob asks with If-None-Match and is told to
+    // keep its copy: a 304 with the same validators and no body.
+    for if_none_match in [
+        ok_etag.clone(),
+        format!("W/{ok_etag}"),
+        format!("\"something-else\", {ok_etag}"),
+        "*".to_string(),
+    ] {
+        let (status, cache_control, etag, body_len) =
+            get_blob_if_none_match(&relay, &ok_sha, &if_none_match).await;
+        assert_eq!(
+            (status, cache_control.as_str(), etag.as_str(), body_len),
+            (304, "no-cache", ok_etag.as_str(), 0),
+            "exit29: If-None-Match {if_none_match} must be answered 304"
+        );
+    }
+    // A cache holding something else gets the blob.
+    let (status, _, _, body_len) =
+        get_blob_if_none_match(&relay, &ok_sha, "\"something-else\"").await;
+    assert_eq!(
+        (status, body_len),
+        (200, 256),
+        "exit29: a tag that does not match must get the bytes"
+    );
+
+    // The same question about the denylisted hash is never answered 304,
+    // whatever the cache claims to hold: it gets the 451, and may not keep
+    // it. The same for a hash this node does not have.
+    let blocked_etag = format!("\"{blocked_sha}\"");
+    for if_none_match in [blocked_etag.as_str(), "*"] {
+        let (status, cache_control, etag, _) =
+            get_blob_if_none_match(&relay, &blocked_sha, if_none_match).await;
+        assert_eq!(
+            (status, cache_control.as_str(), etag.as_str()),
+            (451, "no-store", ""),
+            "exit29: If-None-Match {if_none_match} on a denylisted hash must be 451"
+        );
+    }
+    let absent_sha = sha256_hex(&blob_bytes(204, 64));
+    let (status, cache_control, etag, _) = get_blob_if_none_match(&relay, &absent_sha, "*").await;
+    assert_eq!(
+        (status, cache_control.as_str(), etag.as_str()),
+        (404, "no-store", ""),
+        "exit29: a hash this node does not hold must be an uncacheable 404"
+    );
+
     relay.stop().await;
 }
 
@@ -4336,6 +4567,14 @@ async fn exit30_reload_purge_on_add() {
     assert_eq!(status, 200, "exit30: PUT must succeed; X-Reason: {reason}");
     let (status, body) = get_blob(&relay, &sha).await;
     assert_eq!((status, body.len()), (200, 512), "exit30: pre-takedown GET");
+    // A cache that holds the blob revalidates it and is told to keep it.
+    let etag = format!("\"{sha}\"");
+    let (status, cache_control, _, _) = get_blob_if_none_match(&relay, &sha, &etag).await;
+    assert_eq!(
+        (status, cache_control.as_str()),
+        (304, "no-cache"),
+        "exit30: pre-takedown revalidation"
+    );
     assert!(
         relay_blob_path(&relay, &sha).is_file(),
         "exit30: bytes on disk"
@@ -4349,6 +4588,15 @@ async fn exit30_reload_purge_on_add() {
 
     let status = poll_until(451u16, || async { get_blob(&relay, &sha).await.0 }).await;
     assert_eq!(status, 451, "exit30: GET must turn 451 after the reload");
+    // The reason blobs are served `no-cache`: the same revalidation now
+    // gets the 451, so the cache stops serving its copy, and it may not
+    // keep the 451 either.
+    let (status, cache_control, _, _) = get_blob_if_none_match(&relay, &sha, &etag).await;
+    assert_eq!(
+        (status, cache_control.as_str()),
+        (451, "no-store"),
+        "exit30: revalidating a taken-down blob must be 451, never 304"
+    );
 
     // Bytes unlinked, ledger released, purged counter incremented.
     assert!(
@@ -5407,8 +5655,51 @@ async fn exit40_list_answers_only_the_listed_key() {
         &alias,
         future_expiration(),
     );
-    let (status, _, reason) = put_blob(&relay, data, &sha, &upload).await;
+    let (status, descriptor, reason) = put_blob(&relay, data.clone(), &sha, &upload).await;
     assert_eq!(status, 200, "exit40: PUT must succeed; X-Reason: {reason}");
+    let stored_at = descriptor["uploaded"].as_u64().unwrap_or_default();
+    assert!(
+        stored_at > 0,
+        "exit40: the upload descriptor must say when the blob was stored: {descriptor}"
+    );
+
+    // The list reports that time, and so does a repeat upload a moment
+    // later: it is when the node first stored the bytes, not the time of
+    // the request.
+    let own_list = auth_header_value(&list_auth_event(
+        &tenant,
+        "list",
+        future_expiration(),
+        &relay.domain(),
+    ));
+    let (status, reason, body) = get_list(
+        &relay,
+        &tenant.public_key().to_hex(),
+        Some(own_list.as_str()),
+    )
+    .await;
+    assert_eq!(status, 200, "exit40: own list; X-Reason: {reason}");
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("/list must be JSON");
+    assert_eq!(
+        (
+            listed[0]["sha256"].as_str(),
+            listed[0]["uploaded"].as_u64(),
+            listed[0]["size"].as_u64()
+        ),
+        (Some(sha.as_str()), Some(stored_at), Some(512)),
+        "exit40: the list must report the stored time: {listed}"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (status, repeat, reason) = put_blob(&relay, data, &sha, &upload).await;
+    assert_eq!(
+        status, 200,
+        "exit40: repeat PUT must succeed; X-Reason: {reason}"
+    );
+    assert_eq!(
+        repeat["uploaded"].as_u64(),
+        Some(stored_at),
+        "exit40: a repeat upload must report the first stored time"
+    );
 
     // The listed key's own authorization gets its inventory.
     assert_eq!(
@@ -5418,14 +5709,23 @@ async fn exit40_list_answers_only_the_listed_key() {
     );
     // BUD-11's form of the token, base64url without padding, works as well as
     // the standard base64 the helper sends, and so do the two forms in between.
-    // The helper's own event cannot show it: its JSON is ASCII whose length is
-    // a multiple of three, so every form of its token is the same text. This
-    // content forces the difference. Of three consecutive '?' one encodes to
+    // The helper's own event cannot be relied on to show it: its JSON has no
+    // character that the two alphabets encode differently, and its length may
+    // be a multiple of three, which needs no padding. This content forces
+    // the difference at any length. Of three consecutive '?' one encodes to
     // '_' and of three '>' one to '-' ('/' and '+' in the standard alphabet),
     // and of three consecutive lengths two need padding.
     let mut unpadded = 0;
     for content in ["???>>>", "???>>>.", "???>>>.."] {
-        let json = list_event(&tenant, 24242, "list", future_expiration(), content).as_json();
+        let json = list_event(
+            &tenant,
+            24242,
+            "list",
+            future_expiration(),
+            content,
+            Some(&relay.domain()),
+        )
+        .as_json();
         let url_safe_no_pad = BASE64_URL_SAFE_NO_PAD.encode(json.as_bytes());
         assert!(
             url_safe_no_pad.contains('-') && url_safe_no_pad.contains('_'),
@@ -5470,18 +5770,54 @@ async fn exit40_list_answers_only_the_listed_key() {
     // Refusals: nobody else's authorization, and no malformed one, opens a
     // list. The alias's own write key is not the listed key either.
     let stranger = Keys::generate();
-    let by_writer = auth_header_value(&list_auth_event(&writer, "list", future_expiration()));
-    let by_stranger = auth_header_value(&list_auth_event(&stranger, "list", future_expiration()));
-    let wrong_verb = auth_header_value(&list_auth_event(&tenant, "upload", future_expiration()));
+    // Each of these names this node in its `server` tag, so that what
+    // refuses it is the fault it is here for.
+    let domain = relay.domain();
+    let by_writer = auth_header_value(&list_auth_event(
+        &writer,
+        "list",
+        future_expiration(),
+        &domain,
+    ));
+    let by_stranger = auth_header_value(&list_auth_event(
+        &stranger,
+        "list",
+        future_expiration(),
+        &domain,
+    ));
+    let wrong_verb = auth_header_value(&list_auth_event(
+        &tenant,
+        "upload",
+        future_expiration(),
+        &domain,
+    ));
     let expired = auth_header_value(&list_auth_event(
         &tenant,
         "list",
         Timestamp::now().as_secs() - 60,
+        &domain,
+    ));
+    // Signed by the tenant and in order, except that nothing binds it to
+    // this node: no `server` tag, or one that names another server. Either
+    // could have been captured elsewhere and replayed here.
+    let no_server = auth_header_value(&list_event(
+        &tenant,
+        24242,
+        "list",
+        future_expiration(),
+        "grasp-p test list auth",
+        None,
+    ));
+    let other_server = auth_header_value(&list_auth_event(
+        &tenant,
+        "list",
+        future_expiration(),
+        "blobs.other.example",
     ));
     // A stranger's valid authorization with the tenant's pubkey written over
     // the stranger's: the id and the signature no longer cover the event.
     let forged_event = Event::from_json(
-        list_auth_event(&stranger, "list", future_expiration())
+        list_auth_event(&stranger, "list", future_expiration(), &domain)
             .as_json()
             .replace(
                 &stranger.public_key().to_hex(),
@@ -5503,6 +5839,7 @@ async fn exit40_list_answers_only_the_listed_key() {
         "list",
         future_expiration(),
         "grasp-p test list auth",
+        Some(&domain),
     ));
     let targets = [
         tenant.public_key().to_hex(),
@@ -5517,6 +5854,8 @@ async fn exit40_list_answers_only_the_listed_key() {
         Some(expired.as_str()),
         Some(forged.as_str()),
         Some(wrong_kind.as_str()),
+        Some(no_server.as_str()),
+        Some(other_server.as_str()),
         Some("Nostr not-base64!"),
         Some("Bearer anything"),
     ];
@@ -5557,6 +5896,12 @@ async fn exit40_list_answers_only_the_listed_key() {
     assert!(
         header_sets.windows(2).all(|pair| pair[0] == pair[1]),
         "exit40: refused lists must carry identical headers: {header_sets:?}"
+    );
+    assert!(
+        header_sets[0].iter().any(
+            |(name, value)| name.as_str() == "www-authenticate" && value.as_slice() == b"Nostr"
+        ),
+        "exit40: a refused list must carry the Nostr challenge: {header_sets:?}"
     );
 
     relay.stop().await;

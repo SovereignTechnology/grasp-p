@@ -241,6 +241,7 @@ mod tests {
                         charged_tenant: Some("tenant".to_string()),
                         charged_alias: Some("alias".to_string()),
                         spec_charge: None,
+                        stored_at: None,
                     },
                 )
             })

@@ -134,6 +134,14 @@ pub struct BlobClaim {
     /// `serde(default)` keeps records written before this field readable.
     #[serde(default)]
     pub spec_charge: Option<SpecCharge>,
+    /// Unix seconds when THIS node first stored the bytes, whether a client
+    /// uploaded them or the mirror fetched them. It is what `/list` and the
+    /// upload descriptor report as `uploaded`, so the two nodes of a pair
+    /// each report their own time for one blob. `None` while the blob is
+    /// only declared. Claims are stored as JSON, so `serde(default)` reads
+    /// a record written before this field existed as `None`.
+    #[serde(default)]
+    pub stored_at: Option<u64>,
 }
 
 struct MetaInner {
@@ -475,6 +483,30 @@ impl MetaEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claim written before `stored_at` existed has no such key. It must
+    /// still read, as a blob whose storing time is unknown; a claim written
+    /// now must carry the time.
+    #[test]
+    fn claim_written_before_stored_at_still_reads() {
+        let old = r#"{"size":7,"aliases":["a"],"unreferenced_since":null,"stored":true,"charged_tenant":"t","charged_alias":"a","spec_charge":null}"#;
+        let claim: BlobClaim = serde_json::from_str(old).expect("an old claim must read");
+        assert!(claim.stored);
+        assert_eq!(claim.stored_at, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let sha = "ab".repeat(32);
+        let written = BlobClaim {
+            stored_at: Some(1_700_000_000),
+            ..claim
+        };
+        meta.with_write(|m, txn| m.put_blob_claim(txn, &sha, &written))
+            .unwrap();
+        let txn = meta.read_txn().unwrap();
+        let read = meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
+        assert_eq!(read.stored_at, Some(1_700_000_000));
+    }
 
     /// B3: charged wrap ids must be pruned once they age past the retention
     /// window so the table stays bounded; ids still inside the window and the

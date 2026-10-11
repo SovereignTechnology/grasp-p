@@ -201,7 +201,25 @@ impl BlobError {
             Self::Internal(reason) => reason.clone(),
         }
     }
+
+    /// The reason a client is told, in `X-Reason`.
+    ///
+    /// The same as [`Self::reason`] except for an internal failure, whose
+    /// text carries database and filesystem errors: paths, table names and
+    /// library messages that are nobody's business outside the node. The
+    /// client learns only that the failure was internal; the HTTP layer
+    /// logs the detail. Code inside the node (the mirror's retry classes
+    /// and log lines) keeps reading `reason()`.
+    pub fn public_reason(&self) -> String {
+        match self {
+            Self::Internal(_) => INTERNAL_ERROR_PUBLIC_REASON.to_string(),
+            other => other.reason(),
+        }
+    }
 }
+
+/// What a client is told about any internal failure of the blob routes.
+pub const INTERNAL_ERROR_PUBLIC_REASON: &str = "internal error";
 
 /// Extracted private-repo config subset (cheap to clone into sinks/tasks).
 #[derive(Debug, Clone)]
@@ -440,6 +458,9 @@ pub struct PrivateService {
     /// policy_fingerprint: paired nodes in different jurisdictions may
     /// legitimately enforce different lists.
     pub(crate) denylist: denylist::SharedDenylist,
+    /// What the boot load read from each denylist file, held until the
+    /// reload task takes it as its starting state (`denylist::spawn`).
+    denylist_boot_files: parking_lot::Mutex<Option<Vec<denylist::FileState>>>,
     /// In-flight upload reservations (see [`UploadReservation`]).
     inflight: Arc<parking_lot::Mutex<InflightUploads>>,
     /// Phase 2: hot cache of 30641/1059 events rejected before their 30640
@@ -492,7 +513,8 @@ impl PrivateService {
         let blobs = BlobStore::open(&blob_path)?;
 
         let denylist_paths = config.private_denylist_paths();
-        let denylist = denylist::load_boot(&denylist_paths)?;
+        let denylist_files = denylist::load_boot(&denylist_paths)?;
+        let denylist = denylist::union(&denylist_files);
         crate::metrics::set_private_denylist_entries(denylist.len());
 
         let svc = Arc::new(Self {
@@ -501,6 +523,7 @@ impl PrivateService {
             blobs,
             database,
             denylist: std::sync::Arc::new(std::sync::RwLock::new(denylist)),
+            denylist_boot_files: parking_lot::Mutex::new(Some(denylist_files)),
             inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
             sync_rejected: crate::sync::private_index::PrivateRejectedIndex::new(
                 std::time::Duration::from_secs(config.rejected_hot_cache_duration_secs),
@@ -1023,7 +1046,7 @@ impl PrivateService {
         op: BlossomOp,
         expected_sha: &str,
     ) -> Result<BlossomAuth, BlobError> {
-        let auth = blossom_auth::verify_auth_shape(header, op, expected_sha)?;
+        let auth = blossom_auth::verify_auth_shape(header, op, expected_sha, &self.cfg.domain)?;
 
         let record = self
             .live_registration(&auth.alias)
@@ -1314,7 +1337,9 @@ impl PrivateService {
                     url: format!("https://{}/{}", self.cfg.service_address, sha),
                     sha256: sha,
                     size: claim.size,
-                    uploaded: 0,
+                    // 0 only for a claim stored by a build that did not
+                    // record the time.
+                    uploaded: claim.stored_at.unwrap_or(0),
                 });
             }
         }
@@ -1375,6 +1400,12 @@ impl PrivateService {
     /// configured.
     pub fn spawn_denylist_reload(self: &Arc<Self>) -> Option<JoinHandle<()>> {
         denylist::spawn(self.clone())
+    }
+
+    /// Hand the boot load's per-file states to the reload task. `None` once
+    /// they have been taken.
+    pub(crate) fn take_denylist_boot_files(&self) -> Option<Vec<denylist::FileState>> {
+        self.denylist_boot_files.lock().take()
     }
 }
 
