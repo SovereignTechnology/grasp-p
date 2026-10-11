@@ -156,16 +156,60 @@ Content-addressed encrypted blobs over HTTP: `PUT /upload` (kind-24242 authoriza
 (kind-24242 authorization signed by the listed pubkey).
 Auth event (kind 24242) for upload and delete: tags
 `t`∈{upload,delete}, `x`=<sha256>, `expiration`=<future>, `a`=`30640:<tenant>:<alias>`;
-`created_at` within ±24 h; id + signature verified by the route itself (no relay pipeline has seen
-it); signed by a `w`-set key. For list the required tags are `t`=list and `expiration`=<future>
-(no `x` or `a`; other tags are ignored), with the same freshness and verification, and the signer
+`created_at` from one hour before to 15 minutes after the node's clock; id + signature verified by
+the route itself (no relay pipeline has seen it); signed by a `w`-set key. For list the required
+tags are `t`=list, `expiration`=<future> and a `server` tag naming this node (no `x` or `a`; other
+tags are ignored), with the same freshness and verification, and the signer
 MUST be the pubkey in the path; a write key does not qualify. A path segment that does not parse
 as a pubkey is a `400`. Every other refused list is the same `401` with the same `X-Reason` and no
 body, whether the pubkey has blobs, has none or is unknown to the node, and nothing is looked up
-before the authorization is checked. A list authorization names no server and no blob, so one
-that leaks opens that key's list on any node until it expires.
+before the authorization is checked; a list authorization without a `server` tag for this node is
+refused the same way.
 Header: `Authorization: Nostr <token>`, where `<token>` is the event JSON in standard base64 or in
 base64url, padded or not; the server accepts all four forms.
+
+**Replay of an authorization [N].** Whoever captures an authorization can use it again while the
+node accepts it. Two stateless checks bound that, the same on both nodes of a pair:
+- *Time.* `created_at` must lie in `[now - 3600 s, now + 900 s]` and `expiration` must not have
+  passed, so a captured event is good for at most 75 minutes whatever `expiration` says. The
+  client's own tokens expire after an hour. A client whose clock runs more than 15 minutes fast is
+  refused, as its events of the kinds in §2 already are.
+- *Server.* The BUD-11 `server` tag carries a bare domain (`host` or `host:port`, no scheme and no
+  path). An authorization with one or more `server` tags is accepted only if one of them names the
+  node: its configured domain, compared on the host without regard to case, plus the port when the
+  configured domain has one. A mount path (`NGIT_BASE_PATH`) is not part of the comparison, so two
+  services under different paths of one host are not told apart by it. The tag is REQUIRED for
+  list, which nothing else binds to a node. For upload and delete it is checked when present and
+  not yet required, because the client does not send it; it becomes required with protocol v0.2.
+  Until then an upload or delete authorization without it is valid on any node that has the same
+  registration, which a pair has by design.
+
+The node keeps **no record of authorization ids it has already seen**, deliberately. What a
+captured authorization can still do inside its window (75 minutes at most): a list authorization
+returns that key's inventory to whoever presents it; an upload authorization, together with the
+bytes, stores the blob again if its owner deleted it meanwhile; a delete authorization removes the
+claim again if its owner uploaded the blob again meanwhile. Nothing else: no other blob, no other
+alias, and where the event carries a `server` tag no other server. A record of used ids would
+close these three only on one node and only until its next restart, because a table kept in one
+process is neither shared with the node's peer nor kept across a restart, so the node does not
+promise it. Neither check is part of `policy_fingerprint`:
+authorization events are never replicated between nodes, so two nodes cannot come to hold
+different data because of them, and both nodes of a pair run the same build.
+
+**Responses [N].** A `401` carries `WWW-Authenticate: Nostr`; no other status does. `X-Reason`
+never carries the text of an internal failure (the client reads `internal error`; the detail is in
+the node's log). `X-Reason` and `Retry-After` are exposed to browser clients (CORS). Every response
+of these routes says `X-Content-Type-Options: nosniff`. A served blob also carries
+`Content-Security-Policy: default-src 'none'; sandbox`, `Cache-Control: no-cache` and a strong
+`ETag` that is the sha256 in quotes: a cache may keep the bytes but must ask the node before each
+reuse. `If-None-Match` is answered `304` only after the denylist and existence checks, so
+revalidating a blob that was taken down gets the `451`. Errors and `404`s say
+`Cache-Control: no-store`. Blobs were served `immutable` for a year before; a blob that was taken
+down would have stayed in caches for that long.
+
+**Descriptors [N].** `PUT /upload` and `GET /list` return `{url, sha256, size, uploaded}`.
+`uploaded` is the time this node first stored the bytes, by upload or by mirroring, so the two
+nodes of a pair report different times for one blob, and a repeat upload reports the first time.
 `blob sha256 = SHA256(exact PUT bytes)`. `/list` aggregates only that tenant's own aliases via the
 per-alias claim index (never a cross-tenant scan).
 
@@ -426,7 +470,12 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   operator can tell an unfinished rolling upgrade from a genuine knob split.
 - **Denylist → 451**: node-local, multi-file, periodically reloaded (default 60 s), enforced on the
   read path AND the upload preflight, with purge-on-add and a GC sweep that bypasses the grace
-  period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ.
+  period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ. A file that
+  cannot be read or parsed on a reload keeps the entries it last had, those read at boot included;
+  a file that is missing counts as empty (an open question, see `PLAN.md`). Blobs are served
+  `no-cache` (§2.4) so that a takedown reaches HTTP caches as well.
+- **Authorization window and `server` tag** (§2.4): fixed in the code, the same on every node, and
+  not in the fingerprint, because authorization events are never replicated.
 - **kind-1984 (NIP-56) intake**: observe-then-defer. Event id, reporter, and sha256-looking tag
   values are logged (never the content) and metered; admission then runs the existing related-event
   rules unchanged. No automatic action in v1.
@@ -514,6 +563,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.
 - §2.3 — unregistered stream wraps rejected outright (never the public path); stored held, ephemeral not; **[D]** on collab rumors dropped.
 - §2.3 — **stream wraps moved to their own kinds 3359/23359** (server `c5301bb`, client `eb1e5e2`); 1059 retained ONLY for genuine NIP-59 invites/promotions; legacy 1059/21059 dual-accept as a transitional window, default on; retired-kind rejection string (§5.2); tagless-admission gate written (`tests/private_repos.rs:4881,4892`), closing the hole `nip-conformance.md` item 7b recorded.
+- §2.4 — authorization window narrowed from ±24 h to one hour back and 15 minutes ahead; BUD-11 `server` tag (required for list); no used-id record, and why; response headers (`nosniff`, CSP, `no-cache` + `ETag` in place of a one-year `immutable`, `no-store` on errors, `WWW-Authenticate` on 401 only); `uploaded` is the stored time.
 - §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.

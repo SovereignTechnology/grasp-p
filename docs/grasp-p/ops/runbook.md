@@ -715,6 +715,18 @@ Procedure — verify-then-denylist:
    src/grasp_p/mod.rs:924–925). The mirror never re-fetches it — all five
    mirror skip sites consult `is_denylisted` — and the purged blob drops out
    of `ngit_private_mirror_lag_blobs`.
+
+   **HTTP caches.** The node serves a blob with `Cache-Control: no-cache`
+   and its sha256 as `ETag`: a browser or proxy may keep a copy but has to
+   ask the node before each reuse, and for a denylisted blob that question
+   is answered 451, never 304. So a takedown reaches every cache that
+   honours those headers at its next request. Any reverse proxy or CDN put
+   in front of the node MUST honour the origin's cache headers on the blob
+   paths (`/<sha256>`): no forced TTL, no "cache everything", no serving
+   stale content when the origin answers an error. If one is configured to
+   override them anyway, purge the blob's URL there as part of every
+   takedown, on both nodes of a pair. The 451 and the 404 are sent
+   `no-store` and must not be cached either.
 5. **GC sweep is the durable backstop**: every GC pass purges denylisted
    blobs bypassing both the grace period and the unreferenced requirement —
    even if the reload raced a claim that appeared later
@@ -768,6 +780,8 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
 | HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/grasp_p/mod.rs:175, 189) | takedown | none — operator action only |
 | HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/grasp_p/mod.rs:176, 190) | genuine | DELETE blobs or ask for quota |
+| HTTP 401 + `WWW-Authenticate: Nostr` | blob routes: missing, malformed, expired or mis-addressed kind-24242 authorization. Its `created_at` must be at most 1 hour old and at most 15 minutes ahead of the node's clock; a `server` tag, when present, must name this node (`NGIT_DOMAIN`), and `GET /list` requires one (src/grasp_p/blossom_auth.rs) | genuine | sign a fresh authorization; check the client's clock, and the node's own (a node more than 15 minutes slow or an hour fast refuses every authorization; keep both nodes of a pair time-synchronised) |
+| HTTP 500 + `X-Reason: internal error` | any blob route; the client is never told more | node fault | read the node's log for `blob route internal error: <detail>` at the same time |
 
 A cadence-rejected replacement (`replacement rate-limited; retry later`)
 may be accepted LATER without the client republishing anything: the relay
@@ -946,9 +960,23 @@ Assert:
   comma-separated list; mount only the lists this jurisdiction enforces.
 - A MISSING file is tolerated (boot warn `private denylist file <path> not
   found; treating it as empty`); a present-but-UNREADABLE file is a hard
-  boot error (src/grasp_p/denylist.rs:69–88). During reload an unreadable
-  file keeps its last-known entries and is retried every tick (error-logged)
-  — a transient read error never silently unblocks taken-down content.
+  boot error (`load_boot` in src/grasp_p/denylist.rs). During reload an
+  unreadable file, or one that no longer parses (over the size or line
+  cap), keeps its last-known entries and is retried every tick
+  (error-logged: `keeping last-known entries`) — a transient read error
+  never silently unblocks taken-down content.
+- The reload starts from what the boot load read, file by file. The first
+  reload after boot therefore changes nothing unless a file changed on
+  disk, and "last-known entries" includes the ones a file had at boot.
+  (Before this, a file that became unreadable after boot lost its boot
+  entries as soon as any other file was reloaded.)
+- A file that DISAPPEARS after boot still counts as empty: its entries are
+  dropped at the next reload (warn `no longer found; treating it as
+  empty`) and `ngit_private_denylist_entries` falls. Replace denylist
+  files atomically (write a temp file, then rename) and never by
+  delete-then-write, and treat the "Denylist entries dropped" alert as a
+  possible unmounted volume. Whether a missing file should keep its
+  entries instead is an open decision (`PLAN.md`).
 - Reload every `NGIT_GRASP_P_DENYLIST_RELOAD_SECS` (default 60; 0 disables
   reload — the boot-time set is kept). Only mtime-changed files are
   re-read; the live set swaps atomically.

@@ -73,6 +73,10 @@ registered write key and naming the registration. `GET /list/<pubkey>` needs one
 the listed pubkey itself, and every refusal is the same 401, so the route itself does not
 say whether a pubkey is a tenant (its public registration events do). `GET /<sha256>` is
 unauthenticated. The authorization token is accepted in standard base64 or in base64url.
+An authorization is accepted from one hour before to fifteen minutes after the node's
+clock, and one that names servers (BUD-11 `server` tags) only where it names this node; a
+list must name it. A blob is served so that caches ask the node before each reuse, which is
+how a takedown reaches them.
 
 ## Keys the client holds
 

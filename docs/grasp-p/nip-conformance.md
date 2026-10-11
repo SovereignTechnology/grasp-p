@@ -76,15 +76,17 @@ BUD-11 MUSTs we **violate or omit**:
 
 - **`content` is empty.** `EventBuilder::new(Kind::Custom(24242), "")` — `events.rs:169`. BUD-11
   requires human-readable content. The server does not check it either.
-- **No `server` tag.** The tag list at `events.rs:160-168` has none, and `blossom_auth.rs` never
-  looks for one. BUD-11's repeated lowercase-domain `server` tags are its replay-across-servers
-  mitigation; absent on both sides, a 24242 minted for node A is replayable at node B for the same
-  sha. Our `a` tag limits the blast radius to the same `(tenant, alias)` but not to the same host.
-  A `list` authorization has neither `x` nor `a`, so nothing narrows it: one signed by key K for
-  any Blossom server opens K's whole list on every GRASP-P node, as often as it is presented,
-  until its `expiration` passes or its `created_at` is 24 h old, whichever comes first (48 h
-  after signing at most, for an event post-dated by the full window). It is read-only, and only K
-  can mint one.
+- **No `server` tag from the client (server half closed 2026-10, issue 6).** The client's tag
+  list at `events.rs:160-168` has none. BUD-11's repeated lowercase-domain `server` tags are its
+  replay-across-servers mitigation. The server now checks them (`server_tag_ok` in
+  `src/grasp_p/blossom_auth.rs`): an authorization that carries `server` tags is refused unless
+  one names this node, and a `list` authorization, which has neither `x` nor `a` to narrow it, is
+  refused without one. For upload and delete the tag is not yet required, because the client
+  does not send it, so a 24242 minted for node A is still replayable at node B for the same sha
+  and the same `(tenant, alias)` until it is (protocol v0.2). Any authorization is accepted for
+  at most 75 minutes after it is first presentable (`created_at` no more than an hour old and no
+  more than 15 minutes ahead). The server keeps no record of used authorizations; the spec,
+  section 2.4, says why. Still unmet: the client emitting the tag.
 - **Base64, not base64url (server half closed 2026-10, issue 14).** Client encodes
   `BASE64_STANDARD` (`events.rs:174`), which BUD-11's `Authorization: Nostr <base64url-no-padding>`
   does not allow. The server decoded `BASE64_STANDARD` only until 2026-10; it now accepts standard
@@ -101,8 +103,12 @@ Extra requirements we impose beyond BUD-11 (interop hazards for third-party clie
   `src/grasp_p/mod.rs:907-916` (tenant match `:907-911`, `w`-set membership `:912-916`; `:889-892`
   is only the rustdoc header).
   **KEEP-BESPOKE**, documented as a GRASP-P extension.
-- **±24 h `created_at` window** — `blossom_auth.rs:15,136-143`. BUD-11 relies on `expiration` alone;
-  a conformant client with a long-dated auth and a skewed clock gets a 401 from us.
+- **`created_at` window of one hour back and 15 minutes ahead** — `created_at_in_window` in
+  `src/grasp_p/blossom_auth.rs` (it was ±24 h until 2026-10). BUD-11 relies on `expiration` alone;
+  a conformant client that reuses a long-dated authorization for more than an hour, or whose
+  clock runs more than 15 minutes fast, gets a 401 from us.
+- **`server` tag required on `list`** — same file. BUD-11 makes the tag optional; a third-party
+  client that lists without one gets the same 401 as an anonymous caller.
 - **`list` signer must be the pubkey in the path** — `authorize_list` in
   `src/grasp_p/blossom_auth.rs`. BUD-11 does not say whose token may list whose blobs; a client
   listing another pubkey gets the same 401 as an anonymous one.
@@ -697,7 +703,9 @@ Not NIP questions, but a standards reader will surface them.
    binds an auth event to a host. GRASP-P repos advertise *multiple* nodes (`relays`/`server` tags on
    the 30640, `CORD-git-v0-spec.md:45-47`). Repeated `server` tags covering every node in the repo's
    set is the obvious answer, but it re-widens the replay window to exactly that set — is that the
-   intended granularity, or should each upload name a single target host?
+   intended granularity, or should each upload name a single target host? (Server half decided
+   2026-10, issue 6: an authorization is accepted when any of its `server` tags names the node, so
+   one authorization may name every node of the set. What the client emits is still open.)
 3. **Does `/list` survive?** (Decided 2026-10: it stays, behind the listed key's own authorization;
    the watchdog, the only tooling that used it, no longer does.) BUD-12 marks it unrecommended and gap C shows ours is the widest leak on
    the private surface. Removing it is cheapest; the question is whether any operator tooling depends

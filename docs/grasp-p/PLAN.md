@@ -81,6 +81,23 @@ push; `git status` before every commit.
   fires when the peer has no series. Both parts are in `SEAMS.md`, "Metrics leave a GRASP-P
   node on loopback only". Found on the way: upstream never sets `ngit_sync_relay_failures`,
   so the alert rule on it could not fire and is removed.
+- **#6** (done) blob route hardening, three parts and one from its comment
+  (`SEAMS.md`, "What the blob routes answer"):
+  - A kind-24242 authorization could be replayed for a day either side of its `created_at`.
+    It is now accepted only from one hour before to fifteen minutes after the node's clock,
+    and a BUD-11 `server` tag binds it to the node: required for `list`, and for `upload`
+    and `delete` checked when present and required once the client sends it (M4). The node
+    keeps no record of used event ids, on purpose. Inside its window (75 minutes at most) a captured
+    list authorization still returns that key's inventory, a captured upload with its bytes
+    stores the blob again if the owner deleted it meanwhile, and a captured delete removes
+    the claim again if the owner uploaded it again meanwhile; nothing else. A record of used
+    ids would close these only on one node and only until its next restart, because a table
+    in one process is neither shared with the peer nor kept over a restart.
+  - The text of an internal error went to the client in `X-Reason`. The client is now told
+    `internal error`, and the detail is logged.
+  - `GET /list` reported `uploaded: 0`. A claim now records when the node first stored the
+    blob, and the list and the upload descriptor report it.
+  - `WWW-Authenticate: Nostr` on every 401 of the blob routes and on no other status.
 - **#25** per-tenant claim/file-count caps; **#26** mirror fairness; **#20** purgatory SSRF and
   **#3** DNS rebinding (both via `outbound.rs`); **#16** announcement-indexer pin + leak canary.
 - **#1** offboard: kind-5 tombstone frees alias, keys, ledger; retention purge (customers leave).
@@ -127,11 +144,22 @@ project yet.
   conflict alert.
 - **Events of other kinds can attach to GRASP-P events** through upstream's related-event
   rule: uncharged plaintext stored on a ciphertext node.
-- **Blob responses.** No `X-Content-Type-Options: nosniff` (matters once the web UI shares
-  the origin, M7); a taken-down blob stays in HTTP caches for a year; the operator's event
-  blacklist does not apply to the blob routes; stale upload temp files are never swept.
-- **Denylist reload** can drop the entries of a file that became unreadable after boot
-  (setups with two or more files).
+- **Blob responses** (done, except the blacklist). Every response of the blob routes says
+  `X-Content-Type-Options: nosniff`, and a served blob also carries a
+  `Content-Security-Policy` that makes it inert in a browser. A blob is served
+  `Cache-Control: no-cache` with its sha256 as `ETag`, no longer cacheable for a year: a
+  cache may keep it but asks the node before each reuse, and that question is answered 304
+  only after the denylist and existence checks, so a taken-down blob gets the 451. Errors
+  and 404s say `no-store`. Upload temp files left by an earlier run are removed when the
+  store is opened. Still open: the operator's event blacklist does not apply to the blob
+  routes.
+- **Denylist reload** (done). The reload now starts from what the boot load read, so a file
+  that can no longer be read or parsed keeps the entries it had at boot when another file
+  changes. Still open, and the maintainer's to decide: **what a missing denylist file
+  means.** Today a file that is absent counts as empty, at boot and on reload, so a file
+  that disappears (an unmounted volume, a deploy that is not atomic) lifts its takedowns
+  within one reload interval. The alternative is to keep its last-known entries until a
+  readable file no longer lists them.
 - **Peers.** A configured peer that fails a handshake is muted by the naughty list for 12
   hours. A peer whose session drops (as opposed to a dial that fails) is retired and
   redialled by the next tick with no backoff and a full resync; `handle_disconnect` should

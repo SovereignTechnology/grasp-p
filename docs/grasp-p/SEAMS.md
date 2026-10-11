@@ -295,6 +295,96 @@ the other tests drive are kept by hand. No test runs a pair wired through the bo
 relay alone; the unit test `the_bootstrap_relay_is_a_peer_when_no_list_names_it` covers
 that mapping.
 
+## What the blob routes answer
+
+All of this is in GRASP-P's own files (`src/http/blossom.rs`, `src/grasp_p/`); it adds no
+seam to a file upstream owns, no setting, and nothing to `policy_fingerprint`.
+
+- **Headers on every response.** `X-Content-Type-Options: nosniff`. A blob is whatever
+  bytes a client uploaded, and a browser must not guess a type for them. The CORS
+  expose list of these routes names `X-Reason` and `Retry-After` beside upstream's
+  `WWW-Authenticate`, so a browser client can read why a request failed and when to
+  retry. The public routes keep upstream's list on their own responses. The `OPTIONS`
+  preflight is the exception: `src/http/mod.rs` answers it for every path of a GRASP-P
+  node from the blob routes' CORS function, so on public paths too it names the three
+  headers and says `nosniff`. Both are without effect there (a preflight has no body and
+  its expose list is not read).
+- **A served blob** (`GET` and `HEAD /<sha256>`, same headers) also carries
+  `Content-Security-Policy: default-src 'none'; sandbox`, `Cache-Control: no-cache` and a
+  strong `ETag` that is the sha256 in quotes. It used to say `public, max-age=31536000,
+  immutable`, which let every cache serve a taken-down blob for a year. Now a cache may
+  keep the bytes but asks the node before each reuse.
+- **Conditional requests.** `If-None-Match` (one tag, a list, a weak tag or `*`) is
+  answered `304`, with the same `ETag` and `Cache-Control` and no body, only after the
+  denylist check and the existence check. A cache that revalidates a blob that has been
+  taken down gets the `451`, and one that revalidates a removed blob gets the `404`. The
+  order lives in one function, `decide_blob_read`, apart from the code that reads the
+  facts and builds the responses, and a unit test walks every combination.
+- **Errors and 404s** say `Cache-Control: no-store`: a `404` and a `451` are cacheable by
+  default and a cached one would outlive its cause.
+- **`WWW-Authenticate: Nostr`** on every `401` and on no other status.
+- **`X-Reason` never carries internal detail.** An internal failure reads `internal error`
+  to the client, and a body that could not be read reads `request body error`;
+  `BlobError::public_reason()` is what the HTTP layer sends, and it logs the detail once
+  (`blob route internal error: ...`). `BlobError::reason()` is unchanged, and the mirror's
+  retry classes and log lines still read it.
+- **`uploaded` is real.** `BlobClaim.stored_at` records when this node first stored a
+  blob, by upload or by mirroring. `GET /list` and the `PUT /upload` descriptor report it,
+  and a repeat upload reports the first time, not the time of the repeat. It is per node:
+  the two nodes of a pair report different times for one blob. Claims are stored as JSON
+  (`heed`'s `SerdeJson`), so the field is optional with a default: a claim written by an
+  older build reads as "time unknown" and is listed with `uploaded: 0` until the blob is
+  uploaded again, which records the time of that upload; an older build reading a newer
+  claim ignores the field, and drops it from any claim it rewrites, so after a roll-back
+  the time is unknown again until the next upload. The time belongs to the claim: when GC
+  or a takedown deletes the claim and the blob is stored again, that is a new first time.
+  No migration.
+- **Authorization events (kind 24242)** are accepted only with `created_at` between one
+  hour before and fifteen minutes after the node's clock (it was 24 hours either way),
+  whatever their `expiration`. A BUD-11 `server` tag is checked: an event that carries
+  such tags is refused unless one names this node, a `list` authorization must carry
+  one, and `upload` and `delete` do not need one until the client sends it (M4). "Names
+  this node" is the configured domain (`NGIT_DOMAIN`), compared by `host::url_denotes_domain`
+  like every other such check: the host without regard to case or a trailing dot, and the
+  port when the domain has one. The tag is a bare domain, so the mount path of a node under
+  `NGIT_BASE_PATH` is not compared. A refused `GET /list` is still the one identical `401`,
+  whichever check failed.
+- **No record of used authorizations**, on purpose. What a captured authorization can
+  still do inside its window (75 minutes at most): a list authorization returns that
+  key's inventory to whoever presents it; an upload authorization, with the bytes, stores
+  the blob again if its owner deleted it meanwhile; a delete authorization removes the
+  claim again if its owner uploaded the blob again meanwhile. Nothing else: no other
+  blob, no other alias, and where the event carries a `server` tag no other server. A
+  record of used ids would close these three only on one node and only until its next
+  restart, because a table in one process is neither shared with the peer node nor kept
+  over a restart, so the node does not promise it. The window and the tag are stateless and the same on both nodes. They are not
+  in `policy_fingerprint` because authorization events are never replicated: no setting
+  is involved, both nodes run the same build, and a difference could not make two nodes
+  hold different data.
+- **Denylist reload starts from the boot load.** `denylist::load_boot` returns what it
+  read from each file, the service keeps it, and the reload task takes it as its starting
+  state. It used to start from nothing, so a file that could not be read or parsed again
+  after boot had no entries to keep, and the next change to any other file swapped in a
+  set without them. Now the first reload after boot changes nothing unless a file changed,
+  and such a file keeps what it had. What a **missing** file means is not changed: it
+  counts as empty, at boot and on reload. That is an open decision (`PLAN.md`).
+- **Upload temp files are swept at startup.** `BlobStore::open` unlinks every regular
+  file and symlink directly in `<blob root>/tmp`, judged with `symlink_metadata`, so a
+  link is removed and not followed, and a directory is neither removed nor entered. A
+  `tmp` that is itself a link is not swept at all, with a warning. It
+  logs the number of entries and bytes, and an error is a warning, not a failed start.
+  This is safe because nothing can be uploading yet: the store is opened inside
+  `PrivateService::new`, which `create_relay` awaits before the mirror task is spawned
+  (`spawn_background_tasks`) and before the HTTP listener serves its first request, and
+  one process owns a data directory.
+
+What changes for clients: the client sends no `server` tag and never lists or deletes, so
+nothing breaks for it; its tokens already expire after an hour; a client whose clock runs
+more than fifteen minutes fast is refused on the blob routes, as its events already are.
+A third-party Blossom client that lists without a `server` tag gets the `401`. Anything in
+front of a node that caches must honour the origin's cache headers on blob paths
+(`ops/runbook.md`, takedown procedure).
+
 ## Decisions made during the port
 
 - **Names.** `HttpService.private` and the write-policy field are `grasp_p`;
@@ -435,6 +525,23 @@ features. No package was added.
   (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
   `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. No test runs a
   peer with the guards on.
+- The blob routes ("What the blob routes answer"). Unit tests carry the rules, without a
+  server: in `src/http/blossom.rs` the headers of every error, of a served blob and of its
+  `304`, the `If-None-Match` matching, and the order denylist, existence, conditional
+  (`conditional_answer_comes_after_denylist_and_existence`); in
+  `src/grasp_p/blossom_auth.rs` the window and the `server` tag for each operation,
+  including that a refused list has one reason whatever failed; in
+  `src/grasp_p/blob_store.rs` the stored time and the temp sweep (with symlinks and a
+  subdirectory); in `src/grasp_p/denylist.rs` the seeded reload, with a file that became
+  unreadable and one that stopped parsing, and the unchanged meaning of a missing file;
+  in `src/grasp_p/meta.rs` that a claim without the new field still reads. In
+  `private_repos`, `exit5` checks the challenge on each `401` and its absence on `403`,
+  `400` and `200`, and an authorization for another server; `exit29` checks the headers
+  of a served blob, the `304`, and that a conditional request for a denylisted or absent
+  hash is never a `304`; `exit30` revalidates one blob before and after its takedown;
+  `exit40` checks `uploaded` in the descriptor, in the list and on a repeat upload, and
+  that a list without a `server` tag, or with another server's, is the same `401`. The
+  list helper of that suite now takes the node's domain, because a list needs the tag.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync
