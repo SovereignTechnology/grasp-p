@@ -141,6 +141,18 @@ project yet.
   can fill it and honest early events then wait for the full re-issue.
 - **Upload slots.** 64 for the whole node, no cap per tenant and no timeout on reading a
   body, so one write key can hold them all and stall the mirror too. With #25 and #26.
+  **Done:** at most `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` uploads in flight per account
+  (default 8, answered `429`), a full node answers `503` where it answered `507`, the
+  mirror takes no slot, and an upload body is cut with `408` after 30 seconds of silence
+  or past a deadline set by `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC`.
+  `ngit_private_upload_refused_total` counts each. See "Upload slots and the body
+  timeout" in [`SEAMS.md`](SEAMS.md). Still open: eight or more accounts that each declare
+  a large blob and send a byte inside every idle period can hold the node's 64 slots
+  until the total deadline (about 4 h 33 min for 256 MiB at the default rate), because
+  the rate is not checked as the body arrives; the bytes uploads in flight have reserved
+  (up to 16 GiB at the defaults) still count against the global budget, so a node that
+  close to it can still have mirror fetches refused with `quota`; and the client does
+  not retry these answers yet.
 - **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the
   charge on the uploader for good, at no cost to itself.
 - **Order of checks in registration.** Proofs of possession are verified before the key

@@ -502,6 +502,66 @@ loop — identify it via nginx access logs before relaxing limits. Defaults
 are sized so honest cord-git flows, including widen→narrow rotations, never
 trip (src/config.rs:743–756).
 
+### Upload slots exhausted
+
+**Alert:** `NgitPrivateUploadSlotsExhausted` —
+`increase(ngit_private_upload_refused_total{reason="node_slots"}[10m]) > 0`
+for 15m.
+
+What it means: the node serves at most 64 client uploads at once, and
+clients have been turned away repeatedly over fifteen minutes with `503`
+because all 64 were taken. Nothing stored is at risk and replication does
+not wait for a slot (the blob mirror takes none); it can still be refused
+with `quota` if the node is within the bytes reserved by uploads in flight
+(up to 64 times the largest blob, 16 GiB at the defaults) of its global
+budget. Clients cannot push new content while it lasts, and the client does
+not retry by itself.
+
+What the four reasons of `ngit_private_upload_refused_total` mean, and what a
+client saw:
+
+| `reason` | answer | cause | what to do |
+| --- | --- | --- | --- |
+| `account_slots` | `429`, `Retry-After: 5`, `X-Reason: too many uploads in progress for this account; retry later` | one account has `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` (default 8) uploads in flight | nothing if occasional. Steady from honest users: a team sharing one hosting key pushes in parallel; raise the setting. Steady with `idle_timeout` or `deadline`: one account is stalling uploads, and the cap is doing its job |
+| `node_slots` | `503`, `Retry-After: 30`, `X-Reason: all upload slots are in use; retry later` | 64 client uploads in flight on the node | see below |
+| `idle_timeout` | `408`, `Connection: close`, `X-Reason: upload timed out waiting for the request body` | an upload sent nothing for 30 seconds | nothing if occasional (a client that lost its network). Many at once: stalled connections, deliberate or a broken path in front of the node |
+| `deadline` | the same `408` | an upload took longer than 30 seconds plus its declared length at `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC` (default 16384); also any upload that stalls within 30 seconds of its deadline, which includes every stalled upload smaller than one second's worth at the minimum rate (under 16 KiB at the default) | honest clients on slow lines: lower the setting, or `0` to keep only the idle cut-off. Otherwise: slow senders holding slots, cut as intended |
+
+None of these is `507`. `507` means storage (repository, account or node) is
+full, and is handled under [Ledger budget](#ledger-budget).
+
+Remediate a full node:
+
+```bash
+curl -s 127.0.0.1:9464/metrics | grep '^ngit_private_upload_refused_total'
+```
+
+- `node_slots` with `account_slots` and the timeouts rising too: several
+  accounts are holding slots with slow or stalled uploads. Each account is
+  already capped, so it takes at least eight accounts to fill the node at
+  the default. Lower `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` so that it takes
+  more of them, raise `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC` so that slow
+  uploads are cut sooner, and find where they come from in the front
+  proxy's access log (requests to `/upload` answered `408`, or closed
+  without a status). The log gives client addresses, not accounts; if the
+  senders are not customers, the admission mode is the real control (§1).
+- `node_slots` alone, no timeouts: honest load, more than 64 uploads at the
+  same moment. It clears by itself; clients that were refused run their
+  push again. If it is regular, the request-rate zone on `/upload` at the
+  front proxy (§6) spreads it.
+- Both settings are node-local and outside `policy_fingerprint`: change them
+  on one node and restart it, without touching its peer.
+
+What does not help: raising the storage quotas (these answers are not about
+storage), and `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` (the mirror has its own
+bound and is not counted here).
+
+The client uploads with a fixed 300 second timeout of its own and does not
+retry a `429`, `503` or `408`; the user sees the push fail with the status
+and the reason, and runs it again. A client that was still sending when the
+node answered may report a reset connection in place of the status, because
+the node closes the connection without reading the rest of the body.
+
 ### Hold saturated
 
 **Alert:** `NgitPrivateHoldSaturated` —
@@ -877,7 +937,19 @@ Also stable: `restricted: event exceeds private repo size limit`,
 `restricted: tenant has reached the alias limit`,
 `invalid: event created_at is too far in the future`,
 HTTP 413 `blob exceeds the maximum blob size`, and the 400/401/403/404/411
-blossom shapes (src/grasp_p/mod.rs:141–195).
+blossom shapes (`BlobError` in src/grasp_p/mod.rs).
+
+Three more answers of `PUT /upload`, none of which the client matches on or
+retries today (it reports the status and the reason, and the user runs the
+push again):
+
+| status | `X-Reason` | headers | class |
+| --- | --- | --- | --- |
+| 429 | `too many uploads in progress for this account; retry later` | `Retry-After: 5` | transient: the account has its maximum number of uploads in flight |
+| 503 | `all upload slots are in use; retry later` | `Retry-After: 30` | transient: the node has 64 client uploads in flight (this was a 507 `quota exceeded` before) |
+| 408 | `upload timed out waiting for the request body` | `Connection: close` | the upload stalled for 30 seconds or ran past its deadline; the whole upload has to be sent again |
+
+What to tune is in §3, [Upload slots exhausted](#upload-slots-exhausted).
 
 ---
 
@@ -919,6 +991,16 @@ sections):
   the signal. Bucket state is in-memory: a restart resets every bucket;
   ≤ 65536 keys tracked per limiter, idle entries swept after 1h
   (src/grasp_p/rate.rs:18–25), so key-churn cannot exhaust memory.
+- **Upload slots and body timeout** are separate from the two buckets:
+  `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` (default 8, `0` = off) caps the
+  uploads one account has in flight, and
+  `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC` (default 16384, `0` = idle
+  cut-off only) sets how long an upload body may take. Both are node-local
+  and outside the fingerprint. Meaning of each answer and what to change:
+  §3, [Upload slots exhausted](#upload-slots-exhausted). The time limits
+  need the front proxy to pass the body through as it arrives
+  (`proxy_request_buffering off`, as in nginx-upload-zones.conf); a proxy
+  that buffers the body hides a slow sender from the node.
 - Outer per-IP layer: nginx zones (nginx-upload-zones.conf) —
   `blobput` 10r/s burst 20 on `/upload`, `blobdel` 2r/s burst 5 on
   `DELETE /<sha256>`, throttles answered 429 via `limit_req_status`.

@@ -219,7 +219,31 @@ nodes of a pair report different times for one blob, and a repeat upload reports
 per-alias claim index (never a cross-tenant scan).
 
 Size limits **[N]**: event JSON ≤ 128 KiB; blob ≤ 256 MiB (both configurable). Concurrent uploads
-are capped (64) and reserved against the global byte budget BEFORE any body byte lands on disk.
+are capped and reserved against the global byte budget BEFORE any body byte lands on disk.
+
+**Upload answers [N].** Besides `200` and the authorization answers (`400`, `401`, `403`),
+`PUT /upload` answers:
+
+| Status | `X-Reason` | Meaning | Later attempt |
+|---|---|---|---|
+| `411` | `Content-Length header is required` | no declared length | with a length |
+| `413` | `blob exceeds the maximum blob size` | over the per-blob limit | never |
+| `451` | `content unavailable for legal reasons` | the hash is on the node's denylist | never |
+| `507` | `quota exceeded` | the repository, the account or the node is out of storage | after freeing storage |
+| `429` | `rate-limited; retry later` | the write key's rate bucket is empty; carries `Retry-After` | after `Retry-After` |
+| `429` | `too many uploads in progress for this account; retry later` | the account (the tenant key of the alias in the `a` tag) has its maximum number of uploads in flight, 8 by default; carries `Retry-After: 5` | when one of its uploads has ended |
+| `503` | `all upload slots are in use; retry later` | the node has 64 client uploads in flight; carries `Retry-After: 30` | after `Retry-After` |
+| `408` | `upload timed out waiting for the request body` | the body sent nothing for 30 seconds, or took longer in total than 30 seconds plus its declared length at the node's minimum rate (16 KiB/s by default); carries `Connection: close` | the whole upload, on a new connection |
+
+`507` is only about storage. A `429`, `503` or `408` stored nothing and reserved nothing; the
+same upload, with the same authorization while it is valid, can succeed later. The limits behind
+the last three are node-local and are not part of `policy_fingerprint`. A node answers a refused
+upload without reading the rest of its body and closes the connection, so a client that is still
+sending may see the connection reset in place of the status.
+
+The client today uploads with a fixed 300 second timeout of its own and does not retry any of
+`429`, `503` or `408`: the push fails with the status and reason, and running it again is the
+retry. Honouring `Retry-After` is planned for a later client milestone.
 
 ## 3. Client cryptography [N]
 
@@ -450,6 +474,10 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
   default capacity 120, refill 60/min. Synced and reprocess traffic (loopback:0) bypasses it, so it
   has no convergence impact — and is deliberately NOT in the policy fingerprint. Blob route answers
   429 with `Retry-After`.
+- **Upload slots and body timeout**: at most 8 uploads in flight per account (configurable) and
+  64 per node; the blob mirror takes no slot; an upload body is cut after 30 seconds of silence
+  or past a deadline that scales with its declared length. Answers in §2.4, "Upload answers".
+  Node-local, NOT in the policy fingerprint.
 - **30640 replacement-cadence limit**: per-`(tenant, alias)` bucket on same-tenant REPLACEMENTS,
   default capacity 8, refill 4/hour; burst must stay ≥ 4 (a §3.3 rotation is widen→narrow = 2
   replacements plus retries). **Hold semantics [N]**: a cadence-rejected replacement is both
@@ -576,6 +604,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.3 — unregistered stream wraps rejected outright (never the public path); stored held, ephemeral not; **[D]** on collab rumors dropped.
 - §2.3 — **stream wraps moved to their own kinds 3359/23359** (server `c5301bb`, client `eb1e5e2`); 1059 retained ONLY for genuine NIP-59 invites/promotions; legacy 1059/21059 dual-accept as a transitional window, default on; retired-kind rejection string (§5.2); tagless-admission gate written (`tests/private_repos.rs:4881,4892`), closing the hole `nip-conformance.md` item 7b recorded.
 - §2.4 — authorization window narrowed from ±24 h to one hour back and 15 minutes ahead; BUD-11 `server` tag (required for list); no used-id record, and why; response headers (`nosniff`, CSP, `no-cache` + `ETag` in place of a one-year `immutable`, `no-store` on errors, `WWW-Authenticate` on 401 only); `uploaded` is the stored time.
+- §2.4, §5.1 — upload answers listed; running out of upload slots answers `429` (per account) or `503` (node) with `Retry-After`, no longer `507`; an upload body that stalls or runs out of time is cut with `408`; the mirror takes no upload slot.
 - §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.

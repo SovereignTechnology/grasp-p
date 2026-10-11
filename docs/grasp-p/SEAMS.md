@@ -385,6 +385,105 @@ A third-party Blossom client that lists without a `server` tag gets the `401`. A
 front of a node that caches must honour the origin's cache headers on blob paths
 (`ops/runbook.md`, takedown procedure).
 
+## Upload slots and the body timeout
+
+In GRASP-P's own files (`src/grasp_p/mod.rs`, `src/http/blossom.rs`, one line in
+`src/grasp_p/mirror.rs`), plus two settings and one warning in `src/config.rs` and one
+counter in `src/metrics/mod.rs`. `src/http/mod.rs` is not touched. Nothing joins
+`policy_fingerprint`.
+
+- **What was wrong.** 64 upload slots served the whole node, shared by every client and
+  by the blob mirror. One account that opened 64 uploads and stopped sending took all of
+  them: no other account could upload and the mirror could not replicate. Running out of
+  slots answered `507 quota exceeded`, which tells a client its storage is full. And the
+  body of an upload was read with no time limit, so a stalled upload kept its slot, its
+  temp file and its reserved bytes for as long as the connection stayed open.
+- **Slots per account.** A client upload is counted against the tenant key of the alias
+  its authorization names (the registration's tenant, which `verify_blossom_auth` has
+  already matched to the `a` tag). At most `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` (default
+  8, `0` = no cap) are in flight for one account; one more is answered `429`, `X-Reason:
+  too many uploads in progress for this account; retry later`, `Retry-After: 5`.
+- **Slots of the node.** The cap of 64 client uploads stays, and is not a setting. A full
+  node answers `503`, `X-Reason: all upload slots are in use; retry later`,
+  `Retry-After: 30`. `507` is now only ever about bytes.
+- **Order of the checks.** Account cap, node cap, byte budget, under one lock
+  (`reserve_inflight`). An account at its own cap is told so even when the node is full,
+  because waiting for the node would not help it. A refusal takes nothing.
+- **The two `Retry-After` values are hints.** 5 seconds for the account: its slot comes
+  back when one of its own uploads ends, and an upload of ordinary size ends within
+  seconds. 30 seconds for the node: a full node usually means stalled uploads, and 30
+  seconds is when a stalled upload is cut.
+- **The mirror is outside both caps.** `reserve_upload` takes an origin. A mirror fetch
+  reserves its declared bytes against `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES`, as before, and
+  takes no slot: `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` already bounds how many run. So
+  clients that fill or stall the slots no longer make replication wait for a slot, and
+  the transient number of temp files is now at most 64 plus the mirror's concurrency.
+  This is about slots only. The bytes that client uploads have reserved still count
+  against the global budget the mirror reserves from: up to 64 uploads of the largest
+  blob, 16 GiB at the defaults (8 per account, 2 GiB), for as long as they are in
+  flight. A node closer than that to `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES` can still have
+  mirror fetches refused with `quota`, and client uploads with `507`, while stalled
+  uploads hold their reservations.
+- **Release.** Everything a reservation took (the bytes, the node slot, the account's
+  count) is given back by `UploadReservation::drop` and nowhere else. The reservation is
+  a field of the upload sink, and the sink is a local of the request handler, so every
+  way an upload can end drops it: success and every error return of the handler, the
+  timeout, a client that disconnects (the body read fails, or hyper drops the handler's
+  future), and a panic unwinding through the handler. The sink's own `Drop` removes the
+  temp file first. An account's entry in the map is removed when its count reaches zero,
+  so the map is never larger than the number of uploads in flight.
+- **Body timeout.** `next_frame` in `src/http/blossom.rs` waits for each piece of the
+  body under two clocks. Idle: 30 seconds between two pieces (a constant). Total: 30
+  seconds plus the declared `Content-Length` divided by
+  `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC` (default 16384; `0` = no total deadline),
+  counted from the moment the body starts being read. The total is also checked before
+  each read, so a body that always has a few bytes ready cannot outrun it. Either expiry
+  answers `408`, `X-Reason: upload timed out waiting for the request body`, and
+  `Connection: close`. Writing a piece to disk and the final rename and ledger update
+  are not under these clocks; they do not depend on the client.
+- **What hyper does with the rest of the body** (read from hyper 1.11.1,
+  `proto/h1/dispatch.rs` and `conn.rs`; the node serves HTTP/1.1 only). When the handler
+  answers before the body has been read to its end, hyper does not drain it. It makes one
+  attempt to read what has already arrived; if that completes the body (a small upload
+  whose bytes came with the head) the connection stays usable, otherwise hyper closes its
+  reading side, switches keep-alive off, sends the response and shuts the connection
+  down. That holds for every early answer of `PUT /upload` (`413`, `429`, `503`, `507`,
+  `408`), and was already so before this change. A client that is still sending when the
+  connection closes can get a reset from the operating system and lose the response it
+  had not read yet; a client that had stopped sending, which is the case the idle
+  cut-off is for, reads the `408` and then the end of the connection. The `408` says
+  `Connection: close` itself, so a client or a proxy that reads it knows not to reuse
+  the connection.
+- **Under `NGIT_TEST=1`** the idle time is 5 seconds, so an integration test can wait
+  for it. The unit tests pass the times in and run under paused time.
+- **Counter.** `ngit_private_upload_refused_total{reason}` with `account_slots`,
+  `node_slots`, `idle_timeout` and `deadline`. No label carries a tenant, an alias or a
+  key. The alert `NgitPrivateUploadSlotsExhausted` is on `node_slots`. A stall that
+  begins within the idle time of the deadline is cut at the deadline and counted as
+  `deadline`. That includes every stalled upload smaller than one second's worth at
+  the minimum rate (under 16 KiB at the default), whose deadline is the idle time
+  itself.
+- **Both settings are node-local.** They decide when a client is told to wait or is cut
+  off, never which blob or event a node accepts, so the two nodes of a pair may differ
+  and the fingerprint has nothing to cover. Every value is valid; a cap per account
+  of 64 or more draws a warning at start.
+- **What a client sees.** The client today uploads with a fixed 300 second timeout of
+  its own and does not retry a `429`, a `503` or a `408`: the push fails with the status
+  and the reason, and running it again is the retry. Retrying on `Retry-After` belongs
+  to a later client milestone. With one hosting key for a whole team, the team shares
+  the account's 8 concurrent uploads. At the default rate the node's deadline is longer
+  than the client's own 300 seconds for any blob above about 4.2 MiB (4,423,680 bytes),
+  so for those the client gives up first.
+- **Still open.** The total deadline is one point in time, not a rate that is checked
+  as the body arrives. An upload that declares the largest blob (256 MiB by default)
+  and sends one byte inside every idle period keeps its slot until that deadline, about
+  4 hours 33 minutes at the default rate, having sent a few hundred bytes. Eight
+  accounts doing so fill the 64 slots for that long. The cap per account makes that
+  cost eight registered accounts where it cost one, and the mirror takes no slot.
+  Checking the bytes received against the rate as the body arrives would close it and
+  is not done here. The bytes such uploads reserve are held for as long (see "The
+  mirror is outside both caps").
+
 ## Decisions made during the port
 
 - **Names.** `HttpService.private` and the write-policy field are `grasp_p`;
@@ -593,6 +692,21 @@ features. No package was added.
   `exit40` checks `uploaded` in the descriptor, in the list and on a repeat upload, and
   that a list without a `server` tag, or with another server's, is the same `401`. The
   list helper of that suite now takes the node's domain, because a list needs the tag.
+- Upload slots and the body timeout ("Upload slots and the body timeout"). Unit tests in
+  `src/grasp_p/mod.rs` drive `reserve_inflight` without a server: the cap per account and
+  its `429`, the node cap and its `503` and which of the two answers first, `0` turning
+  the cap per account off, the mirror passing a full node while still bound by the byte
+  budget, and the map of accounts being empty after every reservation is dropped, in any
+  order and through a panic; one more builds the service and checks the default of 8 and
+  the cap of 64 through `reserve_upload`. In `src/http/blossom.rs`, under paused time, a
+  silent body is cut after the idle time, a body that sends a byte every ten seconds is
+  cut at the total deadline and never without one, and the deadline is computed from the
+  declared length (`0` = none, and an absurd length does not panic); the headers of the
+  three new answers are checked beside the other errors. In `private_repos`, `exit41`
+  runs a real node: a second upload of an account whose one slot is held gets the `429`,
+  another account uploads meanwhile, the held upload is cut with `408` once it stops
+  sending, and the account then uploads again. No integration test fills the 64 slots
+  of the node; the `503` is covered by the unit tests only.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync

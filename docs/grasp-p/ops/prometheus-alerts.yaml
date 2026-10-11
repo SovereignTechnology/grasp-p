@@ -181,6 +181,34 @@ groups:
           description: "The in-memory hold for private events that arrive before their registration has been at a bound for 15m ({{ $labels.reason }}). Early events are dropped: one from the peer is fetched again when its registration is accepted or, at the latest, with the next full re-issue; one from a client must be published again. Usually a flood of events for unregistered aliases or keys; check the rejection mix and the source before anything else."
           runbook: "docs/grasp-p/ops/runbook.md#hold-saturated"
 
+      # Upload slots of the node exhausted. A node serves at most 64 client
+      # uploads at once; one more is answered 503 and counted here.
+      # Refusals that keep coming for fifteen minutes mean clients cannot
+      # push new content: either many accounts are holding slots with slow
+      # or stalled uploads, or honest load is above 64 at once. Replication
+      # does not wait for a slot (the blob mirror takes none) and nothing
+      # stored is at risk.
+      # The window is 10m and `for` is 15m so that one burst of refusals,
+      # which keeps the expression above zero for ten minutes, does not
+      # fire the alert.
+      # The other reasons are left out on purpose: account_slots is one
+      # account at its own cap, which is the cap working, and idle_timeout
+      # and deadline are single uploads being cut, which happens whenever a
+      # client loses its network.
+      # The series appears at its first increment, so the rule is inert on
+      # a node that has never been full.
+      - alert: NgitPrivateUploadSlotsExhausted
+        expr: increase(ngit_private_upload_refused_total{reason="node_slots"}[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: ngit-grasp
+          component: grasp-p
+        annotations:
+          summary: "Uploads are being refused: every upload slot of the node is taken"
+          description: "Clients have repeatedly been answered 503 on PUT /upload over the last 15m because the node's 64 upload slots were all in use. Check ngit_private_upload_refused_total by reason: with idle_timeout or deadline rising too, slow or stalled uploads are holding the slots; alone, it is honest load. Clients do not retry by themselves."
+          runbook: "docs/grasp-p/ops/runbook.md#upload-slots-exhausted"
+
       # Full re-issue silence (Phase-4b B1). The timer fires one since=None
       # re-issue round per NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS (default
       # 3600, +-10% jitter; first fire one interval after boot). FS-8: a
