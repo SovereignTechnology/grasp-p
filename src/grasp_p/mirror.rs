@@ -62,7 +62,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::blob_store::UploadSink;
-use super::{BlobError, PrivateService};
+use super::{BlobError, PrivateService, UploadOrigin};
 
 /// One blob a mirror job wants locally.
 #[derive(Debug, Clone)]
@@ -695,11 +695,16 @@ async fn fetch_from_peer(
     // PUT: reservation → sink → stream → finish). finish() releases any
     // pending speculative charge before its quota check, so the reserve nets
     // it too (FF).
+    //
+    // The reservation is for bytes only. A fetch takes none of the upload
+    // slots clients share, so clients that fill or stall those slots cannot
+    // stop replication; the worker's own concurrency limit bounds how many
+    // fetches run at once.
     let pending = svc
         .pending_spec_release(&blob.sha256)
         .map_err(|e| format!("reserve: {}", e.reason()))?;
     let reservation = svc
-        .reserve_upload(blob.size, pending)
+        .reserve_upload(UploadOrigin::Mirror, &job.tenant_hex, blob.size, pending)
         .map_err(|e| match e {
             BlobError::QuotaExceeded => "quota".to_string(),
             other => format!("reserve: {}", other.reason()),

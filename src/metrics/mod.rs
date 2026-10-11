@@ -495,6 +495,28 @@ lazy_static! {
             .expect("register private hold dropped metric");
         metric
     };
+    static ref PRIVATE_UPLOAD_REFUSED_TOTAL: CounterVec = {
+        let metric = CounterVec::new(
+            Opts::new(
+                "ngit_private_upload_refused_total",
+                "Client blob uploads refused or cut for a reason other than \
+                 authorization, size or quota, by reason: account_slots (the \
+                 account had its maximum number of uploads in flight; 429), \
+                 node_slots (every upload slot of the node was taken; 503), \
+                 idle_timeout (the body sent nothing for the idle time; 408), \
+                 deadline (the body took longer in total than its declared \
+                 length allows, including a stall that ends at the deadline; \
+                 408). node_slots means clients are being turned \
+                 away from a full node and is the one to alert on.",
+            ),
+            &["reason"],
+        )
+        .expect("build private upload refused metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private upload refused metric");
+        metric
+    };
     static ref PURGATORY_GIT_FETCH_PASSES_TOTAL: Counter = {
         let metric = Counter::with_opts(Opts::new(
             "ngit_purgatory_git_fetch_passes_total",
@@ -963,6 +985,16 @@ pub fn record_private_report_event() {
 /// event, so the series count stays fixed.
 pub fn record_private_hold_dropped(reason: &str) {
     PRIVATE_HOLD_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record one client blob upload refused for want of a slot, or cut for a
+/// body that stalled or ran out of time. `reason` is one of a fixed set
+/// (`account_slots`, `node_slots`, `idle_timeout`, `deadline`); never pass
+/// anything derived from the request, so the series count stays fixed.
+pub fn record_private_upload_refused(reason: &str) {
+    PRIVATE_UPLOAD_REFUSED_TOTAL
         .with_label_values(&[reason])
         .inc();
 }

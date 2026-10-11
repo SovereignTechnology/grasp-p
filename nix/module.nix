@@ -814,6 +814,33 @@ let
         '';
       };
 
+      privateMaxUploadsPerTenant = mkOption {
+        type = types.int;
+        default = 8;
+        description = ''
+          GRASP-P: blob uploads one account may have in flight at the same
+          time, counted by the tenant key of the alias the upload's
+          authorization names. One more is refused with 429 and Retry-After.
+          0 = no cap per account. The node serves at most 64 client uploads
+          at once whatever this value, so 64 or more lets one account take
+          every slot. The blob mirror is not counted. Node-local: not part
+          of the policy fingerprint.
+        '';
+      };
+
+      privateUploadMinBytesPerSec = mkOption {
+        type = types.int;
+        default = 16384;
+        description = ''
+          GRASP-P: slowest average rate, in bytes per second, at which the
+          body of a PUT /upload may arrive. An upload gets 30 seconds plus
+          its declared length divided by this rate and is cut with 408 when
+          that time is up. 0 = no such deadline. Separately, an upload that
+          sends nothing for 30 seconds is cut. Node-local: not part of the
+          policy fingerprint.
+        '';
+      };
+
       privateRegistrationReplaceCapacity = mkOption {
         type = types.int;
         default = 8;
@@ -1087,6 +1114,10 @@ let
       NGIT_GRASP_P_WRITE_RATE_CAPACITY = toString cfg.privateWriteRateCapacity;
       NGIT_GRASP_P_WRITE_RATE_REFILL_PER_MIN =
         toString cfg.privateWriteRateRefillPerMin;
+      NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT =
+        toString cfg.privateMaxUploadsPerTenant;
+      NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC =
+        toString cfg.privateUploadMinBytesPerSec;
       NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY =
         toString cfg.privateRegistrationReplaceCapacity;
       NGIT_GRASP_P_REGISTRATION_REPLACE_REFILL_PER_HOUR =

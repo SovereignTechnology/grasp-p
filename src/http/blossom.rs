@@ -3,8 +3,8 @@
 //! Routed from `HttpService::call` between the git-URL block and the NIP-11
 //! Accept check, and only when a `PrivateService` exists
 //! (`NGIT_GRASP_P_REPOS_ENABLE=true`). Unlike the git endpoints, these routes
-//! use real HTTP status codes (400/401/403/404/411/413/451/507) with the
-//! reason mirrored in an `X-Reason` header. Upload, delete and list need a
+//! use real HTTP status codes (400/401/403/404/408/411/413/429/451/503/507)
+//! with the reason mirrored in an `X-Reason` header. Upload, delete and list need a
 //! kind-24242 authorization; `GET`/`HEAD /<sha256>` are anonymous by design.
 //!
 //! What every response of these routes says to a browser or a cache:
@@ -21,15 +21,24 @@
 //! - Errors and `404`s say `Cache-Control: no-store`: `404` and `451` are
 //!   cacheable by default, and a cached one would outlive its cause.
 //! - `WWW-Authenticate: Nostr` on a `401` and on no other status.
+//! - `Retry-After` on a `429` and a `503`: the request was sound and the
+//!   same request can succeed later.
+//!
+//! An upload body is read under two clocks (see [`next_frame`]): one for
+//! the gap between two pieces of the body, one for the body as a whole. A
+//! body that runs out of either is answered `408` and what it held is
+//! given back.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use http_body_util::BodyExt;
-use hyper::body::{Bytes, Frame, Incoming};
+use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::{Method, Request, Response};
 use nostr_sdk::prelude::PublicKey;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::git::{empty_body, full_body, GitResponseBody};
 use crate::grasp_p::blossom_auth::authorize_list;
@@ -40,6 +49,17 @@ use http_body_util::StreamBody;
 
 /// What a client is told when its upload body could not be read.
 const BODY_ERROR_REASON: &str = "request body error";
+
+/// How long a `PUT /upload` may go without delivering the next piece of its
+/// body. Without it a client that stops sending keeps its upload slot, its
+/// temp file and its reserved bytes for as long as it keeps the connection
+/// open. The same time is the head start of the total deadline
+/// ([`upload_time_allowance`]).
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The idle time under `NGIT_TEST=1`, short enough for an integration test
+/// to wait for and long enough that a loaded test machine does not trip it
+/// in the middle of an honest upload.
+const UPLOAD_IDLE_TIMEOUT_UNDER_TEST: Duration = Duration::from_secs(5);
 
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 const STREAM_CHANNEL_DEPTH: usize = 8;
@@ -164,9 +184,15 @@ fn error_response(err: &BlobError) -> Response<HttpBody> {
         );
     let builder = match err {
         BlobError::Unauthorized(_) => builder.header("WWW-Authenticate", "Nostr"),
-        BlobError::RateLimited { retry_after_secs } => {
+        BlobError::RateLimited { retry_after_secs }
+        | BlobError::TooManyUploads { retry_after_secs }
+        | BlobError::UploadsBusy { retry_after_secs } => {
             builder.header("Retry-After", retry_after_secs.to_string())
         }
+        // The rest of the body was never read, so the connection cannot
+        // carry another request. Saying so lets the client stop sending and
+        // open a new one, where it would otherwise find out from a reset.
+        BlobError::BodyTimeout => builder.header("Connection", "close"),
         _ => builder,
     };
     builder.body(empty_body()).unwrap()
@@ -337,9 +363,120 @@ pub(crate) async fn handle_upload_preflight(
     }
 }
 
+/// The idle time in force for this process.
+fn upload_idle_timeout() -> Duration {
+    if std::env::var("NGIT_TEST").as_deref() == Ok("1") {
+        UPLOAD_IDLE_TIMEOUT_UNDER_TEST
+    } else {
+        UPLOAD_IDLE_TIMEOUT
+    }
+}
+
+/// Which of the two clocks on an upload body ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyCut {
+    /// Nothing arrived for the idle time.
+    Idle,
+    /// The body as a whole took longer than its declared length allows.
+    Deadline,
+}
+
+impl BodyCut {
+    /// The `reason` label of `ngit_private_upload_refused_total`.
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle_timeout",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
+/// How long the whole body of an upload of `declared_len` bytes may take:
+/// `grace` plus the time the declared length needs at `min_bytes_per_sec`.
+/// `None` when the rate is 0, which leaves only the idle cut-off.
+///
+/// The idle cut-off alone does not bound an upload: a client that sends one
+/// byte just inside every idle period holds its slot for days. The deadline
+/// scales with the declared length so that a large blob on a slow but
+/// honest line is not cut, and the grace keeps a small blob from getting no
+/// time at all.
+fn upload_time_allowance(
+    grace: Duration,
+    declared_len: u64,
+    min_bytes_per_sec: u64,
+) -> Option<Duration> {
+    if min_bytes_per_sec == 0 {
+        return None;
+    }
+    Some(grace.saturating_add(Duration::from_secs(declared_len / min_bytes_per_sec)))
+}
+
+/// The instant an upload that starts at `start` must have delivered its
+/// whole body by, if there is one. An allowance too long to be an instant
+/// is no deadline.
+fn upload_deadline(
+    start: Instant,
+    grace: Duration,
+    declared_len: u64,
+    min_bytes_per_sec: u64,
+) -> Option<Instant> {
+    upload_time_allowance(grace, declared_len, min_bytes_per_sec)
+        .and_then(|allowance| start.checked_add(allowance))
+}
+
+/// What a body yields for one frame: the frame, or the transport's error.
+type BodyFrame<B> = Result<Frame<<B as Body>::Data>, <B as Body>::Error>;
+
+/// Wait for the next frame of an upload body, for at most `idle` and never
+/// past `deadline`.
+///
+/// `Ok` carries what the body itself yielded: a frame, an error of the
+/// transport, or `None` at the end. `Err` says which clock ran out; the
+/// body is then left as it is and the caller answers without it.
+///
+/// The deadline is checked before the body is polled as well. A timer
+/// alone would only fire while the body has nothing to give, so a body
+/// that always has a few bytes ready could run past its deadline.
+async fn next_frame<B>(
+    body: &mut B,
+    idle: Duration,
+    deadline: Option<Instant>,
+) -> Result<Option<BodyFrame<B>>, BodyCut>
+where
+    B: Body + Unpin,
+{
+    let now = Instant::now();
+    let idle_until = now + idle;
+    let (until, cut) = match deadline {
+        Some(deadline) if deadline <= now => return Err(BodyCut::Deadline),
+        Some(deadline) if deadline <= idle_until => (deadline, BodyCut::Deadline),
+        _ => (idle_until, BodyCut::Idle),
+    };
+    tokio::time::timeout_at(until, body.frame())
+        .await
+        .map_err(|_elapsed| cut)
+}
+
+/// Count an upload refused for want of a slot. The other refusals of
+/// `begin_upload` (size, quota, denylist) have their own places.
+fn record_slot_refusal(err: &BlobError) {
+    let reason = match err {
+        BlobError::TooManyUploads { .. } => "account_slots",
+        BlobError::UploadsBusy { .. } => "node_slots",
+        _ => return,
+    };
+    crate::metrics::record_private_upload_refused(reason);
+}
+
 /// `PUT /upload` — streaming upload: frames are hashed + counted while being
 /// written to a temp file; mid-stream overrun aborts with 413; the final hash
 /// must equal the auth `x` tag.
+///
+/// Every `return` below the `begin_upload` call drops `sink`, and the sink
+/// owns the temp file and the reservation (upload slot, account count,
+/// reserved bytes). That drop is the only release there is, so an upload
+/// that ends early for any reason gives everything back; the same holds
+/// when the client goes away and hyper drops this future.
 pub(crate) async fn handle_upload_put(
     private: &Arc<PrivateService>,
     req: Request<Incoming>,
@@ -407,13 +544,36 @@ pub(crate) async fn handle_upload_put(
     // the streaming sink.
     let mut sink = match private.begin_upload(&auth, declared_len).await {
         Ok(sink) => sink,
-        Err(e) => return error_response(&e),
+        Err(e) => {
+            record_slot_refusal(&e);
+            return error_response(&e);
+        }
     };
 
     // Stream hyper's Incoming frame-by-frame — never buffer the body.
+    let idle = upload_idle_timeout();
+    let deadline = upload_deadline(
+        Instant::now(),
+        idle,
+        declared_len,
+        private.upload_min_bytes_per_sec(),
+    );
     let mut body = req.into_body();
     loop {
-        match body.frame().await {
+        let next = match next_frame(&mut body, idle, deadline).await {
+            Ok(next) => next,
+            Err(cut) => {
+                crate::metrics::record_private_upload_refused(cut.as_label());
+                tracing::debug!(
+                    declared_len,
+                    received = sink.written(),
+                    reason = cut.as_label(),
+                    "blob upload cut: the body did not arrive in time"
+                );
+                return error_response(&BlobError::BodyTimeout);
+            }
+        };
+        match next {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     if let Err(e) = sink.write_chunk(&data).await {
@@ -603,6 +763,13 @@ mod tests {
             BlobError::RateLimited {
                 retry_after_secs: 7,
             },
+            BlobError::TooManyUploads {
+                retry_after_secs: 5,
+            },
+            BlobError::UploadsBusy {
+                retry_after_secs: 30,
+            },
+            BlobError::BodyTimeout,
             BlobError::Internal(DETAIL.into()),
         ]
     }
@@ -624,7 +791,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(statuses, [400, 401, 403, 411, 413, 451, 507, 429, 500]);
+        assert_eq!(
+            statuses,
+            [400, 401, 403, 411, 413, 451, 507, 429, 429, 503, 408, 500]
+        );
         assert_eq!(header(&not_found(), "www-authenticate"), None);
         assert_eq!(header(&blob_not_modified(SHA), "www-authenticate"), None);
     }
@@ -682,6 +852,205 @@ mod tests {
             header(&error_response(&BlobError::QuotaExceeded), "retry-after"),
             None
         );
+    }
+
+    /// Running out of upload slots is not running out of storage: the
+    /// answers are a 429 for the account and a 503 for the node, each with
+    /// a time to retry, and neither reads like the quota answer.
+    #[test]
+    fn slot_refusals_say_when_to_retry_and_are_not_the_quota_answer() {
+        use crate::grasp_p::{NODE_UPLOADS_RETRY_AFTER_SECS, TENANT_UPLOADS_RETRY_AFTER_SECS};
+
+        let account = error_response(&BlobError::TooManyUploads {
+            retry_after_secs: TENANT_UPLOADS_RETRY_AFTER_SECS,
+        });
+        assert_eq!(account.status().as_u16(), 429);
+        assert_eq!(header(&account, "retry-after"), Some("5"));
+
+        let node = error_response(&BlobError::UploadsBusy {
+            retry_after_secs: NODE_UPLOADS_RETRY_AFTER_SECS,
+        });
+        assert_eq!(node.status().as_u16(), 503);
+        assert_eq!(header(&node, "retry-after"), Some("30"));
+
+        let quota = error_response(&BlobError::QuotaExceeded);
+        assert_eq!(quota.status().as_u16(), 507);
+        for response in [&account, &node] {
+            let reason = header(response, "x-reason").unwrap_or_default();
+            assert!(reason.contains("retry later"), "{reason}");
+            assert!(!reason.contains("quota"), "{reason}");
+            assert_ne!(Some(reason), header(&quota, "x-reason"));
+            assert_eq!(header(response, "connection"), None);
+        }
+    }
+
+    /// A cut upload is told the connection is finished, and is not told to
+    /// retry at a given time: how long to wait is not the problem.
+    #[test]
+    fn body_timeout_is_a_408_that_closes_the_connection() {
+        let response = error_response(&BlobError::BodyTimeout);
+        assert_eq!(response.status().as_u16(), 408);
+        assert_eq!(header(&response, "connection"), Some("close"));
+        assert_eq!(header(&response, "retry-after"), None);
+        assert_eq!(
+            header(&response, "x-reason"),
+            Some("upload timed out waiting for the request body")
+        );
+        for err in every_error() {
+            if !matches!(err, BlobError::BodyTimeout) {
+                assert_eq!(header(&error_response(&err), "connection"), None);
+            }
+        }
+    }
+
+    type TestFrame = Result<Frame<Bytes>, std::convert::Infallible>;
+
+    /// A body that never yields anything.
+    fn silent_body() -> StreamBody<stream::Pending<TestFrame>> {
+        StreamBody::new(stream::pending())
+    }
+
+    /// A body that yields one byte every `gap`, for ever.
+    fn trickling_body(
+        gap: Duration,
+    ) -> impl Body<Data = Bytes, Error = std::convert::Infallible> + Unpin {
+        StreamBody::new(Box::pin(stream::unfold((), move |()| async move {
+            tokio::time::sleep(gap).await;
+            let frame: TestFrame = Ok(Frame::data(Bytes::from_static(b"x")));
+            Some((frame, ()))
+        })))
+    }
+
+    const IDLE: Duration = Duration::from_secs(30);
+
+    /// A body that sends nothing is cut after the idle time, with or
+    /// without a total deadline further away.
+    #[tokio::test(start_paused = true)]
+    async fn next_frame_times_out_on_an_idle_body() {
+        for deadline_after in [None, Some(Duration::from_secs(600))] {
+            let start = Instant::now();
+            let deadline = deadline_after.map(|after| start + after);
+            let mut body = silent_body();
+            let cut = next_frame(&mut body, IDLE, deadline)
+                .await
+                .expect_err("a silent body must be cut");
+            assert_eq!(cut, BodyCut::Idle, "deadline {deadline_after:?}");
+            assert_eq!(cut.as_label(), "idle_timeout");
+            let waited = start.elapsed();
+            assert!(
+                waited >= IDLE && waited < IDLE + Duration::from_secs(1),
+                "cut after {waited:?}, deadline {deadline_after:?}"
+            );
+        }
+    }
+
+    /// A body that keeps inside the idle time by sending a byte every ten
+    /// seconds is still cut, at the total deadline.
+    #[tokio::test(start_paused = true)]
+    async fn next_frame_enforces_the_total_deadline_on_a_trickle() {
+        let start = Instant::now();
+        let allowance = Duration::from_secs(45);
+        let deadline = Some(start + allowance);
+        let mut body = trickling_body(Duration::from_secs(10));
+
+        // Bounded, so that a deadline that is not enforced fails the test
+        // where an endless loop would hang it.
+        let mut frames = 0;
+        let cut = 'read: {
+            for _ in 0..10 {
+                match next_frame(&mut body, IDLE, deadline).await {
+                    Ok(Some(_frame)) => frames += 1,
+                    Ok(None) => panic!("the trickle never ends"),
+                    Err(cut) => break 'read cut,
+                }
+            }
+            panic!("a trickle must be cut at the deadline; read {frames} frames")
+        };
+        assert_eq!(cut, BodyCut::Deadline);
+        assert_eq!(cut.as_label(), "deadline");
+        // Bytes at 10, 20, 30 and 40 seconds; the fifth never arrives.
+        assert_eq!(frames, 4);
+        let waited = start.elapsed();
+        assert!(
+            waited >= allowance && waited < allowance + Duration::from_secs(1),
+            "cut after {waited:?}"
+        );
+
+        // Past the deadline nothing more is read, even when the body has a
+        // frame ready the moment it is asked.
+        let frame: TestFrame = Ok(Frame::data(Bytes::from_static(b"x")));
+        let mut ready = StreamBody::new(stream::iter([frame]));
+        assert_eq!(
+            next_frame(&mut ready, IDLE, deadline).await.err(),
+            Some(BodyCut::Deadline)
+        );
+        // Without a deadline the same body is read to its end.
+        assert!(matches!(
+            next_frame(&mut ready, IDLE, None).await,
+            Ok(Some(Ok(_)))
+        ));
+        assert!(matches!(next_frame(&mut ready, IDLE, None).await, Ok(None)));
+    }
+
+    /// The same trickle with no total deadline is never cut: every byte
+    /// arrives inside the idle time.
+    #[tokio::test(start_paused = true)]
+    async fn next_frame_without_a_deadline_follows_a_trickle() {
+        let start = Instant::now();
+        let mut body = trickling_body(Duration::from_secs(10));
+        for _ in 0..100 {
+            assert!(matches!(
+                next_frame(&mut body, IDLE, None).await,
+                Ok(Some(Ok(_)))
+            ));
+        }
+        assert!(start.elapsed() >= Duration::from_secs(1000));
+    }
+
+    #[test]
+    fn upload_deadline_scales_with_declared_length() {
+        let secs = Duration::from_secs;
+        // Nothing declared: the grace alone.
+        assert_eq!(upload_time_allowance(IDLE, 0, 16384), Some(secs(30)));
+        // Less than one second's worth adds nothing.
+        assert_eq!(upload_time_allowance(IDLE, 16383, 16384), Some(secs(30)));
+        assert_eq!(upload_time_allowance(IDLE, 16384, 16384), Some(secs(31)));
+        assert_eq!(
+            upload_time_allowance(IDLE, 10 * 16384, 16384),
+            Some(secs(40))
+        );
+        // The largest blob of a default node, 256 MiB, at the default rate.
+        assert_eq!(
+            upload_time_allowance(IDLE, 256 << 20, 16384),
+            Some(secs(30 + 16384))
+        );
+        // A higher floor gives less time for the same length.
+        assert_eq!(
+            upload_time_allowance(IDLE, 256 << 20, 1 << 20),
+            Some(secs(30 + 256))
+        );
+        // The grace is whatever idle time is in force.
+        assert_eq!(upload_time_allowance(secs(5), 16384, 16384), Some(secs(6)));
+
+        // 0 means no total deadline, whatever the length.
+        for len in [0, 1, 256 << 20, u64::MAX] {
+            assert_eq!(upload_time_allowance(IDLE, len, 0), None, "{len}");
+            assert_eq!(upload_deadline(Instant::now(), IDLE, len, 0), None, "{len}");
+        }
+
+        // The deadline is the start plus the allowance.
+        let start = Instant::now();
+        assert_eq!(
+            upload_deadline(start, IDLE, 10 * 16384, 16384),
+            Some(start + secs(40))
+        );
+        // A length and a rate that give an absurd time must not panic, and
+        // an allowance too long to be an instant is no deadline.
+        assert_eq!(
+            upload_time_allowance(IDLE, u64::MAX, 1),
+            Some(Duration::MAX)
+        );
+        assert_eq!(upload_deadline(start, IDLE, u64::MAX, 1), None);
     }
 
     #[test]

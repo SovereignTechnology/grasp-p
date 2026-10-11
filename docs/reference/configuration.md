@@ -1905,6 +1905,63 @@ per bucket instead of being free.
 
 ---
 
+### GRASP-P Upload Limits
+
+These settings bound how many blob uploads (`PUT /upload`) run at once and
+how long one may take. They only have an effect when
+`NGIT_GRASP_P_REPOS_ENABLE=true`. Like the write-rate settings above they are
+node-local: they decide when a client is told to wait or is cut off, never
+what a node accepts, so they are NOT part of the `policy_fingerprint`
+preimage and the two nodes of a pair may run different values.
+
+These limits apply to an upload, and each has its own answer:
+
+| Limit | Value | Answer |
+| --- | --- | --- |
+| Uploads in flight for one account | `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT` | `429` with `Retry-After: 5` |
+| Uploads in flight on the whole node | 64 (fixed) | `503` with `Retry-After: 30` |
+| Time between two pieces of a body | 30 seconds (fixed) | `408` with `Connection: close` |
+| Time for the whole body | 30 seconds + declared length / `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC` | `408` with `Connection: close` |
+
+None of these is the quota answer. `507` still means what it meant: the
+repository, the account or the node is out of storage. An upload refused with
+`429` or `503`, or cut with `408`, stored nothing and reserved nothing, and
+the same upload can succeed later. `X-Reason` says which limit it was.
+
+The account is the tenant key of the alias the upload's authorization names,
+so every write key of every repository of one account shares the account's
+slots. The blob mirror takes no slot of either kind (its own
+`NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` bounds it), so clients that fill or
+stall the slots do not stop replication; what the mirror fetches is still
+counted against `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES` while it is in flight.
+
+#### `NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT`
+
+**Description:** Blob uploads one account may have in flight at the same time. One more is refused with `429` and `Retry-After` until one of the account's uploads ends. `0` = no cap per account. The node serves at most 64 client uploads at once whatever this value, so `64` or more lets one account take every slot (the node warns at start).  
+**Type:** Integer  
+**Default:** `8`  
+**Required:** No
+
+#### `NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC`
+
+**Description:** Slowest average rate, in bytes per second, at which the body of a `PUT /upload` may arrive. An upload gets 30 seconds plus its declared `Content-Length` divided by this rate, and is cut with `408` when that time is up: at the default a 256 MiB blob gets about 4 hours 33 minutes, a 1 MiB blob 94 seconds. `0` = no such deadline. Separately, and whatever this value, an upload that sends nothing for 30 seconds is cut. Raise it to free slots sooner from slow senders; lower it, or set `0`, if honest clients on slow lines are being cut.  
+**Type:** Integer  
+**Default:** `16384`  
+**Required:** No
+
+**Metrics:**
+
+- `ngit_private_upload_refused_total{reason}` — client uploads refused or cut by these limits: `account_slots` (`429`), `node_slots` (`503`), `idle_timeout` and `deadline` (`408`). No account, alias or key is in a label.
+
+**What a front proxy changes:** the two time limits only see what reaches the
+node. A proxy that buffers the whole request body before passing it on hides
+a slow sender from them (and takes over the job of cutting it); the nginx
+configuration in `docs/grasp-p/ops/nginx-upload-zones.conf` passes the body
+through as it arrives (`proxy_request_buffering off`), which is what these
+limits assume.
+
+---
+
 ### GRASP-P Registration Replacement Cadence (Phase 4b)
 
 Kind-30640 is addressable, so replacements are free — and each one

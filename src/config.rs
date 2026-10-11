@@ -945,6 +945,31 @@ pub struct Config {
     )]
     pub private_write_rate_refill_per_min: u32,
 
+    /// Blob uploads one account may have in flight at the same time, counted
+    /// by the tenant key of the alias the upload's authorization names. One
+    /// more is refused with 429 and Retry-After until one of the account's
+    /// uploads ends. 0 = no cap per account. The node as a whole serves at
+    /// most 64 client uploads at once (not configurable; a full node answers
+    /// 503 with Retry-After), so a value of 64 or more lets one account take
+    /// every slot. The blob mirror is not counted. Node-local protection: it
+    /// changes when a client is told to wait, never what the node accepts, so
+    /// it is NOT part of the policy_fingerprint preimage.
+    #[arg(long, env = "NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT", default_value_t = 8)]
+    pub private_max_uploads_per_tenant: u32,
+
+    /// Slowest average rate, in bytes per second, at which the body of a
+    /// PUT /upload may arrive. An upload gets 30 seconds plus its declared
+    /// length divided by this rate, and is cut with 408 when that time is
+    /// up. 0 = no such deadline. Separately, and whatever this value, an
+    /// upload that sends nothing for 30 seconds is cut. Node-local
+    /// protection: NOT part of the policy_fingerprint preimage.
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC",
+        default_value_t = 16384
+    )]
+    pub private_upload_min_bytes_per_sec: u64,
+
     /// Per-(tenant, alias) token bucket capacity for same-tenant kind-30640
     /// REPLACEMENTS (free addressable replacements re-trigger sync index
     /// rebuilds + filter re-issues to all peers within seconds). 0 =
@@ -1608,6 +1633,19 @@ impl Config {
                      NGIT_GRASP_P_WRITE_RATE_CAPACITY is non-zero"
                 ));
             }
+            // Every value of the two upload limits is usable, 0 included
+            // (it turns the limit off), so neither can stop the node from
+            // starting. A cap per account that is not below the node's own
+            // cap limits nothing, and an operator who set one is told. 0 is
+            // the stated way to switch the cap off and draws no warning.
+            if self.private_max_uploads_per_tenant >= crate::grasp_p::MAX_CONCURRENT_UPLOADS {
+                tracing::warn!(
+                    grasp_p_max_uploads_per_tenant = self.private_max_uploads_per_tenant,
+                    node_upload_slots = crate::grasp_p::MAX_CONCURRENT_UPLOADS,
+                    "NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT is not below the node's upload \
+                     slots: one account can take every slot"
+                );
+            }
             if self.private_registration_replace_capacity > 0
                 && self.private_registration_replace_refill_per_hour == 0
             {
@@ -1983,6 +2021,8 @@ impl Config {
             private_accept_legacy_wrap_kind: true,
             private_write_rate_capacity: 120,
             private_write_rate_refill_per_min: 60,
+            private_max_uploads_per_tenant: 8,
+            private_upload_min_bytes_per_sec: 16384,
             private_registration_replace_capacity: 8,
             private_registration_replace_refill_per_hour: 4,
             private_full_reissue_interval_secs: 3600,
@@ -3516,6 +3556,28 @@ mod tests {
             ..Config::for_testing()
         };
         assert!(config.validate().is_ok());
+    }
+
+    /// Neither upload limit has a value that stops the node: 0 turns a
+    /// limit off, and a cap per account that reaches the node's slots only
+    /// warns.
+    #[test]
+    fn test_private_upload_limits_validation() {
+        for (per_tenant, min_rate) in [(8, 16384), (0, 0), (1, 1), (u32::MAX, u64::MAX)] {
+            let config = Config {
+                private_repos_enable: true,
+                private_max_uploads_per_tenant: per_tenant,
+                private_upload_min_bytes_per_sec: min_rate,
+                ..Config::for_testing()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "per account {per_tenant}, minimum rate {min_rate}"
+            );
+        }
+        let defaults = Config::for_testing();
+        assert_eq!(defaults.private_max_uploads_per_tenant, 8);
+        assert_eq!(defaults.private_upload_min_bytes_per_sec, 16384);
     }
 
     #[test]

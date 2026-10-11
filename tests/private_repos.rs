@@ -6209,3 +6209,203 @@ async fn grasp_p_node_refuses_to_start_when_its_metrics_address_is_taken() {
     );
     drop(taken);
 }
+
+// ============================================================================
+// Exit test 41 — upload slots per account, and a stalled upload is cut
+// ============================================================================
+
+/// PUT /upload → (status, X-Reason, Retry-After).
+async fn put_blob_answer(
+    relay: &TestRelay,
+    data: Vec<u8>,
+    sha: &str,
+    auth: &Event,
+) -> (u16, String, Option<String>) {
+    let resp = reqwest::Client::new()
+        .put(format!("{}/upload", http_base(relay)))
+        .header("authorization", auth_header_value(auth))
+        .header("x-sha-256", sha)
+        .body(data)
+        .send()
+        .await
+        .expect("PUT /upload transport");
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    (
+        resp.status().as_u16(),
+        header("x-reason").unwrap_or_default(),
+        header("retry-after"),
+    )
+}
+
+/// An account whose one upload slot is held by a slow upload is told to
+/// wait (429 with Retry-After, not the quota answer) while another account
+/// uploads freely. When the slow upload stops sending, the node cuts it
+/// with 408, closes the connection, stores nothing, and the account can
+/// upload again.
+///
+/// The node runs with `NGIT_TEST=1`, which shortens the idle time to five
+/// seconds. The total deadline is turned off so that the slow upload lives
+/// exactly as long as this test keeps feeding it.
+#[tokio::test]
+async fn exit41_stalled_upload_is_cut_and_frees_its_slot() {
+    let tenant = Keys::generate();
+    let other_tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant, &other_tenant]);
+    let relay = TestRelay::start_with_grasp_p(&[
+        ("NGIT_GRASP_P_MAX_UPLOADS_PER_TENANT", "1"),
+        ("NGIT_GRASP_P_UPLOAD_MIN_BYTES_PER_SEC", "0"),
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+    ])
+    .await;
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+    let other_writer = Keys::generate();
+    let other_alias = random_alias();
+    register_alias(&relay, &other_tenant, &other_writer, &other_alias).await;
+
+    let upload_auth = |signer: &Keys, sha: &str, owner: &Keys, alias: &str| {
+        blossom_auth_event(
+            signer,
+            "upload",
+            sha,
+            &owner.public_key(),
+            alias,
+            future_expiration(),
+        )
+    };
+
+    // The slow upload: the head, the first 300 of 4096 declared bytes, and
+    // then one byte at a time for as long as the loop below runs.
+    let slow = blob_bytes(141, 4096);
+    let slow_sha = sha256_hex(&slow);
+    let slow_auth = upload_auth(&writer, &slow_sha, &tenant, &alias);
+    let domain = relay.domain();
+    let mut request = format!(
+        "PUT /upload HTTP/1.1\r\nHost: {domain}\r\nAuthorization: {}\r\nX-SHA-256: {slow_sha}\r\nContent-Length: {}\r\n\r\n",
+        auth_header_value(&slow_auth),
+        slow.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&slow[..300]);
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", relay_port(&relay)))
+        .await
+        .expect("raw TCP connect");
+    stream.write_all(&request).await.expect("raw TCP write");
+    let mut sent = 300;
+
+    // A second upload of the same account is refused once the first holds
+    // the account's only slot. The first attempts may come before the node
+    // has read the slow upload's head; those succeed, and are repeated.
+    let quick = blob_bytes(142, 64);
+    let quick_sha = sha256_hex(&quick);
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (reason, retry_after) = loop {
+        stream
+            .write_all(&slow[sent..sent + 1])
+            .await
+            .expect("feed the slow upload");
+        sent += 1;
+        let auth = upload_auth(&writer, &quick_sha, &tenant, &alias);
+        let (status, reason, retry_after) =
+            put_blob_answer(&relay, quick.clone(), &quick_sha, &auth).await;
+        if status == 429 {
+            break (reason, retry_after);
+        }
+        assert_eq!(
+            status, 200,
+            "exit41: before the slot is held the upload passes; X-Reason: {reason}"
+        );
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "exit41: the second upload of the account was never refused"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        reason.contains("too many uploads in progress"),
+        "exit41: the 429 must be the slot answer, not the rate limit; X-Reason: {reason}"
+    );
+    assert!(
+        !reason.contains("quota"),
+        "exit41: a busy account is not a full one; X-Reason: {reason}"
+    );
+    assert_eq!(
+        retry_after.as_deref(),
+        Some("5"),
+        "exit41: the slot answer says when to retry"
+    );
+
+    // Another account is not held up by this one.
+    let theirs = blob_bytes(143, 64);
+    let theirs_sha = sha256_hex(&theirs);
+    let theirs_auth = upload_auth(&other_writer, &theirs_sha, &other_tenant, &other_alias);
+    let (status, reason, _) = put_blob_answer(&relay, theirs, &theirs_sha, &theirs_auth).await;
+    assert_eq!(
+        status, 200,
+        "exit41: another account must still upload; X-Reason: {reason}"
+    );
+
+    // Nothing more is sent. The node answers 408 by itself and closes the
+    // connection, which is what ends the read below.
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut answer))
+        .await
+        .expect("exit41: the node must close a stalled upload's connection")
+        .expect("exit41: read the node's answer");
+    let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+    assert!(
+        answer.starts_with("http/1.1 408"),
+        "exit41: a stalled upload must be answered 408; got: {:?}",
+        answer.lines().next()
+    );
+    assert!(
+        answer.contains("\r\nconnection: close\r\n"),
+        "exit41: the 408 must say the connection is finished; got: {answer}"
+    );
+
+    // The slot came back with the cut: the same account uploads again.
+    let auth = upload_auth(&writer, &quick_sha, &tenant, &alias);
+    let (status, reason, _) = put_blob_answer(&relay, quick, &quick_sha, &auth).await;
+    assert_eq!(
+        status, 200,
+        "exit41: the cut must free the account's slot; X-Reason: {reason}"
+    );
+    // And nothing of the cut upload was stored.
+    let (status, _) = get_blob(&relay, &slow_sha).await;
+    assert_eq!(
+        status, 404,
+        "exit41: a cut upload must leave no blob behind"
+    );
+
+    // Each refusal was counted once, under its own reason.
+    let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
+    let refused = |reason: &str| {
+        metrics
+            .counter("ngit_private_upload_refused_total", &[("reason", reason)])
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        refused("account_slots"),
+        1,
+        "exit41: the 429 must be counted once"
+    );
+    assert_eq!(
+        refused("idle_timeout"),
+        1,
+        "exit41: the cut must be counted as an idle timeout"
+    );
+    assert_eq!(refused("node_slots"), 0, "exit41: the node was never full");
+    assert_eq!(
+        refused("deadline"),
+        0,
+        "exit41: the total deadline is off in this test"
+    );
+
+    relay.stop().await;
+}

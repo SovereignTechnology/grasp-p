@@ -117,33 +117,168 @@ pub fn ephemeral_stream_wrap_kinds(accept_legacy: bool) -> Vec<u16> {
     kinds
 }
 
-/// Hard cap on concurrent in-flight blob uploads. Together with the in-flight
-/// byte reservation this bounds transient `<blob_root>/tmp` disk usage, file
-/// descriptors, and inodes BEFORE any request body bytes land on disk.
-const MAX_CONCURRENT_UPLOADS: u32 = 64;
+/// Hard cap on concurrent in-flight CLIENT blob uploads for the whole node.
+/// Together with the in-flight byte reservation this bounds transient
+/// `<blob_root>/tmp` disk usage, file descriptors, and inodes BEFORE any
+/// request body bytes land on disk. The mirror's fetches are not counted
+/// here: its own concurrency setting bounds them.
+pub(crate) const MAX_CONCURRENT_UPLOADS: u32 = 64;
+
+/// `Retry-After` for an upload refused because its account already has its
+/// maximum number of uploads in flight. A hint, not a promise: a slot comes
+/// back when one of the account's own uploads ends, and an upload of
+/// ordinary size ends within seconds.
+pub const TENANT_UPLOADS_RETRY_AFTER_SECS: u64 = 5;
+
+/// `Retry-After` for an upload refused because every upload slot of the
+/// node is taken. When the slots are full it is usually because uploads
+/// have stalled, and a stalled upload is cut after the idle time the HTTP
+/// layer allows between two pieces of a body (30 seconds), so that is when
+/// a slot is most likely to be free again.
+pub const NODE_UPLOADS_RETRY_AFTER_SECS: u64 = 30;
+
+/// Who is asking for upload capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadOrigin {
+    /// A `PUT /upload`: takes one of the node's slots and one of its
+    /// account's, and reserves its declared bytes.
+    Client,
+    /// The blob mirror fetching from the pair's other node: reserves its
+    /// declared bytes and takes no slot, so clients that fill or stall the
+    /// slots cannot stop replication.
+    Mirror,
+}
+
+/// The limits one reservation is checked against.
+#[derive(Debug, Clone, Copy)]
+struct UploadLimits {
+    /// Client uploads in flight on the whole node.
+    node_slots: u32,
+    /// Client uploads in flight for one account; 0 turns the cap off.
+    tenant_slots: u32,
+    /// The global byte budget.
+    byte_budget: u64,
+}
 
 /// Book-keeping for uploads whose bytes are still streaming to tmp files.
 #[derive(Debug, Default)]
 struct InflightUploads {
+    /// Declared bytes of every reservation, client and mirror alike.
     bytes: u64,
+    /// Client uploads in flight.
     count: u32,
+    /// Client uploads in flight per account (tenant key, hex). An entry
+    /// exists only while its count is above zero, so the map is never
+    /// larger than `count`.
+    per_tenant: HashMap<String, u32>,
 }
 
 /// RAII reservation of in-flight upload capacity: declared bytes are counted
 /// against the global budget from BEFORE the temp file is opened until the
-/// sink is finished or dropped.
+/// sink is finished or dropped, and a client upload holds its two slots for
+/// the same time.
+///
+/// Everything a reservation took is given back by its `Drop` and nowhere
+/// else, so no way of ending an upload can leave a count behind.
 #[derive(Debug)]
 pub struct UploadReservation {
     inflight: Arc<parking_lot::Mutex<InflightUploads>>,
     bytes: u64,
+    /// The account whose slot this reservation holds, with one of the
+    /// node's. `None` for a reservation that holds bytes only.
+    slot_tenant: Option<String>,
+}
+
+impl UploadReservation {
+    /// A reservation that holds nothing and is attached to no service, for
+    /// tests that drive an upload sink directly.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self {
+            inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
+            bytes: 0,
+            slot_tenant: None,
+        }
+    }
 }
 
 impl Drop for UploadReservation {
     fn drop(&mut self) {
         let mut guard = self.inflight.lock();
         guard.bytes = guard.bytes.saturating_sub(self.bytes);
+        let Some(tenant) = self.slot_tenant.as_deref() else {
+            return;
+        };
         guard.count = guard.count.saturating_sub(1);
+        let emptied = match guard.per_tenant.get_mut(tenant) {
+            Some(held) => {
+                *held = held.saturating_sub(1);
+                *held == 0
+            }
+            None => false,
+        };
+        if emptied {
+            guard.per_tenant.remove(tenant);
+        }
     }
+}
+
+/// Take capacity for one upload of `declared_len` bytes, or say why not.
+///
+/// `committed_bytes` is what the ledger already charges the node, less
+/// whatever this upload's own completion will release.
+///
+/// A client is checked against its account's slots, then the node's slots,
+/// then the byte budget. The order decides the answer when more than one
+/// limit is reached: an account at its own cap is told so (429) even while
+/// the node is full, since waiting for the node would not help it. The
+/// mirror is checked against the byte budget only.
+///
+/// The checks and the counting happen under one lock, so two uploads racing
+/// for the last slot cannot both get it.
+fn reserve_inflight(
+    inflight: &Arc<parking_lot::Mutex<InflightUploads>>,
+    origin: UploadOrigin,
+    tenant_hex: &str,
+    declared_len: u64,
+    committed_bytes: u64,
+    limits: UploadLimits,
+) -> Result<UploadReservation, BlobError> {
+    let mut guard = inflight.lock();
+    if origin == UploadOrigin::Client {
+        let held = guard.per_tenant.get(tenant_hex).copied().unwrap_or(0);
+        if limits.tenant_slots > 0 && held >= limits.tenant_slots {
+            return Err(BlobError::TooManyUploads {
+                retry_after_secs: TENANT_UPLOADS_RETRY_AFTER_SECS,
+            });
+        }
+        if guard.count >= limits.node_slots {
+            return Err(BlobError::UploadsBusy {
+                retry_after_secs: NODE_UPLOADS_RETRY_AFTER_SECS,
+            });
+        }
+    }
+    if committed_bytes
+        .saturating_add(guard.bytes)
+        .saturating_add(declared_len)
+        > limits.byte_budget
+    {
+        return Err(BlobError::QuotaExceeded);
+    }
+    guard.bytes = guard.bytes.saturating_add(declared_len);
+    let slot_tenant = match origin {
+        UploadOrigin::Client => {
+            guard.count += 1;
+            *guard.per_tenant.entry(tenant_hex.to_string()).or_insert(0) += 1;
+            Some(tenant_hex.to_string())
+        }
+        UploadOrigin::Mirror => None,
+    };
+    Ok(UploadReservation {
+        inflight: inflight.clone(),
+        bytes: declared_len,
+        slot_tenant,
+    })
 }
 
 /// Errors surfaced by the blob routes, carrying their HTTP status.
@@ -169,6 +304,21 @@ pub enum BlobError {
         /// `Retry-After` hint in seconds.
         retry_after_secs: u64,
     },
+    /// 429 — the account already has its maximum number of uploads in
+    /// flight. Its storage is not full; one of its own uploads has to end.
+    TooManyUploads {
+        /// `Retry-After` hint in seconds.
+        retry_after_secs: u64,
+    },
+    /// 503 — every upload slot of the node is taken. Nothing is wrong with
+    /// the request or the account; the same upload can succeed later.
+    UploadsBusy {
+        /// `Retry-After` hint in seconds.
+        retry_after_secs: u64,
+    },
+    /// 408 — the request body stopped arriving, or took longer in total
+    /// than its declared length allows.
+    BodyTimeout,
     /// 500 — internal failure.
     Internal(String),
 }
@@ -183,7 +333,9 @@ impl BlobError {
             Self::TooLarge => 413,
             Self::Denylisted => 451,
             Self::QuotaExceeded => 507,
-            Self::RateLimited { .. } => 429,
+            Self::RateLimited { .. } | Self::TooManyUploads { .. } => 429,
+            Self::UploadsBusy { .. } => 503,
+            Self::BodyTimeout => 408,
             Self::Internal(_) => 500,
         }
     }
@@ -198,6 +350,9 @@ impl BlobError {
             Self::Denylisted => "content unavailable for legal reasons".to_string(),
             Self::QuotaExceeded => "quota exceeded".to_string(),
             Self::RateLimited { .. } => "rate-limited; retry later".to_string(),
+            Self::TooManyUploads { .. } => TOO_MANY_UPLOADS_REASON.to_string(),
+            Self::UploadsBusy { .. } => UPLOADS_BUSY_REASON.to_string(),
+            Self::BodyTimeout => BODY_TIMEOUT_REASON.to_string(),
             Self::Internal(reason) => reason.clone(),
         }
     }
@@ -220,6 +375,15 @@ impl BlobError {
 
 /// What a client is told about any internal failure of the blob routes.
 pub const INTERNAL_ERROR_PUBLIC_REASON: &str = "internal error";
+
+/// What a client is told when its account has its maximum number of
+/// uploads in flight. The words matter: the account's storage is not full.
+pub const TOO_MANY_UPLOADS_REASON: &str =
+    "too many uploads in progress for this account; retry later";
+/// What a client is told when every upload slot of the node is taken.
+pub const UPLOADS_BUSY_REASON: &str = "all upload slots are in use; retry later";
+/// What a client is told when its upload body stalled or ran out of time.
+pub const BODY_TIMEOUT_REASON: &str = "upload timed out waiting for the request body";
 
 /// Extracted private-repo config subset (cheap to clone into sinks/tasks).
 #[derive(Debug, Clone)]
@@ -291,6 +455,15 @@ pub struct PrivateConfig {
     /// Phase-4b D1: denylist reload interval in seconds (0 = reload
     /// disabled; the boot-time set is kept).
     pub denylist_reload_secs: u64,
+    /// Client uploads one account may have in flight (0 = no cap per
+    /// account). Node-local protection, like the write-rate settings: it
+    /// decides when a client is told to wait, never what the node accepts,
+    /// so it is NOT part of `policy_fingerprint`.
+    pub max_uploads_per_tenant: u32,
+    /// The slowest average rate, in bytes per second, at which an upload
+    /// may arrive before it is cut (0 = only the idle cut-off applies).
+    /// Node-local for the same reason; NOT part of `policy_fingerprint`.
+    pub upload_min_bytes_per_sec: u64,
 }
 
 impl PrivateConfig {
@@ -328,6 +501,8 @@ impl PrivateConfig {
                 .private_registration_replace_refill_per_hour,
             denylist_paths: config.private_denylist_paths(),
             denylist_reload_secs: config.private_denylist_reload_secs,
+            max_uploads_per_tenant: config.private_max_uploads_per_tenant,
+            upload_min_bytes_per_sec: config.private_upload_min_bytes_per_sec,
         }
     }
 }
@@ -1216,10 +1391,15 @@ impl PrivateService {
     }
 
     /// Reserve in-flight capacity for `declared_len` bytes BEFORE any body
-    /// byte lands on disk. Enforces (a) a hard cap on concurrent uploads and
-    /// (b) `ledger global total + reserved in-flight bytes + declared_len ≤
+    /// byte lands on disk. Enforces (a) for a client, the caps on concurrent
+    /// uploads per account and per node, and (b) for every origin, `ledger
+    /// global total + reserved in-flight bytes + declared_len ≤
     /// global_budget_bytes`, so N concurrent slow streams can never exceed
-    /// the global byte budget in transient tmp usage.
+    /// the global byte budget in transient tmp usage. See
+    /// [`reserve_inflight`] for the order of the checks and their answers.
+    ///
+    /// `tenant_hex` is the account the upload is counted against: the
+    /// tenant key of the alias its authorization names.
     ///
     /// `pending_spec_release` is the upload's own claim's speculative charge
     /// (0 when none): finish() releases it from the global scope before
@@ -1227,6 +1407,8 @@ impl PrivateService {
     /// preflight had near the cap).
     fn reserve_upload(
         &self,
+        origin: UploadOrigin,
+        tenant_hex: &str,
         declared_len: u64,
         pending_spec_release: u64,
     ) -> Result<UploadReservation, BlobError> {
@@ -1237,24 +1419,25 @@ impl PrivateService {
                 .map_err(|e| BlobError::Internal(e.to_string()))?;
             quota::global_total(&self.meta, &txn).map_err(|e| BlobError::Internal(e.to_string()))?
         };
-        let mut guard = self.inflight.lock();
-        if guard.count >= MAX_CONCURRENT_UPLOADS {
-            return Err(BlobError::QuotaExceeded);
-        }
-        if ledger_total
-            .saturating_sub(pending_spec_release)
-            .saturating_add(guard.bytes)
-            .saturating_add(declared_len)
-            > self.cfg.global_budget_bytes
-        {
-            return Err(BlobError::QuotaExceeded);
-        }
-        guard.count += 1;
-        guard.bytes = guard.bytes.saturating_add(declared_len);
-        Ok(UploadReservation {
-            inflight: self.inflight.clone(),
-            bytes: declared_len,
-        })
+        reserve_inflight(
+            &self.inflight,
+            origin,
+            tenant_hex,
+            declared_len,
+            ledger_total.saturating_sub(pending_spec_release),
+            UploadLimits {
+                node_slots: MAX_CONCURRENT_UPLOADS,
+                tenant_slots: self.cfg.max_uploads_per_tenant,
+                byte_budget: self.cfg.global_budget_bytes,
+            },
+        )
+    }
+
+    /// The slowest average rate at which an upload body may arrive, in
+    /// bytes per second (0 = no such floor). Read by the HTTP layer to set
+    /// the deadline of a `PUT /upload`.
+    pub fn upload_min_bytes_per_sec(&self) -> u64 {
+        self.cfg.upload_min_bytes_per_sec
     }
 
     /// The speculative bytes still held against this upload's own claim
@@ -1287,8 +1470,12 @@ impl PrivateService {
         // Reserve BEFORE opening the temp file: without this, unbounded
         // concurrent PUT streams could exhaust disk/inodes/fds while each
         // one's authoritative charge only happens at finish().
-        let reservation =
-            self.reserve_upload(declared_len, self.pending_spec_release(&auth.sha256)?)?;
+        let reservation = self.reserve_upload(
+            UploadOrigin::Client,
+            &auth.tenant_hex,
+            declared_len,
+            self.pending_spec_release(&auth.sha256)?,
+        )?;
         UploadSink::create(
             self.meta.clone(),
             self.blobs.clone(),
@@ -1795,6 +1982,17 @@ mod tests {
             "node-local write-rate knobs must NOT change the fingerprint"
         );
 
+        // The upload slot cap and the body-rate floor decide when a client
+        // is told to wait or is cut off, never what the node accepts.
+        let mut upload_limits = Config::for_testing();
+        upload_limits.private_max_uploads_per_tenant = 0;
+        upload_limits.private_upload_min_bytes_per_sec = 0;
+        assert_eq!(
+            policy_fingerprint(&base),
+            policy_fingerprint(&upload_limits),
+            "node-local upload limits must NOT change the fingerprint"
+        );
+
         // v3: stream-wrap kind acceptance is DIRECT acceptance behaviour —
         // a peer with legacy accept OFF rejects a 1059 stream wrap this
         // node accepted and stored (split view), so it must be visible in
@@ -2125,5 +2323,255 @@ mod tests {
             }
         }
         assert_eq!(hold.held_len(), 0);
+    }
+
+    const ACCOUNT_A: &str = "aa";
+    const ACCOUNT_B: &str = "bb";
+
+    fn no_uploads() -> Arc<parking_lot::Mutex<InflightUploads>> {
+        Arc::new(parking_lot::Mutex::new(InflightUploads::default()))
+    }
+
+    fn upload_limits(node_slots: u32, tenant_slots: u32, byte_budget: u64) -> UploadLimits {
+        UploadLimits {
+            node_slots,
+            tenant_slots,
+            byte_budget,
+        }
+    }
+
+    /// What is counted right now: (bytes, client uploads, accounts tracked).
+    fn counted(inflight: &Arc<parking_lot::Mutex<InflightUploads>>) -> (u64, u32, usize) {
+        let guard = inflight.lock();
+        (guard.bytes, guard.count, guard.per_tenant.len())
+    }
+
+    /// One account cannot take more than its share of the slots, and what
+    /// it is told is a 429 with a time to retry, not that storage is full.
+    #[test]
+    fn reserve_upload_caps_slots_per_tenant() {
+        let inflight = no_uploads();
+        let limits = upload_limits(64, 2, 1 << 20);
+        let client =
+            |tenant: &str| reserve_inflight(&inflight, UploadOrigin::Client, tenant, 10, 0, limits);
+
+        let first = client(ACCOUNT_A).expect("first upload of the account");
+        let second = client(ACCOUNT_A).expect("second upload of the account");
+        let refused = client(ACCOUNT_A).expect_err("third upload of the account");
+        assert!(
+            matches!(
+                refused,
+                BlobError::TooManyUploads {
+                    retry_after_secs: TENANT_UPLOADS_RETRY_AFTER_SECS
+                }
+            ),
+            "got {refused:?}"
+        );
+        assert_eq!(refused.status(), 429);
+        // A refusal takes nothing.
+        assert_eq!(counted(&inflight), (20, 2, 1));
+
+        // Another account is not affected by the first one being at its cap.
+        let other = client(ACCOUNT_B).expect("upload of another account");
+        assert_eq!(counted(&inflight), (30, 3, 2));
+
+        // Ending one upload gives the account one slot back, and only one.
+        drop(first);
+        let third = client(ACCOUNT_A).expect("upload after one ended");
+        assert!(client(ACCOUNT_A).is_err());
+
+        drop((second, third, other));
+        assert_eq!(counted(&inflight), (0, 0, 0));
+    }
+
+    /// The node-wide cap answers 503 with a time to retry. An account at
+    /// its own cap hears about that first, since waiting for the node would
+    /// not help it. Neither is the quota answer.
+    #[test]
+    fn full_node_answers_503_and_the_account_cap_answers_first() {
+        let inflight = no_uploads();
+        let limits = upload_limits(3, 2, 1 << 20);
+        let client =
+            |tenant: &str| reserve_inflight(&inflight, UploadOrigin::Client, tenant, 1, 0, limits);
+
+        let _a1 = client(ACCOUNT_A).expect("a1");
+        let _a2 = client(ACCOUNT_A).expect("a2");
+        let b1 = client(ACCOUNT_B).expect("b1");
+
+        let busy = client(ACCOUNT_B).expect_err("the node is full");
+        assert!(
+            matches!(
+                busy,
+                BlobError::UploadsBusy {
+                    retry_after_secs: NODE_UPLOADS_RETRY_AFTER_SECS
+                }
+            ),
+            "got {busy:?}"
+        );
+        assert_eq!(busy.status(), 503);
+        assert_ne!(busy.reason(), BlobError::QuotaExceeded.reason());
+
+        let own_cap = client(ACCOUNT_A).expect_err("the account is at its cap");
+        assert!(
+            matches!(own_cap, BlobError::TooManyUploads { .. }),
+            "got {own_cap:?}"
+        );
+
+        // A slot of the node comes back with the upload that held it.
+        drop(b1);
+        let _b2 = client(ACCOUNT_B).expect("a slot of the node is free again");
+    }
+
+    /// 0 turns the cap per account off; the node-wide cap still holds.
+    #[test]
+    fn zero_turns_the_per_tenant_cap_off() {
+        let inflight = no_uploads();
+        let limits = upload_limits(5, 0, 1 << 20);
+        let held: Vec<UploadReservation> = (0..5)
+            .map(|n| {
+                reserve_inflight(&inflight, UploadOrigin::Client, ACCOUNT_A, 1, 0, limits)
+                    .unwrap_or_else(|e| panic!("upload {n} of one account: {e:?}"))
+            })
+            .collect();
+        let refused = reserve_inflight(&inflight, UploadOrigin::Client, ACCOUNT_A, 1, 0, limits)
+            .expect_err("the node cap still applies");
+        assert!(
+            matches!(refused, BlobError::UploadsBusy { .. }),
+            "got {refused:?}"
+        );
+        // The account is still tracked, so its count can be read back.
+        assert_eq!(counted(&inflight), (5, 5, 1));
+        drop(held);
+        assert_eq!(counted(&inflight), (0, 0, 0));
+    }
+
+    /// Clients that fill every slot do not stop the mirror, and the mirror
+    /// still answers to the byte budget.
+    #[test]
+    fn mirror_reservation_ignores_client_slot_caps() {
+        let inflight = no_uploads();
+        let limits = upload_limits(2, 1, 100);
+        let reserve = |origin: UploadOrigin, tenant: &str, len: u64, committed: u64| {
+            reserve_inflight(&inflight, origin, tenant, len, committed, limits)
+        };
+
+        let _a = reserve(UploadOrigin::Client, ACCOUNT_A, 10, 0).expect("client a");
+        let b = reserve(UploadOrigin::Client, ACCOUNT_B, 10, 0).expect("client b");
+        assert!(matches!(
+            reserve(UploadOrigin::Client, "cc", 1, 0),
+            Err(BlobError::UploadsBusy { .. })
+        ));
+
+        // The node is full and account A is at its cap; a fetch for a
+        // repository of account A goes ahead all the same.
+        let fetch = reserve(UploadOrigin::Mirror, ACCOUNT_A, 30, 0).expect("mirror fetch");
+        // It reserved its bytes and took no slot of either kind.
+        assert_eq!(counted(&inflight), (50, 2, 2));
+
+        // The byte budget binds the mirror like anyone: 50 reserved, 40
+        // charged by the ledger, so 11 more do not fit and 10 do.
+        let over = reserve(UploadOrigin::Mirror, ACCOUNT_A, 11, 40).expect_err("over budget");
+        assert!(matches!(over, BlobError::QuotaExceeded), "got {over:?}");
+        assert_eq!(over.status(), 507);
+        let exact = reserve(UploadOrigin::Mirror, ACCOUNT_A, 10, 40).expect("fits exactly");
+        assert_eq!(counted(&inflight), (60, 2, 2));
+
+        // A client over the byte budget still gets the quota answer, and
+        // the bytes a fetch holds count against clients too.
+        drop(b);
+        let client_over = reserve(UploadOrigin::Client, ACCOUNT_B, 51, 0).expect_err("bytes");
+        assert!(
+            matches!(client_over, BlobError::QuotaExceeded),
+            "got {client_over:?}"
+        );
+        // A refusal for bytes leaves no slot behind.
+        assert_eq!(counted(&inflight), (50, 1, 1));
+
+        // Ending a fetch gives back its bytes and touches no slot count.
+        drop((fetch, exact));
+        assert_eq!(counted(&inflight), (10, 1, 1));
+    }
+
+    /// Nothing is left behind however an upload ends: the entry of an
+    /// account goes when its last upload does, in any order, and also when
+    /// the reservation is dropped by a panic passing through.
+    #[test]
+    fn per_tenant_map_is_empty_after_all_reservations_drop() {
+        let inflight = no_uploads();
+        let limits = upload_limits(64, 8, 1 << 20);
+
+        let mut held = Vec::new();
+        for n in 0..8u64 {
+            for tenant in [ACCOUNT_A, ACCOUNT_B, "cc"] {
+                held.push(
+                    reserve_inflight(&inflight, UploadOrigin::Client, tenant, n, 0, limits)
+                        .expect("within every cap"),
+                );
+            }
+        }
+        held.push(
+            reserve_inflight(&inflight, UploadOrigin::Mirror, ACCOUNT_A, 7, 0, limits)
+                .expect("mirror fetch"),
+        );
+        assert_eq!(counted(&inflight), (3 * 28 + 7, 24, 3));
+
+        // Out of order: every other one first, then the rest.
+        let (evens, odds): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .enumerate()
+            .partition(|(index, _)| index % 2 == 0);
+        drop(evens);
+        assert_eq!(inflight.lock().count, 12);
+        drop(odds);
+        assert_eq!(counted(&inflight), (0, 0, 0));
+        assert!(inflight.lock().per_tenant.is_empty());
+
+        // A panic while an upload is in flight unwinds through the
+        // reservation, and the counts come back all the same.
+        let shared = inflight.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = reserve_inflight(&shared, UploadOrigin::Client, ACCOUNT_A, 5, 0, limits)
+                .expect("reservation");
+            panic!("an upload task dies");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(counted(&inflight), (0, 0, 0));
+    }
+
+    /// The service applies the default cap of 8 per account, keeps the node
+    /// cap, and reserves for the mirror outside both.
+    #[tokio::test]
+    async fn service_applies_the_caps_to_clients_only() {
+        let (_dir, svc) = hold_harness(true).await;
+        let client = |tenant: &str| svc.reserve_upload(UploadOrigin::Client, tenant, 1, 0);
+
+        let own: Vec<UploadReservation> = (0..8)
+            .map(|n| client(ACCOUNT_A).unwrap_or_else(|e| panic!("upload {n}: {e:?}")))
+            .collect();
+        assert!(matches!(
+            client(ACCOUNT_A),
+            Err(BlobError::TooManyUploads { .. })
+        ));
+
+        // Fill the rest of the node with other accounts, eight uploads each.
+        let others: Vec<UploadReservation> = (0..(MAX_CONCURRENT_UPLOADS - 8))
+            .map(|n| {
+                let tenant = format!("account-{}", n / 8);
+                client(&tenant).unwrap_or_else(|e| panic!("{tenant}: {e:?}"))
+            })
+            .collect();
+        assert!(matches!(
+            client("one-more-account"),
+            Err(BlobError::UploadsBusy { .. })
+        ));
+        let fetch = svc
+            .reserve_upload(UploadOrigin::Mirror, ACCOUNT_A, 1, 0)
+            .expect("the mirror is outside the slot caps");
+
+        drop(others);
+        assert_eq!(counted(&svc.inflight), (9, 8, 1));
+        drop((own, fetch));
+        assert_eq!(counted(&svc.inflight), (0, 0, 0));
+        assert_eq!(svc.upload_min_bytes_per_sec(), 16384);
     }
 }

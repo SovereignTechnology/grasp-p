@@ -485,8 +485,6 @@ mod tests {
     use super::*;
     use crate::config::RegistrationMode;
     use crate::grasp_p::meta::LEDGER_GLOBAL_KEY;
-    use crate::grasp_p::InflightUploads;
-    use std::sync::Arc;
 
     fn test_cfg(quota_repo_bytes: u64) -> PrivateConfig {
         PrivateConfig {
@@ -521,6 +519,8 @@ mod tests {
             registration_replace_refill_per_hour: 0,
             denylist_paths: vec![],
             denylist_reload_secs: 0,
+            max_uploads_per_tenant: 0,
+            upload_min_bytes_per_sec: 0,
         }
     }
 
@@ -574,10 +574,7 @@ mod tests {
         /// One full streamed upload of `data` by tenant/alias ("tenant"/"alias").
         async fn upload(&self, data: &[u8]) -> Result<BlobDescriptor, BlobError> {
             let sha = sha256::Hash::hash(data).to_string();
-            let reservation = UploadReservation {
-                inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
-                bytes: 0,
-            };
+            let reservation = UploadReservation::detached();
             let mut sink = UploadSink::create(
                 self.meta.clone(),
                 self.store.clone(),
@@ -982,10 +979,7 @@ mod tests {
         let sha = sha256::Hash::hash(&data).to_string();
 
         let new_sink = |h: &Harness| {
-            let reservation = UploadReservation {
-                inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
-                bytes: 0,
-            };
+            let reservation = UploadReservation::detached();
             UploadSink::create(
                 h.meta.clone(),
                 h.store.clone(),
@@ -1053,10 +1047,7 @@ mod tests {
         let data = vec![43u8; 256];
         let sha = sha256::Hash::hash(&data).to_string();
 
-        let reservation = UploadReservation {
-            inflight: Arc::new(parking_lot::Mutex::new(InflightUploads::default())),
-            bytes: 0,
-        };
+        let reservation = UploadReservation::detached();
         let mut sink = UploadSink::create(
             h.meta.clone(),
             h.store.clone(),
