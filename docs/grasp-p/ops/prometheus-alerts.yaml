@@ -297,15 +297,21 @@ groups:
       # A configured peer is disconnected, or the node has no series for it.
       # ngit_sync_relay_connected is a state gauge per relay: 0=disconnected,
       # 1=connecting, 2=syncing, 3=connected,
-      # 4=connected_historic_sync_failures. == 0 for 10m means the peer is
-      # down or unreachable, not just re-handshaking. The selector takes the
-      # peers only (see "Relay labels" at the top of this file).
+      # 4=connected_historic_sync_failures. < 2 for 10m (disconnected, or a
+      # dial in progress) means the node has had no session with the peer for
+      # that long. The gauge reads 1 while a dial runs, and a down peer is
+      # dialled every 5 minutes, so == 0 would restart the 10 minutes
+      # whenever a scrape met a dial. `* 0` keeps the value of this arm at 0.
+      # The selector takes the peers only (see "Relay labels" at the top of
+      # this file).
       #
-      # The absent() arm: `== 0` cannot fire on a series that is not there,
-      # and a peer has none while the node does not track it. Its URL is
-      # missing or wrong in both settings, or the node refused the address,
-      # or the node stopped tracking the relay. Without the arm each of those
-      # reads as a healthy peer.
+      # The absent() arm: the first arm cannot fire on a series that is not
+      # there, and a peer has none while the node does not track it. Its URL is
+      # missing or wrong in both settings, or the node refused the address of
+      # a listed peer. Without the arm each of those reads as a healthy peer.
+      # A peer the node has once tracked keeps its series: an ended session
+      # or a failed dial leaves it tracked, at 0 (1 during a dial), and the
+      # node redials it at least every 5 minutes.
       #   * The arm names peer-1, the one peer of a pair. A node with more
       #     peers repeats it per alias: `or absent(...{relay="peer-2"})`.
       #   * absent() looks at all the series the evaluating server holds, not
@@ -324,9 +330,9 @@ groups:
       #     peer-1 either. On both the arm fires all the time: drop the
       #     rule there.
       # $value tells the two arms apart, and the description prints it: 0 is
-      # a tracked peer that is disconnected, 1 is a peer with no series.
+      # a tracked peer with no session, 1 is a peer with no series.
       - alert: NgitSyncPeerDisconnected
-        expr: ngit_sync_relay_connected{relay=~"peer-.+"} == 0 or absent(ngit_sync_relay_connected{relay="peer-1"})
+        expr: (ngit_sync_relay_connected{relay=~"peer-.+"} < 2) * 0 or absent(ngit_sync_relay_connected{relay="peer-1"})
         for: 10m
         labels:
           severity: warning
@@ -334,7 +340,7 @@ groups:
           component: grasp-p-sync
         annotations:
           summary: "Sync peer {{ $labels.relay }} disconnected or missing from the scrape for 10m"
-          description: "Alert value {{ $value }}. For 10m, ngit_sync_relay_connected for {{ $labels.relay }} has been 0 (alert value 0: the peer is tracked and disconnected) or absent from the scrape (alert value 1: the node tracks no such peer, or is not scraped). {{ $labels.relay }} is an alias, not a URL: on a pair, peer-1 is the other node. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog. Value 0: check the peer process, DNS/TLS and the network path; the node's own log names the relay and its last error. Value 1: check NGIT_GRASP_P_SYNC_PEER_URLS and NGIT_SYNC_BOOTSTRAP_RELAY_URL on the node, and that the node is scraped."
+          description: "Alert value {{ $value }}. For 10m, ngit_sync_relay_connected for {{ $labels.relay }} has been below 2 (alert value 0: the peer is tracked and has no session: disconnected, or being dialled) or absent from the scrape (alert value 1: the node tracks no such peer, or is not scraped). {{ $labels.relay }} is an alias, not a URL: on a pair, peer-1 is the other node. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog. Value 0: check the peer process, DNS/TLS and the network path; the node's own log names the relay and its last error. The node redials a disconnected peer by itself, at least every 5 minutes, so the alert clears once the peer can be reached. Value 1: check NGIT_GRASP_P_SYNC_PEER_URLS and NGIT_SYNC_BOOTSTRAP_RELAY_URL on the node, and that the node is scraped."
           runbook: "docs/grasp-p/ops/runbook.md#sync-peer-disconnected"
 
       # All tracked peers disconnected simultaneously — almost always a LOCAL

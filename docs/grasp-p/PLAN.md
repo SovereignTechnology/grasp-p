@@ -197,13 +197,17 @@ project yet.
   that disappears (an unmounted volume, a deploy that is not atomic) lifts its takedowns
   within one reload interval. The alternative is to keep its last-known entries until a
   readable file no longer lists them.
-- **Peers.** A configured peer that fails a handshake is muted by the naughty list for 12
-  hours. A peer whose session drops (as opposed to a dial that fails) is retired and
-  redialled by the next tick with no backoff and a full resync; `handle_disconnect` should
-  keep configured peers. A peer on a private network needs both SSRF guards switched off for
-  the whole node (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`,
-  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), and a redial from the reconnect loop is vetted
-  by upstream's dial-time policy only. No test runs a peer with the guards on.
+- **Peers** (done). A configured peer, which is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS` or
+  the bootstrap relay, is kept when its session ends, is not muted by the naughty list, and
+  is dialled at least once every five minutes while it is down, where it used to be retired,
+  muted for 12 hours, and (named by the bootstrap setting alone) never dialled a second
+  time. A pair on a private network sets `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and
+  leaves `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` off: only the connection to a configured peer
+  is exempt from upstream's target policy. Every event-directed relay dial of a GRASP-P
+  node also refuses a NAT64 or 6to4 address that wraps an internal one. A pair test runs
+  with upstream's guard on. Still open: the dial is vetted and not pinned (#3), a naughty
+  list entry outlives the peer's recovery by up to 12 hours, and no test runs with GRASP-P's
+  own guard on. See "Configured peers" in [`SEAMS.md`](SEAMS.md).
 - **#10 is wider on v3.** The GRASP-P filters go to every live relay, including upstream's
   NIP-65 discovery connections, and count against each relay's subscription slots, so their
   growth can cost a relay its public coverage. The watchdog's discovery filter does not page

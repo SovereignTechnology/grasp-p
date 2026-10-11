@@ -157,6 +157,11 @@ node's public sync holds. Blob peers come from an operator allowlist when one is
 otherwise they are the `server` tags of accepted registrations, checked against the SSRF
 guard.
 
+The relay connection to a configured peer (the allowlist, and the bootstrap relay) is kept
+for the life of the process: when it drops, or a dial fails for any reason, the node dials
+again by itself, at least once every five minutes. The two nodes may talk over a private
+network while every relay that an event names stays barred from internal addresses.
+
 Missing blobs wait in one queue per account, and the accounts are served in turn, each
 with at most half of the concurrent fetches, so one account whose blobs come slowly cannot
 take every fetch. Two such accounts can fill the default four between them; a third then

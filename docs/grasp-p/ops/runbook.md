@@ -171,6 +171,62 @@ its domain.
   refuses every registration that does not name the new URL. Have the
   accounts publish new editions first.
 
+### A pair on a private network
+
+The two nodes of a pair can reach each other over a private link (a tunnel,
+a private subnet) while the node's guard against internal addresses stays
+on for every relay that customers' events name.
+
+- **Set `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` on both nodes, and
+  leave `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` unset.** The first says the
+  pair's link is private. It lets the blob mirror fetch from a private
+  address, and it exempts the relay connection to a configured peer, and
+  to no other relay, from the outbound target policy. The second lifts
+  that policy for every relay an event names; a pair no longer needs it.
+- **A configured peer** is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS` or the
+  relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`. Name the other node there by
+  the address it has on the private link, for example
+  `ws://10.20.0.2:8080`. The exemption goes with exactly that URL: a
+  customer's event that names another internal address is refused as
+  before, with `Rejecting event-directed sync relay target` in the log.
+- **Set `NGIT_GRASP_P_MIRROR_PEER_URLS` as well**, to the other node's blob
+  address on the link. With the list unset the mirror takes its peers from
+  the `server` tags of registrations, and with private addresses allowed
+  those tags could point it at an internal host. A node started that way
+  says so once, as a warning: `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS is
+  true and NGIT_GRASP_P_MIRROR_PEER_URLS is unset`.
+- **`ws://` and `http://` inside the link, or certificates from a public
+  authority.** The relay client trusts the public web roots only, so a
+  `wss://` peer with a certificate from a private authority is refused
+  (`added to naughty list`, category `TlsCertificateInvalid`).
+- **The setting is not in the `policy_fingerprint`** (§2): it decides what
+  a node dials, not what it accepts. If one node has it and the other does
+  not, the second does not fetch blobs from the first over the link (its
+  mirror backlog grows), and it refuses a peer that only
+  `NGIT_GRASP_P_SYNC_PEER_URLS` names: `Skipping private-repo peer relay`
+  in its log, events flow one way only, and `NgitSyncPeerDisconnected`
+  with value 1 on that node
+  ([Sync peer disconnected](#sync-peer-disconnected)). A peer that
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` names is still dialled there, so events
+  arrive in both directions and only the blobs do not.
+- **With the setting `false`**, the default, a peer that only
+  `NGIT_GRASP_P_SYNC_PEER_URLS` names must be `wss://` on a public address,
+  like any relay. The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is the
+  operator's own target: the node dials it as written whatever this
+  setting says, as upstream does, and never checks its address. The blob
+  mirror still refuses an internal address without the setting.
+
+On a node with GRASP-P enabled, a relay that an event or the peer list names
+and that resolves to a NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address
+wrapping an internal IPv4 address, or to any address in the local-use NAT64
+prefix (`64:ff9b:1::/48`), is refused before the dial: such an address
+passes the ordinary check and can lead to an internal host. The log says `Rejecting event-directed relay target` with the
+address. Not checked: the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, and a
+connection that the first point exempts. The check is made on the addresses
+the name resolves to just before the dial; the dial itself resolves the name
+again and is not held to them (the NIP-11 probe is), so this stops a fixed
+record, not a name whose answers change between the two lookups.
+
 ---
 
 ## 2. `policy_fingerprint` parity
@@ -838,8 +894,10 @@ ToS posture).
 ### Sync peer disconnected
 
 **Alert:** `NgitSyncPeerDisconnected` —
-`ngit_sync_relay_connected{relay=~"peer-.+"} == 0 or absent(ngit_sync_relay_connected{relay="peer-1"})`
-for 10m.
+`(ngit_sync_relay_connected{relay=~"peer-.+"} < 2) * 0 or absent(ngit_sync_relay_connected{relay="peer-1"})`
+for 10m. The gauge is 0 for a disconnected relay and 1 while a dial runs;
+both count, because a peer that is down is dialled every 5 minutes and a
+dial against a silent host takes several seconds.
 
 The alert names the peer by its alias, never by its URL
 ([Relays in the scrape](#relays-in-the-scrape)): on a pair `peer-1` is the
@@ -849,33 +907,57 @@ unless you gave that half an `instance` matcher (below). For a two-node
 GRASP-P pair this halts 30640/30641 sync and grows the mirror backlog. The
 alert's value, which its description starts with, says which half fired:
 
-- **Value 0: the peer is tracked and disconnected.** Remediate: peer process
+- **Value 0: the peer is tracked and has no session** (it is disconnected,
+  or being dialled). Remediate: peer process
   (`systemctl status ngit-grasp` on the peer), DNS/TLS
   (`curl -sI https://<peer>/`), egress firewall, and the relay's last error
   in this node's log, which names it by URL
   (`journalctl -u ngit-grasp | grep '<peer host>'`). A DNS or certificate
   failure also puts the relay on the naughty list: the log line
   `added to naughty list` names it, and `ngit_sync_naughty_relays_total`
-  counts it by category.
+  counts it by category. For a configured peer that entry does not stop
+  the dials (below); it stays for twelve hours, also after the peer is back.
 - **Value 1: the scrape has no `peer-1` series.** The node does not track the
   peer, or is not scraped at all. The node dials the relays in
   `NGIT_GRASP_P_SYNC_PEER_URLS` and the one in
-  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, and keeps dialling only those in the
-  list: verify that the list names the peer, correctly, on both nodes.
-  `Skipping private-repo peer relay` or
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`: verify that one of them names the peer,
+  correctly, on both nodes. `Skipping private-repo peer relay` or
   `Rejecting event-directed sync relay target` in the log means the node
-  refused the address: it is not `wss://`, it is not a public address, or
-  its name did not resolve when the node tried. The node tries again every
-  minute. Then check that the collector reaches the endpoint
+  refused the address of a listed peer: it is not `wss://`, it is not a
+  public address, or its name did not resolve when the node tried. The node
+  tries to register it again every minute. For a pair on a private link see
+  [A pair on a private network](#a-pair-on-a-private-network). Then check
+  that the collector reaches the endpoint
   ([Where the scrape comes from](#where-the-scrape-comes-from)). A node with
   no peer configured, or with GRASP-P off, never has the series: remove the
   rule there.
 
-A peer that only `NGIT_SYNC_BOOTSTRAP_RELAY_URL` names is dialled once, at
-startup. If that dial fails (value 0), or its session ends later and the node
-stops tracking it (value 1), the node does not dial it again until it
-restarts, unless a public repository on the node gives sync a reason to. Name
-the peer in `NGIT_GRASP_P_SYNC_PEER_URLS` as well, on both nodes, and restart.
+**What the node does by itself.** A configured peer, whichever of the two
+settings names it, is never dropped: when its session ends or a dial fails
+it stays tracked and disconnected (value 0, never value 1), and the node
+dials it again without a restart.
+
+- After a session ends or a dial fails, the node redials with a wait that
+  doubles from `NGIT_SYNC_BASE_BACKOFF_SECS` (5 seconds): 5, 10, 20, 40, 80,
+  160 seconds.
+- From there on, and from the first failure for a peer on the naughty list
+  (a DNS, certificate or protocol failure), it dials once every 5 minutes
+  for as long as the peer is down. The log line is
+  `Redialling private-repo peer relay`. Neither the one-hour backoff, nor
+  the one dial a day after 24 hours of failures, nor the twelve hours of
+  the naughty list apply to a configured peer.
+- So a peer that comes back is connected again within about 5 minutes at
+  the latest, plus the dial itself; usually sooner. The alert waits 10
+  minutes, so it clears by itself after an outage that has ended, and one
+  that keeps firing means the peer still cannot be reached.
+- After the reconnect the node catches up by itself; nothing has to be
+  triggered.
+
+The address of a peer that only the list names is checked again before
+every dial, unless the link is declared private: a peer whose name stops
+resolving, or resolves to an address the node may not dial, fails its dials
+and is retried in the same way. The bootstrap relay's address is never
+checked.
 
 The half that fires on a missing series looks at everything the evaluating
 Prometheus holds. Where one server evaluates the rules for both nodes, repeat

@@ -42,7 +42,8 @@ key. Issue 24 is done: a GRASP-P node serves its scrape on loopback only and nam
 by its URL in it (`SEAMS.md`, "Metrics leave a GRASP-P node on loopback only"). Before
 changing the sync or mirror code, read `SEAMS.md`: the pair tests run with both SSRF guards
 switched off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`,
-`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), so the production peer path has no test yet.
+`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), except `exit16`, which leaves upstream's guard
+on; a pair of peers on public addresses, with GRASP-P's own guard on, has no test yet.
 
 Do not start M4 (protocol v0.2) without re-reading the decisions in `PLAN.md`: the owner
 model and the key list change the client substantially.
