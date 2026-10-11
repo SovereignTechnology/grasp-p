@@ -131,7 +131,8 @@ Deliberately ABSENT from the preimage (node-local knobs — src/grasp_p/mod.rs:2
   protection; synced/loopback traffic bypasses it
 - denylist (`NGIT_GRASP_P_DENYLIST_*`) — per-jurisdiction legal config;
   paired nodes may legitimately differ
-- re-issue interval and mirror retry knobs — node-local recovery
+- re-issue interval, mirror retry knobs and the mirror's attempt budget
+  (`NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN`) — node-local recovery
 
 **Where to see it.**
 
@@ -348,9 +349,15 @@ scrape is upstream's, relay URLs included.
 **Alert:** `NgitPrivateMirrorLag` — `ngit_private_mirror_lag_blobs > 0` for 15m.
 
 What it means: blobs referenced by synced 30641 manifests are not yet in the
-local blob store (src/metrics/mod.rs:282–291). A brief non-zero value is
-normal (fetch in flight); backoff-gated blobs stay counted in the gauge —
-the gate suppresses re-enqueue, never the gauge (src/grasp_p/mirror.rs:45–47).
+local blob store. The gauge is set by the repair scan and by nothing else, so
+it is up to one scan interval (60 s) old. A brief non-zero value is normal
+(fetches in flight or queued). A blob waiting out its retry backoff stays
+counted: the backoff stops it being queued, not being counted.
+
+Every failed fetch backs off (table under [Mirror failures](#mirror-failures)),
+so a blob that keeps failing is tried rarely, about once per
+`NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` in the end. This alert, not the failure
+rate, is what shows such a blob.
 
 Remediate:
 
@@ -361,38 +368,86 @@ curl -sI https://<peer-host>/<sha256>                                       # pe
 ```
 
 Likely causes: peer unreachable; SSRF guard blocking the peer
-(`blocked` — non-https or internal-IP resolution; keep
-`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=false` in production,
-src/config.rs:723–733); local quota/budget refusal (`quota` — see
-[Ledger budget](#ledger-budget)); late upload (`http_status: 404` on all
-peers — retried at the max interval). Peer set: `NGIT_GRASP_P_MIRROR_PEER_URLS`
-if set, else the registration's `server` tags minus this node's own domain
-(src/grasp_p/mirror.rs:231–249). There is no give-up — fix the underlying
-condition and the repair scan (60s tick) drains the backlog.
+(`blocked` — non-https, or a name that resolves to an internal address; keep
+`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=false` in production; a name that
+does not resolve at all counts as `network`); local
+quota/budget refusal (`quota` — see [Ledger budget](#ledger-budget)); late
+upload (`http_status: 404` on all peers — retried at the max interval). Peer
+set: `NGIT_GRASP_P_MIRROR_PEER_URLS` if set, else the registration's `server`
+tags minus this node's own domain (`peer_servers_for` in
+src/grasp_p/mirror.rs). There is no give-up.
+
+**After the fix.** A blob is fetched again when its backoff ends, then the
+repair scan (60 s tick) queues it: expect up to
+`NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` plus 20% (about 73 min at the default)
+for `404`, `blocked`,
+`verify` and `too_large`, and for any blob that had failed many times.
+Restarting the node clears every backoff, and the scan at boot queues every
+missing blob at once: do that when the wait matters.
+
+**One account far behind, the others fine.** That is the queue working.
+Missing blobs wait in one queue per account (the tenant key), the accounts
+are served in turn, and one account holds at most half of
+`NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` (rounded down, at least one) fetches,
+so one account whose blobs come slowly, or never, cannot take every fetch.
+Two such accounts can hold all of them at the default of four; other
+accounts then wait for fetches of theirs to end (one fetch lasts at most the
+fetch timeout plus the blob's length at 256 KiB/s, per peer) and are served
+in their turn. The warn lines name the alias; the registration names the
+account. A blob that several accounts claim is fetched for the one with the
+fewest missing blobs; if this node's own state refuses it for that account
+(`quota`, a dead registration), the same attempt goes on for the next
+claimant, up to four accounts. A node with
+one busy account mirrors at half the configured concurrency: raise
+`NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` if a healthy pair is too slow.
+
+**Lag that drains slowly on a healthy pair.** Fetches started per minute
+over all accounts are bounded by `NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN`
+(default 600: a burst of 600, then 10 a second; `0` = unlimited). A push of
+many thousands of small blobs is held to that rate. Nothing is dropped; raise
+the setting if the replica must catch up faster. One account is also held
+to 1024 blobs per repair scan (one scan a minute): its backlog holds 1024
+and the next scan refills it, so no setting takes one account past about 17
+blobs a second. There is no metric for
+fetches held back by the budget: compare the rate of
+`ngit_private_mirror_fetched_total` with the setting.
 
 ### Mirror failures
 
 **Alert:** `NgitPrivateMirrorFailures` — per-`reason` rate > 0 for 10m.
 
 The metric label is the failure-reason string up to the first colon
-(src/grasp_p/mirror.rs:662–667). Reason-label taxonomy
-(src/grasp_p/mirror.rs:22–47, 291–305):
+(`reason_label` in src/grasp_p/mirror.rs). One count is one blob that no peer
+delivered in one attempt. Every class backs off; none is retried by every
+scan. Classes (`classify_failure` and the table in the module documentation
+of src/grasp_p/mirror.rs):
 
-| `reason` label | class | retry behavior | operator action |
+| `reason` label | retry | ends the attempt on the first peer | operator action |
 | --- | --- | --- | --- |
-| `no_peer` | transient | backoff `base·2^(n-1)`, capped, ±20% jitter | no peer server available for the blob — check `NGIT_GRASP_P_MIRROR_PEER_URLS` / the alias's `server` tags |
-| `network` | transient | same backoff | transport failure on every peer — DNS/TLS, peer down, egress firewall |
-| `http_status` | transient (404 = always max interval) | same backoff; 404 pinned to `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` | 5xx: peer erroring; 404 on all peers: late upload, benign, self-heals; other codes: proxy/edge oddity |
-| `blocked` | deterministic | NO hot retry (flat repair scan) | SSRF guard: peer is non-https or resolves internal — pin `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known https peer |
-| `quota` | deterministic | NO hot retry | local ledger/budget full — [Ledger budget](#ledger-budget) |
-| `too_large` | deterministic | NO hot retry | peer streamed past the cap — treat the peer as hostile, investigate |
-| `verify` | deterministic | NO hot retry | peer served wrong bytes/size (poison) — investigate the peer |
-| `store` / `reserve` / `sink` / `write` | deterministic | NO hot retry | local state must move (registration/quota/IO) — read the full reason in the warn line |
+| `no_peer` | backoff `base·2^(n-1)`, capped, ±20% jitter | (no peer to try) | no peer server available for the blob — check `NGIT_GRASP_P_MIRROR_PEER_URLS` / the alias's `server` tags |
+| `network` | same backoff | no | transport failure, no answer within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`, a body that stalled or outran its deadline, or a peer name that did not resolve — DNS/TLS, peer down, egress firewall, a very slow link |
+| `http_status` | same backoff; `404` from every peer always waits `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` | no | 5xx: peer erroring; 404 on all peers: late upload, benign, self-heals; other codes: proxy/edge oddity |
+| `quota` | same backoff | yes | local ledger/budget full — [Ledger budget](#ledger-budget). Refused before any request is sent when the ledgers already show it |
+| `store` / `reserve` / `sink` / `write` | same backoff | yes | this node's own state (registration gone, denylisted mid-fetch, meta store or disk error) — read the full reason in the warn line |
+| `blocked` | always the max interval | no | SSRF guard: peer is non-https, carries credentials, uses a local name, or resolves to a non-global address — pin `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known https peer |
+| `too_large` | always the max interval | no | the peer announced more than `NGIT_GRASP_P_MAX_BLOB_BYTES`, or sent more bytes than the fetch expected (the announced length, or the declared size when none was announced), or the state root declared more than the maximum — check that both nodes run the same maximum; a body longer than expected means the peer serves other bytes: investigate it |
+| `verify` | always the max interval | no | peer served wrong bytes, or a peer named only by a registration announced a length other than the declared one (refused before the body) — investigate the peer |
 
-Correlate with [Mirror lag](#mirror-lag): growing backlog + failures =
-unreachable/misconfigured peer or a far-side refusal. Backoff state is
-in-memory; a restart resets every blob to the base interval (the boot repair
-scan re-derives all wants anyway).
+When a blob has several peers, the reason counted is one for the whole
+attempt: a reason from this node's own state if there was one, otherwise the
+one that retries soonest, whatever the order of the peers. `404` from one
+peer and a timeout from another count as `network`.
+
+A configured peer (`NGIT_GRASP_P_MIRROR_PEER_URLS`) is believed about a blob's
+length up to `NGIT_GRASP_P_MAX_BLOB_BYTES`: a blob whose state root declared
+the wrong size is mirrored and charged at its real size.
+
+Because every class backs off, a few blobs that stay stuck fail a few times
+an hour and this alert goes quiet; [Mirror lag](#mirror-lag) keeps firing
+for them. A steady failure rate means many blobs are failing, or new ones
+keep failing: an unreachable or misconfigured peer, or a quota refusal on
+this node. Backoff state is in memory; a restart resets every blob to the
+base interval (the boot repair scan queues every missing blob anyway).
 
 ### Registration conflict
 
@@ -825,8 +880,8 @@ Procedure — verify-then-denylist:
    purge-on-add immediately frees every claim (releasing ledger charges),
    unlinks the bytes, and GET/HEAD + upload preflight start answering 451
    (src/grasp_p/denylist.rs:150–198, src/http/blossom.rs:218–220,
-   src/grasp_p/mod.rs:924–925). The mirror never re-fetches it — all five
-   mirror skip sites consult `is_denylisted` — and the purged blob drops out
+   src/grasp_p/mod.rs:924–925). The mirror never re-fetches it — every
+   mirror step (enqueue, scan, dispatch, fetch) consults `is_denylisted` — and the purged blob drops out
    of `ngit_private_mirror_lag_blobs`.
 
    **HTTP caches.** The node serves a blob with `Cache-Control: no-cache`
@@ -1158,7 +1213,7 @@ journalctl -u ngit-grasp | grep 'all new private-repo registrations'     # empty
 journalctl -u ngit-grasp | grep 'private registration conflict'          # conflict alerts (fields in §3)
 journalctl -u ngit-grasp | grep -E 'denylist purge-on-add|GC purged denylisted|GC removed'   # purge lines (§4)
 journalctl -u ngit-grasp | grep 'boot reconcile'                         # 'applied N registration(s)'; warns 'stored 30640 no longer passes registration checks'
-journalctl -u ngit-grasp | grep 'private mirror'                         # warn 'blob fetch failed on all peers' carries the full reason
+journalctl -u ngit-grasp | grep 'private mirror'                         # warn 'blob fetch failed on all peers' carries the full reason; at most one per blob and reason per 10 min
 journalctl -u ngit-grasp | grep 'NIP-56 report event received'           # report intake: event_id, reporter, sha256_tags (§4)
 ```
 
@@ -1197,4 +1252,4 @@ Pointers, not procedures:
 - **Paid mode** is not built (boot-rejected, §1).
 - **Mirror DNS-rebinding** at connection time is a documented residual —
   set `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known peer in production
-  (src/grasp_p/mirror.rs:170–175).
+  (`peer_allowed` in src/grasp_p/mirror.rs).

@@ -156,6 +156,14 @@ node's public sync holds. Blob peers come from an operator allowlist when one is
 otherwise they are the `server` tags of accepted registrations, checked against the SSRF
 guard.
 
+Missing blobs wait in one queue per account, and the accounts are served in turn, each
+with at most half of the concurrent fetches, so one account whose blobs come slowly cannot
+take every fetch. Two such accounts can fill the default four between them; a third then
+waits for fetches of theirs to end. A scan of the claim table every minute, and at start, queues whatever is
+still missing. A fetch that fails is tried again after a backoff, for as long as the blob
+is referenced; nothing is given up on. A budget bounds how many fetches start per minute
+over all accounts.
+
 `ngit-private-watchdog` is a separate binary that probes two nodes anonymously and reports
 when they disagree. It holds no keys.
 

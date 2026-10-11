@@ -414,7 +414,8 @@ counter in `src/metrics/mod.rs`. `src/http/mod.rs` is not touched. Nothing joins
   seconds. 30 seconds for the node: a full node usually means stalled uploads, and 30
   seconds is when a stalled upload is cut.
 - **The mirror is outside both caps.** `reserve_upload` takes an origin. A mirror fetch
-  reserves its declared bytes against `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES`, as before, and
+  reserves the bytes it expects to read (a configured peer's announced length, otherwise
+  the declared size) against `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES`, and
   takes no slot: `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` already bounds how many run. So
   clients that fill or stall the slots no longer make replication wait for a slot, and
   the transient number of temp files is now at most 64 plus the mirror's concurrency.
@@ -483,6 +484,102 @@ counter in `src/metrics/mod.rs`. `src/http/mod.rs` is not touched. Nothing joins
   Checking the bytes received against the rate as the body arrives would close it and
   is not done here. The bytes such uploads reserve are held for as long (see "The
   mirror is outside both caps").
+
+## The blob mirror: one queue per account, an attempt budget, every failure gated
+
+In GRASP-P's own files (`src/grasp_p/mirror.rs`, and the quota half of the upload
+preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one setting in
+`src/config.rs`. No other upstream file is touched and nothing joins
+`policy_fingerprint`: none of this changes what a node accepts, only when it fetches.
+
+- **What was wrong.** The worker waited for a fetch slot inside its job loop, and the
+  slots (4 by default) served the whole node. One account whose blobs came slowly, or
+  never, held every slot: no other account's blob was mirrored and the repair scan was
+  not served. Some failure classes cleared the retry gate, so the 60-second scan queued
+  them again for ever, some after downloading the whole blob. A scan walked the claim
+  table and the file system on the async runtime. A blob claimed by several accounts
+  went to whichever alias came first. And the reason recorded for a blob was the last
+  peer's.
+- **One queue per account.** `FairQueue` holds a backlog per account (the tenant key),
+  serves the accounts in turn, and lets one account have at most
+  `max(1, NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY / 2)` fetches running. The share is derived
+  and has no setting. A backlog holds 1024 blobs; one more is dropped, and the next scan
+  derives it again from the claim table, which is why dropping is safe. A hash is queued
+  or running at most once, whoever asked for it. A node with a single busy account
+  mirrors at half the configured concurrency: the share is not lent out, because a slot
+  lent to a slow account is not there when another account's blob arrives. With the
+  default of four, one slow account leaves two slots for everyone else; two slow accounts
+  hold all four, and a third account then waits for fetches of theirs to end, served in
+  its turn. One account is also held to 1024 blobs per repair scan: its backlog holds
+  1024 and the next scan refills it, so no setting takes one account past about 17 blobs
+  a second.
+- **The loop never waits for a slot.** `run_worker` waits for a job, the repair tick, a
+  finished scan or a finished fetch, and after each starts every fetch that may start.
+  The slots are a count the loop keeps, not a semaphore: the only thing that frees one
+  is the report of the fetch that held it, and that report is also what wakes the loop,
+  so a free slot and a sleeping loop cannot coexist. A fetch reports from a drop guard,
+  so one that panics or is cancelled reports too.
+- **Attempt budget.** A token bucket over all accounts, taken when a fetch starts:
+  `NGIT_GRASP_P_MIRROR_MAX_ATTEMPTS_PER_MIN` (default 600, `0` = unlimited), a burst of
+  one minute's worth and then that rate. When the budget is what holds a fetch back, the
+  loop arms a timer for the next token. One attempt is one blob tried against its peers,
+  so with several peers the number of requests is a multiple.
+- **Every failure backs off.** The class table is in the module documentation of
+  `mirror.rs` and in the runbook. Classes that may heal by themselves or by a change on
+  this node back off exponentially; `404` from every peer, `blocked`, `verify` and
+  `too_large` wait the maximum interval. The metric labels are unchanged. A peer name
+  that does not resolve is `network`, not `blocked`: the address guard connects to
+  neither, but a resolver that fails for a moment must not park every blob tried
+  meanwhile for the maximum interval. The two are told apart by how the outbound
+  policy's error begins (`POLICY_DNS_ERROR_PREFIX`); a unit test fails if upstream
+  rewords it. The cost of gating every class is slower recovery: a blob refused with
+  `quota` used to be fetched within a minute of space being freed and now waits out its
+  backoff, about `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` at most. A restart clears every
+  gate.
+- **Which reason is recorded.** A failure from this node's own state (`quota`, `reserve`,
+  `sink`, `write`, `store`) ends the peer loop. Otherwise every peer is tried and the
+  class that retries soonest wins, whatever the order of the peers.
+- **Order within one fetch.** Address guard, quota preflight against local state,
+  request, status, length, byte reservation, temp file, body. A blob the account has no
+  room for costs no request, and a wrong length costs no body.
+- **Whose length is believed.** A peer from `NGIT_GRASP_P_MIRROR_PEER_URLS` is believed
+  up to `NGIT_GRASP_P_MAX_BLOB_BYTES`, so a blob declared with the wrong size is now
+  mirrored and charged at its real size, where it used to fail for ever: the replica
+  matches the origin. A peer that only a registration's `server` tag names must announce
+  exactly the declared size, or the fetch fails as `verify` before the body. With no
+  announced length the declared size bounds the read. Both kinds of peer exist until
+  mirroring is restricted to the operator's list; the second rule goes away with it.
+- **Time limits.** The client has no total timeout any more. The peer must answer, and
+  may not go silent mid-body, within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`; the whole
+  request gets that plus the length divided by 256 KiB/s, so a 256 MiB blob on a slow
+  link can finish (about 19 minutes at the defaults) where it used to be cut at 120
+  seconds every time.
+- **The scan.** Runs under `spawn_blocking`, one at a time, asks the file system once
+  per claim and looks each alias up once. A blob claimed by several accounts is fetched
+  for the live claimant whose account has the fewest missing blobs; within one account,
+  for the alias the blob's speculative charge is booked to, since the quota forecast
+  nets that charge for no other alias. Up to three more accounts are kept as fallbacks:
+  when this node's own state refuses the blob for one account, the same attempt goes on
+  for the next, and a peer that already gave an answer of its own is not asked again.
+  Without the fallbacks an account with a short queue and no room left would be chosen
+  every time and keep the blob from the account that can take it. A job from an event
+  knows its own account only; while its blob still waits, the scan's choice replaces it
+  (`FairQueue::push_or_move`). The scan derives at most a backlog's worth per account.
+  `ngit_private_mirror_lag_blobs` is set by the scan and nowhere else, so it is up to
+  one scan interval old; a scan that cannot read the claim table leaves the gauge as it
+  was.
+- **Still open.** Each attempt resolves the peer's name again (a cached verdict belongs
+  with pinning the resolved address, issue 3). There is no metric for fetches held back
+  by the budget or dropped from a full backlog. Nothing clears an account's gates when
+  its quota is raised. A state root whose declared size differs from the stored blob is
+  still accepted. A state root is accepted before its blobs are uploaded, so a replica
+  can ask during the upload; that one `404` gates the blob for the maximum interval
+  (unchanged by this change), which is late for a client that declares first and
+  uploads after. A full backlog is refilled only by the next scan tick, not as soon as
+  it empties. A shared blob still waits in the lane of the account it is attributed to:
+  an account with few missing blobs and slow peers holds it for as long as its fetches
+  last. No slot is kept back for an account with nothing running when two slow accounts
+  hold them all.
 
 ## Decisions made during the port
 
@@ -707,6 +804,28 @@ features. No package was added.
   another account uploads meanwhile, the held upload is cut with `408` once it stops
   sending, and the account then uploads again. No integration test fills the 64 slots
   of the node; the `503` is covered by the unit tests only.
+- The blob mirror ("The blob mirror: one queue per account ..."). Unit tests in
+  `src/grasp_p/mirror.rs`, without a server: the queue serves accounts in turn, holds an
+  account at its share, keeps a hash once and bounds a backlog; the budget gives a
+  burst, then the rate, and `0` is no limit; every failure reason has one of two
+  schedules and none leaves a blob ungated; the recorded reason does not depend on peer
+  order; the four cases of whose length is believed; the deadline grows with the length;
+  a shared blob goes to the account with the least backlog, with the other accounts as
+  fallbacks and the alias that holds the charge first; a waiting blob moves to the
+  account the scan chose; a name that does not resolve is not a refusal; the scan
+  forgets the gates of blobs that arrived. Six more run the real worker loop against a fake node with
+  time paused: a second account is served while the first holds its share with slow
+  fetches, a failing blob is fetched again until it arrives, the budget holds fetches
+  back and then lets every one through, scans and jobs are taken while every slot is
+  held, what a full backlog dropped comes back with the next scan, and a fetch that
+  panics frees its slot. `grasp_p_mirror_attempt_budget_default_and_env_override` in
+  `src/config.rs` covers the setting. In `private_two_node`,
+  `exit15_one_tenants_backlog_does_not_starve_another` runs a pair with a blob peer that
+  answers forty blobs of one account slowly: a second account's blob must arrive within
+  seconds while the first account is still behind. `fetch_from_peer` itself (the order
+  of its steps, the limits on the body) and the fall-through from one claimant to the
+  next in `fetch_blob` have no unit test; `exit1`, `exit3`, `exit5`,
+  `exit9`, `exit11` and `grasp_p_tls` run it end to end.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync
