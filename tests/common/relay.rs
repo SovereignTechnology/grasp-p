@@ -788,6 +788,53 @@ impl TestRelay {
         relay_data_path: Option<PathBuf>,
         extra_env: &[(&str, &str)],
     ) -> Self {
+        Self::start_grasp_p_pair_node_inner(
+            reservation,
+            bootstrap_relay_url,
+            lmdb_backend,
+            git_data_path,
+            relay_data_path,
+            extra_env,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::start_grasp_p_pair_node`] with upstream's outbound target
+    /// policy left on: `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is not set, as on
+    /// a production node, so a relay that an event names on a loopback or
+    /// private address is refused. The pair's own link is still allowed to
+    /// be local, by `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`, which this
+    /// sets like the other constructor.
+    pub async fn start_grasp_p_pair_node_with_upstream_guard(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        lmdb_backend: bool,
+        git_data_path: Option<PathBuf>,
+        relay_data_path: Option<PathBuf>,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::start_grasp_p_pair_node_inner(
+            reservation,
+            bootstrap_relay_url,
+            lmdb_backend,
+            git_data_path,
+            relay_data_path,
+            extra_env,
+            true,
+        )
+        .await
+    }
+
+    async fn start_grasp_p_pair_node_inner(
+        reservation: PortReservation,
+        bootstrap_relay_url: Option<String>,
+        lmdb_backend: bool,
+        git_data_path: Option<PathBuf>,
+        relay_data_path: Option<PathBuf>,
+        extra_env: &[(&str, &str)],
+        enforce_outbound_target_policy: bool,
+    ) -> Self {
         let mut env = vec![
             ("NGIT_GRASP_P_REPOS_ENABLE".to_string(), "true".to_string()),
             ("NGIT_GRASP_P_MIRROR_ENABLE".to_string(), "true".to_string()),
@@ -821,6 +868,7 @@ impl TestRelay {
                 lmdb_backend,
                 git_data_path,
                 relay_data_path,
+                enforce_outbound_target_policy,
                 extra_env: env,
                 ..RelayOptions::default()
             },

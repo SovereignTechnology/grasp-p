@@ -768,10 +768,16 @@ let
         type = types.bool;
         default = false;
         description = ''
-          GRASP-P Phase 2 SSRF guard: when false (default), mirror fetch
-          peers resolving to loopback/private/link-local IPs are dropped
-          and only https/wss public hosts are contacted. Set true only
-          for local testing (e.g. a 127.0.0.1 node pair).
+          GRASP-P: the pair's link is private. When false (default),
+          mirror fetch peers resolving to loopback/private/link-local IPs
+          are dropped and only https/wss public hosts are contacted. When
+          true, the blob mirror and the relay connection to a configured
+          private-sync peer may use an internal address; every other relay
+          stays under the outbound target policy. Set true for a pair on a
+          private network or for local testing. Set
+          NGIT_GRASP_P_MIRROR_PEER_URLS with it: without that list the
+          mirror takes its peers from registrations' `server` tags, which
+          could then name an internal host.
         '';
       };
 

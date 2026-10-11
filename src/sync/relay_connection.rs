@@ -1079,6 +1079,10 @@ impl RelayConnection {
                 .policy
                 .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
                 .await
+                // GRASP-P seam: the stricter address check of a GRASP-P node.
+                .and_then(|vetted| {
+                    crate::grasp_p::mirror::vet_relay_dial(self.forward_duplicate_events, vetted)
+                })
             {
                 tracing::warn!(
                     url = %self.url,
@@ -1233,6 +1237,9 @@ impl RelayConnection {
             .policy
             .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
             .await?;
+        // GRASP-P seam: the stricter address check of a GRASP-P node.
+        let resolved =
+            crate::grasp_p::mirror::vet_relay_dial(self.forward_duplicate_events, resolved)?;
         // A permissive policy vets no address, so it leaves nothing to hold
         // the request to. Any other policy pins the request to exactly what
         // it vetted.
@@ -3327,6 +3334,54 @@ mod tests {
         assert!(!parse_relay_limit_hints(r#"{"supported_grasps":"GRASP-08"}"#).grasp08);
         assert!(!parse_relay_limit_hints(r#"{"supported_grasps":8}"#).grasp08);
         assert!(!parse_relay_limit_hints("not json at all").grasp08);
+    }
+
+    // GRASP-P seam: one test of the stricter address check of a GRASP-P node.
+    #[tokio::test]
+    async fn grasp_p_dial_refuses_a_nat64_wrapped_internal_address() {
+        // NAT64 around 10.0.0.5. An IP literal is vetted without a lookup,
+        // and a refused dial connects to nothing, so nothing leaves the host.
+        let url = "wss://[64:ff9b::a00:5]:7777";
+        let wrapped: std::net::IpAddr = "64:ff9b::a00:5".parse().unwrap();
+        let event_directed = || {
+            RelayConnection::new(
+                url.to_string(),
+                None,
+                RelayTargetSource::EventDirected,
+                OutboundTargetPolicy::default(),
+            )
+        };
+
+        // Upstream's policy alone passes the address.
+        assert_eq!(
+            event_directed().vet_nip11_target().await,
+            Ok(Some(vec![wrapped]))
+        );
+
+        // On a GRASP-P node neither the dial nor the NIP-11 probe goes on.
+        let flagged = event_directed().with_duplicate_event_forwarding(true);
+        let refusal = flagged
+            .connect(1)
+            .await
+            .expect_err("the dial must be refused before it starts");
+        assert!(
+            refusal.starts_with("Outbound target policy rejected relay")
+                && refusal.contains("not globally reachable"),
+            "{refusal}"
+        );
+        assert!(flagged.vet_nip11_target().await.is_err());
+
+        // A connection the operator made permissive is not vetted at all.
+        let permissive = RelayConnection::new(
+            url.to_string(),
+            None,
+            RelayTargetSource::EventDirected,
+            OutboundTargetPolicy {
+                allow_non_global: true,
+            },
+        )
+        .with_duplicate_event_forwarding(true);
+        assert_eq!(permissive.vet_nip11_target().await, Ok(None));
     }
 
     // SovTech seam: tests of the hardened NIP-11 probe, from here to the end of

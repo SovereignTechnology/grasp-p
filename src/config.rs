@@ -895,11 +895,16 @@ pub struct Config {
     #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
     pub private_sync_peer_urls: Option<String>,
 
-    /// SSRF guard: allow the blob mirror to fetch from peers that resolve to
-    /// loopback/private/link-local IPs (and over plain http), and private-sync
-    /// peer relays over plain ws:// or on internal IPs. Default false —
-    /// production drops such peers and only fetches over https/wss from public
-    /// hosts. Set true only for local testing (e.g. a 127.0.0.1 node pair).
+    /// The pair's link is private: allow the blob mirror to fetch from peers
+    /// that resolve to loopback/private/link-local IPs (and over plain http),
+    /// and the relay connection to a configured private-sync peer over plain
+    /// ws:// or on an internal IP. Only that connection is exempt from the
+    /// outbound target policy. Default false: such peers are dropped and the
+    /// node fetches only over https/wss from public hosts. Set true for a
+    /// pair on a private network or for local testing. Set
+    /// NGIT_GRASP_P_MIRROR_PEER_URLS with it: without that list the mirror
+    /// takes its peers from registrations' `server` tags, which could then
+    /// name an internal host.
     #[arg(
         long,
         env = "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS",

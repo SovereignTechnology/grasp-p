@@ -5401,7 +5401,10 @@ impl SyncManager {
 
         // Create RelayConnection if not exists
         if !self.connections.contains_key(&relay_url) {
-            let policy = self.outbound_target_policy();
+            // GRASP-P seam: a configured peer on a private link has a policy of its own.
+            let policy = self
+                .grasp_p_peer_policy(&relay_url)
+                .unwrap_or_else(|| self.outbound_target_policy());
             let source = if is_bootstrap {
                 RelayTargetSource::OperatorConfigured
             } else {
@@ -5524,6 +5527,8 @@ impl SyncManager {
             .health_tracker
             .naughty_list()
             .is_some_and(|naughty_list| naughty_list.is_naughty(&relay_url))
+            // GRASP-P seam: the naughty list does not mute a configured peer.
+            && self.grasp_p_naughty_mute_applies(&relay_url)
         {
             tracing::debug!(
                 relay = %relay_url,
@@ -7230,6 +7235,8 @@ impl SyncManager {
                     .contains(relay_url)
                     .then(RelaySyncNeeds::default)
             });
+            // GRASP-P seam: a configured peer is kept when its session ends.
+            let desired = desired.or_else(|| self.grasp_p_peer_needs(relay_url));
             let Some(desired) = desired else {
                 tracing::info!(
                     relay = %relay_url,
@@ -8529,7 +8536,7 @@ impl SyncManager {
         let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.dependency_relay_deadlines.keys().cloned());
         desired_relays.extend(self.nip65_discovery.connection_targets());
-        // GRASP-P peers carry no public repositories; keep them connected.
+        // GRASP-P seam: configured peers carry no public repositories; keep them.
         desired_relays.extend(self.grasp_p_peer_relays());
 
         // Collect relays to disconnect
@@ -8645,10 +8652,8 @@ impl SyncManager {
     async fn retry_disconnected_relays(&mut self) {
         let mut desired_relays: HashSet<String> = self.derive_targets().await.into_keys().collect();
         desired_relays.extend(self.nip65_discovery.due_connection_targets(Instant::now()));
-        // GRASP-P peers carry no public repository, so without this a peer
-        // whose dial failed stays disconnected until a restart: the GRASP-P
-        // tick only dials peers that are missing from the index, and a
-        // failed dial leaves the peer in it.
+        // GRASP-P seam: a configured peer carries no public repository, so
+        // without this one whose dial failed is never dialled by this loop.
         desired_relays.extend(self.grasp_p_peer_relays());
 
         // Collect relays to reconnect

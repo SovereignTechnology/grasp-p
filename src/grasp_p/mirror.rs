@@ -282,6 +282,56 @@ pub(crate) async fn relay_peer_allowed(relay_url: &str, allow_private: bool) -> 
         == PeerVerdict::Allowed
 }
 
+/// The address check of a relay dial on a GRASP-P node, applied to what
+/// upstream's outbound target policy has already vetted.
+///
+/// Upstream's check counts the NAT64 prefix `64:ff9b::/96` and the 6to4
+/// prefix `2002::/16` as public, so a name that resolves to an address there
+/// which wraps an internal IPv4 address passes it. [`wraps_non_global`]
+/// decodes both. A node that hosts private repositories dials relays that
+/// customers' events name, and must not be pointed at its own network that
+/// way.
+///
+/// `grasp_p_node` is false on any other node, which keeps upstream's verdict
+/// as it is. A permissive policy vets no address and hands over an empty
+/// list, so nothing is refused for it: that is the operator's statement
+/// that the target may be internal.
+pub(crate) fn vet_relay_dial(
+    grasp_p_node: bool,
+    vetted: crate::outbound::ResolvedTarget,
+) -> Result<crate::outbound::ResolvedTarget, String> {
+    if !grasp_p_node {
+        return Ok(vetted);
+    }
+    match vetted
+        .addresses
+        .iter()
+        .find(|address| wraps_non_global(address))
+    {
+        Some(address) => Err(format!(
+            "address {address} wraps an address that is not globally reachable"
+        )),
+        None => Ok(vetted),
+    }
+}
+
+/// Whether a relay dial must not go to `address`, which upstream's policy
+/// has passed. The mirror's own check comes first. An IPv6 form that carries
+/// an IPv4 address is then held to upstream's verdict on that address, which
+/// knows ranges the mirror's list lacks (benchmarking, reserved, protocol
+/// assignments). The local-use NAT64 prefix `64:ff9b:1::/48` is never global.
+fn wraps_non_global(address: &IpAddr) -> bool {
+    if is_disallowed_ip(address) {
+        return true;
+    }
+    let IpAddr::V6(v6) = address else {
+        return false;
+    };
+    v6.octets()[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
+        || embedded_ipv4(v6)
+            .is_some_and(|v4| !crate::outbound::is_globally_reachable(IpAddr::V4(v4)))
+}
+
 /// What the address guard says about a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerVerdict {
@@ -2687,6 +2737,71 @@ mod tests {
         let public_6to4: Ipv6Addr = "2002:808:808::".parse().unwrap();
         assert_eq!(embedded_ipv4(&public_6to4), Some(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_disallowed_ip(&IpAddr::V6(public_6to4)));
+    }
+
+    /// Upstream's policy passes a NAT64 or 6to4 address whatever it wraps;
+    /// the check of a GRASP-P node's relay dial refuses the ones that wrap an
+    /// address upstream would refuse bare, and the local-use NAT64 prefix,
+    /// and nothing else that upstream passed.
+    #[tokio::test]
+    async fn relay_dial_check_refuses_wrapped_internal_addresses() {
+        use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy};
+
+        // IP literals are vetted without a lookup, so nothing leaves the host.
+        async fn vetted(
+            policy: OutboundTargetPolicy,
+            url: &str,
+        ) -> crate::outbound::ResolvedTarget {
+            policy
+                .authorize_resolved(OutboundTargetKind::EventRelay, url)
+                .await
+                .unwrap_or_else(|reason| panic!("upstream's policy passes {url}: {reason}"))
+        }
+        let strict = OutboundTargetPolicy::default();
+
+        for wrapped in [
+            // NAT64 around the cloud metadata address, and around 10.0.0.5.
+            "wss://[64:ff9b::a9fe:a9fe]:7777",
+            "wss://[64:ff9b::a00:5]",
+            // 6to4 around 10.0.0.5, and around loopback.
+            "wss://[2002:a00:5::1]:7777",
+            "wss://[2002:7f00:1::]",
+            // Ranges only upstream's list knows: NAT64 around 198.18.0.1
+            // (benchmarking) and 6to4 around 240.0.0.1 (reserved).
+            "wss://[64:ff9b::c612:1]",
+            "wss://[2002:f000:1::1]",
+            // The local-use NAT64 prefix, whatever it carries.
+            "wss://[64:ff9b:1::a00:5]",
+        ] {
+            let target = vetted(strict, wrapped).await;
+            assert_eq!(target.addresses.len(), 1, "{wrapped}");
+            let refusal = vet_relay_dial(true, target.clone())
+                .expect_err("a GRASP-P node must not dial a wrapped internal address");
+            assert!(refusal.contains("not globally reachable"), "{refusal}");
+            // Any other node keeps upstream's verdict.
+            assert!(vet_relay_dial(false, target).is_ok(), "{wrapped}");
+        }
+
+        for public in [
+            "wss://8.8.8.8",
+            "wss://[2606:4700:4700::1111]",
+            // The same two forms around a public address.
+            "wss://[64:ff9b::808:808]",
+            "wss://[2002:808:808::1]",
+        ] {
+            let target = vetted(strict, public).await;
+            let passed = vet_relay_dial(true, target.clone()).expect("a public address passes");
+            assert_eq!(passed.addresses, target.addresses, "{public}");
+        }
+
+        // A permissive policy vets no address, so there is nothing to refuse:
+        // the operator has said this target may be internal.
+        let permissive = OutboundTargetPolicy {
+            allow_non_global: true,
+        };
+        let target = vetted(permissive, "ws://[64:ff9b::a9fe:a9fe]:7777").await;
+        assert!(target.addresses.is_empty());
+        assert!(vet_relay_dial(true, target).is_ok());
     }
 
     #[test]

@@ -1693,6 +1693,18 @@ pub fn spawn_background_tasks(
     let mut tasks = vec![service.spawn_gc()];
     tracing::info!("Private blob GC task started");
     if config.private_mirror_enable {
+        // The private-link setting lets the mirror fetch from internal
+        // addresses, and without a mirror peer list its peers come from
+        // registrations, which customers write.
+        if config.private_mirror_allow_private_ips
+            && config.private_mirror_peer_url_entries().is_none()
+        {
+            tracing::warn!(
+                "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS is true and \
+                 NGIT_GRASP_P_MIRROR_PEER_URLS is unset: the blob mirror takes its peers \
+                 from the `server` tags of registrations, which may now name internal hosts"
+            );
+        }
         tasks.push(service.spawn_mirror());
         tracing::info!("Private blob mirror task started");
     }

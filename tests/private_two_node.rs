@@ -2527,9 +2527,11 @@ async fn exit13_mixed_legacy_accept_pair() {
 
 /// A configured peer that is down at the first dial must be dialled again.
 /// The peer here is not the bootstrap relay and shares no public repository,
-/// so only the reconnect loop's knowledge of configured peers brings it back:
-/// before that, one failed dial left it disconnected for the life of the
-/// process.
+/// so only what the node knows of its configured peers brings it back: the
+/// reconnect loop counts it as wanted and the bounded redial dials it.
+/// Before that, one failed dial left it disconnected for the life of the
+/// process. The reconnect loop alone is pinned by the unit test
+/// `failed_first_dial_of_a_bootstrap_only_peer_is_retried`.
 #[tokio::test]
 async fn exit14_peer_down_at_first_dial_is_redialled() {
     let res_a = reserve_port();
@@ -2566,6 +2568,296 @@ async fn exit14_peer_down_at_first_dial_is_redialled() {
 
     a.stop().await;
     b.stop().await;
+}
+
+// ============================================================================
+// Exit test 16 — a pair on a private link with upstream's guard on
+// ============================================================================
+
+/// How many lines of `log_path` pass `predicate`.
+fn count_log_lines(log_path: &std::path::Path, predicate: impl Fn(&str) -> bool) -> usize {
+    std::fs::read_to_string(log_path)
+        .map(|log| log.lines().filter(|line| predicate(line)).count())
+        .unwrap_or(0)
+}
+
+/// Poll until `count` lines of `log_path` or more pass `predicate`.
+async fn wait_for_log_lines(
+    log_path: &std::path::Path,
+    bound: Duration,
+    count: usize,
+    predicate: impl Fn(&str) -> bool,
+) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if count_log_lines(log_path, &predicate) >= count {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The two nodes of a pair reach each other on loopback, as a production
+/// pair would over a private network, and upstream's outbound target policy
+/// stays on: `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is not set on either node.
+/// The link is allowed by `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`
+/// alone. Each node names the other in its peer list and nowhere else, so
+/// the connection is not upstream's exempt bootstrap relay: without the
+/// peer's own dial policy it is refused at registration and nothing
+/// replicates. A relay that an event names on loopback is still refused.
+#[tokio::test]
+async fn exit16_pair_replicates_with_the_upstream_guard_on() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_a = format!("ws://127.0.0.1:{}", res_a.port());
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+    let a = TestRelay::start_grasp_p_pair_node_with_upstream_guard(
+        res_a,
+        None,
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", url_b.as_str()),
+        ],
+    )
+    .await;
+    let b = TestRelay::start_grasp_p_pair_node_with_upstream_guard(
+        res_b,
+        None,
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", url_a.as_str()),
+        ],
+    )
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    let writer = Keys::generate();
+
+    // A to B: a registration, a blob and the state root that names it.
+    let alias = random_alias();
+    register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let blob = blob_bytes(61, 2048);
+    let sha = upload_blob(&a, &tenant, &writer, &alias, &blob).await;
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &edition).await;
+    assert!(accepted, "exit16: 30641 accepted on A; got {message:?}");
+    assert!(
+        wait_for_exact_event(b.url(), edition.id, REPLICATION_BOUND).await,
+        "exit16: the state root must replicate A to B with upstream's guard on"
+    );
+    let mirrored = wait_for_blob(&b, &sha, REPLICATION_BOUND)
+        .await
+        .expect("exit16: the blob must be mirrored to B");
+    assert_eq!(mirrored, blob);
+
+    // B to A: the link works in both directions.
+    let alias_b = random_alias();
+    let registration_b = register_on(&b, &domain_refs, &tenant, &writer, &alias_b).await;
+    assert!(
+        wait_for_exact_event(a.url(), registration_b.id, REPLICATION_BOUND).await,
+        "exit16: a registration must replicate B to A with upstream's guard on"
+    );
+
+    // The guard is on for everything else: a public announcement on A names
+    // a relay on loopback, and A refuses it without a connection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the listener that stands in for an internal service");
+    let internal_relay = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_connections = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            accepted_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let maintainer = Keys::generate();
+    let identifier = "exit16-internal-relay";
+    let announcement = EventBuilder::new(Kind::GitRepoAnnouncement, "")
+        .tags(vec![
+            Tag::identifier(identifier),
+            Tag::custom(
+                "clone",
+                vec![format!(
+                    "http://{}/{}/{identifier}.git",
+                    a.domain(),
+                    maintainer.public_key().to_bech32().expect("npub")
+                )],
+            ),
+            Tag::custom(
+                "relays",
+                vec![format!("ws://{}", a.domain()), internal_relay.clone()],
+            ),
+        ])
+        .finalize(&maintainer)
+        .expect("sign the announcement");
+    let (accepted, message) = publish_with_result(a.url(), &announcement).await;
+    assert!(
+        accepted,
+        "exit16: an announcement that lists A must be admitted; got {message:?}"
+    );
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("Rejecting event-directed sync relay target")
+                && line.contains(&internal_relay)
+        })
+        .await,
+        "exit16: A must refuse {internal_relay}, which only an event names"
+    );
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "exit16: no connection may reach the relay an event names on loopback"
+    );
+    // The peer itself was never refused, on either node.
+    for (node, peer) in [(&a, &url_b), (&b, &url_a)] {
+        assert_eq!(
+            count_log_lines(&node.log_path(), |line| {
+                line.contains("Rejecting event-directed") && line.contains(peer.as_str())
+            }),
+            0,
+            "exit16: the configured peer {peer} must not be refused"
+        );
+    }
+
+    b.stop().await;
+    a.stop().await;
+}
+
+// ============================================================================
+// Exit test 17 — a peer that goes away is kept and dialled again
+// ============================================================================
+
+/// Node B is killed and started again on the same address while node A
+/// keeps running. A must keep B as a relay it tracks, dial it again, and
+/// replicate from it afterwards, without a restart of its own.
+///
+/// `bootstrap_only` chooses how A names B: by `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
+/// alone, or by `NGIT_GRASP_P_SYNC_PEER_URLS` alone. Either way B is a peer
+/// that no public repository names, which is the relay upstream retires
+/// when its session ends.
+async fn restarted_peer_is_kept_and_redialled(bootstrap_only: bool) {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_a = format!("ws://127.0.0.1:{}", res_a.port());
+    let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+
+    // B is up first, so that A's first dial of it succeeds.
+    let b = TestRelay::start_grasp_p_pair_node(
+        res_b,
+        None,
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", url_a.as_str()),
+        ],
+    )
+    .await;
+    // The fixture puts a bootstrap relay into the peer list as well; the
+    // empty value takes it out again for the bootstrap-only case.
+    let (a_bootstrap, a_peers) = if bootstrap_only {
+        (Some(url_b.clone()), "")
+    } else {
+        (None, url_b.as_str())
+    };
+    let a = TestRelay::start_grasp_p_pair_node(
+        res_a,
+        a_bootstrap,
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", a_peers),
+        ],
+    )
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    let writer = Keys::generate();
+    let connected_to_b = |line: &str| line.contains("Connected to relay") && line.contains(&url_b);
+
+    // Baseline: A pulls from B over the session it opened.
+    let before = register_on(&b, &domain_refs, &tenant, &writer, &random_alias()).await;
+    assert!(
+        wait_for_exact_event(a.url(), before.id, REPLICATION_BOUND).await,
+        "exit17: a registration on B must reach A before the restart"
+    );
+    assert!(
+        count_log_lines(&a.log_path(), connected_to_b) >= 1,
+        "exit17: A must have logged its session to {url_b}"
+    );
+    let sessions_before = count_log_lines(&a.log_path(), connected_to_b);
+
+    // B goes away and comes back on the same address, empty. A stays up.
+    let b = b.restart().await;
+
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("Unexpected relay disconnect detected") && line.contains(&url_b)
+        })
+        .await,
+        "exit17: A must treat the end of its session to {url_b} as one to recover from"
+    );
+    assert!(
+        wait_for_log_lines(
+            &a.log_path(),
+            REPLICATION_BOUND,
+            sessions_before + 1,
+            connected_to_b
+        )
+        .await,
+        "exit17: A must dial {url_b} again once it is back"
+    );
+    assert_eq!(
+        count_log_lines(&a.log_path(), |line| {
+            line.contains("retiring without reconnect") && line.contains(&url_b)
+        }),
+        0,
+        "exit17: A must never retire its configured peer {url_b}"
+    );
+
+    // The new session carries events: one published on B now reaches A.
+    let after = register_on(&b, &domain_refs, &tenant, &writer, &random_alias()).await;
+    assert!(
+        wait_for_exact_event(a.url(), after.id, REPLICATION_BOUND).await,
+        "exit17: a registration on the restarted B must reach A without a restart of A"
+    );
+
+    b.stop().await;
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn exit17_restarted_listed_peer_is_kept_and_redialled() {
+    restarted_peer_is_kept_and_redialled(false).await;
+}
+
+#[tokio::test]
+async fn exit17_restarted_bootstrap_only_peer_is_kept_and_redialled() {
+    restarted_peer_is_kept_and_redialled(true).await;
 }
 
 // ============================================================================

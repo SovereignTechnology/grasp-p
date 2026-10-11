@@ -13,7 +13,9 @@
 //!   `wss://` peer. Its trust anchors are the compiled-in webpki roots and
 //!   nothing else, so it can never trust a certificate made here: the test
 //!   requires the handshake to get as far as certificate verification and be
-//!   refused there, which only a working provider can do.
+//!   refused there, which only a working provider can do. That failure puts
+//!   the peer on upstream's naughty list, and the test then requires a second
+//!   dial: a configured peer is not muted by it.
 //!
 //! Node A is an ordinary plain test node. Two in-process TLS fronts terminate
 //! TLS and forward the bytes to A; node B is given the fronts as its blob
@@ -670,6 +672,21 @@ async fn outbound_tls_clients_complete_or_refuse_a_real_handshake() {
         .await,
         "B must record {wss_peer} as a relay with an invalid TLS certificate"
     );
+
+    // For any other relay that entry means no dial for twelve hours. This
+    // one is a configured peer: B dials it again by itself, so a peer whose
+    // certificate is put right is found without a restart. The second
+    // refusal at the front is that second dial.
+    let redial_deadline = Instant::now() + BOUND;
+    while relay_front.count(&refused) < 2 {
+        assert!(
+            Instant::now() < redial_deadline,
+            "B must dial its configured peer {wss_peer} again although it is on the \
+             naughty list; the front saw: {}",
+            relay_front.summary()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // ---- https -------------------------------------------------------------
     // Everything from here on also shows that B is alive and still syncing
