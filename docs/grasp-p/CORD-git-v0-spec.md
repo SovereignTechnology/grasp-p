@@ -48,9 +48,24 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   author key is exempt — the event signature is its proof.
 - `|w| + |aux| ≤ NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS` (default 64); a key repeated across
   `w ∪ aux` is rejected (it would corrupt claim-index diffing).
-- `relays` and `server` tags: ≥1 value of **each** must denote the serving node's domain by
-  **exact host match** (the pre-4b substring test admitted `wss://evil.com/x?example.com` and
-  `example.com.attacker.tld`).
+- `relays` and `server` tags: ≥1 value of **each** must denote the serving node by **exact
+  host match** (the pre-4b substring test admitted `wss://evil.com/x?example.com` and
+  `example.com.attacker.tld`), on the port when the node's domain has one, and, for a node
+  served under a mount path (`NGIT_BASE_PATH`), on that path: the value's path without trailing
+  slashes must equal it, so the bare host does not name such a node and neither does another
+  path on the host. At the root of a domain the path of a value is not compared. Values that
+  name other nodes are not judged: a registration for a pair names both nodes, and each finds
+  itself.
+- **Order of checks [N]**: date and size; then the shape, with no signature verified (`d`, ≥1
+  `w`, the key count against the cap, the form of each key, duplicates, a third value on every
+  key that is not the author's, the `relays` and `server` tags); then admission (§5), which an
+  account that already holds the alias passes and anyone else is put to the mode for; then the
+  proofs of possession; then, in one write transaction, admission again, the conflict merge, the
+  alias limit, the quota and the replacement cadence. The first failure is the answer, so a
+  registration with several faults reports the earliest. A sender the mode refuses has no proof
+  verified and takes part in no conflict merge: no alert, no eviction, no pruning. The order
+  changes no verdict, only the message and the cost, so it is not part of the
+  `policy_fingerprint`.
 - **Deterministic cross-node conflict merge [N]** (plan §3.2): when an incoming 30640 claims an
   alias held by a different tenant, or any `w`/`aux` key claimed by a different alias, the winner
   is the one with the **lowest created_at**, ties to the **lowest event id** — compared against the
@@ -64,7 +79,8 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   quota *check* (never the charge), and the replacement-cadence bucket. Fresh non-conflict
   registrations keep all three. Admission-mode gates (whitelist/pow) **do** apply to a conflict-merge
   alias takeover (§5), because paired nodes are required to run identical, fingerprint-verified
-  admission config — so those gates cannot diverge the merge.
+  admission config — so those gates cannot diverge the merge. They are applied before the merge is
+  evaluated: a sender the mode refuses is neither winner nor loser of anything.
 - **Loser eviction [N]**: in the winner's meta txn the loser's record, key claims, alias slot,
   blob-claim references, orphaned speculative charges, alias event-bytes column, and state-ring
   editions are all freed; its relay-DB 30640 coordinate is pruned by the async caller. Both conflict
@@ -437,7 +453,12 @@ Admission mode **defaults to `whitelist`** — the safe "accept nothing without 
 staging/self-use only; `pow` (NIP-13, default 20 bits) is available; `paid` is **[D]** and rejected
 by config validation. Admission modes gate NEW aliases only (including conflict-merge takeovers and
 meta-index rebuilds); a boot reconcile of an already-admitted same-tenant edition skips them, and a
-rejected replay is non-destructive (no meta mutation, no pruning).
+rejected replay is non-destructive (no meta mutation, no pruning). For a registration from a client
+or a peer the mode is asked before any proof of possession is verified and before any conflict is
+evaluated (§2.1, "Order of checks"); an account that already holds the alias is not asked, so an
+account taken off the whitelist can still replace its registrations and cannot take a new alias. The
+decision is one function of the node's configuration and the event. A boot reconcile asks the mode
+after the conflict checks, as before, so that a stored conflict loser is still pruned.
 
 Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
 Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
@@ -535,6 +556,8 @@ private-IP block, no redirect-following, https-only by default, sha+size-bounded
 | 30640: lost an alias conflict | `alias already registered` | genuine |
 | 30640: lost a key conflict | `write key already registered` | genuine (drives the squat-tolerant widen) |
 | whitelist / pow / alias limit / quota | `tenant is not on the registration whitelist` / `registration requires N bits of NIP-13 proof of work` / `tenant has reached the alias limit` / `quota exceeded` | genuine |
+| 30640: sender refused by the mode AND would lose a conflict, or carries a bad proof | the whitelist / pow message (admission is decided first, §2.1) | genuine |
+| 30640: no `relays` / `server` value names this node (host, port, and mount path if any) | `registration relays tag must list this node` / `registration server tag must list this node` (`invalid:`) | genuine |
 | any private kind, created_at > now + 900 s | `event created_at is too far in the future` | genuine |
 | any private kind, serialized size > `max_event_bytes` (checked first, before any lookup) | `event exceeds private repo size limit` | genuine |
 | 30641: `a` tag names another tenant than the alias's holder | `state root a tag does not match the live registration` | genuine |
@@ -600,6 +623,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.1 — §3.2 deterministic merge + FIRST-edition anchor + winner exemptions + loser eviction (v0: bare "first-registrant-wins").
 - §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
+- §2.1, §5, §5.2 — order of checks in registration: shape (key cap first) before admission, admission before proofs of possession and before the conflict merge; an account that holds the alias is exempt from the mode; no message text changed. A node under a mount path is named by host and path in `relays`/`server`.
 - §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.
 - §2.3 — unregistered stream wraps rejected outright (never the public path); stored held, ephemeral not; **[D]** on collab rumors dropped.
 - §2.3 — **stream wraps moved to their own kinds 3359/23359** (server `c5301bb`, client `eb1e5e2`); 1059 retained ONLY for genuine NIP-59 invites/promotions; legacy 1059/21059 dual-accept as a transitional window, default on; retired-kind rejection string (§5.2); tagless-admission gate written (`tests/private_repos.rs:4881,4892`), closing the hole `nip-conformance.md` item 7b recorded.

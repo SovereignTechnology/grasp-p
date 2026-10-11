@@ -102,6 +102,75 @@ index, then flip back.
 
 Any mode change moves the `policy_fingerprint` — coordinate both nodes (§2).
 
+### What a registration is checked for, and in what order
+
+A kind-30640 registration from a client or from the peer is checked from the
+cheapest test to the most costly, and the first failure is the answer:
+
+1. its date, then its size;
+2. its shape, with no signature verified: the `d` tag, at least one `w`
+   key, the number of keys against `NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS`,
+   the form of each key, no key twice, a proof on every key that is not the
+   author's, and `relays` and `server` tags that name this node;
+3. admission: an account that already holds the alias passes; anyone else is
+   subject to the mode (`whitelist`, `pow`, `open`);
+4. the proofs of possession, one signature check per key;
+5. the write: admission once more, then conflicts, the alias limit, the
+   quota and the replacement cadence.
+
+What this means in operation:
+
+- **A sender the mode refuses costs the node almost nothing.** It gets
+  `tenant is not on the registration whitelist` (or the proof-of-work
+  message) before any proof is verified and before any conflict is looked
+  at. It raises no `NgitPrivateRegistrationConflict`, and nothing is pruned
+  on its account. It still counts in
+  `ngit_private_events_rejected_total{kind="30640"}`
+  ([Admission rejection spike](#admission-rejection-spike)).
+- **An account you take off the whitelist keeps its repositories.** It can
+  still replace the registrations it holds (rotate keys, remove a member).
+  It cannot register a new alias. To stop an account altogether, use the
+  event blacklist (§4 step 8).
+- **A registration with several faults reports the earliest one in the list
+  above.** A client that used to see a proof message may now see the key
+  limit, the whitelist or a `must list this node` message for the same
+  event. The texts themselves are unchanged (§5).
+- **At start-up** the node re-applies the registrations in its own relay
+  database that its meta store lacks. There the conflict checks still come
+  before the mode, so a leftover loser of an old conflict is removed even
+  when its author is no longer admitted.
+
+### Under a base path
+
+A node served under `NGIT_BASE_PATH` (say `/grasp`) is named by its host and
+that path together. Nothing in this section applies to a node at the root of
+its domain.
+
+- **Registrations must name the mounted URL.** The `relays` tag has to carry
+  `wss://<domain>/grasp` and the `server` tag `https://<domain>/grasp`. A
+  registration naming `wss://<domain>` alone is refused with
+  `registration relays tag must list this node`: a client told the bare host
+  would talk to whatever else is served there. A registration for a pair
+  names both nodes; each node looks for itself.
+- **Peer lists must spell each node with its path.** In
+  `NGIT_GRASP_P_SYNC_PEER_URLS`, `wss://<domain>/grasp` is this node and is
+  left out; `wss://<domain>` or `wss://<domain>/other` is taken for another
+  service and dialled as a peer. The same holds for the `server` values the
+  mirror uses when `NGIT_GRASP_P_MIRROR_PEER_URLS` is unset. The
+  `policy_fingerprint` covers this node's full address and its bootstrap
+  relay only (§2): a bootstrap relay spelled without its path shows as a
+  mismatch there, an entry of the peer list does not. Check the peer list by
+  the aliases in the scrape: a node that numbers itself as a peer has an
+  entry that misses its path.
+- **The watchdog** given `--relay-a wss://<domain>/grasp` takes that node's
+  blob base from the `server` values with the same path. Pass
+  `--blob-base-a` / `--blob-base-b` when no registration names it.
+- **Moving a node under a path, or to another path, orphans its
+  registrations for clients**: they name the old URL. The node keeps
+  serving them from its meta store, but a rebuild of a wiped meta store
+  refuses every registration that does not name the new URL. Have the
+  accounts publish new editions first.
+
 ---
 
 ## 2. `policy_fingerprint` parity
@@ -374,7 +443,8 @@ does not resolve at all counts as `network`); local
 quota/budget refusal (`quota` — see [Ledger budget](#ledger-budget)); late
 upload (`http_status: 404` on all peers — retried at the max interval). Peer
 set: `NGIT_GRASP_P_MIRROR_PEER_URLS` if set, else the registration's `server`
-tags minus this node's own domain (`peer_servers_for` in
+tags minus the ones that name this node (host, port, and mount path if it
+has one; `peer_servers_for` in
 src/grasp_p/mirror.rs). There is no give-up.
 
 **After the fix.** A blob is fetched again when its backoff ends, then the
@@ -462,6 +532,14 @@ src/metrics/mod.rs:318–326).
 - `resolution="stored_evicted"` — a previously accepted registration lost
   its seat: key claims freed, record dropped, relay-DB coordinate pruned.
 - `resolution="incoming_rejected"` — the arriving registration lost.
+
+Only senders the node admits can cause either. In `whitelist` mode a
+registration from an account that is not listed is refused by the mode before
+any conflict is looked at (§1, "What a registration is checked for"), so
+this alert means that a listed account, or the peer's copy of one, is in
+conflict; strangers probing aliases do not reach it. The one exception is
+start-up, where a stored loser is still reported as `incoming_rejected`
+whoever its author is.
 
 Remediate:
 
@@ -942,9 +1020,10 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | `restricted: rate-limited; retry later` | 30641/wrap/ephemeral-wrap write bucket empty (src/nostr/builder.rs:815, 848, 879) | transient | back off, retry |
 | `restricted: replacement rate-limited; retry later` | same-tenant 30640 replacement cadence (src/grasp_p/registration.rs:591–598) | transient | retry later; the server ALSO holds the newest rejected edition and retries it after bucket refill (below), so the client may never need to |
 | `restricted: quota exceeded` | registration/wrap over quota (src/grasp_p/registration.rs:552, src/grasp_p/mod.rs:852) | genuine | free space or ask operator for quota |
-| `restricted: tenant is not on the registration whitelist` | whitelist mode (src/grasp_p/registration.rs:469–473) | genuine | ask operator to admit the npub |
-| `restricted: registration requires N bits of NIP-13 proof of work` | pow mode (src/grasp_p/registration.rs:476–481) | genuine | re-mine the 30640 |
-| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss (src/grasp_p/registration.rs:414, 448) | genuine | pick another alias / minimal widen without the squatted keys |
+| `restricted: tenant is not on the registration whitelist` | whitelist mode, for an alias the sender does not hold; decided before any proof is verified and before any conflict (`new_seat_admission` in src/grasp_p/registration.rs) | genuine | ask operator to admit the npub |
+| `restricted: registration requires N bits of NIP-13 proof of work` | pow mode, same place | genuine | re-mine the 30640 |
+| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss, for a sender the mode admits (`apply` in src/grasp_p/registration.rs) | genuine | pick another alias / minimal widen without the squatted keys |
+| `invalid: registration relays tag must list this node` / `invalid: registration server tag must list this node` | no value of the tag names this node: its host and port, and its mount path when it runs under `NGIT_BASE_PATH` (`parse_shape`) | genuine | publish the registration with this node's full URL in both tags |
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
 | HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/grasp_p/mod.rs:175, 189) | takedown | none — operator action only |
 | HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/grasp_p/mod.rs:176, 190) | genuine | DELETE blobs or ask for quota |
@@ -987,6 +1066,19 @@ containing `unregistered` as its widenable case
 (cord-core/src/repo.rs:811), and widening a key cannot help against a
 retired KIND — the client would republish its 30640 and retry the same dead
 kind forever.
+
+The other refusals of a malformed registration are stable too, all with
+the `invalid:` prefix: `registration must carry a d tag`, `registration d tag
+must be exactly 32 lowercase hex chars`, `registration must carry at least
+one w (write key) tag`, `registration exceeds the N key limit`, `w/aux keys
+must be 64 lowercase hex chars`, `registration lists the same key more than
+once`, `w/aux keys must carry a proof-of-possession signature`, `w/aux key
+is not a valid x-only pubkey`, `w/aux key proof-of-possession signature is
+malformed` and `w/aux key proof-of-possession signature is invalid`. A
+registration with more than one fault gets the first that applies in the
+order of §1 ("What a registration is checked for"): shape before admission,
+admission before proofs, proofs before conflicts. A client must not conclude
+from a whitelist or key-limit refusal that its proofs were accepted.
 
 Also stable: `restricted: event exceeds private repo size limit`,
 `restricted: tenant has reached the alias limit`,
@@ -1124,13 +1216,18 @@ discipline (g6_nginx_stream_shape.sh: 127.0.0.1 binds, cleanup on exit).
 
 **Whitelist-mode soak (the shipped posture).** Script sketch: generate N
 fresh keypairs; each signs a shape-valid 30640 (32-char lowercase-hex alias,
-`relays` + `server` tags exactly listing the staging node — exact-host
-match, src/grasp_p/registration.rs:151–165; sole `w` = author key); publish
-all N to node A.
+`relays` + `server` tags exactly listing the staging node — its host and
+port, and its mount path if it has one (`parse_shape`); sole `w` = author
+key); publish all N to node A. For the cost of a refusal, give half of them
+64 `w` keys with well-formed signatures that do not verify: they must be
+refused the same way and as fast, since no proof is verified for a sender
+the mode refuses.
 
 Assert:
 
 - every publish returns OK false `tenant is not on the registration whitelist`
+- `ngit_private_registration_conflicts_total` flat, also when the fresh keys
+  aim at an alias that is taken
 - `ngit_private_events_rejected_total{kind="30640"}` rises by N
 - `ngit_private_registrations_total`, `ngit_private_aliases_total` flat
 - `ngit_private_ledger_bytes{scope="global"}` flat — rejected registrations

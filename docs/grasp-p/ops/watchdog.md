@@ -51,7 +51,11 @@ ngit-private-watchdog --relay-a wss://A --relay-b wss://B \
   host match is the SSRF guard: a tenant-controlled `server` tag can never
   point the watchdog anywhere but the node's own host, and the scheme/port
   match stops derivation latching onto the wrong scheme or an arbitrary
-  port on that host. Multiple matching values that differ ONLY by path
+  port on that host. When the relay URL given to the watchdog has a path
+  (a node under `NGIT_BASE_PATH`, e.g. `wss://host/grasp`), only the values
+  with that same path are candidates, because that node's blob routes are
+  under it; the rest of this paragraph is about a relay URL at the root of
+  its host. Multiple matching values that differ ONLY by path
   (e.g. `https://host` and `https://host/x` — the common nginx path-vhost
   shape) are NOT ambiguous: the path-empty value wins deterministically.
   Genuine ambiguity — one endpoint spelled two ways (e.g. `https://host`

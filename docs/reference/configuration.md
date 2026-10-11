@@ -170,6 +170,13 @@ The corresponding NixOS option is `basePath`.
   failing. Spell the port explicitly (`host:port`) when the blob endpoint
   is not the scheme default; a ported `NGIT_DOMAIN` requires tag URLs to
   match that effective port exactly.
+- **GRASP-P under `NGIT_BASE_PATH`:** a node mounted under a path is named
+  by its host and that path together. A registration's `relays` and `server`
+  tags must carry the mounted URL (`wss://{NGIT_DOMAIN}{NGIT_BASE_PATH}`,
+  `https://{NGIT_DOMAIN}{NGIT_BASE_PATH}`); the bare host, or another path
+  on it, is refused as not listing this node, and in a peer list it is
+  taken for another service and dialled. At the root (`/`) the path of a
+  URL is not compared.
 - **IPv6:** always use the bracketed form (`[::1]`, `[2001:db8::1]:7334`).
   A bare unbracketed IPv6 `NGIT_DOMAIN` (e.g. `::1`) is degenerate — the
   authority splitter misparses it into a garbage host/port pair and the

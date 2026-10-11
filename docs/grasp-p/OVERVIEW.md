@@ -132,7 +132,8 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
 ## What the server enforces
 
 - **Admission**: who may register a new alias. `whitelist` (default), `pow`, or `open`
-  (testing only).
+  (testing only). It is decided before any proof is verified or any conflict is looked at,
+  and an account keeps control of the aliases it already holds.
 - **Key rules**: proof of possession, no key reused across aliases, state roots only from
   write keys.
 - **Conflicts**: if two tenants claim the same alias or key, the earliest first registration

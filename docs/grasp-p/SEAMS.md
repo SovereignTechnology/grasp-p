@@ -26,7 +26,7 @@ Upstream's files carry thin seams only:
 | `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
-| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p` / `start_grasp_p_pair_node`, which both set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
+| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path` and `start_grasp_p_pair_node`, which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
@@ -344,11 +344,12 @@ seam to a file upstream owns, no setting, and nothing to `policy_fingerprint`.
   whatever their `expiration`. A BUD-11 `server` tag is checked: an event that carries
   such tags is refused unless one names this node, a `list` authorization must carry
   one, and `upload` and `delete` do not need one until the client sends it (M4). "Names
-  this node" is the configured domain (`NGIT_DOMAIN`), compared by `host::url_denotes_domain`
-  like every other such check: the host without regard to case or a trailing dot, and the
-  port when the domain has one. The tag is a bare domain, so the mount path of a node under
-  `NGIT_BASE_PATH` is not compared. A refused `GET /list` is still the one identical `401`,
-  whichever check failed.
+  this node" is the configured domain (`NGIT_DOMAIN`), compared by `host::url_denotes_domain`:
+  the host without regard to case or a trailing dot, and the port when the domain has one.
+  The tag is a bare domain, so the mount path of a node under `NGIT_BASE_PATH` is not
+  compared here. The tags of a registration are URLs and are compared with the path (see
+  "Under a base path the node is its host and its path"). A refused `GET /list` is still
+  the one identical `401`, whichever check failed.
 - **No record of used authorizations**, on purpose. What a captured authorization can
   still do inside its window (75 minutes at most): a list authorization returns that
   key's inventory to whoever presents it; an upload authorization, with the bytes, stores
@@ -581,6 +582,155 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
   last. No slot is kept back for an account with nothing running when two slow accounts
   hold them all.
 
+## Registration: cheap checks first, and a node named with its mount path
+
+Both changes are in GRASP-P's own files (`src/grasp_p/registration.rs`, `host.rs`,
+`mirror.rs`, `relay_labels.rs`, `src/sync/private_index.rs`, the watchdog). No upstream
+source file is touched. Two of upstream's other files are: `tests/common/relay.rs` gains
+the constructor `start_with_grasp_p_at_base_path` (seam table above), and
+`docs/reference/configuration.md` gains one bullet under `NGIT_BASE_PATH`.
+
+### The order of checks
+
+A registration (kind 30640) used to have every proof of possession verified, up to 64
+signature checks, before the number of its keys was counted and before the node asked
+whether the sender may register at all. Anyone could make a node do that work for
+registrations it was going to refuse. The admission mode was asked after the conflict
+checks, so a sender the mode refuses could still raise the conflict alert and have a
+coordinate pruned.
+
+The order now, for a registration from a client or from a peer (`handle`):
+
+| # | Step | Where | Refusal |
+|---|---|---|---|
+| 1 | date | `check_not_future_dated` | `invalid: event created_at is too far in the future` |
+| 2 | size | `handle_inner` | `restricted: event exceeds private repo size limit` |
+| 3 | shape, no signature verified | `parse_shape` | in this order: `registration must carry a d tag`, `registration d tag must be exactly 32 lowercase hex chars`, `registration must carry at least one w (write key) tag`, `registration exceeds the N key limit`, `w/aux keys must be 64 lowercase hex chars`, `registration lists the same key more than once`, `w/aux keys must carry a proof-of-possession signature`, `registration relays tag must list this node`, `registration server tag must list this node` (all `invalid:`) |
+| 4 | admission, read only | `pre_admission` | the mode's message (below), or `error: private meta store failure` when the store cannot be read |
+| 5 | proofs | `verify_proofs` | `w/aux key is not a valid x-only pubkey`, `w/aux key proof-of-possession signature is malformed`, `w/aux key proof-of-possession signature is invalid` (all `invalid:`) |
+| 6 | write transaction | `apply` | admission again, first; then `alias already registered`, `write key already registered`, `tenant has reached the alias limit`, `quota exceeded`, `replacement rate-limited; retry later` (all `restricted:`) |
+
+- **Admission is one function.** `new_seat_admission(cfg, event)` is the whole decision
+  for a new seat: nothing in `open` mode, `tenant is not on the registration whitelist`
+  in `whitelist` mode, `registration requires N bits of NIP-13 proof of work` in `pow`
+  mode. `seat_admission` wraps it with the one exemption: an account that already holds
+  the alias passes whatever the mode says, because the mode gates new seats only and an
+  account taken off the list must keep control of the repositories it has. Steps 4 and
+  6 both call `seat_admission`, each with the stored record read in its own
+  transaction, so they can only differ when the record changed in between. Step 6 is
+  the authority; step 4 exists to refuse early. A later change that makes the list
+  reloadable replaces `new_seat_admission` and nothing else.
+- **A sender the mode refuses** gets the mode's message and nothing more happens: no
+  proof is verified, no write lock is taken (step 4 reads a snapshot), no conflict is
+  evaluated, `ngit_private_registration_conflicts_total` does not move and nothing is
+  pruned. Such a refusal still counts in `ngit_private_events_rejected_total`.
+- **No message text changed.** What changed is which message a registration with more
+  than one fault receives:
+  - over the key cap, with a malformed key or a missing, malformed or invalid proof:
+    the key limit, where it used to be the key's or the proof's message;
+  - a malformed key anywhere, with a missing or bad proof on an earlier key: `w/aux keys
+    must be 64 lowercase hex chars`, where it used to be the earlier key's message;
+  - a key listed twice, with a missing or bad proof: `registration lists the same key
+    more than once`, where it used to be the proof's message;
+  - a missing proof on one key and a bad proof (or a key that is not a valid curve
+    point) on an earlier one: `w/aux keys must carry a proof-of-possession signature`,
+    where it used to be the earlier key's message;
+  - a bad proof and a `relays` or `server` tag that does not name this node: the tag's
+    message, where it used to be the proof's;
+  - a bad proof from a sender the mode refuses: the mode's message, where it used to be
+    the proof's;
+  - a sender the mode refuses whose registration also loses a conflict over the alias
+    or over a key: the mode's message, where it used to be `alias already registered`
+    or `write key already registered` (and, before, the alert and the prune that go
+    with a lost conflict).
+
+  A registration with one fault gets the message it always got.
+- **What a node accepts did not change.** Every check is still made; a registration is
+  accepted exactly when it was accepted before. That is why the policy fingerprint has
+  the same inputs and the same version label: the two nodes of a pair run the same
+  build, they are given the same whitelist (which is in the fingerprint), and they
+  reach the same verdict on the same registration. The admission decision reads the
+  configuration and the event only, never a counter that could differ between nodes;
+  the exemption reads the stored record, as the old code did when it asked the mode
+  only for an alias that was new to the node.
+- **Peers.** A registration that arrives from the peer goes through `handle` like one
+  from a client, as before. The peer admitted it under the same policy, so the early
+  check passes here too. The one case where it does not is the one that existed
+  before: the account was taken off the list on both nodes and this node never stored
+  the alias, so here it is a new seat.
+- **Boot replay keeps the old position.** At start-up the node replays the
+  registrations in its own relay database that the meta store does not have
+  (`handle_replay`). There the mode is still asked after the conflict checks, and step
+  4 is skipped. The early position sheds load from senders, and these events are the
+  node's own; and a stored registration that lost a conflict, left behind by a failed
+  prune, is then still recognised as the loser and pruned, even when its author is no
+  longer admitted. With the mode asked first it would be refused by the mode at every
+  start and never removed. A replay that would create a seat is still subject to the
+  mode, as before: rebuilding a wiped meta store under a stricter mode needs the
+  accounts listed, or `open`, for that one start.
+- **What is left.** An admitted account can still send registrations with 64 keys and
+  cost 64 signature checks each time; that is bounded by the cap and attributable to
+  the account. In `open` mode nobody is refused at step 4, so only the cap and the
+  shape checks come before the proofs. In `pow` mode the work is checked before the
+  proofs, but it is paid once per event and not once per send: a registration refused
+  for a bad proof is not stored, so the same mined event can be sent again and cost its
+  proof checks again. Only the relay's limit on events per connection bounds that.
+
+### Under a base path the node is its host and its path
+
+A node can be served under a path (`NGIT_BASE_PATH`, for example `/grasp`). Its relay
+is then `wss://host/grasp` and its blob routes are under `https://host/grasp`, and
+`host` alone is somebody else's service or nothing. The comparison that asked "does
+this URL name this node" looked at the host and the port only.
+
+`host::url_denotes_service(value, service_address)` is the comparison now. The service
+address is `Config::service_address()`: the domain, followed by the mount path if there
+is one. The host and the port are compared as before (`url_denotes_domain`). When the
+service address has a path, the URL's path, with trailing slashes removed, has to equal
+it; a query is not compared. When it has none, the path of the URL is not looked at, so
+**a node at the root of its domain behaves exactly as before**, and so does every
+existing test.
+
+Every caller of the old comparison, and what it does now:
+
+| Caller | Now | Why |
+|---|---|---|
+| `registration::parse_shape`, the `relays` and the `server` tag | service | A registration names where clients go. Naming the bare host of a mounted node would send them to the wrong URL. |
+| `mirror::is_own_server` (peers taken from `server` tags) | service | Another service on the same host is a peer, not this node. |
+| `private_index::configured_peer_relay_urls` (the sync peer list) | service | The same, for relays. Its caller already passed the service address. |
+| `relay_labels::RelayLabels::from_config` | service | It must leave out exactly the entries the sync code leaves out, or a peer would be scraped without an alias. A test holds the two together. |
+| `ngit-private-watchdog`, `derive_blob_base` | path-aware (own code, same rule) | When the relay URL it was given has a path, only `server` values with that path are candidates for the blob base. |
+| `blossom_auth::names_this_node` (the BUD-11 `server` tag of an authorization) | host only, unchanged | BUD-11 puts a bare domain in that tag, with no path. Requiring a path would refuse every conforming client. |
+
+A registration for a pair names both nodes in its `relays` and in its `server` tags.
+Each node looks for itself among the values and does not judge the others.
+
+**What changes for a node under a base path** (nothing changes at the root). A domain
+setting that itself carries a path counts as mounted at that path: put the path in
+`NGIT_BASE_PATH` and keep `NGIT_DOMAIN` to host and port.
+
+- A registration whose `relays` or `server` tags name the bare host, or another path on
+  the host, is refused with `registration relays tag must list this node` or
+  `registration server tag must list this node`. It has to name `wss://host/path` and
+  `https://host/path`. Registrations already stored are not looked at again, except by
+  a boot replay into an empty meta store, which refuses the ones that name the bare
+  host.
+- An entry of `NGIT_GRASP_P_SYNC_PEER_URLS` that names this node's host without its
+  path, or with another path, is no longer taken for the node itself. It is dialled as
+  a peer, and gets an alias in the scrape. A list shared by both nodes must spell each
+  node with its path.
+- With no `NGIT_GRASP_P_MIRROR_PEER_URLS` set, a `server` value on this node's host
+  without its path is a peer the mirror will ask for blobs, where it used to be
+  skipped as the node itself. Set the peer list in production.
+- The watchdog, given `--relay-a wss://host/path`, takes the blob base from the
+  `server` values with that path only.
+
+No setting is added. The fingerprint's `domains` input already was the service address
+plus the bootstrap relay, so its inputs and its label stay as they are: both nodes of a
+pair run the same build, and at the root nothing a node accepts has changed. Upstream
+has its own matcher for its own tags (`outbound::relay_url_matches_service`); it parses
+more leniently and is not used for the GRASP-P checks, which stay strict about the URL.
+
 ## Decisions made during the port
 
 - **Names.** `HttpService.private` and the write-policy field are `grasp_p`;
@@ -668,7 +818,8 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
   reported once) while it cannot be registered at all.
 - **Advertised URLs.** NIP-11 `blob_endpoints` and the blob descriptors are built from
   `Config::service_address()`, so they carry `NGIT_BASE_PATH`. The check that a
-  registration names this node still compares host and port only.
+  registration names this node compares the same address, path included (see "Under a
+  base path the node is its host and its path").
 - **Log lines** keep their legacy wording ("Private ..."): tests and ops docs match on them.
 
 ## Behaviour that changed with upstream
@@ -756,9 +907,9 @@ features. No package was added.
   does not have; and it compares defaults where a file states one it can read. A setting
   added to, renamed in or removed from fewer than four sources fails there.
 - `private_repos`, `private_two_node`, `private_watchdog`: the GRASP-P suites, on the fixture
-  constructors `TestRelay::start_with_grasp_p` and `start_grasp_p_pair_node` in
-  `tests/common/relay.rs` (upstream's file, with those two constructors, the `extra_env` option
-  and the two metrics accessors added). Both constructors set
+  constructors `TestRelay::start_with_grasp_p`, `start_with_grasp_p_at_base_path` and
+  `start_grasp_p_pair_node` in `tests/common/relay.rs` (upstream's file, with those
+  constructors, the `extra_env` option and the two metrics accessors added). They all set
   `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0`, so a node they start has a metrics endpoint on a
   port the kernel picks unless the test overrides the setting or switches GRASP-P off, and the
   suites read metrics through `TestRelay::grasp_p_metrics`, which finds the port in the node's
@@ -826,6 +977,30 @@ features. No package was added.
   of its steps, the limits on the body) and the fall-through from one claimant to the
   next in `fetch_blob` have no unit test; `exit1`, `exit3`, `exit5`,
   `exit9`, `exit11` and `grasp_p_tls` run it end to end.
+- Registration ("Registration: cheap checks first ..."). Unit tests in
+  `src/grasp_p/registration.rs` drive the handler against a real meta store. None counts
+  signature checks: each gives a registration a proof that cannot verify and requires the
+  refusal of an earlier step, which could not come back if a proof had been verified
+  first. They cover the key cap before any proof; every shape refusal before any proof;
+  the whitelist and proof of work before any proof; a refused sender that would have
+  lost or won a conflict getting the mode's message with nothing pruned and no alert
+  recorded, next to a listed sender that still gets the conflict answer; an account off
+  the list replacing the registration it holds and being refused a new alias; the write
+  transaction refusing by itself when the early check is left out (`apply` called
+  directly); the boot replay keeping the conflict checks ahead of the mode; and a node
+  under a base path refusing the bare host and another path while accepting a
+  registration for a pair. `src/grasp_p/host.rs` has the service comparison (root, mount
+  path, trailing slash, other path, other host, port), `src/grasp_p/mirror.rs`,
+  `src/sync/private_index.rs` and `src/grasp_p/relay_labels.rs` each have one test of
+  their own use of it, and the watchdog has `derive_blob_base_follows_the_relay_mount_path`.
+  In `private_repos`, `base_path_registration_and_blob_routes` starts a node under
+  `/grasp`: the advert carries the path, a registration naming the bare host or another
+  path is refused, one naming the mounted URL is accepted, a blob is uploaded and read
+  back under the path, and the same request outside the path is a 404.
+  `exit11_registration_conflict_merge` has its late challenger on the whitelist now (it
+  tests the conflict, and an unlisted sender no longer reaches it), and a new step
+  checks that an unlisted challenger gets the whitelist answer and leaves the conflict
+  counter where it was. No pair test runs under a base path.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync

@@ -166,10 +166,19 @@ project yet.
   not retry these answers yet.
 - **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the
   charge on the uploader for good, at no cost to itself.
-- **Order of checks in registration.** Proofs of possession are verified before the key
-  count is capped and before the admission mode is consulted, and the admission mode is
-  consulted after the conflict merge, so an anonymous sender can cost CPU and raise the
-  conflict alert.
+- **Order of checks in registration** (done). Proofs of possession were verified before
+  the key count was capped and before the admission mode was consulted, and the mode was
+  consulted after the conflict merge, so an anonymous sender could cost CPU and raise the
+  conflict alert. A registration is now checked for shape first, without any signature
+  check and with the key cap ahead of the keys; then for admission, on a read snapshot;
+  then its proofs are verified; and the write transaction asks for admission again
+  before it looks at any conflict. A sender the mode refuses costs no signature check
+  and raises no alert. No message text changed and no registration is accepted or
+  refused that was not before; which message a registration with several faults gets
+  did change. See "Registration: cheap checks first ..." in [`SEAMS.md`](SEAMS.md).
+  Still open: an admitted account can resend a 64-key registration and cost 64 checks
+  each time, `open` mode refuses nobody before the proofs, and in `pow` mode one mined
+  event with a bad proof can be re-sent.
 - **Events of other kinds can attach to GRASP-P events** through upstream's related-event
   rule: uncharged plaintext stored on a ciphertext node.
 - **Blob responses** (done, except the blacklist). Every response of the blob routes says
@@ -199,8 +208,14 @@ project yet.
   NIP-65 discovery connections, and count against each relay's subscription slots, so their
   growth can cost a relay its public coverage. The watchdog's discovery filter does not page
   past 500 events; the sync filters do, through upstream's historic sync.
-- **Base path.** The check that a registration names this node ignores `NGIT_BASE_PATH`,
-  and no test runs GRASP-P under one.
+- **Base path** (done). The check that a registration names this node ignored
+  `NGIT_BASE_PATH`, and no test ran GRASP-P under one. A node under a mount path is now
+  named by its host and that path together: in the `relays` and `server` tags of a
+  registration, where the mirror and the private sync leave this node out of a peer
+  list, and where the watchdog derives a blob base. Nothing changes for a node at the
+  root of its domain. One integration test runs a single node under a path; no pair
+  test does. See "Under a base path the node is its host and its path" in
+  [`SEAMS.md`](SEAMS.md).
 - **Blob mirror peers** default to the `server` tags of accepted registrations when no
   allowlist is set, so tenant events do choose hosts the node connects to (vetted by the
   SSRF guard; see #3). **Mirror half done with #26:** a host that only a registration
