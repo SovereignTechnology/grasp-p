@@ -614,7 +614,10 @@ fn classify_http_status(code: u16) -> Option<BlobProbeOutcome> {
 /// tenant-controlled server tag can never point the watchdog anywhere but
 /// the node's own host; the scheme/port equality keeps derivation from
 /// latching onto the wrong scheme or an arbitrary port on that host (a blind
-/// oracle). Ok(None) = no match; multiple matches go through
+/// oracle). A node served under a mount path has its blob routes under that
+/// path, so when the relay URL has a path only the values with the same path
+/// are candidates; a relay URL at the root of its host puts no condition on
+/// the path, as before. Ok(None) = no match; multiple matches go through
 /// [`resolve_base_candidates`]: a path-only tie resolves to the path-empty
 /// candidate (R2-4), genuine ambiguity is Err (operator must pass
 /// --blob-base-{a,b} explicitly).
@@ -644,6 +647,8 @@ fn derive_blob_base(
     let expected_port = relay
         .port_or_known_default()
         .ok_or_else(|| format!("relay url {relay_url} has no usable port"))?;
+    // Empty for a relay at the root of its host.
+    let mount_path = relay.path().trim_end_matches('/').to_string();
     let matches: BTreeSet<String> = servers
         .into_iter()
         .map(|s| s.trim_end_matches('/').to_string())
@@ -654,6 +659,7 @@ fn derive_blob_base(
                         .map(|h| h.eq_ignore_ascii_case(&host))
                         .unwrap_or(false)
                     && u.port_or_known_default() == Some(expected_port)
+                    && (mount_path.is_empty() || u.path().trim_end_matches('/') == mount_path)
             })
         })
         .collect();
@@ -2340,6 +2346,47 @@ mod tests {
             "https://grasp-a.example.com".to_string(),
         ]);
         assert!(resolve_base_candidates("https://grasp-a.example.com:443", matches).is_err());
+    }
+
+    #[test]
+    fn derive_blob_base_follows_the_relay_mount_path() {
+        // A node under a mount path serves its blobs there: of the values
+        // on its host, only the one with the same path is its blob base.
+        let relay = RelayUrl::parse("wss://grasp-a.example.com/grasp").unwrap();
+        let servers = vec![
+            "https://grasp-a.example.com".to_string(),
+            "https://grasp-a.example.com/grasp".to_string(),
+            "https://grasp-a.example.com/other".to_string(),
+            "https://grasp-b.example.com/grasp".to_string(),
+        ];
+        assert_eq!(
+            derive_blob_base(&relay, servers).unwrap(),
+            Some("https://grasp-a.example.com/grasp".to_string())
+        );
+        // A trailing slash on either side is the same path.
+        let relay = RelayUrl::parse("wss://grasp-a.example.com/grasp/").unwrap();
+        assert_eq!(
+            derive_blob_base(
+                &relay,
+                vec!["https://grasp-a.example.com/grasp/".to_string()]
+            )
+            .unwrap(),
+            Some("https://grasp-a.example.com/grasp".to_string())
+        );
+        // The bare host alone is not this node's blob base.
+        assert_eq!(
+            derive_blob_base(&relay, vec!["https://grasp-a.example.com".to_string()]).unwrap(),
+            None
+        );
+        // Scheme and port still have to match.
+        assert_eq!(
+            derive_blob_base(
+                &relay,
+                vec!["https://grasp-a.example.com:8443/grasp".to_string()]
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

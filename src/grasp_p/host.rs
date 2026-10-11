@@ -6,6 +6,10 @@
 //! `"example.com.attacker.tld"` (domain as a leading label of a hostile
 //! host) passed as "listing this node". The checks here parse the value as
 //! an absolute ws/wss/http/https URL and compare the HOST exactly.
+//!
+//! A node served under a mount path is named by its host and that path
+//! together; [`url_denotes_service`] is the comparison for that, and at the
+//! root of a domain it is the host comparison unchanged.
 
 use url::Url;
 
@@ -38,6 +42,42 @@ pub fn url_denotes_domain(value: &str, domain: &str) -> bool {
         None => true,
         Some(port) => url.port_or_known_default().unwrap_or(default_port) == port,
     }
+}
+
+/// Does `value` denote THIS service, mount path included?
+///
+/// `service_address` is the node's address without a scheme: the domain,
+/// followed by the mount path when the node is served under one
+/// (`Config::service_address`). The authority is compared exactly as
+/// [`url_denotes_domain`] compares it. A node at the root of its domain
+/// answers every path there, so the URL's path is not looked at. A node
+/// under a mount path answers only below it: a URL naming the bare host, or
+/// another path on the same host, reaches a different service or none, and
+/// two services sharing a host must not take each other for themselves. So
+/// there the URL's path, without trailing slashes, has to equal the mount
+/// path. A query or a fragment does not change which service a URL reaches
+/// and is not compared.
+pub fn url_denotes_service(value: &str, service_address: &str) -> bool {
+    if !url_denotes_domain(value, service_address) {
+        return false;
+    }
+    let mount = mount_path(service_address);
+    if mount.is_empty() {
+        return true;
+    }
+    // The base path is validated at start-up to be in the form the URL
+    // parser produces, so the two sides compare as text.
+    Url::parse(value.trim()).is_ok_and(|url| url.path().trim_end_matches('/') == mount)
+}
+
+/// The mount path of a service address: everything from the first `/` after
+/// the authority, without trailing slashes. Empty for a node at the root.
+/// A path written into the domain setting itself is read as a mount path
+/// too, since the node advertises its blob routes under it.
+fn mount_path(service_address: &str) -> &str {
+    let s = service_address.trim().trim_end_matches('/');
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    s.find('/').map_or("", |at| &s[at..])
 }
 
 /// Split the configured domain (an authority: `host`, `host:port`, or
@@ -171,5 +211,134 @@ mod tests {
     fn trailing_slash_and_whitespace_are_trimmed() {
         assert!(url_denotes_domain("wss://example.com/", "example.com/"));
         assert!(url_denotes_domain("  wss://example.com  ", "example.com"));
+    }
+
+    #[test]
+    fn service_at_the_root_ignores_the_path() {
+        for value in [
+            "wss://example.com",
+            "wss://example.com/",
+            "https://example.com/grasp",
+            "https://example.com:443/any/path?x=1",
+        ] {
+            assert!(url_denotes_service(value, "example.com"), "{value}");
+            assert_eq!(
+                url_denotes_service(value, "example.com"),
+                url_denotes_domain(value, "example.com"),
+                "{value}"
+            );
+        }
+        // A trailing slash on the address is still the root.
+        assert!(url_denotes_service("wss://example.com/x", "example.com/"));
+        assert!(!url_denotes_service("wss://other.example", "example.com"));
+        assert!(!url_denotes_service("example.com", "example.com"));
+    }
+
+    #[test]
+    fn service_under_a_mount_path_requires_that_path() {
+        let service = "example.com/grasp";
+        assert!(url_denotes_service("wss://example.com/grasp", service));
+        assert!(url_denotes_service("https://example.com/grasp", service));
+        // The bare host is another service, or none.
+        assert!(!url_denotes_service("wss://example.com", service));
+        assert!(!url_denotes_service("wss://example.com/", service));
+        // So is any other path on the same host: a sibling, a longer name
+        // with the same start, a child, the same name in another case.
+        assert!(!url_denotes_service("wss://example.com/other", service));
+        assert!(!url_denotes_service("wss://example.com/graspy", service));
+        assert!(!url_denotes_service("wss://example.com/grasp/x", service));
+        assert!(!url_denotes_service("wss://example.com/Grasp", service));
+        assert!(!url_denotes_service(
+            "wss://example.com/x/../other",
+            service
+        ));
+        // Dot segments are resolved before the comparison, as a client
+        // resolves them before it connects.
+        assert!(url_denotes_service("wss://example.com/x/../grasp", service));
+    }
+
+    #[test]
+    fn mount_path_comparison_trims_trailing_slashes() {
+        assert!(url_denotes_service(
+            "wss://example.com/grasp/",
+            "example.com/grasp"
+        ));
+        assert!(url_denotes_service(
+            "wss://example.com/grasp//",
+            "example.com/grasp"
+        ));
+        assert!(url_denotes_service(
+            "wss://example.com/grasp",
+            "example.com/grasp/"
+        ));
+        assert!(url_denotes_service(
+            "wss://example.com/services/grasp/",
+            "example.com/services/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "wss://example.com/services",
+            "example.com/services/grasp"
+        ));
+        // A query does not change which service the URL reaches.
+        assert!(url_denotes_service(
+            "wss://example.com/grasp?x=1",
+            "example.com/grasp"
+        ));
+    }
+
+    #[test]
+    fn mounted_service_still_compares_host_and_port() {
+        assert!(!url_denotes_service(
+            "wss://other.example/grasp",
+            "example.com/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "wss://example.com.attacker.tld/grasp",
+            "example.com/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "wss://evil.example/x?example.com/grasp",
+            "example.com/grasp"
+        ));
+        assert!(url_denotes_service(
+            "ws://127.0.0.1:7334/grasp",
+            "127.0.0.1:7334/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "ws://127.0.0.1:7335/grasp",
+            "127.0.0.1:7334/grasp"
+        ));
+        assert!(url_denotes_service(
+            "wss://example.com/grasp",
+            "example.com:443/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "wss://example.com/grasp",
+            "example.com:8443/grasp"
+        ));
+        assert!(url_denotes_service(
+            "https://[::1]:7334/grasp",
+            "[::1]:7334/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "example.com/grasp",
+            "example.com/grasp"
+        ));
+        assert!(!url_denotes_service(
+            "ftp://example.com/grasp",
+            "example.com/grasp"
+        ));
+    }
+
+    #[test]
+    fn mount_path_is_read_from_the_service_address() {
+        assert_eq!(mount_path("example.com"), "");
+        assert_eq!(mount_path("example.com/"), "");
+        assert_eq!(mount_path("example.com:8443"), "");
+        assert_eq!(mount_path("example.com/grasp"), "/grasp");
+        assert_eq!(mount_path("example.com/grasp/"), "/grasp");
+        assert_eq!(mount_path("127.0.0.1:7334/a/b"), "/a/b");
+        assert_eq!(mount_path("[::1]:7334/grasp"), "/grasp");
+        assert_eq!(mount_path("https://example.com/grasp"), "/grasp");
     }
 }

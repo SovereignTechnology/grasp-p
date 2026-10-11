@@ -316,8 +316,10 @@ fn future_expiration() -> u64 {
 // HTTP helpers (Blossom-subset routes)
 // ============================================================================
 
+/// Where this node's HTTP routes start: its host and port, and its mount
+/// path when it runs under one.
 fn http_base(relay: &TestRelay) -> String {
-    format!("http://{}", relay.domain())
+    format!("http://{}", relay.service_address())
 }
 
 fn relay_port(relay: &TestRelay) -> u16 {
@@ -1880,7 +1882,10 @@ async fn exit11_registration_conflict_merge() {
     let late_tenant = Keys::generate();
     let early_tenant = Keys::generate();
     let third = Keys::generate();
-    let whitelist = whitelist_npubs(&[&late_tenant, &early_tenant, &third]);
+    // Admitted like the others: a sender the mode refuses is turned away
+    // before any conflict is looked at, and step (f) is about the conflict.
+    let challenger = Keys::generate();
+    let whitelist = whitelist_npubs(&[&late_tenant, &early_tenant, &third, &challenger]);
     let relay =
         TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
             .await;
@@ -1970,7 +1975,6 @@ async fn exit11_registration_conflict_merge() {
 
     // (f) A later-created challenger still loses to the winner, whenever it
     // arrives.
-    let challenger = Keys::generate();
     let challenge = registration_event(
         &challenger,
         &alias,
@@ -1991,6 +1995,48 @@ async fn exit11_registration_conflict_merge() {
     assert!(
         message.contains("alias already registered"),
         "exit11: conflict-loss message; got {message:?}"
+    );
+
+    // (f2) A challenger the node does not admit is refused for that, with a
+    // proof that could not have been verified, and is no conflict at all:
+    // the alert count checked below is taken before and after it.
+    let conflicts_rejected = |metrics: &common::sync_helpers::ParsedMetrics| {
+        metrics
+            .counter(
+                "ngit_private_registration_conflicts_total",
+                &[("resolution", "incoming_rejected")],
+            )
+            .unwrap_or(0)
+    };
+    let before = conflicts_rejected(&common::sync_helpers::ParsedMetrics::parse(
+        &relay.grasp_p_metrics().await,
+    ));
+    let outsider = Keys::generate();
+    let unproven = registration_event(
+        &outsider,
+        &alias,
+        // A real signature, made for another alias.
+        &[key_entry(
+            &Keys::generate(),
+            &outsider.public_key(),
+            &random_alias(),
+        )],
+        &[],
+        &domain,
+        Some(t0 + 400),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &unproven).await;
+    assert!(
+        !accepted && message.contains("whitelist"),
+        "exit11: a sender the mode refuses must get the mode's answer, not the \
+         conflict's or the proof's; got accepted={accepted} {message:?}"
+    );
+    let after = conflicts_rejected(&common::sync_helpers::ParsedMetrics::parse(
+        &relay.grasp_p_metrics().await,
+    ));
+    assert_eq!(
+        after, before,
+        "exit11: a refused sender must not raise the conflict alert"
     );
 
     // (g) The conflict alert fired for both resolutions.
@@ -4241,6 +4287,119 @@ async fn exit28_exact_host_registration_tags() {
         1,
         "exit28: exact-host registration must round-trip"
     );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// A node under a base path: a registration must name the mounted URL
+// ============================================================================
+
+/// A node served under `/grasp` is named by its host and that path. A
+/// registration naming the bare host is refused; one naming the mounted URL
+/// is accepted, and the blob routes it then uses answer under the path and
+/// nowhere else.
+#[tokio::test]
+async fn base_path_registration_and_blob_routes() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay = TestRelay::start_with_grasp_p_at_base_path(
+        "/grasp",
+        &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
+    )
+    .await;
+    let mounted = relay.service_address();
+    assert_eq!(mounted, format!("{}/grasp", relay.domain()));
+    assert_eq!(relay.url(), format!("ws://{mounted}"));
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let w_entries = [key_entry(&writer, &tenant.public_key(), &alias)];
+    let t0 = Timestamp::now().as_secs() - 10;
+
+    // The advert tells a client where the blob routes are.
+    let doc = nip11_doc(&relay).await;
+    assert_eq!(
+        doc["private_repos"]["blob_endpoints"],
+        serde_json::json!([format!("https://{mounted}")]),
+        "the advert must carry the mount path"
+    );
+
+    // Naming the bare host: both tags miss this node, the relays tag is the
+    // one reported.
+    let bare = registration_event(&tenant, &alias, &w_entries, &[], &relay.domain(), Some(t0));
+    let (accepted, message) = publish_with_result(relay.url(), &bare).await;
+    assert!(
+        !accepted && message.contains("relays tag must list this node"),
+        "a registration naming the bare host must be refused; got accepted={accepted} \
+         {message:?}"
+    );
+
+    // Another path on the same host is another service.
+    let elsewhere = registration_event(
+        &tenant,
+        &alias,
+        &w_entries,
+        &[],
+        &format!("{}/other", relay.domain()),
+        Some(t0 + 1),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &elsewhere).await;
+    assert!(
+        !accepted && message.contains("must list this node"),
+        "a registration naming another path must be refused; got accepted={accepted} \
+         {message:?}"
+    );
+
+    // Naming the mounted URL.
+    let named = registration_event(&tenant, &alias, &w_entries, &[], &mounted, Some(t0 + 2));
+    let (accepted, message) = publish_with_result(relay.url(), &named).await;
+    assert!(
+        accepted,
+        "a registration naming the mounted URL must be accepted; got {message:?}"
+    );
+    let served = fetch_from(
+        relay.url(),
+        Filter::new()
+            .kind(Kind::Custom(30640))
+            .author(tenant.public_key())
+            .identifier(&alias),
+    )
+    .await;
+    assert_eq!(served.len(), 1, "the registration must be served");
+    assert_eq!(served[0].id, named.id);
+
+    // Upload and read back under the mount path.
+    let blob = blob_bytes(77, 2048);
+    let sha = sha256_hex(&blob);
+    let auth = blossom_auth_event(
+        &writer,
+        "upload",
+        &sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, reason) = head_upload(&relay, &sha, blob.len() as u64, Some(&auth)).await;
+    assert_eq!(status, 200, "preflight under the mount; X-Reason: {reason}");
+    let (status, descriptor, reason) = put_blob(&relay, blob.clone(), &sha, &auth).await;
+    assert_eq!(status, 200, "upload under the mount; X-Reason: {reason}");
+    assert_eq!(
+        descriptor["url"],
+        format!("https://{mounted}/{sha}").as_str(),
+        "the descriptor must point under the mount path"
+    );
+    let (status, body) = get_blob(&relay, &sha).await;
+    assert_eq!(status, 200, "download under the mount");
+    assert_eq!(body, blob);
+
+    // Outside the mount there is no blob route.
+    let outside = reqwest::Client::new()
+        .get(format!("http://{}/{sha}", relay.domain()))
+        .send()
+        .await
+        .expect("GET outside the mount transport");
+    assert_eq!(outside.status().as_u16(), 404);
 
     relay.stop().await;
 }

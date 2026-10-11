@@ -103,23 +103,26 @@ impl PrivateSyncIndex {
 }
 
 /// Normalized ws(s):// private-sync peer relay URLs: EXCLUSIVELY the
-/// operator-configured allowlist (`NGIT_GRASP_P_SYNC_PEER_URLS`), minus this
-/// node's own domain. Tenant 30640 `relays` tags deliberately do NOT
-/// contribute — deriving outbound connections from tenant input would let a
+/// operator-configured allowlist (`NGIT_GRASP_P_SYNC_PEER_URLS`), minus the
+/// entries that name this node. `own_service` is the node's service address:
+/// its domain, and its mount path when it is served under one. Tenant 30640
+/// `relays` tags deliberately do NOT contribute — deriving outbound
+/// connections from tenant input would let a
 /// single registration point the node at internal infrastructure or an
 /// attacker relay and leak the entire private-repo membership map through
 /// the derived sync filters. Empty allowlist ⇒ empty set (no connections).
-pub fn configured_peer_relay_urls(allowlist: &[String], own_domain: &str) -> HashSet<String> {
+pub fn configured_peer_relay_urls(allowlist: &[String], own_service: &str) -> HashSet<String> {
     allowlist
         .iter()
-        // Normalize FIRST (bare host[:port] -> wss://) so the exact-host
-        // own-domain exclusion also recognizes scheme-less self entries —
-        // the pre-A3 substring check excluded those too.
+        // Normalize FIRST (bare host[:port] -> wss://) so the exclusion
+        // below also recognizes scheme-less self entries.
         .filter_map(|v| normalize_relay_url(v))
-        // Phase-4b A3: exact-host own-domain exclusion (host + port, so
-        // loopback test pairs stay distinct; the old substring check also
-        // excluded look-alike hosts such as evil twin suffix domains).
-        .filter(|v| !crate::grasp_p::host::url_denotes_domain(v, own_domain))
+        // Drop the entries that name this node: same host and port (so
+        // loopback test pairs stay distinct and look-alike hosts do not
+        // match), and, for a node under a mount path, the same path. A relay
+        // on the same host under another path is a different service and
+        // stays a peer.
+        .filter(|v| !crate::grasp_p::host::url_denotes_service(v, own_service))
         .collect()
 }
 
@@ -931,6 +934,32 @@ mod tests {
         assert!(!peers.contains("ws://127.0.0.1:1111"));
         assert!(peers.contains("ws://127.0.0.1:2222"));
         assert!(peers.contains("ws://127.0.0.1:3333"));
+    }
+
+    #[test]
+    fn same_host_peer_under_another_mount_is_not_self() {
+        let allowlist: Vec<String> = vec![
+            "wss://h.example/a".into(),
+            "wss://h.example/a/".into(),
+            "h.example/a".into(),
+            "wss://h.example/b".into(),
+            "wss://h.example".into(),
+            "wss://other.example/a".into(),
+        ];
+        // A node mounted at /a drops every spelling of itself and keeps the
+        // relay next door, the bare host and the same path on another host.
+        let peers = configured_peer_relay_urls(&allowlist, "h.example/a");
+        assert_eq!(
+            peers,
+            HashSet::from([
+                "wss://h.example/b".to_string(),
+                "wss://h.example".to_string(),
+                "wss://other.example/a".to_string(),
+            ])
+        );
+        // A node at the root of the host is every path on it, as before.
+        let peers = configured_peer_relay_urls(&allowlist, "h.example");
+        assert_eq!(peers, HashSet::from(["wss://other.example/a".to_string()]));
     }
 
     #[test]

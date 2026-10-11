@@ -337,16 +337,18 @@ async fn outbound_target_allowed(
 
 /// Peer servers for an alias, and whether they are the operator's: the
 /// configured list when there is one, otherwise the registration's `server`
-/// tags minus this node's own domain.
+/// tags minus the ones that name this node.
 fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> (Vec<String>, bool) {
     let (candidates, configured): (Vec<&String>, bool) = match svc.cfg.mirror_peer_urls {
         Some(ref configured) => (configured.iter().collect(), true),
         None => (
             registration_servers
                 .iter()
-                // Phase-4b A3: exact-host own-domain exclusion (host + port —
-                // loopback test pairs are host-equal but port-distinct).
-                .filter(|v| !is_own_server(v, &svc.cfg.domain))
+                // Host and port, so that loopback test pairs (same host,
+                // different ports) stay distinct, and the mount path when
+                // this node has one, so that another service on the same
+                // host is a peer and not this node.
+                .filter(|v| !is_own_server(v, &svc.cfg.service_address))
                 .collect(),
             false,
         ),
@@ -362,16 +364,19 @@ fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> (V
     (out, configured)
 }
 
-/// Own-domain exclusion for a `server` tag value: exact-host match on the
-/// value as given, plus on its scheme-defaulted base-URL form so a bare
-/// `host[:port]` self-reference is still recognized as this node (the pre-A3
-/// substring check excluded those too).
-fn is_own_server(value: &str, own_domain: &str) -> bool {
-    if super::host::url_denotes_domain(value, own_domain) {
+/// Does a `server` tag value name this node? `own_service` is the node's
+/// service address: its domain, and its mount path when it has one.
+///
+/// The value is compared as given, and in its scheme-defaulted base-URL
+/// form as well, so that a self-reference written without a scheme
+/// (`host[:port]`, with the mount path if any) is still recognised as this
+/// node.
+fn is_own_server(value: &str, own_service: &str) -> bool {
+    if super::host::url_denotes_service(value, own_service) {
         return true;
     }
     match server_base_url(value) {
-        Some(base) => super::host::url_denotes_domain(&base, own_domain),
+        Some(base) => super::host::url_denotes_service(&base, own_service),
         None => false,
     }
 }
@@ -3180,5 +3185,27 @@ mod tests {
         assert_eq!(backend.attempts_of("dies-once").len(), 2);
 
         worker.handle.abort();
+    }
+
+    /// A `server` tag names this node when it names its host and port and,
+    /// for a node under a mount path, that path. At the root of a domain
+    /// every path on the host is this node, as it always was.
+    #[test]
+    fn own_server_is_matched_with_the_mount_path() {
+        let mounted = "h.example/grasp";
+        assert!(is_own_server("https://h.example/grasp", mounted));
+        assert!(is_own_server("https://h.example/grasp/", mounted));
+        assert!(is_own_server("h.example/grasp", mounted));
+        assert!(!is_own_server("https://h.example", mounted));
+        assert!(!is_own_server("h.example", mounted));
+        assert!(!is_own_server("https://h.example/other", mounted));
+        assert!(!is_own_server("https://peer.example/grasp", mounted));
+
+        let root = "h.example";
+        assert!(is_own_server("https://h.example", root));
+        assert!(is_own_server("https://h.example/any/path", root));
+        assert!(is_own_server("h.example", root));
+        assert!(!is_own_server("https://peer.example", root));
+        assert!(!is_own_server("http://127.0.0.1:2222", "127.0.0.1:1111"));
     }
 }

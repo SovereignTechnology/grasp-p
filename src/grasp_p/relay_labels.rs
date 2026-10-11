@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use prometheus::proto::{Metric, MetricFamily};
 
-use super::host::url_denotes_domain;
+use super::host::url_denotes_service;
 use crate::config::Config;
 use crate::sync::canonical_relay_key;
 use crate::sync::private_index::normalize_relay_url;
@@ -88,7 +88,7 @@ impl RelayLabels {
             .private_sync_peer_url_entries()
             .into_iter()
             .filter_map(|entry| normalize_relay_url(&entry))
-            .filter(|url| !url_denotes_domain(url, &own_address))
+            .filter(|url| !url_denotes_service(url, &own_address))
             .filter_map(|url| canonical_relay_key(&url).ok());
         let bootstrap = config
             .sync_bootstrap_relay_url
@@ -418,6 +418,31 @@ mod tests {
 
         let labels = RelayLabels::from_config(&config).expect("GRASP-P is enabled");
 
+        let aliased: HashSet<String> = labels.aliases.keys().cloned().collect();
+        assert_eq!(aliased, dialled);
+    }
+
+    /// Under a mount path this node is its host and that path together: a
+    /// relay on the same host under another path is a peer the sync code
+    /// dials, so it has an alias, and the two readings still agree.
+    #[test]
+    fn under_a_mount_path_only_the_mounted_url_is_this_node() {
+        let mut config = node(
+            Some("wss://own.example/grasp, wss://own.example/other, wss://b.example/grasp"),
+            None,
+        );
+        config.base_path = "/grasp".to_string();
+
+        let dialled: HashSet<String> = configured_peer_relay_urls(
+            &config.private_sync_peer_url_entries(),
+            &config.service_address(),
+        )
+        .iter()
+        .filter_map(|url| canonical_relay_key(url).ok())
+        .collect();
+        assert_eq!(dialled.len(), 2, "the two other services, never this one");
+
+        let labels = RelayLabels::from_config(&config).expect("GRASP-P is enabled");
         let aliased: HashSet<String> = labels.aliases.keys().cloned().collect();
         assert_eq!(aliased, dialled);
     }

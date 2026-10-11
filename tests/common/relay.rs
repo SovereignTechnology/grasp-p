@@ -730,6 +730,24 @@ impl TestRelay {
     /// endpoint on a kernel-assigned loopback port (see
     /// [`Self::grasp_p_metrics`]), which `extra_env` can override as well.
     pub async fn start_with_grasp_p(extra_env: &[(&str, &str)]) -> Self {
+        Self::start_grasp_p_node(None, extra_env).await
+    }
+
+    /// [`Self::start_with_grasp_p`] for a node mounted at a public URL path
+    /// (`NGIT_BASE_PATH`), as behind a reverse proxy that shares the host
+    /// with other services.
+    ///
+    /// [`Self::url`] and [`Self::service_address`] carry the path, and a
+    /// test must build every URL from them: the node answers nothing but a
+    /// 404 outside its mount. [`Self::domain`] stays the bare `host:port`.
+    pub async fn start_with_grasp_p_at_base_path(
+        base_path: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::start_grasp_p_node(Some(base_path.to_string()), extra_env).await
+    }
+
+    async fn start_grasp_p_node(base_path: Option<String>, extra_env: &[(&str, &str)]) -> Self {
         let mut env = vec![
             ("NGIT_GRASP_P_REPOS_ENABLE".to_string(), "true".to_string()),
             // A GRASP-P node serves no scrape on its public port. Port 0:
@@ -748,6 +766,7 @@ impl TestRelay {
         Self::start_internal(
             port::reserve_port(),
             RelayOptions {
+                base_path,
                 extra_env: env,
                 ..RelayOptions::default()
             },

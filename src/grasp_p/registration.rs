@@ -49,6 +49,13 @@ pub fn key_pop_input(tenant_hex: &str, alias: &str) -> String {
 static VERIFY_CTX: std::sync::LazyLock<secp256k1::Secp256k1<secp256k1::VerifyOnly>> =
     std::sync::LazyLock::new(secp256k1::Secp256k1::verification_only);
 
+#[cfg(test)]
+thread_local! {
+    /// Proofs verified on this thread; tests read it to show that a step
+    /// ran or did not.
+    static PROOFS_VERIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Verify the schnorr proof-of-possession `sig_hex` for `key_hex`.
 fn verify_key_pop(
     key_hex: &str,
@@ -61,6 +68,9 @@ fn verify_key_pop(
     use bitcoin_hashes::{sha256, Hash};
     use secp256k1::{schnorr::Signature, XOnlyPublicKey};
 
+    #[cfg(test)]
+    PROOFS_VERIFIED.with(|n| n.set(n.get() + 1));
+
     let pk = XOnlyPublicKey::from_str(key_hex)
         .map_err(|_| "w/aux key is not a valid x-only pubkey".to_string())?;
     let sig = Signature::from_str(sig_hex)
@@ -71,37 +81,38 @@ fn verify_key_pop(
         .map_err(|_| "w/aux key proof-of-possession signature is invalid".to_string())
 }
 
-/// Collect the claimed keys of every `name` tag, enforcing hex shape AND
-/// proof-of-possession: each key must either BE the event author (the event
-/// signature is the proof) or carry a valid schnorr signature over
-/// [`key_pop_input`] as the tag's third value. Without this, any pubkey could
-/// squat someone else's known write key (denying the victim registration and
-/// hijacking 1059 wrap attribution/quota).
-fn parse_claimed_keys(
-    event: &Event,
-    name: &str,
-    tenant_hex: &str,
-    alias: &str,
-) -> Result<Vec<String>, String> {
-    let mut keys = Vec::new();
-    for tag in event.tags.iter() {
-        let v = tag.clone().to_vec();
-        if v.len() < 2 || v[0] != name {
-            continue;
-        }
-        let key = v[1].clone();
-        if !super::blossom_auth::is_lower_hex_64(&key) {
-            return Err("w/aux keys must be 64 lowercase hex chars".to_string());
-        }
-        if key != tenant_hex {
-            let sig = v.get(2).ok_or_else(|| {
-                "w/aux keys must carry a proof-of-possession signature".to_string()
-            })?;
-            verify_key_pop(&key, sig, tenant_hex, alias)?;
-        }
-        keys.push(key);
+/// The claimed keys of every `name` tag, in tag order, each with the proof
+/// its tag carries as a third value, if any. Nothing is judged here.
+fn claimed_keys(event: &Event, name: &str) -> Vec<(String, Option<String>)> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let v = tag.as_slice();
+            if v.len() >= 2 && v[0] == name {
+                Some((v[1].clone(), v.get(2).cloned()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Verify every proof of possession a registration carries.
+///
+/// A claimed key must either BE the event author (the event signature is
+/// the proof) or carry a schnorr signature over [`key_pop_input`]; without
+/// that, any account could claim someone else's known write key, deny its
+/// owner a registration and take over the attribution of its events.
+/// [`parse_shape`] has already made sure a proof is present wherever one is
+/// needed. This is the only costly step of handling a registration (one
+/// signature check per key), which is why it runs after every check that
+/// can refuse the registration more cheaply.
+fn verify_proofs(parsed: &ParsedRegistration, tenant_hex: &str) -> Result<(), String> {
+    for (key, proof) in &parsed.proofs {
+        verify_key_pop(key, proof, tenant_hex, &parsed.alias)?;
     }
-    Ok(keys)
+    Ok(())
 }
 
 fn first_tag_value(event: &Event, name: &str) -> Option<String> {
@@ -120,11 +131,20 @@ struct ParsedRegistration {
     alias: String,
     w_keys: Vec<String>,
     aux_keys: Vec<String>,
+    /// Every claimed key that is not the author's, with the proof of
+    /// possession its tag carries: present, not yet verified.
+    proofs: Vec<(String, String)>,
     relays: Vec<String>,
     servers: Vec<String>,
     quota_class: Option<String>,
 }
 
+/// Everything about a registration that can be judged from its text alone.
+///
+/// No signature is verified here, so a registration that is refused for its
+/// shape costs the node next to nothing. The count of keys is checked before
+/// the keys themselves for the same reason: the cap bounds every loop below
+/// it, and the proof checks that follow in [`verify_proofs`].
 fn parse_shape(event: &Event, cfg: &PrivateConfig) -> Result<ParsedRegistration, String> {
     let alias =
         first_tag_value(event, "d").ok_or_else(|| "registration must carry a d tag".to_string())?;
@@ -132,55 +152,151 @@ fn parse_shape(event: &Event, cfg: &PrivateConfig) -> Result<ParsedRegistration,
         return Err("registration d tag must be exactly 32 lowercase hex chars".to_string());
     }
 
-    let tenant_hex = event.pubkey.to_hex();
-    let w_keys = parse_claimed_keys(event, "w", &tenant_hex, &alias)?;
-    if w_keys.is_empty() {
+    let w_claims = claimed_keys(event, "w");
+    let aux_claims = claimed_keys(event, "aux");
+    if w_claims.is_empty() {
         return Err("registration must carry at least one w (write key) tag".to_string());
     }
-    let aux_keys = parse_claimed_keys(event, "aux", &tenant_hex, &alias)?;
-    let total_keys = w_keys.len() + aux_keys.len();
-    if total_keys > cfg.max_write_keys_per_alias as usize {
+    if w_claims.len() + aux_claims.len() > cfg.max_write_keys_per_alias as usize {
         return Err(format!(
             "registration exceeds the {} key limit",
             cfg.max_write_keys_per_alias
         ));
     }
+    if w_claims
+        .iter()
+        .chain(aux_claims.iter())
+        .any(|(key, _)| !super::blossom_auth::is_lower_hex_64(key))
+    {
+        return Err("w/aux keys must be 64 lowercase hex chars".to_string());
+    }
     // Duplicate keys across w+aux would corrupt the claim index diffing.
     {
         let mut seen = std::collections::HashSet::new();
-        for key in w_keys.iter().chain(aux_keys.iter()) {
+        for (key, _) in w_claims.iter().chain(aux_claims.iter()) {
             if !seen.insert(key) {
                 return Err("registration lists the same key more than once".to_string());
             }
         }
     }
+    // The author's own key needs no proof: the event signature is one.
+    let tenant_hex = event.pubkey.to_hex();
+    let mut proofs = Vec::new();
+    for (key, proof) in w_claims.iter().chain(aux_claims.iter()) {
+        if *key == tenant_hex {
+            continue;
+        }
+        let proof = proof
+            .as_ref()
+            .ok_or_else(|| "w/aux keys must carry a proof-of-possession signature".to_string())?;
+        proofs.push((key.clone(), proof.clone()));
+    }
 
     let relays = tag_values(event, "relays");
     let servers = tag_values(event, "server");
-    // Phase-4b A3: exact-host match against the configured domain (the old
-    // substring check let "wss://evil.com/x?example.com" and
-    // "example.com.attacker.tld" pass as listing this node).
+    // The node has to find ITSELF among the values, by host and, when it is
+    // served under a mount path, by that path too. Other values are not
+    // judged: a registration for a pair names both nodes, and each of them
+    // looks for its own name only. A plain substring match is not enough
+    // ("wss://evil.com/x?example.com" and "example.com.attacker.tld" would
+    // pass), and neither is the host alone under a mount path: a client that
+    // was told the bare host would talk to whatever else is served there.
     if !relays
         .iter()
-        .any(|v| super::host::url_denotes_domain(v, &cfg.domain))
+        .any(|v| super::host::url_denotes_service(v, &cfg.service_address))
     {
         return Err("registration relays tag must list this node".to_string());
     }
     if !servers
         .iter()
-        .any(|v| super::host::url_denotes_domain(v, &cfg.domain))
+        .any(|v| super::host::url_denotes_service(v, &cfg.service_address))
     {
         return Err("registration server tag must list this node".to_string());
     }
 
     Ok(ParsedRegistration {
         alias,
-        w_keys,
-        aux_keys,
+        w_keys: w_claims.into_iter().map(|(key, _)| key).collect(),
+        aux_keys: aux_claims.into_iter().map(|(key, _)| key).collect(),
+        proofs,
         relays,
         servers,
         quota_class: first_tag_value(event, "quota-class"),
     })
+}
+
+/// May this event's author take a seat it does not hold yet?
+///
+/// This is the whole admission decision, as a function of the node's
+/// configuration and the event alone, so that the two places that ask (the
+/// early check outside the write lock and the check inside the write
+/// transaction) cannot disagree, and so that a different source for the
+/// list of admitted accounts replaces this one function. `None` admits; a
+/// refusal carries the message the client is given.
+fn new_seat_admission(cfg: &PrivateConfig, event: &Event) -> Option<WritePolicyResult> {
+    match cfg.registration_mode {
+        RegistrationMode::Open => None,
+        RegistrationMode::Whitelist => {
+            let npub = event.pubkey.to_bech32().unwrap_or_default();
+            if cfg.tenant_whitelist.iter().any(|entry| entry == &npub) {
+                None
+            } else {
+                Some(reject_restricted(
+                    "tenant is not on the registration whitelist",
+                ))
+            }
+        }
+        RegistrationMode::Pow => {
+            if event.id.check_pow(cfg.pow_bits) {
+                None
+            } else {
+                Some(reject_restricted(format!(
+                    "registration requires {} bits of NIP-13 proof of work",
+                    cfg.pow_bits
+                )))
+            }
+        }
+        // Unreachable: Config::validate() rejects paid mode.
+        RegistrationMode::Paid => {
+            Some(reject_restricted("paid registration mode is not available"))
+        }
+    }
+}
+
+/// The admission decision for a registration, given what the meta store
+/// holds for its alias.
+///
+/// The mode gates new seats only. An account that already holds the alias
+/// passes whatever the mode says now, so an operator who tightens the mode,
+/// or takes an account off the list, does not lock that account out of the
+/// repositories it has. `stored` must come from the same transaction as the
+/// decision that relies on this answer.
+fn seat_admission(
+    cfg: &PrivateConfig,
+    event: &Event,
+    stored: Option<&RegistrationRecord>,
+) -> Option<WritePolicyResult> {
+    if stored.is_some_and(|record| record.tenant_hex == event.pubkey.to_hex()) {
+        return None;
+    }
+    new_seat_admission(cfg, event)
+}
+
+/// [`seat_admission`] against a read snapshot, before anything costly.
+///
+/// It takes no write lock, so a flood of registrations from accounts the
+/// mode refuses neither queues behind writers nor makes the node verify
+/// proofs. It only sheds load: the write transaction asks the same question
+/// again and its answer is the one that counts, so a registration that
+/// changes hands between the two reads is still judged correctly.
+fn pre_admission(
+    svc: &PrivateService,
+    event: &Event,
+    alias: &str,
+) -> anyhow::Result<Option<WritePolicyResult>> {
+    let txn = svc.meta.read_txn()?;
+    let stored = svc.meta.get_registration(&txn, alias)?;
+    Ok(seat_admission(&svc.cfg, event, stored.as_ref()))
 }
 
 /// Is `incoming` (created_at, id) strictly newer than the stored record per
@@ -350,52 +466,95 @@ pub(crate) fn handle(svc: &PrivateService, event: &Event) -> RegistrationOutcome
 }
 
 /// Re-admission of an event this node already holds (boot_reconcile).
-/// Identical to [`handle`] except the A2 replacement-cadence bucket is not
-/// consulted: replays must not consume replacement budget.
+/// Differs from [`handle`] in two ways. The A2 replacement-cadence bucket is
+/// not consulted: replays must not consume replacement budget. And the
+/// admission mode is asked where it always was, after the conflict checks:
+/// a stored registration that lost a conflict is then still recognised as
+/// the loser and pruned, even when its author is no longer admitted. The
+/// early position exists to shed load from senders the mode refuses, and
+/// the events replayed here are the node's own.
 pub(crate) fn handle_replay(svc: &PrivateService, event: &Event) -> RegistrationOutcome {
     handle_inner(svc, event, Admission::Replay)
 }
 
-/// Whether a 30640 admission consumes A2 replacement-cadence budget.
+/// Where a 30640 comes from: a client or a peer (live), or this node's own
+/// relay database at start-up (replay).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
     Live,
     Replay,
 }
 
+/// A refusal that changed nothing and leaves nothing to prune.
+fn refused(result: WritePolicyResult) -> RegistrationOutcome {
+    RegistrationOutcome {
+        result,
+        prune: Vec::new(),
+    }
+}
+
 /// Handle a kind-30640 registration event (admission + meta application).
+///
+/// The checks run from the cheapest to the most costly, so that a
+/// registration the node will refuse anyway costs it as little as possible:
+/// date and size, then the shape, then whether this sender may register at
+/// all, and only then the proofs of possession (one signature check per
+/// key). The write transaction in [`apply`] comes last and is the authority
+/// on everything that depends on stored state.
 fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> RegistrationOutcome {
     let cfg = &svc.cfg;
 
     if let Some(rejection) = super::check_not_future_dated(event) {
-        return RegistrationOutcome {
-            result: rejection,
-            prune: Vec::new(),
-        };
+        return refused(rejection);
     }
 
     // Size cap on serialized JSON.
     if event.as_json().len() as u64 > cfg.max_event_bytes {
-        return RegistrationOutcome {
-            result: reject_restricted(super::admission::OVERSIZE_REJECT_MESSAGE),
-            prune: Vec::new(),
-        };
+        return refused(reject_restricted(super::admission::OVERSIZE_REJECT_MESSAGE));
     }
 
     let parsed = match parse_shape(event, cfg) {
         Ok(p) => p,
-        Err(reason) => {
-            return RegistrationOutcome {
-                result: crate::nostr::policy::reject_invalid(reason),
-                prune: Vec::new(),
-            }
-        }
+        Err(reason) => return refused(crate::nostr::policy::reject_invalid(reason)),
     };
 
+    if admission == Admission::Live {
+        match pre_admission(svc, event, &parsed.alias) {
+            Ok(None) => {}
+            Ok(Some(rejection)) => return refused(rejection),
+            Err(e) => {
+                tracing::warn!("private registration admission read failed: {e}");
+                return refused(reject_error("private meta store failure"));
+            }
+        }
+    }
+
+    if let Err(reason) = verify_proofs(&parsed, &event.pubkey.to_hex()) {
+        return refused(crate::nostr::policy::reject_invalid(reason));
+    }
+
+    apply(svc, event, &parsed, admission)
+}
+
+/// The write transaction of a registration, and what follows from its
+/// verdict (alerts, counters, the coordinates to prune).
+///
+/// The caller has checked the shape and the proofs. Every check that reads
+/// stored state is made here, inside the transaction that acts on it.
+fn apply(
+    svc: &PrivateService,
+    event: &Event,
+    parsed: &ParsedRegistration,
+    admission: Admission,
+) -> RegistrationOutcome {
+    let cfg = &svc.cfg;
     let tenant_hex = event.pubkey.to_hex();
     let event_id_hex = event.id.to_hex();
     let created_at = event.created_at.as_secs();
     let event_bytes = event.as_json().len() as u64;
+    // A live registration is asked for admission before anything else; a
+    // replayed one where it always was (see `handle_replay`).
+    let admission_first = admission == Admission::Live;
 
     let result = svc.meta.with_write(|meta, txn| {
         let stored = meta.get_registration(txn, &parsed.alias)?;
@@ -403,6 +562,21 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         // ---- Decision phase: NO mutations until every check has passed.
         // with_write COMMITS on Ok (including Ok-with-rejection), so any
         // mutation made before a later reject-path would silently land.
+
+        // Admission, first, for every sender that does not already hold
+        // this alias. The read above and this decision share the write
+        // transaction, so the answer cannot be stale; the check before the
+        // proofs asked the same function and only saved work. A sender the
+        // mode refuses stops here: it takes part in no conflict, so it
+        // raises no conflict alert and gets nothing pruned.
+        let refused_at_the_door = if admission_first {
+            seat_admission(cfg, event, stored.as_ref())
+        } else {
+            None
+        };
+        if let Some(rejection) = refused_at_the_door {
+            return Ok(TxnOutcome::reject(rejection));
+        }
 
         // §3.2 alias conflict: the alias is held by a DIFFERENT tenant.
         // Resolved by the deterministic merge (issue !11), never by arrival
@@ -467,31 +641,15 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         // fingerprint parity — so the gates cannot diverge the merge).
         let is_new_alias = stored.is_none() || alias_takeover;
         if is_new_alias {
-            // Admission mode gates NEW aliases only.
-            match cfg.registration_mode {
-                RegistrationMode::Open => {}
-                RegistrationMode::Whitelist => {
-                    let npub = event.pubkey.to_bech32().unwrap_or_default();
-                    if !cfg.tenant_whitelist.iter().any(|entry| entry == &npub) {
-                        return Ok(TxnOutcome::reject(reject_restricted(
-                            "tenant is not on the registration whitelist",
-                        )));
-                    }
-                }
-                RegistrationMode::Pow => {
-                    if !event.id.check_pow(cfg.pow_bits) {
-                        return Ok(TxnOutcome::reject(reject_restricted(format!(
-                            "registration requires {} bits of NIP-13 proof of work",
-                            cfg.pow_bits
-                        ))));
-                    }
-                }
-                RegistrationMode::Paid => {
-                    // Unreachable: Config::validate() rejects paid mode.
-                    return Ok(TxnOutcome::reject(reject_restricted(
-                        "paid registration mode is not available",
-                    )));
-                }
+            // Admission mode gates NEW aliases only. A live registration
+            // was asked at the top of this transaction.
+            let refused_as_new = if admission_first {
+                None
+            } else {
+                new_seat_admission(cfg, event)
+            };
+            if let Some(rejection) = refused_as_new {
+                return Ok(TxnOutcome::reject(rejection));
             }
 
             // FB (verify round 1): a conflict-merge WINNER is exempt from
@@ -747,10 +905,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         }
         Err(e) => {
             tracing::warn!("private registration meta update failed: {e}");
-            RegistrationOutcome {
-                result: reject_error("private meta store failure"),
-                prune: Vec::new(),
-            }
+            refused(reject_error("private meta store failure"))
         }
     }
 }
@@ -861,6 +1016,12 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with(|_| {}).await
+    }
+
+    /// The harness with settings of the caller's choosing on top of the
+    /// test defaults (open mode, a node at the root of `localhost:7334`).
+    async fn harness_with(configure: impl FnOnce(&mut crate::config::Config)) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::config::Config::for_testing();
         config.private_repos_enable = true;
@@ -868,6 +1029,7 @@ mod tests {
             Some(dir.path().join("meta").to_string_lossy().into_owned());
         config.private_blob_data_path =
             Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        configure(&mut config);
         let database: crate::nostr::SharedDatabase =
             std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let svc = PrivateService::new(&config, database)
@@ -912,15 +1074,41 @@ mod tests {
         created_at: u64,
         w_entries: Vec<Vec<String>>,
     ) -> Event {
+        registration_event_naming(
+            tenant,
+            alias,
+            created_at,
+            &["ws://localhost:7334"],
+            &["http://localhost:7334"],
+            w_entries,
+            Vec::new(),
+        )
+    }
+
+    /// A 30640 with every tag chosen by the caller: the values of its
+    /// `relays` and `server` tags, and its `w` and `aux` entries.
+    fn registration_event_naming(
+        tenant: &nostr_sdk::prelude::Keys,
+        alias: &str,
+        created_at: u64,
+        relays: &[&str],
+        servers: &[&str],
+        w_entries: Vec<Vec<String>>,
+        aux_entries: Vec<Vec<String>>,
+    ) -> Event {
         use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Kind, Tag};
 
+        let values = |urls: &[&str]| urls.iter().map(|url| url.to_string()).collect::<Vec<_>>();
         let mut tags = vec![
             Tag::identifier(alias),
-            Tag::custom("relays", vec!["ws://localhost:7334".to_string()]),
-            Tag::custom("server", vec!["http://localhost:7334".to_string()]),
+            Tag::custom("relays", values(relays)),
+            Tag::custom("server", values(servers)),
         ];
         for entry in w_entries {
             tags.push(Tag::custom("w", entry));
+        }
+        for entry in aux_entries {
+            tags.push(Tag::custom("aux", entry));
         }
         EventBuilder::new(Kind::Custom(super::super::KIND_REGISTRATION), "")
             .tags(tags)
@@ -1802,5 +1990,591 @@ mod tests {
         let txn = svc.meta.read_txn().unwrap();
         let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
         assert_eq!(r.event_id, winner.id.to_hex(), "rejection must not mutate");
+    }
+
+    // ------------------------------------------------------------------
+    // Order of checks: shape, then admission, then proofs, then the write
+    // transaction. None of these tests counts signature checks. They give a
+    // registration a proof that cannot verify and assert that the refusal it
+    // gets is the one of an EARLIER step: had a proof been verified first,
+    // the proof's own message would have come back instead.
+    // ------------------------------------------------------------------
+
+    const KEY_LIMIT: &str = "registration exceeds the 64 key limit";
+    const NOT_LISTED: &str = "tenant is not on the registration whitelist";
+    const PROOF_INVALID: &str = "w/aux key proof-of-possession signature is invalid";
+    const PROOF_MISSING: &str = "w/aux keys must carry a proof-of-possession signature";
+
+    /// The message of a refusal; panics on anything else.
+    fn refusal(outcome: &RegistrationOutcome) -> &str {
+        match &outcome.result {
+            WritePolicyResult::Reject {
+                message,
+                status: false,
+                ..
+            } => message.as_ref(),
+            _ => panic!("expected a refusal"),
+        }
+    }
+
+    /// The message `parse_shape` refuses with; panics when it accepts.
+    fn shape_error(event: &Event, cfg: &PrivateConfig) -> String {
+        match parse_shape(event, cfg) {
+            Err(reason) => reason,
+            Ok(_) => panic!("the shape check must refuse this registration"),
+        }
+    }
+
+    /// A `w`/`aux` entry whose proof is a real signature by `key`, made for
+    /// another alias: well formed, and never valid for the registration it
+    /// is put in.
+    fn unprovable_entry(
+        key: &nostr_sdk::prelude::Keys,
+        tenant: &nostr_sdk::prelude::Keys,
+    ) -> Vec<String> {
+        key_entry(key, tenant, &"9".repeat(32))
+    }
+
+    /// A node in whitelist mode that admits exactly `listed`.
+    async fn whitelist_harness(listed: &[&nostr_sdk::prelude::Keys]) -> Harness {
+        let whitelist = listed
+            .iter()
+            .map(|keys| keys.public_key().to_bech32().expect("npub"))
+            .collect::<Vec<_>>()
+            .join(",");
+        harness_with(|config| {
+            config.private_registration_mode = RegistrationMode::Whitelist;
+            config.private_tenant_whitelist = whitelist;
+        })
+        .await
+    }
+
+    /// A registration over the key cap is refused for the cap, whatever its
+    /// proofs are worth: the count is taken before any key is looked at.
+    #[tokio::test]
+    async fn key_count_cap_is_checked_before_any_proof() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let tenant = Keys::generate();
+        let alias = "a".repeat(32);
+
+        let over_the_cap: Vec<Vec<String>> = (0..65)
+            .map(|_| unprovable_entry(&Keys::generate(), &tenant))
+            .collect();
+        let event = registration_event_with_w(&tenant, &alias, 1000, over_the_cap);
+        assert_eq!(shape_error(&event, &svc.cfg), KEY_LIMIT);
+        assert_eq!(refusal(&handle(svc, &event)), KEY_LIMIT);
+
+        // The cap counts w and aux together, and comes before the look at
+        // each key: a malformed key among too many is still "too many".
+        let mut w_entries: Vec<Vec<String>> = (0..40)
+            .map(|_| unprovable_entry(&Keys::generate(), &tenant))
+            .collect();
+        w_entries.push(vec!["not-a-key".to_string()]);
+        let aux_entries: Vec<Vec<String>> = (0..24)
+            .map(|_| unprovable_entry(&Keys::generate(), &tenant))
+            .collect();
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &["ws://localhost:7334"],
+            &["http://localhost:7334"],
+            w_entries,
+            aux_entries,
+        );
+        assert_eq!(shape_error(&event, &svc.cfg), KEY_LIMIT);
+
+        // At the cap the proofs are what decides.
+        let at_the_cap: Vec<Vec<String>> = (0..64)
+            .map(|_| unprovable_entry(&Keys::generate(), &tenant))
+            .collect();
+        let event = registration_event_with_w(&tenant, &alias, 1000, at_the_cap);
+        assert!(parse_shape(&event, &svc.cfg).is_ok());
+        assert_eq!(refusal(&handle(svc, &event)), PROOF_INVALID);
+    }
+
+    /// Every refusal the shape check can give comes before any proof is
+    /// verified: each registration here carries a proof that cannot verify,
+    /// and none of them is told so.
+    #[tokio::test]
+    async fn shape_refusals_come_before_proof_refusals() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let cfg = &h.svc.cfg;
+        let tenant = Keys::generate();
+        let alias = "b".repeat(32);
+        let own = ["ws://localhost:7334"];
+        let own_server = ["http://localhost:7334"];
+        let bad = || unprovable_entry(&Keys::generate(), &tenant);
+        let bare = || vec![Keys::generate().public_key().to_hex()];
+
+        // A tag that does not name this node.
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &["ws://other.example"],
+            &own_server,
+            vec![bad()],
+            Vec::new(),
+        );
+        assert_eq!(
+            shape_error(&event, cfg),
+            "registration relays tag must list this node"
+        );
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &own,
+            &["http://other.example"],
+            vec![bad()],
+            Vec::new(),
+        );
+        assert_eq!(
+            shape_error(&event, cfg),
+            "registration server tag must list this node"
+        );
+
+        // The same key twice.
+        let twice = bad();
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &own,
+            &own_server,
+            vec![twice.clone()],
+            vec![twice],
+        );
+        assert_eq!(
+            shape_error(&event, cfg),
+            "registration lists the same key more than once"
+        );
+
+        // A missing proof on a later key.
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &own,
+            &own_server,
+            vec![bad()],
+            vec![bare()],
+        );
+        assert_eq!(shape_error(&event, cfg), PROOF_MISSING);
+
+        // A malformed key after one whose proof is missing: the shape of
+        // every key is looked at before the presence of any proof.
+        let event = registration_event_naming(
+            &tenant,
+            &alias,
+            1000,
+            &own,
+            &own_server,
+            vec![bare()],
+            vec![vec!["ABCDEF".to_string()]],
+        );
+        assert_eq!(
+            shape_error(&event, cfg),
+            "w/aux keys must be 64 lowercase hex chars"
+        );
+
+        // A registration that passes the shape check is refused by the
+        // proof step, and only there.
+        let event = registration_event_with_w(&tenant, &alias, 1000, vec![bad()]);
+        let parsed = parse_shape(&event, cfg).expect("the shape is fine");
+        assert_eq!(parsed.proofs.len(), 1);
+        assert_eq!(
+            verify_proofs(&parsed, &tenant.public_key().to_hex()),
+            Err(PROOF_INVALID.to_string())
+        );
+
+        // The author's own key carries no proof and needs none.
+        let writer = Keys::generate();
+        let event = registration_event_with_w(
+            &tenant,
+            &alias,
+            1000,
+            vec![
+                vec![tenant.public_key().to_hex()],
+                key_entry(&writer, &tenant, &alias),
+            ],
+        );
+        let parsed = parse_shape(&event, cfg).expect("the shape is fine");
+        assert_eq!(parsed.proofs.len(), 1);
+        assert_eq!(parsed.w_keys.len(), 2);
+        assert_eq!(
+            verify_proofs(&parsed, &tenant.public_key().to_hex()),
+            Ok(())
+        );
+    }
+
+    /// A sender the whitelist refuses is told so before any proof is
+    /// verified: its unverifiable proof goes unnoticed. The same
+    /// registration from a listed sender reaches the proof step.
+    #[tokio::test]
+    async fn unlisted_sender_is_refused_before_any_proof() {
+        use nostr_sdk::prelude::Keys;
+
+        let listed = Keys::generate();
+        let h = whitelist_harness(&[&listed]).await;
+        let svc = &h.svc;
+        let alias = "c".repeat(32);
+
+        let outsider = Keys::generate();
+        let event = registration_event_with_w(
+            &outsider,
+            &alias,
+            1000,
+            vec![unprovable_entry(&Keys::generate(), &outsider)],
+        );
+        let before = PROOFS_VERIFIED.with(|n| n.get());
+        let outcome = handle(svc, &event);
+        assert_eq!(
+            PROOFS_VERIFIED.with(|n| n.get()),
+            before,
+            "no proof may be verified for a refused sender"
+        );
+        assert_eq!(refusal(&outcome), NOT_LISTED);
+        assert!(outcome.prune.is_empty());
+
+        let event = registration_event_with_w(
+            &listed,
+            &alias,
+            1000,
+            vec![unprovable_entry(&Keys::generate(), &listed)],
+        );
+        assert_eq!(refusal(&handle(svc, &event)), PROOF_INVALID);
+        assert_eq!(PROOFS_VERIFIED.with(|n| n.get()), before + 1);
+    }
+
+    /// Proof-of-work mode is asked before the proofs as well.
+    #[tokio::test]
+    async fn pow_mode_asks_for_work_before_proofs() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness_with(|config| {
+            config.private_registration_mode = RegistrationMode::Pow;
+            config.private_pow_bits = 40;
+        })
+        .await;
+        let tenant = Keys::generate();
+        let event = registration_event_with_w(
+            &tenant,
+            &"d".repeat(32),
+            1000,
+            vec![unprovable_entry(&Keys::generate(), &tenant)],
+        );
+        assert_eq!(
+            refusal(&handle(&h.svc, &event)),
+            "registration requires 40 bits of NIP-13 proof of work"
+        );
+    }
+
+    /// A sender the mode refuses takes part in no conflict: whether its
+    /// registration would have lost or won against the holder, it gets the
+    /// mode's message, nothing is pruned and no conflict alert is recorded.
+    /// A listed sender in the same position still gets the conflict answer.
+    #[tokio::test]
+    async fn unlisted_sender_takes_part_in_no_conflict() {
+        use nostr_sdk::prelude::Keys;
+
+        let holder = Keys::generate();
+        let rival = Keys::generate();
+        let h = whitelist_harness(&[&holder, &rival]).await;
+        let svc = &h.svc;
+        let alias = "e".repeat(32);
+        let held = registration_event(&holder, &alias, 1000);
+        assert!(matches!(
+            handle(svc, &held).result,
+            WritePolicyResult::Accept
+        ));
+
+        let outsider = Keys::generate();
+        // Dated after the holder (would lose the alias), dated before it
+        // (would win it), and under another alias while claiming the
+        // holder's key with a valid proof (would lose a key conflict).
+        let other_alias = "f".repeat(32);
+        let attempts = [
+            registration_event(&outsider, &alias, 2000),
+            registration_event(&outsider, &alias, 500),
+            registration_event_with_w(
+                &outsider,
+                &other_alias,
+                2000,
+                vec![key_entry(&holder, &outsider, &other_alias)],
+            ),
+        ];
+        for attempt in &attempts {
+            let outcome = handle(svc, attempt);
+            assert_eq!(refusal(&outcome), NOT_LISTED);
+            assert!(outcome.prune.is_empty(), "nothing to prune");
+            assert!(
+                svc.conflict_alert_dedup
+                    .lock()
+                    .should_alert(&attempt.id.to_hex()),
+                "no conflict alert may have been recorded for a refused sender"
+            );
+        }
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+            assert_eq!(r.event_id, held.id.to_hex(), "the holder is untouched");
+            assert!(svc
+                .meta
+                .get_registration(&txn, &other_alias)
+                .unwrap()
+                .is_none());
+        }
+
+        // A listed sender that loses the same conflict is told about the
+        // conflict, its coordinate is pruned and the alert is recorded.
+        let late = registration_event(&rival, &alias, 2000);
+        let outcome = handle(svc, &late);
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert_eq!(
+            outcome.prune,
+            vec![(rival.public_key().to_hex(), alias.clone())]
+        );
+        assert!(!svc
+            .conflict_alert_dedup
+            .lock()
+            .should_alert(&late.id.to_hex()));
+    }
+
+    /// The mode gates new seats only. An account that holds an alias and is
+    /// not (or no longer) on the list can still replace its registration;
+    /// what it cannot do is take a new alias.
+    #[tokio::test]
+    async fn lapsed_account_can_still_replace_its_registration() {
+        use nostr_sdk::prelude::Keys;
+
+        let someone_else = Keys::generate();
+        let h = whitelist_harness(&[&someone_else]).await;
+        let svc = &h.svc;
+        let tenant = Keys::generate();
+        let tenant_hex = tenant.public_key().to_hex();
+        let alias = "1".repeat(32);
+
+        // The seat as an earlier, more permissive configuration left it.
+        let first = registration_event(&tenant, &alias, 3000);
+        let held_aliases = vec![alias.clone()];
+        svc.meta
+            .with_write(|m, txn| {
+                m.put_registration(
+                    txn,
+                    &alias,
+                    &RegistrationRecord {
+                        tenant_hex: tenant_hex.clone(),
+                        event_id: first.id.to_hex(),
+                        created_at: 3000,
+                        w_keys: vec![tenant_hex.clone()],
+                        aux_keys: vec![],
+                        relays: vec![],
+                        servers: vec![],
+                        quota_class: None,
+                        registered_at: 1,
+                        tombstoned_at: None,
+                        first_created_at: None,
+                        first_event_id: None,
+                    },
+                )?;
+                m.put_key_claim(txn, &tenant_hex, &alias)?;
+                m.put_tenant_aliases(txn, &tenant_hex, &held_aliases)
+            })
+            .unwrap();
+
+        let writer = Keys::generate();
+        let newer = registration_event_with_w(
+            &tenant,
+            &alias,
+            4000,
+            vec![key_entry(&writer, &tenant, &alias)],
+        );
+        assert!(
+            matches!(handle(svc, &newer).result, WritePolicyResult::Accept),
+            "an account must keep control of the alias it holds"
+        );
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+            assert_eq!(r.event_id, newer.id.to_hex());
+            assert_eq!(r.w_keys, vec![writer.public_key().to_hex()]);
+        }
+
+        // Its proofs are still verified.
+        let forged = registration_event_with_w(
+            &tenant,
+            &alias,
+            5000,
+            vec![unprovable_entry(&Keys::generate(), &tenant)],
+        );
+        assert_eq!(refusal(&handle(svc, &forged)), PROOF_INVALID);
+
+        // A new alias is a new seat, and the mode refuses it.
+        let another = registration_event(&tenant, &"2".repeat(32), 4000);
+        assert_eq!(refusal(&handle(svc, &another)), NOT_LISTED);
+    }
+
+    /// The write transaction asks for admission by itself, first: with the
+    /// early check left out, a sender the mode refuses is still refused with
+    /// the mode's message, before any conflict is looked at.
+    #[tokio::test]
+    async fn write_transaction_refuses_without_the_early_check() {
+        use nostr_sdk::prelude::Keys;
+
+        let holder = Keys::generate();
+        let h = whitelist_harness(&[&holder]).await;
+        let svc = &h.svc;
+        let alias = "3".repeat(32);
+        let held = registration_event(&holder, &alias, 1000);
+        assert!(matches!(
+            handle(svc, &held).result,
+            WritePolicyResult::Accept
+        ));
+
+        let outsider = Keys::generate();
+        // On the held alias (a conflict it would lose) and on a free one.
+        for target in [alias.clone(), "4".repeat(32)] {
+            let event = registration_event(&outsider, &target, 2000);
+            let parsed = parse_shape(&event, &svc.cfg).expect("the shape is fine");
+            let outcome = apply(svc, &event, &parsed, Admission::Live);
+            assert_eq!(refusal(&outcome), NOT_LISTED);
+            assert!(outcome.prune.is_empty());
+            assert!(svc
+                .conflict_alert_dedup
+                .lock()
+                .should_alert(&event.id.to_hex()));
+        }
+        let txn = svc.meta.read_txn().unwrap();
+        let r = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+        assert_eq!(r.event_id, held.id.to_hex());
+        assert!(svc
+            .meta
+            .get_registration(&txn, &"4".repeat(32))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A replay of the node's own stored events keeps the conflict checks
+    /// ahead of the mode: a stored loser whose author is not admitted any
+    /// more is still recognised as the loser, and its coordinate pruned.
+    /// The mode is still asked for a seat the replay would create.
+    #[tokio::test]
+    async fn replay_keeps_the_conflict_checks_ahead_of_the_mode() {
+        use nostr_sdk::prelude::Keys;
+
+        let holder = Keys::generate();
+        let h = whitelist_harness(&[&holder]).await;
+        let svc = &h.svc;
+        let alias = "5".repeat(32);
+        let held = registration_event(&holder, &alias, 1000);
+        assert!(matches!(
+            handle(svc, &held).result,
+            WritePolicyResult::Accept
+        ));
+
+        let outsider = Keys::generate();
+        let leftover = registration_event(&outsider, &alias, 2000);
+        let outcome = handle_replay(svc, &leftover);
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert_eq!(
+            outcome.prune,
+            vec![(outsider.public_key().to_hex(), alias.clone())]
+        );
+
+        // The same event arriving live is refused by the mode instead.
+        assert_eq!(refusal(&handle(svc, &leftover)), NOT_LISTED);
+
+        let fresh = registration_event(&outsider, &"6".repeat(32), 2000);
+        let outcome = handle_replay(svc, &fresh);
+        assert_eq!(refusal(&outcome), NOT_LISTED);
+        assert!(outcome.prune.is_empty());
+    }
+
+    /// A node served under a mount path is named by host and path together:
+    /// a registration that names the bare host, or another path on the host,
+    /// does not list this node. A registration for a pair names two nodes,
+    /// and this node only has to find itself among them.
+    #[tokio::test]
+    async fn registration_under_a_base_path_must_name_the_mount() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness_with(|config| config.base_path = "/grasp".to_string()).await;
+        let cfg = &h.svc.cfg;
+        assert_eq!(cfg.service_address, "localhost:7334/grasp");
+        let tenant = Keys::generate();
+        let alias = "7".repeat(32);
+        let named = |relays: &[&str], servers: &[&str]| {
+            registration_event_naming(
+                &tenant,
+                &alias,
+                1000,
+                relays,
+                servers,
+                vec![vec![tenant.public_key().to_hex()]],
+                Vec::new(),
+            )
+        };
+        let relays_refusal = "registration relays tag must list this node";
+        let server_refusal = "registration server tag must list this node";
+
+        let bare = named(&["ws://localhost:7334"], &["http://localhost:7334"]);
+        assert_eq!(shape_error(&bare, cfg), relays_refusal);
+        let bare_server = named(&["ws://localhost:7334/grasp"], &["http://localhost:7334"]);
+        assert_eq!(shape_error(&bare_server, cfg), server_refusal);
+        let other_path = named(
+            &["ws://localhost:7334/other"],
+            &["http://localhost:7334/grasp"],
+        );
+        assert_eq!(shape_error(&other_path, cfg), relays_refusal);
+        let child_path = named(
+            &["ws://localhost:7334/grasp"],
+            &["http://localhost:7334/grasp/blobs"],
+        );
+        assert_eq!(shape_error(&child_path, cfg), server_refusal);
+
+        let mounted = named(
+            &["ws://localhost:7334/grasp"],
+            &["http://localhost:7334/grasp/"],
+        );
+        let parsed = parse_shape(&mounted, cfg).expect("the mounted URLs name this node");
+        assert_eq!(parsed.relays, vec!["ws://localhost:7334/grasp"]);
+
+        let pair = named(
+            &["wss://other.example/grasp", "ws://localhost:7334/grasp"],
+            &["https://other.example", "http://localhost:7334/grasp"],
+        );
+        assert!(parse_shape(&pair, cfg).is_ok());
+        assert!(matches!(
+            handle(&h.svc, &pair).result,
+            WritePolicyResult::Accept
+        ));
+    }
+
+    /// At the root of a domain nothing changes: the path of a URL is not
+    /// compared, and a registration for a pair passes on finding this node.
+    #[tokio::test]
+    async fn registration_at_the_root_ignores_the_path() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let cfg = &h.svc.cfg;
+        let tenant = Keys::generate();
+        let event = registration_event_naming(
+            &tenant,
+            &"8".repeat(32),
+            1000,
+            &["wss://other.example", "ws://localhost:7334/any/path"],
+            &["http://localhost:7334/", "https://other.example/grasp"],
+            vec![vec![tenant.public_key().to_hex()]],
+            Vec::new(),
+        );
+        assert!(parse_shape(&event, cfg).is_ok());
     }
 }

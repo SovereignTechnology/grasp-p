@@ -117,11 +117,12 @@ fn tag_value(event: &Event, name: &str) -> Option<String> {
 ///
 /// BUD-11 puts a bare domain in the tag, so that is the one form accepted:
 /// `host` or `host:port`, with no scheme, path or user part. It is compared
-/// with the node's configured domain by the rule every other "is this us"
-/// check uses ([`url_denotes_domain`]): host equality without regard to
-/// case or a trailing dot, and the same port when the configured domain
-/// has one. The mount path of a node served under a base path is not part
-/// of the comparison, because the tag names a server and not a URL.
+/// with the node's configured domain by [`url_denotes_domain`]: host
+/// equality without regard to case or a trailing dot, and the same port
+/// when the configured domain has one. The mount path of a node served
+/// under a base path is not part of the comparison, because the tag names a
+/// server and not a URL. (The tags of a registration are URLs, and those
+/// are compared with the path: `host::url_denotes_service`.)
 fn names_this_node(value: &str, own_domain: &str) -> bool {
     let value = value.trim();
     let bare_authority = !value.is_empty()

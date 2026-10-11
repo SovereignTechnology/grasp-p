@@ -990,8 +990,11 @@ impl PrivateService {
     /// Remove the relay-DB 30640 coordinate of every registration the §3.2
     /// conflict merge evicted, so naive REQ readers cannot resolve a merge
     /// loser as live. Best-effort: the meta store is the admission authority
-    /// (the loser's keys are already unclaimed), and a lingering event is
-    /// re-rejected — and re-pruned — whenever it is next reprocessed.
+    /// (the loser's keys are already unclaimed). A lingering event is rejected
+    /// again whenever it is reprocessed, and pruned again when that happens at
+    /// boot or while its author is still admitted; a live redelivery from an
+    /// author the admission mode now refuses is turned away by the mode and
+    /// prunes nothing, so such a leftover goes at the next start.
     async fn prune_evicted_registrations(&self, evicted: &[(String, String)]) {
         for (tenant_hex, alias) in evicted {
             let Ok(tenant_pk) = PublicKey::from_hex(tenant_hex) else {
