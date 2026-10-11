@@ -2669,8 +2669,10 @@ async fn exit16_pair_replicates_with_the_upstream_guard_on() {
     assert_eq!(mirrored, blob);
 
     // B to A: the link works in both directions.
+    // A write key belongs to one alias, so the second alias has its own.
     let alias_b = random_alias();
-    let registration_b = register_on(&b, &domain_refs, &tenant, &writer, &alias_b).await;
+    let writer_b = Keys::generate();
+    let registration_b = register_on(&b, &domain_refs, &tenant, &writer_b, &alias_b).await;
     assert!(
         wait_for_exact_event(a.url(), registration_b.id, REPLICATION_BOUND).await,
         "exit16: a registration must replicate B to A with upstream's guard on"
@@ -2840,7 +2842,11 @@ async fn restarted_peer_is_kept_and_redialled(bootstrap_only: bool) {
     );
 
     // The new session carries events: one published on B now reaches A.
-    let after = register_on(&b, &domain_refs, &tenant, &writer, &random_alias()).await;
+    // With a write key of its own: A still holds the first registration, and
+    // a write key belongs to one alias, so A would refuse a second alias
+    // under the first one's key.
+    let writer_after = Keys::generate();
+    let after = register_on(&b, &domain_refs, &tenant, &writer_after, &random_alias()).await;
     assert!(
         wait_for_exact_event(a.url(), after.id, REPLICATION_BOUND).await,
         "exit17: a registration on the restarted B must reach A without a restart of A"
