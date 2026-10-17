@@ -1,14 +1,12 @@
 version: 1
 system: x86_64-linux
-name: Rust release validation and crates.io publication
+name: Crates.io publication
+reuse: never
 on:
   push:
     tags: ["v*"]
+needs-workflows:
+  ci: rust_ci.yaml
 jobs:
-  lint:
-    build: checks.x86_64-linux.ci-lint
-  tests:
-    build: checks.x86_64-linux.ci-tests
   publish:
-    needs: [lint, tests]
     secrets: [CARGO_REGISTRY_TOKEN]
