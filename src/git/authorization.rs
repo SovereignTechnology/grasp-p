@@ -975,6 +975,15 @@ pub fn validate_push_refs(
                         new_oid
                     ));
                 }
+            } else {
+                // Tag not in state - REJECT (GRASP-01 requirement, mirrors
+                // branch handling above). Untouched tags never enter this
+                // loop; undeclared-tag deletion is allowed by the deletion
+                // branch earlier.
+                return Err(anyhow!(
+                    "Tag {} push rejected: not announced in state event",
+                    tag_name
+                ));
             }
         }
 
@@ -2228,6 +2237,43 @@ mod tests {
         let result = validate_push_refs(&state, &pushed_refs);
         // The branch name matches, but commit doesn't match exactly - this tests the logic
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_validate_push_refs_rejects_undeclared_tag_creation() {
+        let alice = create_test_keys();
+        let identifier = "test-repo";
+        let oid = "a".repeat(40);
+        let stray = "b".repeat(40);
+
+        let state = RepositoryState::from_event(
+            EventBuilder::new(Kind::RepoState, "")
+                .tags([
+                    Tag::identifier(identifier),
+                    Tag::custom("refs/heads/main", [&oid]),
+                    Tag::custom("refs/tags/v1", [&oid]),
+                ])
+                .finalize(&alice)
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Tag declared in state at the matching commit: allowed.
+        assert!(validate_push_refs(
+            &state,
+            &[(oid.clone(), oid.clone(), "refs/tags/v1".to_string())]
+        )
+        .is_ok());
+
+        // Tag NOT declared in state: rejected, mirroring branch handling.
+        // (Upstream whole-state matching denies this too; this layer must
+        // not be the permissive one.)
+        let result = validate_push_refs(
+            &state,
+            &[(oid.clone(), stray, "refs/tags/stray".to_string())],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not announced"));
     }
 
     #[test]
