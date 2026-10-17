@@ -6,7 +6,7 @@ let
   };
   common = {
     inherit src version;
-    cargoLock.lockFile = ../Cargo.lock;
+    cargoLock.lockFile = ../../../Cargo.lock;
     nativeBuildInputs = [ pkgs.pkg-config pkgs.git ];
     buildInputs = [ pkgs.openssl ];
     NGIT_BUILD_REVISION = sourceRevision;

@@ -30,15 +30,15 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
-        ci = import ./nix/ci.nix {
+        ci = import ./.ngit/nix/workflows/ci.nix {
           inherit pkgs rustToolchain sourceRevision;
           src = ./.;
           version = ngitGraspVersion;
         };
-        release = import ./nix/release.nix {
+        release = import ./.ngit/nix/workflows/release.nix {
           inherit pkgs rustToolchain;
           version = ngitGraspVersion;
-          ngit = import ./nix/release-ngit.nix {
+          ngit = import ./.ngit/nix/workflows/release-ngit.nix {
             inherit pkgs;
             sourcePackage = release-ngit.packages.${system}.default;
           };

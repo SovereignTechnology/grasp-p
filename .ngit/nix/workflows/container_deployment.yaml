@@ -12,7 +12,7 @@ on:
       - "compose*.yaml"
       - "deploy/**"
       - "flake.lock"
-      - "nix/ci-container.nix"
+      - ".ngit/nix/workflows/ci-container.nix"
       - ".ngit/nix/workflows/container_deployment.yaml"
       - "scripts/build-container-layout.sh"
       - "scripts/test-container-deployment.sh"
@@ -23,7 +23,7 @@ on:
 jobs:
   container-deployment:
     # Builds the release image with a job-owned Docker daemon inside the
-    # provider's disposable VM; see nix/ci-container.nix.
+    # provider's disposable VM; see .ngit/nix/workflows/ci-container.nix.
     run: apps.x86_64-linux.ci-container-deployment
     requirements:
       resources:
