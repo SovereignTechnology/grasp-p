@@ -10,6 +10,9 @@ jobs:
     artifacts:
       release-archive: release
   container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - build
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -33,9 +36,15 @@ jobs:
       layout: layout
       provenance: provenance.json
   publish-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
     needs: [container]
     secrets: [NGIT_PUBLISHER_NBUNKSEC]
   verify-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - verify
     needs: [publish-container]
     requirements:
       resources:
@@ -57,5 +66,8 @@ jobs:
         /configuration/guest/kernel-features/NF_TABLES: {eq: true}
         /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
   publish-release:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
     needs: [archive, verify-container]
     secrets: [NGIT_PUBLISHER_NBUNKSEC]

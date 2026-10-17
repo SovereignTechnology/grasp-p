@@ -13,6 +13,9 @@ on:
       - "compose*.yaml"
       - "deploy/**"
       - "flake.lock"
+      - "flake.nix"
+      - ".ngit/nix/workflows/default.nix"
+      - ".ngit/nix/workflows/ci.nix"
       - ".ngit/nix/workflows/ci-container.nix"
       - ".ngit/nix/workflows/container_deployment.yaml"
       - "scripts/build-container-layout.sh"
@@ -23,6 +26,9 @@ on:
 
 jobs:
   container-deployment:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - test
     # Builds the release image with a job-owned Docker daemon inside the
     # provider's disposable VM; see .ngit/nix/workflows/ci-container.nix.
     requirements:

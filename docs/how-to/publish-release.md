@@ -2,7 +2,7 @@
 
 All CI workflows and their support files live in `.ngit/nix/workflows/`.
 `default.nix` groups commands by workflow and job; the root flake exports them
-as `ngit-ci.commands`, so YAML selects each command by its job name. A `v*` tag push runs
+as `ngit-ci.commands`, so YAML selects each command by its job and step names. A `v*` tag push runs
 `release.yaml`: a pure static-musl archive build and a container layout build,
 followed by OCI publication, a pull-and-run verification, and NIP-82 publication.
 The publisher copies the exact predecessor archive/layout; it does not rebuild
@@ -10,8 +10,10 @@ release products. The container builder preserves the repository Dockerfile
 and `scripts/build-container-layout.sh`. Its base-image pulls retain that
 Dockerfile's existing update policy.
 
-Release commands pin Git, Python, ngit, Cargo and container tooling in the root
-flake. The separate `release-ngit` input must support both release and container
+Publisher and container jobs begin with explicit tool builds. Their closures
+are shared through the provider cache before runtime commands start; credentials
+are used only by the publisher step. These commands pin Git, Python, ngit, Cargo
+and container tooling. The separate `release-ngit` input must support both release and container
 publication; `checks.x86_64-linux.release-cli` verifies its required flags.
 Checks and publishers share `.ngit/nix/workflows/release-ngit.nix`: on x86_64 Linux it installs
 the SHA-256-pinned static v3.0.3 release archive, avoiding a lengthy LTO rebuild

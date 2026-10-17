@@ -5,6 +5,9 @@ on:
   workflow_dispatch:
 jobs:
   container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - build
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -28,9 +31,15 @@ jobs:
       layout: layout
       provenance: provenance.json
   publish-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
     needs: [container]
     secrets: [NGIT_PUBLISHER_NBUNKSEC]
   verify-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - verify
     needs: [publish-container]
     requirements:
       resources:

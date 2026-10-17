@@ -68,6 +68,8 @@
         packages = {
           default = self.packages.${system}.ngit-grasp;
           ci-dependencies = ci.dependencies;
+          ci-publisher-tools = ci.publisher-tools;
+          ci-container-tools = ci.container-tools;
 
           ngit-grasp = pkgs.rustPlatform.buildRustPackage {
             pname = "ngit-grasp";

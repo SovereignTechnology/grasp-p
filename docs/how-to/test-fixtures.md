@@ -34,11 +34,12 @@ unchanged. Tag validation and publication also use native Nix workflows; see
 
 ## Reproduce the container deployment check
 
-`.ngit/nix/workflows/container_deployment.yaml` runs the `container_deployment.container-deployment`
-command when deployment-relevant files change and on pull requests. When the
-provider supplies `NGIT_CI_STEP`, its result reports separate durations for
-building the OCI image, importing it, and running deployment tests. Local runs
-and older providers execute the same commands without timing instrumentation.
+`.ngit/nix/workflows/container_deployment.yaml` runs the `container_deployment.container-deployment.test`
+command when deployment-relevant files change and on pull requests. Its leading
+`tools` step caches the pinned daemon and CLI closure. The `test` step builds
+the real Dockerfile, imports the image and runs deployment checks. This test
+still needs Docker Hub, Debian repositories and crates.io for the Dockerfile
+build; it deliberately exercises the supported container installation path.
 
 The command owns its container daemon: the flake pins Docker, containerd, runc, iptables and
 skopeo, and the command starts `dockerd` with its data, exec root and socket under
@@ -48,10 +49,10 @@ provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
 modules. On any other provider the command stops before starting the daemon and
 names the missing requirement.
 
-The app needs root, so run it only in a disposable VM:
+The command needs root, so run it only in a disposable VM:
 
 ```sh
-nix run .#ci-container-deployment
+nix run .#ngit-ci.commands.x86_64-linux.container_deployment.container-deployment.test
 ```
 
 It reads `NGIT_CI_COMMIT_SHA` and `NGIT_CI_OUTPUT_DIR`. On a workstation with

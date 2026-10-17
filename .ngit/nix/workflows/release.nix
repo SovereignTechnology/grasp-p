@@ -25,6 +25,8 @@ PYTHON
       workload = context + workload;
   };
 in {
+  tools = pkgs.linkFarm "ngit-grasp-publisher-tools"
+    (map (tool: { name = tool.name; path = tool; }) tools);
   commands = {
     release-container = containerCommand "ngit-grasp-release-container" ''
       [[ $NGIT_CI_TRIGGER == push ]] || { echo 'Use container backfill for manual runs' >&2; exit 1; }
@@ -60,7 +62,8 @@ in {
     for option in --nbunksec-file --manifest --defaults --repo-relay-only; do
       grep -q -- "$option" container.txt
     done
-    touch "$out"
+    mkdir -p "$out"
+    ln -s ${ngit} "$out/ngit"
   '';
   checks.release-scripts = pkgs.runCommand "ngit-grasp-release-script-tests" {
     nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.git pkgs.coreutils ];

@@ -1,4 +1,4 @@
-# Shared by release apps before any build or publication effect.
+# Shared by release commands before any build or publication effect.
 case "${NGIT_CI_TRIGGER:-}" in
   push | manual) ;;
   *) echo 'Release jobs require a tag push or manual tag replay' >&2; exit 1 ;;
