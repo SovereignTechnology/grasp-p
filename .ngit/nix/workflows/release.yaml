@@ -1,4 +1,5 @@
 version: 1
+system: x86_64-linux
 name: release assets
 on:
   push:
@@ -9,7 +10,6 @@ jobs:
     artifacts:
       release-archive: release
   container:
-    run: apps.x86_64-linux.release-container
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -34,11 +34,9 @@ jobs:
       provenance: provenance.json
   publish-container:
     needs: [container]
-    run: apps.x86_64-linux.publish-container
     secrets: [NGIT_PUBLISHER_NBUNKSEC]
   verify-container:
     needs: [publish-container]
-    run: apps.x86_64-linux.verify-container
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -60,5 +58,4 @@ jobs:
         /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
   publish-release:
     needs: [archive, verify-container]
-    run: apps.x86_64-linux.publish-release
     secrets: [NGIT_PUBLISHER_NBUNKSEC]

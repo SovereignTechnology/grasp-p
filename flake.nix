@@ -21,8 +21,7 @@
         else "unknown";
       ngitGraspVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-    in
-    (flake-utils.lib.eachDefaultSystem (system:
+      perSystem = flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
@@ -30,13 +29,9 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
-        ci = import ./.ngit/nix/workflows/ci.nix {
+        ci = import ./.ngit/nix/workflows {
           inherit pkgs rustToolchain sourceRevision;
-          src = ./.;
-          version = ngitGraspVersion;
-        };
-        release = import ./.ngit/nix/workflows/release.nix {
-          inherit pkgs rustToolchain;
+          src = self;
           version = ngitGraspVersion;
           ngit = import ./.ngit/nix/workflows/release-ngit.nix {
             inherit pkgs;
@@ -44,8 +39,8 @@
           };
         };
       in {
-        checks = ci.checks // release.checks;
-        apps = ci.apps // release.apps;
+        checks = ci.checks;
+        ciCommands = ci.commands;
         devShells.default = pkgs.mkShell {
           # Single dev shell for the whole workspace (ngit-grasp + grasp-audit).
           buildInputs = with pkgs; [ rustToolchain pkg-config openssl git gitlint ];
@@ -137,7 +132,9 @@
             doCheck = false;
           };
         };
-      })) // {
+      });
+    in (builtins.removeAttrs perSystem [ "ciCommands" ]) // {
+        ngit-ci.commands = perSystem.ciCommands;
         # NixOS module for deployment
         nixosModules.default = { ... }: {
           imports = [ ./nix/module.nix ];

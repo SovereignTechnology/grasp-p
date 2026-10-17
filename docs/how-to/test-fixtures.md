@@ -30,18 +30,18 @@ unchanged. Tag validation and publication also use native Nix workflows; see
 
 ## Reproduce the container deployment check
 
-`.ngit/nix/workflows/container_deployment.yaml` runs the `ci-container-deployment`
-app when deployment-relevant files change and on pull requests. When the
+`.ngit/nix/workflows/container_deployment.yaml` runs the `container_deployment.container-deployment`
+command when deployment-relevant files change and on pull requests. When the
 provider supplies `NGIT_CI_STEP`, its result reports separate durations for
 building the OCI image, importing it, and running deployment tests. Local runs
 and older providers execute the same commands without timing instrumentation.
 
-The app owns its container daemon: the flake pins Docker, containerd, runc, iptables and
-skopeo, and the app starts `dockerd` with its data, exec root and socket under
+The command owns its container daemon: the flake pins Docker, containerd, runc, iptables and
+skopeo, and the command starts `dockerd` with its data, exec root and socket under
 `$HOME`, waits for readiness with a deadline, runs
 `scripts/test-container-release.sh` and stops the daemon. A Firecracker Nix
 provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
-modules. On any other provider the app stops before starting the daemon and
+modules. On any other provider the command stops before starting the daemon and
 names the missing requirement.
 
 The app needs root, so run it only in a disposable VM:

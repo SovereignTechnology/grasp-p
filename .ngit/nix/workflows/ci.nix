@@ -54,8 +54,5 @@ in {
       '';
     });
   };
-  apps.ci-container-deployment = {
-    type = "app";
-    program = "${import ./ci-container.nix { inherit pkgs version; }}/bin/ngit-grasp-ci-container-deployment";
-  };
+  container = import ./ci-container.nix { inherit pkgs version; };
 }

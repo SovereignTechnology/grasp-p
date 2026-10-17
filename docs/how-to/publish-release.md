@@ -1,6 +1,8 @@
 # Publish releases with native Nix CI
 
-All CI workflows live in `.ngit/nix/workflows/`. A `v*` tag push runs
+All CI workflows and their support files live in `.ngit/nix/workflows/`.
+`default.nix` groups commands by workflow and job; the root flake exports them
+as `ngit-ci.commands`, so YAML selects each command by its job name. A `v*` tag push runs
 `release.yaml`: a pure static-musl archive build and a container layout build,
 followed by OCI publication, a pull-and-run verification, and NIP-82 publication.
 The publisher copies the exact predecessor archive/layout; it does not rebuild
@@ -8,7 +10,7 @@ release products. The container builder preserves the repository Dockerfile
 and `scripts/build-container-layout.sh`. Its base-image pulls retain that
 Dockerfile's existing update policy.
 
-Release apps pin Git, Python, ngit, Cargo and container tooling in the root
+Release commands pin Git, Python, ngit, Cargo and container tooling in the root
 flake. The separate `release-ngit` input must support both release and container
 publication; `checks.x86_64-linux.release-cli` verifies its required flags.
 Checks and publishers share `.ngit/nix/workflows/release-ngit.nix`: on x86_64 Linux it installs
@@ -30,7 +32,7 @@ existing `.ngit/release.yaml` and `.ngit/containers.yaml` retain the publication
 metadata, relays and Blossom servers. Archive contents are reproducible with
 a fixed tar timestamp; the NIP-82 release date comes from the actual Git tag.
 
-Every release app requires an explicit tag context and fetches that tag from
+Every release command requires an explicit tag context and fetches that tag from
 the Nostr repository. Ordinary tag pushes check the Cargo version and both
 the checkout and peeled tag against the signed `NGIT_CI_COMMIT_SHA`. A moved tag fails before
 publication. Branch or pull-request contexts cannot publish.
@@ -39,7 +41,7 @@ publication. Branch or pull-request contexts cannot publish.
 
 Replay `.ngit/nix/workflows/container_backfill.yaml` from a commit containing
 this workflow with an explicit `refs/tags/v<version>` context. The current
-reviewed app fetches only that historical tag, validates its Cargo version,
+reviewed command fetches only that historical tag, validates its Cargo version,
 and extracts its source into the job's private workspace. It builds and
 publishes only the exact OCI version tag, preserving `latest` and prerelease
 aliases, then pulls and verifies the image. It does not publish a crate or
