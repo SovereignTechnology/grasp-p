@@ -3,26 +3,30 @@
 ## Reproduce the Nix CI checks
 
 Branch pushes and pull requests use `.ngit/nix/workflows/rust_ci.yaml`.
-The workflow builds the following root-flake checks independently:
+One Rust job runs dependency and release-tool checks, then reports format,
+compile, lint and test steps separately. The dependency build caches Crane's
+third-party objects, vendored sources and pinned compiler/native tools. Cargo
+runs offline; compile builds the current repository code, and lint and tests
+reuse its writable target directory. Compiler environment variables match the
+cached build so native dependencies are not needlessly recompiled.
+
+For the same commands locally:
 
 ```sh
-nix build .#checks.x86_64-linux.ci-lint
-nix build .#checks.x86_64-linux.ci-tests
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.format
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.compile
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.lint
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.tests
 ```
 
-`ci-lint` checks formatting and runs Clippy for the whole workspace with
-warnings denied. `ci-tests` builds both binaries and runs workspace unit,
-integration and documentation tests with offline Cargo dependencies. It retains
-the deliberately hostile ambient Git settings used by the previous act CI.
-The fixtures bind local sockets; they do not need external relay access.
-The Nix sandbox isolates those sockets from the host network. PR execution
-adds a Firecracker boundary around the complete provider job.
+Tests cover both workspace crates, including integration and documentation
+tests. The test command gives deliberately hostile ambient Git settings their
+own HOME. Fixtures bind local sockets and need no external relay. Production
+CI executes all commands inside a disposable Firecracker guest.
 
-Each job succeeds when its checks exit successfully. These validation jobs do
-not publish artifacts or run a separate artifact-verification job. Providers
-may run the checks concurrently on different machines. The same workflow also
-runs `release-scripts` and `release-cli` to validate the publication guards
-and pinned CLI compatibility without publishing.
+The leading `release-scripts` and `release-cli` build steps check publication
+guards and pinned CLI compatibility without publishing. They share the Rust
+job rather than starting two extra guests.
 
 The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
 unchanged. Tag validation and publication also use native Nix workflows; see

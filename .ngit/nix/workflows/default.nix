@@ -1,10 +1,12 @@
-{ pkgs, rustToolchain, src, version, sourceRevision, ngit }:
+{ pkgs, rustToolchain, src, version, craneLib, ngit }:
 let
-  ci = import ./ci.nix { inherit pkgs rustToolchain src version sourceRevision; };
+  ci = import ./ci.nix { inherit pkgs rustToolchain src version craneLib; };
   release = import ./release.nix { inherit pkgs rustToolchain version ngit; };
 in {
-  checks = ci.checks // release.checks;
+  checks = release.checks;
+  dependencies = ci.dependencies;
   commands = {
+    rust_ci.rust = ci.commands;
     container_deployment.container-deployment = ci.container;
     release = {
       container = release.commands.release-container;

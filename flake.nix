@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    crane.url = "github:ipetkov/crane/2c71e194474d13de031d729b729c968ddbe3507f";
     release-ngit = {
       url = "git+https://relay.ngit.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit.git?rev=31e48be58ee3fa2e3c56b1df68b6358c385d5e91&allRefs=1";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -13,7 +14,7 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, release-ngit }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, release-ngit, crane }:
     let
       sourceRevision =
         if self ? rev then self.rev
@@ -30,7 +31,9 @@
           extensions = [ "rust-src" "rust-analyzer" ];
         };
         ci = import ./.ngit/nix/workflows {
-          inherit pkgs rustToolchain sourceRevision;
+          inherit pkgs;
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.stable.latest.default;
           src = self;
           version = ngitGraspVersion;
           ngit = import ./.ngit/nix/workflows/release-ngit.nix {
@@ -64,6 +67,7 @@
         # Both crates are members of a single workspace sharing one Cargo.lock.
         packages = {
           default = self.packages.${system}.ngit-grasp;
+          ci-dependencies = ci.dependencies;
 
           ngit-grasp = pkgs.rustPlatform.buildRustPackage {
             pname = "ngit-grasp";
