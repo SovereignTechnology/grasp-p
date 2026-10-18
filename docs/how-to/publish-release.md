@@ -26,6 +26,10 @@ Container build and verification jobs reuse the deployment test's job-owned
 Docker daemon. They require a disposable root VM with the kernel facilities
 listed in their workflow requirements, and clean up the daemon on exit.
 
+Rust CI, archive builds, container builds and Cargo publication require at
+least 4 GiB of guest RAM, including container verification.
+These are provider-selection floors, not memory caps.
+
 Configure the repository `NGIT_PUBLISHER_NBUNKSEC` secret. Only the OCI and
 NIP-82 publisher jobs request it, and pass its private
 `$NGIT_CI_SECRETS_DIR/NGIT_PUBLISHER_NBUNKSEC` file directly to ngit. No secret

@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
 jobs:
   archive:
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
     build: packages.x86_64-linux.release-archive
     artifacts:
       release-archive: release
