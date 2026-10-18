@@ -16,6 +16,7 @@ jobs:
     requirements:
       resources:
         memory-mib: {gte: 4096}
+        vcpus: {gte: 4}
     steps:
       - release-scripts: {build: checks.x86_64-linux.release-scripts}
       - release-cli: {build: checks.x86_64-linux.release-cli}
