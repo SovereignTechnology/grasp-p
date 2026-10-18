@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh workspace dependencies, including base64 0.23, bitcoin_hashes 1.2,
+  and tokio-tungstenite 0.30.
+
 ### Security
 
 - Update negentropy to 0.5.2 to reject malformed NIP-77 ID counts before

@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use dashmap::DashMap;
 use tempfile::Builder;
 use tokio::sync::{Mutex, OwnedMutexGuard};

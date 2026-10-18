@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{bail, ensure, Context, Result};
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use serde::{Deserialize, Serialize};
 
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat};

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use bitcoin_hashes::sha1::Hash as Sha1Hash;
-use bitcoin_hashes::{Hash, HashEngine};
+use bitcoin_hashes::HashEngine;
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, UPGRADE};

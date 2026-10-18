@@ -425,7 +425,7 @@ async fn forward_backend(
 /// Derive the Sec-WebSocket-Accept key from the request key.
 fn derive_accept_key(request_key: &[u8]) -> String {
     use bitcoin_hashes::sha1::Hash as Sha1Hash;
-    use bitcoin_hashes::{Hash, HashEngine};
+    use bitcoin_hashes::HashEngine;
 
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
