@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    crane.url = "github:ipetkov/crane/2c71e194474d13de031d729b729c968ddbe3507f";
+    crane.url = "github:ipetkov/crane";
     release-ngit = {
       url = "git+https://relay.ngit.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit.git?rev=31e48be58ee3fa2e3c56b1df68b6358c385d5e91&allRefs=1";
       inputs.nixpkgs.follows = "nixpkgs";
