@@ -8,12 +8,14 @@ member is not selected for publication.
 
 Configure the repository's `CARGO_REGISTRY_TOKEN` secret in ngit-ci with a
 crates.io token scoped to publishing `ngit-grasp`. The token is supplied as
-`$NGIT_CI_SECRETS_DIR/CARGO_REGISTRY_TOKEN` only to the publication app; Cargo
+`$NGIT_CI_SECRETS_DIR/CARGO_REGISTRY_TOKEN` only to the publication command; Cargo
 does not write a login credential file.
 
-Separate pure Nix jobs run the existing workspace lint and test checks before
-the publication app starts. The app verifies the fetched tag and checkout
-against `NGIT_CI_COMMIT_SHA`.
+The publisher depends on the complete `rust_ci.yaml` workflow at the peeled
+tag commit. Compatible successful CI is reused; missing checks are scheduled
+and failed checks block publication. `reuse: never` makes publication specific
+to each tag push. The command verifies the fetched tag and checkout against
+`NGIT_CI_COMMIT_SHA`.
 
 The workflow runs `cargo publish --locked --registry crates-io --package
 ngit-grasp`, including Cargo's package verification. A missing token or an

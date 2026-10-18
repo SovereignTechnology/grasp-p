@@ -3,26 +3,30 @@
 ## Reproduce the Nix CI checks
 
 Branch pushes and pull requests use `.ngit/nix/workflows/rust_ci.yaml`.
-The workflow builds the following root-flake checks independently:
+One Rust job runs dependency and release-tool checks, then reports format,
+compile, lint and test steps separately. The dependency build caches Crane's
+third-party objects, vendored sources and pinned compiler/native tools. Cargo
+runs offline; compile builds the current repository code, and lint and tests
+reuse its writable target directory. Compiler environment variables match the
+cached build so native dependencies are not needlessly recompiled.
+
+For the same commands locally:
 
 ```sh
-nix build .#checks.x86_64-linux.ci-lint
-nix build .#checks.x86_64-linux.ci-tests
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.format
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.compile
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.lint
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.tests
 ```
 
-`ci-lint` checks formatting and runs Clippy for the whole workspace with
-warnings denied. `ci-tests` builds both binaries and runs workspace unit,
-integration and documentation tests with offline Cargo dependencies. It retains
-the deliberately hostile ambient Git settings used by the previous act CI.
-The fixtures bind local sockets; they do not need external relay access.
-The Nix sandbox isolates those sockets from the host network. PR execution
-adds a Firecracker boundary around the complete provider job.
+Tests cover both workspace crates, including integration and documentation
+tests. The test command gives deliberately hostile ambient Git settings their
+own HOME. Fixtures bind local sockets and need no external relay. Production
+CI executes all commands inside a disposable Firecracker guest.
 
-Each job succeeds when its checks exit successfully. These validation jobs do
-not publish artifacts or run a separate artifact-verification job. Providers
-may run the checks concurrently on different machines. The same workflow also
-runs `release-scripts` and `release-cli` to validate the publication guards
-and pinned CLI compatibility without publishing.
+The leading `release-scripts` and `release-cli` build steps check publication
+guards and pinned CLI compatibility without publishing. They share the Rust
+job rather than starting two extra guests.
 
 The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
 unchanged. Tag validation and publication also use native Nix workflows; see
@@ -30,24 +34,25 @@ unchanged. Tag validation and publication also use native Nix workflows; see
 
 ## Reproduce the container deployment check
 
-`.ngit/nix/workflows/container_deployment.yaml` runs the `ci-container-deployment`
-app when deployment-relevant files change and on pull requests. When the
-provider supplies `NGIT_CI_STEP`, its result reports separate durations for
-building the OCI image, importing it, and running deployment tests. Local runs
-and older providers execute the same commands without timing instrumentation.
+`.ngit/nix/workflows/container_deployment.yaml` runs the `container_deployment.container-deployment.test`
+command when deployment-relevant files change and on pull requests. Its leading
+`tools` step caches the pinned daemon and CLI closure. The `test` step builds
+the real Dockerfile, imports the image and runs deployment checks. This test
+still needs Docker Hub, Debian repositories and crates.io for the Dockerfile
+build; it deliberately exercises the supported container installation path.
 
-The app owns its container daemon: the flake pins Docker, containerd, runc, iptables and
-skopeo, and the app starts `dockerd` with its data, exec root and socket under
+The command owns its container daemon: the flake pins Docker, containerd, runc, iptables and
+skopeo, and the command starts `dockerd` with its data, exec root and socket under
 `$HOME`, waits for readiness with a deadline, runs
 `scripts/test-container-release.sh` and stops the daemon. A Firecracker Nix
 provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
-modules. On any other provider the app stops before starting the daemon and
+modules. On any other provider the command stops before starting the daemon and
 names the missing requirement.
 
-The app needs root, so run it only in a disposable VM:
+The command needs root, so run it only in a disposable VM:
 
 ```sh
-nix run .#ci-container-deployment
+nix run .#ngit-ci.commands.x86_64-linux.container_deployment.container-deployment.test
 ```
 
 It reads `NGIT_CI_COMMIT_SHA` and `NGIT_CI_OUTPUT_DIR`. On a workstation with

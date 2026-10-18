@@ -1,4 +1,5 @@
 version: 1
+system: x86_64-linux
 name: Container deployment e2e
 on:
   push:
@@ -12,7 +13,10 @@ on:
       - "compose*.yaml"
       - "deploy/**"
       - "flake.lock"
-      - "nix/ci-container.nix"
+      - "flake.nix"
+      - ".ngit/nix/workflows/default.nix"
+      - ".ngit/nix/workflows/ci.nix"
+      - ".ngit/nix/workflows/ci-container.nix"
       - ".ngit/nix/workflows/container_deployment.yaml"
       - "scripts/build-container-layout.sh"
       - "scripts/test-container-deployment.sh"
@@ -22,9 +26,11 @@ on:
 
 jobs:
   container-deployment:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - test
     # Builds the release image with a job-owned Docker daemon inside the
-    # provider's disposable VM; see nix/ci-container.nix.
-    run: apps.x86_64-linux.ci-container-deployment
+    # provider's disposable VM; see .ngit/nix/workflows/ci-container.nix.
     requirements:
       resources:
         memory-mib: {gte: 4096}
