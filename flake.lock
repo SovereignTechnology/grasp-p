@@ -134,9 +134,7 @@
     "release-ngit": {
       "inputs": {
         "buzz": "buzz",
-        "flake-utils": [
-          "flake-utils"
-        ],
+        "flake-utils": "flake-utils",
         "nixpkgs": [
           "nixpkgs"
         ],
@@ -164,7 +162,6 @@
     "root": {
       "inputs": {
         "crane": "crane",
-        "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "release-ngit": "release-ngit",
         "rust-overlay": "rust-overlay"

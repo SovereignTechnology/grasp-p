@@ -9,20 +9,21 @@
       url = "git+https://relay.ngit.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit.git?rev=31e48be58ee3fa2e3c56b1df68b6358c385d5e91&allRefs=1";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
-      inputs.flake-utils.follows = "flake-utils";
     };
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, release-ngit, crane }:
+  outputs = { self, nixpkgs, rust-overlay, release-ngit, crane }:
     let
+      forAllSystems = nixpkgs.lib.genAttrs [
+        "aarch64-linux" "x86_64-linux" "aarch64-darwin" "x86_64-darwin"
+      ];
       sourceRevision =
         if self ? rev then self.rev
         else if self ? dirtyRev then self.dirtyRev
         else "unknown";
       ngitGraspVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-      perSystem = flake-utils.lib.eachDefaultSystem (system:
+      perSystem = forAllSystems (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
@@ -139,8 +140,11 @@
           };
         };
       });
-    in (builtins.removeAttrs perSystem [ "ciCommands" ]) // {
-        ngit-ci.commands = perSystem.ciCommands;
+    in {
+        packages = forAllSystems (system: perSystem.${system}.packages);
+        checks = forAllSystems (system: perSystem.${system}.checks);
+        devShells = forAllSystems (system: perSystem.${system}.devShells);
+        ngit-ci.commands = forAllSystems (system: perSystem.${system}.ciCommands);
         # NixOS module for deployment
         nixosModules.default = { ... }: {
           imports = [ ./nix/module.nix ];
