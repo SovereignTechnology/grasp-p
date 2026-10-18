@@ -30,6 +30,11 @@ Rust CI, archive builds, container builds and Cargo publication require at
 least 4 GiB of guest RAM, including container verification.
 These are provider-selection floors, not memory caps.
 
+Review the provider summary at the top of the final job log when tuning these
+minimums: observed guest RAM includes the guest OS, and swap activity or OOM
+kills signal pressure. Compare cold dependency builds with cached runs and
+leave headroom; a successful run alone does not measure peak memory.
+
 Configure the repository `NGIT_PUBLISHER_NBUNKSEC` secret. Only the OCI and
 NIP-82 publisher jobs request it, and pass its private
 `$NGIT_CI_SECRETS_DIR/NGIT_PUBLISHER_NBUNKSEC` file directly to ngit. No secret
