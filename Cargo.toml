@@ -1,6 +1,6 @@
 [package]
 name = "ngit-grasp"
-version = "3.0.7"
+version = "3.0.8"
 edition = "2021"
 authors = ["ngit-grasp contributors"]
 license = "MIT"

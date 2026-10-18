@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.8] - 2026-10-18
+
+Harden NIP-77 reconciliation, escape reflected 404 paths, tighten tag push
+authorization, and restore staged-history compatibility with older Git versions.
+
 ### Changed
 
 - Refresh workspace dependencies, including base64 0.23, bitcoin_hashes 1.2,
