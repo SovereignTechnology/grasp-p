@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Update negentropy to 0.5.2 to reject malformed NIP-77 ID counts before
+  allocating memory, preventing peer-triggered memory exhaustion.
+
 ### Fixed
 
 - Fix staged history promotion and PR event acceptance on Git versions older
