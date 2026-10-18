@@ -642,7 +642,7 @@ pub fn get_generic_404_html(config: &Config, path: &str) -> String {
         base_css = get_base_css(),
         relay_name = config.relay_name(),
         home_path = escape_html(&home_path),
-        path = path,
+        path = escape_html(path),
         version = get_version(),
         footer_script = get_footer_script(),
         theme_toggle = get_theme_toggle_html(),
@@ -902,4 +902,23 @@ pub fn get_repo_html(config: &Config, npub: &str, identifier: &str) -> String {
         theme_toggle = get_theme_toggle_html(),
         theme_script = get_theme_script(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use clap::Parser;
+
+    #[test]
+    fn generic_404_escapes_reflected_request_path() {
+        let config =
+            Config::try_parse_from(["ngit-grasp", "--domain", "relay.example"]).unwrap();
+        let html = get_generic_404_html(&config, "/<script>alert(1)</script>");
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "reflected request path must be HTML-escaped"
+        );
+        assert!(!html.contains("<script>alert(1)</script>"));
+    }
 }

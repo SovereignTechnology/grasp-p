@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Escape the requested path displayed on generic 404 pages so HTML-like input
+  is rendered as text rather than markup. Thanks to mptf for the fix.
+
 - Reject tag creation and updates absent from the signed repository state in
   the per-ref push validator. This adds defense in depth to the existing
   whole-state authorization check and preserves deletion of undeclared tags.
