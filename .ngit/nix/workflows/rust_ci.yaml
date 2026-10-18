@@ -1,4 +1,5 @@
 version: 1
+system: x86_64-linux
 name: Rust CI
 on:
   push:
@@ -8,13 +9,15 @@ on:
       - "**/*.md"
       - "work/**"
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  lint:
-    build: checks.x86_64-linux.ci-lint
-  tests:
-    build: checks.x86_64-linux.ci-tests
-  release-scripts:
-    build: checks.x86_64-linux.release-scripts
-  release-cli:
-    build: checks.x86_64-linux.release-cli
+  rust:
+    steps:
+      - dependencies: {build: packages.x86_64-linux.ci-dependencies}
+      - release-scripts: {build: checks.x86_64-linux.release-scripts}
+      - release-cli: {build: checks.x86_64-linux.release-cli}
+      - format
+      - compile
+      - lint
+      - tests

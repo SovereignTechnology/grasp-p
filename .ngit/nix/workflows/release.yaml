@@ -1,4 +1,5 @@
 version: 1
+system: x86_64-linux
 name: release assets
 on:
   push:
@@ -9,7 +10,9 @@ jobs:
     artifacts:
       release-archive: release
   container:
-    run: apps.x86_64-linux.release-container
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - build
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -33,12 +36,16 @@ jobs:
       layout: layout
       provenance: provenance.json
   publish-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
     needs: [container]
-    run: apps.x86_64-linux.publish-container
     secrets: [NGIT_PUBLISHER_NBUNKSEC]
   verify-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - verify
     needs: [publish-container]
-    run: apps.x86_64-linux.verify-container
     requirements:
       resources:
         memory-mib: {gte: 4096}
@@ -59,6 +66,8 @@ jobs:
         /configuration/guest/kernel-features/NF_TABLES: {eq: true}
         /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
   publish-release:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
     needs: [archive, verify-container]
-    run: apps.x86_64-linux.publish-release
     secrets: [NGIT_PUBLISHER_NBUNKSEC]
