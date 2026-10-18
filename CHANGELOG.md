@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix staged history promotion and PR event acceptance on Git versions older
+  than 2.42 by passing retained-history exclusions as command-line arguments
+  instead of revision input. Thanks to Holly for the fix.
+
 - Escape the requested path displayed on generic 404 pages so HTML-like input
   is rendered as text rather than markup. Thanks to mptf for the fix.
 
