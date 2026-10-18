@@ -912,8 +912,7 @@ mod tests {
 
     #[test]
     fn generic_404_escapes_reflected_request_path() {
-        let config =
-            Config::try_parse_from(["ngit-grasp", "--domain", "relay.example"]).unwrap();
+        let config = Config::try_parse_from(["ngit-grasp", "--domain", "relay.example"]).unwrap();
         let html = get_generic_404_html(&config, "/<script>alert(1)</script>");
         assert!(
             html.contains("&lt;script&gt;"),
