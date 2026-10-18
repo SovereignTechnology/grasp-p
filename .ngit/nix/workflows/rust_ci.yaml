@@ -17,9 +17,9 @@ jobs:
       resources:
         memory-mib: {gte: 4096}
     steps:
-      - dependencies: {build: packages.x86_64-linux.ci-dependencies}
       - release-scripts: {build: checks.x86_64-linux.release-scripts}
       - release-cli: {build: checks.x86_64-linux.release-cli}
+      - dependencies: {build: packages.x86_64-linux.ci-dependencies}
       - format
       - compile
       - lint
