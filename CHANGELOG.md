@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject tag creation and updates absent from the signed repository state in
+  the per-ref push validator. This adds defense in depth to the existing
+  whole-state authorization check and preserves deletion of undeclared tags.
+  Thanks to mptf for the fix.
+
 ## [3.0.7] - 2026-10-02
 
 Reduce unnecessary sync traffic, reserve Git capacity for advertised commits,
