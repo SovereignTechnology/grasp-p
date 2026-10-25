@@ -222,7 +222,7 @@ mod tests {
         let (_dir, svc) = harness().await;
         let data = vec![7u8; 512];
         let sha = {
-            use bitcoin_hashes::{sha256, Hash};
+            use bitcoin_hashes::sha256;
             sha256::Hash::hash(&data).to_string()
         };
 

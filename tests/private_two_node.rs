@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use nostr_sdk::prelude::*;
 
 use common::port::reserve_port;

@@ -29,7 +29,7 @@ use base64::prelude::{
     BASE64_STANDARD, BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE, BASE64_URL_SAFE_NO_PAD,
 };
 use base64::Engine as _;
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use nostr::nips::nip13::SingleThreadPow;
 use nostr_sdk::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bitcoin_hashes::{sha256, Hash, HashEngine};
+use bitcoin_hashes::{sha256, HashEngine};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 

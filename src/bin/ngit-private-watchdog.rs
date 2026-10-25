@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitcoin_hashes::{sha256, Hash, HashEngine};
+use bitcoin_hashes::{sha256, HashEngine};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ngit_grasp::grasp_p::{KIND_REGISTRATION, KIND_STATE_ROOT};

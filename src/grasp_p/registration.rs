@@ -65,7 +65,7 @@ fn verify_key_pop(
 ) -> Result<(), String> {
     use std::str::FromStr;
 
-    use bitcoin_hashes::{sha256, Hash};
+    use bitcoin_hashes::sha256;
     use secp256k1::{schnorr::Signature, XOnlyPublicKey};
 
     #[cfg(test)]
@@ -1060,7 +1060,7 @@ mod tests {
         tenant: &nostr_sdk::prelude::Keys,
         alias: &str,
     ) -> Vec<String> {
-        use bitcoin_hashes::{sha256, Hash};
+        use bitcoin_hashes::sha256;
 
         let digest =
             sha256::Hash::hash(key_pop_input(&tenant.public_key().to_hex(), alias).as_bytes());

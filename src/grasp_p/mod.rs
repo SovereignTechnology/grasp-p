@@ -537,7 +537,7 @@ impl PrivateConfig {
 pub const POLICY_VERSION: &str = "grasp-p-policy-v3";
 
 pub fn policy_fingerprint(config: &Config) -> String {
-    use bitcoin_hashes::{sha256, Hash};
+    use bitcoin_hashes::sha256;
 
     fn strip_url(value: &str) -> String {
         let v = value.trim().trim_end_matches('/');
