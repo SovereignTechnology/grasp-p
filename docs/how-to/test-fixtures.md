@@ -1,5 +1,75 @@
 # Reliable test fixtures
 
+## Reproduce the Nix CI checks
+
+Branch pushes and pull requests use `.ngit/nix/workflows/rust_ci.yaml`.
+One Rust job runs dependency and release-tool checks, then reports format,
+compile, lint and test steps separately. The dependency build caches Crane's
+third-party objects, vendored sources and pinned compiler/native tools. Cargo
+runs offline; compile builds the current repository code, and lint and tests
+reuse its writable target directory. Compiler environment variables match the
+cached build so native dependencies are not needlessly recompiled.
+
+For the same commands locally:
+
+```sh
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.format
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.compile
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.lint
+nix run .#ngit-ci.commands.x86_64-linux.rust_ci.rust.tests
+```
+
+Tests cover both workspace crates, including integration and documentation
+tests. The test command gives deliberately hostile ambient Git settings their
+own HOME. Fixtures bind local sockets and need no external relay. Production
+CI executes all commands inside a disposable Firecracker guest.
+
+The leading `release-scripts` and `release-cli` build steps check publication
+guards and pinned CLI compatibility without publishing. They share the Rust
+job rather than starting two extra guests.
+
+The normal packaging outputs (`ngit-grasp`, `grasp-audit`, `static`) remain
+unchanged. Tag validation and publication also use native Nix workflows; see
+[publishing releases](publish-release.md).
+
+## Reproduce the container deployment check
+
+`.ngit/nix/workflows/container_deployment.yaml` runs the `container_deployment.container-deployment.test`
+command when deployment-relevant files change and on pull requests. Its leading
+`tools` step caches the pinned daemon and CLI closure. The `test` step builds
+the real Dockerfile, imports the image and runs deployment checks. This test
+still needs Docker Hub, Debian repositories and crates.io for the Dockerfile
+build; it deliberately exercises the supported container installation path.
+
+The command owns its container daemon: the flake pins Docker, containerd, runc, iptables and
+skopeo, and the command starts `dockerd` with its data, exec root and socket under
+`$HOME`, waits for readiness with a deadline, runs
+`scripts/test-container-release.sh` and stops the daemon. A Firecracker Nix
+provider supplies only a disposable VM with root, cgroup v2 and loadable kernel
+modules. On any other provider the command stops before starting the daemon and
+names the missing requirement.
+
+The command needs root, so run it only in a disposable VM:
+
+```sh
+nix run .#ngit-ci.commands.x86_64-linux.container_deployment.container-deployment.test
+```
+
+It reads `NGIT_CI_COMMIT_SHA` and `NGIT_CI_OUTPUT_DIR`. On a workstation with
+an existing Docker daemon, run the script directly instead; it honours
+`DOCKER_HOST`:
+
+```sh
+nix shell nixpkgs#docker-client nixpkgs#curl nixpkgs#jq nixpkgs#skopeo \
+  --command scripts/test-container-release.sh \
+  "$(nix eval --raw .#static.version)" "$(git rev-parse HEAD)"
+```
+
+Release and manual container backfill jobs use the same daemon wrapper; see
+[publishing releases](publish-release.md).
+
+## Fixture rules
+
 Run tests through the repository development shell. Keep parallel checks
 enabled: each fixture owns its socket, tasks, subprocesses and temporary data.
 

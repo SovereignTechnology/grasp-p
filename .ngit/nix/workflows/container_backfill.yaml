@@ -1,0 +1,62 @@
+version: 1
+system: x86_64-linux
+name: container release backfill
+on:
+  workflow_dispatch:
+jobs:
+  container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - build
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+      environment:
+        /configuration/guest/job-uid: {eq: 0}
+        /configuration/guest/no-new-privileges: {eq: false}
+        /configuration/guest/module-autoload: {eq: true}
+        /configuration/guest/kernel-features/NAMESPACES: {eq: true}
+        /configuration/guest/kernel-features/PID_NS: {eq: true}
+        /configuration/guest/kernel-features/NET_NS: {eq: true}
+        /configuration/guest/kernel-features/CGROUPS: {eq: true}
+        /configuration/guest/kernel-features/MEMCG: {eq: true}
+        /configuration/guest/kernel-features/OVERLAY_FS: {eq: true}
+        /configuration/guest/kernel-features/BRIDGE: {eq: true}
+        /configuration/guest/kernel-features/VETH: {eq: true}
+        /configuration/guest/kernel-features/NETFILTER: {eq: true}
+        /configuration/guest/kernel-features/NF_NAT: {eq: true}
+        /configuration/guest/kernel-features/NF_TABLES: {eq: true}
+        /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}
+    artifacts:
+      layout: layout
+      provenance: provenance.json
+  publish-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
+    needs: [container]
+    secrets: [NGIT_PUBLISHER_NBUNKSEC]
+  verify-container:
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-container-tools}
+      - verify
+    needs: [publish-container]
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+      environment:
+        /configuration/guest/job-uid: {eq: 0}
+        /configuration/guest/no-new-privileges: {eq: false}
+        /configuration/guest/module-autoload: {eq: true}
+        /configuration/guest/kernel-features/NAMESPACES: {eq: true}
+        /configuration/guest/kernel-features/PID_NS: {eq: true}
+        /configuration/guest/kernel-features/NET_NS: {eq: true}
+        /configuration/guest/kernel-features/CGROUPS: {eq: true}
+        /configuration/guest/kernel-features/MEMCG: {eq: true}
+        /configuration/guest/kernel-features/OVERLAY_FS: {eq: true}
+        /configuration/guest/kernel-features/BRIDGE: {eq: true}
+        /configuration/guest/kernel-features/VETH: {eq: true}
+        /configuration/guest/kernel-features/NETFILTER: {eq: true}
+        /configuration/guest/kernel-features/NF_NAT: {eq: true}
+        /configuration/guest/kernel-features/NF_TABLES: {eq: true}
+        /configuration/guest/kernel-features/SECCOMP_FILTER: {eq: true}

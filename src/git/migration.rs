@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin_hashes::{sha256, Hash, HashEngine};
+use bitcoin_hashes::{sha256, HashEngine};
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
 use tracing::warn;

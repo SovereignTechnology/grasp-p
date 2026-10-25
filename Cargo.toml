@@ -1,6 +1,6 @@
 [package]
 name = "ngit-grasp"
-version = "3.0.7"
+version = "3.0.8"
 edition = "2021"
 authors = ["ngit-grasp contributors"]
 license = "MIT"
@@ -26,15 +26,15 @@ nostr-memory = "0.45.2"
 # SHA-1 for the `Sec-WebSocket-Accept` handshake. `nostr` uses this same crate
 # internally but stopped re-exporting it as `nostr::hashes` in 0.45,
 # so depend on it directly rather than pulling in a second hash implementation.
-bitcoin_hashes = "0.14"
+bitcoin_hashes = { version = "1.2", features = ["hex"] }
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.28", default-features = false }
+tokio-tungstenite = { version = "0.30", default-features = false }
 # Message type in `nostr-sdk`'s `WebSocketTransport` signatures, which the
 # in-process self-subscription transport implements. `nostr-sdk` does not
 # re-export it. No features requested: the build keeps whatever `nostr-sdk`
 # already selects.
 async-wsocket = { version = "0.17", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1.0"
 tar = "0.4"
 fs2 = "0.4"
@@ -107,7 +107,7 @@ secp256k1 = { version = "0.30", default-features = false, features = ["std"] }
 grasp-audit = { path = "grasp-audit", version = "0.2.0" }
 tempfile = "3"
 tokio = { version = "1.35", features = ["full", "test-util"] }
-tokio-tungstenite = "0.28.0"
+tokio-tungstenite = "0.30"
 
 # GRASP-P TLS path test (tests/grasp_p_tls.rs): an in-process TLS front for a
 # plain test node, and a CA made at run time. Linux only, like the OpenSSL

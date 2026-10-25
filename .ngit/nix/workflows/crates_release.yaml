@@ -1,0 +1,18 @@
+version: 1
+system: x86_64-linux
+name: Crates.io publication
+reuse: never
+on:
+  push:
+    tags: ["v*"]
+needs-workflows:
+  ci: rust_ci.yaml
+jobs:
+  publish:
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+    steps:
+      - tools: {build: packages.x86_64-linux.ci-publisher-tools}
+      - publish
+    secrets: [CARGO_REGISTRY_TOKEN]

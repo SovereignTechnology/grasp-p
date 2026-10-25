@@ -3,20 +3,30 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    crane.url = "github:ipetkov/crane";
+    release-ngit = {
+      url = "git+https://relay.ngit.dev/npub15qydau2hjma6ngxkl2cyar74wzyjshvl65za5k5rl69264ar2exs5cyejr/ngit.git?rev=31e48be58ee3fa2e3c56b1df68b6358c385d5e91&allRefs=1";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, release-ngit, crane }:
     let
+      forAllSystems = nixpkgs.lib.genAttrs [
+        "aarch64-linux" "x86_64-linux" "aarch64-darwin" "x86_64-darwin"
+      ];
       sourceRevision =
         if self ? rev then self.rev
         else if self ? dirtyRev then self.dirtyRev
         else "unknown";
       ngitGraspVersion =
         (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-    in
-    (flake-utils.lib.eachDefaultSystem (system:
+      perSystem = forAllSystems (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
@@ -24,7 +34,20 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
+        ci = import ./.ngit/nix/workflows {
+          inherit pkgs;
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.stable.latest.default;
+          src = self;
+          version = ngitGraspVersion;
+          ngit = import ./.ngit/nix/workflows/release-ngit.nix {
+            inherit pkgs;
+            sourcePackage = release-ngit.packages.${system}.default;
+          };
+        };
       in {
+        checks = ci.checks;
+        ciCommands = ci.commands;
         devShells.default = pkgs.mkShell {
           # Single dev shell for the whole workspace (ngit-grasp + grasp-audit).
           buildInputs = with pkgs; [ rustToolchain pkg-config openssl git gitlint ];
@@ -48,6 +71,9 @@
         # Both crates are members of a single workspace sharing one Cargo.lock.
         packages = {
           default = self.packages.${system}.ngit-grasp;
+          ci-dependencies = ci.dependencies;
+          ci-publisher-tools = ci.publisher-tools;
+          ci-container-tools = ci.container-tools;
 
           ngit-grasp = pkgs.rustPlatform.buildRustPackage {
             pname = "ngit-grasp";
@@ -89,6 +115,16 @@
             doCheck = false;
           };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          release-archive = pkgs.runCommand "ngit-grasp-release-archive" {
+            nativeBuildInputs = [ pkgs.gnutar pkgs.gzip ];
+          } ''
+            archive="ngit-grasp-${ngitGraspVersion}-${pkgs.pkgsStatic.stdenv.hostPlatform.rust.cargoShortTarget}"
+            mkdir -p "$archive" "$out/release"
+            cp ${self.packages.${system}.static}/bin/ngit-grasp "$archive/"
+            cp ${./LICENSE} "$archive/"
+            tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner \
+              -czf "$out/release/$archive.tar.gz" "$archive"
+          '';
           # Portable release binary used by the tag-triggered release workflow.
           static = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
             pname = "ngit-grasp";
@@ -106,7 +142,12 @@
             doCheck = false;
           };
         };
-      })) // {
+      });
+    in {
+        packages = forAllSystems (system: perSystem.${system}.packages);
+        checks = forAllSystems (system: perSystem.${system}.checks);
+        devShells = forAllSystems (system: perSystem.${system}.devShells);
+        ngit-ci.commands = forAllSystems (system: perSystem.${system}.ciCommands);
         # NixOS module for deployment
         nixosModules.default = { ... }: {
           imports = [ ./nix/module.nix ];

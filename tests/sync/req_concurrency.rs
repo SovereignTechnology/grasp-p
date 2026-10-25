@@ -21,7 +21,7 @@
 //! The burst only occurs when startup recomputes filters from an
 //! already-populated index — during initial discovery, root events trickle
 //! in through short batching windows and batches stay small. The scenario
-//! therefore syncs everything into persistent storage first, then restarts
+//! therefore seeds a complete persistent event database before starting
 //! the relay, exactly the production startup shape. Unbounded subscription
 //! creation draws rejections at that startup; the bounded client must draw
 //! none while still overlapping REQs and completing the sync.
@@ -30,6 +30,7 @@
 
 use std::time::Duration;
 
+use nostr_lmdb::NostrLmdb;
 use nostr_sdk::prelude::*;
 
 use crate::common::purgatory_helpers::{
@@ -37,7 +38,8 @@ use crate::common::purgatory_helpers::{
 };
 use crate::common::req_limiting_proxy::ReqLimitingProxy;
 use crate::common::sync_helpers::{
-    fetch_metrics, repo_coord, send_to_relay, wait_for_event_on_relay, TestClient,
+    build_layer3_reply_with_e_tag, fetch_metrics, repo_coord, send_to_relay,
+    wait_for_event_on_relay, TestClient,
 };
 use crate::common::{port, TestRelay};
 
@@ -93,13 +95,12 @@ async fn wait_for_historic_completion(
 /// 2. A proxy in front of the source enforces the strfry-style limit of 5
 ///    concurrent transient REQs and records peak concurrency and
 ///    rejections.
-/// 3. The syncing relay (negentropy disabled, persistent storage)
-///    bootstraps through the proxy and syncs all issues.
-/// 4. The syncing relay restarts. Startup recomputes sync filters from the
-///    persisted index of 2500 root events, producing one historic batch
-///    with ~8 REQ groups — more than the limit.
-/// 5. The relay must complete that startup sync without a single rejection
-///    while still keeping REQ subscriptions overlapping.
+/// 3. Seed all roots and repository metadata in the stopped target's LMDB,
+///    verifying that every root is present before starting it.
+/// 4. Startup reconstructs filters from those 2500 root events, producing
+///    one historic batch with more REQ groups than the concurrency limit.
+/// 5. Source-only descendants must arrive and startup sync must complete
+///    without a single rejection while keeping REQs overlapping.
 #[tokio::test]
 async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     // 1. Pre-allocate the syncing relay port for announcement tags.
@@ -114,7 +115,15 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     // not itself sync through the proxy that fronts it: the proxy's REQ
     // budget belongs to the syncing relay under test.
     let source = TestRelay::start_archive_source_behind_proxy().await;
-    let proxy = ReqLimitingProxy::start(source.url(), PROXY_REQ_LIMIT).await;
+    // Production starts background queries one second apart. Hold EOSE long
+    // enough for six starts so the five-request cap, not pacing, prevents the
+    // sixth concurrent subscription. The proxy keeps reading while delaying.
+    let proxy = ReqLimitingProxy::start_with_eose_delay(
+        source.url(),
+        PROXY_REQ_LIMIT,
+        Duration::from_secs(6),
+    )
+    .await;
 
     // 3. One hosted repository: announcement + state event + git data. The
     //    relays tag lists the proxy so the syncing relay targets the proxied
@@ -182,6 +191,7 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     // full initial token bucket, so seed through a fresh connection per
     // batch, each batch staying under the initial burst allowance.
     const SEED_BATCH: usize = 50;
+    let mut issues = Vec::with_capacity(ISSUE_COUNT);
     let mut issue_ids = Vec::with_capacity(ISSUE_COUNT);
     for batch_start in (0..ISSUE_COUNT).step_by(SEED_BATCH) {
         let seed_client = TestClient::new(source.url(), Keys::generate())
@@ -198,6 +208,7 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
                 .send_event(&issue)
                 .await
                 .expect("send issue to source");
+            issues.push(issue);
         }
         seed_client.disconnect().await;
     }
@@ -214,13 +225,72 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
         "seeded issues should be accepted by the source relay"
     );
 
-    // 5. Phase 1: the syncing relay (negentropy disabled) bootstraps
-    //    through the proxy and syncs everything into persistent storage.
-    //    Root events trickle in through short batching windows here, so
-    //    historic batches stay small; the burst this test guards against
-    //    comes at the next startup.
+    // Prepare exactly the state this regression targets: a previously populated
+    // persistent database. Incremental discovery of 2500 roots exercises a
+    // different path and spends its time rebuilding live/mailbox inventories;
+    // requiring that bootstrap here made setup depend on CPU throughput.
     let syncing_git_dir = tempfile::tempdir().expect("create syncing git dir");
     let syncing_data_dir = tempfile::tempdir().expect("create syncing relay data dir");
+    let repository_path = syncing_git_dir.path().join(&npub).join("req-repo.git");
+    std::fs::create_dir_all(repository_path.parent().unwrap()).expect("create repository owner");
+    let clone = grasp_audit::git_command()
+        .arg("clone")
+        .arg("--bare")
+        .arg(git_temp_dir.path())
+        .arg(&repository_path)
+        .output()
+        .expect("clone persisted repository");
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    {
+        let database = NostrLmdb::builder(syncing_data_dir.path())
+            .process_nip09(false)
+            .process_nip62(false)
+            .build()
+            .await
+            .expect("open fixture database");
+        for event in [&announcement, &state_event]
+            .into_iter()
+            .chain(issues.iter())
+        {
+            database
+                .save_event(event)
+                .await
+                .expect("seed persisted event");
+        }
+        let persisted = database
+            .query(Filter::new().ids(issue_ids.clone()))
+            .await
+            .expect("query persisted roots");
+        assert_eq!(
+            persisted.len(),
+            ISSUE_COUNT,
+            "every root must be persisted before startup"
+        );
+    }
+
+    // Replies exist only at the source. Their parents span the sorted root
+    // inventory, so successful startup must hydrate descendants from its
+    // reconstructed byte-budgeted filters, not merely read our seeded events.
+    let mut sorted_roots = issue_ids.clone();
+    sorted_roots.sort();
+    let mut replies = Vec::new();
+    for index in [0, ISSUE_COUNT / 2, ISSUE_COUNT - 1] {
+        let reply = build_layer3_reply_with_e_tag(
+            &keys,
+            &sorted_roots[index],
+            &format!("Startup descendant {index}"),
+        )
+        .expect("build source-only reply");
+        send_to_relay(&source, &reply)
+            .await
+            .expect("seed source-only reply");
+        replies.push(reply);
+    }
+
     let syncing = TestRelay::start_on_reservation_persistent_sync(
         syncing_reservation,
         Some(proxy.url().to_string()),
@@ -230,48 +300,23 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
     )
     .await;
 
-    // 6. The issues must arrive via historic sync (sampled ends of the
-    //    range cover the byte-budgeted chunks).
-    for issue_id in [
-        issue_ids[0],
-        issue_ids[ISSUE_COUNT / 2],
-        issue_ids[ISSUE_COUNT - 1],
-    ] {
+    for reply in replies {
         assert!(
             wait_for_event_on_relay(
                 syncing.url(),
-                Filter::new().id(issue_id),
-                Duration::from_secs(120),
+                Filter::new().id(reply.id),
+                Duration::from_secs(120)
             )
             .await,
-            "issue should reach the syncing relay through historic sync"
+            "source-only descendant must arrive through startup historic sync"
         );
     }
+    let (opened, rejected) =
+        wait_for_historic_completion(&syncing, &proxy, 7, Duration::from_secs(120))
+            .await
+            .expect("startup historic coverage should be confirmed");
 
-    // 7. Wait for confirmed phase-1 history, then restart. Startup recomputes
-    //    sync filters from the full persisted index (2500 root events),
-    //    producing one historic batch with ~8 byte-budgeted REQ groups —
-    //    the production startup burst.
-    wait_for_historic_completion(&syncing, &proxy, 1, Duration::from_secs(120))
-        .await
-        .expect("phase-1 historic coverage should be confirmed before restart");
-    let before_restart = proxy.opened_count() + proxy.rejected_count();
-
-    let syncing = syncing.restart().await;
-
-    // 8. Wait for confirmed startup history: the restarted
-    //    relay re-syncs the repository batch and the ~8 root-event groups.
-    let (opened, rejected) = wait_for_historic_completion(
-        &syncing,
-        &proxy,
-        before_restart + 7,
-        Duration::from_secs(120),
-    )
-    .await
-    .expect("restart historic coverage should be confirmed");
-
-    // 9. The regression assertions (cumulative across both phases; the
-    //    trickle-shaped phase 1 must stay within the bound too).
+    // The regression assertions apply to the populated-index startup.
     assert_eq!(
         rejected,
         0,
@@ -283,6 +328,10 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
         proxy.peak_concurrent() <= PROXY_REQ_LIMIT,
         "peak concurrent transient REQs {} exceeded the bound {PROXY_REQ_LIMIT}",
         proxy.peak_concurrent()
+    );
+    assert!(
+        proxy.peak_concurrent() > 1,
+        "startup must overlap transient REQs to exercise concurrent admission"
     );
     assert!(
         opened > PROXY_REQ_LIMIT,

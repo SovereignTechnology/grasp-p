@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{bail, ensure, Context, Result};
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use serde::{Deserialize, Serialize};
 
 use super::storage::{FamilyKey, LocalGitStorage, ObjectFormat};
@@ -254,10 +254,22 @@ fn complete_in_family(family: &Path, oids: &[&str]) -> Result<bool> {
         input.extend_from_slice(oid.as_bytes());
         input.push(b'\n');
     }
-    input.extend_from_slice(format!("--not\n{RETAINED_GLOB}\n").as_bytes());
+    // The retained-root exclusion belongs on the command line, not in the
+    // revision input: `git rev-list --stdin` only learned to accept options
+    // alongside the revisions in 2.42 ("allows feeding options like --all and
+    // --not in the --stdin mode"). An older git aborts the whole walk with
+    // "fatal: options not supported in --stdin mode", which this function
+    // reads as history that is not in the family.
     let output = git(
         family,
-        &["rev-list", "--objects", "--missing=error", "--stdin"],
+        &[
+            "rev-list",
+            "--objects",
+            "--missing=error",
+            "--stdin",
+            "--not",
+            RETAINED_GLOB,
+        ],
         &input,
     )?;
     Ok(output.status.success())

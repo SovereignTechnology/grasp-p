@@ -1,6 +1,18 @@
 #!/bin/sh
 set -eu
 
+# Optional provider timing leaves local execution and command failures intact.
+ci_step() {
+    ci_step_id=$1
+    ci_step_label=$2
+    shift 2
+    if [ -n "${NGIT_CI_STEP:-}" ]; then
+        "$NGIT_CI_STEP" "$ci_step_id" "$ci_step_label" "$@"
+    else
+        "$@"
+    fi
+}
+
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <version> <40-character-git-revision>" >&2
     exit 2
@@ -66,16 +78,26 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-"${script_dir}/build-container-layout.sh" \
+ci_step build-image "Build OCI image" "${script_dir}/build-container-layout.sh" \
     "${version}" \
     "${revision}" \
     "${layout}"
 
-skopeo --insecure-policy copy --format v2s2 \
+# skopeo reads neither DOCKER_HOST nor TMPDIR, so forward them explicitly.
+# Its temporary image copies otherwise go to /var/tmp.
+set --
+if [ -n "${TMPDIR:-}" ]; then
+    set -- --tmpdir "${TMPDIR}"
+fi
+set -- "$@" copy --format v2s2
+if [ -n "${DOCKER_HOST:-}" ]; then
+    set -- "$@" --dest-daemon-host "${DOCKER_HOST}"
+fi
+ci_step import-image "Import OCI image" skopeo --insecure-policy "$@" \
     "oci:${layout}:${version}" \
     "docker-daemon:${image_name}"
 
 NGIT_TEST_IMAGE=${image_name} \
-    "${script_dir}/test-container-deployment.sh"
+    ci_step deployment-tests "Run deployment tests" "${script_dir}/test-container-deployment.sh"
 
 printf 'OCI release layout and imported image verified for %s\n' "${version}"

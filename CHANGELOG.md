@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.8] - 2026-10-18
+
+Harden NIP-77 reconciliation, escape reflected 404 paths, tighten tag push
+authorization, and restore staged-history compatibility with older Git versions.
+
+### Changed
+
+- Refresh workspace dependencies, including base64 0.23, bitcoin_hashes 1.2,
+  and tokio-tungstenite 0.30.
+
+### Security
+
+- Update negentropy to 0.5.2 to reject malformed NIP-77 ID counts before
+  allocating memory, preventing peer-triggered memory exhaustion.
+
+### Fixed
+
+- Fix staged history promotion and PR event acceptance on Git versions older
+  than 2.42 by passing retained-history exclusions as command-line arguments
+  instead of revision input. Thanks to Holly for the fix.
+
+- Escape the requested path displayed on generic 404 pages so HTML-like input
+  is rendered as text rather than markup. Thanks to mptf for the fix.
+
+- Reject tag creation and updates absent from the signed repository state in
+  the per-ref push validator. This adds defense in depth to the existing
+  whole-state authorization check and preserves deletion of undeclared tags.
+  Thanks to mptf for the fix.
+
 ## [3.0.7] - 2026-10-02
 
 Reduce unnecessary sync traffic, reserve Git capacity for advertised commits,

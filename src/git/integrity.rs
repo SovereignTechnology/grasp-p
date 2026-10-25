@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use bitcoin_hashes::{sha256, Hash};
+use bitcoin_hashes::sha256;
 use clap::Args;
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};

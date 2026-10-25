@@ -33,7 +33,7 @@
 //! // ... assert proxy.rejected_count() == 0 && proxy.peak_concurrent() <= 5 ...
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +64,15 @@ impl ReqLimitingProxy {
     /// and rejecting transient REQ frames that would exceed `limit`
     /// concurrent subscriptions on a connection.
     pub async fn start(backend_url: &str, limit: usize) -> Self {
+        Self::start_with_eose_delay(backend_url, limit, REQ_RESPONSE_DELAY).await
+    }
+
+    /// Delay EOSE without blocking admission, including paced client requests.
+    pub async fn start_with_eose_delay(
+        backend_url: &str,
+        limit: usize,
+        eose_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ReqLimitingProxy failed to bind");
@@ -97,6 +106,7 @@ impl ReqLimitingProxy {
                                 stream,
                                 &backend_url,
                                 limit,
+                                eose_delay,
                                 peak,
                                 rejected,
                                 opened,
@@ -179,6 +189,7 @@ async fn proxy_connection(
     client_stream: tokio::net::TcpStream,
     backend_url: &str,
     limit: usize,
+    eose_delay: Duration,
     peak: Arc<AtomicUsize>,
     rejected: Arc<AtomicUsize>,
     opened: Arc<AtomicUsize>,
@@ -195,9 +206,15 @@ async fn proxy_connection(
 
     // Transient REQ subscription ids currently open on this connection.
     let mut active: HashSet<String> = HashSet::new();
+    let mut delayed = VecDeque::<(tokio::time::Instant, String, Message)>::new();
 
     loop {
+        let next_eose = delayed.front().map(|(deadline, _, _)| *deadline);
         tokio::select! {
+            _ = tokio::time::sleep_until(next_eose.unwrap_or_else(tokio::time::Instant::now)), if next_eose.is_some() => {
+                let (_, _, message) = delayed.pop_front().expect("pending EOSE");
+                client_tx.send(message).await.map_err(|e| format!("client write: {e}"))?;
+            }
             message = client_rx.next() => {
                 let Some(message) = message else { break };
                 let message = message.map_err(|e| format!("client read: {e}"))?;
@@ -206,6 +223,7 @@ async fn proxy_connection(
                         Some(ClientFrame::Req(subid)) => {
                             match admit_req(&mut active, subid.clone(), limit) {
                                 ReqAdmission::Replacement => {
+                                    delayed.retain(|(_, id, _)| id != &subid);
                                     // NIP-01 replaces an existing subscription with
                                     // the same id; relay-side occupancy is unchanged.
                                 }
@@ -241,6 +259,7 @@ async fn proxy_connection(
                         }
                         Some(ClientFrame::Close(subid)) => {
                             active.remove(&subid);
+                            delayed.retain(|(_, id, _)| id != &subid);
                         }
                         Some(ClientFrame::NegOpen(subid)) => {
                             // This proxy models a relay without NIP-77 so
@@ -271,9 +290,11 @@ async fn proxy_connection(
                             // REQs provably overlap at the proxy. EOSE ends the
                             // stored-event phase but does not close the relay-side
                             // subscription; wait for client CLOSE or backend CLOSED.
-                            tokio::time::sleep(REQ_RESPONSE_DELAY).await;
+                            delayed.push_back((tokio::time::Instant::now() + eose_delay, subid, message));
+                            continue;
                         } else if !is_eose {
                             apply_backend_end(&mut active, &subid, is_eose);
+                            delayed.retain(|(_, id, _)| id != &subid);
                         }
                     }
                 }
@@ -370,6 +391,76 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{admit_req, apply_backend_end, parse_backend_subscription_end, ReqAdmission};
+
+    #[tokio::test]
+    async fn delayed_eose_keeps_admission_responsive_and_close_cancels_delivery() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("ws://{}", backend.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = backend.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                if let Some(super::ClientFrame::Req(id)) = super::parse_client_frame(&text) {
+                    socket
+                        .send(Message::text(format!(r#"["EOSE","{id}"]"#)))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let proxy =
+            super::ReqLimitingProxy::start_with_eose_delay(&backend_url, 2, Duration::from_secs(1))
+                .await;
+        let (mut client, _) = tokio_tungstenite::connect_async(proxy.url()).await.unwrap();
+        for id in ["first", "second", "excess"] {
+            client
+                .send(Message::text(format!(r#"["REQ","{id}",{{"kinds":[1]}}]"#)))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = client.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                assert!(
+                    !text.starts_with(r#"["EOSE"#),
+                    "admission must respond before delayed EOSE"
+                );
+                if text.contains(r#"["CLOSED","excess""#) {
+                    break;
+                }
+            }
+            client
+                .send(Message::text(r#"["CLOSE","first"]"#))
+                .await
+                .unwrap();
+            loop {
+                let message = client.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                if let Some((id, true)) = super::parse_backend_subscription_end(&text) {
+                    assert_eq!(id, "second", "CLOSE must cancel first EOSE");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("bounded proxy admission and delivery");
+        assert_eq!(proxy.peak_concurrent(), 2);
+        assert_eq!(proxy.opened_count(), 2);
+        assert_eq!(proxy.rejected_count(), 1);
+        drop(client);
+        proxy.stop().await;
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn same_id_req_replaces_without_consuming_another_slot() {

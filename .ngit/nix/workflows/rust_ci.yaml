@@ -1,0 +1,27 @@
+version: 1
+system: x86_64-linux
+name: Rust CI
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "work/**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    requirements:
+      resources:
+        memory-mib: {gte: 4096}
+        vcpus: {gte: 4}
+    steps:
+      - release-scripts: {build: checks.x86_64-linux.release-scripts}
+      - release-cli: {build: checks.x86_64-linux.release-cli}
+      - dependencies: {build: packages.x86_64-linux.ci-dependencies}
+      - format
+      - compile
+      - lint
+      - tests
