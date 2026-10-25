@@ -1,5 +1,9 @@
 # ngit-grasp Documentation
 
+> **GRASP-P, this fork's private-repository extension, is experimental and a work in
+> progress.** Its documentation is in [`grasp-p/`](grasp-p/); start with
+> [`grasp-p/OVERVIEW.md`](grasp-p/OVERVIEW.md). Everything else here is upstream ngit-grasp's.
+
 Welcome to the **ngit-grasp** documentation! We use the [Diátaxis](https://diataxis.fr/) framework to organize our documentation into four types, each serving a different purpose.
 
 ```

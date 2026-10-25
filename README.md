@@ -1,6 +1,42 @@
-# ngit-grasp
+# ngit-grasp, with GRASP-P
 
 A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized via Signed-Nostr Proofs) implementation in Rust.
+
+## SovTech fork: GRASP-P (experimental, work in progress)
+
+> **Experimental, work in progress.** This repository is SovTech's fork of
+> ngit-grasp carrying GRASP-P, an early prototype. GRASP-P has not been
+> independently security-audited, its events, blob routes and configuration may
+> change incompatibly without notice, and there is no stability or support
+> guarantee. Do not rely on it for anything you cannot afford to lose or leak.
+
+**What GRASP-P is:** private git repositories hosted on a public Nostr/GRASP
+server whose operator is **not trusted**. The client encrypts everything before
+upload; the server stores only ciphertext and opaque public keys, checks
+signatures, enforces quotas and moves bytes. It is a different model from
+GRASP-08, which gates access to a server that still reads plaintext.
+
+| Part | Repo | Role |
+|---|---|---|
+| **GRASP-P** | this one (`src/grasp_p/`, `src/http/blossom.rs`) | Server extension to ngit-grasp |
+| **CORD-git** | [cord-git](https://github.com/SovereignTechnology/cord-git) | Client: keys, encryption, membership, invites |
+
+Start with [`docs/grasp-p/OVERVIEW.md`](docs/grasp-p/OVERVIEW.md) (one page), then the
+server draft [`docs/grasp-p/grasp-xx-draft.md`](docs/grasp-p/grasp-xx-draft.md) and the full
+convention [`docs/grasp-p/CORD-git-v0-spec.md`](docs/grasp-p/CORD-git-v0-spec.md).
+
+**Upstream:** everything outside GRASP-P is [ngit-grasp](https://gitworkshop.dev/danconwaydev.com/grasp)
+by DanConwayDev and contributors, MIT-licensed; this fork tracks its releases
+(currently v3.0.7, see [`docs/grasp-p/SEAMS.md`](docs/grasp-p/SEAMS.md) for where the two meet).
+The rest of this README is upstream's and describes upstream's features. It is not
+an upstream project, and upstream is not responsible for GRASP-P.
+
+**Where it lives:**
+
+- Canonical repository, on Nostr (clone with [ngit](https://ngit.dev)):
+  `nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/grasp-p`
+- GitHub: [SovereignTechnology/grasp-p](https://github.com/SovereignTechnology/grasp-p), a read-only mirror.
+  Send patches and pull requests over Nostr with ngit.
 
 ## Overview
 
@@ -13,9 +49,12 @@ A [GRASP](https://gitworkshop.dev/danconwaydev.com/grasp) (Git Relays Authorized
 
 ## Status
 
-**Production Ready** - Full GRASP-01 and GRASP-02 support, default-on GRASP-03
-Sync+, and opt-in GRASP-05, GRASP-06, and GRASP-08 profiles with comprehensive
-test coverage.
+**Upstream ngit-grasp: production ready** - Full GRASP-01 and GRASP-02 support,
+default-on GRASP-03 Sync+, and opt-in GRASP-05, GRASP-06, and GRASP-08 profiles
+with comprehensive test coverage.
+
+**GRASP-P (this fork's addition): experimental, work in progress.** See
+[the section above](#sovtech-fork-grasp-p-experimental-work-in-progress).
 
 ## Key Features
 
