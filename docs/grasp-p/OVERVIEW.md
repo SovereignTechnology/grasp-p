@@ -194,6 +194,6 @@ Gaps being closed before production (tracked as issues on the two projects):
   else references them; the tombstone, the retention window and the purge of stored events
   are not implemented.
 
-The server runs on ngit-grasp v3.0.7. Its code is in `src/grasp_p/` and its settings are
+The server runs on ngit-grasp v3.0.8. Its code is in `src/grasp_p/` and its settings are
 `NGIT_GRASP_P_*`; `src/private/` and `NGIT_PRIVATE_*` belong to upstream's GRASP-08 mode,
 and the server refuses to start with both enabled.

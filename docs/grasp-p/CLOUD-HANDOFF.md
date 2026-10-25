@@ -30,7 +30,7 @@ Two repositories:
   seen before without checking it, and upstream's sync trusted that. Any relay a node syncs
   from could forge an event from any author; on a GRASP-P node that meant registrations and
   deletions. The server now verifies every synced event itself. The same flaw is in
-  unmodified upstream v3.0.7 and has not been reported there: that needs the maintainer's
+  unmodified upstream v3.0.7 and v3.0.8 and has not been reported there: that needs the maintainer's
   go-ahead.
 - **One test uses real TLS** (`tests/grasp_p_tls.rs`). Keep reqwest on native-tls.
 - **The review of the port left a list for M3**, in `PLAN.md` under "Found in the M2 review".

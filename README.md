@@ -27,7 +27,7 @@ convention [`docs/grasp-p/CORD-git-v0-spec.md`](docs/grasp-p/CORD-git-v0-spec.md
 
 **Upstream:** everything outside GRASP-P is [ngit-grasp](https://gitworkshop.dev/danconwaydev.com/grasp)
 by DanConwayDev and contributors, MIT-licensed; this fork tracks its releases
-(currently v3.0.7, see [`docs/grasp-p/SEAMS.md`](docs/grasp-p/SEAMS.md) for where the two meet).
+(currently v3.0.8, see [`docs/grasp-p/SEAMS.md`](docs/grasp-p/SEAMS.md) for where the two meet).
 The rest of this README is upstream's and describes upstream's features. It is not
 an upstream project, and upstream is not responsible for GRASP-P.
 

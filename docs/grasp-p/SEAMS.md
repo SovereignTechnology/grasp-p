@@ -1,6 +1,6 @@
 # GRASP-P on upstream ngit-grasp: seams and differences
 
-GRASP-P is an overlay on upstream ngit-grasp, v3.0.7 today. This page records where the
+GRASP-P is an overlay on upstream ngit-grasp, v3.0.8 today. This page records where the
 overlay touches upstream's files, the decisions taken when it was ported from the v1.2.0
 line (`legacy/v1.2-grasp-p`), and what behaves differently from that line. Read it before
 an upstream sync: every seam listed here has to survive the merge.
@@ -66,7 +66,8 @@ A node that synced before this check may hold a forged event under a genuine id;
 id answers `Duplicate` from then on. No GRASP-P node has run in production, so there is
 nothing of ours to scan.
 
-The flaw is in unmodified upstream v3.0.7 and in nostr-sdk. Reporting it to both is the
+The flaw is in unmodified upstream v3.0.7 and v3.0.8 (re-checked at the v3.0.8 sync: still
+no verification in `src/sync/`, nostr-sdk still 0.45.4) and in nostr-sdk. Reporting it to both is the
 maintainer's call. When upstream verifies on its own, drop this seam in the sync that
 brings the fix.
 
@@ -81,7 +82,8 @@ anyone can publish; the index relays (`NGIT_USER_INDEX_RELAYS`), the Sync+ fallb
 relays (`NGIT_SYNC_PLUS_FALLBACK_RELAYS`) and the GRASP-P sync peers an operator lists
 are registered the same way.
 
-Upstream v3.0.7 makes that request with `reqwest::Client::new()`. It follows up to ten
+Upstream v3.0.7 makes that request with `reqwest::Client::new()`, and v3.0.8 still does
+(re-checked at the v3.0.8 sync, along with `src/outbound.rs`'s ranges). It follows up to ten
 redirects, to plain `http` as well, honours the proxy variables of the environment, and
 reads the whole body, limited only by a 3 second timeout. Only the call before the dial
 (`preflight_limit_hints`) checks an event-directed target against the outbound target
@@ -992,6 +994,19 @@ the address check is not pinned to the connection (issue 3).
 `tokio-rustls`), and `serde` / `serde_json` on `heed` and `heed-types` from heed's serde
 features. No package was added.
 
+## Upstream syncs
+
+- **v3.0.7 -> v3.0.8 (2026-10-25), by merge.** Only `Cargo.lock` conflicted: v3.0.8's lock plus
+  `cargo update --workspace`, which re-adds exactly the edges above and no package. Every seam
+  survived the auto-merge (`src/http/mod.rs`, `Cargo.toml`, `nix/module.nix` checked by hand).
+  Upstream moved to `bitcoin_hashes` 1.2, where `hash`, `engine`, `from_engine` and the byte-array
+  methods are inherent; its `85cd03a` dropped the `Hash` trait imports in its own files, and the
+  sync does the same in ours (`src/grasp_p/`, the watchdog, four tests). `tokio-tungstenite` 0.30
+  needed no change. Upstream's `9c31db9` makes the persisted-startup REQ test pre-seed its relay,
+  which fixes that test on slow CI hosts (it failed every run on alpha's idle-priority runner).
+  Upstream's `f1c867e` passes the retained-history exclusions on argv, so the `rev-list --stdin`
+  need below is gone; it supersedes our unmerged branch `sovtech/git-2.39-compat`.
+
 ## What the server needs at run time
 
 - **git 2.42 or newer on `PATH`.** Upstream v3.0.6 and later pass `--not` and `--glob=` on
@@ -1007,6 +1022,9 @@ features. No package was added.
   `git --version` that it cannot read a version from only ever warns. The check is not
   specific to GRASP-P and could be offered upstream in unconditional form; that is the
   maintainer's call, and the seam in `src/server.rs` goes when upstream checks for itself.
+  Since v3.0.8 (`f1c867e`) upstream no longer needs `--stdin` exclusions, so the 2.42 reason is
+  upstream's past; the 2.41 one (empty-repository capabilities) has not been re-measured. The
+  check keeps 2.42 until it is; lowering it is a separate change.
 - **`libssl.so.3` and CA certificates.** The blob mirror and upstream's NIP-11 probe use
   reqwest with native-tls (OpenSSL). Relay connections use rustls with ring and the
   compiled-in web PKI roots, so a relay peer behind a private CA can be mirrored from but

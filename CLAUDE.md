@@ -17,7 +17,7 @@ four-source configuration rule. Where the two disagree, this file wins.
 
 | Branch | What it is | Rule |
 |---|---|---|
-| `main` | Upstream v3.0.7 plus GRASP-P and the GitLab pipeline, merged by merge request | Never push to it |
+| `main` | Upstream v3.0.8 plus GRASP-P and the GitLab pipeline, merged by merge request | Never push to it |
 | `legacy/v1.2-grasp-p` | The complete GRASP-P server on upstream v1.2.0, before the port | Read-only reference |
 
 Do new work on a branch cut from `main`.
