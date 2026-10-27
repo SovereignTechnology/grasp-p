@@ -1529,6 +1529,79 @@ async fn exit8_late_witness_misanchor_and_backdated_self_heal() {
 }
 
 // ============================================================================
+// Exit test 21 — a settled seat keeps its alias on both nodes (D8)
+// ============================================================================
+
+/// A seat whose first edition is dated more than an hour back is settled
+/// the moment it arrives, so the test needs no waiting: the holder's
+/// registration, dated two hours back, reaches B through sync, and a claim
+/// dated before it is then refused by both nodes, by B against a seat that
+/// sync delivered, the same way as by A, which took the seat from a client.
+/// Both keep serving the holder's registration alone.
+#[tokio::test]
+async fn exit21_settled_seat_is_kept_on_both_nodes() {
+    let holder = Keys::generate();
+    let challenger = Keys::generate();
+    let whitelist = whitelist_npubs(&[&holder, &challenger]);
+    let (a, b) = start_pair(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let holder_writer = Keys::generate();
+    let challenger_writer = Keys::generate();
+    let alias = random_alias();
+    let now = Timestamp::now().as_secs();
+
+    let held = registration_event(
+        &holder,
+        &alias,
+        &holder_writer,
+        &domain_refs,
+        Some(now - 7200),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &held).await;
+    assert!(
+        accepted,
+        "exit21: the holder's registration failed: {message:?}"
+    );
+    assert!(
+        wait_for_exact_event(b.url(), held.id, REPLICATION_BOUND).await,
+        "exit21: the holder's registration must replicate to B"
+    );
+
+    let backdated = registration_event(
+        &challenger,
+        &alias,
+        &challenger_writer,
+        &domain_refs,
+        Some(now - 10800),
+    );
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let (accepted, message) = publish_with_result(node.url(), &backdated).await;
+        assert!(
+            !accepted && message.contains("alias already registered"),
+            "exit21: node {name} must refuse a claim dated before a settled seat; got accepted={accepted} {message:?}"
+        );
+    }
+
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let served = fetch_from(
+            node.url(),
+            Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+        )
+        .await;
+        assert_eq!(
+            served.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![held.id],
+            "exit21: node {name} serves the holder's registration alone"
+        );
+    }
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
 // Exit test 9 — mirror finish() re-check + no re-enqueue after death (R2-C)
 // ============================================================================
 

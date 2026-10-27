@@ -919,7 +919,18 @@ impl PrivateService {
     /// Rebuild registrations/key_claims/tenant_aliases from the relay DB's
     /// kind-30640 events when the meta index is missing or stale. Ledger and
     /// blob claims are authoritative in meta and never recomputed here.
+    ///
+    /// The seats an existing meta index holds are trusted: a conflict with
+    /// one of them is judged by its age, as it would be live. A meta index
+    /// older than the relay DB (a restore not taken from one snapshot) can
+    /// therefore refuse a registration this node accepted later; such a
+    /// refusal deletes nothing, and deleting the index, so that this start
+    /// rebuilds it, recovers (runbook §9, "Restores").
     async fn boot_reconcile(&self) -> Result<()> {
+        // Seats the meta store held before this point are judged by their
+        // age, as they would be live; seats the replay creates by the order
+        // alone (`registration::handle_replay`).
+        let reconcile_started = nostr::prelude::Timestamp::now().as_secs();
         let filter = Filter::new().kind(Kind::Custom(KIND_REGISTRATION));
         let events = self
             .database
@@ -987,7 +998,7 @@ impl PrivateService {
                 // Phase-4b A2: REPLAY admission — the replacement-cadence
                 // bucket is skipped (these events were already admitted
                 // once; replays must not consume budget).
-                let outcome = registration::handle_replay(self, &event);
+                let outcome = registration::handle_replay(self, &event, reconcile_started);
                 self.prune_evicted_registrations(&outcome.prune).await;
                 if matches!(outcome.result, WritePolicyResult::Accept) {
                     applied += 1;

@@ -313,7 +313,11 @@ fn is_newer_than_stored(created_at: u64, event_id_hex: &str, stored: &Registrati
 /// state like arrival order or tombstones), so every node that has seen the
 /// same pair of registrations resolves the same winner — that is what makes
 /// partitioned nodes converge instead of permanently disagreeing about who
-/// owns an alias/key set.
+/// owns an alias/key set. A live decision also asks whether the holder's
+/// seat has settled ([`challenge`]); this order alone cannot protect an
+/// established seat, since the signer chooses `created_at`. Nodes that meet
+/// a conflict only after a seat has settled on one of them no longer
+/// converge.
 fn incoming_wins_conflict(
     created_at: u64,
     event_id_hex: &str,
@@ -330,6 +334,82 @@ fn incoming_wins_conflict(
     let (anchor_created_at, anchor_id) = stored.anchor();
     created_at < anchor_created_at.as_secs()
         || (created_at == anchor_created_at.as_secs() && *event_id_hex < *anchor_id)
+}
+
+/// How long a seat is open to the merge order, counted from the
+/// `created_at` of its first edition. Past it the seat is settled: no other
+/// account takes its alias or any of its keys, whatever date it puts on its
+/// registration.
+///
+/// Whoever registers second can date its registration before the holder's,
+/// so the merge order by itself lets any admitted account evict any
+/// repository. Within the hour the order still decides, which is what lets
+/// two nodes that saw a fresh conflict in different orders agree. A constant
+/// and not a setting: both nodes of a pair must judge a seat settled at the
+/// same moment.
+pub(crate) const SEAT_SETTLE_SECS: u64 = 3600;
+
+/// Whether `stored` has settled at `now`: its first edition is more than
+/// [`SEAT_SETTLE_SECS`] older than `now`.
+///
+/// The age comes from the anchor, an event's own date, and not from when
+/// this node first stored the seat, so two nodes that hold the same anchor
+/// judge a seat settled at the same moment. A node rebuilt from its relay
+/// database, or a peer that joined late, holds only each seat's newest
+/// edition and anchors there, so a seat with an edition from the last hour
+/// is young on that node only. A seat dated after `now` is young.
+fn seat_is_settled(stored: &RegistrationRecord, now: u64) -> bool {
+    now.saturating_sub(stored.anchor().0.as_secs()) > SEAT_SETTLE_SECS
+}
+
+/// How a registration fares against a seat another account holds, for the
+/// alias or for one of its keys (a key also against another alias of the
+/// same account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Challenge {
+    /// The registration takes the seat; the holder is evicted.
+    Wins,
+    /// The holder keeps the seat by the merge order.
+    LosesByOrder,
+    /// The merge order favours the registration, but the seat has settled
+    /// and the holder keeps it. Only a registration dated before a first
+    /// edition that is over an hour old gets here (or one on the same
+    /// second with a lower id): a claim backdated against an established
+    /// repository, or an older one that reaches this node late, such as
+    /// after a partition, or a new edition of the sender's own seat that
+    /// claims a key of a seat whose first edition is over an hour old (an older
+    /// edition is judged by the order alone, see `apply`).
+    LosesToSettledSeat,
+}
+
+/// Judge a registration dated (`created_at`, `event_id_hex`) against the
+/// seat `stored`, which another account holds, or, for a key, another alias
+/// of the same account.
+///
+/// `settle_clock` is the node's clock for a live decision and for a replay
+/// against a seat the node held before the replay began, and `None` where
+/// the order alone decides (see [`handle_replay`]). This is where the
+/// node's clock enters a merge decision, on purpose: two nodes judging a
+/// challenger that arrives within their delivery lag of the moment a seat
+/// settles can disagree, one evicting the holder and the other refusing,
+/// and both raise the conflict alert. Two nodes that saw the two
+/// registrations in different orders can also disagree with no timing near
+/// that moment: a seat dated more than an hour back is settled on arrival,
+/// so a challenger that the other node saw first is kept there and refused
+/// here.
+fn challenge(
+    created_at: u64,
+    event_id_hex: &str,
+    stored: &RegistrationRecord,
+    settle_clock: Option<u64>,
+) -> Challenge {
+    if !incoming_wins_conflict(created_at, event_id_hex, stored) {
+        Challenge::LosesByOrder
+    } else if settle_clock.is_some_and(|now| seat_is_settled(stored, now)) {
+        Challenge::LosesToSettledSeat
+    } else {
+        Challenge::Wins
+    }
 }
 
 /// Result of applying a 30640: the admission verdict plus the relay-DB
@@ -419,6 +499,11 @@ struct TxnOutcome {
     evicted: Vec<(String, String)>,
     /// The rejection above was a lost §3.2 conflict (fires the alert).
     incoming_conflict_loss: bool,
+    /// That conflict was lost to a settled seat ([`Challenge::LosesToSettledSeat`]):
+    /// by the merge order alone the incoming registration would have won.
+    /// The warning carries it, so an operator can tell a refusal by the
+    /// seat's age, never an ordinary merge, from a loss by the order.
+    incumbent_settled: bool,
     /// The conflict-losing incoming's own coordinate holds no live
     /// registration, so any lingering relay-DB events there are stale and
     /// safe to prune. NEVER set when the loser tenant still holds a live
@@ -433,6 +518,7 @@ impl TxnOutcome {
             rejection: None,
             evicted,
             incoming_conflict_loss: false,
+            incumbent_settled: false,
             prune_incoming: false,
         }
     }
@@ -442,15 +528,21 @@ impl TxnOutcome {
             rejection: Some(rejection),
             evicted: Vec::new(),
             incoming_conflict_loss: false,
+            incumbent_settled: false,
             prune_incoming: false,
         }
     }
 
-    fn conflict_reject(rejection: WritePolicyResult, prune_incoming: bool) -> Self {
+    fn conflict_reject(
+        rejection: WritePolicyResult,
+        prune_incoming: bool,
+        lost: Challenge,
+    ) -> Self {
         Self {
             rejection: Some(rejection),
             evicted: Vec::new(),
             incoming_conflict_loss: true,
+            incumbent_settled: lost == Challenge::LosesToSettledSeat,
             prune_incoming,
         }
     }
@@ -462,27 +554,71 @@ impl TxnOutcome {
 /// applies (client-submitted AND synced events — the knob is part of the
 /// policy fingerprint, so both paths must behave identically).
 pub(crate) fn handle(svc: &PrivateService, event: &Event) -> RegistrationOutcome {
-    handle_inner(svc, event, Admission::Live)
+    let now = nostr::prelude::Timestamp::now().as_secs();
+    handle_inner(svc, event, Admission::Live { now })
 }
 
 /// Re-admission of an event this node already holds (boot_reconcile).
-/// Differs from [`handle`] in two ways. The A2 replacement-cadence bucket is
-/// not consulted: replays must not consume replacement budget. And the
+/// Differs from [`handle`] in three ways. The A2 replacement-cadence bucket
+/// is not consulted: replays must not consume replacement budget. The
 /// admission mode is asked where it always was, after the conflict checks:
 /// a stored registration that lost a conflict is then still recognised as
 /// the loser and pruned, even when its author is no longer admitted. The
 /// early position exists to shed load from senders the mode refuses, and
-/// the events replayed here are the node's own.
-pub(crate) fn handle_replay(svc: &PrivateService, event: &Event) -> RegistrationOutcome {
-    handle_inner(svc, event, Admission::Replay)
+/// the events replayed here are the node's own. And a seat counts as settled
+/// only when this node held it before the replay began
+/// (`reconcile_started`, the node's clock when `boot_reconcile` started):
+/// a seat the replay itself creates is judged by the merge order alone.
+///
+/// A replay has to reach the decisions the node already made. The node
+/// writes its meta record before it stores the event, and a refused event
+/// is never stored, so a stored registration the meta store does not hold
+/// (a leftover) is a holder the node evicted, whose prune failed or never
+/// ran. Against a seat the meta store already held, the clock decides as it
+/// would live: the order refuses a leftover dated after that seat, and a
+/// settled seat that another account took after the eviction refuses an
+/// older one, which the order alone would let evict it on this node only.
+/// Such a refusal by age prunes nothing, since a meta store restored from an
+/// older copy than the relay database could otherwise delete the only copy
+/// of a registration the node accepted. A seat the replay creates is a meta
+/// store being rebuilt from the relay database, newest first; judged by the
+/// clock, it would seat the evicted holder first, settled at once by its
+/// old date, and then refuse the winner, the opposite of what this node
+/// decided and of what its peer holds, so the order alone decides there.
+/// What the rule still gets wrong is listed in SEAMS.md, "A settled seat is
+/// not displaced".
+pub(crate) fn handle_replay(
+    svc: &PrivateService,
+    event: &Event,
+    reconcile_started: u64,
+) -> RegistrationOutcome {
+    handle_inner(svc, event, Admission::Replay { reconcile_started })
 }
 
 /// Where a 30640 comes from: a client or a peer (live), or this node's own
-/// relay database at start-up (replay).
+/// relay database at start-up (replay). `now` is the node's time, which
+/// says whether a seat has settled; `reconcile_started` is the node's time
+/// when the replay began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
-    Live,
-    Replay,
+    Live { now: u64 },
+    Replay { reconcile_started: u64 },
+}
+
+impl Admission {
+    /// The clock a conflict with `holder` is judged by: the node's for a
+    /// live registration; for a replay, the replay's start when this node
+    /// held the seat before the replay began, and none for a seat the
+    /// replay created (see [`handle_replay`]). `registered_at` is when this
+    /// node first stored the seat and is kept across its editions.
+    fn settle_clock(self, holder: &RegistrationRecord) -> Option<u64> {
+        match self {
+            Admission::Live { now } => Some(now),
+            Admission::Replay { reconcile_started } => {
+                (holder.registered_at < reconcile_started).then_some(reconcile_started)
+            }
+        }
+    }
 }
 
 /// A refusal that changed nothing and leaves nothing to prune.
@@ -518,7 +654,7 @@ fn handle_inner(svc: &PrivateService, event: &Event, admission: Admission) -> Re
         Err(reason) => return refused(crate::nostr::policy::reject_invalid(reason)),
     };
 
-    if admission == Admission::Live {
+    if matches!(admission, Admission::Live { .. }) {
         match pre_admission(svc, event, &parsed.alias) {
             Ok(None) => {}
             Ok(Some(rejection)) => return refused(rejection),
@@ -554,10 +690,37 @@ fn apply(
     let event_bytes = event.as_json().len() as u64;
     // A live registration is asked for admission before anything else; a
     // replayed one where it always was (see `handle_replay`).
-    let admission_first = admission == Admission::Live;
+    let admission_first = matches!(admission, Admission::Live { .. });
 
     let result = svc.meta.with_write(|meta, txn| {
         let stored = meta.get_registration(txn, &parsed.alias)?;
+        // A same-tenant edition no newer than the stored one changes no
+        // claim: the stale-edition path below accepts it as a no-op and
+        // drops `evict`. A settled seat has nothing to lose to it, so it is
+        // judged by the order alone, as before seats settled, instead of
+        // being refused with a settled-seat warning that names its own
+        // author; and it still lowers the anchor when it is older evidence.
+        let judged_by_age = !matches!(
+            &stored,
+            Some(r) if r.tenant_hex == tenant_hex
+                && !is_newer_than_stored(created_at, &event_id_hex, r)
+        );
+        let settle_clock = |holder: &RegistrationRecord| {
+            if judged_by_age {
+                admission.settle_clock(holder)
+            } else {
+                None
+            }
+        };
+        // A replay's refusal by a seat's age deletes nothing. The meta store
+        // it judges by can be older than the relay database (a restore that
+        // was not taken from one snapshot), and the stored event may then be
+        // the only copy of a registration this node accepted; kept, it is
+        // seated again by a rebuild of the meta store.
+        let may_prune_loser = |verdict: Challenge| {
+            !(verdict == Challenge::LosesToSettledSeat
+                && matches!(admission, Admission::Replay { .. }))
+        };
 
         // ---- Decision phase: NO mutations until every check has passed.
         // with_write COMMITS on Ok (including Ok-with-rejection), so any
@@ -582,27 +745,33 @@ fn apply(
         // Resolved by the deterministic merge (issue !11), never by arrival
         // order: the (created_at, id) winner takes the alias on every node,
         // the loser is evicted (claims freed, record dropped, relay-DB
-        // coordinate pruned by the caller) with a conflict alert.
+        // coordinate pruned by the caller) with a conflict alert. A settled
+        // seat is never the loser (`challenge`).
         let mut evict: Vec<(String, RegistrationRecord)> = Vec::new();
         let mut alias_takeover = false;
         if let Some(ref record) = stored {
             if record.tenant_hex != tenant_hex {
-                if incoming_wins_conflict(created_at, &event_id_hex, record) {
+                let verdict = challenge(created_at, &event_id_hex, record, settle_clock(record));
+                if verdict == Challenge::Wins {
                     evict.push((parsed.alias.clone(), record.clone()));
                     alias_takeover = true;
                 } else {
-                    // The alias's live record belongs to the winner, so the
+                    // The alias's live record belongs to the holder, so the
                     // loser's own coordinate holds nothing live → prunable.
                     return Ok(TxnOutcome::conflict_reject(
                         reject_restricted("alias already registered"),
-                        true,
+                        may_prune_loser(verdict),
+                        verdict,
                     ));
                 }
             }
         }
 
         // Key conflicts: any claimed key held by a DIFFERENT alias — the
-        // same deterministic merge, against each holder's registration.
+        // same deterministic merge, against each holder's registration, and
+        // the same protection for a settled holder. Every member of a
+        // repository holds its shared aux key, so without it any member
+        // could evict the whole repository from an alias of its own.
         for key in parsed.w_keys.iter().chain(parsed.aux_keys.iter()) {
             if let Some(holder) = meta.get_key_claim(txn, key)? {
                 if evict.iter().any(|(alias, _)| *alias == holder) {
@@ -617,7 +786,13 @@ fn apply(
                     // stale, the incoming registration may take the key.
                     continue;
                 };
-                if incoming_wins_conflict(created_at, &event_id_hex, &holder_record) {
+                let verdict = challenge(
+                    created_at,
+                    &event_id_hex,
+                    &holder_record,
+                    settle_clock(&holder_record),
+                );
+                if verdict == Challenge::Wins {
                     evict.push((holder, holder_record));
                 } else {
                     // Prunable only when the incoming's own coordinate has no
@@ -629,7 +804,8 @@ fn apply(
                         .unwrap_or(false);
                     return Ok(TxnOutcome::conflict_reject(
                         reject_restricted("write key already registered"),
-                        prune_incoming,
+                        prune_incoming && may_prune_loser(verdict),
+                        verdict,
                     ));
                 }
             }
@@ -730,7 +906,8 @@ fn apply(
         //   list — and it is exempt for the same reason the quota and
         //   alias-limit gates above are (§3.2 hard invariant): the bucket is
         //   node-local state, and node-local state must NEVER gate the
-        //   deterministic merge. A cadence-rejected key-conflict winner
+        //   deterministic merge (the node's clock in `challenge` is the one
+        //   deliberate exception). A cadence-rejected key-conflict winner
         //   evicts the loser on nodes that admit it while leaving the loser
         //   live on nodes that reject it — permanent split-brain once a
         //   newer edition supersedes the winner everywhere (the loser can
@@ -747,13 +924,15 @@ fn apply(
         // policy_fingerprint preimage (v3) so paired nodes run identical
         // cadence config. Bucket state itself is node-local, so a transient
         // divergence after a flood is possible — it heals on refill +
-        // redelivery.
+        // redelivery, unless the retried edition meets, on this node only, a
+        // claim that has settled meanwhile (SEAT_SETTLE_SECS): that split
+        // stays.
         let is_same_tenant_replacement = stored
             .as_ref()
             .map(|r| r.tenant_hex == tenant_hex)
             .unwrap_or(false);
         if is_same_tenant_replacement
-            && admission == Admission::Live
+            && matches!(admission, Admission::Live { .. })
             && evict.is_empty()
             && !svc.registration_replace_allowed(&tenant_hex, &parsed.alias)
         {
@@ -810,8 +989,10 @@ fn apply(
         // victim's self-heal is to re-mint a registration with created_at ≤
         // the squatter's — a same-tenant no-op on correctly-witnessed nodes
         // (lowering their anchors if it is older evidence), a cross-tenant
-        // winner on mis-anchored ones. Inherent to §3.2's created_at anchor
-        // choice, not a bug this layer can fix.
+        // winner on mis-anchored ones while the squatter's seat there is
+        // under SEAT_SETTLE_SECS old; a settled squat is not displaced by
+        // the re-mint either. Inherent to §3.2's created_at anchor choice,
+        // not a bug this layer can fix.
         let (first_created_at, first_event_id) = match (&stored, alias_takeover) {
             (Some(r), false) => {
                 let (anchor_created_at, anchor_id) = r.anchor();
@@ -834,7 +1015,15 @@ fn apply(
             quota_class: parsed.quota_class.clone(),
             registered_at: match (&stored, alias_takeover) {
                 (Some(r), false) => r.registered_at,
-                _ => nostr::prelude::Timestamp::now().as_secs(),
+                // A seat a replay creates is never dated before the replay,
+                // even if the clock stepped back meanwhile: it must stay a
+                // seat the replay created (`Admission::settle_clock`).
+                _ => match admission {
+                    Admission::Replay { reconcile_started } => nostr::prelude::Timestamp::now()
+                        .as_secs()
+                        .max(reconcile_started),
+                    Admission::Live { .. } => nostr::prelude::Timestamp::now().as_secs(),
+                },
             },
             tombstoned_at: None,
             first_created_at,
@@ -872,6 +1061,7 @@ fn apply(
                         loser_tenant = %tenant_hex,
                         loser_created_at = created_at,
                         loser_event_id = %event_id_hex,
+                        incumbent_settled = outcome.incumbent_settled,
                         "private registration conflict: incoming registration lost the \
                          deterministic merge (§3.2) and was rejected"
                     );
@@ -1005,6 +1195,67 @@ mod tests {
         assert!(!is_newer_than_stored(1500, "cc", &stored));
     }
 
+    /// D8: a seat settles once its first edition is more than
+    /// `SEAT_SETTLE_SECS` older than the clock: not at an hour exactly, at
+    /// the next second. The age is the first edition's, so a newer edition
+    /// does not make an old seat young again, and a seat dated after the
+    /// clock is young.
+    #[test]
+    fn seat_settles_one_second_after_an_hour() {
+        assert_eq!(SEAT_SETTLE_SECS, 3600);
+        let mut seat = record(10_000, "bb");
+        assert!(!seat_is_settled(&seat, 10_000));
+        assert!(!seat_is_settled(&seat, 10_000 + SEAT_SETTLE_SECS - 1));
+        assert!(
+            !seat_is_settled(&seat, 10_000 + SEAT_SETTLE_SECS),
+            "an hour old exactly is still young"
+        );
+        assert!(seat_is_settled(&seat, 10_000 + SEAT_SETTLE_SECS + 1));
+        assert!(
+            !seat_is_settled(&seat, 9_000),
+            "a seat dated after the clock is young"
+        );
+
+        seat.first_created_at = Some(nostr::prelude::Timestamp::from_secs(1_000));
+        seat.first_event_id = Some("aa".to_string());
+        assert!(!seat_is_settled(&seat, 1_000 + SEAT_SETTLE_SECS));
+        assert!(
+            seat_is_settled(&seat, 1_000 + SEAT_SETTLE_SECS + 1),
+            "the first edition's age counts, not the latest's"
+        );
+    }
+
+    /// D8: the settle rule only ever turns a win into a refusal. A
+    /// registration the merge order refuses is refused by the order,
+    /// settled seat or not, so its warning does not blame the settle rule;
+    /// and without a clock (a replay of a seat the replay created) the
+    /// order alone decides, however old the seat.
+    #[test]
+    fn a_settled_seat_turns_only_a_win_into_a_refusal() {
+        let seat = record(10_000, "bb");
+        let young = Some(10_000 + SEAT_SETTLE_SECS);
+        let settled = Some(10_000 + SEAT_SETTLE_SECS + 1);
+
+        // Dated before the seat, or on its second with a lower id.
+        for (created_at, id) in [(9_000, "ff"), (1, "ff"), (10_000, "aa")] {
+            assert_eq!(challenge(created_at, id, &seat, young), Challenge::Wins);
+            assert_eq!(
+                challenge(created_at, id, &seat, settled),
+                Challenge::LosesToSettledSeat
+            );
+            assert_eq!(challenge(created_at, id, &seat, None), Challenge::Wins);
+        }
+        // Dated after the seat, or on its second with a higher id.
+        for (created_at, id) in [(11_000, "00"), (10_000, "cc")] {
+            for clock in [young, settled, None] {
+                assert_eq!(
+                    challenge(created_at, id, &seat, clock),
+                    Challenge::LosesByOrder
+                );
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Meta-level harness: drive `handle()` against a real meta store with an
     // empty in-memory relay DB (registration admission never queries it).
@@ -1022,6 +1273,18 @@ mod tests {
     /// The harness with settings of the caller's choosing on top of the
     /// test defaults (open mode, a node at the root of `localhost:7334`).
     async fn harness_with(configure: impl FnOnce(&mut crate::config::Config)) -> Harness {
+        let database: crate::nostr::SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        harness_on(database, configure).await
+    }
+
+    /// The harness over a relay database the caller already filled, with an
+    /// empty meta store of its own: a node whose meta store is rebuilt from
+    /// that database at start-up, as after a wipe.
+    async fn harness_on(
+        database: crate::nostr::SharedDatabase,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::config::Config::for_testing();
         config.private_repos_enable = true;
@@ -1030,12 +1293,73 @@ mod tests {
         config.private_blob_data_path =
             Some(dir.path().join("blobs").to_string_lossy().into_owned());
         configure(&mut config);
-        let database: crate::nostr::SharedDatabase =
-            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
         let svc = PrivateService::new(&config, database)
             .await
             .expect("private service");
         Harness { _dir: dir, svc }
+    }
+
+    /// A clock under an hour after every 1970 date that the tests of this
+    /// module older than the settle rule give a seat. Those tests decide
+    /// their conflicts at this clock, so their seats are young and the merge
+    /// order alone decides, as before seats settled. Decided at the real
+    /// clock those seats are decades old: a challenger a test expects to win
+    /// would be refused, and one it expects to lose would lose to the settle
+    /// rule whatever the order said, so the test would no longer catch a
+    /// fault in the order.
+    const WHILE_YOUNG: u64 = 4_000;
+
+    /// A replay that began before this node stored any seat, as when a
+    /// meta store is rebuilt from the relay database: every seat is the
+    /// replay's own, so the merge order alone decides.
+    const BEFORE_EVERY_SEAT: u64 = 0;
+
+    /// A live decision with the node's clock at `now`.
+    fn handle_at(svc: &PrivateService, event: &Event, now: u64) -> RegistrationOutcome {
+        handle_inner(svc, event, Admission::Live { now })
+    }
+
+    /// Run `f` under a log subscriber of its own and return what it logged
+    /// with its result.
+    fn logged<R>(f: impl FnOnce() -> R) -> (R, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // One subscriber for the whole test binary that wants every warning.
+        // Without it, a warning first reached on another test's thread while
+        // this capture is the only subscriber is cached as unwanted while it lives
+        // (tracing-core asks that thread's default, which is none), and the
+        // capture then misses its own line.
+        static EVERY_THREAD: std::sync::Once = std::sync::Once::new();
+        EVERY_THREAD.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        });
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || capture.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).expect("utf-8 log");
+        (result, log)
     }
 
     /// A shape-valid 30640: alias `d`, the tenant's own pubkey as the sole w
@@ -1162,10 +1486,12 @@ mod tests {
         }
 
         // Squatter at t=1500 (between the editions) still loses; the victim
-        // keeps the seat and no eviction happens.
+        // keeps the seat and no eviction happens. Decided while the seat is
+        // young, so it is the preserved anchor that refuses it, not the
+        // seat's age.
         let squatter = Keys::generate();
         let squat = registration_event(&squatter, &alias, 1500);
-        let outcome = handle(svc, &squat);
+        let outcome = handle_at(svc, &squat, WHILE_YOUNG);
         assert!(
             !matches!(outcome.result, WritePolicyResult::Accept),
             "intermediate-created_at squatter must keep losing after rotation"
@@ -1334,9 +1660,10 @@ mod tests {
             })
             .unwrap();
 
-        // The earlier-created winner takes the alias.
+        // The earlier-created winner takes the alias (the loser's seat is
+        // young).
         let reg_w = registration_event(&winner, &alias, 1000);
-        let outcome = handle(svc, &reg_w);
+        let outcome = handle_at(svc, &reg_w, WHILE_YOUNG);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
         assert_eq!(
             outcome.prune,
@@ -1565,9 +1892,10 @@ mod tests {
         }
 
         // The intermediate-created_at squatter now LOSES (pre-R2-B it won on
-        // late-witness nodes anchored at edition 2).
+        // late-witness nodes anchored at edition 2). Decided while the seat
+        // is young, so it is the lowered anchor that refuses it.
         let squat = registration_event(&Keys::generate(), &alias, 1500);
-        let outcome = handle(svc, &squat);
+        let outcome = handle_at(svc, &squat, WHILE_YOUNG);
         assert!(
             !matches!(outcome.result, WritePolicyResult::Accept),
             "the squatter must lose once the anchor reflects the earlier edition"
@@ -1610,7 +1938,7 @@ mod tests {
 
         // The eviction lands between liveness and the charge txn.
         let reg_w = registration_event(&winner, &alias, 1000);
-        let outcome = handle(svc, &reg_w);
+        let outcome = handle_at(svc, &reg_w, WHILE_YOUNG);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
         let winner_bytes = reg_w.as_json().len() as u64;
 
@@ -1678,7 +2006,7 @@ mod tests {
 
         // The registration dies (takeover) before the wrap's charge txn.
         let reg_w = registration_event(&winner, &alias, 1000);
-        let outcome = handle(svc, &reg_w);
+        let outcome = handle_at(svc, &reg_w, WHILE_YOUNG);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
 
         let outcome = svc
@@ -1853,7 +2181,7 @@ mod tests {
 
         // boot_reconcile replay of the cadence-rejected edition: bypasses
         // the bucket entirely (replays must not consume budget).
-        let outcome = handle_replay(&svc, &ed4);
+        let outcome = handle_replay(&svc, &ed4, BEFORE_EVERY_SEAT);
         assert!(
             matches!(outcome.result, WritePolicyResult::Accept),
             "replay admission must bypass the cadence bucket"
@@ -1865,7 +2193,7 @@ mod tests {
         // with the tenant's cadence budget for OTHER aliases exhausted.
         let squatter = Keys::generate();
         let squat = registration_event(&squatter, &alias2, 3400);
-        let outcome = handle(&svc, &squat);
+        let outcome = handle_at(&svc, &squat, WHILE_YOUNG);
         assert!(
             matches!(outcome.result, WritePolicyResult::Accept),
             "a conflict-merge winner must never be cadence-gated"
@@ -1949,7 +2277,7 @@ mod tests {
             1500,
             vec![key_entry(&shared, &tenant, &alias)],
         );
-        let outcome = handle(&svc, &winner);
+        let outcome = handle_at(&svc, &winner, WHILE_YOUNG);
         assert!(
             matches!(outcome.result, WritePolicyResult::Accept),
             "a key-conflict-winning replacement must bypass the cadence gate"
@@ -2297,7 +2625,8 @@ mod tests {
 
         let outsider = Keys::generate();
         // Dated after the holder (would lose the alias), dated before it
-        // (would win it), and under another alias while claiming the
+        // (would win it, the holder's seat being young at the clock these
+        // are decided at), and under another alias while claiming the
         // holder's key with a valid proof (would lose a key conflict).
         let other_alias = "f".repeat(32);
         let attempts = [
@@ -2311,7 +2640,7 @@ mod tests {
             ),
         ];
         for attempt in &attempts {
-            let outcome = handle(svc, attempt);
+            let outcome = handle_at(svc, attempt, WHILE_YOUNG);
             assert_eq!(refusal(&outcome), NOT_LISTED);
             assert!(outcome.prune.is_empty(), "nothing to prune");
             assert!(
@@ -2443,7 +2772,7 @@ mod tests {
         for target in [alias.clone(), "4".repeat(32)] {
             let event = registration_event(&outsider, &target, 2000);
             let parsed = parse_shape(&event, &svc.cfg).expect("the shape is fine");
-            let outcome = apply(svc, &event, &parsed, Admission::Live);
+            let outcome = apply(svc, &event, &parsed, Admission::Live { now: WHILE_YOUNG });
             assert_eq!(refusal(&outcome), NOT_LISTED);
             assert!(outcome.prune.is_empty());
             assert!(svc
@@ -2481,7 +2810,7 @@ mod tests {
 
         let outsider = Keys::generate();
         let leftover = registration_event(&outsider, &alias, 2000);
-        let outcome = handle_replay(svc, &leftover);
+        let outcome = handle_replay(svc, &leftover, BEFORE_EVERY_SEAT);
         assert_eq!(refusal(&outcome), "alias already registered");
         assert_eq!(
             outcome.prune,
@@ -2492,7 +2821,7 @@ mod tests {
         assert_eq!(refusal(&handle(svc, &leftover)), NOT_LISTED);
 
         let fresh = registration_event(&outsider, &"6".repeat(32), 2000);
-        let outcome = handle_replay(svc, &fresh);
+        let outcome = handle_replay(svc, &fresh, BEFORE_EVERY_SEAT);
         assert_eq!(refusal(&outcome), NOT_LISTED);
         assert!(outcome.prune.is_empty());
     }
@@ -2576,5 +2905,674 @@ mod tests {
             Vec::new(),
         );
         assert!(parse_shape(&event, cfg).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Settled seats (D8). A seat whose first edition is more than
+    // SEAT_SETTLE_SECS old keeps its alias and its keys against every
+    // other account; a younger one merges by the order, as before; a
+    // replay judges a seat it created by the order alone and one the meta
+    // store held before it by its age. Except where a test says
+    // otherwise, the clock is passed in, so the dates are free and the
+    // tests do not depend on when they run.
+    // ------------------------------------------------------------------
+
+    /// The date these tests give the first edition of an established seat.
+    const SEATED_AT: u64 = 100_000;
+
+    /// Who holds `alias` in the meta store, and by which event.
+    fn seated(svc: &PrivateService, alias: &str) -> Option<(String, String)> {
+        let txn = svc.meta.read_txn().unwrap();
+        svc.meta
+            .get_registration(&txn, alias)
+            .unwrap()
+            .map(|record| (record.tenant_hex, record.event_id))
+    }
+
+    /// A backdated registration from another account takes no alias from a
+    /// settled seat, where the merge order alone would hand it over. It
+    /// gets the ordinary conflict answer, its own coordinate is pruned and
+    /// the alert is raised; the warning says the seat had settled and names
+    /// the challenger. The holder loses nothing: record, key claim, ring
+    /// and blob claim stay.
+    #[tokio::test]
+    async fn settled_seat_keeps_its_alias_against_a_backdated_claim() {
+        use super::super::meta::{BlobClaim, MetaEnv};
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let holder = Keys::generate();
+        let holder_hex = holder.public_key().to_hex();
+        let alias = "a".repeat(32);
+
+        let held = registration_event(&holder, &alias, SEATED_AT);
+        assert!(matches!(
+            handle_at(svc, &held, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        // What an eviction would strip: a state-root edition and a claim.
+        let sha = "55".repeat(32);
+        svc.meta
+            .with_write(|m, txn| {
+                m.put_state_ring(
+                    txn,
+                    &MetaEnv::state_ring_key(&alias, SEATED_AT + 60, "aa"),
+                    "{}",
+                )?;
+                m.put_blob_claim(
+                    txn,
+                    &sha,
+                    &BlobClaim {
+                        size: 512,
+                        aliases: vec![alias.clone()],
+                        unreferenced_since: None,
+                        stored: true,
+                        charged_tenant: Some(holder_hex.clone()),
+                        charged_alias: Some(alias.clone()),
+                        spec_charge: None,
+                        stored_at: None,
+                    },
+                )?;
+                m.put_alias_claim(txn, &alias, &sha)
+            })
+            .unwrap();
+
+        let challenger = Keys::generate();
+        let backdated = registration_event(&challenger, &alias, 1);
+        let (outcome, log) =
+            logged(|| handle_at(svc, &backdated, SEATED_AT + SEAT_SETTLE_SECS + 1));
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert_eq!(
+            outcome.prune,
+            vec![(challenger.public_key().to_hex(), alias.clone())],
+            "the challenger's own coordinate is pruned, as for any lost conflict"
+        );
+        assert!(log.contains("incumbent_settled=true"), "{log}");
+        assert!(
+            log.contains(&format!(
+                "loser_tenant={}",
+                challenger.public_key().to_hex()
+            )),
+            "the warning names the challenger: {log}"
+        );
+        assert!(
+            !svc.conflict_alert_dedup
+                .lock()
+                .should_alert(&backdated.id.to_hex()),
+            "the conflict alert was raised"
+        );
+
+        assert_eq!(
+            seated(svc, &alias),
+            Some((holder_hex.clone(), held.id.to_hex()))
+        );
+        let txn = svc.meta.read_txn().unwrap();
+        assert_eq!(
+            svc.meta.get_key_claim(&txn, &holder_hex).unwrap(),
+            Some(alias.clone())
+        );
+        assert_eq!(
+            svc.meta.state_ring_for_alias(&txn, &alias).unwrap().len(),
+            1,
+            "the holder's ring is kept"
+        );
+        let claim = svc.meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
+        assert_eq!(claim.aliases, vec![alias.clone()], "the claim is kept");
+        assert!(claim.unreferenced_since.is_none());
+    }
+
+    /// The member case. Every writer of a repository holds its write key
+    /// and every member its shared aux key, so any of them can register an
+    /// alias of its own that claims that key, with a valid proof, dated
+    /// before the repository. By the merge order that evicts the whole
+    /// repository; against a settled seat it is refused, for a write key
+    /// and for an aux key alike, and the repository keeps both keys.
+    #[tokio::test]
+    async fn settled_seat_keeps_its_keys_against_a_backdated_member() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let own = ["ws://localhost:7334"];
+        let own_server = ["http://localhost:7334"];
+        let holder = Keys::generate();
+        let writer = Keys::generate();
+        let shared = Keys::generate();
+        let alias = "b".repeat(32);
+        let held = registration_event_naming(
+            &holder,
+            &alias,
+            SEATED_AT,
+            &own,
+            &own_server,
+            vec![key_entry(&writer, &holder, &alias)],
+            vec![key_entry(&shared, &holder, &alias)],
+        );
+        assert!(matches!(
+            handle_at(svc, &held, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+
+        for (claimed, as_aux, member_alias) in [
+            (&writer, false, "c".repeat(32)),
+            (&shared, true, "d".repeat(32)),
+        ] {
+            let member = Keys::generate();
+            let entry = key_entry(claimed, &member, &member_alias);
+            let (w_entries, aux_entries) = if as_aux {
+                (vec![vec![member.public_key().to_hex()]], vec![entry])
+            } else {
+                (vec![entry], Vec::new())
+            };
+            let claim = registration_event_naming(
+                &member,
+                &member_alias,
+                1,
+                &own,
+                &own_server,
+                w_entries,
+                aux_entries,
+            );
+            let (outcome, log) =
+                logged(|| handle_at(svc, &claim, SEATED_AT + SEAT_SETTLE_SECS + 1));
+            assert_eq!(refusal(&outcome), "write key already registered");
+            assert_eq!(
+                outcome.prune,
+                vec![(member.public_key().to_hex(), member_alias.clone())]
+            );
+            assert!(log.contains("incumbent_settled=true"), "{log}");
+            assert_eq!(seated(svc, &member_alias), None);
+        }
+
+        assert_eq!(
+            seated(svc, &alias),
+            Some((holder.public_key().to_hex(), held.id.to_hex()))
+        );
+        let txn = svc.meta.read_txn().unwrap();
+        for key in [&writer, &shared] {
+            assert_eq!(
+                svc.meta
+                    .get_key_claim(&txn, &key.public_key().to_hex())
+                    .unwrap(),
+                Some(alias.clone())
+            );
+        }
+    }
+
+    /// A holder's own new edition (a widen dated just after its live one)
+    /// that claims a key a settled seat of another account holds is refused
+    /// like any challenger, and its own coordinate, which still holds its
+    /// live registration, is not pruned.
+    #[tokio::test]
+    async fn settled_squat_refuses_a_widen_without_pruning_the_victim() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let victim = Keys::generate();
+        let squatter = Keys::generate();
+        let rekey = Keys::generate();
+        let (v_alias, s_alias) = ("7".repeat(32), "8".repeat(32));
+        let live = registration_event(&victim, &v_alias, SEATED_AT - 500);
+        assert!(matches!(
+            handle_at(svc, &live, SEATED_AT - 500).result,
+            WritePolicyResult::Accept
+        ));
+        let squat = registration_event_with_w(
+            &squatter,
+            &s_alias,
+            SEATED_AT,
+            vec![key_entry(&rekey, &squatter, &s_alias)],
+        );
+        assert!(matches!(
+            handle_at(svc, &squat, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        let widen = registration_event_with_w(
+            &victim,
+            &v_alias,
+            SEATED_AT - 499,
+            vec![
+                vec![victim.public_key().to_hex()],
+                key_entry(&rekey, &victim, &v_alias),
+            ],
+        );
+        let (outcome, log) = logged(|| handle_at(svc, &widen, SEATED_AT + SEAT_SETTLE_SECS + 1));
+        assert_eq!(refusal(&outcome), "write key already registered");
+        assert!(
+            outcome.prune.is_empty(),
+            "the victim's live coordinate stays"
+        );
+        assert!(log.contains("incumbent_settled=true"), "{log}");
+        assert_eq!(
+            seated(svc, &v_alias),
+            Some((victim.public_key().to_hex(), live.id.to_hex()))
+        );
+        assert_eq!(
+            seated(svc, &s_alias).map(|(tenant, _)| tenant),
+            Some(squatter.public_key().to_hex())
+        );
+    }
+
+    /// A registration that the order would let take a young alias, but that
+    /// also claims a key a settled seat holds, is refused outright: the young
+    /// holder is not evicted either, and the settled seat keeps its key.
+    #[tokio::test]
+    async fn a_settled_key_holder_refuses_a_claim_that_would_take_a_young_alias() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let settled_at = SEATED_AT + SEAT_SETTLE_SECS + 1;
+        let young = Keys::generate();
+        let holder = Keys::generate();
+        let writer = Keys::generate();
+        let challenger = Keys::generate();
+        let (young_alias, held_alias) = ("5".repeat(32), "6".repeat(32));
+
+        let held = registration_event_with_w(
+            &holder,
+            &held_alias,
+            SEATED_AT,
+            vec![
+                vec![holder.public_key().to_hex()],
+                key_entry(&writer, &holder, &held_alias),
+            ],
+        );
+        let fresh = registration_event(&young, &young_alias, settled_at - 60);
+        for event in [&held, &fresh] {
+            assert!(matches!(
+                handle_at(svc, event, event.created_at.as_secs()).result,
+                WritePolicyResult::Accept
+            ));
+        }
+
+        let claim = registration_event_with_w(
+            &challenger,
+            &young_alias,
+            SEATED_AT - 100,
+            vec![
+                vec![challenger.public_key().to_hex()],
+                key_entry(&writer, &challenger, &young_alias),
+            ],
+        );
+        let (outcome, log) = logged(|| handle_at(svc, &claim, settled_at));
+        assert_eq!(refusal(&outcome), "write key already registered");
+        assert_eq!(
+            outcome.prune,
+            vec![(challenger.public_key().to_hex(), young_alias.clone())]
+        );
+        assert!(log.contains("incumbent_settled=true"), "{log}");
+        assert!(!log.contains("stored registration evicted"), "{log}");
+        assert_eq!(
+            seated(svc, &young_alias),
+            Some((young.public_key().to_hex(), fresh.id.to_hex()))
+        );
+        let txn = svc.meta.read_txn().unwrap();
+        assert_eq!(
+            svc.meta
+                .get_key_claim(&txn, &writer.public_key().to_hex())
+                .unwrap(),
+            Some(held_alias.clone())
+        );
+    }
+
+    /// An older edition of the holder's own registration, sent again after a
+    /// key it listed has passed to another account whose seat has since
+    /// settled, changes no claim (a stale edition never evicts), so the
+    /// settle rule has nothing to protect and the order alone judges it, as
+    /// before seats settled. It is accepted as a no-op with no conflict
+    /// warning naming the holder, the key stays where it is, and on a node
+    /// that never saw it, it still lowers the holder's anchor.
+    #[tokio::test]
+    async fn a_stale_own_edition_is_not_refused_by_a_settled_seat() {
+        use nostr_sdk::prelude::Keys;
+
+        let holder = Keys::generate();
+        let other = Keys::generate();
+        let dropped = Keys::generate();
+        let (alias, other_alias) = ("9".repeat(32), "a".repeat(32));
+        let first = registration_event_with_w(
+            &holder,
+            &alias,
+            SEATED_AT,
+            vec![
+                vec![holder.public_key().to_hex()],
+                key_entry(&dropped, &holder, &alias),
+            ],
+        );
+        let narrowed = registration_event(&holder, &alias, SEATED_AT + 50);
+        let claim = registration_event_with_w(
+            &other,
+            &other_alias,
+            SEATED_AT + 100,
+            vec![
+                vec![other.public_key().to_hex()],
+                key_entry(&dropped, &other, &other_alias),
+            ],
+        );
+        let settled = SEATED_AT + 100 + SEAT_SETTLE_SECS + 1;
+
+        // A node that saw every edition, and one that joined after the first
+        // edition had been replaced.
+        for saw_first in [true, false] {
+            let h = harness().await;
+            let svc = &h.svc;
+            let mut arrivals = vec![&narrowed, &claim];
+            if saw_first {
+                arrivals.insert(0, &first);
+            }
+            for event in arrivals {
+                assert!(matches!(
+                    handle_at(svc, event, event.created_at.as_secs()).result,
+                    WritePolicyResult::Accept
+                ));
+            }
+
+            let (outcome, log) = logged(|| handle_at(svc, &first, settled));
+            assert!(matches!(outcome.result, WritePolicyResult::Accept));
+            assert!(outcome.prune.is_empty());
+            assert!(!log.contains("private registration conflict"), "{log}");
+            assert_eq!(
+                seated(svc, &alias),
+                Some((holder.public_key().to_hex(), narrowed.id.to_hex()))
+            );
+            let txn = svc.meta.read_txn().unwrap();
+            assert_eq!(
+                svc.meta
+                    .get_key_claim(&txn, &dropped.public_key().to_hex())
+                    .unwrap(),
+                Some(other_alias.clone())
+            );
+            let record = svc.meta.get_registration(&txn, &alias).unwrap().unwrap();
+            assert_eq!(
+                record.first_created_at,
+                Some(nostr::prelude::Timestamp::from_secs(SEATED_AT))
+            );
+            assert_eq!(record.first_event_id, Some(first.id.to_hex()));
+        }
+    }
+
+    /// Just under the settle age the merge order decides, as before seats
+    /// settled: an hour old exactly, a seat is still young (it settles the
+    /// next second, above). A claim dated before the holder takes the
+    /// alias, or a key and with it the holder's whole registration, and the
+    /// same pair of registrations leaves the same holder in either arrival
+    /// order, which is what lets two nodes agree.
+    #[tokio::test]
+    async fn young_seat_still_merges_by_created_at() {
+        use nostr_sdk::prelude::Keys;
+
+        let young = SEATED_AT + SEAT_SETTLE_SECS;
+        let holder = Keys::generate();
+        let challenger = Keys::generate();
+        let alias = "e".repeat(32);
+        let held = registration_event(&holder, &alias, SEATED_AT);
+        let earlier = registration_event(&challenger, &alias, SEATED_AT - 100);
+        let winner = Some((challenger.public_key().to_hex(), earlier.id.to_hex()));
+
+        // The holder arrives first: the earlier claim evicts it.
+        let h = harness().await;
+        assert!(matches!(
+            handle_at(&h.svc, &held, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        let (outcome, log) = logged(|| handle_at(&h.svc, &earlier, young));
+        assert!(matches!(outcome.result, WritePolicyResult::Accept));
+        assert_eq!(
+            outcome.prune,
+            vec![(holder.public_key().to_hex(), alias.clone())]
+        );
+        assert!(log.contains("stored registration evicted"), "{log}");
+        assert_eq!(seated(&h.svc, &alias), winner);
+
+        // The earlier claim arrives first: the holder's registration is
+        // refused by the order. By this clock the earlier seat is itself over
+        // an hour old, but the order refuses first, so the warning does not
+        // blame the settle rule.
+        let h = harness().await;
+        assert!(matches!(
+            handle_at(&h.svc, &earlier, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        let (outcome, log) = logged(|| handle_at(&h.svc, &held, young));
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert!(log.contains("incumbent_settled=false"), "{log}");
+        assert_eq!(seated(&h.svc, &alias), winner);
+
+        // A member's claim of the shared aux key still evicts a young
+        // repository.
+        let h = harness().await;
+        let own = ["ws://localhost:7334"];
+        let own_server = ["http://localhost:7334"];
+        let owner = Keys::generate();
+        let shared = Keys::generate();
+        let member = Keys::generate();
+        let repo = "f".repeat(32);
+        let member_alias = "0".repeat(32);
+        let repo_registration = registration_event_naming(
+            &owner,
+            &repo,
+            SEATED_AT,
+            &own,
+            &own_server,
+            vec![vec![owner.public_key().to_hex()]],
+            vec![key_entry(&shared, &owner, &repo)],
+        );
+        assert!(matches!(
+            handle_at(&h.svc, &repo_registration, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        let claim = registration_event_naming(
+            &member,
+            &member_alias,
+            SEATED_AT - 100,
+            &own,
+            &own_server,
+            vec![vec![member.public_key().to_hex()]],
+            vec![key_entry(&shared, &member, &member_alias)],
+        );
+        let outcome = handle_at(&h.svc, &claim, young);
+        assert!(matches!(outcome.result, WritePolicyResult::Accept));
+        assert_eq!(
+            outcome.prune,
+            vec![(owner.public_key().to_hex(), repo.clone())]
+        );
+        assert_eq!(seated(&h.svc, &repo), None);
+        let txn = h.svc.meta.read_txn().unwrap();
+        assert_eq!(
+            h.svc
+                .meta
+                .get_key_claim(&txn, &shared.public_key().to_hex())
+                .unwrap(),
+            Some(member_alias.clone())
+        );
+    }
+
+    /// `handle`, the path of clients and peers, judges a seat's age by the
+    /// node's own clock: a seat first registered two hours ago is settled,
+    /// one registered ten minutes ago is not.
+    #[tokio::test]
+    async fn handle_judges_seat_age_by_the_node_clock() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let now = nostr::prelude::Timestamp::now().as_secs();
+        for (alias, seated_at, settled) in [
+            ("1".repeat(32), now - 2 * SEAT_SETTLE_SECS, true),
+            ("2".repeat(32), now - 600, false),
+        ] {
+            let holder = Keys::generate();
+            let challenger = Keys::generate();
+            let held = registration_event(&holder, &alias, seated_at);
+            assert!(matches!(
+                handle(svc, &held).result,
+                WritePolicyResult::Accept
+            ));
+            let backdated = registration_event(&challenger, &alias, seated_at - 100);
+            let outcome = handle(svc, &backdated);
+            let (tenant, _) = seated(svc, &alias).expect("the alias has a holder");
+            if settled {
+                assert_eq!(refusal(&outcome), "alias already registered");
+                assert_eq!(tenant, holder.public_key().to_hex());
+            } else {
+                assert!(matches!(outcome.result, WritePolicyResult::Accept));
+                assert_eq!(tenant, challenger.public_key().to_hex());
+            }
+        }
+    }
+
+    /// The trap the settle rule sets for a replay. A claim dated before a
+    /// seat took it while the seat was minutes old, and the evicted
+    /// holder's 30640 stayed in the relay database, as after a prune that
+    /// failed. Long after, with both dates decades old by the real clock:
+    ///
+    /// - a restart over the same meta store keeps the winner; the leftover
+    ///   is refused by the order and pruned, and sent again live it loses
+    ///   by the order too, not to the settle rule;
+    /// - a node whose meta store was wiped and is rebuilt from the relay
+    ///   database seats the winner again. The rebuild replays the newest
+    ///   event first, the evicted holder's; judged by the clock, that seat
+    ///   would be settled from its first second and would refuse the
+    ///   winner;
+    /// - replayed by hand, the two events give the winner in either order.
+    #[tokio::test]
+    async fn replay_reaches_the_decision_made_while_the_seat_was_young() {
+        use nostr_sdk::prelude::{Filter, Keys, Kind};
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let holder = Keys::generate();
+        let challenger = Keys::generate();
+        let alias = "3".repeat(32);
+        let first = registration_event(&holder, &alias, 2_000);
+        let backdated = registration_event(&challenger, &alias, 1_000);
+        let winner = Some((challenger.public_key().to_hex(), backdated.id.to_hex()));
+
+        assert!(matches!(
+            handle_at(svc, &first, 2_000).result,
+            WritePolicyResult::Accept
+        ));
+        svc.database
+            .save_event(&first)
+            .await
+            .expect("save the holder's 30640");
+        let outcome = handle_at(svc, &backdated, 2_300);
+        assert!(matches!(outcome.result, WritePolicyResult::Accept));
+        assert_eq!(
+            outcome.prune,
+            vec![(holder.public_key().to_hex(), alias.clone())]
+        );
+        svc.database
+            .save_event(&backdated)
+            .await
+            .expect("save the winner's 30640");
+        // The prune is not carried out: both 30640s stay in the database.
+
+        // A restart over the same meta store.
+        svc.boot_reconcile().await.expect("boot reconcile");
+        assert_eq!(seated(svc, &alias), winner);
+        let leftover = svc
+            .database
+            .query(
+                Filter::new()
+                    .kind(Kind::Custom(super::super::KIND_REGISTRATION))
+                    .author(holder.public_key()),
+            )
+            .await
+            .expect("query the relay database");
+        assert!(leftover.is_empty(), "the replay prunes the leftover");
+        let (outcome, log) = logged(|| handle(svc, &first));
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert!(log.contains("incumbent_settled=false"), "{log}");
+        assert_eq!(seated(svc, &alias), winner);
+
+        // A wiped meta store, rebuilt from a relay database that holds both
+        // events again.
+        svc.database
+            .save_event(&first)
+            .await
+            .expect("put the leftover back");
+        let rebuilt = harness_on(svc.database.clone(), |_| {}).await;
+        assert_eq!(
+            seated(&rebuilt.svc, &alias),
+            winner,
+            "a rebuilt node must seat the winner it seated before"
+        );
+
+        for order in [[&first, &backdated], [&backdated, &first]] {
+            let fresh = harness().await;
+            for event in order {
+                handle_replay(&fresh.svc, event, BEFORE_EVERY_SEAT);
+            }
+            assert_eq!(seated(&fresh.svc, &alias), winner);
+        }
+    }
+
+    /// A registration this node evicted once (through one of its keys) and
+    /// failed to prune is still stored, and another account has since taken
+    /// its alias and held it for over an hour. A restart over the same meta
+    /// store replays the leftover against that seat, which was there before
+    /// the replay began, so the seat is judged by its age as it would be
+    /// live: the leftover is refused, and nothing is pruned, since a replay's
+    /// refusal by age deletes nothing. By the order alone the older leftover
+    /// would take the alias on this node and not on its peer. A seat the
+    /// replay created itself, as in a rebuild, is judged by the order.
+    #[tokio::test]
+    async fn replay_judges_a_seat_it_did_not_create_by_its_age() {
+        use nostr_sdk::prelude::Keys;
+
+        let h = harness().await;
+        let svc = &h.svc;
+        let holder = Keys::generate();
+        let alias = "e".repeat(32);
+        let held = registration_event(&holder, &alias, SEATED_AT);
+        assert!(matches!(
+            handle_at(svc, &held, SEATED_AT).result,
+            WritePolicyResult::Accept
+        ));
+        let holder_seat = seated(svc, &alias);
+
+        // The leftover is dated before the seat; arriving live now, it would
+        // be refused by the seat's age too, and its coordinate pruned.
+        let challenger = Keys::generate();
+        let backdated = registration_event(&challenger, &alias, 1);
+        let live = handle_at(svc, &backdated, SEATED_AT + SEAT_SETTLE_SECS + 1);
+        assert_eq!(refusal(&live), "alias already registered");
+        assert_eq!(
+            live.prune,
+            vec![(challenger.public_key().to_hex(), alias.clone())]
+        );
+
+        let registered_at = {
+            let txn = svc.meta.read_txn().unwrap();
+            svc.meta
+                .get_registration(&txn, &alias)
+                .unwrap()
+                .expect("the holder is seated")
+                .registered_at
+        };
+
+        // A restart: the replay began after the node stored the seat.
+        let outcome = handle_replay(svc, &backdated, registered_at + 1);
+        assert_eq!(refusal(&outcome), "alias already registered");
+        assert!(
+            outcome.prune.is_empty(),
+            "a replay's refusal by age deletes nothing: {:?}",
+            outcome.prune
+        );
+        assert_eq!(seated(svc, &alias), holder_seat);
+
+        // The seat counts as the replay's own when the replay began no
+        // earlier than the node stored it: the order decides, and the older
+        // claim takes the alias.
+        let outcome = handle_replay(svc, &backdated, registered_at);
+        assert!(matches!(outcome.result, WritePolicyResult::Accept));
+        assert_eq!(
+            seated(svc, &alias),
+            Some((challenger.public_key().to_hex(), backdated.id.to_hex()))
+        );
     }
 }

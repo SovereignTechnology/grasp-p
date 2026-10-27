@@ -76,8 +76,11 @@ impl RegistrationRecord {
     /// recorded, else the latest edition's — the fallback for pre-existing
     /// records (first-edition history is unrecoverable there; accepted
     /// pre-multi-node-traffic). NEVER `registered_at` — that is node-local
-    /// wall clock, and merge decisions must stay pure functions of
-    /// event-intrinsic data + meta state.
+    /// wall clock. The merge order stays a pure function of event-intrinsic
+    /// data + meta state; the one place the node's clock enters a merge is
+    /// the settled-seat rule (`SEAT_SETTLE_SECS` in registration.rs), which
+    /// a live decision judges against this anchor, and so does a replay for
+    /// a seat the meta store held before the replay began.
     pub fn anchor(&self) -> (Timestamp, &str) {
         match (&self.first_created_at, &self.first_event_id) {
             (Some(created_at), Some(event_id)) => (*created_at, event_id.as_str()),
