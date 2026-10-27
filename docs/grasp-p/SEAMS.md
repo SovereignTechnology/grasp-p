@@ -784,7 +784,9 @@ The order now, for a registration from a client or from a peer (`handle`):
   longer admitted. With the mode asked first it would be refused by the mode at every
   start and never removed. A replay that would create a seat is still subject to the
   mode, as before: rebuilding a wiped meta store under a stricter mode needs the
-  accounts listed, or `open`, for that one start.
+  accounts listed, or `open`, for that one start. A replay judges a seat the meta store
+  held before it began by its age, and a seat it creates by the order alone ("A settled
+  seat is not displaced", below).
 - **What is left.** An admitted account can still send registrations with 64 keys and
   cost 64 signature checks each time; that is bounded by the cap and attributable to
   the account. In `open` mode nobody is refused at step 4, so only the cap and the
@@ -847,6 +849,161 @@ plus the bootstrap relay, so its inputs and its label stay as they are: both nod
 pair run the same build, and at the root nothing a node accepts has changed. Upstream
 has its own matcher for its own tags (`outbound::relay_url_matches_service`); it parses
 more leniently and is not used for the GRASP-P checks, which stay strict about the URL.
+
+## A settled seat is not displaced
+
+All of it is in `src/grasp_p/registration.rs` (`SEAT_SETTLE_SECS`, `seat_is_settled`,
+`challenge`, the two conflict checks in `apply`). No upstream file is touched, no setting
+is added, and the fingerprint keeps its inputs and its label: the two nodes of a pair run
+the same build, and no node runs the old rule.
+
+### Why
+
+Two accounts that claim the same alias, or the same key under different aliases, are
+merged by the order of their registrations: the lower `created_at` of the incoming
+registration and the holder's first edition wins, ties to the lower event id. That order
+is what makes the two nodes of a pair agree whatever order they saw the claims in. But the
+signer chooses `created_at`, and it has no lower bound, so any admitted account could
+evict any repository by dating a registration before it: by its alias, or by one of its
+keys, which takes the holder's whole registration. Every writer of a repository holds its
+write key and every member its shared aux key, so the key form was open to every member.
+The evicted repository's blob claims are dropped and its blobs collected after the grace
+period.
+
+### The rule
+
+The maintainer's decision (2026-10-27): a seat whose first edition is more than an hour
+older than the node's clock (`SEAT_SETTLE_SECS`, 3600 seconds) is never the loser of a
+conflict with another account for its alias, nor with any other alias, the same account's
+included, for any of its keys. An hour old exactly, a seat is still young; it settles the
+next second. Younger seats merge by the order as before, so two nodes that saw a fresh
+conflict in different orders still agree.
+
+- **The age is the anchor's.** It is counted from the `created_at` of the seat's first
+  edition, the same anchor the order compares against, never from `registered_at`, the
+  time this node first stored the seat. Two nodes that hold the same anchor therefore judge
+  a seat settled at the same moment. A node rebuilt from its relay database, or a peer that
+  joined late, holds only each seat's newest edition (the relay database replaces older
+  ones) and anchors there: it protects a seat once that edition is an hour old, at once for
+  a seat with no edition in the last hour. Until then a claim dated before that edition
+  takes the seat on that node only: the other node, which kept the older anchor, refuses
+  it, by the order if it is dated after the seat's first edition and as settled if before,
+  and the pair splits. A registration of the holder's own that lowers the anchor makes the
+  seat older, never younger.
+- **A constant, not a setting.** Both nodes must use the same value, and none of the four
+  configuration sources changes.
+- **The answer is the one a lost conflict always got:** `restricted: alias already
+  registered` or `restricted: write key already registered`. The challenger's own
+  coordinate is pruned and the conflict alert is raised as for any lost conflict. The
+  warning `private registration conflict: incoming registration lost the deterministic
+  merge (§3.2) and was rejected` keeps its text and gains the field `incumbent_settled`:
+  `true` when the order alone would have let the challenger win and only the seat's age
+  refused it, `false` for an ordinary merge loss. `loser_tenant` in the same line is the
+  challenger's key.
+- **The rule only ever refuses.** It turns what the order would have made a win into a
+  refusal, and never the reverse, so it never evicts anyone and never puts an event into
+  the relay database.
+
+### Where the clock is read, and where it is not
+
+The node's clock now enters a merge decision, against the rule the anchor was built on
+(see `RegistrationRecord::anchor` in `src/grasp_p/meta.rs`, which names this exception). It
+is read for every live decision (`handle`): a client's registration, one a peer delivers,
+and a held registration retried later. The one live exception is an edition of the
+sender's own seat that is no newer than the stored one: it changes no claim (it is
+accepted as a no-op, and whatever it would evict stays), so a settled seat has nothing to
+lose to it, and the order alone judges it, as before. Judged by the clock, an old edition
+that anyone sends again, once a key it lists has passed to another account after a
+rotation and that account's seat has settled, would be refused with a settled-seat warning
+that names the repository's own account, and it could no longer lower the anchor on a node
+that never saw it. When the node replays its own relay database at start-up
+(`handle_replay`, called by `boot_reconcile`), the clock judges only the seats the meta store
+held before the replay began (`registered_at` before the replay's start, passed in as
+`reconcile_started`); a seat the replay itself creates is judged by the order alone. That is
+what keeps a restart and a rebuild from changing what the node decided:
+
+- **Replay.** The node writes its meta record before it stores the event, and a refused
+  event is never stored, so a stored registration the meta store does not hold (a
+  leftover) is a holder the node evicted, whose prune failed or never ran. At a restart
+  over the same meta store the seat a leftover meets was there before the replay, so it is
+  judged as it would be live. Usually the order already refuses the leftover, since the
+  meta store keeps the winner's first-edition anchor. Where the leftover's alias, or a key
+  it claims, was freed and then taken by another account dated after it, the order would
+  let the older leftover evict that seat on this node only; once that seat has settled, its
+  age refuses the leftover instead. A replay's refusal by age prunes nothing: a meta store
+  older than the relay database (a restore not taken from one snapshot) would otherwise
+  refuse a registration the node accepted later and delete the only stored copy of it.
+  A rebuild into an empty meta store creates every seat it meets, so the order alone
+  decides there. Judged by the clock instead, a rebuild would go wrong at once:
+  `boot_reconcile` replays newest first (nostr orders events by `created_at`,
+  descending), so it would seat the evicted holder first, settled from its first second by
+  its old date, and refuse the winner, the opposite of what the node had decided and of
+  what its peer holds. A seat a replay creates is dated no earlier than the replay began,
+  so a clock that steps back during it does not turn it into one judged by age. What the
+  replay still gets wrong is under "What is left".
+- **Restoring a node.** Never start a node on a meta store (`private-meta`, inside
+  `NGIT_RELAY_DATA_PATH`) older than its relay database: its seats are trusted at the
+  restart, so a registration accepted after the meta copy was taken is refused (and kept,
+  not deleted) while the peer holds it. Restore both from one snapshot taken with the
+  service stopped, or restore the relay database alone and delete `private-meta`, so the
+  start rebuilds it.
+- **Sync redelivery.** An event the node accepted is a duplicate before admission
+  (`process_event_static_inner` looks the id up first). A client that sends an accepted
+  edition again gets the same-tenant no-op it got before. A refused registration that
+  comes back is refused again while the holder holds the seat: the anchor never moves
+  later, and a settled seat stays settled (a rebuild of the meta store is the exception: it
+  re-anchors each seat on its newest stored edition).
+- **A held registration.** Only a same-tenant replacement refused for the replacement
+  cadence is held and retried, and such a registration took part in no conflict when it
+  was refused: one that wins a conflict is exempt from the cadence, one that loses is
+  refused for the conflict. A conflict it meets at the retry is new, and is judged like any
+  arrival. If the order favours it but the claim it meets has settled here meanwhile, it is
+  refused here while the peer, which admitted it at once, keeps it, and the pair splits.
+
+### What is left
+
+- **The first hour.** An admitted account can still take a repository's alias in its first
+  hour, or, holding one of its keys, the whole repository. The eviction raises the alert
+  (`stored_evicted`) and its warning names the offender as `winner_tenant`; the account is
+  closed. M4 binds the alias to the account key in the wire format, so that no other
+  account can register it at all.
+- **The moment a seat settles, and seats that arrive settled.** A node refuses a
+  challenger only for a seat it already holds once that seat has settled; a node that saw
+  the challenger first, or before the seat settled, keeps the challenger. So a challenger
+  that reaches one node of a pair just before the seat settles there and the other just
+  after is accepted by one and refused by the other. The lag is seconds when live sync
+  carries the challenger, but up to the hourly full re-issue
+  (`NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS`, 3600 s by default) when it does not, so a
+  winner of a seat's first hour that misses live delivery to the peer can split the pair,
+  the likelier the later in the hour it won. The same split needs no timing near any
+  settle moment for a seat that is already over an hour old when it arrives (dated back by
+  its signer, or delivered late): it is settled on arrival, so a challenger that the other
+  node saw first is kept there and refused here. Both nodes raise the alert, the
+  watchdog's registration check reports the split, and the split stays: each node now
+  holds a seat the other's claim cannot displace. There is no operator tool to repair it
+  until the offboarding work (issue 1).
+- **A conflict planted across a partition** of more than an hour no longer heals by
+  itself: each node keeps the seat it had.
+- **The victim's self-heal on a mis-anchored node** (a node that never saw the seat's first
+  edition, where a claim dated between the editions won; see the R2-B note in `apply`)
+  works only while the claimant's seat there is under an hour old.
+- **A backdated seat counts as settled at once**, since its anchor is old. That costs a
+  victim only a re-registration race it could not have won anyway; two such claims sent to
+  the two nodes at once split the pair ("The moment a seat settles", above).
+- **A rebuild meets leftovers.** A meta store rebuilt from the relay database decides by
+  the order alone and anchors each seat on its newest stored edition. A leftover the node
+  failed to prune then takes a seat back on this node only (watchdog registration parity
+  FAIL) when the winner that evicted it has published a later edition, or when its alias
+  was freed and taken by another account dated after it; the peer keeps the winner, with
+  no repair tool before the offboarding work. A restart over the same meta store keeps the
+  first-edition anchors and is not affected by the first case; in the second it judges
+  the other account's seat by its age, so a leftover can still evict that seat while it
+  is under an hour old.
+- **Three or more parties.** A chain of conflicts (A and B share one key, B and C another)
+  is not order-independent at a replay or a rebuild, as before this change: a later
+  registrant can lose its seat there until sync redelivers it.
+- **The loser's blob claims** are still dropped at eviction; keeping them needs a claim
+  state of its own, because claims are keyed by the alias the winner now holds.
 
 ## Configured peers: the only relays GRASP-P syncs with; kept, not muted, redialled
 
@@ -1427,6 +1584,57 @@ features. No package was added.
   tests the conflict, and an unlisted sender no longer reaches it), and a new step
   checks that an unlisted challenger gets the whitelist answer and leaves the conflict
   counter where it was. No pair test runs under a base path.
+- Settled seats ("A settled seat is not displaced"). Unit tests in
+  `src/grasp_p/registration.rs`; except where named, they pass the node's clock in, so
+  their dates are free and the result does not depend on when they run.
+  `seat_settles_one_second_after_an_hour` (the boundary, the first edition's age, a seat
+  dated after the clock) and `a_settled_seat_turns_only_a_win_into_a_refusal` (an
+  order loss is never put down to the settle rule; no clock, no settling) are pure.
+  `settled_seat_keeps_its_alias_against_a_backdated_claim` and
+  `settled_seat_keeps_its_keys_against_a_backdated_member` (a write key and a shared aux
+  key, each claimed under an alias of the claimant's own) require the ordinary conflict
+  answer, the prune of the challenger's coordinate, `incumbent_settled=true` and the
+  challenger's key in the warning, and the holder's record, key claims, ring and blob
+  claim untouched. `settled_squat_refuses_a_widen_without_pruning_the_victim` refuses a
+  holder's own widen that claims a key a settled seat holds, and prunes nothing, since the
+  holder's coordinate still holds its live registration.
+  `a_settled_key_holder_refuses_a_claim_that_would_take_a_young_alias` refuses outright a
+  registration that would take a young alias but also claims a settled seat's key, and
+  evicts neither holder. `a_stale_own_edition_is_not_refused_by_a_settled_seat` sends a
+  holder's first edition again after a key it listed has passed to another account whose
+  seat has settled: it is accepted as a no-op with no conflict warning, on a node that saw
+  it and on one that did not, where it still lowers the anchor to its own date.
+  `young_seat_still_merges_by_created_at` decides at an hour exactly: the earlier claim
+  ends up holding the seat in either arrival order (it evicts the holder, or the holder is
+  refused), a member's aux-key claim evicts a young repository, and an order loss logs
+  `incumbent_settled=false`.
+  `handle_judges_seat_age_by_the_node_clock` goes through `handle` with the real clock.
+  `replay_reaches_the_decision_made_while_the_seat_was_young` lets a claim win while the
+  seat is minutes old, leaves the evicted holder's event in the relay database, and then,
+  with both dates decades old, requires the winner after `boot_reconcile` over the same meta
+  store, after a rebuild into an empty one (newest event first, the case a clock would get
+  wrong) and after replays by hand in both orders. Eight older tests that date their
+  seats in 1970 now decide those conflicts at a clock under an hour after the dates
+  (`WHILE_YOUNG`): five expect an earlier claim to win and would see it refused at the
+  real clock (`eviction_cleans_loser_footprint`, the two `stale_record_*` tests,
+  `same_tenant_replacement_cadence`, `key_conflict_winning_replacement_exempt_from_cadence`);
+  two would still pass but no longer catch the fault they are about, since the settle rule
+  would refuse their squatter whatever the anchor said
+  (`same_tenant_replacement_preserves_anchor`, `stale_same_tenant_edition_lowers_anchor`);
+  and in `unlisted_sender_takes_part_in_no_conflict` the refused sender has to be one that
+  would otherwise win. `write_transaction_refuses_without_the_early_check` only passes the
+  clock to `apply`, which now takes it. The integration suites give a seat they expect to
+  lose a first edition at most 600 seconds older than the start of the test (`exit15` and
+  `exit22` in `private_repos`; the backdated claims of `exit8` in `private_two_node`, 650
+  seconds back, are winners), so none of them reaches the settle age.
+  `exit21_settled_seat_is_kept_on_both_nodes` in `private_two_node` exercises the rule on a
+  pair without waiting: a seat dated two hours back is settled on arrival, reaches B through
+  sync, and a claim dated before it is refused by both nodes with the conflict answer, by B
+  against the seat sync delivered, while both keep serving the holder's registration
+  alone. The log capture of the unit tests installs, once per test binary, a global
+  subscriber that takes every warning and discards it: without one, a warning first reached on another test's
+  thread while a capture is the only subscriber is cached by tracing-core as unwanted, and
+  the capture misses its own line.
 - `grasp_p_node_refuses_to_start_on_git_older_than_2_42` in `private_repos` is the only test
   of the call to the git check in `src/server.rs`. It starts a GRASP-P node with a fake `git`
   that reports 2.39.5 first on `PATH` and requires the refusal, so it fails when a sync

@@ -137,7 +137,10 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
 - **Key rules**: proof of possession, no key reused across aliases, state roots only from
   write keys.
 - **Conflicts**: if two tenants claim the same alias or key, the earliest first registration
-  wins on every node, so partitioned nodes agree.
+  wins on every node, so nodes partitioned for less than an hour agree. Since anyone can
+  date a registration early, that holds only while a repository is under an hour old: after
+  that no other account can take its alias or any of its keys. In its first hour another
+  admitted account can still take it; the node alerts with that account's key.
 - **Quotas**: per tenant, per repo and global byte budgets. A state root is charged for the
   blobs it declares even before they are uploaded.
 - **Rate limits**: per write key, and on how often a registration may be replaced.

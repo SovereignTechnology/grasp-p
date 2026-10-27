@@ -71,16 +71,41 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   is the one with the **lowest created_at**, ties to the **lowest event id** — compared against the
   holder's **FIRST-edition anchor** (`first_created_at`/`first_event_id`), never the latest edition
   and never node-local `registered_at`. Both operands are event-intrinsic, so partitioned nodes
-  converge on the same winner. Same-tenant replacement PRESERVES the anchor; authentic older
-  same-tenant evidence LOWERS it (late-witness self-heal). This comparator and same-tenant
-  replacement ordering (newest wins) are strict duals — pinned by test, never merged.
+  converge on the same winner while the contested seat is young (see Settled seats below: after a
+  partition of more than an hour each node keeps the seat it had). Same-tenant replacement
+  PRESERVES the anchor; authentic older same-tenant evidence LOWERS it (late-witness self-heal).
+  This comparator and same-tenant replacement ordering (newest wins) are strict duals — pinned by
+  test, never merged.
+- **Settled seats [N]**: the signer chooses `created_at`, so the order alone lets anyone who
+  registers second win by dating before the holder. A holder whose FIRST-edition anchor is more
+  than **3600 s** older than the node's clock (`SEAT_SETTLE_SECS`, a constant, not a setting) is
+  therefore never the loser, neither of its alias nor of any `w`/`aux` key: the incoming
+  registration gets the ordinary conflict message, as for any lost conflict, and the operator
+  warning says `incumbent_settled=true`. Younger seats merge by the order alone, so nodes that saw a
+  fresh conflict in different orders still agree. An edition of the sender's own seat no newer than
+  its stored one changes no claim (it is an accept-no-op), so it is judged by the order alone. The
+  age is the anchor's, so two nodes holding the same anchor judge a seat settled at the same moment;
+  a rebuilt or late-joining node anchors on the newest edition it holds, so a seat with an edition
+  from the last hour is young there only. A **boot reconcile judges by the clock only the seats the
+  meta index held before it began**, and a seat it creates itself by the order alone: a stored
+  registration the index does not hold is a holder the node evicted and failed to prune (a refused
+  registration is never stored), so against a seat already held it is decided as it would be
+  live, and a refusal by age there deletes nothing; a rebuild of the meta index, which creates
+  every seat, decides by the order. The cases where a restart or a rebuild still differs from
+  what the node decided are in §7. A node must not start on a meta index older than its relay
+  database. This is the one place a node-local value, the clock, enters the merge: a challenger
+  that one node judges against a seat it holds after that seat settled, and the other judges first
+  or while the seat was young (a seat dated more than an hour back is settled on arrival), is
+  accepted by one and refused by the other (both alert; the watchdog reports it). Protocol v0.2
+  (M4) binds the alias to the hosting key.
 - **Merge-winner exemptions [N]**: node-local state **that is not in the `policy_fingerprint`
   preimage** must never gate a merge winner — a winner is exempt from the alias-count limit, the
   quota *check* (never the charge), and the replacement-cadence bucket. Fresh non-conflict
   registrations keep all three. Admission-mode gates (whitelist/pow) **do** apply to a conflict-merge
   alias takeover (§5), because paired nodes are required to run identical, fingerprint-verified
   admission config — so those gates cannot diverge the merge. They are applied before the merge is
-  evaluated: a sender the mode refuses is neither winner nor loser of anything.
+  evaluated: a sender the mode refuses is neither winner nor loser of anything. The node's clock is
+  the one exception to the first rule, by decision, through the settled-seat rule above.
 - **Loser eviction [N]**: in the winner's meta txn the loser's record, key claims, alias slot,
   blob-claim references, orphaned speculative charges, alias event-bytes column, and state-ring
   editions are all freed; its relay-DB 30640 coordinate is pruned by the async caller. Both conflict
@@ -458,7 +483,9 @@ or a peer the mode is asked before any proof of possession is verified and befor
 evaluated (§2.1, "Order of checks"); an account that already holds the alias is not asked, so an
 account taken off the whitelist can still replace its registrations and cannot take a new alias. The
 decision is one function of the node's configuration and the event. A boot reconcile asks the mode
-after the conflict checks, as before, so that a stored conflict loser is still pruned.
+after the conflict checks, as before, so that a stored conflict loser is still pruned, and judges
+a conflict with a seat the meta index held before it by that seat's age, and one with a seat it
+creates by the order alone (§2.1, "Settled seats").
 
 Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
 Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
@@ -589,8 +616,9 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 | Non-member npub | No keys ⇒ cannot read; blob PUT and 30641 gated by registered write key + PoP. **Not** gated: `GET /<sha256>` is unauthenticated, so a non-member who learns a hash (state roots are public and name them) can download that (encrypted) blob. `GET /list/<pubkey>` answers only the listed pubkey (§1, §2.4) |
 | Malicious reader-member | Blobs content-addressed immutable; 30641 needs a `w` key; rekeys authenticated by the tenant signature, not by the derivable outer key |
 | Removed member | Forward-only: keeps old clone; post-rotation cannot push, learn new keys, or read new content |
-| Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat loses to the live+1 widen and is evicted); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
-| Cross-node split-brain | First-edition-anchored deterministic merge; node-local state never gates a winner; `policy_fingerprint` parity; watchdog |
+| Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat under an hour old loses to the live+1 widen and is evicted; an older one is a settled seat and keeps the address); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
+| Backdating tenant or member | Settled seats (§2.1): a seat over an hour old keeps its alias and its keys against another account's registration, however dated; inside the first hour the order decides, the eviction alerts with the offender's key and the account is closed; alias bound to the hosting key in v0.2 |
+| Cross-node split-brain | First-edition-anchored deterministic merge; node-local state never gates a winner, the clock of the settled-seat rule excepted; boot reconcile judges held seats by age and the seats it creates by the order; `policy_fingerprint` parity; watchdog |
 | Malicious tenant (abuse) | Quotas, speculative-claim charging, global budget, admission modes, per-write-key + cadence buckets, per-IP nginx zones, denylist/451, 1984 intake |
 | Mirror SSRF | Private-IP block, no redirect-follow, https-only default, sha+size-bounded, peer allowlist |
 
@@ -602,10 +630,20 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - **Residuals [I]**: ciphertext store-now/decrypt-later; removed-member re-fetch of old ciphertext;
   epoch lineage visible to the operator (the price of quotas); the relay dial to a peer is vetted
   on one DNS answer and not pinned to it (the blob mirror is); sizes/timing side channels (padding defaults **[D]**); an
-  attacker backdating BELOW the true first edition wins the §3.2 merge (inherent to the created_at
-  anchor); if edition 1 is purged from every sync source, a late-joining node anchors on its
-  first-witnessed edition until the victim re-mints an earlier registration; ≥3-party conflict
-  chains converge only with sync redelivery (the earliest registrant always keeps its seat); spec
+  admitted account backdating BELOW a seat's first edition wins the §3.2 merge on every node while
+  that seat is under an hour old, so it can take a repository's alias, or, holding one of its keys,
+  the whole repository, in its first hour (alert with the offender's key; the account is closed;
+  the alias binding of v0.2 closes it); a challenger that one node judges against an already
+  settled seat and the other judges first or while the seat was young (around the moment a seat
+  settles, or at any time for a seat dated more than an hour back) splits the pair until operator
+  action, with no repair tool before the offboarding work; a conflict planted across a partition
+  longer than an hour no longer heals; a rebuild of the meta index seats a leftover the node failed
+  to prune over a winner that has since published a later edition, or over another account that
+  took the leftover's alias after it, and a restart can still let such a leftover evict that
+  account's seat while it is under an hour old; if edition 1 is purged from every sync source, a late-joining
+  node anchors on its first-witnessed edition until the victim re-mints an earlier registration,
+  which wins there only while the squatter's seat is under an hour old; ≥3-party conflict chains
+  converge only with sync redelivery (the earliest registrant always keeps its seat); spec
   charges carried by a dead scope leave a bounded unbilled window until the survivor's next 30641;
   `t:`/`g:` event-byte stranding on registration death; a live squatter saturating their own quota
   blocks a rekey at their claimed address until operator action; byte quotas do not bound
@@ -626,6 +664,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 ## 8. Amendments since v0
 
 - §2.1 — §3.2 deterministic merge + FIRST-edition anchor + winner exemptions + loser eviction (v0: bare "first-registrant-wins").
+- §2.1, §5, §6, §7 — settled seats: a seat whose first edition is more than an hour older than the node's clock is never the loser of a conflict, by alias or by key; the warning carries `incumbent_settled`; a boot reconcile judges the seats its meta index held by their age and the seats it creates by the order alone; no message text changed.
 - §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
 - §2.1, §5, §5.2 — order of checks in registration: shape (key cap first) before admission, admission before proofs of possession and before the conflict merge; an account that holds the alias is exempt from the mode; no message text changed. A node under a mount path is named by host and path in `relays`/`server`.

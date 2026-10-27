@@ -99,7 +99,8 @@ push; `git status` before every commit.
   - `GET /list` reported `uploaded: 0`. A claim now records when the node first stored the
     blob, and the list and the upload descriptor report it.
   - `WWW-Authenticate: Nostr` on every 401 of the blob routes and on no other status.
-- **#25** per-tenant claim/file-count caps; **#26** mirror fairness (**done**, below); **#20**
+- **#25** per-tenant claim/file-count caps (decided on 2026-10-27: a minimum billable size,
+  no count; below); **#26** mirror fairness (**done**, below); **#20**
   purgatory SSRF and **#3** DNS rebinding (both via `outbound.rs`; the mirror half of #3
   **done**, below); **#16** announcement-indexer pin + leak canary.
   - **#26 done.** The mirror keeps one queue per account and serves them in turn, an
@@ -131,27 +132,43 @@ NIP-11 probe, the wider reach of #10, the base-path check, the second SSRF switc
 project yet.
 
 - **Report the unverified-sync flaw upstream** (ngit-grasp and nostr-sdk; `SEAMS.md`,
-  "Synced events are verified here"). The fork is fixed. Needs the maintainer's go-ahead,
-  and our seam goes when upstream verifies for itself.
+  "Synced events are verified here"). The fork is fixed. Reported on 2026-10-27, under the
+  decision on upstream reports (below); our seam goes when upstream verifies for itself.
 - **Upstream's NIP-11 probe follows redirects and reads an unbounded body** (done)
   (`src/sync/relay_connection.rs`), past the outbound target policy. The fork's probe
   follows no redirect, uses no proxy, reads at most 256 KiB, and checks an event-directed
   target on every call and, under the default target policy, connects only to the
   addresses that check vetted; not behind the GRASP-P switch (`SEAMS.md`, "The NIP-11
-  probe is vetted, pinned and bounded here"). Beside #20. Still open: offering the change
-  upstream, which needs the maintainer's go-ahead; our seam goes when upstream hardens
-  the probe itself.
-- **Alias takeover by backdating.** A cross-tenant alias conflict is won by the lowest
-  `created_at`, which has no lower bound, so any admitted tenant can evict another's alias,
-  and the loser's blobs are collected after the grace period. Bound the winner and do not
-  strip the loser's blob claims without an operator. The runbook understates this.
+  probe is vetted, pinned and bounded here"). Beside #20. Offered upstream on 2026-10-27
+  with the unverified-sync report (below); our seam goes when upstream hardens the probe
+  itself.
+- **Alias takeover by backdating** (done, the server half). A cross-tenant conflict was won
+  by the lowest `created_at`, which has no lower bound, so any admitted tenant could evict
+  another's alias, or, holding one of its keys (every member holds the shared aux key), the
+  whole repository, and the loser's blobs were collected after the grace period. Now a seat
+  whose first edition is more than an hour older than the node's clock is never the loser,
+  by its alias or by any of its keys (`SEAT_SETTLE_SECS`, a constant, not a setting); younger
+  seats merge as before, so two nodes that saw a fresh conflict in different orders still
+  agree. The refusal is the ordinary conflict answer, and the warning carries
+  `incumbent_settled=true`. A replay at start-up judges the seats the meta store already held
+  by their age, as live (a refusal by age there deletes nothing), and the seats it creates (a
+  rebuild) by the order alone; the cases where a restart or a rebuild still differs from the
+  live decision are listed in SEAMS.md and the runbook, and a node must never start on a meta
+  store older than its relay database. The runbook and both specs say so. See "A settled
+  seat is not displaced" in [`SEAMS.md`](SEAMS.md). Still open: a repository can be taken in
+  its first hour (M4 binds the alias to the account key); the node's clock now enters the
+  merge, so a challenger that arrives just as a seat settles, or one racing a seat dated more
+  than an hour back, can split the pair, with no repair tool before the offboarding work
+  (#1); the loser's blob claims are still stripped at eviction.
 - **Who may delete.** A kind 5 or a vanish request signed by a write key or a stream key is
   honoured for state roots and stream wraps, so a read-only or revoked member can delete a
-  repository's stream history and block the shared stream key. Decide with #1.
+  repository's stream history and block the shared stream key. Decided on 2026-10-27: only
+  the account key deletes, and only a whole repository (below).
 - **Offboarding (#1) is half there.** An accepted deletion of a registration already frees
   the alias, the key claims and the blob claims. Missing: the tombstone and retention window
   (`NGIT_GRASP_P_OFFBOARD_RETENTION_SECS` is read and unused) and removal of the stored
-  state roots and wraps. The text of issue 1 predates this.
+  state roots and wraps. The text of issue 1 predates this. The hold is decided: 30 days,
+  restorable by the same account key (below).
 - **The hold for out-of-order events is capped by count only**, and an event is held before
   its size is checked. One sync relay can pin about 4096 x 5 MB. Give it a byte budget and
   do not hold what can never be admitted. **Done:** the size is checked first, only a
@@ -175,7 +192,8 @@ project yet.
   close to it can still have mirror fetches refused with `quota`; and the client does
   not retry these answers yet.
 - **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the
-  charge on the uploader for good, at no cost to itself.
+  charge on the uploader for good, at no cost to itself. Decided on 2026-10-27: every
+  referencing repository pays the full size (below).
 - **Order of checks in registration** (done). Proofs of possession were verified before
   the key count was capped and before the admission mode was consulted, and the mode was
   consulted after the conflict merge, so an anonymous sender could cost CPU and raise the
@@ -199,14 +217,15 @@ project yet.
   only after the denylist and existence checks, so a taken-down blob gets the 451. Errors
   and 404s say `no-store`. Upload temp files left by an earlier run are removed when the
   store is opened. Still open: the operator's event blacklist does not apply to the blob
-  routes.
+  routes; decided on 2026-10-27 that a blocked account's writes are frozen on both nodes
+  (below).
 - **Denylist reload** (done). The reload now starts from what the boot load read, so a file
   that can no longer be read or parsed keeps the entries it had at boot when another file
-  changes. Still open, and the maintainer's to decide: **what a missing denylist file
-  means.** Today a file that is absent counts as empty, at boot and on reload, so a file
-  that disappears (an unmounted volume, a deploy that is not atomic) lifts its takedowns
-  within one reload interval. The alternative is to keep its last-known entries until a
-  readable file no longer lists them.
+  changes. Still open: **what a missing denylist file means.** Today a file that is absent
+  counts as empty, at boot and on reload, so a file that disappears (an unmounted volume, a
+  deploy that is not atomic) lifts its takedowns within one reload interval. Decided on
+  2026-10-27, not built yet: keep its last-known entries until a readable file no longer
+  lists them (below).
 - **Peers** (done). A configured peer, which is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`
   (the bootstrap relay counted as well at first, and no longer does; see the next point),
   is kept when its session ends, is not muted by the naughty list, and is dialled
@@ -288,6 +307,11 @@ No private repo is live anywhere, so v0.2 breaks compatibility freely. Decisions
   carrying identical keys and picks a deterministic winner on a true race (Concord's rule) instead
   of failing. Subsumes **#15**, **#24**, **#26**; still do **#23/#31** (validate and size-check the
   rekey before publishing anything).
+- **Alias bound to the account key** (decided 2026-10-27; see the M3 decisions below). The
+  registration commits its alias to the hosting key, so no other account can ever register an
+  alias that is taken; the server checks it from the event alone and the alias half of the
+  conflict merge goes. Until then the server protects repositories older than one hour (M3).
+  The client, both specs and the GRASP draft change with it.
 - **Invites are real NIP-59**: the seal is signed by the inviter's own key (**#17**); `join` checks
   the inviter against the owner-signed roster and the delivered keys against the live repo.
 - Remaining defects: **#22** per-working-tree CAS anchor, **#25** "none valid" is not "never
@@ -468,3 +492,54 @@ Do not reopen these without the maintainer.
 - Storage is sold per account, with any number of private repositories inside it. An account is
   one hosting key, so all of a customer's repositories register under one key, which lets the
   server link them.
+
+## Decisions taken for M3 (2026-10-27)
+
+Do not reopen these without the maintainer either. Each is the option that was recommended
+when the question was put.
+
+- A stored blob that several repositories reference is paid by every one of them, at its full
+  size, while it references it; two repositories of one account count it twice in v1, and the
+  disk keeps one copy (#5). An account's bill then depends on its own repositories alone, and
+  both nodes of a pair compute the same ledger in any arrival order.
+- Small objects are billed at a minimum of 16 KiB per stored or declared blob, with no separate
+  count of objects (#25). The minimum is advertised in NIP-11 and stated wherever plans are
+  described. Objects are then bounded by bytes at every scope, and the per-account limit record
+  of M9 needs no object field.
+- Only the account (hosting) key deletes anything from the server, and only a whole repository,
+  through its registration. Members cannot delete from the server: clients hide content through
+  the encrypted stream, and the site says that the ciphertext stays until the repository is
+  deleted. The server cannot tell members apart behind a shared key, so any deletion by a member
+  would be a right for every member to delete everything.
+- A deleted repository, or a closed account, is held for 30 days and can be restored by the same
+  account key; its bytes count against the allowance until the purge (#1). A NIP-62 vanish closes
+  the account under the same hold. The deletion request itself stays public under upstream's
+  retention, and the privacy text says so. The site promises erasure within 30 days, plus one day
+  of blob grace.
+- A repository older than one hour cannot be displaced by another account, by its alias or by any
+  of its keys (done in M3; above). In M4 the alias is bound to the account key in the v0.2 wire
+  format, so that no other account can ever register it. Accepted until then: an admitted account
+  can take a repository's alias in its first hour; the node alerts with that account's key, and
+  the account is closed. Accepted with it: the node's clock enters a merge decision, so the two
+  nodes can disagree about a challenger that arrives just as a repository turns one hour old, and
+  the tool to repair that arrives only with the offboarding work.
+- An account on `NGIT_EVENT_BLACKLIST` is frozen on both nodes: no new registrations, state
+  roots, stream wraps, uploads or deletions, by the account or by any of its registered keys.
+  Reads and `/list` keep working, so a customer can take their data and leave; removing content
+  stays the denylist's job. The list joins the policy fingerprint, so each change needs both
+  nodes restarted with the same list until M9's reload path takes it over.
+- Reports (kind 1984) that point at private-repository events are logged and counted as today,
+  then refused: they are neither stored nor served. The runbook asks reporters to include the
+  blob key, so a stored report would publish that key beside a public blob, and an accusation
+  against a customer's repository with it. The log line and the counter stay the operator's
+  intake.
+- A denylist file that was loaded and then disappears keeps its takedowns: the node keeps its
+  last-known entries and logs an error, and a takedown is lifted only by a readable file that no
+  longer lists the hash. A file missing at boot is still tolerated.
+- Findings in upstream's own code go upstream in two batches. Ordinary robustness and
+  documentation fixes are offered as they land here. The security-relevant ones (the NIP-11
+  probe, `/metrics` open with CORS `*`, the related-event anchors, the NAT64 and 6to4 gap) go
+  privately with the unverified-sync report, after the operator's own public instance has been
+  checked. Each offer still needs the maintainer's go-ahead at the time. The unverified-sync
+  report and the NIP-11 and NAT64 items went upstream on 2026-10-27; the `/metrics` and
+  related-event items follow later.

@@ -138,7 +138,15 @@ What this means in operation:
 - **At start-up** the node re-applies the registrations in its own relay
   database that its meta store lacks. There the conflict checks still come
   before the mode, so a leftover loser of an old conflict is removed even
-  when its author is no longer admitted.
+  when its author is no longer admitted. A conflict met there against a
+  seat the meta store already held is judged as it would be live, by the
+  order and by the seat's age (a refusal by age deletes nothing); against
+  a seat the replay itself created (a rebuild of a wiped meta store) by the
+  order alone ([Registration conflict](#registration-conflict)). A restart
+  or a rebuild can still differ from what the node decided when the events
+  first arrived in the cases listed in §10 ("A rebuild meets leftovers",
+  "Three or more parties"). Never start on a meta store older than the
+  relay database (§9, "Restores").
 
 ### Under a base path
 
@@ -632,11 +640,22 @@ base interval (the boot repair scan queues every missing blob anyway).
 What it means: the deterministic `(created_at, id)` merge resolved a
 cross-tenant conflict in the last 5m — every conflict is either a
 split-brain heal or an attempted alias/key squat (metric help text,
-src/metrics/mod.rs:318–326).
+src/metrics/mod.rs:318–326), or, since seats settle, a split that does not
+heal (step 6).
 
 - `resolution="stored_evicted"` — a previously accepted registration lost
   its seat: key claims freed, record dropped, relay-DB coordinate pruned.
 - `resolution="incoming_rejected"` — the arriving registration lost.
+
+The merge order alone (lowest `created_at` wins) can be beaten by anyone
+who dates a registration before the holder's, so it is not the whole rule.
+**A seat whose first edition is more than an hour older than the node's
+clock is never the loser**, neither of its alias nor of any of its keys: a
+registration dated before it is refused with the ordinary conflict message,
+and its warning carries `incumbent_settled=true`. Seats younger than that
+merge by the order alone. The hour is a constant (`SEAT_SETTLE_SECS` in
+src/grasp_p/registration.rs), the same on both nodes, and counted from the
+first edition's `created_at`, not from when the node stored it.
 
 Only senders the node admits can cause either. In `whitelist` mode a
 registration from an account that is not listed is refused by the mode before
@@ -653,18 +672,57 @@ journalctl -u ngit-grasp --since -24h | grep 'private registration conflict'
 ```
 
 Log fields — incoming loss: `alias`, `loser_tenant`, `loser_created_at`,
-`loser_event_id` (src/grasp_p/registration.rs:698–705); eviction: `alias`,
-`loser_tenant`, `winner_tenant`, `winner_created_at`, `winner_event_id`
-(src/grasp_p/registration.rs:717–725).
+`loser_event_id`, `incumbent_settled`; eviction: `alias`, `loser_tenant`,
+`winner_tenant`, `winner_created_at`, `winner_event_id` (both warnings in
+`apply`, src/grasp_p/registration.rs).
 
 1. Determine the genuine tenant. Lowest `created_at` wins, ties break to the
    lowest event id, compared against the seat's FIRST-edition anchor
-   (src/grasp_p/registration.rs:184–208).
-2. Split-brain (both sides genuine, admitted under partition): nothing to
-   repair — the merge is deterministic and both nodes converge on the same
-   winner. Confirm parity with the watchdog (§7) before the next sync round.
+   (`incoming_wins_conflict`), unless the seat had settled (`challenge`, both
+   in src/grasp_p/registration.rs).
+2. Split-brain (both sides genuine, admitted under partition): if each
+   registration reached the other node while the seat it challenges there
+   was under an hour old, nothing to repair — the merge is deterministic and
+   both nodes converge on the earlier registration. Confirm parity with the
+   watchdog (§7) before the next sync round. If one arrived after that seat
+   had settled (a partition of more than an hour, or a delivery that waited
+   for the hourly full re-issue), each node keeps its own seat, at least one
+   node's warning carries `incumbent_settled=true`, and the split does not
+   heal: step 6.
 3. Squat attempt: note the squatter's tenant npub; if it repeats, escalate
    via `NGIT_EVENT_BLACKLIST` (§4 step 8).
+4. `incumbent_settled=true`: a registration dated before a seat over an hour
+   old claimed its alias or one of its keys, and was refused; nothing
+   changed, nothing to repair. By the order alone it would have won, so it is
+   never an ordinary merge. Usually `loser_tenant` backdated a claim against
+   an established repository (every member holds a repository's shared aux
+   key): handle it as a squat attempt (step 3). Two other cases look the
+   same. If `loser_tenant` already holds an older repository and this was a
+   new edition of it claiming a key (a widen), the squatter is the holder of
+   that key, and the client falls back to a minimal widen (§5). If the peer
+   was cut off for over an hour, a genuine registration may have reached
+   this node after another account took the seat here: check the other node
+   (step 6). The field describes only the first conflict the registration
+   lost, in the order the node checks them (the alias, then its w keys, then
+   its aux keys, each in tag order): one that loses by the order at an
+   earlier check reports `false` even when a later claim of it was backdated
+   against a settled seat, and the sender chooses the order of its keys. An
+   `incumbent_settled=false` loss by an account with a history of conflicts
+   is therefore still worth the squat check of step 3.
+5. `stored_evicted` and the winner is not the genuine tenant: a repository
+   was taken in its first hour, which the rule still allows (a seat under an
+   hour old merges by the order alone). The offender is `winner_tenant`;
+   close the account (§4 step 8). The victim registers the repository again
+   (a new alias).
+6. The two nodes disagree about a seat (watchdog registration parity FAILs
+   for the alias, alerts on both nodes): a challenger reached them on either
+   side of the moment the seat settled, or reached one of them first while
+   the other already held a seat that was settled on arrival, so the two
+   nodes kept different registrations. A rebuilt or late-joining node that
+   anchored a seat on a recent edition ends the same way (§10). This does not heal by itself, since each
+   node now holds a settled seat. There is no repair tool until the
+   offboarding work (issue 1); until then the victim registers the
+   repository again and the offender's account is closed.
 
 Dedup note: the `incoming_rejected` counter increments once per loser EVENT
 id per hour per process (FG dedup, in-memory — src/grasp_p/registration.rs:224–281);
@@ -1155,7 +1213,7 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | `restricted: quota exceeded` | registration/wrap over quota (src/grasp_p/registration.rs:552, src/grasp_p/mod.rs:852) | genuine | free space or ask operator for quota |
 | `restricted: tenant is not on the registration whitelist` | whitelist mode, for an alias the sender does not hold; decided before any proof is verified and before any conflict (`new_seat_admission` in src/grasp_p/registration.rs) | genuine | ask operator to admit the npub |
 | `restricted: registration requires N bits of NIP-13 proof of work` | pow mode, same place | genuine | re-mine the 30640 |
-| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss, for a sender the mode admits (`apply` in src/grasp_p/registration.rs) | genuine | pick another alias / minimal widen without the squatted keys |
+| `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss, for a sender the mode admits: the holder's first edition is earlier, or the holder's seat is more than an hour old (`apply` in src/grasp_p/registration.rs) | genuine | pick another alias / minimal widen without the squatted keys |
 | `invalid: registration relays tag must list this node` / `invalid: registration server tag must list this node` | no value of the tag names this node: its host and port, and its mount path when it runs under `NGIT_BASE_PATH` (`parse_shape`) | genuine | publish the registration with this node's full URL in both tags |
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
 | HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/grasp_p/mod.rs:175, 189) | takedown | none — operator action only |
@@ -1422,11 +1480,21 @@ Assert:
 **Backups.** The relay DB under `NGIT_RELAY_DATA_PATH` (default
 `./data/relay`) is the source of truth for registrations — the private meta
 index (`<relay_data_path>/private-meta`, override
-`NGIT_GRASP_P_META_DATA_PATH`) is rebuilt from it by `boot_reconcile` (§1).
-Blob bytes under `<relay_data_path>/blobs` (override
+`NGIT_GRASP_P_META_DATA_PATH`) is rebuilt from it by `boot_reconcile` (§1)
+when it is missing. Blob bytes under `<relay_data_path>/blobs` (override
 `NGIT_GRASP_P_BLOB_DATA_PATH`) are NOT rebuildable — losing them is data
 loss; back them up. (Generic storage notes: configuration.md
 §`NGIT_RELAY_DATA_PATH`.)
+
+**Restores.** Never start a node on a meta index older than its relay DB.
+At a restart the seats the meta index already holds are judged by their
+age, so a registration the node accepted after that copy was taken is
+refused against a settled seat there (kept in the relay DB, not deleted)
+while the peer holds it: watchdog registration parity FAILs. Restore the
+relay DB and the meta index from one snapshot taken with the service
+stopped, or restore the relay DB alone and delete `private-meta`, so the
+start rebuilds the index from it. The same applies to the rebuild under a
+stricter mode (§1): delete the index, do not restore an old one.
 
 **Config changes.** Keep all four sources in sync — src/config.rs,
 docs/reference/configuration.md, nix/module.nix, .env.example (AGENTS.md
@@ -1467,11 +1535,52 @@ Pointers, not procedures:
   own quota blocks the genuine rekey at the claimed address until operator
   action (their tenant npub is operator-visible — §3 Registration conflict);
   FG conflict-alert dedup is in-memory (one re-alert per restart/TTL at
-  most); a squatter backdating BELOW the true first registration edition
-  wins the §3.2 merge on nodes that never witnessed edition 1 — victim
-  self-heal is re-minting with `created_at` ≤ the squatter's
-  (src/grasp_p/registration.rs:625–636); ≥3-party conflict chains converge
-  only via sync redelivery.
+  most); ≥3-party conflict chains converge only via sync redelivery.
+- **Backdating in a seat's first hour.** A registration dated before a
+  seat's first edition wins the §3.2 merge on every node, not only on nodes
+  that missed an edition, while the seat is under an hour old: an admitted
+  account can take a repository's alias in its first hour, or, holding one
+  of its keys, the whole repository, and the repository's blobs are
+  collected after the grace period. It raises `NgitPrivateRegistrationConflict`
+  (`stored_evicted`, the offender in `winner_tenant`), and the account is
+  closed ([Registration conflict](#registration-conflict) step 5). A seat
+  older than an hour is never displaced. M4 binds the alias to the account
+  key, so that no other account can register it at all.
+- **The node's clock in the merge.** Whether a seat has settled is judged by
+  each node's own clock, so a challenger that reaches the two nodes on either
+  side of that moment is accepted by one and refused by the other, and so is
+  one that reached the other node first when the seat was already over an
+  hour old on arrival (backdated by its signer, or delivered late). The lag
+  is seconds when live sync carries the challenger, but up to the hourly
+  full re-issue (`NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS`, 3600 s by
+  default) when it does not, so a winner of a seat's first hour that misses
+  live delivery to the peer can split the pair. Both alert, the watchdog
+  reports it, and the split does not heal by itself. There is no repair
+  tool until the offboarding work (issue 1). Keep both nodes' clocks
+  synchronised. For the same reason a conflict planted across a partition
+  longer than an hour no longer heals: each node keeps its seat.
+- **Late-witness anchors.** On a node that never saw a seat's first edition
+  (it was replaced everywhere before this node synced), any registration
+  dated before the edition the node saw wins there while that edition is
+  under an hour old, and the other node refuses it (by the order if it is
+  dated after the first edition, as settled if before), so the pair splits
+  (Registration conflict, step 6). A node whose meta store was rebuilt is
+  in the same position for every seat. The victim's self-heal, re-minting
+  with `created_at` ≤ the squatter's, works only while the squatter's seat
+  on that node is under an hour old (the R2-B note in `apply`,
+  src/grasp_p/registration.rs).
+- **A rebuild meets leftovers.** A rebuild of a wiped meta store decides
+  by the merge order alone and anchors each seat on its newest stored
+  edition. A registration the node evicted but failed to prune then takes
+  the seat back on this node, while the peer keeps the winner (Registration
+  conflict, step 6), when the winner has published a later edition, or when
+  the leftover's alias was freed and taken by another account dated after
+  it. A restart over the same meta store keeps the first-edition anchors,
+  and judges another account's seat by its age, so there a leftover can
+  evict such a seat only while it is under an hour old.
+- **Three or more parties.** A chain of conflicts (A and B share one key,
+  B and C another) is not order-independent at a replay or a rebuild: a
+  later registrant can lose its seat there until sync redelivers it.
 - **WS-path per-IP limiting gap**: nginx `limit_req` cannot inspect frames
   inside a long-lived WS connection — the per-IP outer layer covers the
   HTTP blob routes only; the inner layer is the per-write-key bucket
