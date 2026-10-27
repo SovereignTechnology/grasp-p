@@ -480,13 +480,15 @@ accepted; only dependency rejections are kept, within a count cap and a byte bud
 and outside the policy fingerprint because it changes when an event is retried and never whether
 it is accepted); hourly `since=None` full re-issue with
 a per-peer minimum interval; **pull-only blob mirror** over the peer's public GET with per-blob
-exponential backoff. **[N]** Outbound private-sync connections are *initiated* ONLY to the operator
-allowlist `NGIT_GRASP_P_SYNC_PEER_URLS` — tenant `relays` tags are advisory metadata and never
-trigger a connection (SSRF + membership-map-leak guard). **One exception, by design**: a configured
-`NGIT_SYNC_BOOTSTRAP_RELAY_URL` is connected unconditionally at startup and also carries the
-derived private filters, so it MUST be treated as a trusted private-sync peer — it learns the same
-registration-derived `#d`/`authors` filter set as an allowlisted peer, i.e. the tenant's alias and
-key map. Do not point it at a relay you would not put on the allowlist. Mirror SSRF guard:
+exponential backoff. **[N]** Private-repo events replicate ONLY between the relays on the operator
+allowlist `NGIT_GRASP_P_SYNC_PEER_URLS`, in both directions: only those relays are sent the
+registration-derived `#d`/`authors` filters (the tenants' alias and key map), and a 30640, 30641 or
+stream wrap that relay sync brings from any other relay is refused before admission. Tenant
+`relays` and `server` tags are advisory metadata and never trigger a relay connection (SSRF +
+membership-map-leak guard); the blob mirror still takes its peers from `server` tags while
+`NGIT_GRASP_P_MIRROR_PEER_URLS` is unset, under the mirror SSRF guard below. The relay in
+`NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when the allowlist names it too; otherwise it
+carries the node's public sync alone. Mirror SSRF guard:
 private-IP block, no redirect-following, https-only by default, sha+size-bounded.
 
 ### 5.1 Abuse hardening (phase-4b) [N]

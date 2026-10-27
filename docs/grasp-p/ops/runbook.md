@@ -171,6 +171,47 @@ its domain.
   refuses every registration that does not name the new URL. Have the
   accounts publish new editions first.
 
+### Who a node replicates with
+
+A node replicates private repositories with the relays in
+`NGIT_GRASP_P_SYNC_PEER_URLS` and with no other. Write the other node of
+the pair there, on both nodes; one list for both is fine, since an entry
+that names the node itself is left out.
+
+- **Only a listed peer is sent the private sync filters.** They name every
+  alias and write key the node holds. Every other relay the node syncs with
+  for its public repositories (the user index, the Sync+ fallbacks, relays
+  that announcements name) gets upstream's filters and nothing more.
+- **Only a listed peer may bring GRASP-P events.** A registration, state
+  root or stream wrap that relay sync brings from any other relay is
+  refused before admission, held nowhere and remembered nowhere, so the
+  same event from the peer, or from a client, is taken as ever. The node
+  logs `Refusing GRASP-P events from a relay that is not a configured sync
+  peer` once per relay (up to 1024 relays), and counts each such event in
+  `ngit_private_sync_foreign_source_total`. Such a relay was never asked
+  for them; a rising count means a relay sends what nobody asked for, or
+  the peer is reached under a second name that the list does not spell
+  (another host name, a path, `ws://` for `wss://`).
+- **The bootstrap relay is a peer only when the list names it.**
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` alone no longer wires a pair: such a
+  relay carries public sync only, is retired and redialled as upstream
+  decides, and gets no alias in the scrape. A node whose peer is named only
+  there replicates nothing, and its `NgitSyncPeerDisconnected` fires with
+  value 1. The `policy_fingerprint` still takes the bootstrap relay into
+  its domain set (§2), so such a pair can show equal fingerprints and
+  still not replicate: the list is what counts.
+- **Unset list, no replication.** A node with GRASP-P on and no peer serves
+  its clients and pulls no private repository from any relay. Sync is
+  pull-only and reads are not gated, so any client, and any node that lists
+  this one as its peer, can still fetch its GRASP-P events by REQ and its
+  blobs by GET.
+
+Relay and server tags in a registration are advisory for sync: they tell
+clients where to go and never make the node open a relay connection. Server
+tags still choose the hosts the blob mirror fetches from, under its SSRF
+guard, while `NGIT_GRASP_P_MIRROR_PEER_URLS` is unset; set that list on both
+nodes.
+
 ### A pair on a private network
 
 The two nodes of a pair can reach each other over a private link (a tunnel,
@@ -183,12 +224,13 @@ on for every relay that customers' events name.
   address, and it exempts the relay connection to a configured peer, and
   to no other relay, from the outbound target policy. The second lifts
   that policy for every relay an event names; a pair no longer needs it.
-- **A configured peer** is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS` or the
-  relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`. Name the other node there by
-  the address it has on the private link, for example
-  `ws://10.20.0.2:8080`. The exemption goes with exactly that URL: a
-  customer's event that names another internal address is refused as
-  before, with `Rejecting event-directed sync relay target` in the log.
+- **A configured peer** is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`, and
+  the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` only when the list names it
+  too. Name the other node there by the address it has on the private
+  link, for example `ws://10.20.0.2:8080`. The exemption goes with exactly
+  that URL: a customer's event that names another internal address is
+  refused as before, with `Rejecting event-directed sync relay target` in
+  the log.
 - **Set `NGIT_GRASP_P_MIRROR_PEER_URLS` as well**, to the other node's blob
   address on the link. With the list unset the mirror takes its peers from
   the `server` tags of registrations, and with private addresses allowed
@@ -206,9 +248,9 @@ on for every relay that customers' events name.
   `NGIT_GRASP_P_SYNC_PEER_URLS` names: `Skipping private-repo peer relay`
   in its log, events flow one way only, and `NgitSyncPeerDisconnected`
   with value 1 on that node
-  ([Sync peer disconnected](#sync-peer-disconnected)). A peer that
-  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` names is still dialled there, so events
-  arrive in both directions and only the blobs do not.
+  ([Sync peer disconnected](#sync-peer-disconnected)). A listed peer that
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` names as well is still dialled there, so
+  events arrive in both directions and only the blobs do not.
 - **With the setting `false`**, the default, a peer that only
   `NGIT_GRASP_P_SYNC_PEER_URLS` names must be `wss://` on a public address,
   like any relay. The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is the
@@ -413,26 +455,25 @@ monitoring system. So the `relay` label is rewritten before a scrape is sent:
 
 - **Your configured peers appear under an alias**: `peer-1`, `peer-2`, … The
   peers are the entries of `NGIT_GRASP_P_SYNC_PEER_URLS`, numbered in the
-  order you wrote them, and then the relay in
-  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, which takes the next number unless the
-  list already names it. In the list, different spellings of one relay
-  (`relay.example/`, `https://relay.example`, `wss://relay.example`) are one
-  peer, and an entry that names the node itself takes no number. The
-  bootstrap setting takes a `ws://` or `wss://` URL or a bare host; an
-  `http://` or `https://` value there is never dialled (the startup log says
-  `Rejecting invalid bootstrap relay target`) and gets no alias.
+  order you wrote them
+  ([Who a node replicates with](#who-a-node-replicates-with)).
+  In the list, different spellings of one relay (`relay.example/`,
+  `https://relay.example`, `wss://relay.example`) are one peer, and an
+  entry that names the node itself takes no number. The relay in
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` has an alias only when the list names
+  it, and then the number of its entry.
 - **On a pair the alias is `peer-1` on both nodes.** `peer-1` on node A is
-  node B, and `peer-1` on node B is node A, whichever of the two settings
-  names the other node. Prometheus's `instance` label says which node a
-  series came from, and with that which node its `peer-1` is. Each node is
-  scraped on a loopback address, so where both use the same port the default
-  `instance` is the same on both: give each node its own `instance` (or
-  another label) in its scrape configuration.
+  node B, and `peer-1` on node B is node A. Prometheus's `instance` label
+  says which node a series came from, and with that which node its
+  `peer-1` is. Each node is scraped on a loopback address, so where both
+  use the same port the default `instance` is the same on both: give each
+  node its own `instance` (or another label) in its scrape configuration.
 - **Every other relay has no series of its own in the scrape**: the relays
   that customers' repositories name, the user-index relays, the Sync+
-  fallbacks. The node serves its public repositories from the same process,
-  so the relays those bring in are left out as well. All of them are still
-  counted in three aggregates, which carry no relay label:
+  fallbacks, and a bootstrap relay the list does not name. The node serves
+  its public repositories from the same process, so the relays those bring
+  in are left out as well. All of them are still counted in three
+  aggregates, which carry no relay label:
   `ngit_sync_relays_tracked_total`, `ngit_sync_relays_connected_total` and
   `ngit_sync_naughty_relays_total`. `ngit_sync_relays_dead_total` is in the
   scrape as well, but the server never updates it and it reads 0.
@@ -455,11 +496,7 @@ monitoring system. So the `relay` label is rewritten before a scrape is sent:
   `journalctl -u ngit-grasp | grep -i relay`.
 - **Changing the list renumbers.** Insert, remove or reorder entries and the
   aliases move with them, so the history of `peer-1` then belongs to another
-  relay. Add a new peer at the end of the list. The bootstrap relay is
-  numbered after the list unless the list names it: on a node whose peer is
-  named by `NGIT_SYNC_BOOTSTRAP_RELAY_URL` alone, write that peer into the
-  list first, or the first entry you add becomes `peer-1` and the bootstrap
-  relay moves to `peer-2`.
+  relay. Add a new peer at the end of the list.
 
 ```bash
 curl -s 127.0.0.1:9464/metrics | grep 'relay="'   # peer-N only, never a URL
@@ -814,11 +851,12 @@ What it means: the Phase-4b B1 self-heal timer
 (`NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS`, default 3600, ±10% jitter —
 src/sync/mod.rs:524–555) has not completed a round in over 2× the default
 interval. FS-8 split the counter (src/metrics/mod.rs:353–380): delivered
-rounds count into `ngit_private_full_reissue_total`, rounds where every
-live peer was skipped (rate-limit cooldown / the FS-3
-`NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS` floor) count into
-`ngit_private_full_reissue_skipped_total` — so BOTH must be flat before the
-timer is called dead. Live delivery still works, but redelivery-dependent
+rounds count into `ngit_private_full_reissue_total`, rounds where no
+configured peer was live or every live peer was skipped (rate-limit
+cooldown / the FS-3 `NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS` floor) count
+into `ngit_private_full_reissue_skipped_total` — so BOTH must be flat
+before the timer is called dead. A re-issue goes to the configured peers
+only. Live delivery still works, but redelivery-dependent
 gaps — expired rejected-hot-cache entries, cadence-limited 30640
 replacements that left the server-side hold unaccepted (expiry/overflow;
 their PRIMARY heal is the hold-and-retry drain, this timer only the
@@ -831,11 +869,12 @@ start line; confirm `NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS` is not `0`
 otherwise the sync task is wedged — check for a stalled peer connection
 holding the sync-manager lock and restart the process as the last resort.
 If the delivered counter is flat but `..._skipped_total` keeps rising, the
-timer is alive and the peer is chronically skipped: check the FS-3 floor
-value and peer health instead. Caveat: the series appear only at their
-FIRST increment, so this rule cannot detect a timer that never started
-since boot — add the `absent()` variant from the rule-file comment if you
-want boot-silence detection.
+timer is alive and the peer is chronically skipped or down: check the FS-3
+floor value, peer health, and that `NGIT_GRASP_P_SYNC_PEER_URLS` names the
+peer. Caveat: the series appear only at their FIRST increment, so this
+rule cannot detect a timer that never started since boot — add the
+`absent()` variant from the rule-file comment if you want boot-silence
+detection.
 
 ### Denylist entries dropped
 
@@ -918,10 +957,11 @@ alert's value, which its description starts with, says which half fired:
   counts it by category. For a configured peer that entry does not stop
   the dials (below); it stays for twelve hours, also after the peer is back.
 - **Value 1: the scrape has no `peer-1` series.** The node does not track the
-  peer, or is not scraped at all. The node dials the relays in
-  `NGIT_GRASP_P_SYNC_PEER_URLS` and the one in
-  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`: verify that one of them names the peer,
-  correctly, on both nodes. `Skipping private-repo peer relay` or
+  peer, or is not scraped at all. The node's peers are the relays in
+  `NGIT_GRASP_P_SYNC_PEER_URLS`: verify that the list names the peer,
+  correctly, on both nodes. `NGIT_SYNC_BOOTSTRAP_RELAY_URL` alone does not
+  make a peer ([Who a node replicates with](#who-a-node-replicates-with)).
+  `Skipping private-repo peer relay` or
   `Rejecting event-directed sync relay target` in the log means the node
   refused the address of a listed peer: it is not `wss://`, it is not a
   public address, or its name did not resolve when the node tried. The node
@@ -932,10 +972,9 @@ alert's value, which its description starts with, says which half fired:
   no peer configured, or with GRASP-P off, never has the series: remove the
   rule there.
 
-**What the node does by itself.** A configured peer, whichever of the two
-settings names it, is never dropped: when its session ends or a dial fails
-it stays tracked and disconnected (value 0, never value 1), and the node
-dials it again without a restart.
+**What the node does by itself.** A configured peer is never dropped: when
+its session ends or a dial fails it stays tracked and disconnected (value 0,
+never value 1), and the node dials it again without a restart.
 
 - After a session ends or a dial fails, the node redials with a wait that
   doubles from `NGIT_SYNC_BASE_BACKOFF_SECS` (5 seconds): 5, 10, 20, 40, 80,
@@ -1260,8 +1299,9 @@ Prereqs: watchdog installed with its timer running against both nodes
    iptables -A OUTPUT -p tcp -d <node-A-IP> --dport 443 -j REJECT
    ```
 
-   (Equivalent: restart B with its sync bootstrap peer unset — the E2E pins
-   exactly that shape, tests/private_watchdog.rs:452–510.)
+   (Equivalent: restart B with no `NGIT_GRASP_P_SYNC_PEER_URLS` entry for A;
+   unsetting the bootstrap relay is not needed. The E2E restarts B with
+   neither setting, on a new port: tests/private_watchdog.rs:513–525.)
 
 3. **Withhold**: publish a new 30641 edition to node A (an ordinary
    cord-git push does this).

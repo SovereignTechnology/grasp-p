@@ -24,13 +24,13 @@
 # Relay labels: the scrape of a GRASP-P node names no relay by its URL. The
 # `relay` label of the ngit_sync_* series holds an alias, peer-1, peer-2,
 # ..., for the relays the operator configured as this node's peers: the
-# entries of NGIT_GRASP_P_SYNC_PEER_URLS in the order written, then the relay
-# in NGIT_SYNC_BOOTSTRAP_RELAY_URL unless the list already names it. On a
-# pair, peer-1 on node A is node B and peer-1 on node B is node A; the
-# `instance` label says which node a series came from, once each node's
-# scrape sets its own (each is scraped on a loopback address, which can be
-# the same on both). Every other relay the node dials has no series of its
-# own in the scrape and is counted only in the aggregates
+# entries of NGIT_GRASP_P_SYNC_PEER_URLS in the order written. The relay in
+# NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer, with an alias, only when the list
+# names it. On a pair, peer-1 on node A is node B and peer-1 on node B is
+# node A; the `instance` label says which node a series came from, once
+# each node's scrape sets its own (each is scraped on a loopback address,
+# which can be the same on both). Every other relay the node dials has no
+# series of its own in the scrape and is counted only in the aggregates
 # (ngit_sync_relays_tracked_total, ngit_sync_relays_connected_total,
 # ngit_sync_naughty_relays_total; ngit_sync_relays_dead_total is never
 # updated by the server and reads 0). See the runbook, §3 "Relays in the
@@ -213,11 +213,12 @@ groups:
       # re-issue round per NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS (default
       # 3600, +-10% jitter; first fire one interval after boot). FS-8: a
       # round that delivered at least one peer increments
-      # ngit_private_full_reissue_total; a round where every live peer was
-      # skipped (rate-limit cooldown / FS-3 re-issue floor) increments
-      # ngit_private_full_reissue_skipped_total instead. Silence of BOTH
-      # over 2x the default interval = the self-heal timer is dead (a flat
-      # delivered counter alone can be a legitimately floor-skipped peer).
+      # ngit_private_full_reissue_total; a round where no configured peer was
+      # live, or every live peer was skipped (rate-limit cooldown / FS-3
+      # re-issue floor), increments ngit_private_full_reissue_skipped_total
+      # instead. Silence of BOTH over 2x the default interval = the self-heal
+      # timer is dead (a flat delivered counter alone can be a legitimately
+      # floor-skipped peer).
       # NOTE: the series appear at their first increment — if the timer
       # never fired since boot this rule is inert; add
       # `or (absent(ngit_private_full_reissue_total) and absent(ngit_private_full_reissue_skipped_total))`
@@ -307,8 +308,9 @@ groups:
       #
       # The absent() arm: the first arm cannot fire on a series that is not
       # there, and a peer has none while the node does not track it. Its URL is
-      # missing or wrong in both settings, or the node refused the address of
-      # a listed peer. Without the arm each of those reads as a healthy peer.
+      # missing or wrong in NGIT_GRASP_P_SYNC_PEER_URLS (the bootstrap setting
+      # alone makes no peer), or the node refused the address of a listed
+      # peer. Without the arm each of those reads as a healthy peer.
       # A peer the node has once tracked keeps its series: an ended session
       # or a failed dial leaves it tracked, at 0 (1 during a dial), and the
       # node redials it at least every 5 minutes.
@@ -340,7 +342,7 @@ groups:
           component: grasp-p-sync
         annotations:
           summary: "Sync peer {{ $labels.relay }} disconnected or missing from the scrape for 10m"
-          description: "Alert value {{ $value }}. For 10m, ngit_sync_relay_connected for {{ $labels.relay }} has been below 2 (alert value 0: the peer is tracked and has no session: disconnected, or being dialled) or absent from the scrape (alert value 1: the node tracks no such peer, or is not scraped). {{ $labels.relay }} is an alias, not a URL: on a pair, peer-1 is the other node. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog. Value 0: check the peer process, DNS/TLS and the network path; the node's own log names the relay and its last error. The node redials a disconnected peer by itself, at least every 5 minutes, so the alert clears once the peer can be reached. Value 1: check NGIT_GRASP_P_SYNC_PEER_URLS and NGIT_SYNC_BOOTSTRAP_RELAY_URL on the node, and that the node is scraped."
+          description: "Alert value {{ $value }}. For 10m, ngit_sync_relay_connected for {{ $labels.relay }} has been below 2 (alert value 0: the peer is tracked and has no session: disconnected, or being dialled) or absent from the scrape (alert value 1: the node tracks no such peer, or is not scraped). {{ $labels.relay }} is an alias, not a URL: on a pair, peer-1 is the other node. For GRASP-P two-node replication this halts 30640/30641 sync and grows the mirror backlog. Value 0: check the peer process, DNS/TLS and the network path; the node's own log names the relay and its last error. The node redials a disconnected peer by itself, at least every 5 minutes, so the alert clears once the peer can be reached. Value 1: check that NGIT_GRASP_P_SYNC_PEER_URLS on the node names the peer (NGIT_SYNC_BOOTSTRAP_RELAY_URL alone makes no peer), and that the node is scraped."
           runbook: "docs/grasp-p/ops/runbook.md#sync-peer-disconnected"
 
       # All tracked peers disconnected simultaneously — almost always a LOCAL

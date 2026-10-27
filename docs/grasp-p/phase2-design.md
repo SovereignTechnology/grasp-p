@@ -5,6 +5,12 @@ gated: **when `NGIT_GRASP_P_REPOS_ENABLE=false` the SyncManager and blob layer b
 as upstream** (existing sync tests MUST still pass unchanged). Mirror activity additionally
 gated on `NGIT_GRASP_P_MIRROR_ENABLE`.
 
+Superseded on peers: GRASP-P now syncs events only with the relays in
+`NGIT_GRASP_P_SYNC_PEER_URLS` (SEAMS.md, "Configured peers"); the bootstrap relay is a peer
+only when that list names it, and registration tags never choose a relay to sync with. Where
+the text below pairs nodes through the bootstrap relay or routes filters by tags, it
+describes the older design.
+
 ## 0. The problem Phase 2 solves
 
 Private repos publish NO kind-30617 announcement, so ngit-grasp's announcement-driven

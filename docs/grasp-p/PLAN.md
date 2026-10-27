@@ -75,12 +75,13 @@ push; `git status` before every commit.
   header (`src/grasp_p/metrics_endpoint.rs`). The node that hosts private repositories serves
   public ones in the same process, so their `/metrics` is closed with it. In that scrape no
   relay is named by its URL (`src/grasp_p/relay_labels.rs`): the configured peers, which are
-  the entries of `NGIT_GRASP_P_SYNC_PEER_URLS` and the bootstrap relay, appear as `peer-1`,
-  `peer-2`, ..., and the per-relay series of every other relay are left out, those of the
-  public service included; the aggregates stay. The peer alert selects the alias and also
-  fires when the peer has no series. Both parts are in `SEAMS.md`, "Metrics leave a GRASP-P
-  node on loopback only". Found on the way: upstream never sets `ngit_sync_relay_failures`,
-  so the alert rule on it could not fire and is removed.
+  the entries of `NGIT_GRASP_P_SYNC_PEER_URLS` (the bootstrap relay only when the list names
+  it), appear as `peer-1`, `peer-2`, ..., and the per-relay series of every other relay are
+  left out, those of the public service included; the aggregates stay. The peer alert
+  selects the alias and also fires when the peer has no series. Both parts are in
+  `SEAMS.md`, "Metrics leave a GRASP-P node on loopback only". Found on the way: upstream
+  never sets `ngit_sync_relay_failures`, so the alert rule on it could not fire and is
+  removed.
 - **#6** (done) blob route hardening, three parts and one from its comment
   (`SEAMS.md`, "What the blob routes answer"):
   - A kind-24242 authorization could be replayed for a day either side of its `created_at`.
@@ -197,21 +198,28 @@ project yet.
   that disappears (an unmounted volume, a deploy that is not atomic) lifts its takedowns
   within one reload interval. The alternative is to keep its last-known entries until a
   readable file no longer lists them.
-- **Peers** (done). A configured peer, which is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS` or
-  the bootstrap relay, is kept when its session ends, is not muted by the naughty list, and
-  is dialled at least once every five minutes while it is down, where it used to be retired,
-  muted for 12 hours, and (named by the bootstrap setting alone) never dialled a second
-  time. A pair on a private network sets `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and
-  leaves `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` off: only the connection to a configured peer
+- **Peers** (done). A configured peer, which is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`
+  (the bootstrap relay counted as well at first, and no longer does; see the next point),
+  is kept when its session ends, is not muted by the naughty list, and is dialled
+  at least once every five minutes while it is down, where it used to be retired and muted
+  for 12 hours. A pair on a private network sets `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`
+  and leaves `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` off: only the connection to a configured peer
   is exempt from upstream's target policy. Every event-directed relay dial of a GRASP-P
   node also refuses a NAT64 or 6to4 address that wraps an internal one. A pair test runs
   with upstream's guard on. Still open: the dial is vetted and not pinned (#3), a naughty
   list entry outlives the peer's recovery by up to 12 hours, and no test runs with GRASP-P's
   own guard on. See "Configured peers" in [`SEAMS.md`](SEAMS.md).
-- **#10 is wider on v3.** The GRASP-P filters go to every live relay, including upstream's
-  NIP-65 discovery connections, and count against each relay's subscription slots, so their
-  growth can cost a relay its public coverage. The watchdog's discovery filter does not page
-  past 500 events; the sync filters do, through upstream's historic sync.
+- **#10 is wider on v3** (the reach of sync: done). The GRASP-P filters went to every live
+  relay, including upstream's NIP-65 discovery connections, and any relay could bring a
+  GRASP-P event into admission. The maintainer decided that GRASP-P data replicates only
+  between operator-configured peers, with no setting to widen it, so both now happen on a
+  configured peer's connection alone: only a peer is sent the filters (so only a peer's
+  subscription slots carry them), only a peer may bring GRASP-P events, and only a peer's
+  connection forwards duplicates; the bootstrap relay is a peer only when the list names it.
+  See "Configured peers" in [`SEAMS.md`](SEAMS.md). Still open: on the peer link the GRASP-P
+  and announcement filters share one subscription budget, and the watchdog's discovery
+  filter does not page past 500 events; the sync filters do, through upstream's historic
+  sync.
 - **Base path** (done). The check that a registration names this node ignored
   `NGIT_BASE_PATH`, and no test ran GRASP-P under one. A node under a mount path is now
   named by its host and that path together: in the `relays` and `server` tags of a

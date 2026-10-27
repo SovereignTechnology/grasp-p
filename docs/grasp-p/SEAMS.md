@@ -20,9 +20,9 @@ Upstream's files carry thin seams only:
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
 | `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion |
-| `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`; `register_relay` builds each connection with `with_duplicate_event_forwarding` and takes its outbound policy from `grasp_p_peer_policy` when that gives one; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`), see "Configured peers" below; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); the id and signature check in `process_event_static_inner` (see below) |
+| `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`, for a configured peer only (`grasp_p_filters_for`); `register_relay` builds each connection with the GRASP-P node's address check (`with_grasp_p_address_check`) and with duplicate forwarding on a configured peer's connection only (`with_duplicate_event_forwarding`), and takes its outbound policy from `grasp_p_peer_policy` when that gives one; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`); the source gate in `process_event_static_inner` (`grasp_p_gate`), directly after the id and signature check (see below); the GRASP-P ids counted as delivered in the negentropy completion check of `handle_eose` (`grasp_p_settled_ids`); see "Configured peers" below for these; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
-| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only when GRASP-P is enabled, after checking their id and signature and skipping the SDK's second copy of a new event; one call of `grasp_p::mirror::vet_relay_dial` each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one (see "Configured peers"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
+| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one (see "Configured peers"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
 | `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
@@ -52,7 +52,7 @@ through upstream's own `fetch_events` (missing-event recovery, dependency fetch,
 and NIP-65 fetches); through any ordinary subscription once the SDK's list of seen ids
 (35,000 per connection) has dropped an id that its verification cache (128,000) still
 holds, at which point the SDK reports the forged copy as a new event; and, on a GRASP-P
-node, through the duplicate-forwarding arm.
+node, through the duplicate-forwarding arm of a configured peer's connection.
 
 `process_event_static_inner` therefore verifies id and signature itself, after the
 duplicate lookup. A failure is `Rejected(Other)`, not `Invalid`: `Invalid` is a final
@@ -233,25 +233,21 @@ rewrites the gathered families before they are encoded.
   are untouched. The same process serves the node's public repositories, so the relays
   those bring in lose their per-relay series as well.
 - **The peers** are the entries of `NGIT_GRASP_P_SYNC_PEER_URLS`, numbered in their
-  order, and then the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, unless the list already
-  names it. The bootstrap relay is one of them because a pair can be wired through it
-  alone: upstream dials it at startup, it is sent the private filters, and
-  `policy_fingerprint` takes the pair's other node from it. If only the list counted,
-  the peer of such a node would be dropped from its scrape and `NgitSyncPeerDisconnected`
-  would have nothing to read. Both settings are the operator's, so an alias tells nothing
-  a customer chose. Relays configured for another purpose (the user index, the Sync+
-  fallbacks) get no alias, which keeps the peer alert about the pair. On a pair the one
-  peer is `peer-1` on both nodes, whichever setting names it. The sync code keeps the
-  same set connected (`grasp_p_peer_relays`, "Configured peers"), so a peer named by the
-  bootstrap setting alone is dialled again like a listed one.
-- **Each setting is read the way the sync code reads it**: a list entry through
-  `normalize_relay_url`, the own-address exclusion of `configured_peer_relay_urls` and
-  `canonical_relay_key`; the bootstrap URL through `canonical_relay_key` alone. The label
+  order: the one set the sync code treats as peers ("Configured peers"). The setting is
+  the operator's, so an alias tells nothing a customer chose. The relay in
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` has an alias only when the list names it, and then the
+  number of its entry; one the list leaves out carries public sync alone and is dropped
+  with the other relays. So are relays configured for another purpose (the user index,
+  the Sync+ fallbacks), which keeps the peer alert about the pair. On a pair the one peer
+  is `peer-1` on both nodes.
+- **The list is read by the function the service builds its peer set with**,
+  `configured_peer_relay_keys` (`src/sync/private_index.rs`): `normalize_relay_url`, the
+  own-address exclusion and `canonical_relay_key`, each key once, in list order. The label
   upstream writes is that key, and it is compared as it stands. A key has one alias, so
   two series of one family cannot end up with the same labels; a label in any other
   spelling is dropped, never folded in. The unit test
-  `aliases_exist_for_exactly_the_relays_sync_dials_as_peers` holds the two readings
-  together.
+  `aliases_exist_for_exactly_the_relays_sync_treats_as_peers` holds the aliases to the
+  service's set.
 - **A family left with no sample is removed.** The registry prunes empty families before
   it hands them over, and the text encoder answers one with an error, which `render`
   unwraps.
@@ -301,10 +297,10 @@ GRASP-P enabled. The rules of the rewrite have unit tests in
 `src/grasp_p/relay_labels.rs`, on a registry of their own and never the global one. One
 of them reads upstream's `src/sync/metrics.rs` as text and fails when the number of
 families labelled with a relay, or of methods that take one, changes, because the lists
-the other tests drive are kept by hand. No test reads the scrape of a node wired through
-the bootstrap relay alone; the unit test `the_bootstrap_relay_is_a_peer_when_no_list_names_it`
-covers that mapping, and `exit17_restarted_bootstrap_only_peer_is_kept_and_redialled` runs
-such a node without reading its scrape.
+the other tests drive are kept by hand. `the_bootstrap_relay_is_a_peer_only_when_listed`
+covers the bootstrap relay, and `exit18_bootstrap_relay_that_is_not_a_peer_carries_no_grasp_p_sync`
+in `private_two_node` reads the scrape of a node whose bootstrap relay is not listed: it
+counts the relay and names none.
 
 ## What the blob routes answer
 
@@ -708,7 +704,7 @@ Every caller of the old comparison, and what it does now:
 |---|---|---|
 | `registration::parse_shape`, the `relays` and the `server` tag | service | A registration names where clients go. Naming the bare host of a mounted node would send them to the wrong URL. |
 | `mirror::is_own_server` (peers taken from `server` tags) | service | Another service on the same host is a peer, not this node. |
-| `private_index::configured_peer_relay_urls` (the sync peer list) | service | The same, for relays. Its caller already passed the service address. |
+| `private_index::configured_peer_relay_keys` (the sync peer list) | service | The same, for relays. Its callers pass the service address. |
 | `relay_labels::RelayLabels::from_config` | service | It must leave out exactly the entries the sync code leaves out, or a peer would be scraped without an alias. A test holds the two together. |
 | `ngit-private-watchdog`, `derive_blob_base` | path-aware (own code, same rule) | When the relay URL it was given has a path, only `server` values with that path are candidates for the blob base. |
 | `blossom_auth::names_this_node` (the BUD-11 `server` tag of an authorization) | host only, unchanged | BUD-11 puts a bare domain in that tag, with no path. Requiring a path would refuse every conforming client. |
@@ -742,46 +738,112 @@ pair run the same build, and at the root nothing a node accepts has changed. Ups
 has its own matcher for its own tags (`outbound::relay_url_matches_service`); it parses
 more leniently and is not used for the GRASP-P checks, which stay strict about the URL.
 
-## Configured peers: kept, not muted, redialled, and a dial policy of their own
+## Configured peers: the only relays GRASP-P syncs with; kept, not muted, redialled
 
 The relay connection a node keeps to the other node of its pair is how private
-repositories replicate, and it will be the only way once peers come from the operator's
-settings alone. Upstream's sync manager treats every relay as one it may give up on. The
-logic is in `src/sync/grasp_p_sync.rs` (and one function in `src/grasp_p/mirror.rs`);
-upstream's files carry five short seams, each marked `GRASP-P seam:`:
+repositories replicate, and it is the only way: GRASP-P events, and the filters that ask
+for them, travel on the connections to the relays the operator listed and on no other.
+That is the maintainer's decision, with no setting to widen it; relay and server tags in
+registrations never choose a relay to sync with. Upstream's sync manager sends every
+relay the same filters, takes events from any of them, and treats every relay as one it
+may give up on. The logic is in `src/sync/grasp_p_sync.rs` (the peer set in `src/sync/private_index.rs` and
+`src/grasp_p/mod.rs`, the address check in `src/grasp_p/mirror.rs`); upstream's files
+carry these seams, each marked `GRASP-P seam:`:
 
 | # | Where | Seam | Lines |
 |---|---|---|---|
 | 1 | `src/sync/mod.rs`, `handle_disconnect` | `let desired = desired.or_else(\|\| self.grasp_p_peer_needs(relay_url));` after upstream's own two sources | 2 |
 | 2 | `src/sync/mod.rs`, `schedule_connect_relay` | `&& self.grasp_p_naughty_mute_applies(&relay_url)` on the naughty-list condition | 2 |
 | 3 | `src/sync/mod.rs`, `register_relay` | `self.grasp_p_peer_policy(&relay_url).unwrap_or_else(\|\| self.outbound_target_policy())` where upstream took the node's policy | 4 |
-| 4 | `src/sync/relay_connection.rs`, `connect` | `.and_then(\|vetted\| { mirror::vet_relay_dial(self.forward_duplicate_events, vetted) })` on the result of `authorize_resolved` | 4 |
-| 5 | `src/sync/relay_connection.rs`, `vet_nip11_target` | `let resolved = mirror::vet_relay_dial(self.forward_duplicate_events, resolved)?;` after `authorize_resolved` | 3 |
+| 4 | `src/sync/relay_connection.rs`, `connect` | `.and_then(\|vetted\| { mirror::vet_relay_dial(self.grasp_p_node, vetted) })` on the result of `authorize_resolved` | 4 |
+| 5 | `src/sync/relay_connection.rs`, `vet_nip11_target` | `let resolved = mirror::vet_relay_dial(self.grasp_p_node, resolved)?;` after `authorize_resolved` | 2 |
+| 6 | `src/sync/relay_connection.rs`, `RelayConnection` | the field `grasp_p_node` and its builder `with_grasp_p_address_check`, `grasp_p_node: false` in both constructors, and `pub(super)` on it and on `forward_duplicate_events`, so the sync manager's tests can read both | 11 |
+| 7 | `src/sync/mod.rs`, `sync_generic_filters` | `filters.extend(self.grasp_p_filters_for(relay_url));` | 2 |
+| 8 | `src/sync/mod.rs`, `sync_generic_history` | the same | 2 |
+| 9 | `src/sync/mod.rs`, `complete_live_filters` | the same | 2 |
+| 10 | `src/sync/mod.rs`, `register_relay` | `.with_grasp_p_address_check(self.config.private_repos_enable)` and `.with_duplicate_event_forwarding(self.grasp_p_is_peer(&relay_url))`, where forwarding went by the switch alone | 4 |
+| 11 | `src/sync/mod.rs`, `process_event_static_inner` | `if let Some(refused) = Self::grasp_p_gate(write_policy, event, relay_url, save_context) { return refused; }`, directly after the id and signature check | 4 |
+| 12 | `src/sync/mod.rs`, `handle_eose` | `received.extend(self.grasp_p_settled_ids(requested));` beside upstream's own `is_dependency_pending` extension of the negentropy completion check | 2 |
 
-Seams 4 and 5 read the connection's private flag where they stand, so the file carries
-no method of GRASP-P's. The two older seams in `check_disconnects` and
-`retry_disconnected_relays` are unchanged lines; the set they extend with is wider now.
+Seams 7 to 9 were `filters.extend(self.grasp_p_filters());`, unmarked, before. The two
+older seams in `check_disconnects` and `retry_disconnected_relays`
+(`desired_relays.extend(self.grasp_p_peer_relays())`) are unchanged lines; the set they
+extend with is narrower now.
 
-- **Who is a configured peer** (`grasp_p_peer_relays`): the entries of
-  `NGIT_GRASP_P_SYNC_PEER_URLS`, minus the ones that name this node, and the relay in
-  `NGIT_SYNC_BOOTSTRAP_RELAY_URL`. It is the set the scrape gives an alias to. The
-  bootstrap relay belongs to it for the reason given there: a pair can be wired through
-  it alone. Upstream dials its bootstrap relay a second time only while a public
-  repository gives it a reason to (it is a NIP-65 source for the repositories' authors);
-  on a node with none, a failed first dial
-  left it disconnected for the life of the process (`retry_disconnected_relays` wants a
-  repository or a listed reason), and an ended session retired it (`handle_disconnect`
-  has no exception for it). On a GRASP-P node both are now repaired for it, because the
-  two older seams count the wider set. The cost is that a bootstrap relay that is not
-  the pair's other node is treated as one too: it is never retired and it is redialled
-  every five minutes while it is down. Only the tick registers peers by itself, and
-  only the listed ones (`grasp_p_listed_peers`); upstream registers the bootstrap relay.
+- **One set.** The configured peers are the entries of `NGIT_GRASP_P_SYNC_PEER_URLS`,
+  minus the ones that name this node, each as the key the sync code files a relay under
+  (`configured_peer_relay_keys`: `normalize_relay_url`, the own-address exclusion, then
+  `canonical_relay_key`). `PrivateConfig::from_config` builds the set once and the
+  service holds it (`PrivateService::sync_peer_relays`, `is_sync_peer`); the sync manager
+  reads it through `grasp_p_peer_relays` and `grasp_p_is_peer` for every point below:
+  the filters, the re-issue, the source gate, duplicate forwarding, keep-alive, the
+  redial, the naughty-list exemption and the dial policy. The scrape's aliases come from
+  the same function. So no two of them can disagree about a relay. A relay URL is brought
+  to its key before it is compared, by the function `register_relay` files it under, so
+  `wss://peer.example/` is the peer `wss://peer.example`. With GRASP-P off there is no
+  service and no peer.
+- **The bootstrap relay is a peer only when the list names it.** Upstream dials it at
+  startup and registers it as operator-configured; that is all a relay named by
+  `NGIT_SYNC_BOOTSTRAP_RELAY_URL` alone gets on a GRASP-P node: public sync under
+  upstream's rules, no private filters, no GRASP-P events, no duplicate forwarding, no
+  keep-alive, no redial, no naughty-list exemption and no alias in the scrape. Upstream
+  retires it when its session ends and nothing public wants it, and does not dial it
+  again. A relay that is both listed and the bootstrap relay is a peer like any listed
+  one, and keeps upstream's exemption from the outbound policy, because it is registered
+  as the bootstrap relay and a peer is never retired. Upstream reads the bootstrap URL
+  through `canonical_relay_key` alone, without `normalize_relay_url`: spell it as the
+  list entry is spelled (a trailing slash after a path makes a different key, and then
+  a second connection, which is not a peer). `policy_fingerprint` still takes its
+  `domains` from the bootstrap relay; that changes with the next label of the
+  fingerprint, not here.
+- **Egress: the private filters go to peers only** (seams 7 to 9). They name every alias
+  and write key the node holds. Every way they reach a relay goes through
+  `grasp_p_filters_for(relay_url)`: the live and historic sync at connect
+  (`sync_generic_filters`), the quick reconnect and the consolidation
+  (`complete_live_filters`, then `sync_generic_history`), every rebuild of a relay's live
+  coverage (`complete_live_filters`), and negentropy, which runs inside the historic sync
+  of those same filters. The full re-issue builds the whole set unconditionally
+  (`grasp_p_filter_set`), the re-issue on an index change the derived filters alone, and
+  both send to `grasp_p_live_peers` alone (`grasp_p_reissue_to_live_relays`). Any other
+  relay is asked for upstream's filters and nothing more, so this node's subscriptions
+  hand no relay outside the list the membership map (the registrations themselves are
+  served to any anonymous REQ, CORD-git-v0-spec.md §1), and its subscription slots carry
+  no GRASP-P filter. A full re-issue round that finds no live
+  peer counts as skipped (`ngit_private_full_reissue_skipped_total`).
+- **Ingress: the source gate** (seam 11, `grasp_p_gate`). A 30640, a 30641 or a stream
+  wrap of a kind the node takes (stored or ephemeral) that relay sync brings from a relay
+  that is not a peer is answered `Rejected(Blocked)` before admission. Nothing of it is
+  applied, held or remembered by id, so the same event from a peer or a client is
+  admitted as ever, and `Blocked` is a final answer, so a batch or a recovery fetch on
+  that relay completes instead of asking again. One call covers every relay-sync path,
+  because each ends in `process_event_static_inner` with `SaveContext::RelaySync` and the
+  relay the event came from: the event stream of a connection (live subscriptions,
+  historic pages, negentropy hydration, duplicate forwarding), missing-event recovery,
+  the participant mailbox fetch, NIP-65 discovery and the purgatory dependency fetch. It
+  does not gate hold reprocessing or the cadence retry (`HotCacheReprocess`: the event
+  came from a peer or a client before it was held), nor events from clients, which never
+  pass here. The stream's known-rejected skip comes first and runs no admission either.
+  Upstream's related-event closure re-enters the function with its trigger's relay, but
+  its candidates are upstream's related events, never a GRASP-P kind, which admission
+  always answers itself. Each refusal counts in `ngit_private_sync_foreign_source_total`,
+  and the first from a relay logs `Refusing GRASP-P events from a relay that is not a
+  configured sync peer` (up to 1024 relays, then only the counter). Without the gate a
+  relay outside the list could feed admission with events nobody asked it for.
+- **Duplicate forwarding on a peer's connection only** (seam 10). The re-issue that needs
+  it goes to peers alone, and every other connection of a GRASP-P node now syncs exactly
+  as upstream's. The stricter address check stays on every connection (seams 4 to 6,
+  below): it is about the relays customers' events name.
+- **Negentropy counts GRASP-P's own decisions** (seam 12, `grasp_p_settled_ids`). A
+  requested id that GRASP-P holds for a registration, or has refused and remembers, was
+  delivered. Before, a batch that held a new GRASP-P event completed only on the SDK's
+  second copy, which duplicate forwarding skips, so it took a second round and logged
+  "Negentropy sync incomplete". The skip of known-rejected GRASP-P ids before a fetch
+  (`src/sync/history.rs`) is unchanged.
 - **Kept when its session ends** (seam 1). A relay whose session ends without the node
   having closed it is kept by upstream only if a repository or a NIP-65 list still names
   it. A configured peer carries neither, so it was retired: its state, its connection
-  object, its health record and its metrics were dropped, and the next tick registered a
-  listed one from nothing, as an event-directed relay even when it had been the
-  bootstrap relay, with no backoff and a full resync. Now it stays tracked, in the
+  object, its health record and its metrics were dropped, and the next tick registered it
+  again from nothing, with no backoff and a full resync. Now it stays tracked, in the
   disconnected state, with the failure counted, and upstream's reconnect loop redials it
   under upstream's backoff. A node no longer logs `Naturally ended relay session is no
   longer owned; retiring without reconnect` for a peer; it logs `Unexpected relay
@@ -810,7 +872,8 @@ no method of GRASP-P's. The two older seams in `check_disconnects` and
   and moves it to connecting, and through the one-per-relay reservation of dial
   attempts, so two dials of one relay cannot be in flight; and a dial by either resets
   the other's clock. The dial runs in upstream's worker, so nothing here does network
-  work under the manager's lock.
+  work under the manager's lock. Only the tick registers a peer that is not tracked yet;
+  a peer that is also the bootstrap relay is registered by upstream at startup.
 - **A dial policy of its own** (seam 3). Every relay that is not registered as the
   bootstrap relay must pass upstream's outbound target policy, which refuses loopback
   and private addresses. A pair whose nodes talk over a private network therefore had to
@@ -821,52 +884,78 @@ no method of GRASP-P's. The two older seams in `check_disconnects` and
   other connection keeps the node's policy. With that setting `false` a listed peer gets
   the node's policy like any relay. The bootstrap relay is registered as
   operator-configured, so no policy is consulted for it under either value, which is
-  upstream's exemption; now that it is never retired it keeps that for the life of the
-  process, also when the list names it too (it used to lose it at its first ended
-  session, when the tick registered it again as event-directed). The exception is carried by the relay key, as upstream
-  carries its bootstrap exception: an event that names exactly the peer's URL shares the
-  peer's connection, and any other URL does not. A permissive policy vets nothing and
-  pins nothing for that connection, NIP-11 probe included, which is what the operator
-  asked for. The setting is node-local and not in `policy_fingerprint`: it decides what
-  a node dials, never what it accepts. Two nodes that differ in it do not show in the
-  fingerprint; the node without it mirrors no blob over the link and refuses a peer
-  that only the list names, so events then flow one way only and
-  `NgitSyncPeerDisconnected` (value 1) on that node reports it. A peer that is also its
-  bootstrap relay is still dialled. The setting also opens the blob mirror to internal
-  addresses, and without `NGIT_GRASP_P_MIRROR_PEER_URLS` the mirror's peers come from
-  registrations: the node warns once when the mirror starts that way
+  upstream's exemption; a listed peer that is also the bootstrap relay keeps it for the
+  life of the process, since a peer is never retired. The exception is carried by the
+  relay key, as upstream carries its bootstrap exception: an event that names exactly the
+  peer's URL shares the peer's connection, and any other URL does not. A permissive
+  policy vets nothing and pins nothing for that connection, NIP-11 probe included, which
+  is what the operator asked for. The setting is node-local and not in
+  `policy_fingerprint`: it decides what a node dials, never what it accepts. Two nodes
+  that differ in it do not show in the fingerprint; the node without it mirrors no blob
+  over the link and refuses a peer that only the list names, so events then flow one way
+  only and `NgitSyncPeerDisconnected` (value 1) on that node reports it. A listed peer
+  that is also its bootstrap relay is still dialled. The setting also opens the blob
+  mirror to internal addresses, and without `NGIT_GRASP_P_MIRROR_PEER_URLS` the mirror's
+  peers come from registrations: the node warns once when the mirror starts that way
   (`spawn_background_tasks` in `src/grasp_p/mod.rs`).
-- **The stricter address check** (seams 4 and 5, `mirror::vet_relay_dial`). Every
-  connection of a GRASP-P node carries the duplicate-forwarding flag
-  (`register_relay` sets it from `private_repos_enable`, and it is the only place a
-  connection is built outside tests). On such a connection, an event-directed target
-  that upstream's policy passed is also put to `wraps_non_global`, on every dial and on
-  both NIP-11 probes, in the dial worker and never under the manager's lock. It applies
-  to every event-directed relay of the node and not to peers alone: the relays that
-  customers' events name are the ones an attacker chooses. What it adds to upstream's
-  check is a NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address that wraps an address
-  upstream would refuse bare (the mirror's own list first, then upstream's
-  `is_globally_reachable` on the wrapped address, which knows more ranges), and the
-  local-use NAT64 prefix `64:ff9b:1::/48`, refused whole because it is never global. A public relay that is reachable only through
-  such an address is not dialled by a GRASP-P node: each attempt fails with `Outbound
-  target policy rejected relay`, the relay backs off like any failing relay, and its
-  NIP-11 probe returns default hints. None should exist: both prefixes are for reaching
-  IPv4 hosts, and a public relay has a public IPv4 address to be wrapped. Left alone:
-  the bootstrap relay (upstream does not vet an operator's own target, and neither does
+- **The stricter address check** (seams 4 to 6, `mirror::vet_relay_dial`). Every
+  connection of a GRASP-P node carries the flag `grasp_p_node` (`register_relay` sets it
+  from `private_repos_enable`, and it is the only place a connection is built outside
+  tests). It used to be the duplicate-forwarding flag, which is now a peer's alone, and
+  the check would otherwise have gone with it from the connections that need it most.
+  On such a connection, an event-directed target that upstream's policy passed is also
+  put to `wraps_non_global`, on every dial and on both NIP-11 probes, in the dial worker
+  and never under the manager's lock. It applies to every event-directed relay of the
+  node and not to peers alone: the relays that customers' events name are the ones an
+  attacker chooses. What it adds to upstream's check is a NAT64 (`64:ff9b::/96`) or 6to4
+  (`2002::/16`) address that wraps an address upstream would refuse bare (the mirror's
+  own list first, then upstream's `is_globally_reachable` on the wrapped address, which
+  knows more ranges), and the local-use NAT64 prefix `64:ff9b:1::/48`, refused whole
+  because it is never global. A public relay that is reachable only through such an
+  address is not dialled by a GRASP-P node: each attempt fails with `Outbound target
+  policy rejected relay`, the relay backs off like any failing relay, and its NIP-11
+  probe returns default hints. None should exist: both prefixes are for reaching IPv4
+  hosts, and a public relay has a public IPv4 address to be wrapped. Left alone: the
+  bootstrap relay (upstream does not vet an operator's own target, and neither does
   this) and a connection with a permissive policy (no address is vetted, so there is
   nothing to check). The check is made on one DNS answer: the probe is held to it and
   the WebSocket dial resolves the name again (issue 3).
 
-What an operator sees is in `ops/runbook.md`, "NgitSyncPeerDisconnected" and "A pair on a
-private network". At an upstream sync, each seam is one line to carry over; if upstream
-keeps its own bootstrap relay through a disconnect, or exempts operator-configured relays
-from the naughty list, seams 1 and 2 go, and the control half of
-`failed_first_dial_of_a_bootstrap_only_peer_is_retried` fails to say so.
+**What changed from the first version of this section.** It counted the relay in
+`NGIT_SYNC_BOOTSTRAP_RELAY_URL` as a configured peer whether or not the list named it,
+because a pair could then be wired through that setting alone. Under the rule above a
+relay named there alone is no peer, and loses everything a peer gets: it is no longer
+kept when its session ends, no longer exempt from the naughty-list mute, no longer
+redialled every five minutes, no longer has an alias in the scrape, and, together with
+every other relay outside the list, it is no longer sent the private filters, no longer
+forwards duplicates, and may no longer bring GRASP-P events. Its dial policy does not
+change: it never had one, as upstream's operator-configured target. A pair wired through
+the bootstrap setting alone therefore replicates nothing now; list the peer.
+
+What an operator sees is in `ops/runbook.md`, "Who a node replicates with",
+"NgitSyncPeerDisconnected" and "A pair on a private network". At an upstream sync, each
+seam is a line or two to carry over. If upstream keeps its own bootstrap relay through a
+disconnect, redials it, or exempts operator-configured relays from the naughty list,
+nothing here needs to follow, and the rows that pin upstream's rule fail to say so: the
+retired rows of `configured_peer_survives_an_ended_session` and
+`ended_session_retires_every_relay_with_grasp_p_off`, the control rows of
+`failed_first_dial_of_the_bootstrap_relay_is_retried_only_when_listed`, and the bootstrap
+row of `naughty_list_does_not_mute_a_configured_peer`.
+If upstream starts to verify synced events itself, the source gate still goes directly
+after that check. If upstream adds a path that admits relay-synced events without
+`process_event_static_inner`, the gate does not see it: look for new calls of
+`admit_event` and `save_accepted_event` in `src/sync/`.
 
 Not done here: a peer that is taken out of the settings still needs a restart, as
 before; a listed peer that upstream first opened as a NIP-65 discovery connection is
-still subject to that connection's idle retirement and comes back through the tick; and
-the address check is not pinned to the connection (issue 3).
+still subject to that connection's idle retirement and comes back through the tick; the
+address check is not pinned to the connection (issue 3); a peer reached under a second
+name (another host name, a path, another scheme) is no peer on that connection, and
+GRASP-P events from it there are refused and counted; on the peer link the GRASP-P and
+announcement filters still share one subscription budget; no alert reads
+`ngit_private_sync_foreign_source_total`; `policy_fingerprint` still takes its domains
+from the bootstrap relay and not from the peer list; and the startup line `GRASP-P
+private repositories enabled` still prints the bootstrap relay as `configured_peer`.
 
 ## Decisions made during the port
 
@@ -895,11 +984,13 @@ the address check is not pinned to the connection (issue 3).
   M3 #3).
 - **Duplicate forwarding.** Legacy made `RelayConnection` forward events nostr-sdk reports
   as already seen, unconditionally. It is now behind `with_duplicate_event_forwarding`, set
-  only when GRASP-P is enabled, so a public node's sync is unchanged. The SDK sends a new
+  only on the connection to a configured peer, so a public node's sync is unchanged and so
+  is every other connection of a GRASP-P node ("Configured peers"). The SDK sends a new
   event twice (as `Event`, then inside `Message`); only the copy it did not also deliver as
-  `Event` is forwarded. One consequence: a new GRASP-P event that is rejected and held is
-  no longer accounted for by its second copy, so a negentropy batch that contains one does
-  one extra retry round and logs "Negentropy sync incomplete".
+  `Event` is forwarded. A new GRASP-P event that is rejected and held is therefore not
+  accounted for by its second copy; the negentropy completion check counts the ids
+  GRASP-P holds or refused as delivered instead (`grasp_p_settled_ids`), so a batch that
+  contains one completes in its first round.
 - **Hold expiry.** Legacy expired held GRASP-P events inside upstream's rejected-index
   cleanup and shortened that cleanup's interval under `NGIT_TEST=1`. The expiry now runs on
   GRASP-P's own registration timer and upstream's cleanup is untouched.
@@ -1073,27 +1164,51 @@ features. No package was added.
   node they would pass on a 404 page. One use of it is left, in `exit4_disabled_is_noop` of
   `private_two_node`: that node runs with GRASP-P off and serves upstream's `/metrics`.
   `phase0_gates` runs the stock relay (`TestRelay::start`, `start_with_lmdb`) with GRASP-P off:
-  it checks what GRASP-P needs from upstream. In the pair tests the peer is also the bootstrap
-  relay, except `exit14`, `exit16` and the two `exit17` tests in `private_two_node`, and both
-  SSRF guards are switched off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
-  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. `exit16` is the
-  exception to the second: it leaves upstream's guard on. No test runs a pair with GRASP-P's
+  it checks what GRASP-P needs from upstream. In the pair tests the peer is listed and is also
+  the bootstrap relay (`start_grasp_p_pair_node` sets both), except `exit14`, `exit16` and
+  `exit17_restarted_listed_peer_is_kept_and_redialled` (listed only), `exit18` (bootstrap
+  relay only, which is no peer) and `exit19` (A lists no relay and has no bootstrap relay;
+  B has A as both) in `private_two_node`, and both SSRF guards are switched
+  off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. `exit16` is
+  the exception to the second: it leaves upstream's guard on. No test runs a pair with GRASP-P's
   own guard on, because that needs peers on public addresses.
-- Configured peers ("Configured peers: kept, not muted ..."). Unit tests in
-  `src/sync/grasp_p_sync.rs` build a real sync manager whose dial workers get no slot, so a
-  scheduled dial stays queued until the test reports its outcome, and nothing opens a socket.
-  Time is passed in: the health tracker reads the system clock, which a paused runtime does
-  not move. `configured_peers_are_the_list_and_the_bootstrap_relay`;
-  `configured_peer_survives_an_ended_session` (a listed peer and a bootstrap-only one are
-  kept with their connection and a counted failure, another relay is retired) and
-  `ended_session_retires_every_relay_with_grasp_p_off`;
-  `disconnected_configured_peer_survives_the_disconnect_check` (the `check_disconnects`
-  path); `failed_first_dial_of_a_bootstrap_only_peer_is_retried` (with a control half that
-  pins upstream's behaviour with GRASP-P off); `naughty_list_does_not_mute_a_configured_peer`
-  (the entry is recorded, upstream's loop skips the peer, the redial dials it, another relay
-  stays muted); `peer_redial_admits_one_dial_per_interval` (the rule alone) and
-  `disconnected_peer_is_redialled_once_per_interval` (on the manager, including a dial
-  already queued); `only_a_configured_peer_on_a_private_link_gets_a_permissive_policy`.
+- Configured peers ("Configured peers: the only relays GRASP-P syncs with ..."). Unit tests
+  in `src/sync/grasp_p_sync.rs` build a real sync manager, its relay and its GRASP-P
+  service from one configuration, as at startup; its dial workers get no slot, so a
+  scheduled dial stays queued until the test reports its outcome, and nothing opens a
+  socket. Time is passed in: the health tracker reads the system clock, which a paused
+  runtime does not move. The set: `the_peer_set_is_the_list_alone` (the list, in any
+  spelling of a key, never this node, never a bootstrap relay the list leaves out,
+  nothing with GRASP-P off). Egress: `grasp_p_filters_go_only_to_configured_peers`,
+  `complete_live_filters_carry_grasp_p_only_for_a_peer` (fails without seam 9) and
+  `reissue_targets_only_live_configured_peers` (the set, and a re-issue sent to it alone).
+  Ingress: `grasp_p_event_from_a_non_peer_is_refused_before_admission_and_not_held`
+  (blocked, not held, not stored; the peer's copy is admitted and held; fails without
+  seam 11) and `only_relay_sync_of_a_grasp_p_kind_from_a_non_peer_is_gated` (every
+  GRASP-P kind, stored, ephemeral and legacy, is refused; hold reprocessing, a client's
+  path, a public kind and GRASP-P off pass); in `src/grasp_p/mod.rs`,
+  `admits_kind_is_every_kind_admission_claims` (the gate's kinds, legacy on and off) and
+  `a_foreign_sync_source_is_reported_once_within_a_bound` (one warning per relay, at most
+  1024 relays). `only_a_peer_connection_forwards_duplicates`
+  (and that the address check is on every connection; fails without seam 10).
+  `negentropy_batch_counts_a_held_grasp_p_event_as_delivered` (one round, nothing left for
+  recovery; fails without seam 12). The lifecycle: `configured_peer_survives_an_ended_session`
+  (a listed peer, and one that is also the bootstrap relay, are kept with their connection
+  and a counted failure; a bootstrap relay the list leaves out and another relay are
+  retired) and `ended_session_retires_every_relay_with_grasp_p_off`;
+  `disconnected_configured_peer_survives_the_disconnect_check` and
+  `connected_peer_is_not_an_empty_relay_disconnect_candidate` (the `check_disconnects`
+  path, disconnected and live); `failed_first_dial_of_the_bootstrap_relay_is_retried_only_when_listed`
+  (with control rows that pin upstream's behaviour); `naughty_list_does_not_mute_a_configured_peer`
+  (the entry is recorded, upstream's loop skips the peer, the redial dials it, another
+  relay and a bootstrap relay the list leaves out stay muted); `peer_redial_admits_one_dial_per_interval`
+  (the rule alone) and `disconnected_peer_is_redialled_once_per_interval` (on the manager,
+  including a dial already queued); `only_a_configured_peer_on_a_private_link_gets_a_permissive_policy`.
+  The set itself has `peer_keys_are_sync_keys_once_each_in_list_order` in
+  `src/sync/private_index.rs` and `sync_peer_set_is_canonical_and_excludes_own_address` in
+  `src/grasp_p/mod.rs`, and the scrape `aliases_exist_for_exactly_the_relays_sync_treats_as_peers`
+  and `the_bootstrap_relay_is_a_peer_only_when_listed` in `src/grasp_p/relay_labels.rs`.
   `relay_dial_check_refuses_wrapped_internal_addresses` in `src/grasp_p/mirror.rs` and
   `grasp_p_dial_refuses_a_nat64_wrapped_internal_address` in `src/sync/relay_connection.rs`
   cover the address check, on IP literals, with no lookup and no connection. In
@@ -1102,12 +1217,24 @@ features. No package was added.
   and `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`: events and a blob replicate, and a
   loopback relay that a public announcement names is refused without a connection. It fails
   without seam 3. `exit17_restarted_listed_peer_is_kept_and_redialled` and
-  `exit17_restarted_bootstrap_only_peer_is_kept_and_redialled` kill one node and start it
-  again on the same address: the other must log the disconnect as one to recover from, never
-  retire the peer, dial it again and replicate from it. They fail without seam 1.
-  `grasp_p_tls` requires a second dial of the `wss://` peer after its naughty-list entry,
-  which fails without seam 2 or without the redial. No test waits out the 300 seconds, runs a
-  peer down for hours, or resolves a name to a NAT64 address.
+  `exit17_restarted_peer_that_is_also_the_bootstrap_relay_is_kept_and_redialled` kill one
+  node and start it again on the same address: the other must log the disconnect as one to
+  recover from, never retire the peer, dial it again and replicate from it. They fail
+  without seam 1. `exit18_bootstrap_relay_that_is_not_a_peer_carries_no_grasp_p_sync`
+  wires a node through the bootstrap setting alone: a public announcement crosses, no
+  registration does, before or after the connection opened, and the scrape names no
+  relay. It fails when the bootstrap relay counts as a peer again, in the set or in the
+  aliases. Egress and ingress each stop the registration on their own, so it fails only
+  when both go; each has its own unit tests above.
+  `exit19_connect_time_sync_replicates_with_the_full_reissue_off` starts a node after its
+  peer holds a registration and a state root, with the periodic re-issue off: both must
+  arrive. It is the one test that fails without seam 7. Seam 8 alone has
+  no test that fails without it: it runs on a quick reconnect and a consolidation, and
+  the re-issue covers both in every pair test. `grasp_p_tls` requires a second dial of the
+  `wss://` peer after its naughty-list entry, which fails without seam 2 or without the
+  redial. No test waits out the 300 seconds, runs a peer down for hours, or resolves a
+  name to a NAT64 address, and no integration test has a relay send GRASP-P events it was
+  not asked for: the gate is covered by the unit tests.
 - The blob routes ("What the blob routes answer"). Unit tests carry the rules, without a
   server: in `src/http/blossom.rs` the headers of every error, of a served blob and of its
   `304`, the `If-None-Match` matching, and the order denylist, existence, conditional

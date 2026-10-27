@@ -151,16 +151,20 @@ It advertises all of this in its NIP-11 document under `private_repos`, includin
 
 Two nodes can mirror each other. Sync is pull-only: a node subscribes to its peer's
 registrations, derives filters for the state roots and stream wraps that belong to them,
-and fetches missing blobs over the peer's public `GET`. Connections opened for GRASP-P go to
-an operator allowlist only, but the same filters are also sent on every relay connection the
-node's public sync holds. Blob peers come from an operator allowlist when one is set;
-otherwise they are the `server` tags of accepted registrations, checked against the SSRF
-guard.
+and fetches missing blobs over the peer's public `GET`. Registrations, state roots and stream
+wraps travel only between the relays an operator lists in `NGIT_GRASP_P_SYNC_PEER_URLS`, in
+both directions: only those are sent the GRASP-P filters, and a GRASP-P event that relay sync
+brings from any other relay is refused before admission. The node's public sync, to the
+bootstrap relay and every relay its public repositories name, runs beside it as upstream's
+does; the bootstrap relay is a peer only when the list names it. Relay and server tags in a
+registration never decide who the node syncs events with. Blob peers come from an operator
+allowlist when one is set; otherwise they are the `server` tags of accepted registrations,
+checked against the SSRF guard.
 
-The relay connection to a configured peer (the allowlist, and the bootstrap relay) is kept
-for the life of the process: when it drops, or a dial fails for any reason, the node dials
-again by itself, at least once every five minutes. The two nodes may talk over a private
-network while every relay that an event names stays barred from internal addresses.
+The relay connection to a configured peer is kept for the life of the process: when it
+drops, or a dial fails for any reason, the node dials again by itself, at least once every
+five minutes. The two nodes may talk over a private network while every relay that an
+event names stays barred from internal addresses.
 
 Missing blobs wait in one queue per account, and the accounts are served in turn, each
 with at most half of the concurrent fetches, so one account whose blobs come slowly cannot
