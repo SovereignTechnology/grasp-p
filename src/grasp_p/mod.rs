@@ -435,6 +435,15 @@ pub struct PrivateConfig {
     /// only https peers are contacted. Tests set this true to mirror over
     /// http://127.0.0.1.
     pub mirror_allow_private_ips: bool,
+    /// The relays this node replicates GRASP-P events with, as the keys the
+    /// sync code files relays under: the entries of
+    /// `NGIT_GRASP_P_SYNC_PEER_URLS` that do not name this node
+    /// (`sync::private_index::configured_peer_relay_keys`). Nothing else is
+    /// a peer, the bootstrap relay included. Node-local and outside the
+    /// fingerprint: it decides which relays GRASP-P events may come from and
+    /// go to, never whether an event is admissible; the same event from a
+    /// peer or a client is admitted under the same rules.
+    pub sync_peer_relays: HashSet<String>,
     /// R6 parity fingerprint over the admission-affecting config.
     pub policy_fingerprint: String,
     /// Phase-4b A1: per-write-key token bucket capacity for CLIENT-submitted
@@ -499,6 +508,12 @@ impl PrivateConfig {
             mirror_retry_max_secs: config.private_mirror_retry_max_secs,
             mirror_max_attempts_per_min: config.private_mirror_max_attempts_per_min,
             mirror_allow_private_ips: config.private_mirror_allow_private_ips,
+            sync_peer_relays: crate::sync::private_index::configured_peer_relay_keys(
+                &config.private_sync_peer_url_entries(),
+                &config.service_address(),
+            )
+            .into_iter()
+            .collect(),
             policy_fingerprint: policy_fingerprint(config),
             write_rate_capacity: config.private_write_rate_capacity,
             write_rate_refill_per_min: config.private_write_rate_refill_per_min,
@@ -626,6 +641,10 @@ pub(crate) fn check_not_future_dated(event: &Event) -> Option<WritePolicyResult>
     }
 }
 
+/// How many relays [`PrivateService::note_foreign_sync_source`] reports by
+/// name before it only counts.
+const MAX_FOREIGN_SYNC_SOURCES: usize = 1024;
+
 /// The GRASP-P private-repo subsystem: registration/key/quota/blob state plus
 /// admission handlers and blob-route logic. Constructed once per relay when
 /// `NGIT_GRASP_P_REPOS_ENABLE=true`.
@@ -672,6 +691,10 @@ pub struct PrivateService {
     /// this knob is consensus-relevant, hence the fingerprint preimage;
     /// only boot_reconcile replays bypass it).
     registration_replace_rate: parking_lot::Mutex<rate::KeyedTokenBucket>,
+    /// Relays that relay sync has brought a GRASP-P event from although they
+    /// are not peers, so each is reported once (see
+    /// [`Self::note_foreign_sync_source`]).
+    foreign_sync_sources: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for PrivateService {
@@ -733,6 +756,7 @@ impl PrivateService {
                 config.private_registration_replace_capacity,
                 config.private_registration_replace_refill_per_hour as f64 / 3600.0,
             )),
+            foreign_sync_sources: parking_lot::Mutex::new(HashSet::new()),
         });
 
         svc.boot_reconcile().await?;
@@ -754,6 +778,53 @@ impl PrivateService {
     /// [`Self::note_rejected`] only.
     pub fn sync_rejected(&self) -> &crate::sync::private_index::PrivateRejectedIndex {
         &self.sync_rejected
+    }
+
+    /// The operator's GRASP-P sync peers, as sync relay keys
+    /// ([`PrivateConfig::sync_peer_relays`]). Every GRASP-P privilege of a
+    /// relay connection goes by this one set: the private filters, the
+    /// GRASP-P events relay sync may bring in, duplicate forwarding,
+    /// keep-alive, the redial, the naughty-list exemption and the dial
+    /// policy of a private link.
+    pub fn sync_peer_relays(&self) -> &HashSet<String> {
+        &self.cfg.sync_peer_relays
+    }
+
+    /// Whether `relay_url` is one of [`Self::sync_peer_relays`]. The URL is
+    /// brought to the sync key first, so any spelling the sync code files
+    /// under the same key is the same relay, and no other is.
+    pub fn is_sync_peer(&self, relay_url: &str) -> bool {
+        crate::sync::canonical_relay_key(relay_url)
+            .is_ok_and(|key| self.cfg.sync_peer_relays.contains(&key))
+    }
+
+    /// Whether GRASP-P admission may accept an event of `kind`: a
+    /// registration, a state root, or a stream wrap of a kind this node
+    /// takes, stored or ephemeral. The retired legacy kinds are not among
+    /// them; admission refuses those whoever sends them. Admission's size
+    /// check asks this too, so the sync source gate and admission agree on
+    /// which kinds are GRASP-P's.
+    pub fn admits_kind(&self, kind: u16) -> bool {
+        kind == KIND_REGISTRATION
+            || kind == KIND_STATE_ROOT
+            || self.accepts_stream_wrap_kind(kind)
+            || self.accepts_ephemeral_stream_wrap_kind(kind)
+    }
+
+    /// Count a GRASP-P event that relay sync brought from `relay_key`, which
+    /// is not a peer, and say whether it is the first from that relay, so
+    /// the caller warns once per relay. The relays a node dials are bounded
+    /// only by what events name, so the record is bounded too: past
+    /// `MAX_FOREIGN_SYNC_SOURCES` relays the counter still counts and
+    /// nothing more is reported.
+    pub fn note_foreign_sync_source(&self, relay_key: &str) -> bool {
+        crate::metrics::record_private_sync_foreign_source();
+        let mut reported = self.foreign_sync_sources.lock();
+        if reported.len() >= MAX_FOREIGN_SYNC_SOURCES || reported.contains(relay_key) {
+            return false;
+        }
+        reported.insert(relay_key.to_string());
+        true
     }
 
     /// The one place that decides what the node keeps of a rejected 30640,
@@ -2202,6 +2273,54 @@ mod tests {
         );
     }
 
+    /// The one peer set: the list's entries as the keys the sync code files
+    /// relays under, never this node and never a bootstrap relay the list
+    /// leaves out. The service knows a peer in any spelling of its key and
+    /// no relay that only looks like it.
+    #[tokio::test]
+    async fn sync_peer_set_is_canonical_and_excludes_own_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.domain = "own.example".to_string();
+        config.private_sync_peer_urls =
+            Some("wss://own.example, https://Peer.Example/, wss://peer.example".to_string());
+        config.sync_bootstrap_relay_url = Some("wss://bootstrap.example".to_string());
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+
+        assert_eq!(
+            PrivateConfig::from_config(&config).sync_peer_relays,
+            HashSet::from(["wss://peer.example".to_string()])
+        );
+
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        for spelling in [
+            "wss://peer.example",
+            "wss://peer.example/",
+            "wss://PEER.example",
+            "peer.example",
+        ] {
+            assert!(svc.is_sync_peer(spelling), "{spelling}");
+        }
+        for other in [
+            "wss://own.example",
+            "wss://bootstrap.example",
+            "ws://peer.example",
+            "wss://peer.example/nostr",
+            "wss://peer.example:444",
+            "not a relay url",
+        ] {
+            assert!(!svc.is_sync_peer(other), "{other}");
+        }
+    }
+
     async fn hold_harness(accept_legacy: bool) -> (tempfile::TempDir, Arc<PrivateService>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = Config::for_testing();
@@ -2217,6 +2336,54 @@ mod tests {
             .await
             .expect("private service");
         (dir, svc)
+    }
+
+    /// The kinds the sync source gate refuses from a non-peer are exactly the
+    /// kinds admission claims for itself, stored and ephemeral, legacy only
+    /// while the window is open.
+    #[tokio::test]
+    async fn admits_kind_is_every_kind_admission_claims() {
+        for accept_legacy in [true, false] {
+            let (_dir, svc) = hold_harness(accept_legacy).await;
+            for (kind, admitted) in [
+                (KIND_REGISTRATION, true),
+                (KIND_STATE_ROOT, true),
+                (KIND_STREAM_WRAP, true),
+                (KIND_EPHEMERAL_STREAM_WRAP, true),
+                (KIND_WRAP, accept_legacy),
+                (KIND_EPHEMERAL_WRAP, accept_legacy),
+                (KIND_REPORT, false),
+                (30617, false),
+                (5, false),
+            ] {
+                assert_eq!(
+                    svc.admits_kind(kind),
+                    admitted,
+                    "kind {kind}, legacy {accept_legacy}"
+                );
+            }
+        }
+    }
+
+    /// A relay outside the peer set is reported once, and the record of such
+    /// relays is bounded: a relay set nobody controls cannot make the node
+    /// warn on every event or grow the record without end.
+    #[tokio::test]
+    async fn a_foreign_sync_source_is_reported_once_within_a_bound() {
+        let (_dir, svc) = hold_harness(true).await;
+        assert!(svc.note_foreign_sync_source("wss://a.example"));
+        assert!(!svc.note_foreign_sync_source("wss://a.example"));
+        for n in 1..MAX_FOREIGN_SYNC_SOURCES {
+            assert!(
+                svc.note_foreign_sync_source(&format!("wss://r{n}.example")),
+                "relay {n}"
+            );
+        }
+        assert!(!svc.note_foreign_sync_source("wss://late.example"));
+        assert_eq!(
+            svc.foreign_sync_sources.lock().len(),
+            MAX_FOREIGN_SYNC_SOURCES
+        );
     }
 
     /// An event of `kind` with a `d` tag, enough for the hold to key it. A

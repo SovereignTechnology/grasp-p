@@ -755,12 +755,15 @@ let
         type = types.listOf types.str;
         default = [ ];
         description = ''
-          GRASP-P Phase 2: operator-approved peer relay URLs for
-          private-repo sync. Outbound private-sync WebSocket connections
-          are made ONLY to this allowlist — tenant 30640 `relays` tags
+          GRASP-P: relay URLs of the nodes this one replicates private
+          repositories with. GRASP-P events travel between these peers
+          alone: only they are sent the private sync filters, and a
+          GRASP-P event that relay sync brings from any other relay is
+          refused. Tenant 30640 `relays` tags are advisory metadata and
           never trigger a connection (SSRF / membership-map-leak guard).
-          Empty (default): no private-sync peer connections are initiated
-          (bootstrap relays still carry the private filters).
+          The relay in NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it
+          is listed here too. Empty (default): no peers, so no private-repo
+          replication.
         '';
       };
 

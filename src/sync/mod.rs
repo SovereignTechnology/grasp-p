@@ -3158,6 +3158,8 @@ impl SyncManager {
                         .copied()
                         .filter(|id| self.rejected_events_index.is_dependency_pending(id)),
                 );
+                // GRASP-P seam: so do GRASP-P's own retained decisions.
+                received.extend(self.grasp_p_settled_ids(requested));
                 let missing: Vec<EventId> = requested.difference(received).cloned().collect();
 
                 if !missing.is_empty() {
@@ -4959,7 +4961,8 @@ impl SyncManager {
 
     async fn sync_generic_filters(&mut self, relay_url: &str, since: Option<Timestamp>) {
         let mut filters = vec![filters::build_announcement_filter(None)];
-        filters.extend(self.grasp_p_filters());
+        // GRASP-P seam: the private filters, for a configured peer only.
+        filters.extend(self.grasp_p_filters_for(relay_url));
 
         // Create live subscription for ongoing announcements
         if self.sync_live(relay_url, &filters).await.is_err() {
@@ -4983,7 +4986,8 @@ impl SyncManager {
 
     async fn sync_generic_history(&mut self, relay_url: &str, since: Option<Timestamp>) {
         let mut filters = vec![filters::build_announcement_filter(None)];
-        filters.extend(self.grasp_p_filters());
+        // GRASP-P seam: the private filters, for a configured peer only.
+        filters.extend(self.grasp_p_filters_for(relay_url));
         let _batch_id = self
             .historic_sync_with_options(
                 relay_url,
@@ -5269,7 +5273,8 @@ impl SyncManager {
         since: Option<Timestamp>,
     ) -> Vec<Filter> {
         let mut filters = vec![filters::build_announcement_filter(None)];
-        filters.extend(self.grasp_p_filters());
+        // GRASP-P seam: the private filters, for a configured peer only.
+        filters.extend(self.grasp_p_filters_for(relay_url));
         let index = self.relay_sync_index.read().await;
         if let Some(state) = index.get(relay_url) {
             filters.extend(filters::build_essential_live_filters(
@@ -5452,7 +5457,10 @@ impl SyncManager {
                 policy,
             )
             .with_health_tracker(Arc::clone(&self.health_tracker))
-            .with_duplicate_event_forwarding(self.config.private_repos_enable);
+            // GRASP-P seam: the address check on every connection of a GRASP-P
+            // node, duplicate forwarding on a configured peer's only.
+            .with_grasp_p_address_check(self.config.private_repos_enable)
+            .with_duplicate_event_forwarding(self.grasp_p_is_peer(&relay_url));
             self.connections.insert(relay_url.clone(), connection);
             if nip65_discovery_only {
                 self.nip65_discovery_only_relays.insert(relay_url.clone());
@@ -7598,6 +7606,10 @@ impl SyncManager {
                 "Rejecting synced event: id or signature does not verify"
             );
             return ProcessResult::Rejected(PolicyRejection::Other);
+        }
+        // GRASP-P seam: GRASP-P events come by relay sync from configured peers only.
+        if let Some(refused) = Self::grasp_p_gate(write_policy, event, relay_url, save_context) {
+            return refused;
         }
 
         // Apply write policy using a dummy address (sync events aren't from network clients)

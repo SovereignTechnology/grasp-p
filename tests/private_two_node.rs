@@ -2531,7 +2531,7 @@ async fn exit13_mixed_legacy_accept_pair() {
 /// reconnect loop counts it as wanted and the bounded redial dials it.
 /// Before that, one failed dial left it disconnected for the life of the
 /// process. The reconnect loop alone is pinned by the unit test
-/// `failed_first_dial_of_a_bootstrap_only_peer_is_retried`.
+/// `failed_first_dial_of_the_bootstrap_relay_is_retried_only_when_listed`.
 #[tokio::test]
 async fn exit14_peer_down_at_first_dial_is_redialled() {
     let res_a = reserve_port();
@@ -2752,11 +2752,13 @@ async fn exit16_pair_replicates_with_the_upstream_guard_on() {
 /// keeps running. A must keep B as a relay it tracks, dial it again, and
 /// replicate from it afterwards, without a restart of its own.
 ///
-/// `bootstrap_only` chooses how A names B: by `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
-/// alone, or by `NGIT_GRASP_P_SYNC_PEER_URLS` alone. Either way B is a peer
+/// A names B in `NGIT_GRASP_P_SYNC_PEER_URLS`, and `also_bootstrap` names it
+/// in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as well, so that the connection is the
+/// one upstream registers for its bootstrap relay. Either way B is a peer
 /// that no public repository names, which is the relay upstream retires
-/// when its session ends.
-async fn restarted_peer_is_kept_and_redialled(bootstrap_only: bool) {
+/// when its session ends. A bootstrap relay the list does not name is no
+/// peer at all (`exit18`).
+async fn restarted_peer_is_kept_and_redialled(also_bootstrap: bool) {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
     let res_a = reserve_port();
@@ -2777,22 +2779,15 @@ async fn restarted_peer_is_kept_and_redialled(bootstrap_only: bool) {
         ],
     )
     .await;
-    // The fixture puts a bootstrap relay into the peer list as well; the
-    // empty value takes it out again for the bootstrap-only case.
-    let (a_bootstrap, a_peers) = if bootstrap_only {
-        (Some(url_b.clone()), "")
-    } else {
-        (None, url_b.as_str())
-    };
     let a = TestRelay::start_grasp_p_pair_node(
         res_a,
-        a_bootstrap,
+        also_bootstrap.then(|| url_b.clone()),
         true,
         None,
         None,
         &[
             ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
-            ("NGIT_GRASP_P_SYNC_PEER_URLS", a_peers),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", url_b.as_str()),
         ],
     )
     .await;
@@ -2862,8 +2857,174 @@ async fn exit17_restarted_listed_peer_is_kept_and_redialled() {
 }
 
 #[tokio::test]
-async fn exit17_restarted_bootstrap_only_peer_is_kept_and_redialled() {
+async fn exit17_restarted_peer_that_is_also_the_bootstrap_relay_is_kept_and_redialled() {
     restarted_peer_is_kept_and_redialled(true).await;
+}
+
+// ============================================================================
+// Exit test 18 — the bootstrap relay is a peer only when the list names it
+// ============================================================================
+
+/// Node A is bootstrapped to node C and lists no peer, so C is the relay A's
+/// public sync starts from and nothing more. Public sync runs over that
+/// connection as upstream's does; GRASP-P sync does not: A never asks C for
+/// a registration, takes none from it, and has no peer in its scrape. A node
+/// that treated its bootstrap relay as a peer would hold both registrations
+/// within seconds, one from its first sync of C and one from the live
+/// subscription.
+#[tokio::test]
+async fn exit18_bootstrap_relay_that_is_not_a_peer_carries_no_grasp_p_sync() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let res_a = reserve_port();
+    let res_c = reserve_port();
+    let url_c = format!("ws://127.0.0.1:{}", res_c.port());
+    let a_domain = format!("127.0.0.1:{}", res_a.port());
+
+    let c = TestRelay::start_grasp_p_pair_node(
+        res_c,
+        None,
+        true,
+        None,
+        None,
+        &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
+    )
+    .await;
+    let domains = [a_domain.clone(), c.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    // Both registrations name both nodes and their tenant is listed on both,
+    // so A would accept either if it were given one.
+    let (first_writer, second_writer) = (Keys::generate(), Keys::generate());
+    let before = register_on(&c, &domain_refs, &tenant, &first_writer, &random_alias()).await;
+
+    // The fixture lists a bootstrap relay as a peer too; the empty value
+    // takes it out again.
+    let a = TestRelay::start_grasp_p_pair_node(
+        res_a,
+        Some(url_c.clone()),
+        true,
+        None,
+        None,
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_GRASP_P_SYNC_PEER_URLS", ""),
+        ],
+    )
+    .await;
+
+    // Public sync over the bootstrap connection: an announcement on C that
+    // lists A reaches A. By then A's first sync of C is done.
+    let maintainer = Keys::generate();
+    let identifier = "exit18-public-over-bootstrap";
+    let (_announcement, _repository) =
+        setup_announcement_on_relay(&c, &maintainer, &domain_refs, identifier).await;
+    assert!(
+        wait_for_event_on_relay(
+            a.url(),
+            Filter::new()
+                .kind(Kind::GitRepoAnnouncement)
+                .author(maintainer.public_key())
+                .identifier(identifier),
+            REPLICATION_BOUND,
+        )
+        .await,
+        "exit18: a public announcement on C must reach A over the bootstrap connection"
+    );
+
+    // A registration published on C while A is connected, then three
+    // periods of the full re-issue (2 s under NGIT_TEST) and some.
+    let after = register_on(&c, &domain_refs, &tenant, &second_writer, &random_alias()).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let held = fetch_from(
+        a.url(),
+        Filter::new()
+            .kind(Kind::Custom(30640))
+            .author(tenant.public_key()),
+    )
+    .await;
+    assert!(
+        held.is_empty(),
+        "exit18: A must take no registration from a bootstrap relay that is not a peer; \
+         it serves {:?} (before {}, after {})",
+        held.iter().map(|event| event.id).collect::<Vec<_>>(),
+        before.id,
+        after.id
+    );
+
+    // The scrape follows the same set: C has no alias on A, and A still
+    // counts it among the relays it tracks.
+    let scrape = wait_for_scrape(&a, REPLICATION_BOUND, |m| {
+        m.relays_tracked_total().is_some_and(|tracked| tracked >= 1)
+    })
+    .await
+    .expect("exit18: A's scrape must count the bootstrap relay it tracks");
+    assert!(
+        relay_label_values(&scrape).is_empty(),
+        "exit18: a bootstrap relay that is not a peer has no series of its own; got {:?}",
+        relay_label_values(&scrape)
+    );
+
+    a.stop().await;
+    c.stop().await;
+}
+
+// ============================================================================
+// Exit test 19 — the connect-time sync of a peer carries the private filters
+// ============================================================================
+
+/// With the periodic full re-issue off, a node that starts after its peer
+/// already holds a registration and a state root still gets both: the
+/// registration from its first sync of the peer, the state root from the
+/// re-issue that the new registration triggers. Every other pair test would
+/// also pass on the full re-issue alone, so this is the one that fails when
+/// the seam in `sync_generic_filters` goes.
+#[tokio::test]
+async fn exit19_connect_time_sync_replicates_with_the_full_reissue_off() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let env = [
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+        ("NGIT_GRASP_P_FULL_REISSUE_INTERVAL_SECS", "0"),
+    ];
+    let res_a = reserve_port();
+    let res_b = reserve_port();
+    let url_a = format!("ws://127.0.0.1:{}", res_a.port());
+    let b_domain = format!("127.0.0.1:{}", res_b.port());
+
+    // A first, with no peer of its own: it never dials B.
+    let a = TestRelay::start_grasp_p_pair_node(res_a, None, true, None, None, &env).await;
+    let domains = [a.domain(), b_domain];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let registration = register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let blob = blob_bytes(71, 1024);
+    let sha = upload_blob(&a, &tenant, &writer, &alias, &blob).await;
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &edition).await;
+    assert!(accepted, "exit19: 30641 accepted on A; got {message:?}");
+
+    // B starts with A as its peer and its bootstrap relay.
+    let b = TestRelay::start_grasp_p_pair_node(res_b, Some(url_a), true, None, None, &env).await;
+    assert!(
+        wait_for_exact_event(b.url(), registration.id, REPLICATION_BOUND).await,
+        "exit19: B's first sync of A must bring the registration"
+    );
+    assert!(
+        wait_for_exact_event(b.url(), edition.id, REPLICATION_BOUND).await,
+        "exit19: the state root must follow its registration to B"
+    );
+
+    b.stop().await;
+    a.stop().await;
 }
 
 // ============================================================================

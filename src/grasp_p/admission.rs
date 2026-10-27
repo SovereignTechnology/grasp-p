@@ -157,12 +157,7 @@ pub async fn admit(
     // otherwise bounded only by the transport's message limit, far above
     // this one, and an event too large to ever be accepted must cost the
     // node nothing but this check.
-    if (kind == super::KIND_REGISTRATION
-        || kind == super::KIND_STATE_ROOT
-        || stored_wrap
-        || ephemeral_wrap)
-        && event.as_json().len() as u64 > service.cfg.max_event_bytes
-    {
+    if service.admits_kind(kind) && event.as_json().len() as u64 > service.cfg.max_event_bytes {
         crate::metrics::record_private_event_rejected(kind);
         return Some(noted(
             service,

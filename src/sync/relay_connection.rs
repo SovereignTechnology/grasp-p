@@ -777,9 +777,12 @@ pub struct RelayConnection {
     /// Per-session ceiling learned from explicit filter-count refusals.
     max_filters_per_req: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// GRASP-P: forward events the SDK reports as already seen (see the
-    /// `RelayMessage::Event` arm of the event loop). Off unless GRASP-P is
-    /// enabled, so a public node's sync is unchanged.
-    forward_duplicate_events: bool,
+    /// `RelayMessage::Event` arm of the event loop). Off unless the relay is
+    /// a GRASP-P sync peer, so every other connection syncs as upstream's.
+    pub(super) forward_duplicate_events: bool,
+    /// GRASP-P seam: the stricter address check of a GRASP-P node, on every
+    /// connection it makes (`grasp_p::mirror::vet_relay_dial`).
+    pub(super) grasp_p_node: bool,
 }
 
 impl RelayConnection {
@@ -795,6 +798,12 @@ impl RelayConnection {
     /// connection, so a since=None re-issue can redeliver them.
     pub(super) fn with_duplicate_event_forwarding(mut self, enabled: bool) -> Self {
         self.forward_duplicate_events = enabled;
+        self
+    }
+
+    /// GRASP-P seam: turn on the stricter address check (`grasp_p_node`).
+    pub(super) fn with_grasp_p_address_check(mut self, enabled: bool) -> Self {
+        self.grasp_p_node = enabled;
         self
     }
 
@@ -973,6 +982,7 @@ impl RelayConnection {
                 super::MAX_FILTERS_PER_REQ,
             )),
             forward_duplicate_events: false,
+            grasp_p_node: false,
         }
     }
 
@@ -1050,6 +1060,7 @@ impl RelayConnection {
                 super::MAX_FILTERS_PER_REQ,
             )),
             forward_duplicate_events: false,
+            grasp_p_node: false,
         }
     }
 
@@ -1081,7 +1092,7 @@ impl RelayConnection {
                 .await
                 // GRASP-P seam: the stricter address check of a GRASP-P node.
                 .and_then(|vetted| {
-                    crate::grasp_p::mirror::vet_relay_dial(self.forward_duplicate_events, vetted)
+                    crate::grasp_p::mirror::vet_relay_dial(self.grasp_p_node, vetted)
                 })
             {
                 tracing::warn!(
@@ -1238,8 +1249,7 @@ impl RelayConnection {
             .authorize_resolved(OutboundTargetKind::EventRelay, &self.url)
             .await?;
         // GRASP-P seam: the stricter address check of a GRASP-P node.
-        let resolved =
-            crate::grasp_p::mirror::vet_relay_dial(self.forward_duplicate_events, resolved)?;
+        let resolved = crate::grasp_p::mirror::vet_relay_dial(self.grasp_p_node, resolved)?;
         // A permissive policy vets no address, so it leaves nothing to hold
         // the request to. Any other policy pins the request to exactly what
         // it vetted.
@@ -3359,7 +3369,7 @@ mod tests {
         );
 
         // On a GRASP-P node neither the dial nor the NIP-11 probe goes on.
-        let flagged = event_directed().with_duplicate_event_forwarding(true);
+        let flagged = event_directed().with_grasp_p_address_check(true);
         let refusal = flagged
             .connect(1)
             .await
@@ -3380,7 +3390,7 @@ mod tests {
                 allow_non_global: true,
             },
         )
-        .with_duplicate_event_forwarding(true);
+        .with_grasp_p_address_check(true);
         assert_eq!(permissive.vet_nip11_target().await, Ok(None));
     }
 

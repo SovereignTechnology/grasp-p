@@ -418,15 +418,29 @@ lazy_static! {
         let metric = Counter::with_opts(Opts::new(
             "ngit_private_full_reissue_skipped_total",
             "Periodic full re-issue timer rounds (Phase-4b B1) that re-issued NO peer \
-             because every live relay was skipped (health-tracker rate-limit cooldown \
-             or the FS-3 NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS floor). Sustained \
-             increases mean a chronically-skipped peer: the self-heal timer fires but \
-             never delivers.",
+             because no configured peer was live or every live peer was skipped \
+             (health-tracker rate-limit cooldown or the FS-3 \
+             NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS floor). Sustained increases mean a \
+             chronically-skipped or absent peer: the self-heal timer fires but never \
+             delivers.",
         ))
         .expect("build private full reissue skipped metric");
         REGISTRY
             .register(Box::new(metric.clone()))
             .expect("register private full reissue skipped metric");
+        metric
+    };
+    static ref PRIVATE_SYNC_FOREIGN_SOURCE_TOTAL: Counter = {
+        let metric = Counter::with_opts(Opts::new(
+            "ngit_private_sync_foreign_source_total",
+            "GRASP-P events (30640, 30641, stream wraps) that relay sync brought from a \
+             relay that is not in NGIT_GRASP_P_SYNC_PEER_URLS, refused before admission. \
+             Such a relay was not asked for them. The node's log names each relay once, up to 1024 relays.",
+        ))
+        .expect("build private sync foreign source metric");
+        REGISTRY
+            .register(Box::new(metric.clone()))
+            .expect("register private sync foreign source metric");
         metric
     };
     static ref PRIVATE_DENYLIST_ENTRIES: Gauge = {
@@ -956,10 +970,17 @@ pub fn record_private_full_reissue() {
     PRIVATE_FULL_REISSUE_TOTAL.inc();
 }
 
-/// Record one full re-issue timer round that re-issued NO peer (every
-/// live relay rate-limit- or floor-skipped, FS-8 review L3-F7).
+/// Record one full re-issue timer round that re-issued NO peer (no peer
+/// live, or every live peer rate-limit- or floor-skipped, FS-8 review
+/// L3-F7).
 pub fn record_private_full_reissue_skipped() {
     PRIVATE_FULL_REISSUE_SKIPPED_TOTAL.inc();
+}
+
+/// Record one GRASP-P event that relay sync brought from a relay that is not
+/// a configured peer, refused before admission.
+pub fn record_private_sync_foreign_source() {
+    PRIVATE_SYNC_FOREIGN_SOURCE_TOTAL.inc();
 }
 
 /// Update the live denylist entry-count gauge (boot load + every reload

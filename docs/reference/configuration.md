@@ -1814,14 +1814,18 @@ startup log line.
 
 #### `NGIT_GRASP_P_SYNC_PEER_URLS`
 
-**Description:** Comma-separated operator-approved peer relay URLs for private-repo sync. Outbound private-sync WebSocket connections are made ONLY to this allowlist — tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). When unset, no private-sync peer connections are initiated (bootstrap relays still carry the private filters). A peer named here, like the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` on a GRASP-P node, is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it.  
+**Description:** Comma-separated relay URLs of the nodes this one replicates private repositories with. GRASP-P events (registrations, state roots, stream wraps) travel between these peers alone, in both directions: only they are sent the private sync filters, which name every alias and write key the node holds, and a GRASP-P event that relay sync brings from any other relay is refused before admission and counted in `ngit_private_sync_foreign_source_total`. Clients still publish to the node directly. Tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when it is listed here too; otherwise it carries public sync alone, as upstream's does. When unset, the node has no peers and replicates no private repository. A peer named here is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it. An entry that names this node itself is left out, so both nodes of a pair can be given the same list.  
 **Type:** String (CSV URLs)  
 **Default:** unset (no private-sync peers)  
 **Required:** No
 
+**Metrics:**
+
+- `ngit_private_sync_foreign_source_total` — GRASP-P events that relay sync brought from a relay not in this list, refused before admission. Such a relay was never asked for them; the node logs `Refusing GRASP-P events from a relay that is not a configured sync peer` once per relay (up to 1024 relays, then only the counter). A steady count can also mean the peer is reached under a name the list does not spell.
+
 #### `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS`
 
-**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`, or the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under it. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair); set `NGIT_GRASP_P_MIRROR_PEER_URLS` with it, because without that list the mirror takes its peers from registrations' `server` tags, which could then name an internal host (the node warns at startup). Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link and refuses a peer that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (the bootstrap relay is always dialled as written).  
+**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under it. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair); set `NGIT_GRASP_P_MIRROR_PEER_URLS` with it, because without that list the mirror takes its peers from registrations' `server` tags, which could then name an internal host (the node warns at startup). Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link and refuses a peer that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (a peer that is also the bootstrap relay is still dialled, as written).  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No
@@ -2046,7 +2050,7 @@ run different values.
 **Metrics:**
 
 - `ngit_private_full_reissue_total` — rounds that ACTUALLY re-issued at least one live peer
-- `ngit_private_full_reissue_skipped_total` — rounds where EVERY live relay was skipped (health-tracker rate-limit cooldown or the FS-3 re-issue floor below)
+- `ngit_private_full_reissue_skipped_total` — rounds that re-issued no peer: no configured peer (`NGIT_GRASP_P_SYNC_PEER_URLS`) was live, or EVERY live peer was skipped (health-tracker rate-limit cooldown or the FS-3 re-issue floor below). A re-issue goes to the configured peers only.
 
 Alert only when BOTH stop increasing while private repos are enabled: a
 flat delivered counter with a rising skipped counter means a
@@ -2198,11 +2202,10 @@ so.
 The scrape of such a node names no relay by its URL. In the `ngit_sync_*`
 series the `relay` label holds an alias, `peer-1`, `peer-2` and so on, for
 the node's configured peers: the entries of `NGIT_GRASP_P_SYNC_PEER_URLS` in
-the order written, and then the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL`
-unless the list already names it. The per-relay series of every other relay
-the node dials are left out of the scrape, and the aggregate series still
-count those relays. See "Relays in the scrape" in
-`docs/grasp-p/ops/runbook.md`.
+the order written. The bootstrap relay has an alias only when the list names
+it. The per-relay series of every other relay the node dials are left out of
+the scrape, and the aggregate series still count those relays. See "Relays in
+the scrape" in `docs/grasp-p/ops/runbook.md`.
 
 With GRASP-P disabled none of this applies: the setting is ignored and
 `/metrics` is upstream's public route, with upstream's labels.

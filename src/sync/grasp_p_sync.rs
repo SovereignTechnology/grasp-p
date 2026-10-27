@@ -3,32 +3,48 @@
 //! Everything here is inert unless `NGIT_GRASP_P_REPOS_ENABLE=true`. The sync
 //! manager calls in at a handful of points:
 //!
-//! - its filter builders ([`SyncManager::grasp_p_filters`]): the Layer-1
-//!   kind-30640 registration filter plus the 30641/stream-wrap filters derived
-//!   from the registrations this node holds, so connect-time sync, quick
-//!   reconnects and consolidations all carry them;
+//! - its filter builders ([`SyncManager::grasp_p_filters_for`]): for a
+//!   configured peer, the Layer-1 kind-30640 registration filter plus the
+//!   30641/stream-wrap filters derived from the registrations this node
+//!   holds, so connect-time sync, quick reconnects and consolidations all
+//!   carry them; for any other relay, nothing;
 //! - two timers ([`spawn_timers`]): the registration index rebuild (which also
 //!   reprocesses held out-of-order events, retries cadence-held 30640
 //!   replacements, expires holds and connects the operator's peers) and the
-//!   periodic full re-issue;
-//! - the event pipeline: skip known-rejected private events, reprocess held
-//!   events after a 30640 is accepted, and hand rejected private events to
-//!   the hold's decision point;
+//!   periodic full re-issue, both to configured peers only;
+//! - the event pipeline: refuse a GRASP-P event that relay sync brought from
+//!   a relay that is not a peer ([`SyncManager::grasp_p_gate`]), skip
+//!   known-rejected private events, reprocess held events after a 30640 is
+//!   accepted, and hand rejected private events to the hold's decision
+//!   point;
+//! - negentropy: a requested GRASP-P event that this node holds or refused
+//!   counts as delivered ([`SyncManager::grasp_p_settled_ids`]);
 //! - the relay lifecycle of a configured peer: it carries no public
 //!   repository, so the empty-relay heuristic must not drop it, a session
-//!   that ends must not retire it, the naughty list must not mute it, and it
-//!   may be given a dial policy of its own (see "Configured peers" below).
+//!   that ends must not retire it, the naughty list must not mute it, it
+//!   may be given a dial policy of its own, and only its connection
+//!   forwards duplicates (see "Configured peers" below).
 //!
 //! # Configured peers
 //!
 //! A configured peer is a relay the operator named as a node this one
 //! replicates private repositories with: an entry of
-//! `NGIT_GRASP_P_SYNC_PEER_URLS`, or the relay in
-//! `NGIT_SYNC_BOOTSTRAP_RELAY_URL` ([`SyncManager::grasp_p_peer_relays`]).
-//! The bootstrap relay counts because a pair can be wired through it alone,
-//! which is also why the scrape gives it a peer alias
-//! (`src/grasp_p/relay_labels.rs`). Relay URLs inside tenant events never
-//! make a peer and never trigger a connection.
+//! `NGIT_GRASP_P_SYNC_PEER_URLS` that does not name this node. The set is
+//! built once, held by the service (`PrivateService::sync_peer_relays`) and
+//! read through [`SyncManager::grasp_p_peer_relays`] and
+//! [`SyncManager::grasp_p_is_peer`] by everything below, so no two of them
+//! can disagree about a relay. It is also the set the scrape gives an alias
+//! to (`src/grasp_p/relay_labels.rs`). Nothing else is a peer: not a relay
+//! that tenant events name, and not the relay in
+//! `NGIT_SYNC_BOOTSTRAP_RELAY_URL` unless the list names it too. A
+//! bootstrap relay that is not listed is a public-sync relay under
+//! upstream's rules, with no GRASP-P traffic and none of what follows.
+//!
+//! GRASP-P events travel only on a peer's connection, in both directions:
+//! only a peer is sent the private filters, which name every alias and key
+//! this node holds, and a GRASP-P event that relay sync brings from any
+//! other relay is refused before admission. Relay and server tags in
+//! registrations never choose a relay to sync with.
 //!
 //! Upstream treats every relay as one it may give up on: a session that ends
 //! retires a relay no repository names, and a relay whose dial failed over
@@ -275,13 +291,20 @@ async fn run_full_reissue_timer(
 }
 
 impl SyncManager {
-    /// The GRASP-P filters every relay subscription set carries: the Layer-1
-    /// kind-30640 filter and the filters derived from the current index.
-    /// Empty when GRASP-P is disabled.
-    pub(super) fn grasp_p_filters(&self) -> Vec<Filter> {
-        if !self.config.private_repos_enable {
+    /// The GRASP-P filters the subscription set of `relay_url` carries: the
+    /// whole set for a configured peer, nothing for any other relay. The
+    /// filters name every alias and write key this node holds, so they go
+    /// where GRASP-P events may come from and nowhere else.
+    pub(super) fn grasp_p_filters_for(&self, relay_url: &str) -> Vec<Filter> {
+        if !self.grasp_p_is_peer(relay_url) {
             return Vec::new();
         }
+        self.grasp_p_filter_set()
+    }
+
+    /// The Layer-1 kind-30640 filter and the filters derived from the
+    /// current index, whoever they are for.
+    fn grasp_p_filter_set(&self) -> Vec<Filter> {
         let mut filters = vec![filters::build_private_registration_filter(None)];
         filters.extend(filters::build_private_derived_filters(
             &self.grasp_p.index.derived_inputs(),
@@ -291,50 +314,29 @@ impl SyncManager {
         filters
     }
 
-    /// The peers of `NGIT_GRASP_P_SYNC_PEER_URLS`, as canonical relay keys.
-    /// These are the relays the tick registers and dials by itself. Empty
-    /// when GRASP-P is disabled.
-    fn grasp_p_listed_peers(&self) -> HashSet<String> {
-        if !self.config.private_repos_enable {
-            return HashSet::new();
-        }
-        private_index::configured_peer_relay_urls(
-            &self.config.private_sync_peer_url_entries(),
-            &self.service_domain,
-        )
-        .iter()
-        .filter_map(|url| canonical_relay_key(url).ok())
-        .collect()
+    /// The configured peers, as sync relay keys: the set the service holds
+    /// (`PrivateService::sync_peer_relays`). Empty when GRASP-P is disabled.
+    pub(super) fn grasp_p_peer_relays(&self) -> HashSet<String> {
+        self.write_policy
+            .grasp_p()
+            .map(|service| service.sync_peer_relays().clone())
+            .unwrap_or_default()
     }
 
-    /// The configured peers, as canonical relay keys: the listed peers and
-    /// the bootstrap relay. Empty when GRASP-P is disabled.
-    ///
-    /// The bootstrap relay is one of them because a pair can be wired through
-    /// it alone: upstream dials it at startup, it is sent the private filters
-    /// like any relay, and `policy_fingerprint` takes the pair's other node
-    /// from it. Upstream itself dials it a second time only for its public
-    /// repositories, so without this a peer named by that setting alone was
-    /// lost to the first failed dial or ended session until a restart. The set is the one
-    /// `RelayLabels::from_config` gives an alias to.
-    pub(super) fn grasp_p_peer_relays(&self) -> HashSet<String> {
-        let mut peers = self.grasp_p_listed_peers();
-        if self.config.private_repos_enable {
-            peers.extend(
-                self.bootstrap_relay_url
-                    .as_deref()
-                    .and_then(|url| canonical_relay_key(url).ok()),
-            );
-        }
-        peers
+    /// Whether `relay_url`, in any spelling the sync code files under the
+    /// same key, is a configured peer. False for every relay when GRASP-P
+    /// is disabled.
+    pub(super) fn grasp_p_is_peer(&self, relay_url: &str) -> bool {
+        self.write_policy
+            .grasp_p()
+            .is_some_and(|service| service.is_sync_peer(relay_url))
     }
 
     /// What a configured peer is wanted for when its session ends: nothing
     /// that upstream counts, which is still a reason to keep it. `None` for
     /// any other relay, and for every relay when GRASP-P is disabled.
     pub(super) fn grasp_p_peer_needs(&self, relay_url: &str) -> Option<RelaySyncNeeds> {
-        self.grasp_p_peer_relays()
-            .contains(relay_url)
+        self.grasp_p_is_peer(relay_url)
             .then(RelaySyncNeeds::default)
     }
 
@@ -344,7 +346,7 @@ impl SyncManager {
     /// replication without a word. The entry itself is upstream's and stays,
     /// with its warning and its metric.
     pub(super) fn grasp_p_naughty_mute_applies(&self, relay_url: &str) -> bool {
-        !self.grasp_p_peer_relays().contains(relay_url)
+        !self.grasp_p_is_peer(relay_url)
     }
 
     /// The outbound target policy of the connection to `relay_url` when it
@@ -356,9 +358,8 @@ impl SyncManager {
     /// This is what lets a pair on a private network leave upstream's guard
     /// on for the relays that customers' events name.
     pub(super) fn grasp_p_peer_policy(&self, relay_url: &str) -> Option<OutboundTargetPolicy> {
-        (self.config.private_mirror_allow_private_ips
-            && self.grasp_p_peer_relays().contains(relay_url))
-        .then_some(OutboundTargetPolicy {
+        let private_link = self.config.private_mirror_allow_private_ips;
+        (private_link && self.grasp_p_is_peer(relay_url)).then_some(OutboundTargetPolicy {
             allow_non_global: true,
         })
     }
@@ -408,7 +409,7 @@ impl SyncManager {
 
     /// Rebuild the index from the relay DB's 30640s, reprocess held events
     /// for newly available registrations, retry cadence-held 30640s, expire
-    /// holds and, on change, re-issue derived filters to live relays and
+    /// holds and, on change, re-issue derived filters to live peers and
     /// connect newly configured peers.
     async fn grasp_p_sync_registrations(&mut self) {
         let Some(service) = self.write_policy.grasp_p().cloned() else {
@@ -534,12 +535,13 @@ impl SyncManager {
         // Connect operator-allowlisted peers not yet registered. Their
         // filters arrive on connect through the generic filter set.
         // A peer that cannot be registered is tried again after a pause and
-        // reported once, not on every tick.
+        // reported once, not on every tick. A peer that is also the
+        // bootstrap relay is already registered, by upstream, at startup.
         let now = Instant::now();
         let peer_retry_delay = Duration::from_secs(if test_mode() { 1 } else { 60 });
         let unknown_peers: Vec<String> = {
             let index = self.relay_sync_index.read().await;
-            self.grasp_p_listed_peers()
+            self.grasp_p_peer_relays()
                 .into_iter()
                 .filter(|url| !index.contains_key(url))
                 .filter(|url| {
@@ -599,7 +601,23 @@ impl SyncManager {
         self.grasp_p.reissue_pending = outcome.floor_skipped > 0;
     }
 
-    /// Re-issue private sync filters to every live relay: extend the live
+    /// The configured peers whose live subscriptions are open now: where a
+    /// re-issue goes. Any other live relay was never sent the private
+    /// filters and is sent none here.
+    async fn grasp_p_live_peers(&self) -> Vec<String> {
+        let peers = self.grasp_p_peer_relays();
+        let index = self.relay_sync_index.read().await;
+        peers
+            .into_iter()
+            .filter(|peer| {
+                index
+                    .get(peer)
+                    .is_some_and(|state| state.connection_status.is_live_sync_active())
+            })
+            .collect()
+    }
+
+    /// Re-issue private sync filters to every live peer: extend the live
     /// subscription set (falling back to upstream's consolidation when the
     /// minimal extension does not fit) and run a since=None historic sync.
     /// Each peer is gated by the `NGIT_GRASP_P_REISSUE_MIN_INTERVAL_SECS`
@@ -613,14 +631,7 @@ impl SyncManager {
             floor_secs
         });
         let now = Instant::now();
-        let live_relays: Vec<String> = {
-            let index = self.relay_sync_index.read().await;
-            index
-                .iter()
-                .filter(|(_, state)| state.connection_status.is_live_sync_active())
-                .map(|(url, _)| url.clone())
-                .collect()
-        };
+        let live_relays = self.grasp_p_live_peers().await;
         let mut outcome = ReissueOutcome::default();
         for relay_url in live_relays {
             if self.health_tracker.is_subscription_paused(&relay_url) {
@@ -659,10 +670,10 @@ impl SyncManager {
     /// index-change path but not gated on a diff; with an empty index the bare
     /// 30640 filter is still re-issued. Public subscriptions are left alone.
     async fn grasp_p_reissue_full(&mut self) {
-        let filters = self.grasp_p_filters();
-        if filters.is_empty() {
+        if self.write_policy.grasp_p().is_none() {
             return;
         }
+        let filters = self.grasp_p_filter_set();
         let outcome = self.grasp_p_reissue_to_live_relays(filters).await;
         // FS-8: count a round only when at least one peer was re-issued, so a
         // chronically skipped peer is visible.
@@ -687,6 +698,59 @@ impl SyncManager {
             || kind == crate::grasp_p::KIND_STATE_ROOT
             || service.accepts_stream_wrap_kind(kind);
         is_private_kind && service.sync_rejected().contains(&event.id)
+    }
+
+    /// The answer for a GRASP-P event that relay sync brought from a relay
+    /// that is not a configured peer: refused as blocked, before admission.
+    /// Nothing of the event is applied, held or remembered by id, so the
+    /// same event from a peer or a client is admitted as ever. Blocked is a
+    /// final answer, so a batch or a recovery fetch on that relay completes
+    /// instead of asking again.
+    ///
+    /// `None`, and the event goes on, for every other case: an event of
+    /// another kind, one from a peer, every event when GRASP-P is disabled,
+    /// and every event that relay sync did not bring just now. A held event
+    /// that is tried again came from a peer or a client before it was held,
+    /// and an event from a client never passes here.
+    pub(super) fn grasp_p_gate(
+        write_policy: &Nip34WritePolicy,
+        event: &Event,
+        relay_url: &str,
+        save_context: crate::nostr::persistence::SaveContext,
+    ) -> Option<ProcessResult> {
+        if save_context != crate::nostr::persistence::SaveContext::RelaySync {
+            return None;
+        }
+        let service = write_policy.grasp_p()?;
+        if !service.admits_kind(event.kind.as_u16()) || service.is_sync_peer(relay_url) {
+            return None;
+        }
+        if service.note_foreign_sync_source(relay_url) {
+            tracing::warn!(
+                relay = %relay_url,
+                event_id = %event.id,
+                kind = event.kind.as_u16(),
+                "Refusing GRASP-P events from a relay that is not a configured sync peer"
+            );
+        }
+        Some(ProcessResult::Rejected(PolicyRejection::Blocked))
+    }
+
+    /// The ids among `requested` that GRASP-P has already settled: held
+    /// until a registration arrives, or refused and remembered by id. Each
+    /// reached the node, so a negentropy batch that asked for it needs no
+    /// other copy. Without this, a batch that holds one completes only on
+    /// the SDK's second copy of the event, which duplicate forwarding skips,
+    /// and so takes a second round. Empty when GRASP-P is disabled.
+    pub(super) fn grasp_p_settled_ids(&self, requested: &HashSet<EventId>) -> Vec<EventId> {
+        let Some(service) = self.write_policy.grasp_p() else {
+            return Vec::new();
+        };
+        requested
+            .iter()
+            .copied()
+            .filter(|id| service.sync_rejected().contains(id))
+            .collect()
     }
 
     /// Event ids negentropy should not fetch again: known-rejected GRASP-P
@@ -803,17 +867,25 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Configured peers: kept, not muted, redialled, and their dial policy
+    // Configured peers: one set, kept, not muted, redialled, a dial policy,
+    // and the only relays GRASP-P events travel to and from
     // ------------------------------------------------------------------
+
+    use crate::nostr::persistence::SaveContext;
 
     const INTERVAL: Duration = Duration::from_secs(300);
     /// A loopback peer, a second one, and a relay no setting names.
     const PEER: &str = "ws://127.0.0.1:1";
     const OTHER_PEER: &str = "ws://127.0.0.1:3";
     const STRANGER: &str = "ws://127.0.0.1:2";
+    /// The address the test nodes serve under.
+    const SERVICE: &str = "service.example";
 
     /// A sync manager with GRASP-P enabled and upstream's target policy
-    /// permissive, as changed by `configure`.
+    /// permissive, as changed by `configure`, and `bootstrap` as its
+    /// bootstrap relay. The relay and its GRASP-P service are built from
+    /// the final settings, as at startup, so the service, and the peer set
+    /// it holds, exists exactly when `configure` leaves GRASP-P on.
     ///
     /// No dial ever starts: the dial workers are given no slot, so a
     /// scheduled dial stays queued (`Connecting`) until the test reports its
@@ -824,16 +896,19 @@ mod tests {
     ) -> (SyncManager, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_testing();
+        config.domain = SERVICE.to_string();
         config.git_data_path = directory.path().join("git").to_string_lossy().into_owned();
         config.relay_data_path = directory
             .path()
             .join("relay")
             .to_string_lossy()
             .into_owned();
+        config.private_repos_enable = true;
+        config.sync_allow_non_global_targets = true;
+        config.sync_bootstrap_relay_url = bootstrap.map(str::to_string);
+        configure(&mut config);
         let git_path = PathBuf::from(&config.git_data_path);
         let purgatory = Arc::new(crate::purgatory::Purgatory::new(git_path.clone()));
-        // The relay is built with GRASP-P off: these tests need the sync
-        // manager's reading of the settings and no private store.
         let runtime = crate::nostr::builder::create_relay(
             &config,
             purgatory,
@@ -842,12 +917,14 @@ mod tests {
         )
         .await
         .unwrap();
-        config.private_repos_enable = true;
-        config.sync_allow_non_global_targets = true;
-        configure(&mut config);
+        assert_eq!(
+            runtime.write_policy.grasp_p().is_some(),
+            config.private_repos_enable,
+            "the service exists exactly when GRASP-P is on"
+        );
         let mut manager = SyncManager::new(
-            bootstrap.map(str::to_string),
-            "service.example".into(),
+            config.sync_bootstrap_relay_url.clone(),
+            config.service_address(),
             runtime.stores.database.clone(),
             runtime.write_policy,
             runtime.relay,
@@ -904,6 +981,67 @@ mod tests {
             .await;
     }
 
+    /// A stored stream wrap from a key no registration holds: admission
+    /// refuses it with a rejection a later registration can cure, so a
+    /// peer's copy is held. The counter keeps every id distinct.
+    fn unregistered_wrap() -> Event {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        EventBuilder::new(
+            Kind::Custom(crate::grasp_p::KIND_STREAM_WRAP),
+            format!("ciphertext {n}"),
+        )
+        .finalize(&Keys::generate())
+        .unwrap()
+    }
+
+    /// Hand `event` to the event pipeline as relay sync from `relay` would.
+    async fn synced_from(
+        manager: &SyncManager,
+        event: &Event,
+        relay: &str,
+        context: SaveContext,
+    ) -> ProcessResult {
+        SyncManager::process_event_static(
+            event,
+            relay,
+            &manager.database,
+            &manager.write_policy,
+            &manager.local_relay,
+            &manager.rejected_events_index,
+            context,
+        )
+        .await
+    }
+
+    fn is_held(manager: &SyncManager, event: &Event) -> bool {
+        manager
+            .write_policy
+            .grasp_p()
+            .expect("GRASP-P is on")
+            .sync_rejected()
+            .contains(&event.id)
+    }
+
+    /// Whether `filters` hold any filter that asks for a GRASP-P kind.
+    fn asks_for_grasp_p(filters: &[Filter]) -> bool {
+        let grasp_p_kinds = [
+            crate::grasp_p::KIND_REGISTRATION,
+            crate::grasp_p::KIND_STATE_ROOT,
+            crate::grasp_p::KIND_STREAM_WRAP,
+            crate::grasp_p::KIND_WRAP,
+        ];
+        filters.iter().any(|filter| {
+            filter.kinds.as_ref().is_some_and(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| grasp_p_kinds.contains(&kind.as_u16()))
+            })
+        })
+    }
+
     /// C3, the rule alone: one dial per interval per peer, counted from the
     /// latest of this redial's own dial and anybody's attempt or failure.
     #[test]
@@ -939,74 +1077,112 @@ mod tests {
         assert!(redial.issued.contains_key("a"));
     }
 
-    /// The set C1 to C4 work on: the listed peers and the bootstrap relay,
-    /// never this node, and nothing with GRASP-P off.
+    /// The one set C1 to C4, the filters and the ingress gate work on: the
+    /// listed peers, held by the service, compared in any spelling the sync
+    /// code files under the same key. Never this node, never a bootstrap
+    /// relay the list does not name, and nothing with GRASP-P off.
     #[tokio::test]
-    async fn configured_peers_are_the_list_and_the_bootstrap_relay() {
+    async fn the_peer_set_is_the_list_alone() {
+        // A bootstrap relay the list does not name is not a peer.
         let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
-            config.private_sync_peer_urls = Some(format!("{PEER}, wss://service.example"));
+            config.private_sync_peer_urls = Some(format!("{PEER}/, wss://{SERVICE}"));
         })
         .await;
+        let service = manager.write_policy.grasp_p().expect("GRASP-P is on");
+        assert_eq!(service.sync_peer_relays(), &HashSet::from([key(PEER)]));
+        assert_eq!(manager.grasp_p_peer_relays(), HashSet::from([key(PEER)]));
+        for spelling in [PEER, "ws://127.0.0.1:1/"] {
+            assert!(manager.grasp_p_is_peer(spelling), "{spelling}");
+        }
+        let own = format!("wss://{SERVICE}");
+        for not_a_peer in [OTHER_PEER, STRANGER, own.as_str()] {
+            assert!(!manager.grasp_p_is_peer(not_a_peer), "{not_a_peer}");
+            assert!(manager.grasp_p_peer_needs(not_a_peer).is_none());
+            assert!(manager.grasp_p_naughty_mute_applies(not_a_peer));
+        }
+        manager.shutdown().await;
 
-        assert_eq!(
-            manager.grasp_p_peer_relays(),
-            HashSet::from([key(PEER), key(OTHER_PEER)])
-        );
-        // The tick registers the listed peers only; upstream registers the
-        // bootstrap relay.
-        assert_eq!(manager.grasp_p_listed_peers(), HashSet::from([key(PEER)]));
+        // A bootstrap relay the list names is a peer like any listed one.
+        let (mut manager, _directory) = peer_test_manager(Some(PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        assert_eq!(manager.grasp_p_peer_relays(), HashSet::from([key(PEER)]));
+        manager.shutdown().await;
 
-        manager.config.private_repos_enable = false;
+        // With GRASP-P off there is no service and no peer, whatever the
+        // settings say.
+        let (mut manager, _directory) = peer_test_manager(Some(PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+            config.private_mirror_allow_private_ips = true;
+            config.private_repos_enable = false;
+        })
+        .await;
         assert!(manager.grasp_p_peer_relays().is_empty());
+        assert!(!manager.grasp_p_is_peer(PEER));
         assert!(manager.grasp_p_peer_needs(&key(PEER)).is_none());
         assert!(manager.grasp_p_naughty_mute_applies(&key(PEER)));
         assert!(manager.grasp_p_peer_policy(&key(PEER)).is_none());
+        assert!(manager.grasp_p_filters_for(PEER).is_empty());
         manager.shutdown().await;
     }
 
     /// C1: a session that ends leaves a configured peer tracked and
-    /// disconnected, with its connection and its health record, whether the
-    /// list or the bootstrap setting names it. Any other relay is retired,
-    /// as in upstream.
+    /// disconnected, with its connection and its health record, also when
+    /// the peer is the bootstrap relay as well. A bootstrap relay the list
+    /// does not name is retired like any other relay, as in upstream.
     #[tokio::test]
     async fn configured_peer_survives_an_ended_session() {
-        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
-            config.private_sync_peer_urls = Some(PEER.to_string());
-        })
-        .await;
-        let (peer, bootstrap, stranger) = (key(PEER), key(OTHER_PEER), key(STRANGER));
-        assert!(manager.register_relay(peer.clone(), false, false).await);
-        assert!(manager.register_relay(bootstrap.clone(), true, false).await);
-        assert!(manager.register_relay(stranger.clone(), false, false).await);
+        let both = format!("{PEER},{OTHER_PEER}");
+        let cases: [(&str, &[&str], &[&str]); 2] = [
+            // (peer list, kept, retired)
+            (PEER, &[PEER], &[OTHER_PEER, STRANGER]),
+            (both.as_str(), &[PEER, OTHER_PEER], &[STRANGER]),
+        ];
+        for (listed, kept, retired) in cases {
+            let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+                config.private_sync_peer_urls = Some(listed.to_string());
+            })
+            .await;
+            assert!(manager.register_relay(key(PEER), false, false).await);
+            assert!(manager.register_relay(key(OTHER_PEER), true, false).await);
+            assert!(manager.register_relay(key(STRANGER), false, false).await);
 
-        for relay in [&peer, &bootstrap, &stranger] {
-            set_status(&manager, relay, ConnectionStatus::Connected).await;
-            manager.handle_disconnect(relay).await;
-        }
+            for relay in [PEER, OTHER_PEER, STRANGER].map(key) {
+                set_status(&manager, &relay, ConnectionStatus::Connected).await;
+                manager.handle_disconnect(&relay).await;
+            }
 
-        for kept in [&peer, &bootstrap] {
-            assert_eq!(
-                status(&manager, kept).await,
-                Some(ConnectionStatus::Disconnected),
-                "{kept} must stay tracked"
-            );
-            assert!(manager.connections.contains_key(kept), "{kept}");
-            assert_eq!(
-                manager.health_tracker.get_failure_count(kept),
-                1,
-                "the ended session of {kept} is a failure upstream's backoff counts"
-            );
+            for relay in kept.iter().copied().map(key) {
+                assert_eq!(
+                    status(&manager, &relay).await,
+                    Some(ConnectionStatus::Disconnected),
+                    "list {listed}: {relay} must stay tracked"
+                );
+                assert!(manager.connections.contains_key(&relay), "{relay}");
+                assert_eq!(
+                    manager.health_tracker.get_failure_count(&relay),
+                    1,
+                    "the ended session of {relay} is a failure upstream's backoff counts"
+                );
+            }
+            for relay in retired.iter().copied().map(key) {
+                assert_eq!(
+                    status(&manager, &relay).await,
+                    None,
+                    "list {listed}: {relay}"
+                );
+                assert!(!manager.connections.contains_key(&relay), "{relay}");
+            }
+            manager.shutdown().await;
         }
-        assert_eq!(status(&manager, &stranger).await, None);
-        assert!(!manager.connections.contains_key(&stranger));
-        manager.shutdown().await;
     }
 
     /// C1 is GRASP-P's alone: with it off, the same settings keep nothing.
     #[tokio::test]
     async fn ended_session_retires_every_relay_with_grasp_p_off() {
         let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
-            config.private_sync_peer_urls = Some(PEER.to_string());
+            config.private_sync_peer_urls = Some(format!("{PEER},{OTHER_PEER}"));
             config.private_repos_enable = false;
         })
         .await;
@@ -1025,6 +1201,8 @@ mod tests {
 
     /// C1, the other way a relay is retired: the periodic check drops a
     /// disconnected relay that nothing wants. A configured peer is wanted.
+    /// The bootstrap relay stays too, listed or not, by upstream's own rule:
+    /// that check never drops it.
     #[tokio::test]
     async fn disconnected_configured_peer_survives_the_disconnect_check() {
         let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
@@ -1050,14 +1228,56 @@ mod tests {
         manager.shutdown().await;
     }
 
-    /// A peer named by the bootstrap setting alone used to be dialled once:
-    /// upstream's reconnect loop does not count its own bootstrap relay as
-    /// wanted. It is a configured peer, so the loop dials it again.
+    /// C1 on a live session: a connected peer whose history is synced and
+    /// that carries no public repository is not an empty relay the check
+    /// disconnects. Any other relay in that state is.
     #[tokio::test]
-    async fn failed_first_dial_of_a_bootstrap_only_peer_is_retried() {
-        for grasp_p in [true, false] {
+    async fn connected_peer_is_not_an_empty_relay_disconnect_candidate() {
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        let (peer, stranger) = (key(PEER), key(STRANGER));
+        for relay in [&peer, &stranger] {
+            assert!(manager.register_relay(relay.clone(), false, false).await);
+            let mut index = manager.relay_sync_index.write().await;
+            let state = index.get_mut(relay).expect("the relay is tracked");
+            state.connection_status = ConnectionStatus::Connected;
+            state.historic_sync_completed = true;
+        }
+
+        manager.check_disconnects().await;
+
+        assert_eq!(
+            status(&manager, &peer).await,
+            Some(ConnectionStatus::Connected)
+        );
+        assert_eq!(
+            status(&manager, &stranger).await,
+            Some(ConnectionStatus::Disconnecting),
+            "an empty relay that is not a peer is disconnected, as in upstream"
+        );
+        manager.shutdown().await;
+    }
+
+    /// The reconnect loop counts a configured peer as wanted, so a peer
+    /// whose first dial failed is dialled again; it does that for the
+    /// bootstrap relay only when the list names it. Upstream's loop does not
+    /// count its own bootstrap relay as wanted, and a bootstrap relay that
+    /// is not a peer keeps that rule.
+    #[tokio::test]
+    async fn failed_first_dial_of_the_bootstrap_relay_is_retried_only_when_listed() {
+        // (GRASP-P, the list names the bootstrap relay, status after the loop)
+        for (grasp_p, listed, expected) in [
+            (true, true, ConnectionStatus::Connecting),
+            (true, false, ConnectionStatus::Disconnected),
+            // Upstream as it is. If upstream starts to redial its bootstrap
+            // relay, these two rows change and nothing else does.
+            (false, true, ConnectionStatus::Disconnected),
+        ] {
             let (mut manager, _directory) = peer_test_manager(Some(PEER), |config| {
                 config.private_repos_enable = grasp_p;
+                config.private_sync_peer_urls = listed.then(|| PEER.to_string());
                 // No wait between dials, so the loop is due at once.
                 config.sync_max_backoff_secs = 0;
             })
@@ -1073,17 +1293,10 @@ mod tests {
 
             manager.retry_disconnected_relays().await;
 
-            let expected = if grasp_p {
-                ConnectionStatus::Connecting
-            } else {
-                // Upstream as it is. If upstream starts to redial its
-                // bootstrap relay, this half goes and nothing else changes.
-                ConnectionStatus::Disconnected
-            };
             assert_eq!(
                 status(&manager, &peer).await,
                 Some(expected),
-                "GRASP-P {grasp_p}"
+                "GRASP-P {grasp_p}, listed {listed}"
             );
             manager.shutdown().await;
         }
@@ -1092,16 +1305,17 @@ mod tests {
     /// C2 and C3 together: a certificate failure puts a peer on the naughty
     /// list like any relay, upstream's loop then leaves it alone, and the
     /// bounded redial still dials it. A relay that is not a peer stays
-    /// muted.
+    /// muted, the bootstrap relay included when the list does not name it.
     #[tokio::test]
     async fn naughty_list_does_not_mute_a_configured_peer() {
-        let (mut manager, _directory) = peer_test_manager(None, |config| {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
             config.private_sync_peer_urls = Some(PEER.to_string());
             config.sync_max_backoff_secs = 0;
         })
         .await;
-        let (peer, stranger) = (key(PEER), key(STRANGER));
+        let (peer, bootstrap, stranger) = (key(PEER), key(OTHER_PEER), key(STRANGER));
         assert!(manager.register_relay(peer.clone(), false, false).await);
+        assert!(manager.register_relay(bootstrap.clone(), true, false).await);
         assert!(manager.register_relay(stranger.clone(), false, false).await);
         let naughty = manager.health_tracker.naughty_list().unwrap();
 
@@ -1118,13 +1332,15 @@ mod tests {
             naughty.get_entry(&peer).map(|entry| entry.category),
             Some(crate::sync::naughty_list::NaughtyCategory::TlsCertificateInvalid)
         );
-        naughty.record(
-            &stranger,
-            crate::sync::naughty_list::NaughtyCategory::TlsCertificateInvalid,
-            "invalid peer certificate".to_string(),
-        );
+        for muted in [&stranger, &bootstrap] {
+            naughty.record(
+                muted,
+                crate::sync::naughty_list::NaughtyCategory::TlsCertificateInvalid,
+                "invalid peer certificate".to_string(),
+            );
+        }
 
-        // Upstream's loop dials neither while the entry stands.
+        // Upstream's loop dials none of them while the entries stand.
         manager.retry_disconnected_relays().await;
         assert_eq!(
             status(&manager, &peer).await,
@@ -1132,22 +1348,27 @@ mod tests {
         );
 
         // A dial that is asked for goes through for the peer only.
-        manager.schedule_connect_relay(&stranger).await;
-        assert_eq!(
-            status(&manager, &stranger).await,
-            Some(ConnectionStatus::Disconnected)
-        );
+        for muted in [&stranger, &bootstrap] {
+            manager.schedule_connect_relay(muted).await;
+            assert_eq!(
+                status(&manager, muted).await,
+                Some(ConnectionStatus::Disconnected),
+                "{muted}"
+            );
+        }
         let later = Instant::now() + INTERVAL + Duration::from_secs(10);
         manager.grasp_p_redial_peers(later, INTERVAL).await;
         assert_eq!(
             status(&manager, &peer).await,
             Some(ConnectionStatus::Connecting)
         );
-        assert_eq!(
-            status(&manager, &stranger).await,
-            Some(ConnectionStatus::Disconnected),
-            "the redial is for configured peers only"
-        );
+        for muted in [&stranger, &bootstrap] {
+            assert_eq!(
+                status(&manager, muted).await,
+                Some(ConnectionStatus::Disconnected),
+                "the redial is for configured peers only: {muted}"
+            );
+        }
         assert!(naughty.is_naughty(&peer), "the entry is not cleared");
         manager.shutdown().await;
     }
@@ -1214,11 +1435,14 @@ mod tests {
 
     /// C4: only a configured peer, and only when the operator has said the
     /// pair's link is private, is registered on an internal address with
-    /// upstream's guard on. Everything else keeps the node's own policy.
+    /// upstream's guard on. Everything else keeps the node's own policy, a
+    /// bootstrap relay the list does not name included (it is upstream's
+    /// operator-configured target, which no policy is asked about).
     #[tokio::test]
     async fn only_a_configured_peer_on_a_private_link_gets_a_permissive_policy() {
         const PRIVATE_PEER: &str = "ws://10.0.0.5:7777";
         const PRIVATE_STRANGER: &str = "ws://10.0.0.6:7777";
+        const PRIVATE_BOOTSTRAP: &str = "ws://10.0.0.7:7777";
 
         // (GRASP-P, link declared private, the peer is registered)
         for (grasp_p, private_link, registered) in [
@@ -1226,7 +1450,7 @@ mod tests {
             (true, false, false),
             (false, true, false),
         ] {
-            let (mut manager, _directory) = peer_test_manager(None, |config| {
+            let (mut manager, _directory) = peer_test_manager(Some(PRIVATE_BOOTSTRAP), |config| {
                 config.sync_allow_non_global_targets = false;
                 config.private_repos_enable = grasp_p;
                 config.private_mirror_allow_private_ips = private_link;
@@ -1244,6 +1468,12 @@ mod tests {
                 "{case}"
             );
             assert!(manager.grasp_p_peer_policy(&stranger).is_none(), "{case}");
+            assert!(
+                manager
+                    .grasp_p_peer_policy(&key(PRIVATE_BOOTSTRAP))
+                    .is_none(),
+                "{case}"
+            );
 
             assert_eq!(
                 manager.register_relay(peer.clone(), false, false).await,
@@ -1257,5 +1487,339 @@ mod tests {
             );
             manager.shutdown().await;
         }
+    }
+
+    /// Egress: the private filters, which name every alias and key the node
+    /// holds, are for a configured peer, in any spelling of its key, and for
+    /// no other relay: not the bootstrap relay the list does not name, not a
+    /// relay an event names, and none at all with GRASP-P off.
+    #[tokio::test]
+    async fn grasp_p_filters_go_only_to_configured_peers() {
+        let registration = filters::build_private_registration_filter(None);
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        for spelling in [PEER, "ws://127.0.0.1:1/"] {
+            assert!(
+                manager
+                    .grasp_p_filters_for(spelling)
+                    .contains(&registration),
+                "{spelling}"
+            );
+        }
+        for not_a_peer in [OTHER_PEER, STRANGER] {
+            assert!(
+                manager.grasp_p_filters_for(not_a_peer).is_empty(),
+                "{not_a_peer}"
+            );
+        }
+        manager.shutdown().await;
+
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+            config.private_repos_enable = false;
+        })
+        .await;
+        assert!(manager.grasp_p_filters_for(PEER).is_empty());
+        manager.shutdown().await;
+    }
+
+    /// Egress through upstream's builder: the complete live coverage of a
+    /// connection carries the private filters for a peer only. It fails
+    /// when the seam in `complete_live_filters` goes.
+    #[tokio::test]
+    async fn complete_live_filters_carry_grasp_p_only_for_a_peer() {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        assert!(manager.register_relay(key(PEER), false, false).await);
+        assert!(manager.register_relay(key(OTHER_PEER), true, false).await);
+        assert!(manager.register_relay(key(STRANGER), false, false).await);
+        let announcements = filters::build_announcement_filter(None);
+        let registration = filters::build_private_registration_filter(None);
+
+        let peer = manager.complete_live_filters(&key(PEER), None).await;
+        assert!(peer.contains(&announcements) && peer.contains(&registration));
+        for not_a_peer in [OTHER_PEER, STRANGER] {
+            let coverage = manager.complete_live_filters(&key(not_a_peer), None).await;
+            assert!(coverage.contains(&announcements), "{not_a_peer}");
+            assert!(
+                !asks_for_grasp_p(&coverage),
+                "{not_a_peer} must not be asked for GRASP-P events: {coverage:?}"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    /// Egress on a re-issue: it goes to the peers whose live subscriptions
+    /// are open, and to no other live relay. A non-peer that is syncing (a
+    /// NIP-65 source, the bootstrap relay the list does not name) is left
+    /// alone, and so is a peer that is down.
+    #[tokio::test]
+    async fn reissue_targets_only_live_configured_peers() {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(format!("{PEER},ws://127.0.0.1:4"));
+        })
+        .await;
+        let down_peer = key("ws://127.0.0.1:4");
+        assert!(manager.register_relay(key(PEER), false, false).await);
+        assert!(manager.register_relay(key(OTHER_PEER), true, false).await);
+        assert!(manager.register_relay(key(STRANGER), false, false).await);
+        assert!(
+            manager
+                .register_relay(down_peer.clone(), false, false)
+                .await
+        );
+        for relay in [PEER, OTHER_PEER, STRANGER].map(key) {
+            set_status(&manager, &relay, ConnectionStatus::Syncing).await;
+        }
+        assert_eq!(
+            status(&manager, &down_peer).await,
+            Some(ConnectionStatus::Disconnected)
+        );
+
+        assert_eq!(manager.grasp_p_live_peers().await, vec![key(PEER)]);
+
+        // The re-issue itself goes to that set. Without a connection object
+        // sync_live and historic_sync return at once, so nothing is dialled.
+        for relay in [PEER, OTHER_PEER, STRANGER].map(key) {
+            manager.connections.remove(&relay);
+        }
+        let outcome = manager
+            .grasp_p_reissue_to_live_relays(vec![filters::build_private_registration_filter(None)])
+            .await;
+        assert_eq!(outcome.sent, 1);
+        assert_eq!(
+            manager
+                .grasp_p
+                .reissue_floor
+                .last_sent
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from([key(PEER)])
+        );
+        manager.shutdown().await;
+    }
+
+    /// Ingress: a GRASP-P event that relay sync brings from a relay that is
+    /// not a peer is refused as blocked before admission. It is not held,
+    /// not remembered by id and not stored, so the same event from the peer
+    /// is admitted as ever: here, held for its registration. It fails when
+    /// the seam in `process_event_static_inner` goes.
+    #[tokio::test]
+    async fn grasp_p_event_from_a_non_peer_is_refused_before_admission_and_not_held() {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        let wrap = unregistered_wrap();
+
+        for not_a_peer in [STRANGER, OTHER_PEER] {
+            assert_eq!(
+                synced_from(&manager, &wrap, not_a_peer, SaveContext::RelaySync).await,
+                ProcessResult::Rejected(PolicyRejection::Blocked),
+                "{not_a_peer}"
+            );
+            assert!(!is_held(&manager, &wrap), "{not_a_peer}");
+            assert!(manager
+                .database
+                .event_by_id(&wrap.id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        // The peer, under another spelling of its key: admission runs.
+        assert_eq!(
+            synced_from(&manager, &wrap, "ws://127.0.0.1:1/", SaveContext::RelaySync).await,
+            ProcessResult::Rejected(PolicyRejection::Restricted)
+        );
+        assert!(is_held(&manager, &wrap));
+        manager.shutdown().await;
+    }
+
+    /// The gate is for relay sync alone. A held event that is tried again
+    /// (it came from a peer or a client before it was held) reaches
+    /// admission whatever name its retry carries, an event a client sends
+    /// never passes here, an event of a public kind passes, and with GRASP-P
+    /// off nothing is gated.
+    #[tokio::test]
+    async fn only_relay_sync_of_a_grasp_p_kind_from_a_non_peer_is_gated() {
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        let wrap = unregistered_wrap();
+        let gate = |event: &Event, relay: &str, context: SaveContext| {
+            SyncManager::grasp_p_gate(&manager.write_policy, event, relay, context)
+        };
+
+        assert_eq!(
+            gate(&wrap, STRANGER, SaveContext::RelaySync),
+            Some(ProcessResult::Rejected(PolicyRejection::Blocked))
+        );
+        // Every kind admission claims, stored and ephemeral; the legacy
+        // kinds too, which the test settings still accept.
+        for kind in [
+            crate::grasp_p::KIND_REGISTRATION,
+            crate::grasp_p::KIND_STATE_ROOT,
+            crate::grasp_p::KIND_STREAM_WRAP,
+            crate::grasp_p::KIND_EPHEMERAL_STREAM_WRAP,
+            crate::grasp_p::KIND_WRAP,
+            crate::grasp_p::KIND_EPHEMERAL_WRAP,
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind), "")
+                .finalize(&Keys::generate())
+                .unwrap();
+            assert_eq!(
+                gate(&event, STRANGER, SaveContext::RelaySync),
+                Some(ProcessResult::Rejected(PolicyRejection::Blocked)),
+                "kind {kind}"
+            );
+        }
+        assert_eq!(gate(&wrap, PEER, SaveContext::RelaySync), None);
+        assert_eq!(
+            gate(
+                &wrap,
+                "grasp-p-30640-reprocess",
+                SaveContext::HotCacheReprocess
+            ),
+            None
+        );
+        assert_eq!(
+            gate(&wrap, STRANGER, SaveContext::DirectWritePolicyAcceptance),
+            None
+        );
+        let public = EventBuilder::new(Kind::TextNote, "public")
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert_eq!(gate(&public, STRANGER, SaveContext::RelaySync), None);
+
+        // A held event retried through the pipeline reaches admission.
+        let retried = unregistered_wrap();
+        assert_eq!(
+            synced_from(
+                &manager,
+                &retried,
+                "grasp-p-30640-reprocess",
+                SaveContext::HotCacheReprocess
+            )
+            .await,
+            ProcessResult::Rejected(PolicyRejection::Restricted)
+        );
+        assert!(is_held(&manager, &retried));
+        manager.shutdown().await;
+
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+            config.private_repos_enable = false;
+        })
+        .await;
+        assert_eq!(
+            SyncManager::grasp_p_gate(
+                &manager.write_policy,
+                &wrap,
+                STRANGER,
+                SaveContext::RelaySync
+            ),
+            None
+        );
+        manager.shutdown().await;
+    }
+
+    /// Duplicate forwarding is on for a peer's connection alone, so every
+    /// other connection of the node syncs as upstream's; the stricter
+    /// address check stays on all of them. It fails when the seam in
+    /// `register_relay` goes.
+    #[tokio::test]
+    async fn only_a_peer_connection_forwards_duplicates() {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        assert!(manager.register_relay(key(PEER), false, false).await);
+        assert!(manager.register_relay(key(OTHER_PEER), true, false).await);
+        assert!(manager.register_relay(key(STRANGER), false, false).await);
+        for (relay, forwards) in [(PEER, true), (OTHER_PEER, false), (STRANGER, false)] {
+            let connection = &manager.connections[&key(relay)];
+            assert_eq!(connection.forward_duplicate_events, forwards, "{relay}");
+            assert!(connection.grasp_p_node, "{relay}");
+        }
+        manager.shutdown().await;
+
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+            config.private_repos_enable = false;
+        })
+        .await;
+        assert!(manager.register_relay(key(PEER), false, false).await);
+        let connection = &manager.connections[&key(PEER)];
+        assert!(!connection.forward_duplicate_events);
+        assert!(!connection.grasp_p_node);
+        manager.shutdown().await;
+    }
+
+    /// Negentropy: a requested event that GRASP-P holds counts as delivered,
+    /// so the batch completes on its EOSE, with no second round and nothing
+    /// left for missing-event recovery. It fails when the seam beside
+    /// upstream's own dependency check in `handle_eose` goes.
+    #[tokio::test]
+    async fn negentropy_batch_counts_a_held_grasp_p_event_as_delivered() {
+        let (mut manager, _directory) = peer_test_manager(None, |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        let peer = key(PEER);
+        let wrap = unregistered_wrap();
+        // Delivered once and held. Its second copy, which used to complete
+        // the batch, is the one duplicate forwarding skips.
+        assert_eq!(
+            synced_from(&manager, &wrap, &peer, SaveContext::RelaySync).await,
+            ProcessResult::Rejected(PolicyRejection::Restricted)
+        );
+        assert!(is_held(&manager, &wrap));
+        let never_seen = unregistered_wrap();
+        assert_eq!(
+            manager.grasp_p_settled_ids(&HashSet::from([wrap.id, never_seen.id])),
+            vec![wrap.id]
+        );
+
+        let sub = SubscriptionId::generate();
+        manager.pending_sync_index.write().await.insert(
+            peer.clone(),
+            vec![PendingBatch {
+                batch_id: 1,
+                purpose: PendingBatchPurpose::Core,
+                items: PendingItems::default(),
+                outstanding_subs: HashSet::from([sub.clone()]),
+                sync_method: SyncMethod::Negentropy,
+                pagination_state: HashMap::new(),
+                requested_event_ids: Some(HashSet::from([wrap.id])),
+                received_event_ids: Some(HashSet::new()),
+                initial_hydration_counts: None,
+                retry_count: 0,
+                failed: false,
+            }],
+        );
+        tokio::time::timeout(Duration::from_secs(5), manager.handle_eose(&peer, sub))
+            .await
+            .unwrap();
+
+        assert!(
+            !manager.pending_sync_index.read().await.contains_key(&peer),
+            "the batch must complete in its first round"
+        );
+        assert_eq!(
+            manager
+                .missing_event_recovery
+                .lock()
+                .unwrap()
+                .pending_ids(&peer),
+            None
+        );
+        manager.shutdown().await;
     }
 }

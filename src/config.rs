@@ -886,12 +886,14 @@ pub struct Config {
     )]
     pub private_mirror_fetch_timeout_secs: u64,
 
-    /// Comma-separated operator-approved peer relay URLs for private-repo
-    /// sync. Outbound private-sync WebSocket connections are made ONLY to
-    /// this allowlist — tenant 30640 `relays` tags are advisory metadata and
-    /// never trigger a connection (SSRF / membership-map-leak guard). Unset
-    /// (default): no private-sync peer connections are initiated (bootstrap
-    /// relays still carry the private filters).
+    /// Comma-separated relay URLs of the nodes this one replicates private
+    /// repositories with. GRASP-P events travel between these peers alone:
+    /// only they are sent the private sync filters, and a GRASP-P event that
+    /// relay sync brings from any other relay is refused. Tenant 30640
+    /// `relays` tags are advisory metadata and never trigger a connection
+    /// (SSRF / membership-map-leak guard). The relay in
+    /// NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it is listed here
+    /// too. Unset (default): no peers, so no private-repo replication.
     #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
     pub private_sync_peer_urls: Option<String>,
 

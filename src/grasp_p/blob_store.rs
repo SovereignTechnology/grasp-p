@@ -513,6 +513,7 @@ mod tests {
             mirror_retry_max_secs: 60,
             mirror_max_attempts_per_min: 0,
             mirror_allow_private_ips: false,
+            sync_peer_relays: Default::default(),
             policy_fingerprint: String::new(),
             write_rate_capacity: 0,
             write_rate_refill_per_min: 0,

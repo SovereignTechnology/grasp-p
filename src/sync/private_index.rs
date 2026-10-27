@@ -6,9 +6,8 @@
 //! - [`PrivateSyncIndex`]: alias → {w+aux keys, relay URLs, server URLs},
 //!   rebuilt from the relay DB's accepted kind-30640 registrations. Parallel
 //!   to `RepoSyncIndex`; drives the derived 30641/stream-wrap sync filters. The
-//!   private peer-relay set is NOT derived from it — outbound sync peers
-//!   come only from the operator allowlist
-//!   ([`configured_peer_relay_urls`]).
+//!   private peer-relay set is NOT derived from it — sync peers come only
+//!   from the operator allowlist ([`configured_peer_relay_keys`]).
 //! - [`PrivateRejectedIndex`]: a dedicated hot cache for 30641/stream-wrap
 //!   events rejected because their authorizing 30640 has not arrived yet
 //!   (out-of-order sync), bounded by count and by bytes. What enters it is
@@ -33,7 +32,7 @@ pub struct PrivateRepoEntry {
     /// `relays` tag values from the registration. ADVISORY METADATA ONLY —
     /// tenant-supplied, so it must never drive outbound connections (SSRF /
     /// membership-map-leak vector); peers come from the operator allowlist
-    /// via [`configured_peer_relay_urls`].
+    /// via [`configured_peer_relay_keys`].
     pub relay_urls: Vec<String>,
     /// `server` tag values from the registration.
     pub server_urls: Vec<String>,
@@ -102,17 +101,27 @@ impl PrivateSyncIndex {
     }
 }
 
-/// Normalized ws(s):// private-sync peer relay URLs: EXCLUSIVELY the
-/// operator-configured allowlist (`NGIT_GRASP_P_SYNC_PEER_URLS`), minus the
-/// entries that name this node. `own_service` is the node's service address:
-/// its domain, and its mount path when it is served under one. Tenant 30640
-/// `relays` tags deliberately do NOT contribute — deriving outbound
-/// connections from tenant input would let a
-/// single registration point the node at internal infrastructure or an
-/// attacker relay and leak the entire private-repo membership map through
-/// the derived sync filters. Empty allowlist ⇒ empty set (no connections).
-pub fn configured_peer_relay_urls(allowlist: &[String], own_service: &str) -> HashSet<String> {
-    allowlist
+/// The GRASP-P sync peers of a node: EXCLUSIVELY the operator-configured
+/// allowlist (`NGIT_GRASP_P_SYNC_PEER_URLS`), minus the entries that name
+/// this node, each once and in the order written. `own_service` is the
+/// node's service address: its domain, and its mount path when it is served
+/// under one.
+///
+/// Each entry is given as the key the sync code files a relay under
+/// (`canonical_relay_key`), so that a comparison with a connection's key is
+/// exact, and two spellings of one relay are one peer. This is the one peer
+/// set: the service holds it, every GRASP-P privilege of a connection goes by
+/// it, and the scrape gives its members an alias, numbered in this order.
+/// The bootstrap relay is not in it unless the list names it.
+///
+/// Tenant 30640 `relays` tags deliberately do NOT contribute — deriving
+/// outbound connections from tenant input would let a single registration
+/// point the node at internal infrastructure or an attacker relay and leak
+/// the entire private-repo membership map through the derived sync filters.
+/// Empty allowlist ⇒ no peers.
+pub fn configured_peer_relay_keys(allowlist: &[String], own_service: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let candidates = allowlist
         .iter()
         // Normalize FIRST (bare host[:port] -> wss://) so the exclusion
         // below also recognizes scheme-less self entries.
@@ -123,7 +132,13 @@ pub fn configured_peer_relay_urls(allowlist: &[String], own_service: &str) -> Ha
         // on the same host under another path is a different service and
         // stays a peer.
         .filter(|v| !crate::grasp_p::host::url_denotes_service(v, own_service))
-        .collect()
+        .filter_map(|v| super::canonical_relay_key(&v).ok());
+    for key in candidates {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 /// http(s) → ws(s) conversion + trailing-slash trim; bare host:port → wss://.
@@ -924,16 +939,46 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_peer_relay_urls_excludes_own_domain() {
+    fn test_configured_peer_relay_keys_excludes_own_domain() {
         let allowlist: Vec<String> = vec![
             "ws://127.0.0.1:1111".into(),
             "ws://127.0.0.1:2222/".into(),
             "http://127.0.0.1:3333".into(),
         ];
-        let peers = configured_peer_relay_urls(&allowlist, "127.0.0.1:1111");
-        assert!(!peers.contains("ws://127.0.0.1:1111"));
-        assert!(peers.contains("ws://127.0.0.1:2222"));
-        assert!(peers.contains("ws://127.0.0.1:3333"));
+        let peers = configured_peer_relay_keys(&allowlist, "127.0.0.1:1111");
+        assert_eq!(
+            peers,
+            vec![
+                "ws://127.0.0.1:2222".to_string(),
+                "ws://127.0.0.1:3333".to_string()
+            ]
+        );
+    }
+
+    /// The keys are what the sync code files a relay under, so a connection
+    /// is a peer by an exact comparison. Spellings of one relay are one
+    /// peer, at the place of its first entry.
+    #[test]
+    fn peer_keys_are_sync_keys_once_each_in_list_order() {
+        let allowlist: Vec<String> = vec![
+            "wss://b.example/".into(),
+            "B.example".into(),
+            " https://a.example ".into(),
+            "wss://b.example".into(),
+            "wss://own.example".into(),
+        ];
+        let peers = configured_peer_relay_keys(&allowlist, "own.example");
+        assert_eq!(
+            peers,
+            vec!["wss://b.example".to_string(), "wss://a.example".to_string()]
+        );
+        for key in &peers {
+            assert_eq!(
+                super::super::canonical_relay_key(key).as_ref(),
+                Ok(key),
+                "{key} must already be the sync key"
+            );
+        }
     }
 
     #[test]
@@ -948,18 +993,18 @@ mod tests {
         ];
         // A node mounted at /a drops every spelling of itself and keeps the
         // relay next door, the bare host and the same path on another host.
-        let peers = configured_peer_relay_urls(&allowlist, "h.example/a");
+        let peers = configured_peer_relay_keys(&allowlist, "h.example/a");
         assert_eq!(
             peers,
-            HashSet::from([
+            vec![
                 "wss://h.example/b".to_string(),
                 "wss://h.example".to_string(),
                 "wss://other.example/a".to_string(),
-            ])
+            ]
         );
         // A node at the root of the host is every path on it, as before.
-        let peers = configured_peer_relay_urls(&allowlist, "h.example");
-        assert_eq!(peers, HashSet::from(["wss://other.example/a".to_string()]));
+        let peers = configured_peer_relay_keys(&allowlist, "h.example");
+        assert_eq!(peers, vec!["wss://other.example/a".to_string()]);
     }
 
     #[test]
@@ -983,15 +1028,13 @@ mod tests {
         index.replace_all(entries);
 
         // No allowlist configured: zero peers, regardless of tenant input.
-        let peers = configured_peer_relay_urls(&[], "thisnode.example.com");
+        let peers = configured_peer_relay_keys(&[], "thisnode.example.com");
         assert!(peers.is_empty());
 
         // Allowlist configured: exactly the allowlist, tenant values ignored.
         let allowlist: Vec<String> = vec!["wss://peer.example.com".into()];
-        let peers = configured_peer_relay_urls(&allowlist, "thisnode.example.com");
-        assert_eq!(peers, HashSet::from(["wss://peer.example.com".to_string()]));
-        assert!(!peers.contains("ws://169.254.169.254"));
-        assert!(!peers.contains("wss://attacker.example.com"));
+        let peers = configured_peer_relay_keys(&allowlist, "thisnode.example.com");
+        assert_eq!(peers, vec!["wss://peer.example.com".to_string()]);
     }
 
     #[test]

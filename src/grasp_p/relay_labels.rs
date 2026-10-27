@@ -24,19 +24,19 @@
 //!
 //! The peers are the relays the operator named as the nodes this one
 //! replicates private repositories with: the entries of
-//! `NGIT_GRASP_P_SYNC_PEER_URLS`, and the relay in
-//! `NGIT_SYNC_BOOTSTRAP_RELAY_URL`. The bootstrap relay counts because a pair
-//! can be wired through it alone: it is dialled at startup, it is sent the
-//! private filters like a listed peer, and `policy_fingerprint` takes the
-//! pair's other node from it. Left out, the peer of such a node would vanish
-//! from its scrape and the alerts on that peer would go blind. Both settings
-//! are the operator's own, so an alias tells nothing that a customer chose.
-//! Relays configured for another purpose, such as the user index and the
-//! Sync+ fallbacks, are not nodes of the pair and are dropped with the rest.
+//! `NGIT_GRASP_P_SYNC_PEER_URLS`. That is the one set the sync code treats
+//! as peers (`sync::private_index::configured_peer_relay_keys`, held by the
+//! service), so a relay has an alias exactly when it carries GRASP-P
+//! traffic. The setting is the operator's own, so an alias tells nothing
+//! that a customer chose. The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a
+//! peer, and has an alias, only when the list names it: one the list leaves
+//! out carries public sync alone and is dropped with the other relays. So
+//! are relays configured for another purpose, such as the user index and the
+//! Sync+ fallbacks.
 //!
 //! A label is compared as it stands with the key the sync code files a relay
 //! under, which is also what its recorders are given as the label. The
-//! configured URLs are brought to that key by the functions the sync code
+//! configured URLs are brought to that key by the function the sync code
 //! uses for them, so every spelling of one relay is one peer. The comparison
 //! is exact and a key has one alias, so two series of a family can never be
 //! left with the same labels; a label in any other spelling names no peer
@@ -46,10 +46,8 @@ use std::collections::HashMap;
 
 use prometheus::proto::{Metric, MetricFamily};
 
-use super::host::url_denotes_service;
 use crate::config::Config;
-use crate::sync::canonical_relay_key;
-use crate::sync::private_index::normalize_relay_url;
+use crate::sync::private_index::configured_peer_relay_keys;
 
 /// The label upstream's sync metrics put a relay URL in.
 const RELAY_LABEL: &str = "relay";
@@ -69,39 +67,28 @@ impl RelayLabels {
     /// The aliases of a node with GRASP-P enabled; `None` on any other node,
     /// whose scrape stays upstream's.
     ///
-    /// Peers are numbered in the order of `NGIT_GRASP_P_SYNC_PEER_URLS`. The
-    /// bootstrap relay takes the next number when the list does not already
-    /// name it, so the one peer of a pair is `peer-1` whichever of the two
-    /// settings names it. An entry that names this node itself takes no
-    /// number: the sync code never dials it, and a list shared by both nodes
-    /// of a pair would otherwise number the other node differently on each.
+    /// Peers are numbered in the order of `NGIT_GRASP_P_SYNC_PEER_URLS`, so
+    /// the one peer of a pair is `peer-1`. An entry that names this node
+    /// itself takes no number: the sync code never dials it, and a list
+    /// shared by both nodes of a pair would otherwise number the other node
+    /// differently on each.
     ///
-    /// Each setting is read exactly as the sync code reads it, own-address
-    /// rule included, so that an alias exists for the relays it dials as
-    /// peers and for no other.
+    /// The list is read by the function the service builds its peer set
+    /// with, own-address rule included, so that an alias exists for the
+    /// relays the sync code treats as peers and for no other.
     pub fn from_config(config: &Config) -> Option<Self> {
         if !config.private_repos_enable {
             return None;
         }
-        let own_address = config.service_address();
-        let listed = config
-            .private_sync_peer_url_entries()
+        let peers = configured_peer_relay_keys(
+            &config.private_sync_peer_url_entries(),
+            &config.service_address(),
+        );
+        let aliases = peers
             .into_iter()
-            .filter_map(|entry| normalize_relay_url(&entry))
-            .filter(|url| !url_denotes_service(url, &own_address))
-            .filter_map(|url| canonical_relay_key(&url).ok());
-        let bootstrap = config
-            .sync_bootstrap_relay_url
-            .as_deref()
-            .and_then(|url| canonical_relay_key(url).ok());
-
-        let mut aliases: HashMap<String, String> = HashMap::new();
-        for key in listed.chain(bootstrap) {
-            let number = aliases.len() + 1;
-            aliases
-                .entry(key)
-                .or_insert_with(|| format!("{ALIAS_PREFIX}{number}"));
-        }
+            .enumerate()
+            .map(|(index, key)| (key, format!("{ALIAS_PREFIX}{}", index + 1)))
+            .collect();
         Some(Self { aliases })
     }
 
@@ -148,8 +135,8 @@ mod tests {
     use prometheus::{IntCounterVec, Opts, Registry, TextEncoder};
 
     use super::*;
+    use crate::sync::canonical_relay_key;
     use crate::sync::health::HealthState;
-    use crate::sync::private_index::configured_peer_relay_urls;
     use crate::sync::{ConnectionStatus, SyncMetrics};
 
     /// The families upstream labels with a relay, and how many series
@@ -334,11 +321,10 @@ mod tests {
         metrics.record_failure_count("wss://b.example", 2);
         metrics.record_failure_count("wss://c.example", 3);
 
-        // b comes first and is listed twice, in two spellings; the bootstrap
-        // relay is not in the list and is numbered after it.
+        // b comes first and is listed twice, in two spellings.
         let labels = labels_for(
-            Some("wss://b.example, b.example/, https://a.example"),
-            Some("wss://c.example"),
+            Some("wss://b.example, b.example/, https://a.example, wss://c.example"),
+            None,
         );
         let rendered = text(&labels.scrub(registry.gather()));
         for (alias, failures) in [("peer-1", 2), ("peer-2", 1), ("peer-3", 3)] {
@@ -350,32 +336,51 @@ mod tests {
             );
         }
         assert!(!rendered.contains("peer-4"), "{rendered}");
-
-        // A bootstrap relay the list already names takes no second number.
-        let labels = labels_for(
-            Some("wss://b.example,wss://a.example"),
-            Some("wss://a.example/"),
-        );
-        let rendered = text(&labels.scrub(registry.gather()));
-        assert!(
-            rendered.contains("ngit_sync_relay_failures{relay=\"peer-2\"} 1\n")
-                && !rendered.contains("peer-3"),
-            "{rendered}"
-        );
     }
 
+    /// The bootstrap relay is a peer only when the list names it, as in the
+    /// sync code: one the list leaves out carries no GRASP-P traffic and its
+    /// series go with every other relay's. Named in the list, it keeps the
+    /// number of its entry.
     #[test]
-    fn the_bootstrap_relay_is_a_peer_when_no_list_names_it() {
+    fn the_bootstrap_relay_is_a_peer_only_when_listed() {
         let (registry, metrics) = sync_metrics();
         record_all(&metrics, "wss://b.example");
+        metrics.record_failure_count("wss://a.example", 1);
 
         let scrubbed = labels_for(None, Some("wss://b.example")).scrub(registry.gather());
+        for (family, _) in RELAY_FAMILIES {
+            assert!(
+                relays_of(&scrubbed, family).is_empty(),
+                "{family}: a bootstrap relay the list leaves out has no series"
+            );
+        }
 
+        let scrubbed =
+            labels_for(Some("wss://a.example"), Some("wss://b.example")).scrub(registry.gather());
+        assert_eq!(
+            relays_of(&scrubbed, "ngit_sync_relay_failures"),
+            vec!["peer-1"],
+            "the listed relay is the one peer"
+        );
+
+        let scrubbed = labels_for(
+            Some("wss://a.example,wss://b.example"),
+            Some("wss://b.example/"),
+        )
+        .scrub(registry.gather());
         for (family, series) in RELAY_FAMILIES {
+            let relays = relays_of(&scrubbed, family);
             assert_eq!(
-                relays_of(&scrubbed, family),
-                vec!["peer-1"; series],
-                "{family}: a pair wired through the bootstrap relay alone keeps its peer"
+                relays.iter().filter(|relay| *relay == "peer-2").count(),
+                series,
+                "{family}: a bootstrap relay the list names is the peer of its entry"
+            );
+            assert!(
+                relays
+                    .iter()
+                    .all(|relay| relay == "peer-1" || relay == "peer-2"),
+                "{family}: {relays:?}"
             );
         }
     }
@@ -399,27 +404,28 @@ mod tests {
     }
 
     #[test]
-    fn aliases_exist_for_exactly_the_relays_sync_dials_as_peers() {
+    fn aliases_exist_for_exactly_the_relays_sync_treats_as_peers() {
         let config = node(
             Some("wss://own.example, b.example/, https://a.example, wss://b.example"),
             Some("wss://c.example/"),
         );
-        // What the sync code keeps connected as GRASP-P peers, and the relay
-        // it registers as the bootstrap relay, each read its own way.
-        let mut dialled: HashSet<String> = configured_peer_relay_urls(
-            &config.private_sync_peer_url_entries(),
-            &config.service_address(),
-        )
-        .iter()
-        .filter_map(|url| canonical_relay_key(url).ok())
-        .collect();
-        dialled.extend(canonical_relay_key("wss://c.example/").ok());
-        assert_eq!(dialled.len(), 3, "a, b and c; never this node itself");
+        // The peer set the service holds, which every GRASP-P privilege of a
+        // relay connection goes by. Never this node, and never the bootstrap
+        // relay the list does not name.
+        let peers = super::super::PrivateConfig::from_config(&config).sync_peer_relays;
+        assert_eq!(
+            peers,
+            ["wss://b.example", "wss://a.example"]
+                .map(|url| canonical_relay_key(url).expect("a valid relay URL"))
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "a and b; never this node itself, never c"
+        );
 
         let labels = RelayLabels::from_config(&config).expect("GRASP-P is enabled");
 
         let aliased: HashSet<String> = labels.aliases.keys().cloned().collect();
-        assert_eq!(aliased, dialled);
+        assert_eq!(aliased, peers);
     }
 
     /// Under a mount path this node is its host and that path together: a
@@ -433,18 +439,12 @@ mod tests {
         );
         config.base_path = "/grasp".to_string();
 
-        let dialled: HashSet<String> = configured_peer_relay_urls(
-            &config.private_sync_peer_url_entries(),
-            &config.service_address(),
-        )
-        .iter()
-        .filter_map(|url| canonical_relay_key(url).ok())
-        .collect();
-        assert_eq!(dialled.len(), 2, "the two other services, never this one");
+        let peers = super::super::PrivateConfig::from_config(&config).sync_peer_relays;
+        assert_eq!(peers.len(), 2, "the two other services, never this one");
 
         let labels = RelayLabels::from_config(&config).expect("GRASP-P is enabled");
         let aliased: HashSet<String> = labels.aliases.keys().cloned().collect();
-        assert_eq!(aliased, dialled);
+        assert_eq!(aliased, peers);
     }
 
     #[test]
