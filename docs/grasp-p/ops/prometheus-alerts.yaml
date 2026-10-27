@@ -62,7 +62,7 @@ groups:
           component: grasp-p
         annotations:
           summary: "Private blob mirror backlog: {{ $value }} blobs unfetched"
-          description: "ngit_private_mirror_lag_blobs has been > 0 for 15m. The gauge is set by the repair scan (every 60s), and a blob waiting out its retry backoff stays counted. Every failed fetch backs off, up to NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS (1h by default) plus 20% jitter, so this alert, not NgitPrivateMirrorFailures, is the one that shows a blob that keeps failing. Read the reason in ngit_private_mirror_failed_total and in the 'private mirror' warn lines: no_peer, network or http_status = look at the peer set or the far side; quota, reserve or store = this node's own state; lag during known peer downtime is expected and heals by itself. After a fix the blob is fetched when its backoff ends; a restart clears every backoff."
+          description: "ngit_private_mirror_lag_blobs has been > 0 for 15m. The gauge is set by the repair scan (every 60s), and a blob waiting out its retry backoff stays counted. Every failed fetch backs off, up to NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS (1h by default) plus 20% jitter, so this alert, not NgitPrivateMirrorFailures, is the one that shows a blob that keeps failing. Read the reason in ngit_private_mirror_failed_total and in the 'private mirror' warn lines: no_peer = NGIT_GRASP_P_MIRROR_PEER_URLS is unset or names only this node (blobs come from that list alone); network or http_status = the peer or the path to it; quota, reserve or store = this node's own state; lag during known peer downtime is expected and heals by itself. After a fix the blob is fetched when its backoff ends; a restart clears every backoff."
           runbook: "docs/grasp-p/ops/runbook.md#mirror-lag"
 
       # Mirror fetch failures, split by the server's `reason` label.
@@ -75,7 +75,7 @@ groups:
           component: grasp-p
         annotations:
           summary: "Private blob mirror fetches failing (reason={{ $labels.reason }})"
-          description: "Mirror fetch failures in every 10m window for 10m with reason={{ $labels.reason }}. Each failed blob backs off (minutes, then up to NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS), so a steady rate means many blobs are failing or new ones keep failing, not one blob retried in a loop; a few blobs that stay stuck go quiet here and show in NgitPrivateMirrorLag instead. A growing backlog plus failures usually means an unreachable or misconfigured peer, or a quota refusal on this node."
+          description: "Mirror fetch failures in every 10m window for 10m with reason={{ $labels.reason }}. Each failed blob backs off (minutes, then up to NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS), so a steady rate means many blobs are failing or new ones keep failing, not one blob retried in a loop; a few blobs that stay stuck go quiet here and show in NgitPrivateMirrorLag instead. A growing backlog plus failures usually means an unreachable or misconfigured peer (reason=blocked: the peer's address, or an address its name resolved to, is one the mirror may not reach), or a quota refusal on this node."
           runbook: "docs/grasp-p/ops/runbook.md#mirror-failures"
 
       # Registration conflicts. The metric's own help text: "Alert on any

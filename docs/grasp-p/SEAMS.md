@@ -26,7 +26,7 @@ Upstream's files carry thin seams only:
 | `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
-| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
+| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the two pair constructors also name their bootstrap peer in `NGIT_GRASP_P_SYNC_PEER_URLS` and, through `TestRelay::blob_peer_url`, in `NGIT_GRASP_P_MIRROR_PEER_URLS`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
@@ -149,7 +149,8 @@ The address check is upstream's too (`src/outbound.rs`), unchanged. It counts th
 prefixes (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 (`2002::/16`) as globally reachable,
 so an address there that wraps an internal IPv4 address passes it, for the probe as for
 the dial. The blob mirror decodes `64:ff9b::/96` and `2002::/16` and refuses such an
-address (`is_disallowed_ip` in `src/grasp_p/mirror.rs`). On a node with GRASP-P enabled
+address, and the local-use prefix whatever it carries (`wraps_non_global` in
+`src/grasp_p/mirror.rs`). On a node with GRASP-P enabled
 the relay dial and the probe now pass the mirror's check as well ("Configured peers",
 the last point); a node without it keeps upstream's check alone. Aligning upstream's
 ranges is still to be offered upstream, and that seam goes when upstream decodes them.
@@ -422,7 +423,7 @@ counter in `src/metrics/mod.rs`. `src/http/mod.rs` is not touched. Nothing joins
   seconds. 30 seconds for the node: a full node usually means stalled uploads, and 30
   seconds is when a stalled upload is cut.
 - **The mirror is outside both caps.** `reserve_upload` takes an origin. A mirror fetch
-  reserves the bytes it expects to read (a configured peer's announced length, otherwise
+  reserves the bytes it expects to read (the peer's announced length, otherwise
   the declared size) against `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES`, and
   takes no slot: `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY` already bounds how many run. So
   clients that fill or stall the slots no longer make replication wait for a slot, and
@@ -536,9 +537,10 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
   `mirror.rs` and in the runbook. Classes that may heal by themselves or by a change on
   this node back off exponentially; `404` from every peer, `blocked`, `verify` and
   `too_large` wait the maximum interval. The metric labels are unchanged. A peer name
-  that does not resolve is `network`, not `blocked`: the address guard connects to
+  that does not resolve is `network`, not `blocked`: the address check connects to
   neither, but a resolver that fails for a moment must not park every blob tried
-  meanwhile for the maximum interval. The two are told apart by how the outbound
+  meanwhile for the maximum interval. A lookup through the client's resolver that
+  fails, or answers no address, is `network` for the same reason. The two are told apart by how the outbound
   policy's error begins (`POLICY_DNS_ERROR_PREFIX`); a unit test fails if upstream
   rewords it. The cost of gating every class is slower recovery: a blob refused with
   `quota` used to be fetched within a minute of space being freed and now waits out its
@@ -547,16 +549,17 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
 - **Which reason is recorded.** A failure from this node's own state (`quota`, `reserve`,
   `sink`, `write`, `store`) ends the peer loop. Otherwise every peer is tried and the
   class that retries soonest wins, whatever the order of the peers.
-- **Order within one fetch.** Address guard, quota preflight against local state,
-  request, status, length, byte reservation, temp file, body. A blob the account has no
+- **Order within one fetch.** Address check, quota preflight against local state,
+  request (its connection vetted by the client's resolver), status, length, byte
+  reservation, temp file, body. A blob the account has no
   room for costs no request, and a wrong length costs no body.
-- **Whose length is believed.** A peer from `NGIT_GRASP_P_MIRROR_PEER_URLS` is believed
-  up to `NGIT_GRASP_P_MAX_BLOB_BYTES`, so a blob declared with the wrong size is now
-  mirrored and charged at its real size, where it used to fail for ever: the replica
-  matches the origin. A peer that only a registration's `server` tag names must announce
-  exactly the declared size, or the fetch fails as `verify` before the body. With no
-  announced length the declared size bounds the read. Both kinds of peer exist until
-  mirroring is restricted to the operator's list; the second rule goes away with it.
+- **Whose length is believed.** The peer's, up to `NGIT_GRASP_P_MAX_BLOB_BYTES`, so a
+  blob declared with the wrong size is now mirrored and charged at its real size, where
+  it used to fail for ever: the replica matches the origin. With no announced length the
+  declared size bounds the read. A peer is always one the operator listed ("The blob
+  mirror fetches from the operator's peers only"); while a registration's `server` tag
+  could name one, such a peer had to announce exactly the declared size, and that rule
+  went with the tags.
 - **Time limits.** The client has no total timeout any more. The peer must answer, and
   may not go silent mid-body, within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`; the whole
   request gets that plus the length divided by 256 KiB/s, so a 256 MiB blob on a slow
@@ -576,8 +579,9 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
   `ngit_private_mirror_lag_blobs` is set by the scan and nowhere else, so it is up to
   one scan interval old; a scan that cannot read the claim table leaves the gauge as it
   was.
-- **Still open.** Each attempt resolves the peer's name again (a cached verdict belongs
-  with pinning the resolved address, issue 3). There is no metric for fetches held back
+- **Still open.** Without `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS`, each attempt looks the
+  peer's name up twice: in the early check, and in the client's resolver, whose answer is
+  the one connected to. There is no metric for fetches held back
   by the budget or dropped from a full backlog. Nothing clears an account's gates when
   its quota is raised. A state root whose declared size differs from the stored blob is
   still accepted. A state root is accepted before its blobs are uploaded, so a replica
@@ -588,6 +592,112 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
   an account with few missing blobs and slow peers holds it for as long as its fetches
   last. No slot is kept back for an account with nothing running when two slow accounts
   hold them all.
+
+## The blob mirror fetches from the operator's peers only, at the address it vetted
+
+In GRASP-P's own files (`src/grasp_p/mirror.rs`, `src/grasp_p/vetted_dns.rs`, one warning
+in `src/grasp_p/mod.rs`), plus the text of two settings in the four config sources and the
+pair constructors of `tests/common/relay.rs` (seam table). No setting is added, and nothing
+joins `policy_fingerprint`: the list is node-local, it decides where a node fetches blobs and
+never what it accepts.
+
+- **What was wrong.** With `NGIT_GRASP_P_MIRROR_PEER_URLS` unset the mirror took its peers
+  from the `server` tags of each registration, so an account chose the hosts this node sent
+  requests to, with a path largely of the account's choosing, on every repair pass. And a
+  fetch was vetted on one DNS answer and connected on another: the address check resolved
+  the peer's name, then reqwest resolved it again with the system resolver, and honoured the
+  proxy variables of the environment. A name could answer a public address to the check and
+  an internal one to the connection.
+- **The peers are the operator's list alone**, the maintainer's decision that GRASP-P events
+  and blobs replicate only between operator-configured peers, with no setting to widen it.
+  `peer_servers_for` returns the entries of `NGIT_GRASP_P_MIRROR_PEER_URLS` as base URLs, each
+  once, less the ones that name this node (`is_own_server`, mount path included, as for the
+  sync list), so both nodes of a pair can be given one list; the list used to be taken as
+  written, this node included. A registration's `server` tags are advisory: they tell clients
+  where to go and choose no host to fetch from. With no list, or one that names only this
+  node, there is no peer and every missing blob fails as `no_peer`.
+- **One warning at startup** when the mirror is on and has no peer:
+  `NGIT_GRASP_P_MIRROR_ENABLE is true and NGIT_GRASP_P_MIRROR_PEER_URLS names no peer of this
+  node: the blob mirror has no peers, so no blob will replicate to this node`. It replaces the
+  warning about `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS` without a list, which was about the
+  tag path. The private-link setting needs no warning of its own any more: each of its readers
+  (the mirror's early check and its resolver, `relay_peer_allowed`, `grasp_p_peer_policy`)
+  applies it to a listed peer only, so it no longer widens what an account can reach.
+- **Every peer's length is believed**, up to the maximum blob size (`expected_len`), since
+  every peer is the operator's. The flag `peers_configured` on jobs and routes, and the rule
+  that held a peer named only by a registration to the declared size, are gone.
+- **The address vetted is the address connected to.** The mirror's one long-lived client
+  (`mirror::http_client`) has a resolver of its own, `vetted_dns::VettedResolver`, and
+  `no_proxy()`. The resolver looks the name up (`tokio::net::lookup_host`; a test passes a
+  lookup of its own), refuses an empty answer, and, unless
+  `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`, refuses the whole answer when any address in
+  it fails `outbound::is_globally_reachable` or `mirror::wraps_non_global` (the relay dial's
+  check: the mirror's list, a NAT64 or 6to4 form held to both lists by the address it wraps,
+  and the local-use NAT64 prefix), as the early check does. hyper-util connects to exactly
+  the addresses it returns, so the connection makes no lookup of its own and nothing falls
+  through to the system resolver. The lookup's socket addresses go on as they came, so a
+  link-local answer keeps its scope. `connect_timeout` covers the lookup and the connection
+  together.
+- **Its refusal is `blocked`.** reqwest keeps a resolver's error as a source: its own DNS
+  error wraps it, hyper-util's connect error wraps that, and the client error wraps the
+  connect error (read in reqwest 0.13.5 and hyper-util 0.1.21). `vetted_dns::blocked_target`
+  finds it there, and `fetch_from_peer` records `blocked: <host> resolved to <address>, which
+  the blob mirror does not connect to`: the class that waits the maximum interval, with the
+  metric label `blocked`. A lookup that fails or answers nothing is `network`, as in the
+  early check.
+- **The early check stays** (`peer_allowed`): scheme, credentials, local names, and the
+  address of a host that is an IP literal, which hyper-util connects to without asking a
+  resolver. For a name it still makes its own lookup; only the resolver's answer is connected
+  to.
+- **Why a resolver.** `ClientBuilder::resolve_to_addrs` fixes one name per client and hands
+  every other lookup to the system resolver, so it would mean a client per blob, or a cache.
+  The NIP-11 probe's `VettedAddresses` (`src/sync/relay_connection.rs`) does the other thing,
+  answering with addresses vetted before its per-probe client was built, and is left as it is.
+- **A connection is used again.** The client keeps its pool, so a connection opened to a
+  vetted address serves later fetches without a lookup for as long as the peer keeps it open.
+
+For an operator: set `NGIT_GRASP_P_MIRROR_PEER_URLS` on both nodes, to the other node's blob
+base, which is the host, port and path of its relay over `https`; without it no blob
+replicates. `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` no longer apply to the mirror: a pair
+that reached its peer through a proxy loses the mirror until the proxy is out of the path. A
+peer whose name answers an internal address next to its public one is refused whole, unless
+the link is declared private.
+
+Tests. In `src/grasp_p/vetted_dns.rs`, with injected lookups and no network:
+`resolver_hands_on_an_all_global_answer`, `resolver_refuses_an_empty_answer` (also on a
+private link, and not as a refusal of an address), `resolver_refuses_a_mixed_answer_whole`
+(with a row that only upstream's list refuses, 198.18.0.1, rows that only the mirror's
+refuses, a NAT64 and a 6to4 form, the same forms around 198.18.0.1 and 240.0.0.1, and the
+local-use NAT64 prefix), `resolver_on_a_private_link_passes_every_answer`,
+`resolver_keeps_the_scope_of_a_link_local_answer`, `resolver_refuses_a_rebound_answer` (a
+public answer, then loopback) and
+`resolver_asks_for_the_name_and_passes_a_failed_lookup_on`. In `src/grasp_p/mirror.rs`, on
+the real client against a loopback listener, with a name under `.test` that no resolver
+answers: `mirror_client_refuses_a_name_that_resolves_to_an_internal_address` (no connection,
+the failure is `blocked` with the host and the address; it fails when the client loses its
+resolver, because the system resolver finds no address and the failure is `network`),
+`mirror_client_connects_to_the_address_its_resolver_vetted` (its control: the same request,
+the answer allowed, one connection with the name in `Host`) and
+`mirror_client_reports_a_failed_lookup_as_network`;
+`fetch_from_peer_records_the_resolvers_refusal_as_blocked` takes the same refusal through
+`fetch_from_peer` itself; `peer_allowed_refuses_internal_literals_the_resolver_never_sees`
+covers the early check on the hosts no resolver is asked about. The rule of the peers:
+`peer_servers_are_the_list_less_this_node` and `server_tags_never_name_a_blob_peer` (a
+repair scan and the job a state root enqueues, on a real service, a registration whose
+`server` tags name another host: no peer without the list, the list's peers with it).
+`expected_len_believes_the_peer_up_to_the_maximum` replaces the test of the two length
+rules. In `private_two_node`, every pair node started with a bootstrap peer has it as its
+blob peer; `exit16`, which starts its pair without one, lists each node's blob peer by hand,
+and `exit18` empties the list beside the sync list and asserts the warning, which `exit1`
+asserts is absent with a peer. `exit20_mirror_ignores_the_proxy_variables` runs B with every
+proxy variable set (a node is its own process, so its environment races with no other test).
+Not tested: a TLS connection through the resolver (`grasp_p_tls` names its blob peer by an
+IP literal), and a pooled connection outliving a change of the peer's DNS.
+
+Still open: a name is looked up twice per attempt off a private link (above); the relay dial
+is vetted and not pinned (seams 4 to 6; a pinned WebSocket dial is offered upstream); and a
+pair sets two lists, `NGIT_GRASP_P_SYNC_PEER_URLS` and `NGIT_GRASP_P_MIRROR_PEER_URLS`, that
+the node does not compare.
 
 ## Registration: cheap checks first, and a node named with its mount path
 
@@ -703,7 +813,7 @@ Every caller of the old comparison, and what it does now:
 | Caller | Now | Why |
 |---|---|---|
 | `registration::parse_shape`, the `relays` and the `server` tag | service | A registration names where clients go. Naming the bare host of a mounted node would send them to the wrong URL. |
-| `mirror::is_own_server` (peers taken from `server` tags) | service | Another service on the same host is a peer, not this node. |
+| `mirror::is_own_server` (entries of `NGIT_GRASP_P_MIRROR_PEER_URLS`; it judged `server` tags until the mirror took its peers from the list alone) | service | Another service on the same host is a peer, not this node. |
 | `private_index::configured_peer_relay_keys` (the sync peer list) | service | The same, for relays. Its callers pass the service address. |
 | `relay_labels::RelayLabels::from_config` | service | It must leave out exactly the entries the sync code leaves out, or a peer would be scraped without an alias. A test holds the two together. |
 | `ngit-private-watchdog`, `derive_blob_base` | path-aware (own code, same rule) | When the relay URL it was given has a path, only `server` values with that path are candidates for the blob base. |
@@ -726,9 +836,9 @@ setting that itself carries a path counts as mounted at that path: put the path 
   path, or with another path, is no longer taken for the node itself. It is dialled as
   a peer, and gets an alias in the scrape. A list shared by both nodes must spell each
   node with its path.
-- With no `NGIT_GRASP_P_MIRROR_PEER_URLS` set, a `server` value on this node's host
-  without its path is a peer the mirror will ask for blobs, where it used to be
-  skipped as the node itself. Set the peer list in production.
+- An entry of `NGIT_GRASP_P_MIRROR_PEER_URLS` that names this node's host without its
+  path, or with another path, is a peer the mirror asks for blobs; one with the path
+  is this node and is left out. Spell each node with its path there as well.
 - The watchdog, given `--relay-a wss://host/path`, takes the blob base from the
   `server` values with that path only.
 
@@ -895,9 +1005,9 @@ extend with is narrower now.
   over the link and refuses a peer that only the list names, so events then flow one way
   only and `NgitSyncPeerDisconnected` (value 1) on that node reports it. A listed peer
   that is also its bootstrap relay is still dialled. The setting also opens the blob
-  mirror to internal addresses, and without `NGIT_GRASP_P_MIRROR_PEER_URLS` the mirror's
-  peers come from registrations: the node warns once when the mirror starts that way
-  (`spawn_background_tasks` in `src/grasp_p/mod.rs`).
+  mirror to internal addresses, for the peers in `NGIT_GRASP_P_MIRROR_PEER_URLS` only:
+  the mirror has no other peers ("The blob mirror fetches from the operator's peers
+  only").
 - **The stricter address check** (seams 4 to 6, `mirror::vet_relay_dial`). Every
   connection of a GRASP-P node carries the flag `grasp_p_node` (`register_relay` sets it
   from `private_repos_enable`, and it is the only place a connection is built outside
@@ -974,14 +1084,15 @@ private repositories enabled` still prints the bootstrap relay as `configured_pe
   extension, with the same fallback to a deferred consolidation that
   `handle_new_sync_filters` uses.
 - **Outbound policy.** The mirror's SSRF guards (`peer_allowed`, `relay_peer_allowed`) go
-  through `crate::outbound::OutboundTargetPolicy::authorize_resolved`, then re-check every
-  vetted address with our `is_disallowed_ip`, which also decodes the NAT64 and 6to4 forms
+  through `crate::outbound::OutboundTargetPolicy::authorize_resolved`, then put every
+  vetted address to our `wraps_non_global`, which also decodes the NAT64 and 6to4 forms
   that upstream's `is_globally_reachable` lets through (upstream already refuses every
   IPv4-compatible address). Production still
   requires https / wss. Listed GRASP-P peers register as event-directed targets, so
   upstream's dial-time policy applies to them too, unless the operator has declared the
-  pair's link private ("Configured peers"). Addresses are not pinned yet (DNS rebinding,
-  M3 #3).
+  pair's link private ("Configured peers"). The mirror connects to the addresses its
+  client's resolver vetted ("The blob mirror fetches from the operator's peers only");
+  the relay dial is vetted and not pinned (M3 #3, the relay half).
 - **Duplicate forwarding.** Legacy made `RelayConnection` forward events nostr-sdk reports
   as already seen, unconditionally. It is now behind `with_duplicate_event_forwarding`, set
   only on the connection to a configured peer, so a public node's sync is unchanged and so
@@ -1164,11 +1275,14 @@ features. No package was added.
   node they would pass on a 404 page. One use of it is left, in `exit4_disabled_is_noop` of
   `private_two_node`: that node runs with GRASP-P off and serves upstream's `/metrics`.
   `phase0_gates` runs the stock relay (`TestRelay::start`, `start_with_lmdb`) with GRASP-P off:
-  it checks what GRASP-P needs from upstream. In the pair tests the peer is listed and is also
-  the bootstrap relay (`start_grasp_p_pair_node` sets both), except `exit14`, `exit16` and
-  `exit17_restarted_listed_peer_is_kept_and_redialled` (listed only), `exit18` (bootstrap
-  relay only, which is no peer) and `exit19` (A lists no relay and has no bootstrap relay;
-  B has A as both) in `private_two_node`, and both SSRF guards are switched
+  it checks what GRASP-P needs from upstream. In the pair tests the peer is listed as sync
+  peer and as blob peer and is also the bootstrap relay (`start_grasp_p_pair_node` sets all
+  three from the one URL), except `exit14`, `exit16` and
+  `exit17_restarted_listed_peer_is_kept_and_redialled` (listed only; `exit16` lists the blob
+  peer too, the others need no mirror), `exit18` (bootstrap relay only, which is no peer of
+  either kind) and `exit19` (A lists no relay and has no bootstrap relay; B has A as all
+  three) in `private_two_node`; `exit11`, `exit15` and `grasp_p_tls` give a blob peer of
+  their own, which replaces the fixture's; and both SSRF guards are switched
   off (`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` and upstream's
   `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`), because the nodes are on loopback. `exit16` is
   the exception to the second: it leaves upstream's guard on. No test runs a pair with GRASP-P's
@@ -1272,7 +1386,7 @@ features. No package was added.
   account at its share, keeps a hash once and bounds a backlog; the budget gives a
   burst, then the rate, and `0` is no limit; every failure reason has one of two
   schedules and none leaves a blob ungated; the recorded reason does not depend on peer
-  order; the four cases of whose length is believed; the deadline grows with the length;
+  order; the peer's length is believed up to the maximum; the deadline grows with the length;
   a shared blob goes to the account with the least backlog, with the other accounts as
   fallbacks and the alias that holds the charge first; a waiting blob moves to the
   account the scan chose; a name that does not resolve is not a refusal; the scan

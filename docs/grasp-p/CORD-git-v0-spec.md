@@ -485,11 +485,14 @@ allowlist `NGIT_GRASP_P_SYNC_PEER_URLS`, in both directions: only those relays a
 registration-derived `#d`/`authors` filters (the tenants' alias and key map), and a 30640, 30641 or
 stream wrap that relay sync brings from any other relay is refused before admission. Tenant
 `relays` and `server` tags are advisory metadata and never trigger a relay connection (SSRF +
-membership-map-leak guard); the blob mirror still takes its peers from `server` tags while
-`NGIT_GRASP_P_MIRROR_PEER_URLS` is unset, under the mirror SSRF guard below. The relay in
+membership-map-leak guard), and never choose a host the blob mirror fetches from: its peers are
+the operator allowlist `NGIT_GRASP_P_MIRROR_PEER_URLS` alone, and a node without one mirrors
+nothing. The relay in
 `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when the allowlist names it too; otherwise it
 carries the node's public sync alone. Mirror SSRF guard:
-private-IP block, no redirect-following, https-only by default, sha+size-bounded.
+private-IP block, no redirect-following, no proxy, https-only by default, sha+size-bounded,
+and the connection goes to the addresses its resolver vetted (the connection makes no DNS
+lookup of its own).
 
 ### 5.1 Abuse hardening (phase-4b) [N]
 
@@ -597,8 +600,8 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
   `KeyBackend` seam; a Concord backend (pinned commit 23dcea57) is future engineering, not a
   promise (R1). Marmot remains a risk-register fallback.
 - **Residuals [I]**: ciphertext store-now/decrypt-later; removed-member re-fetch of old ciphertext;
-  epoch lineage visible to the operator (the price of quotas); mirror DNS-rebinding (mitigated by
-  an explicit peer-URL override); sizes/timing side channels (padding defaults **[D]**); an
+  epoch lineage visible to the operator (the price of quotas); the relay dial to a peer is vetted
+  on one DNS answer and not pinned to it (the blob mirror is); sizes/timing side channels (padding defaults **[D]**); an
   attacker backdating BELOW the true first edition wins the §3.2 merge (inherent to the created_at
   anchor); if edition 1 is purged from every sync source, a late-joining node anchors on its
   first-witnessed edition until the victim re-mints an earlier registration; ≥3-party conflict
@@ -635,7 +638,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.
 - §4.1 (new) — pending-epoch lifecycle; templates at `created_at = live+1`; no idle rekey-address admission; rival-resume guard; mint-time fork prevention; squat-tolerant widen; tenant-signed `scopes` + epoch-atomic fold.
-- §5 — whitelist is the SHIPPED DEFAULT (v0 implied open); paid config-rejected; sync peers only from the operator allowlist.
+- §5 — whitelist is the SHIPPED DEFAULT (v0 implied open); paid config-rejected; sync peers only from the operator allowlist; blob mirror peers only from the operator allowlist too (`server` tags advisory), and the mirror connects to the addresses it vetted.
 - §5.1 (new) — per-write-key bucket; cadence limit with hold semantics; fingerprint v2 + exclusions; denylist/1984 re-marked **[N]**; watchdog.
 - §5.2 (new) — exact transient-vs-genuine rejection strings and the `unregistered` substring contract.
 - §6/§7 — squatter + split-brain adversary rows; residuals expanded with the accepted anchor/merge/spec-charge findings; **[D]** narrowed.

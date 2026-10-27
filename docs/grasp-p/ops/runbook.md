@@ -155,8 +155,9 @@ its domain.
 - **Peer lists must spell each node with its path.** In
   `NGIT_GRASP_P_SYNC_PEER_URLS`, `wss://<domain>/grasp` is this node and is
   left out; `wss://<domain>` or `wss://<domain>/other` is taken for another
-  service and dialled as a peer. The same holds for the `server` values the
-  mirror uses when `NGIT_GRASP_P_MIRROR_PEER_URLS` is unset. The
+  service and dialled as a peer. The same holds for the entries of
+  `NGIT_GRASP_P_MIRROR_PEER_URLS`: `https://<domain>/grasp` is this node,
+  `https://<domain>` another service the mirror asks for blobs. The
   `policy_fingerprint` covers this node's full address and its bootstrap
   relay only (§2): a bootstrap relay spelled without its path shows as a
   mismatch there, an entry of the peer list does not. Check the peer list by
@@ -205,12 +206,20 @@ that names the node itself is left out.
   pull-only and reads are not gated, so any client, and any node that lists
   this one as its peer, can still fetch its GRASP-P events by REQ and its
   blobs by GET.
+- **Blobs come from `NGIT_GRASP_P_MIRROR_PEER_URLS` alone.** Write the other
+  node's blob base there, on both nodes: the host, port and path of its
+  relay, over `https` (`https://<peer-domain>`, or
+  `https://<peer-domain>/grasp` under a base path). One list for both
+  nodes is fine here too. A node with the mirror on and no peer in the list
+  fetches no blob from anywhere and says so once at startup:
+  `NGIT_GRASP_P_MIRROR_ENABLE is true and NGIT_GRASP_P_MIRROR_PEER_URLS
+  names no peer of this node`; its missing blobs fail as `no_peer`
+  ([Mirror failures](#mirror-failures)).
 
-Relay and server tags in a registration are advisory for sync: they tell
-clients where to go and never make the node open a relay connection. Server
-tags still choose the hosts the blob mirror fetches from, under its SSRF
-guard, while `NGIT_GRASP_P_MIRROR_PEER_URLS` is unset; set that list on both
-nodes.
+Relay and server tags in a registration are advisory: they tell clients
+where to go, and never make the node open a relay connection or fetch a
+blob from a host they name. The two lists are separate settings and the
+node does not compare them: set both.
 
 ### A pair on a private network
 
@@ -232,11 +241,11 @@ on for every relay that customers' events name.
   refused as before, with `Rejecting event-directed sync relay target` in
   the log.
 - **Set `NGIT_GRASP_P_MIRROR_PEER_URLS` as well**, to the other node's blob
-  address on the link. With the list unset the mirror takes its peers from
-  the `server` tags of registrations, and with private addresses allowed
-  those tags could point it at an internal host. A node started that way
-  says so once, as a warning: `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS is
-  true and NGIT_GRASP_P_MIRROR_PEER_URLS is unset`.
+  address on the link, for example `http://10.20.0.2:8080`. It is the
+  mirror's only source of peers: a registration's `server` tags cannot
+  point the mirror at an internal host. With the setting on, the mirror
+  checks no address a listed name resolves to, so list the peer by its
+  address on the link, as here, or by a name whose DNS you control.
 - **`ws://` and `http://` inside the link, or certificates from a public
   authority.** The relay client trusts the public web roots only, so a
   `wss://` peer with a certificate from a private authority is refused
@@ -529,16 +538,18 @@ journalctl -u ngit-grasp --since -1h | grep 'private mirror'                # fu
 curl -sI https://<peer-host>/<sha256>                                       # peer serves the blob?
 ```
 
-Likely causes: peer unreachable; SSRF guard blocking the peer
-(`blocked` — non-https, or a name that resolves to an internal address; keep
+Likely causes: no peer (`no_peer` — `NGIT_GRASP_P_MIRROR_PEER_URLS` unset,
+or naming only this node; the node warned at startup); peer unreachable; SSRF
+guard blocking the peer (`blocked` — non-https, or a name that resolves to an
+internal address, at the check before the request or at the connection; keep
 `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=false` in production; a name that
 does not resolve at all counts as `network`); local
 quota/budget refusal (`quota` — see [Ledger budget](#ledger-budget)); late
 upload (`http_status: 404` on all peers — retried at the max interval). Peer
-set: `NGIT_GRASP_P_MIRROR_PEER_URLS` if set, else the registration's `server`
-tags minus the ones that name this node (host, port, and mount path if it
-has one; `peer_servers_for` in
-src/grasp_p/mirror.rs). There is no give-up.
+set: the entries of `NGIT_GRASP_P_MIRROR_PEER_URLS` minus the ones that name
+this node (host, port, and mount path if it has one; `peer_servers_for` in
+src/grasp_p/mirror.rs), the same for every account; a registration's
+`server` tags are not consulted. There is no give-up.
 
 **After the fix.** A blob is fetched again when its backoff ends, then the
 repair scan (60 s tick) queues it: expect up to
@@ -587,23 +598,24 @@ of src/grasp_p/mirror.rs):
 
 | `reason` label | retry | ends the attempt on the first peer | operator action |
 | --- | --- | --- | --- |
-| `no_peer` | backoff `base·2^(n-1)`, capped, ±20% jitter | (no peer to try) | no peer server available for the blob — check `NGIT_GRASP_P_MIRROR_PEER_URLS` / the alias's `server` tags |
-| `network` | same backoff | no | transport failure, no answer within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`, a body that stalled or outran its deadline, or a peer name that did not resolve — DNS/TLS, peer down, egress firewall, a very slow link |
+| `no_peer` | backoff `base·2^(n-1)`, capped, ±20% jitter | (no peer to try) | the node has no blob peer: `NGIT_GRASP_P_MIRROR_PEER_URLS` is unset or names only this node (startup warning `the blob mirror has no peers`) — list the other node |
+| `network` | same backoff | no | transport failure, no answer within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`, a body that stalled or outran its deadline, or a peer name that did not resolve or resolved to no address — DNS/TLS, peer down, egress firewall, a very slow link. The mirror uses no proxy from the environment: a peer reachable only through `HTTPS_PROXY` fails here |
 | `http_status` | same backoff; `404` from every peer always waits `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` | no | 5xx: peer erroring; 404 on all peers: late upload, benign, self-heals; other codes: proxy/edge oddity |
 | `quota` | same backoff | yes | local ledger/budget full — [Ledger budget](#ledger-budget). Refused before any request is sent when the ledgers already show it |
 | `store` / `reserve` / `sink` / `write` | same backoff | yes | this node's own state (registration gone, denylisted mid-fetch, meta store or disk error) — read the full reason in the warn line |
-| `blocked` | always the max interval | no | SSRF guard: peer is non-https, carries credentials, uses a local name, or resolves to a non-global address — pin `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known https peer |
+| `blocked` | always the max interval | no | SSRF guard: peer is non-https, carries credentials, uses a local name, or resolves to a non-global address, either at the check before the request or at the connection (`blocked: <host> resolved to <address>, ...` in the warn line: the answer held an address the mirror may not reach, and the whole answer was refused) — fix the entry or the peer's DNS, or, for a pair on a private link, set `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` |
 | `too_large` | always the max interval | no | the peer announced more than `NGIT_GRASP_P_MAX_BLOB_BYTES`, or sent more bytes than the fetch expected (the announced length, or the declared size when none was announced), or the state root declared more than the maximum — check that both nodes run the same maximum; a body longer than expected means the peer serves other bytes: investigate it |
-| `verify` | always the max interval | no | peer served wrong bytes, or a peer named only by a registration announced a length other than the declared one (refused before the body) — investigate the peer |
+| `verify` | always the max interval | no | peer served wrong bytes: they do not hash to the blob's name, or a body sent without a length ended short of the declared size — investigate the peer |
 
 When a blob has several peers, the reason counted is one for the whole
 attempt: a reason from this node's own state if there was one, otherwise the
 one that retries soonest, whatever the order of the peers. `404` from one
 peer and a timeout from another count as `network`.
 
-A configured peer (`NGIT_GRASP_P_MIRROR_PEER_URLS`) is believed about a blob's
-length up to `NGIT_GRASP_P_MAX_BLOB_BYTES`: a blob whose state root declared
-the wrong size is mirrored and charged at its real size.
+A peer is believed about a blob's length up to
+`NGIT_GRASP_P_MAX_BLOB_BYTES`: a blob whose state root declared the wrong
+size is mirrored and charged at its real size. Every peer is one the
+operator listed.
 
 Because every class backs off, a few blobs that stay stuck fail a few times
 an hour and this alert goes quiet; [Mirror lag](#mirror-lag) keeps firing
@@ -1469,6 +1481,8 @@ Pointers, not procedures:
   (per-tenant metrics, direct invites; plan-v2-fix-log.md S6) were
   removed. `ngit_private_ledger_bytes` has only `scope="global"`.
 - **Paid mode** is not built (boot-rejected, §1).
-- **Mirror DNS-rebinding** at connection time is a documented residual —
-  set `NGIT_GRASP_P_MIRROR_PEER_URLS` to the known peer in production
-  (`peer_allowed` in src/grasp_p/mirror.rs).
+- **Mirror lookups**: the mirror connects to the addresses its client's
+  resolver vetted (src/grasp_p/vetted_dns.rs), so a name cannot answer one
+  address to the check and another to the connection; a connection kept in
+  the client's pool stays on the address it was opened to. The relay dial
+  is still vetted and not pinned (§1, "A pair on a private network").

@@ -6,10 +6,12 @@ as upstream** (existing sync tests MUST still pass unchanged). Mirror activity a
 gated on `NGIT_GRASP_P_MIRROR_ENABLE`.
 
 Superseded on peers: GRASP-P now syncs events only with the relays in
-`NGIT_GRASP_P_SYNC_PEER_URLS` (SEAMS.md, "Configured peers"); the bootstrap relay is a peer
-only when that list names it, and registration tags never choose a relay to sync with. Where
-the text below pairs nodes through the bootstrap relay or routes filters by tags, it
-describes the older design.
+`NGIT_GRASP_P_SYNC_PEER_URLS` (SEAMS.md, "Configured peers"), and mirrors blobs only from the
+hosts in `NGIT_GRASP_P_MIRROR_PEER_URLS` (SEAMS.md, "The blob mirror fetches from the
+operator's peers only"); the bootstrap relay is a peer only when the sync list names it, and
+registration tags never choose a relay to sync with or a host to fetch blobs from. Where the
+text below pairs nodes through the bootstrap relay, routes filters by tags or derives blob
+peers from `server` tags, it describes the older design.
 
 ## 0. The problem Phase 2 solves
 

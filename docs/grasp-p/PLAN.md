@@ -100,8 +100,8 @@ push; `git status` before every commit.
     blob, and the list and the upload descriptor report it.
   - `WWW-Authenticate: Nostr` on every 401 of the blob routes and on no other status.
 - **#25** per-tenant claim/file-count caps; **#26** mirror fairness (**done**, below); **#20**
-  purgatory SSRF and **#3** DNS rebinding (both via `outbound.rs`); **#16**
-  announcement-indexer pin + leak canary.
+  purgatory SSRF and **#3** DNS rebinding (both via `outbound.rs`; the mirror half of #3
+  **done**, below); **#16** announcement-indexer pin + leak canary.
   - **#26 done.** The mirror keeps one queue per account and serves them in turn, an
     account holds at most half of the fetch slots, the worker never waits for a slot,
     every failure class backs off (none is retried by every scan any more),
@@ -110,8 +110,17 @@ push; `git status` before every commit.
     scan runs off the async runtime, and a fetch's deadline grows with the blob's length.
     See "The blob mirror" in [`SEAMS.md`](SEAMS.md). Still open: nothing clears an
     account's retry gates when its quota is raised (a blob refused with `quota` waits out
-    its backoff, about an hour at most; a restart clears it), and each attempt still resolves the
-    peer's name (with #3).
+    its backoff, about an hour at most; a restart clears it), and off a private link each
+    attempt looks the peer's name up twice (the early check, then the resolver whose answer
+    is connected to).
+  - **#3, mirror half done.** The blob mirror's client has a resolver of its own
+    (`src/grasp_p/vetted_dns.rs`) and uses no proxy: the DNS answer it vets is the one the
+    connection uses, an answer with any address the mirror may not reach is refused whole
+    (`blocked`), and nothing falls through to the system resolver. The early check stays
+    for hosts that are IP literals. Still open: the relay dial is vetted and not pinned (a
+    pinned WebSocket dial is offered upstream), and off a private link a name is looked up
+    twice per attempt.
+    See "The blob mirror fetches from the operator's peers only" in [`SEAMS.md`](SEAMS.md).
 - **#1** offboard: kind-5 tombstone frees alias, keys, ledger; retention purge (customers leave).
 - **#21** document every config var; **#10** adversarial re-review of the ported sync/mirror.
 
@@ -228,17 +237,20 @@ project yet.
   root of its domain. One integration test runs a single node under a path; no pair
   test does. See "Under a base path the node is its host and its path" in
   [`SEAMS.md`](SEAMS.md).
-- **Blob mirror peers** default to the `server` tags of accepted registrations when no
-  allowlist is set, so tenant events do choose hosts the node connects to (vetted by the
-  SSRF guard; see #3). **Mirror half done with #26:** a host that only a registration
-  names is no longer believed about a blob's length (it must announce exactly the
-  declared size, or the fetch stops before the body), a blob that several accounts claim
-  is fetched for the account with the least backlog and not for whichever came first
-  (the other claimants are tried when that account's own state refuses it), and an
-  account that names slow or dead hosts holds at most half of the fetches. **Still open, for
-  the change that restricts mirroring to the operator's list:** with no allowlist set the
-  node still connects to hosts that accounts chose, and still resolves their names on
-  every attempt; the rule for a registration-named peer's length goes away with them.
+- **Blob mirror peers** (done). They defaulted to the `server` tags of accepted
+  registrations when no allowlist was set, so tenant events chose hosts the node
+  connected to. With #26 a blob that several accounts claim is fetched for the account
+  with the least backlog, the other claimants are tried when that account's own state
+  refuses it, and one account holds at most half of the fetches. Now, under the
+  maintainer's decision that GRASP-P events and blobs replicate only between
+  operator-configured peers, the mirror's peers are `NGIT_GRASP_P_MIRROR_PEER_URLS` alone,
+  less the entries that name this node; `server` tags are advisory and choose no host; a
+  node with the mirror on and no peer warns at startup and fails each missing blob as
+  `no_peer`. Every peer is believed about a blob's length up to the maximum, and the rule
+  that held a registration-named peer to the declared size is gone. The connection goes to
+  the address the client's resolver vetted (#3, above). No setting was added. Still open:
+  the sync and mirror lists are separate settings the node does not compare. See "The blob
+  mirror fetches from the operator's peers only" in [`SEAMS.md`](SEAMS.md).
 - **Fail fast on old git** (done). The server checks `git --version` at startup, before the
   storage migration (`src/git/version.rs`). With GRASP-P enabled a git older than 2.42 stops
   it with a message that names the version found, the minimum and the symptom, and so does

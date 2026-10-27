@@ -157,9 +157,10 @@ both directions: only those are sent the GRASP-P filters, and a GRASP-P event th
 brings from any other relay is refused before admission. The node's public sync, to the
 bootstrap relay and every relay its public repositories name, runs beside it as upstream's
 does; the bootstrap relay is a peer only when the list names it. Relay and server tags in a
-registration never decide who the node syncs events with. Blob peers come from an operator
-allowlist when one is set; otherwise they are the `server` tags of accepted registrations,
-checked against the SSRF guard.
+registration never decide who the node syncs events with, or where it fetches blobs from:
+blob peers are the operator's list `NGIT_GRASP_P_MIRROR_PEER_URLS` alone, and a node without
+one mirrors nothing. The mirror connects only to addresses its client's resolver vetted for a
+peer; the connection makes no lookup of its own.
 
 The relay connection to a configured peer is kept for the life of the process: when it
 drops, or a dial fails for any reason, the node dials again by itself, at least once every
