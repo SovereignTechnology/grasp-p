@@ -864,9 +864,15 @@ pub struct Config {
     #[arg(long, env = "NGIT_GRASP_P_MIRROR_ENABLE", default_value_t = false)]
     pub private_mirror_enable: bool,
 
-    /// Comma-separated peer blob-server base URLs for the Phase-2 mirror.
-    /// Default (unset): derive peers from each registration's `server` tags
-    /// (minus this node's own domain).
+    /// Comma-separated blob base URLs of the nodes this one mirrors blobs
+    /// from: the pair's other node, where it serves GET /<sha256> (an entry
+    /// without a scheme is taken as https://). The blob mirror fetches from
+    /// these peers and from no other host: a registration's `server` tags
+    /// are advisory and never choose one. An entry that names this node
+    /// itself is left out, so both nodes of a pair can be given the same
+    /// list. Unset (default): no blob peers, so no blob replicates to this
+    /// node; with the mirror enabled the node warns at startup. The mirror
+    /// uses no proxy from the environment.
     #[arg(long, env = "NGIT_GRASP_P_MIRROR_PEER_URLS")]
     pub private_mirror_peer_urls: Option<String>,
 
@@ -903,10 +909,10 @@ pub struct Config {
     /// ws:// or on an internal IP. Only that connection is exempt from the
     /// outbound target policy. Default false: such peers are dropped and the
     /// node fetches only over https/wss from public hosts. Set true for a
-    /// pair on a private network or for local testing. Set
-    /// NGIT_GRASP_P_MIRROR_PEER_URLS with it: without that list the mirror
-    /// takes its peers from registrations' `server` tags, which could then
-    /// name an internal host.
+    /// pair on a private network or for local testing. It applies only to
+    /// the peers the operator lists in NGIT_GRASP_P_MIRROR_PEER_URLS and
+    /// NGIT_GRASP_P_SYNC_PEER_URLS: no host a registration names is fetched
+    /// from or dialled as a peer.
     #[arg(
         long,
         env = "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS",
@@ -1731,8 +1737,7 @@ impl Config {
     }
 
     /// Parsed NGIT_GRASP_P_MIRROR_PEER_URLS (base URLs, CSV). `None` when
-    /// unset or empty — the mirror then derives peers from each
-    /// registration's `server` tags.
+    /// unset or empty: the mirror then has no peers.
     pub fn private_mirror_peer_url_entries(&self) -> Option<Vec<String>> {
         let raw = self.private_mirror_peer_urls.as_ref()?;
         let entries: Vec<String> = raw

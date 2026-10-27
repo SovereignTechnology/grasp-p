@@ -779,6 +779,10 @@ impl TestRelay {
     /// (each node of a pair bootstraps to the other), and optional persistent
     /// LMDB paths for kill-and-restart tests.
     ///
+    /// The bootstrap peer is also the node's sync peer and its blob peer
+    /// ([`Self::blob_peer_url`]). A node started without one has neither, so
+    /// a test that needs its mirror lists the peer itself.
+    ///
     /// `extra_env` is applied last, so callers can override any default.
     pub async fn start_grasp_p_pair_node(
         reservation: PortReservation,
@@ -851,10 +855,14 @@ impl TestRelay {
                 "127.0.0.1:0".to_string(),
             ),
         ];
-        // Private-sync peers come only from the operator allowlist: point
-        // each node of the pair at its peer explicitly.
+        // GRASP-P events and blobs come only from the operator's lists:
+        // point each node of the pair at its peer in both.
         if let Some(ref url) = bootstrap_relay_url {
             env.push(("NGIT_GRASP_P_SYNC_PEER_URLS".to_string(), url.clone()));
+            env.push((
+                "NGIT_GRASP_P_MIRROR_PEER_URLS".to_string(),
+                Self::blob_peer_url(url),
+            ));
         }
         env.extend(
             extra_env
@@ -874,6 +882,21 @@ impl TestRelay {
             },
         )
         .await
+    }
+
+    /// The blob base URL the mirror is given for the node whose relay is
+    /// `relay_url`: the same host, port and path over HTTP, where the node
+    /// serves `GET /<sha256>` (`ws://` becomes `http://`, `wss://` becomes
+    /// `https://`).
+    pub fn blob_peer_url(relay_url: &str) -> String {
+        let url = relay_url.trim_end_matches('/');
+        if let Some(rest) = url.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = url.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            url.to_string()
+        }
     }
 
     /// Start a relay with every configurable option, on a pre-reserved port.

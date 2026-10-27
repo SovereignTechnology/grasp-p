@@ -18,6 +18,22 @@
 //!   for lack of room or lost in a restart comes back through it. The scan
 //!   also sets `ngit_private_mirror_lag_blobs`; nothing else does.
 //!
+//! ## Where blobs come from
+//!
+//! From the operator's peers and from no other host: the entries of
+//! `NGIT_GRASP_P_MIRROR_PEER_URLS`, less the ones that name this node. A
+//! registration's `server` tags tell clients where to go and never choose
+//! a host the mirror fetches from, so no account can point this node's
+//! fetches anywhere. With no list the node has no peer, and every missing
+//! blob fails as `no_peer`.
+//!
+//! The client connects to the address it vetted. Its resolver
+//! (`vetted_dns`) looks the peer's name up, refuses the whole answer when
+//! an address in it may not be reached, and hands the connector exactly the
+//! addresses it vetted; the connection makes no lookup of its own that
+//! could lead it elsewhere. A host that is an IP literal never reaches a
+//! resolver; the early check before each request covers it.
+//!
 //! ## How work is ordered
 //!
 //! Storage is sold per account (the tenant key), so the account is the unit
@@ -46,8 +62,8 @@
 //! - Every failure closes a per-blob gate (table below). No class is left
 //!   to the flat scan cadence, so no blob is fetched again every minute for
 //!   ever.
-//! - Within one fetch the cheap checks come first: the address guard, then
-//!   a quota check against local state, then the request; the peer's
+//! - Within one fetch the cheap checks come first: the early address check,
+//!   then a quota check against local state, then the request; the peer's
 //!   announced length is judged before the first byte of the body is read.
 //!
 //! ## Failure classes
@@ -63,7 +79,7 @@
 //! | `write: …`                     | `base * 2^n`, capped      | yes                |
 //! | `store: …`                     | `base * 2^n`, capped      | yes                |
 //! | `http_status: 404`             | the maximum interval      | no                 |
-//! | `blocked` (address guard)      | the maximum interval      | no                 |
+//! | `blocked` (address check)      | the maximum interval      | no                 |
 //! | `verify: …` (bad bytes/size)   | the maximum interval      | no                 |
 //! | `too_large`                    | the maximum interval      | no                 |
 //!
@@ -73,9 +89,11 @@
 //! change, a peer that serves other bytes), so it waits the maximum
 //! interval every time. All delays carry ±20% jitter.
 //!
-//! A peer whose name does not resolve is `network`, not `blocked`: a
-//! resolver that fails for a moment must not park every blob tried
-//! meanwhile for the maximum interval.
+//! `blocked` comes from the early check or from the client's resolver, which
+//! refuses an answer that holds an address the mirror may not reach. A peer
+//! whose name does not resolve, or resolves to no address, is `network`,
+//! not `blocked`: a resolver that fails for a moment must not park every
+//! blob tried meanwhile for the maximum interval.
 //!
 //! A failure caused by this node's own state would repeat on every peer,
 //! so it ends the peer loop and is the reason recorded. Otherwise each peer
@@ -100,6 +118,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::blob_store::UploadSink;
+use super::vetted_dns::{self, VettedResolver};
 use super::{BlobError, PrivateService, UploadOrigin};
 
 /// Blobs one account may have waiting in the queue. What does not fit is
@@ -138,12 +157,9 @@ pub struct MirrorJob {
     pub tenant_hex: String,
     pub alias: String,
     pub want: Vec<WantBlob>,
-    /// Peer blob-server base URLs (this node's own domain already excluded).
+    /// The operator's blob peers as base URLs, this node left out
+    /// ([`peer_servers_for`]).
     pub peer_servers: Vec<String>,
-    /// Whether `peer_servers` is the operator's list. A peer the operator
-    /// named is believed about a blob's length; a peer that only a
-    /// registration names is not.
-    pub peers_configured: bool,
 }
 
 /// What every blob of one job has in common.
@@ -152,7 +168,6 @@ struct Route {
     tenant_hex: String,
     alias: String,
     peer_servers: Vec<String>,
-    peers_configured: bool,
 }
 
 /// One blob to fetch: the unit the queue holds and a fetch slot runs.
@@ -167,9 +182,9 @@ struct FetchTask {
     blob: WantBlob,
 }
 
-/// Normalize a `server` tag value / configured peer URL into an HTTP base
-/// URL: keeps explicit http:// (tests) and https:// schemes, defaults bare
-/// host[:port] values to https://, and trims trailing slashes.
+/// Normalize an entry of the peer list into an HTTP base URL: keeps
+/// explicit http:// (tests, a private link) and https:// schemes, defaults
+/// bare host[:port] values to https://, and trims trailing slashes.
 fn server_base_url(value: &str) -> Option<String> {
     let v = value.trim().trim_end_matches('/');
     if v.is_empty() {
@@ -219,7 +234,8 @@ fn embedded_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
 /// RFC1918 private, CGNAT shared, link-local, unspecified, broadcast,
 /// multicast, documentation, IPv6 ULA/link-local, and any embedded-IPv4
 /// transition form (IPv4-mapped, NAT64, 6to4, IPv4-compatible) wrapping one
-/// of these.
+/// of these. The early check and the client's resolver apply it through
+/// [`wraps_non_global`].
 fn is_disallowed_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -251,14 +267,18 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// SSRF guard for a peer base URL. Production requires https; plaintext http
-/// is only permitted under `allow_private` (loopback tests). The URL then goes
+/// The early address check of a peer base URL, made before each request.
+/// Production requires https; plaintext http is only permitted under
+/// `allow_private` (a private link, the loopback tests). The URL then goes
 /// through upstream's outbound target policy (`crate::outbound`), which
 /// rejects credentials, local hostnames and non-global IP literals, resolves
-/// the host and fails closed unless every answer is globally reachable. This
-/// defeats the literal-IP / static-hostname SSRF via a hostile 30640 `server`
-/// tag; DNS rebinding at connection time remains a documented residual
-/// (production should set NGIT_GRASP_P_MIRROR_PEER_URLS to the known peer).
+/// the host and fails closed unless every answer is globally reachable.
+///
+/// For a host that is an IP literal this is the only check: reqwest
+/// connects to a literal without asking a resolver. For a name, the answer
+/// checked here is not the one connected to; the client's resolver
+/// (`vetted_dns`) checks the answer the connection uses, so a name that
+/// resolves elsewhere by the time of the request is still refused.
 async fn peer_allowed(peer_base: &str, allow_private: bool) -> PeerVerdict {
     outbound_target_allowed(
         peer_base,
@@ -315,12 +335,14 @@ pub(crate) fn vet_relay_dial(
     }
 }
 
-/// Whether a relay dial must not go to `address`, which upstream's policy
-/// has passed. The mirror's own check comes first. An IPv6 form that carries
-/// an IPv4 address is then held to upstream's verdict on that address, which
-/// knows ranges the mirror's list lacks (benchmarking, reserved, protocol
+/// Whether a relay dial, or a blob fetch, must not go to `address`, which
+/// upstream's policy has passed: the relay dial of a GRASP-P node, the
+/// mirror's early check and the mirror client's resolver all apply it. The
+/// mirror's own check comes first. An IPv6 form that carries an IPv4
+/// address is then held to upstream's verdict on that address, which knows
+/// ranges the mirror's list lacks (benchmarking, reserved, protocol
 /// assignments). The local-use NAT64 prefix `64:ff9b:1::/48` is never global.
-fn wraps_non_global(address: &IpAddr) -> bool {
+pub(super) fn wraps_non_global(address: &IpAddr) -> bool {
     if is_disallowed_ip(address) {
         return true;
     }
@@ -353,8 +375,8 @@ const POLICY_DNS_ERROR_PREFIX: &str = "DNS resolution";
 
 /// Shared body of the two guards. With `allow_private` the policy skips DNS
 /// vetting (upstream's `allow_non_global`) but still checks scheme and
-/// credentials. Every vetted address is also re-checked against
-/// [`is_disallowed_ip`], which additionally decodes the NAT64 / 6to4 /
+/// credentials. Every vetted address is also put to [`wraps_non_global`],
+/// the relay dial's check, which decodes the NAT64 / 6to4 /
 /// IPv4-compatible transition forms that can wrap an internal IPv4.
 async fn outbound_target_allowed(
     url: &str,
@@ -373,7 +395,7 @@ async fn outbound_target_allowed(
             if resolved
                 .addresses
                 .iter()
-                .all(|address| !is_disallowed_ip(address))
+                .all(|address| !wraps_non_global(address))
             {
                 PeerVerdict::Allowed
             } else {
@@ -385,37 +407,39 @@ async fn outbound_target_allowed(
     }
 }
 
-/// Peer servers for an alias, and whether they are the operator's: the
-/// configured list when there is one, otherwise the registration's `server`
-/// tags minus the ones that name this node.
-fn peer_servers_for(svc: &PrivateService, registration_servers: &[String]) -> (Vec<String>, bool) {
-    let (candidates, configured): (Vec<&String>, bool) = match svc.cfg.mirror_peer_urls {
-        Some(ref configured) => (configured.iter().collect(), true),
-        None => (
-            registration_servers
-                .iter()
-                // Host and port, so that loopback test pairs (same host,
-                // different ports) stay distinct, and the mount path when
-                // this node has one, so that another service on the same
-                // host is a peer and not this node.
-                .filter(|v| !is_own_server(v, &svc.cfg.service_address))
-                .collect(),
-            false,
-        ),
-    };
+/// The blob peers of this node: [`configured_peer_servers`] of the
+/// operator's list. The same for every alias: a registration's `server`
+/// tags are advisory, and no account chooses a host this node fetches from.
+pub(super) fn peer_servers_for(svc: &PrivateService) -> Vec<String> {
+    configured_peer_servers(
+        svc.cfg.mirror_peer_urls.as_deref().unwrap_or_default(),
+        &svc.cfg.service_address,
+    )
+}
+
+/// The entries of `NGIT_GRASP_P_MIRROR_PEER_URLS` as base URLs, each once,
+/// less the ones that name this node, so that both nodes of a pair can be
+/// given the same list.
+fn configured_peer_servers(entries: &[String], own_service: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for value in candidates {
-        if let Some(base) = server_base_url(value) {
+    // Host and port, so that loopback test pairs (same host, different
+    // ports) stay distinct, and the mount path when this node has one, so
+    // that another service on the same host is a peer and not this node.
+    for entry in entries
+        .iter()
+        .filter(|entry| !is_own_server(entry, own_service))
+    {
+        if let Some(base) = server_base_url(entry) {
             if !out.contains(&base) {
                 out.push(base);
             }
         }
     }
-    (out, configured)
+    out
 }
 
-/// Does a `server` tag value name this node? `own_service` is the node's
-/// service address: its domain, and its mount path when it has one.
+/// Does an entry of the peer list name this node? `own_service` is the
+/// node's service address: its domain, and its mount path when it has one.
 ///
 /// The value is compared as given, and in its scheme-defaulted base-URL
 /// form as well, so that a self-reference written without a scheme
@@ -832,31 +856,13 @@ impl AttemptBudget {
 ///
 /// `announced` is the length the response states, if it states one.
 ///
-/// - A peer the operator configured is the pair's other node. Its length is
-///   the length of the blob it stores, so it is believed even where the
-///   state root declared another: the replica then stores what the origin
-///   stores.
-/// - A peer that only a registration names is whatever host an account
-///   wrote there. It may serve exactly the declared number of bytes; any
-///   other announcement fails here, before the body is read.
-/// - With no announced length, the declared size bounds the read.
-///
-/// In every case nothing longer than the maximum blob size is read.
-fn expected_len(
-    announced: Option<u64>,
-    declared: u64,
-    peer_configured: bool,
-    max_blob_bytes: u64,
-) -> Result<u64, String> {
-    let expected = match announced {
-        Some(announced) if peer_configured => announced,
-        Some(announced) if announced != declared => {
-            return Err(format!(
-                "verify: peer announced {announced} bytes, the state root declared {declared}"
-            ));
-        }
-        _ => declared,
-    };
+/// Every peer is one the operator listed, the pair's other node. Its length
+/// is the length of the blob it stores, so it is believed even where the
+/// state root declared another: the replica then stores what the origin
+/// stores. With no announced length, the declared size bounds the read. In
+/// every case nothing longer than the maximum blob size is read.
+fn expected_len(announced: Option<u64>, declared: u64, max_blob_bytes: u64) -> Result<u64, String> {
+    let expected = announced.unwrap_or(declared);
     if expected > max_blob_bytes {
         return Err("too_large".to_string());
     }
@@ -1085,13 +1091,11 @@ pub(crate) fn enqueue_for_state_root(svc: &PrivateService, event: &Event) {
         }
     };
 
-    let (peer_servers, peers_configured) = peer_servers_for(svc, &record.servers);
     let job = MirrorJob {
-        tenant_hex: record.tenant_hex.clone(),
+        tenant_hex: record.tenant_hex,
         alias,
         want,
-        peer_servers,
-        peers_configured,
+        peer_servers: peer_servers_for(svc),
     };
     let _ = tx.send(job);
 }
@@ -1215,22 +1219,20 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
     // Ends the borrow of `missing`, which is taken apart below.
     drop(missing_now);
 
-    // Each alias is looked up once, however many blobs it claims.
+    // Each alias is looked up once, however many blobs it claims. Every
+    // alias has the same peers: the operator's.
+    let peer_servers = peer_servers_for(svc);
     let mut routes: HashMap<String, Option<Arc<Route>>> = HashMap::new();
     let mut route_for = |alias: &str| -> Option<Arc<Route>> {
         if let Some(known) = routes.get(alias) {
             return known.clone();
         }
         let route = match svc.meta.get_registration(&txn, alias) {
-            Ok(Some(record)) if record.tombstoned_at.is_none() => {
-                let (peer_servers, peers_configured) = peer_servers_for(svc, &record.servers);
-                Some(Arc::new(Route {
-                    tenant_hex: record.tenant_hex,
-                    alias: alias.to_string(),
-                    peer_servers,
-                    peers_configured,
-                }))
-            }
+            Ok(Some(record)) if record.tombstoned_at.is_none() => Some(Arc::new(Route {
+                tenant_hex: record.tenant_hex,
+                alias: alias.to_string(),
+                peer_servers: peer_servers.clone(),
+            })),
             _ => None,
         };
         routes.insert(alias.to_string(), route.clone());
@@ -1325,13 +1327,24 @@ fn local_preflight(
         })
 }
 
+/// The reason recorded for a request that got no response. The resolver's
+/// refusal of an answer is `blocked`, like the early check's, and names the
+/// host and the address; anything else, a name that did not resolve
+/// included, is `network`.
+fn send_failure_reason(error: &reqwest::Error) -> String {
+    match vetted_dns::blocked_target(error) {
+        Some(blocked) => format!("blocked: {blocked}"),
+        None => format!("network: {error}"),
+    }
+}
+
 /// Fetch one blob from one peer through the upload sink, for one of the
 /// accounts that claim it.
 ///
 /// The order is the point: each step is cheaper than the next, and a blob
-/// that a cheap step refuses never reaches a dearer one. Address guard,
-/// quota preflight, request, status, length, byte reservation, temp file,
-/// body.
+/// that a cheap step refuses never reaches a dearer one. Address check,
+/// quota preflight, request (whose connection the resolver vets), status,
+/// length, byte reservation, temp file, body.
 async fn fetch_from_peer(
     svc: &Arc<PrivateService>,
     client: &reqwest::Client,
@@ -1340,9 +1353,9 @@ async fn fetch_from_peer(
     blob: &WantBlob,
     peer_base: &str,
 ) -> Result<(), String> {
-    // Address guard: a `server` tag an account wrote must never point this
-    // node's fetch at an internal host. A name that does not resolve is
-    // not connected to either, but it is a passing failure, not a refusal.
+    // The early address check, the only one an IP literal gets. A name
+    // that does not resolve is not connected to either, but it is a
+    // passing failure, not a refusal.
     match peer_allowed(peer_base, svc.cfg.mirror_allow_private_ips).await {
         PeerVerdict::Allowed => {}
         PeerVerdict::Refused => return Err("blocked".to_string()),
@@ -1355,7 +1368,7 @@ async fn fetch_from_peer(
     let url = format!("{}/{}", peer_base, blob.sha256);
     let response = match tokio::time::timeout(fetch_timeout, client.get(&url).send()).await {
         Ok(Ok(response)) => response,
-        Ok(Err(e)) => return Err(format!("network: {e}")),
+        Ok(Err(e)) => return Err(send_failure_reason(&e)),
         Err(_) => {
             return Err(format!(
                 "network: no response within {}s",
@@ -1367,14 +1380,9 @@ async fn fetch_from_peer(
         return Err(format!("http_status: {}", response.status().as_u16()));
     }
 
-    let expected = expected_len(
-        response.content_length(),
-        blob.size,
-        route.peers_configured,
-        svc.cfg.max_blob_bytes,
-    )?;
-    // The preflight above used the declared size. A configured peer may
-    // have announced a larger one; ask again before reading it.
+    let expected = expected_len(response.content_length(), blob.size, svc.cfg.max_blob_bytes)?;
+    // The preflight above used the declared size. The peer may have
+    // announced a larger one; ask again before reading it.
     if expected > blob.size {
         local_preflight(svc, route, blob, expected)?;
     }
@@ -1670,7 +1678,6 @@ fn queue_job(queue: &mut FairQueue<FetchTask>, job: MirrorJob) {
         tenant_hex: job.tenant_hex,
         alias: job.alias,
         peer_servers: job.peer_servers,
-        peers_configured: job.peers_configured,
     });
     queue_tasks(
         queue,
@@ -1905,6 +1912,30 @@ async fn run_worker<B: MirrorBackend>(
     }
 }
 
+/// The mirror's one HTTP client. It lives as long as the worker, so a
+/// connection to the peer is kept and used again.
+///
+/// - Its resolver vets every answer and the connection goes to the
+///   addresses it vetted ([`VettedResolver`]).
+/// - It uses no proxy from the environment: the connection would go to the
+///   proxy, which looks the peer's name up again by itself.
+/// - It follows no redirect: a peer must not send a fetch on to another
+///   host.
+/// - It has no total timeout: a fetch sets its own limits, which depend on
+///   the blob's length (`fetch_from_peer`). `connect_timeout` bounds the
+///   lookup and the connection together.
+fn http_client(
+    connect_timeout: Duration,
+    resolver: VettedResolver,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(resolver)
+        .build()
+}
+
 /// Spawn the mirror worker. Called once from `RelayServer::start` when
 /// private repos AND mirroring are enabled.
 pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
@@ -1942,15 +1973,9 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
         repair_interval,
     };
 
+    let resolver = VettedResolver::system(svc.cfg.mirror_allow_private_ips);
     tokio::spawn(async move {
-        // No total timeout on the client: a fetch sets its own limits,
-        // which depend on the blob's length (`fetch_from_peer`).
-        let client = match reqwest::Client::builder()
-            .connect_timeout(fetch_timeout)
-            // No redirect-chasing — a peer must not bounce us to an internal host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
+        let client = match http_client(fetch_timeout, resolver) {
             Ok(client) => client,
             Err(e) => {
                 tracing::error!("private mirror: failed to build HTTP client: {e}");
@@ -1962,6 +1987,7 @@ pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
         let retry = svc.mirror_retry.clone();
 
         tracing::info!(
+            blob_peers = peer_servers_for(&svc).len(),
             max_concurrency = max_concurrency,
             max_concurrency_per_account = account_share(max_concurrency),
             max_attempts_per_min = settings.attempts_per_min,
@@ -2231,41 +2257,175 @@ mod tests {
         assert_eq!(merge_peer_failures(&[]), None);
     }
 
-    /// The length a fetch reads: an operator's peer is believed up to the
-    /// maximum blob size, a peer from a registration only when it agrees
-    /// with the state root, and no announcement leaves the declared size.
+    /// The length a fetch reads: every peer is the operator's, and its
+    /// announced length is believed up to the maximum blob size, whatever
+    /// the state root declared; no announcement leaves the declared size.
     #[test]
-    fn expected_len_trusts_only_a_configured_peer() {
+    fn expected_len_believes_the_peer_up_to_the_maximum() {
         const MAX: u64 = 1000;
 
-        // Configured peer: its length wins, smaller or larger.
-        assert_eq!(expected_len(Some(500), 500, true, MAX), Ok(500));
-        assert_eq!(expected_len(Some(700), 500, true, MAX), Ok(700));
-        assert_eq!(expected_len(Some(300), 500, true, MAX), Ok(300));
-        assert_eq!(expected_len(Some(MAX), 500, true, MAX), Ok(MAX));
+        // The announced length wins, equal, smaller or larger. No length is
+        // refused for differing from the declared one any more: the replica
+        // stores what the origin stores.
+        for announced in [500, 700, 300, 0, 499, 501, MAX] {
+            assert_eq!(
+                expected_len(Some(announced), 500, MAX),
+                Ok(announced),
+                "{announced}"
+            );
+        }
         assert_eq!(
-            expected_len(Some(MAX + 1), 500, true, MAX),
+            expected_len(Some(MAX + 1), 500, MAX),
             Err("too_large".to_string())
         );
 
-        // A peer only a registration names: equal or refused.
-        assert_eq!(expected_len(Some(500), 500, false, MAX), Ok(500));
-        for announced in [0, 499, 501, MAX + 1] {
-            let refused = expected_len(Some(announced), 500, false, MAX)
-                .expect_err("another length must be refused before the body");
-            assert!(refused.starts_with("verify:"), "{refused}");
-            assert_eq!(classify_failure(&refused), RetryClass::AtMax);
+        // No announced length: the declared size bounds the read.
+        assert_eq!(expected_len(None, 500, MAX), Ok(500));
+        assert_eq!(
+            expected_len(None, MAX + 1, MAX),
+            Err("too_large".to_string())
+        );
+        assert_eq!(classify_failure("too_large"), RetryClass::AtMax);
+    }
+
+    /// The peers are the operator's list as base URLs, each once, never
+    /// this node, in the order written. Nothing else adds one.
+    #[test]
+    fn peer_servers_are_the_list_less_this_node() {
+        let entries =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|entry| entry.to_string()).collect() };
+        let own = "127.0.0.1:1111";
+        assert_eq!(
+            configured_peer_servers(
+                &entries(&[
+                    "http://127.0.0.1:1111",
+                    "http://127.0.0.1:2222/",
+                    "peer.example",
+                    "http://127.0.0.1:2222",
+                    "127.0.0.1:1111",
+                ]),
+                own
+            ),
+            vec![
+                "http://127.0.0.1:2222".to_string(),
+                "https://peer.example".to_string()
+            ]
+        );
+        // A list that names only this node, and no list, give no peer.
+        assert!(configured_peer_servers(&entries(&["http://127.0.0.1:1111/"]), own).is_empty());
+        assert!(configured_peer_servers(&[], own).is_empty());
+
+        // Under a mount path the node is its host and its path: the bare
+        // host is another service, and a peer.
+        assert_eq!(
+            configured_peer_servers(
+                &entries(&["https://h.example/grasp", "https://h.example"]),
+                "h.example/grasp"
+            ),
+            vec!["https://h.example".to_string()]
+        );
+    }
+
+    /// A registration's `server` tags never choose a host to fetch from, on
+    /// either path a job comes by. The repair scan of a node with no list
+    /// finds the missing blob and gives it no peer, although the
+    /// registration names one, and so does the job a state root enqueues;
+    /// with a list the peers are the list's alone.
+    #[tokio::test]
+    async fn server_tags_never_name_a_blob_peer() {
+        async fn scanned_peers(list: Option<&str>) -> Vec<String> {
+            use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut config = crate::config::Config::for_testing();
+            config.private_repos_enable = true;
+            config.domain = "own.example".to_string();
+            config.private_mirror_peer_urls = list.map(str::to_string);
+            config.private_meta_data_path =
+                Some(dir.path().join("meta").to_string_lossy().into_owned());
+            config.private_blob_data_path =
+                Some(dir.path().join("blobs").to_string_lossy().into_owned());
+            let database: crate::nostr::SharedDatabase =
+                Arc::new(nostr_memory::MemoryDatabase::unbounded());
+            let svc = PrivateService::new(&config, database)
+                .await
+                .expect("private service");
+
+            let alias = "ab".repeat(16);
+            let sha = "cd".repeat(32);
+            let record = crate::grasp_p::meta::RegistrationRecord {
+                tenant_hex: "ef".repeat(32),
+                event_id: "01".repeat(32),
+                created_at: 1,
+                w_keys: Vec::new(),
+                aux_keys: Vec::new(),
+                relays: vec!["wss://own.example".to_string()],
+                servers: vec![
+                    "https://own.example".to_string(),
+                    "https://tagged.example".to_string(),
+                ],
+                quota_class: None,
+                registered_at: 1,
+                tombstoned_at: None,
+                first_created_at: None,
+                first_event_id: None,
+            };
+            let claim = crate::grasp_p::meta::BlobClaim {
+                size: 100,
+                aliases: vec![alias.clone()],
+                unreferenced_since: None,
+                stored: false,
+                charged_tenant: None,
+                charged_alias: None,
+                spec_charge: None,
+                stored_at: None,
+            };
+            svc.meta
+                .with_write(|meta, txn| {
+                    meta.put_registration(txn, &alias, &record)?;
+                    meta.put_blob_claim(txn, &sha, &claim)
+                })
+                .expect("seed the registration and the claim");
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            assert!(svc.mirror_tx.set(tx).is_ok(), "the job channel is set once");
+
+            let outcome = scan_missing(&svc, clock_now()).expect("the claim table reads");
+            assert_eq!(outcome.lag, 1);
+            assert_eq!(outcome.tasks.len(), 1, "the missing blob is derived");
+            let peers = outcome.tasks[0].route.peer_servers.clone();
+            assert_eq!(
+                peers,
+                peer_servers_for(&svc),
+                "the scan's peers are the node's peers"
+            );
+
+            // A state root for the same alias, as an accepted 30641 enqueues
+            // it.
+            let state_root = EventBuilder::new(Kind::Custom(crate::grasp_p::KIND_STATE_ROOT), "")
+                .tags([
+                    Tag::custom("d", vec![alias.clone()]),
+                    Tag::custom("m", vec![sha.clone(), "100".to_string()]),
+                ])
+                .finalize(&Keys::generate())
+                .expect("sign");
+            enqueue_for_state_root(&svc, &state_root);
+            let job = rx.try_recv().expect("one job for the missing blob");
+            assert_eq!(
+                job.peer_servers, peers,
+                "the enqueue path has the scan's peers"
+            );
+            peers
         }
 
-        // No announced length: the declared size bounds the read.
-        for configured in [true, false] {
-            assert_eq!(expected_len(None, 500, configured, MAX), Ok(500));
-            assert_eq!(
-                expected_len(None, MAX + 1, configured, MAX),
-                Err("too_large".to_string())
-            );
-        }
-        assert_eq!(classify_failure("too_large"), RetryClass::AtMax);
+        assert!(
+            scanned_peers(None).await.is_empty(),
+            "with no list there is no peer, whatever the registration names"
+        );
+        assert_eq!(
+            scanned_peers(Some("https://own.example, https://peer.example/")).await,
+            vec!["https://peer.example".to_string()]
+        );
     }
 
     #[test]
@@ -2837,6 +2997,42 @@ mod tests {
         );
     }
 
+    /// A host that is an IP literal never reaches the client's resolver, so
+    /// the early check is all that stands between it and a connection. It
+    /// refuses the literals each list knows: a NAT64 and a 6to4 form that
+    /// upstream's list passes, addresses that upstream's list refuses, the
+    /// same forms around addresses only upstream's list knows, and the
+    /// local-use NAT64 prefix, as the resolver does. On a private link they
+    /// pass, as the operator said.
+    #[tokio::test]
+    async fn peer_allowed_refuses_internal_literals_the_resolver_never_sees() {
+        for literal in [
+            "https://[64:ff9b::a9fe:a9fe]",
+            "https://[2002:a00:5::]",
+            "https://[::1]",
+            "https://[fe80::1]",
+            "https://198.18.0.1",
+            // NAT64 around 198.18.0.1, 6to4 around 240.0.0.1.
+            "https://[64:ff9b::c612:1]",
+            "https://[2002:f000:1::1]",
+            // The local-use NAT64 prefix, around 10.0.0.5 and around the
+            // cloud metadata address.
+            "https://[64:ff9b:1::a00:5]",
+            "https://[64:ff9b:1::a9fe:a9fe]",
+        ] {
+            assert_eq!(
+                peer_allowed(literal, false).await,
+                PeerVerdict::Refused,
+                "{literal}"
+            );
+            assert_eq!(
+                peer_allowed(literal, true).await,
+                PeerVerdict::Allowed,
+                "{literal}"
+            );
+        }
+    }
+
     /// A name that does not resolve is not a refusal: it is retried on the
     /// backoff of a network failure, not parked for the maximum interval.
     /// This also pins the wording of the outbound policy's lookup error,
@@ -2916,7 +3112,6 @@ mod tests {
                 tenant_hex: account.to_string(),
                 alias: format!("{account}-repo"),
                 peer_servers: vec!["https://peer.example".to_string()],
-                peers_configured: true,
             }),
             fallbacks: Vec::new(),
             blob: WantBlob {
@@ -3234,7 +3429,6 @@ mod tests {
                     size: 1,
                 }],
                 peer_servers: vec!["https://peer.example".to_string()],
-                peers_configured: true,
             })
             .expect("the worker is running");
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -3302,8 +3496,8 @@ mod tests {
         worker.handle.abort();
     }
 
-    /// A `server` tag names this node when it names its host and port and,
-    /// for a node under a mount path, that path. At the root of a domain
+    /// An entry of the peer list names this node when it names its host and
+    /// port and, for a node under a mount path, that path. At the root of a domain
     /// every path on the host is this node, as it always was.
     #[test]
     fn own_server_is_matched_with_the_mount_path() {
@@ -3322,5 +3516,222 @@ mod tests {
         assert!(is_own_server("h.example", root));
         assert!(!is_own_server("https://peer.example", root));
         assert!(!is_own_server("http://127.0.0.1:2222", "127.0.0.1:1111"));
+    }
+
+    // ---- the client and its resolver ---------------------------------------
+
+    /// A name under `.test`, which no resolver answers: only an injected
+    /// lookup can give it an address.
+    const PEER_NAME: &str = "peer.mirror.test";
+
+    fn answer_loopback(_host: String) -> vetted_dns::LookupFuture {
+        let answer: std::io::Result<Vec<std::net::SocketAddr>> =
+            Ok(vec![std::net::SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )]);
+        Box::pin(std::future::ready(answer))
+    }
+
+    fn answer_nothing_found(_host: String) -> vetted_dns::LookupFuture {
+        let answer: std::io::Result<Vec<std::net::SocketAddr>> =
+            Err(std::io::Error::other("no such name"));
+        Box::pin(std::future::ready(answer))
+    }
+
+    /// A peer on loopback that counts the connections it accepts, keeps the
+    /// head of each request and answers it with an empty 200.
+    struct CountingPeer {
+        port: u16,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl CountingPeer {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the peer");
+            let port = listener.local_addr().expect("the peer's address").port();
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let heads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let (count, record) = (Arc::clone(&accepted), Arc::clone(&heads));
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let record = Arc::clone(&record);
+                    tokio::spawn(async move {
+                        let mut head: Vec<u8> = Vec::new();
+                        let mut buffer = [0_u8; 1024];
+                        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => head.extend_from_slice(&buffer[..read]),
+                            }
+                        }
+                        record
+                            .lock()
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            Self {
+                port,
+                accepted,
+                heads,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn blob_url(&self) -> String {
+            format!("http://{PEER_NAME}:{}/{}", self.port, "ab".repeat(32))
+        }
+    }
+
+    /// The mirror's client connects to the address its resolver vetted and
+    /// to nothing else: the name has no address anywhere, so only the
+    /// resolver's answer can lead to the listener. The name still travels in
+    /// the request.
+    #[tokio::test]
+    async fn mirror_client_connects_to_the_address_its_resolver_vetted() {
+        let peer = CountingPeer::start().await;
+        let resolver = VettedResolver::with_lookup(true, Arc::new(answer_loopback));
+        let client = http_client(Duration::from_secs(5), resolver).expect("the mirror's client");
+
+        let response = client
+            .get(peer.blob_url())
+            .send()
+            .await
+            .expect("the vetted address answers");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(peer.accepted(), 1);
+        let heads = peer.heads.lock().clone();
+        assert!(
+            heads[0]
+                .to_ascii_lowercase()
+                .contains(&format!("host: {PEER_NAME}:{}\r\n", peer.port)),
+            "{heads:?}"
+        );
+    }
+
+    /// DNS rebinding, on the real client: a name whose lookup answers an
+    /// internal address is refused before any connection is made, and the
+    /// failure is `blocked`, which waits the maximum interval and names the
+    /// host and the address. The test above sends the same request with the
+    /// same answer allowed and reaches the listener, so it is the resolver
+    /// that kept this one away.
+    #[tokio::test]
+    async fn mirror_client_refuses_a_name_that_resolves_to_an_internal_address() {
+        let peer = CountingPeer::start().await;
+        let resolver = VettedResolver::with_lookup(false, Arc::new(answer_loopback));
+        let client = http_client(Duration::from_secs(5), resolver).expect("the mirror's client");
+
+        let error = client
+            .get(peer.blob_url())
+            .send()
+            .await
+            .expect_err("an internal answer must be refused");
+
+        let blocked =
+            vetted_dns::blocked_target(&error).expect("the resolver's refusal is a source");
+        assert_eq!(blocked.host, PEER_NAME);
+        assert_eq!(blocked.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let reason = send_failure_reason(&error);
+        assert_eq!(reason_label(&reason), "blocked", "{reason}");
+        assert_eq!(classify_failure(&reason), RetryClass::AtMax);
+        assert!(!stops_peer_loop(&reason), "another peer may still serve it");
+        assert!(
+            reason.contains(PEER_NAME) && reason.contains("127.0.0.1"),
+            "{reason}"
+        );
+        assert_eq!(
+            peer.accepted(),
+            0,
+            "nothing may connect to an address the resolver refused"
+        );
+    }
+
+    /// `fetch_from_peer` records the resolver's refusal as `blocked`. The
+    /// node's early check passes the `.test` name without a lookup (a
+    /// private link), and the client's resolver, which allows no internal
+    /// answer, refuses loopback before any connection.
+    #[tokio::test]
+    async fn fetch_from_peer_records_the_resolvers_refusal_as_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_mirror_allow_private_ips = true;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: crate::nostr::SharedDatabase =
+            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let peer = CountingPeer::start().await;
+        let resolver = VettedResolver::with_lookup(false, Arc::new(answer_loopback));
+        let client = http_client(Duration::from_secs(5), resolver).expect("the mirror's client");
+        let route = Route {
+            tenant_hex: "ef".repeat(32),
+            alias: "ab".repeat(16),
+            peer_servers: Vec::new(),
+        };
+        let blob = WantBlob {
+            sha256: "cd".repeat(32),
+            size: 1,
+        };
+        let peer_base = format!("http://{PEER_NAME}:{}", peer.port);
+
+        let reason = fetch_from_peer(
+            &svc,
+            &client,
+            Duration::from_secs(5),
+            &route,
+            &blob,
+            &peer_base,
+        )
+        .await
+        .expect_err("an internal answer must be refused");
+
+        assert_eq!(reason_label(&reason), "blocked", "{reason}");
+        assert!(
+            reason.contains(PEER_NAME) && reason.contains("127.0.0.1"),
+            "{reason}"
+        );
+        assert_eq!(peer.accepted(), 0);
+    }
+
+    /// A name that does not resolve fails as `network`, as it does in the
+    /// early check: a resolver that fails for a moment must not park the
+    /// blob for the maximum interval.
+    #[tokio::test]
+    async fn mirror_client_reports_a_failed_lookup_as_network() {
+        let resolver = VettedResolver::with_lookup(false, Arc::new(answer_nothing_found));
+        let client = http_client(Duration::from_secs(5), resolver).expect("the mirror's client");
+
+        let error = client
+            .get(format!("http://{PEER_NAME}/{}", "ab".repeat(32)))
+            .send()
+            .await
+            .expect_err("a name without an address cannot be fetched from");
+
+        assert!(vetted_dns::blocked_target(&error).is_none(), "{error}");
+        let reason = send_failure_reason(&error);
+        assert_eq!(reason_label(&reason), "network", "{reason}");
+        assert_eq!(classify_failure(&reason), RetryClass::Backoff);
     }
 }

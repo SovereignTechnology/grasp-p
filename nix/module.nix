@@ -723,9 +723,16 @@ let
         type = types.listOf types.str;
         default = [ ];
         description = ''
-          GRASP-P Phase 2: peer blob-server base URLs for the mirror.
-          Empty (default): derive peers from each registration's `server`
-          tags (minus this node's own domain).
+          GRASP-P Phase 2: blob base URLs of the nodes this one mirrors
+          blobs from: the pair's other node, where it serves
+          GET /<sha256> (an entry without a scheme is taken as https://).
+          The blob mirror fetches from these peers and from no other host:
+          a registration's `server` tags are advisory and never choose one.
+          An entry that names this node itself is left out, so both nodes
+          of a pair can be given the same list. Empty (default): no blob
+          peers, so no blob replicates to this node; with the mirror
+          enabled the node warns at startup. The mirror uses no proxy from
+          the environment.
         '';
       };
 
@@ -777,10 +784,10 @@ let
           true, the blob mirror and the relay connection to a configured
           private-sync peer may use an internal address; every other relay
           stays under the outbound target policy. Set true for a pair on a
-          private network or for local testing. Set
-          NGIT_GRASP_P_MIRROR_PEER_URLS with it: without that list the
-          mirror takes its peers from registrations' `server` tags, which
-          could then name an internal host.
+          private network or for local testing. It applies only to the
+          peers the operator lists in NGIT_GRASP_P_MIRROR_PEER_URLS and
+          NGIT_GRASP_P_SYNC_PEER_URLS: no host a registration names is
+          fetched from or dialled as a peer.
         '';
       };
 

@@ -649,6 +649,11 @@ async fn exit1_replication_e2e() {
         "exit1: mirrored pack must byte-compare equal to the original"
     );
 
+    let warnings = count_log_lines(&b.log_path(), |line| {
+        line.contains("the blob mirror has no peers")
+    });
+    assert_eq!(warnings, 0, "exit1: a node with a blob peer must not warn");
+
     let latency = replication_started.elapsed();
     println!("exit1: full A->B replication (events + blobs) in {latency:?}");
     assert!(
@@ -1998,9 +2003,9 @@ async fn exit11_mirror_retry_backoff() {
     let sha = sha256_hex(&blob);
     let stub = FlakyBlobServer::start(vec![(sha.clone(), blob.clone())]).await;
 
-    // The mirror peer override (both nodes) points at the stub — the
-    // registration's own server tags are bypassed. NGIT_TEST clamps the
-    // backoff base to 1s and the repair tick is 1s.
+    // The stub is the only blob peer of both nodes: the list given here
+    // replaces the one the fixture derives from the other node. NGIT_TEST
+    // clamps the backoff base to 1s and the repair tick is 1s.
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
     let (a, b) = start_pair(&[
@@ -2604,10 +2609,11 @@ async fn wait_for_log_lines(
 /// pair would over a private network, and upstream's outbound target policy
 /// stays on: `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is not set on either node.
 /// The link is allowed by `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`
-/// alone. Each node names the other in its peer list and nowhere else, so
-/// the connection is not upstream's exempt bootstrap relay: without the
-/// peer's own dial policy it is refused at registration and nothing
-/// replicates. A relay that an event names on loopback is still refused.
+/// alone. Each node names the other in its two peer lists (sync and blob)
+/// and nowhere else, so the connection is not upstream's exempt bootstrap
+/// relay: without the peer's own dial policy it is refused at registration
+/// and nothing replicates. A relay that an event names on loopback is still
+/// refused.
 #[tokio::test]
 async fn exit16_pair_replicates_with_the_upstream_guard_on() {
     let tenant = Keys::generate();
@@ -2616,6 +2622,10 @@ async fn exit16_pair_replicates_with_the_upstream_guard_on() {
     let res_b = reserve_port();
     let url_a = format!("ws://127.0.0.1:{}", res_a.port());
     let url_b = format!("ws://127.0.0.1:{}", res_b.port());
+    // With no bootstrap relay the fixture names no peer, so each node is
+    // given the other as its sync peer and as its blob peer here.
+    let blobs_a = TestRelay::blob_peer_url(&url_a);
+    let blobs_b = TestRelay::blob_peer_url(&url_b);
     let a = TestRelay::start_grasp_p_pair_node_with_upstream_guard(
         res_a,
         None,
@@ -2625,6 +2635,7 @@ async fn exit16_pair_replicates_with_the_upstream_guard_on() {
         &[
             ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
             ("NGIT_GRASP_P_SYNC_PEER_URLS", url_b.as_str()),
+            ("NGIT_GRASP_P_MIRROR_PEER_URLS", blobs_b.as_str()),
         ],
     )
     .await;
@@ -2637,6 +2648,7 @@ async fn exit16_pair_replicates_with_the_upstream_guard_on() {
         &[
             ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
             ("NGIT_GRASP_P_SYNC_PEER_URLS", url_a.as_str()),
+            ("NGIT_GRASP_P_MIRROR_PEER_URLS", blobs_a.as_str()),
         ],
     )
     .await;
@@ -2897,8 +2909,9 @@ async fn exit18_bootstrap_relay_that_is_not_a_peer_carries_no_grasp_p_sync() {
     let (first_writer, second_writer) = (Keys::generate(), Keys::generate());
     let before = register_on(&c, &domain_refs, &tenant, &first_writer, &random_alias()).await;
 
-    // The fixture lists a bootstrap relay as a peer too; the empty value
-    // takes it out again.
+    // The fixture lists a bootstrap relay as a sync peer and a blob peer
+    // too; the empty values take it out again, so C is no peer of A in any
+    // sense.
     let a = TestRelay::start_grasp_p_pair_node(
         res_a,
         Some(url_c.clone()),
@@ -2908,9 +2921,17 @@ async fn exit18_bootstrap_relay_that_is_not_a_peer_carries_no_grasp_p_sync() {
         &[
             ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
             ("NGIT_GRASP_P_SYNC_PEER_URLS", ""),
+            ("NGIT_GRASP_P_MIRROR_PEER_URLS", ""),
         ],
     )
     .await;
+    assert!(
+        common::sync_helpers::wait_for_log_line(&a.log_path(), REPLICATION_BOUND, |line| {
+            line.contains("the blob mirror has no peers")
+        })
+        .await,
+        "exit18: A runs the mirror with no blob peer and must warn at startup"
+    );
 
     // Public sync over the bootstrap connection: an announcement on C that
     // lists A reaches A. By then A's first sync of C is done.
@@ -3021,6 +3042,81 @@ async fn exit19_connect_time_sync_replicates_with_the_full_reissue_off() {
     assert!(
         wait_for_exact_event(b.url(), edition.id, REPLICATION_BOUND).await,
         "exit19: the state root must follow its registration to B"
+    );
+
+    b.stop().await;
+    a.stop().await;
+}
+
+// ============================================================================
+// Exit test 20 — the blob mirror uses no proxy from the environment
+// ============================================================================
+
+/// B runs with every proxy variable pointing at a listener that only counts
+/// connections: B still mirrors the blob from A, and the listener sees
+/// nothing. A node is its own process, so its environment races with no
+/// other test. `NO_PROXY` is emptied so that a value the test runner
+/// inherits cannot exempt loopback and pass this by itself.
+#[tokio::test]
+async fn exit20_mirror_ignores_the_proxy_variables() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stand-in proxy");
+    let proxy = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("the proxy's address").port()
+    );
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair_with_split_env(
+        &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("HTTP_PROXY", proxy.as_str()),
+            ("http_proxy", proxy.as_str()),
+            ("HTTPS_PROXY", proxy.as_str()),
+            ("https_proxy", proxy.as_str()),
+            ("ALL_PROXY", proxy.as_str()),
+            ("all_proxy", proxy.as_str()),
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
+        ],
+    )
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(String::as_str).collect();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let blob = blob_bytes(91, 1024);
+    let sha = upload_blob(&a, &tenant, &writer, &alias, &blob).await;
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&sha, blob.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(a.url(), &edition).await;
+    assert!(accepted, "exit20: 30641 accepted on A; got {message:?}");
+
+    let mirrored = wait_for_blob(&b, &sha, REPLICATION_BOUND)
+        .await
+        .expect("exit20: B must mirror the blob whatever its proxy variables say");
+    assert_eq!(mirrored, blob, "exit20: mirrored bytes intact");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "exit20: nothing may reach the proxy"
     );
 
     b.stop().await;

@@ -616,7 +616,9 @@ async fn outbound_tls_clients_complete_or_refuse_a_real_handshake() {
                 "SSL_CERT_FILE",
                 ca_file.to_str().expect("temporary path is UTF-8"),
             ),
-            // reqwest honours proxy variables; loopback must never be proxied.
+            // Neither of B's HTTP clients (the mirror's, the NIP-11 probe's)
+            // reads proxy variables; these keep loopback unproxied if one
+            // ever does.
             ("NO_PROXY", "127.0.0.1"),
             ("no_proxy", "127.0.0.1"),
             // A relay dial may take no longer than the base backoff (1 s in

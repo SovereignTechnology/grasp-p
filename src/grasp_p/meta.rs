@@ -46,7 +46,9 @@ pub struct RegistrationRecord {
     pub aux_keys: Vec<String>,
     /// `relays` tag values from the registration.
     pub relays: Vec<String>,
-    /// `server` tag values from the registration.
+    /// `server` tag values from the registration. Advisory: they tell
+    /// clients where the blobs are and never choose a host the mirror
+    /// fetches from.
     pub servers: Vec<String>,
     /// Opaque quota-class tag (recorded, unused in Phase 1).
     pub quota_class: Option<String>,

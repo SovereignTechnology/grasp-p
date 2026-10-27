@@ -34,7 +34,9 @@ pub struct PrivateRepoEntry {
     /// membership-map-leak vector); peers come from the operator allowlist
     /// via [`configured_peer_relay_keys`].
     pub relay_urls: Vec<String>,
-    /// `server` tag values from the registration.
+    /// `server` tag values from the registration. Advisory as well: the
+    /// blob mirror fetches only from the operator's list
+    /// (`grasp_p::mirror::peer_servers_for`).
     pub server_urls: Vec<String>,
 }
 

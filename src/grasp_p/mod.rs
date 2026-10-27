@@ -28,6 +28,7 @@ pub mod rate;
 pub mod registration;
 pub mod relay_labels;
 pub mod state_root;
+mod vetted_dns;
 pub mod write_keys;
 
 use std::collections::{HashMap, HashSet};
@@ -416,6 +417,11 @@ pub struct PrivateConfig {
     pub accept_legacy_wrap_kind: bool,
     // Phase 2 blob mirror knobs.
     pub mirror_enable: bool,
+    /// The entries of `NGIT_GRASP_P_MIRROR_PEER_URLS`, as written: the only
+    /// hosts the mirror fetches from, less the ones that name this node
+    /// (`mirror::peer_servers_for`). Node-local and outside the
+    /// fingerprint: it decides where a node fetches blobs, never what it
+    /// accepts.
     pub mirror_peer_urls: Option<Vec<String>>,
     pub mirror_max_concurrency: u32,
     pub mirror_fetch_timeout_secs: u64,
@@ -431,8 +437,9 @@ pub struct PrivateConfig {
     /// `policy_fingerprint`.
     pub mirror_max_attempts_per_min: u32,
     /// SSRF guard: when false (default), mirror fetch peers resolving to
-    /// loopback/private/link-local/unspecified/multicast IPs are dropped and
-    /// only https peers are contacted. Tests set this true to mirror over
+    /// loopback/private/link-local/unspecified/multicast IPs are refused and
+    /// only https peers are contacted, by the early check and by the
+    /// client's resolver alike. Tests set this true to mirror over
     /// http://127.0.0.1.
     pub mirror_allow_private_ips: bool,
     /// The relays this node replicates GRASP-P events with, as the keys the
@@ -1764,16 +1771,18 @@ pub fn spawn_background_tasks(
     let mut tasks = vec![service.spawn_gc()];
     tracing::info!("Private blob GC task started");
     if config.private_mirror_enable {
-        // The private-link setting lets the mirror fetch from internal
-        // addresses, and without a mirror peer list its peers come from
-        // registrations, which customers write.
-        if config.private_mirror_allow_private_ips
-            && config.private_mirror_peer_url_entries().is_none()
-        {
+        // The mirror fetches from the operator's list alone, so with no
+        // list, or one that names only this node, no blob reaches this node
+        // from its pair, and nothing at startup would say so: afterwards only
+        // the `no_peer` failures and the lag gauge show it. The
+        // private-link setting needs no warning of its own any more: it
+        // widens what the mirror may reach for listed peers only, and no
+        // host a customer names reaches the mirror.
+        if mirror::peer_servers_for(service).is_empty() {
             tracing::warn!(
-                "NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS is true and \
-                 NGIT_GRASP_P_MIRROR_PEER_URLS is unset: the blob mirror takes its peers \
-                 from the `server` tags of registrations, which may now name internal hosts"
+                "NGIT_GRASP_P_MIRROR_ENABLE is true and NGIT_GRASP_P_MIRROR_PEER_URLS names no \
+                 peer of this node: the blob mirror has no peers, so no blob will replicate to \
+                 this node"
             );
         }
         tasks.push(service.spawn_mirror());

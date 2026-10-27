@@ -161,15 +161,17 @@ The corresponding NixOS option is `basePath`.
 - Used in repository clone URLs: `https://{NGIT_DOMAIN}/{npub}/{repo}.git`
 - **GRASP-P exact-host checks (Phase-4b A3, src/grasp_p/host.rs):** a
   **port-less** `NGIT_DOMAIN` matches registration `relays`/`server` tag
-  URLs on **any** port (host alone). Consequence: a `server` tag carrying
-  the wrong port on this host still counts as "listing this node" at
-  admission and is then **self-excluded from this node's mirror peer set** —
-  if every listed tag resolves to this node, the mirror has no peer
+  URLs, and the entries of the peer lists, on **any** port (host alone).
+  Consequence: a `server` tag carrying the wrong port on this host still
+  counts as "listing this node" at admission, and an entry of
+  `NGIT_GRASP_P_MIRROR_PEER_URLS` or `NGIT_GRASP_P_SYNC_PEER_URLS` on this
+  host is taken for this node whatever its port and left out. If every
+  entry of the mirror list is left out that way, the mirror has no peer
   (`ngit_private_mirror_failed_total{reason="no_peer"}`, backlog visible via
-  the `ngit_private_mirror_lag_blobs` gauge) instead of a fetch attempt
-  failing. Spell the port explicitly (`host:port`) when the blob endpoint
-  is not the scheme default; a ported `NGIT_DOMAIN` requires tag URLs to
-  match that effective port exactly.
+  the `ngit_private_mirror_lag_blobs` gauge, and a warning at startup).
+  Spell the port explicitly (`host:port`) when the blob endpoint is not the
+  scheme default; a ported `NGIT_DOMAIN` requires tag URLs and list entries
+  to match that effective port exactly.
 - **GRASP-P under `NGIT_BASE_PATH`:** a node mounted under a path is named
   by its host and that path together. A registration's `relays` and `server`
   tags must carry the mounted URL (`wss://{NGIT_DOMAIN}{NGIT_BASE_PATH}`,
@@ -1793,9 +1795,9 @@ startup log line.
 
 #### `NGIT_GRASP_P_MIRROR_PEER_URLS`
 
-**Description:** Comma-separated peer blob-server base URLs for the mirror. When unset, peers are derived from each registration's `server` tags (minus this node's own domain).  
+**Description:** Comma-separated blob base URLs of the nodes this one mirrors blobs from: the pair's other node, where it serves `GET /<sha256>` (an entry without a scheme is taken as `https://`). The blob mirror fetches from these peers and from no other host: a registration's `server` tags are advisory and never choose one. An entry that names this node itself is left out, so both nodes of a pair can be given the same list. When unset, the node has no blob peers, so no blob replicates to it; with `NGIT_GRASP_P_MIRROR_ENABLE=true` it warns at startup (`the blob mirror has no peers`). The mirror uses no proxy from the environment (`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` do not apply to it), and connects only to addresses its client's resolver vetted (the connection makes no lookup of its own). Node-local and not part of the `policy_fingerprint`.  
 **Type:** String (CSV URLs)  
-**Default:** unset (derive from `server` tags)  
+**Default:** unset (no blob peers)  
 **Required:** No
 
 #### `NGIT_GRASP_P_MIRROR_MAX_CONCURRENCY`
@@ -1825,7 +1827,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS`
 
-**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under it. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair); set `NGIT_GRASP_P_MIRROR_PEER_URLS` with it, because without that list the mirror takes its peers from registrations' `server` tags, which could then name an internal host (the node warns at startup). Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link and refuses a peer that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (a peer that is also the bootstrap relay is still dialled, as written).  
+**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under it. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair). It applies only to the peers the operator lists in `NGIT_GRASP_P_MIRROR_PEER_URLS` and `NGIT_GRASP_P_SYNC_PEER_URLS`: no host a registration names is fetched from or dialled as a peer. Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link and refuses a peer that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (a peer that is also the bootstrap relay is still dialled, as written).  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No
