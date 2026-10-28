@@ -1602,6 +1602,189 @@ async fn exit21_settled_seat_is_kept_on_both_nodes() {
 }
 
 // ============================================================================
+// Exit test 22 — the account's offboard request reaches the peer; a write key
+// cannot delete (decision D6)
+// ============================================================================
+
+/// Only the account key deletes, and only a whole repository, through its
+/// registration. A write key's deletion of its own state root, by event id
+/// or by coordinate, is refused on both nodes and the state root stays
+/// served on both. The account's offboard request, published on A alone,
+/// reaches B by sync (the offboard filter rides the peer link), B judges it
+/// as A did, and the registration is no longer live on either node: a new
+/// state root is refused on both. A second account then closes by vanish on
+/// A alone; B asks A for the vanishes of the accounts it hosts, a filter it
+/// adds when its index changes, and stops serving that account's
+/// registration too. Ledger and purge assertions belong to the hold and
+/// purge work.
+#[tokio::test]
+async fn exit22_offboard_request_reaches_the_peer_and_a_write_key_cannot_delete() {
+    let tenant = Keys::generate();
+    let tenant2 = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant, &tenant2]);
+    let (a, b) = start_pair(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let now = Timestamp::now().as_secs();
+
+    let registration = registration_event(&tenant, &alias, &writer, &domain_refs, Some(now - 120));
+    let (accepted, message) = publish_with_result(a.url(), &registration).await;
+    assert!(accepted, "exit22: registration failed: {message:?}");
+    assert!(
+        wait_for_exact_event(b.url(), registration.id, REPLICATION_BOUND).await,
+        "exit22: the registration must replicate to B"
+    );
+
+    let manifest = sha256_hex(&blob_bytes(97, 64));
+    let root = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&manifest, 64),
+        &[],
+        now - 60,
+    );
+    let (accepted, message) = publish_with_result(a.url(), &root).await;
+    assert!(accepted, "exit22: state root failed: {message:?}");
+    assert!(
+        wait_for_exact_event(b.url(), root.id, REPLICATION_BOUND).await,
+        "exit22: the state root must replicate to B"
+    );
+
+    // The write key deletes its own state root: upstream alone would take
+    // both, and the coordinate form would also refuse the key's later state
+    // roots for this alias.
+    let by_id = EventBuilder::new(Kind::EventDeletion, "")
+        .tags(vec![
+            Tag::event(root.id),
+            Tag::custom("k", vec!["30641".to_string()]),
+        ])
+        .finalize(&writer)
+        .expect("sign kind-5");
+    let by_coordinate = EventBuilder::new(Kind::EventDeletion, "")
+        .tags(vec![
+            Tag::custom(
+                "a",
+                vec![format!("30641:{}:{alias}", writer.public_key().to_hex())],
+            ),
+            Tag::custom("k", vec!["30641".to_string()]),
+        ])
+        .finalize(&writer)
+        .expect("sign kind-5");
+    for (name, node) in [("A", &a), ("B", &b)] {
+        for (what, request) in [("by id", &by_id), ("by coordinate", &by_coordinate)] {
+            let (accepted, message) = publish_with_result(node.url(), request).await;
+            assert!(
+                !accepted && message.contains("restricted:") && !message.contains("unregistered"),
+                "exit22: node {name} must refuse the write key's deletion {what}; got accepted={accepted} {message:?}"
+            );
+        }
+    }
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let served = fetch_from(node.url(), Filter::new().id(root.id)).await;
+        assert_eq!(
+            served.len(),
+            1,
+            "exit22: node {name} must still serve the state root"
+        );
+    }
+
+    // The account's offboard request, on A only.
+    let offboard = EventBuilder::new(Kind::EventDeletion, "offboard")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(a.url(), &offboard).await;
+    assert!(
+        accepted,
+        "exit22: A refused the offboard request: {message:?}"
+    );
+    assert!(
+        wait_for_exact_event(b.url(), offboard.id, REPLICATION_BOUND).await,
+        "exit22: the offboard request must reach B by sync"
+    );
+
+    // B stores a request only after acting on it; poll anyway, so a slow
+    // save cannot fail the test for the wrong reason.
+    let registrations = Filter::new()
+        .kind(Kind::Custom(30640))
+        .author(tenant.public_key())
+        .identifier(&alias);
+    let deadline = Instant::now() + REPLICATION_BOUND;
+    while !fetch_from(b.url(), registrations.clone()).await.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "exit22: B still serves the registration after the offboard request arrived"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    let after = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&manifest, 64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let (accepted, message) = publish_with_result(node.url(), &after).await;
+        assert!(
+            !accepted && message.contains("unregistered alias"),
+            "exit22: node {name} must refuse a state root once the registration is deleted; got accepted={accepted} {message:?}"
+        );
+    }
+
+    // A second account closes by vanish on A only. B asks A for the
+    // vanishes of the accounts it hosts, a filter added when its index
+    // changes.
+    let writer2 = Keys::generate();
+    let alias2 = random_alias();
+    let registration2 =
+        registration_event(&tenant2, &alias2, &writer2, &domain_refs, Some(now - 120));
+    let (accepted, message) = publish_with_result(a.url(), &registration2).await;
+    assert!(accepted, "exit22: second registration failed: {message:?}");
+    assert!(
+        wait_for_exact_event(b.url(), registration2.id, REPLICATION_BOUND).await,
+        "exit22: the second registration must replicate to B"
+    );
+    let vanish = EventBuilder::new(Kind::RequestToVanish, "")
+        .tags(vec![Tag::custom("relay", vec!["ALL_RELAYS".to_string()])])
+        .finalize(&tenant2)
+        .expect("sign kind-62");
+    let (accepted, message) = publish_with_result(a.url(), &vanish).await;
+    assert!(
+        accepted,
+        "exit22: A refused the account's vanish: {message:?}"
+    );
+    assert!(
+        wait_for_exact_event(b.url(), vanish.id, REPLICATION_BOUND).await,
+        "exit22: the vanish must reach B by sync"
+    );
+    let registrations2 = Filter::new()
+        .kind(Kind::Custom(30640))
+        .author(tenant2.public_key())
+        .identifier(&alias2);
+    let deadline = Instant::now() + REPLICATION_BOUND;
+    while !fetch_from(b.url(), registrations2.clone()).await.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "exit22: B still serves the vanished account's registration"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    a.stop().await;
+    b.stop().await;
+}
+
+// ============================================================================
 // Exit test 9 — mirror finish() re-check + no re-enqueue after death (R2-C)
 // ============================================================================
 

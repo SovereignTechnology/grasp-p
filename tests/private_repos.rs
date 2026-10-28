@@ -1803,11 +1803,36 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
         "exit10: a newer edition's claims must survive a stale deletion; got {message:?}"
     );
 
-    // e-tag deletion of the CURRENT edition frees its claims (the author
-    // knows their own event id; this is the same wedge vector as the a-tag).
-    let etag_deletion = EventBuilder::new(Kind::EventDeletion, "by id")
+    // An e-tag deletion of the CURRENT edition alone is refused: a
+    // registration is deleted by its coordinate, which covers whichever
+    // edition each node of a pair holds. Nothing is deleted.
+    let etag_only = EventBuilder::new(Kind::EventDeletion, "by id")
         .tags(vec![
             Tag::event(reg2.id),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 4))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &etag_only).await;
+    assert!(
+        !accepted && message.contains("restricted:") && !message.contains("unregistered"),
+        "exit10: an e-tag-only deletion of a registration must be refused; got {message:?}"
+    );
+    assert_eq!(
+        fetch_from(relay.url(), Filter::new().id(reg2.id))
+            .await
+            .len(),
+        1,
+        "exit10: a refused deletion deletes nothing"
+    );
+
+    // The event id beside the coordinate is honoured and frees the claims
+    // of the CURRENT edition (the same wedge vector as the a-tag alone).
+    let etag_deletion = EventBuilder::new(Kind::EventDeletion, "by id and coordinate")
+        .tags(vec![
+            Tag::event(reg2.id),
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
             Tag::custom("k", vec!["30640".to_string()]),
         ])
         .custom_created_at(Timestamp::from_secs(t0 + 4))
@@ -1831,16 +1856,22 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
     );
 
     // A FOREIGN author cannot free claims with a deletion naming the
-    // coordinate: register once more, then a stranger "deletes" it.
+    // coordinate: register once more, with a key nobody holds now (`other`
+    // took w2 above), then another account "deletes" it.
+    let w3 = Keys::generate();
     let reg3 = registration_event(
         &tenant,
         &alias,
-        &[key_entry(&w2, &tenant.public_key(), &alias)],
+        &[key_entry(&w3, &tenant.public_key(), &alias)],
         &[],
         &domain,
         Some(t0 + 6),
     );
-    publish_with_result(relay.url(), &reg3).await;
+    let (accepted, message) = publish_with_result(relay.url(), &reg3).await;
+    assert!(
+        accepted,
+        "exit10: re-registration with w3 failed: {message:?}"
+    );
     let foreign = EventBuilder::new(Kind::EventDeletion, "malicious")
         .tags(vec![
             Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
@@ -1849,20 +1880,26 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
         .custom_created_at(Timestamp::from_secs(t0 + 7))
         .finalize(&other)
         .expect("sign foreign kind-5");
-    let _ = publish_with_result(relay.url(), &foreign).await;
+    let (accepted, message) = publish_with_result(relay.url(), &foreign).await;
+    assert!(
+        !accepted && message.contains("restricted:"),
+        "exit10: a deletion of another account's registration must be refused; got {message:?}"
+    );
+    // The guard refused that request before any hook ran, so w3 is still
+    // the tenant's: another account cannot take it.
     let grab_alias3 = random_alias();
     let grab3 = registration_event(
         &other,
         &grab_alias3,
-        &[key_entry(&w2, &other.public_key(), &grab_alias3)],
+        &[key_entry(&w3, &other.public_key(), &grab_alias3)],
         &[],
         &domain,
         Some(t0 + 8),
     );
-    let (accepted, _message) = publish_with_result(relay.url(), &grab3).await;
+    let (accepted, message) = publish_with_result(relay.url(), &grab3).await;
     assert!(
-        !accepted,
-        "exit10: a foreign deletion must never free the tenant's claims"
+        !accepted && message.contains("write key already registered"),
+        "exit10: a foreign deletion must never free the tenant's claims; got {message:?}"
     );
 
     relay.stop().await;

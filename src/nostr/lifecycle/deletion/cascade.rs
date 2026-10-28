@@ -162,6 +162,7 @@ impl DeletionPolicy {
             &self.ctx.database,
             &deletable_announcements,
             &self.ctx.config.service_address(),
+            self.ctx.config.private_repos_enable,
         )
         .await
         {
@@ -434,6 +435,7 @@ async fn plan_deleted_announcement_cascade(
     database: &SharedDatabase,
     deleted_announcements: &[Event],
     domain: &str,
+    grasp_p: bool,
 ) -> Result<CascadeDeletionPlan, String> {
     let deleted_announcement_ids: HashSet<EventId> = deleted_announcements
         .iter()
@@ -456,8 +458,20 @@ async fn plan_deleted_announcement_cascade(
             .await
             .map_err(|e| e.to_string())?;
     let kept_event_ids = compute_retained_events(&graph, &deleted_announcement_ids, domain);
-    let orphan_event_ids =
+    let mut orphan_event_ids =
         compute_deletable_events(&graph, &kept_event_ids, &deleted_announcement_ids);
+    // GRASP-P seam: a registration, its state roots and its stream wraps go
+    // only with the registration's own offboard request (decision D6), never
+    // with a public repository's cascade. They stay in the graph, so what the
+    // cascade keeps of every other event is upstream's.
+    if grasp_p {
+        orphan_event_ids.retain(|id| {
+            graph
+                .nodes
+                .get(id)
+                .is_none_or(|event| !crate::grasp_p::offboard::cascade_exempt(event.kind.as_u16()))
+        });
+    }
 
     Ok(CascadeDeletionPlan {
         kept_event_ids,

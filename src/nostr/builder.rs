@@ -925,8 +925,15 @@ impl WritePolicy for Nip34WritePolicy {
             // `process_nip62(false)`. We reproduce that rejection here from our
             // own persistent `Tombstones` store so deleted events (and events
             // from vanished pubkeys) stay rejected across restarts.
-            if let Some(rejection) = self.deletion.gate(event).await {
-                return rejection;
+            // GRASP-P seam: state roots and stream wraps answer to their
+            // registration alone, never to a deletion request.
+            let gate_exempt = self.grasp_p.get().is_some_and(|service| {
+                crate::grasp_p::offboard::deletion_gate_exempt(service, event.kind.as_u16())
+            });
+            if !gate_exempt {
+                if let Some(rejection) = self.deletion.gate(event).await {
+                    return rejection;
+                }
             }
 
             // Detect if this is a synced event (from proactive sync) vs user-submitted

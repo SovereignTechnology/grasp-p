@@ -3,9 +3,10 @@
 //! Two small additive structures, both inert unless
 //! `NGIT_GRASP_P_REPOS_ENABLE=true`:
 //!
-//! - [`PrivateSyncIndex`]: alias → {w+aux keys, relay URLs, server URLs},
-//!   rebuilt from the relay DB's accepted kind-30640 registrations. Parallel
-//!   to `RepoSyncIndex`; drives the derived 30641/stream-wrap sync filters. The
+//! - [`PrivateSyncIndex`]: alias → {account key, w+aux keys, relay URLs,
+//!   server URLs}, rebuilt from the relay DB's accepted kind-30640
+//!   registrations. Parallel to `RepoSyncIndex`; drives the derived
+//!   30641/stream-wrap sync filters and the vanish filter. The
 //!   private peer-relay set is NOT derived from it — sync peers come only
 //!   from the operator allowlist ([`configured_peer_relay_keys`]).
 //! - [`PrivateRejectedIndex`]: a dedicated hot cache for 30641/stream-wrap
@@ -27,6 +28,9 @@ use nostr_sdk::prelude::{Event, EventId};
 /// One registration's sync-relevant fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrivateRepoEntry {
+    /// The account key that signed the registration (lowercase hex): whose
+    /// vanish requests the peer is asked for.
+    pub tenant_hex: String,
     /// Registered w + aux key pubkeys (lowercase hex).
     pub keys: Vec<String>,
     /// `relays` tag values from the registration. ADVISORY METADATA ONLY —
@@ -89,6 +93,19 @@ impl PrivateSyncIndex {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The account keys of every registration, each once, sorted: the
+    /// input of `build_private_vanish_filters`.
+    pub fn tenants(&self) -> Vec<String> {
+        let mut tenants: Vec<String> = self
+            .entries
+            .values()
+            .map(|entry| entry.tenant_hex.clone())
+            .collect();
+        tenants.sort();
+        tenants.dedup();
+        tenants
     }
 
     /// (alias, w+aux keys) pairs for `build_private_derived_filters`.
@@ -923,6 +940,7 @@ mod tests {
         entries.insert(
             "a".repeat(32),
             PrivateRepoEntry {
+                tenant_hex: "t1".into(),
                 keys: vec!["k1".into()],
                 relay_urls: vec!["ws://peer:1".into()],
                 server_urls: vec!["http://peer:1".into()],
@@ -934,10 +952,38 @@ mod tests {
         assert_eq!(diff.added_keys, vec!["k1".to_string()]);
 
         // Same content again: no change.
-        let diff = index.replace_all(entries);
+        let diff = index.replace_all(entries.clone());
         assert!(!diff.changed);
         assert!(diff.added_aliases.is_empty());
         assert!(diff.added_keys.is_empty());
+
+        // The same alias and keys under another account is a change: the
+        // vanish filter asks for that account's requests now.
+        entries.get_mut(&"a".repeat(32)).expect("entry").tenant_hex = "t2".into();
+        let diff = index.replace_all(entries);
+        assert!(diff.changed);
+        assert!(diff.added_aliases.is_empty() && diff.added_keys.is_empty());
+        assert_eq!(index.tenants(), vec!["t2".to_string()]);
+    }
+
+    /// Every account once, whatever the number of its aliases, in a fixed
+    /// order, so the filters built from it do not change from one rebuild
+    /// to the next.
+    #[test]
+    fn tenants_are_each_account_once_in_order() {
+        let mut index = PrivateSyncIndex::default();
+        assert!(index.tenants().is_empty());
+        let entry = |tenant: &str| PrivateRepoEntry {
+            tenant_hex: tenant.to_string(),
+            ..PrivateRepoEntry::default()
+        };
+        let entries = HashMap::from([
+            ("a".repeat(32), entry("t2")),
+            ("b".repeat(32), entry("t1")),
+            ("c".repeat(32), entry("t2")),
+        ]);
+        index.replace_all(entries);
+        assert_eq!(index.tenants(), vec!["t1".to_string(), "t2".to_string()]);
     }
 
     #[test]
@@ -1019,6 +1065,7 @@ mod tests {
         entries.insert(
             "c".repeat(32),
             PrivateRepoEntry {
+                tenant_hex: "t1".into(),
                 keys: vec!["k1".into()],
                 relay_urls: vec![
                     "ws://169.254.169.254".into(),

@@ -4,10 +4,11 @@
 //! manager calls in at a handful of points:
 //!
 //! - its filter builders ([`SyncManager::grasp_p_filters_for`]): for a
-//!   configured peer, the Layer-1 kind-30640 registration filter plus the
-//!   30641/stream-wrap filters derived from the registrations this node
-//!   holds, so connect-time sync, quick reconnects and consolidations all
-//!   carry them; for any other relay, nothing;
+//!   configured peer, the Layer-1 kind-30640 registration filter, the
+//!   filter for offboard requests (kind 5 with `#k` 30640), and the
+//!   30641/stream-wrap and vanish filters derived from the registrations
+//!   this node holds, so connect-time sync, quick reconnects and
+//!   consolidations all carry them; for any other relay, nothing;
 //! - two timers ([`spawn_timers`]): the registration index rebuild (which also
 //!   reprocesses held out-of-order events, retries cadence-held 30640
 //!   replacements, expires holds and connects the operator's peers) and the
@@ -196,6 +197,55 @@ fn tag_values<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a S
     })
 }
 
+/// GRASP-P offboard requests: every kind 5 that deletes a registration.
+///
+/// On a GRASP-P node only the account key deletes, and only through its
+/// registration, with a request that must carry `["k", "30640"]`
+/// (`grasp_p::offboard`), so this one tag selects every kind 5 that can
+/// delete anything private. It is not scoped by author: a node takes a
+/// request even before it holds the registration, and then refuses that
+/// registration when it arrives. Like the registration filter it does not
+/// depend on the index, and like every GRASP-P filter it goes to configured
+/// peers only.
+fn build_private_offboard_filter(since: Option<Timestamp>) -> Filter {
+    let filter = Filter::new().kind(Kind::EventDeletion).custom_tag(
+        SingleLetterTag::LOWERCASE_K,
+        crate::grasp_p::KIND_REGISTRATION.to_string(),
+    );
+    match since {
+        Some(ts) => filter.since(ts),
+        None => filter,
+    }
+}
+
+/// GRASP-P account closures: the NIP-62 vanish requests of the accounts
+/// that hold registrations here, 100 authors per filter.
+///
+/// # Arguments
+/// * `tenants` - account keys (lowercase hex) from accepted registrations;
+///   values that do not parse are skipped
+/// * `since` - Optional timestamp for incremental sync
+fn build_private_vanish_filters(tenants: &[String], since: Option<Timestamp>) -> Vec<Filter> {
+    let mut authors: Vec<PublicKey> = tenants
+        .iter()
+        .filter_map(|tenant| PublicKey::from_hex(tenant).ok())
+        .collect();
+    authors.sort();
+    authors.dedup();
+    authors
+        .chunks(100)
+        .map(|chunk| {
+            let filter = Filter::new()
+                .kind(Kind::RequestToVanish)
+                .authors(chunk.iter().copied());
+            match since {
+                Some(ts) => filter.since(ts),
+                None => filter,
+            }
+        })
+        .collect()
+}
+
 /// Spawn the GRASP-P sync timers. Does nothing when GRASP-P is disabled.
 pub(super) async fn spawn_timers(
     sync_manager: &Arc<Mutex<SyncManager>>,
@@ -302,14 +352,30 @@ impl SyncManager {
         self.grasp_p_filter_set()
     }
 
-    /// The Layer-1 kind-30640 filter and the filters derived from the
-    /// current index, whoever they are for.
+    /// The Layer-1 kind-30640 filter, the offboard-request filter, and the
+    /// filters derived from the current index, whoever they are for.
     fn grasp_p_filter_set(&self) -> Vec<Filter> {
-        let mut filters = vec![filters::build_private_registration_filter(None)];
-        filters.extend(filters::build_private_derived_filters(
+        let mut filters = vec![
+            filters::build_private_registration_filter(None),
+            build_private_offboard_filter(None),
+        ];
+        filters.extend(self.grasp_p_index_filters());
+        filters
+    }
+
+    /// The filters that change with the index: state roots by alias, stream
+    /// wraps by key, and the vanish requests of the accounts. An index
+    /// change re-issues these alone; the two that never change ride every
+    /// connect and the periodic full re-issue.
+    fn grasp_p_index_filters(&self) -> Vec<Filter> {
+        let mut filters = filters::build_private_derived_filters(
             &self.grasp_p.index.derived_inputs(),
             None,
             self.config.private_accept_legacy_wrap_kind,
+        );
+        filters.extend(build_private_vanish_filters(
+            &self.grasp_p.index.tenants(),
+            None,
         ));
         filters
     }
@@ -451,6 +517,7 @@ impl SyncManager {
             entries.insert(
                 alias,
                 private_index::PrivateRepoEntry {
+                    tenant_hex: event.pubkey.to_hex(),
                     keys,
                     relay_urls,
                     server_urls,
@@ -586,11 +653,7 @@ impl SyncManager {
         if !(diff.changed || self.grasp_p.reissue_pending) {
             return;
         }
-        let derived = filters::build_private_derived_filters(
-            &self.grasp_p.index.derived_inputs(),
-            None,
-            self.config.private_accept_legacy_wrap_kind,
-        );
+        let derived = self.grasp_p_index_filters();
         if derived.is_empty() {
             // No aliases means nothing to re-issue; a peer that connects
             // later gets the current (empty) derived set at connect time.
@@ -1548,6 +1611,157 @@ mod tests {
             assert!(
                 !asks_for_grasp_p(&coverage),
                 "{not_a_peer} must not be asked for GRASP-P events: {coverage:?}"
+            );
+        }
+        manager.shutdown().await;
+    }
+
+    /// The pair sees the same deletion: the offboard filter selects every
+    /// kind 5 that deletes a registration and nothing else, and the vanish
+    /// filters select the vanishes of the accounts listed, each once, at
+    /// most 100 to a filter.
+    #[test]
+    fn private_deletion_filters_ask_for_offboard_requests_and_account_vanishes() {
+        let opts = MatchEventOptions::new();
+        let account = Keys::generate();
+        let stranger = Keys::generate();
+        let request = |kind: Kind, tags: Vec<Tag>, keys: &Keys| {
+            EventBuilder::new(kind, "")
+                .tags(tags)
+                .finalize(keys)
+                .expect("sign")
+        };
+        let coordinate = Tag::custom(
+            "a",
+            vec![format!(
+                "30640:{}:{}",
+                account.public_key().to_hex(),
+                "a".repeat(32)
+            )],
+        );
+        let k = |kind: &str| Tag::custom("k", vec![kind.to_string()]);
+
+        let offboard = build_private_offboard_filter(None);
+        assert_eq!(offboard.since, None);
+        let with_k = request(
+            Kind::EventDeletion,
+            vec![coordinate.clone(), k("30640")],
+            &account,
+        );
+        assert!(offboard.match_event(&with_k, opts));
+        for (what, event) in [
+            (
+                "no k tag",
+                request(Kind::EventDeletion, vec![coordinate.clone()], &account),
+            ),
+            (
+                "another k",
+                request(Kind::EventDeletion, vec![k("1")], &stranger),
+            ),
+            (
+                "a vanish",
+                request(Kind::RequestToVanish, vec![k("30640")], &account),
+            ),
+        ] {
+            assert!(!offboard.match_event(&event, opts), "{what}");
+        }
+        let since = Timestamp::from_secs(1_000);
+        assert_eq!(
+            build_private_offboard_filter(Some(since)).since,
+            Some(since)
+        );
+
+        assert!(build_private_vanish_filters(&[], None).is_empty());
+        let mut tenants: Vec<String> = (0..250)
+            .map(|_| Keys::generate().public_key().to_hex())
+            .collect();
+        tenants.push(tenants[0].clone());
+        tenants.push("not a key".to_string());
+        tenants.push(account.public_key().to_hex());
+        let vanish = build_private_vanish_filters(&tenants, None);
+        assert_eq!(vanish.len(), 3);
+        let mut listed = HashSet::new();
+        for filter in &vanish {
+            assert_eq!(
+                filter
+                    .kinds
+                    .as_ref()
+                    .expect("kinds")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![&Kind::RequestToVanish]
+            );
+            let authors = filter.authors.as_ref().expect("authors");
+            assert!(authors.len() <= 100);
+            for author in authors {
+                assert!(listed.insert(*author), "{author} listed twice");
+            }
+        }
+        assert_eq!(listed.len(), 251);
+        let by_account = request(Kind::RequestToVanish, vec![], &account);
+        let by_stranger = request(Kind::RequestToVanish, vec![], &stranger);
+        assert!(vanish.iter().any(|f| f.match_event(&by_account, opts)));
+        assert!(!vanish.iter().any(|f| f.match_event(&by_stranger, opts)));
+        assert!(!vanish.iter().any(|f| f.match_event(&with_k, opts)));
+        assert!(build_private_vanish_filters(&tenants, Some(since))
+            .iter()
+            .all(|f| f.since == Some(since)));
+    }
+
+    /// The deletion filters ride a peer's set and no other relay's: the
+    /// offboard-request filter always, and the vanish filter of every
+    /// account the index holds, which the index-change set
+    /// (`grasp_p_index_filters`) carries too. A relay that is not a peer is
+    /// asked for neither, so a deletion reaches the other node of the pair
+    /// and goes nowhere else.
+    #[tokio::test]
+    async fn deletion_filters_go_only_to_configured_peers() {
+        let (mut manager, _directory) = peer_test_manager(Some(OTHER_PEER), |config| {
+            config.private_sync_peer_urls = Some(PEER.to_string());
+        })
+        .await;
+        let tenant = Keys::generate().public_key().to_hex();
+        let writer = Keys::generate().public_key().to_hex();
+        manager.grasp_p.index.replace_all(HashMap::from([(
+            "a".repeat(32),
+            private_index::PrivateRepoEntry {
+                tenant_hex: tenant.clone(),
+                keys: vec![writer],
+                ..Default::default()
+            },
+        )]));
+        let offboard = build_private_offboard_filter(None);
+        let vanish = build_private_vanish_filters(&[tenant], None);
+        assert_eq!(vanish.len(), 1);
+
+        let for_peer = manager.grasp_p_filters_for(PEER);
+        assert!(for_peer.contains(&offboard) && for_peer.contains(&vanish[0]));
+        let on_index_change = manager.grasp_p_index_filters();
+        assert!(on_index_change.contains(&vanish[0]));
+        for not_a_peer in [OTHER_PEER, STRANGER] {
+            assert!(
+                manager.grasp_p_filters_for(not_a_peer).is_empty(),
+                "{not_a_peer}"
+            );
+        }
+
+        // The whole live coverage of a connection, through upstream's
+        // builder.
+        assert!(manager.register_relay(key(PEER), false, false).await);
+        assert!(manager.register_relay(key(OTHER_PEER), true, false).await);
+        assert!(manager.register_relay(key(STRANGER), false, false).await);
+        let coverage = manager.complete_live_filters(&key(PEER), None).await;
+        assert!(coverage.contains(&offboard) && coverage.contains(&vanish[0]));
+        for not_a_peer in [OTHER_PEER, STRANGER] {
+            let coverage = manager.complete_live_filters(&key(not_a_peer), None).await;
+            assert!(
+                !coverage
+                    .iter()
+                    .any(|filter| filter.kinds.as_ref().is_some_and(|kinds| {
+                        kinds.contains(&Kind::EventDeletion)
+                            || kinds.contains(&Kind::RequestToVanish)
+                    })),
+                "{not_a_peer} must not be asked for deletion requests: {coverage:?}"
             );
         }
         manager.shutdown().await;

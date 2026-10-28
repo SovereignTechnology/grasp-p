@@ -350,6 +350,14 @@ impl DeletionPolicy {
         let mut outcome = DeletionOutcome::default();
         let mut deleted_announcement_repo_scopes = HashSet::new();
         for event in matches {
+            // GRASP-P seam: a state root or a stream wrap goes only with its
+            // repository's registration (decision D6), however a deletion
+            // request or a vanish got past admission.
+            if self.ctx.config.private_repos_enable
+                && crate::grasp_p::offboard::removal_exempt(event.kind.as_u16())
+            {
+                continue;
+            }
             let mut event_metadata = metadata.clone();
 
             if matches!(

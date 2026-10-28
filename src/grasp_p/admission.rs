@@ -1,8 +1,12 @@
 //! GRASP-P admission arms for `Nip34WritePolicy::admit_event`.
 //!
 //! The write policy calls [`admit`] only when the private-repo service is
-//! installed (`NGIT_GRASP_P_REPOS_ENABLE=true`), after its blacklist and
-//! deletion gates. Which stream-wrap kinds route here is decided in one place
+//! installed (`NGIT_GRASP_P_REPOS_ENABLE=true`), after its blacklist and,
+//! for every kind but state roots and stream wraps, upstream's deletion gate
+//! (see [`super::offboard`]). Deletion requests and vanishes are judged here
+//! first (`offboard::guard`) and, when they pass, left to upstream.
+//!
+//! Which stream-wrap kinds route here is decided in one place
 //! (`PrivateService::accepts_*_stream_wrap_kind`), so the dual-accept window
 //! (3359 + legacy 1059) can never diverge from the sync filters or the NIP-11
 //! advert; its complement (`rejects_retired_wrap_kind`) refuses the legacy
@@ -10,7 +14,7 @@
 //! weaker public related-event path.
 
 use nostr_sdk::local_relay::WritePolicyResult;
-use nostr_sdk::prelude::Event;
+use nostr_sdk::prelude::{Event, Kind, MachineReadablePrefix};
 
 use super::registration::REPLACE_CADENCE_REJECT_MESSAGE;
 use super::PrivateService;
@@ -147,6 +151,29 @@ pub async fn admit(
     event: &Event,
     is_synced: bool,
 ) -> Option<WritePolicyResult> {
+    // Who may delete what (decision D6). Kinds 5 and 62 are not GRASP-P's
+    // own, so a request the guard lets through goes on to upstream.
+    if event.kind == Kind::EventDeletion || event.kind == Kind::RequestToVanish {
+        let refusal = super::offboard::guard(service, event).await;
+        // A request the peer took and this node refuses is offered again on
+        // every sync. Keep its id, as for a refused GRASP-P kind, so the
+        // batch that asked for it completes. A store fault may clear, and
+        // the target cap is upstream's own answer, so neither is kept.
+        if is_synced {
+            if let Some(WritePolicyResult::Reject {
+                prefix, message, ..
+            }) = &refusal
+            {
+                if !matches!(prefix, MachineReadablePrefix::Error)
+                    && *message != super::offboard::TOO_MANY_TARGETS_MESSAGE
+                {
+                    service.sync_rejected().add_id_only(event.id);
+                }
+            }
+        }
+        return refusal;
+    }
+
     let kind = event.kind.as_u16();
     let stored_wrap = service.accepts_stream_wrap_kind(kind);
     let ephemeral_wrap = service.accepts_ephemeral_stream_wrap_kind(kind);

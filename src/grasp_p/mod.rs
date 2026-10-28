@@ -23,6 +23,7 @@ pub mod host;
 pub mod meta;
 pub mod metrics_endpoint;
 pub mod mirror;
+pub mod offboard;
 pub mod quota;
 pub mod rate;
 pub mod registration;
@@ -782,7 +783,8 @@ impl PrivateService {
     /// Phase 2: the out-of-order rejected-event hold (30641 by alias, 1059
     /// by outer author). Used by the sync layer's pre-filter and
     /// 30640-Accept reprocess hook. Rejections enter it through
-    /// [`Self::note_rejected`] only.
+    /// [`Self::note_rejected`], and the ids of refused synced deletion
+    /// requests and vanishes through `admission::admit`.
     pub fn sync_rejected(&self) -> &crate::sync::private_index::PrivateRejectedIndex {
         &self.sync_rejected
     }
