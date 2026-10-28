@@ -144,12 +144,19 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
 - **Quotas**: per tenant, per repo and global byte budgets. A state root is charged for the
   blobs it declares even before they are uploaded.
 - **Rate limits**: per write key, and on how often a registration may be replaced.
-- **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports. An
-  account on the operator's event blacklist is frozen: no state root, stream wrap, upload or
-  blob delete is accepted under its registrations, whichever of its keys signs it, and no
-  registration by one of those keys, from clients or from the peer, while everything it
-  stored stays readable. Events of other kinds that tag its registration still pass
-  upstream's related-event rule until the private-only switch.
+- **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports that
+  point at a private repository: they are logged and counted for the operator, and refused,
+  so a blob key or an accusation in one is never published beside the repository. A
+  reporter sends the blob key to the operator by mail. An account on the operator's event
+  blacklist is frozen: no state root, stream wrap, upload or blob delete is accepted under
+  its registrations, whichever of its keys signs it, and no registration by one of those
+  keys, from clients or from the peer, while everything it stored stays readable.
+- **Nothing attaches**: the node serves public repositories in the same process, under
+  upstream's rules. An event of any other kind (deletion requests and vanishes aside, which
+  the deletion rules judge) that tags a registration, a state root or a wrap, by its
+  coordinate or by the id of one the node holds, is refused, whoever signs it; the private
+  events themselves carry no such tags. Upstream would otherwise have
+  stored it, and served it beside the repository, on the private event as its anchor.
 - **Garbage collection**: blobs no state root references are removed after a grace period.
 
 It advertises all of this in its NIP-11 document under `private_repos`, including a
@@ -196,6 +203,9 @@ Design limits, which stay:
 - Metadata is visible: sizes, timing, key sets, rotation history.
 - Revocation is forward-only.
 - The operator can refuse service or withhold data. It cannot forge or read.
+- A public event that names a state root or a wrap by an id the node does not hold yet, one
+  still on its way from the peer, is stored beside a public anchor and stays; a reference by
+  coordinate is always refused (deletion requests aside).
 
 Gaps being closed before production (tracked as issues on the two projects):
 

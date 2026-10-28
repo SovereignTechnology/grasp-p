@@ -1090,15 +1090,28 @@ must re-upload (§4 step 7).
 **Alert:** `NgitPrivateReportEvents` —
 `increase(ngit_private_report_events_total[1h]) > 0` (no `for`).
 
-What it means: kind-1984 (NIP-56 report) events are arriving
-(metric: src/metrics/mod.rs:394–409). The intake logs the event id,
-reporter, and up to 16 sha256-looking tag values — never the content — and
-v1 takes NO automatic action, so the alert IS the page to work §4.
+What it means: kind-1984 (NIP-56 report) events that point at
+private-repository content are arriving (`ngit_private_report_events_total`,
+`record_private_report_event` in src/metrics/mod.rs). Such a report names a
+registration, a state root or a wrap by coordinate or id, a blob this node
+holds or has on its denylist, a hash beside a `server` tag naming either node
+of the pair (this node, or a peer listed in `NGIT_GRASP_P_SYNC_PEER_URLS` or
+`NGIT_GRASP_P_MIRROR_PEER_URLS`), or a write or aux key in `p`
+(src/grasp_p/reports.rs). It is refused, never stored or served, so a key or
+an accusation in it is not published beside the customer's repository; the
+reporter is told `reports about private repositories are not stored on this
+service`. The intake logs the event id, reporter, and up to 16 sha256-looking
+tag values, the `x` values first and in lower case — never the content — once
+per report, however often sync fetches it again, and v1 takes NO automatic
+action, so the alert IS the page to work §4. Reports on public content are
+upstream's, stored or refused as on any node, and are neither logged nor
+counted here.
 
 Remediate: `journalctl -u ngit-grasp | grep 'NIP-56 report event received'`
-for the intake lines, then work the §4 takedown workflow from step 2
-(decrypt-to-confirm). A report without the blob key is not actionable (§4
-ToS posture).
+for the intake lines, then work the §4 takedown workflow: the hashes in the
+line are the evidence, and the blob key comes from the reporter by direct
+mail (§4 step 1). A report without the blob key is not actionable (§4 ToS
+posture).
 
 ### Sync peer disconnected
 
@@ -1223,17 +1236,28 @@ and the server verifies only outer signatures
 impossible** — the operator cannot see content. A hash-addressed takedown
 IS honored, and the ToS must say so: actionable reports MUST include the
 blob key (and its sha256), or the operator cannot verify and cannot act
-(plan T7, docs/grasp-p/plan-v2-fix-log.md:308–311).
+(plan T7, docs/grasp-p/plan-v2-fix-log.md:308–311). The ToS and the report
+page must also say HOW: the blob's sha256 in an `x` tag of the report (or in
+the mail), and the blob key **only by direct mail to the operator, never in
+an event** — a Nostr event is public, and anything in one can be copied to
+other relays whatever this node does with it.
 
 Procedure — verify-then-denylist:
 
 1. **Accept evidence.** A report must carry (a) the blob sha256
-   (hash-addressed) and (b) the blob key. Sources: direct operator mail, or
-   kind-1984 NIP-56 reports. The 1984 intake logs the event id, the
-   reporter, and up to 16 sha256-looking tag values; the event CONTENT is
-   never logged (src/nostr/builder.rs:914–941). Metric:
-   `ngit_private_report_events_total`. v1 takes NO automatic action — a
-   rising count is a page to work this runbook.
+   (hash-addressed) and (b) the blob key. The key arrives by direct operator
+   mail only. The sha256 arrives in that mail, or in a kind-1984 NIP-56
+   report with the hash in an `x` tag (beside a `server` tag naming the
+   node, when the node does not hold the blob yet). A report that points at
+   private-repository content is refused and never stored (D10), so it
+   publishes nothing; the 1984 intake logs its event id, the reporter, and
+   up to 16 sha256-looking tag values (the `x` values first, in lower case),
+   and the event CONTENT is never logged
+   (`log_report` in src/grasp_p/admission.rs, called from
+   src/grasp_p/reports.rs). Metric: `ngit_private_report_events_total`,
+   which counts those reports only. v1 takes NO automatic action — a rising
+   count is a page to work this runbook. Reports on public content are
+   upstream's and do not reach this intake.
 2. **Operator decrypts to CONFIRM.** Fetch the blob (`GET /<sha256>` —
    public by design), decrypt with the supplied key, verify the sha256 of
    the plaintext. **This step creates actual knowledge of the content — and
@@ -1327,6 +1351,11 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | `restricted: a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | kind 62 from a key with stored 30641s or wraps | genuine | offboard each repository by kind 5 |
 | `blocked: Account <npub> is blacklisted` | 30641 or stream wrap (stored or ephemeral) made under a registration whose account is on `NGIT_EVENT_BLACKLIST` (`grasp_p::blacklist`), from a client or from sync | operator block | none — the account is frozen; reads still work (§2, "The event blacklist"); deliberately does NOT contain `unregistered` |
 | `blocked: Event author <npub> is blacklisted` | any event signed by a key on `NGIT_EVENT_BLACKLIST` (upstream's check; the account's own registrations and deletions included) | operator block | none |
+| `invalid: registrations and stream wraps carry no e, E, q, a or A tag` / `invalid: a state root carries one a tag and no e, E, q or A tag` | a 30640 or a stream wrap (any kind) with a reference tag; a 30641 with one beside its own `a`, or a second `a` (`attachment::reference_tag_refusal`) | genuine, final | none: cord-git sends no such tag; decided before the key lookup, so never held |
+| `invalid: private repository events cannot carry the t tag grasp-audit-test-event` | any GRASP-P event with upstream's audit hashtag, which upstream's audit cleanup would delete past every hook | genuine, final | none |
+| `restricted: events that reference private repositories are not stored on this service` | an event of any other kind but 5, 62 and 1984 with a coordinate of a GRASP-P kind, or the id of a stored GRASP-P event, in an `a`, `A`, `q`, `e` or `E` tag, whoever signs it (`attachment::judge`) | genuine | none: drop the reference; deliberately names no target and does NOT contain `unregistered` |
+| `restricted: reports about private repositories are not stored on this service` | a kind 1984 that points at private-repository content (§3 Report events) | genuine | send the blob key by mail to the operator (§4 step 1) |
+| `invalid: event carries too many references to check` | more than 2048 distinct `e`/`E`/`q` ids, or a report with more than 2048 distinct 64-hex values or, beside an `x` tag, `server` values | genuine | split the event |
 | HTTP 403 + `X-Reason: Account <npub> is blacklisted` (or `Event author <npub> is blacklisted`) | `HEAD /upload`, `PUT /upload`, `DELETE /<sha256>` under a registration of a listed account, or signed by a listed key | operator block | none — `GET`/`HEAD /<sha256>` and `GET /list` still answer |
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
 | HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/grasp_p/mod.rs:175, 189) | takedown | none — operator action only |
@@ -1627,7 +1656,7 @@ journalctl -u ngit-grasp | grep 'private registration conflict'          # confl
 journalctl -u ngit-grasp | grep -E 'denylist purge-on-add|GC purged denylisted|GC removed'   # purge lines (§4)
 journalctl -u ngit-grasp | grep 'boot reconcile'                         # 'applied N registration(s)'; warns 'stored 30640 no longer passes registration checks'
 journalctl -u ngit-grasp | grep 'private mirror'                         # warn 'blob fetch failed on all peers' carries the full reason; at most one per blob and reason per 10 min
-journalctl -u ngit-grasp | grep 'NIP-56 report event received'           # report intake: event_id, reporter, sha256_tags (§4)
+journalctl -u ngit-grasp | grep 'NIP-56 report event received'           # report intake, private-pointing reports only (refused): event_id, reporter, sha256_tags (§4)
 ```
 
 ---

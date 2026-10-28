@@ -40,6 +40,10 @@ MUST refuse every kind `5` and every vanish signed by a `w` or `aux` key of a re
 
 When an accepted deletion or vanish removes a registration, MUST free its claims, honouring the request's `created_at` as a cutoff so a replayed stale deletion cannot free a newer edition. Two services that replicate each other MUST exchange the deletions of repositories they accepted and the vanishes of the accounts they host.
 
+## Events of Other Kinds
+
+A service may store events of other kinds beside these, as one that also hosts public repositories does. It MUST NOT let an event of the kinds in this document serve as a reference that admits an event of another kind, in either direction: neither an `a`, `A` or `q` coordinate of these kinds, read as a number, nor the id of a stored event of these kinds, nor a tag that such an event carries, makes another event admissible. Deletion requests and vanishes are governed by Deletion above, not by this section. Otherwise anyone could store plaintext, an accusation or a blob key among it, against a private repository, served to whoever asks for what tags it. The reference implementation refuses such an event, and refuses an event of these kinds that carries an `e`, `E`, `q`, `a` or `A` tag beyond a kind `30641`'s own `a` tag.
+
 ## Blob Store
 
 MUST serve the [Blossom](https://github.com/hzrd149/blossom) subset BUD-01 (`GET /<sha256>`, `HEAD /<sha256>`), BUD-02 (`PUT /upload`) and BUD-06 (`HEAD /upload`). `DELETE /<sha256>` and `GET /list/<pubkey>` are BUD-12, which marks `/list` unrecommended. Authorization is BUD-11's kind `24242` event, carried as `Authorization: Nostr <token>` where `<token>` is the event JSON encoded base64url without padding, as BUD-11 requires; a service SHOULD also accept standard base64 and padded forms.

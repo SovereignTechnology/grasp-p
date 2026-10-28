@@ -601,9 +601,33 @@ lookup of its own).
   `no-cache` (§2.4) so that a takedown reaches HTTP caches as well.
 - **Authorization window and `server` tag** (§2.4): fixed in the code, the same on every node, and
   not in the fingerprint, because authorization events are never replicated.
-- **kind-1984 (NIP-56) intake**: observe-then-defer. Event id, reporter, and sha256-looking tag
-  values are logged (never the content) and metered; admission then runs the existing related-event
-  rules unchanged. No automatic action in v1.
+- **Nothing attaches to private-repository events [N]**: the node also serves public repositories
+  (one process, one hostname), so an event of any other kind (kinds 5 and 62 aside, §2.1) is refused
+  `restricted: events that reference private repositories are not stored on this service` when an
+  `a`, `A` or `q` coordinate has the kind 30640, 30641, 3359, 23359, 1059 or 21059 (read as a
+  number, from the event alone) or an `e`, `E` or `q` id is such an event stored on the node; a 10317
+  and the relay owner's events included. An id the node does not hold yet, such as a wrap still on
+  its way from the peer, cannot be recognised, and an event that names one beside a public anchor is
+  stored. The kinds of §2 carry no reference tags of their own: a 30640 or a stream wrap with an
+  `e`, `E`, `q`, `a` or `A` tag, a 30641 with any of these beside its one `a`, and any of them with
+  `["t", "grasp-audit-test-event"]` are refused `invalid:`. More than 2048 distinct `e`/`E`/`q`
+  ids, or a report with more than 2048 distinct 64-hex values or, beside an `x` tag, more than
+  2048 distinct `server` values, is refused `invalid:` whole; repeats and values that do not
+  parse are not counted.
+- **kind-1984 (NIP-56) intake**: a report that points at private-repository content is refused
+  each time it arrives, never stored or served, and logged (event id, reporter, up to 16
+  sha256-looking tag values, the `x` values first, never the content) and metered once for the
+  report rather than for each delivery. It points there when it references a private event as
+  above, when a 64-hex value is a blob the node holds a claim for or has on its denylist, when an
+  `x` tag sits beside a `server` tag naming either node of the pair or a blob URL on it (this node,
+  or a peer the operator lists in `NGIT_GRASP_P_SYNC_PEER_URLS` or `NGIT_GRASP_P_MIRROR_PEER_URLS`,
+  by its `NGIT_DOMAIN`), or when a `p` or `P` tag names a registered write or aux key (an account
+  key does not count, even one its registration also lists as a write or aux key). The reporter is
+  told `restricted: reports about private repositories are not stored on this service`, with no
+  target named. Any other report is the public relay's, neither logged nor counted. **[I]** A
+  reporter puts the blob's sha256 in an `x` tag and sends the blob key **only by direct mail to the
+  operator, never in an event**: an event is public and can be copied to other relays whatever one
+  node does with it. No automatic action in v1.
 - **`ngit-private-watchdog` [I]**: a separate binary that anonymously probes TWO nodes and alerts
   on split-view divergence (NIP-11 fingerprint, registrations, state roots, blob existence).
   Holds no keys, signs nothing, publishes nothing, and so cannot read `/list`. Exit 0 = parity, 1 = divergence, 2 =
@@ -638,6 +662,12 @@ lookup of its own).
 | kind 62 from a key with stored 30641s or stream wraps | `a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | genuine |
 | 30641 or stream wrap under a registration of an account on `NGIT_EVENT_BLACKLIST`, or a 30640 signed by a key such a registration lists | `Account <npub> is blacklisted` (`blocked:`; blob routes `403` with the same `X-Reason`) | genuine, **not** widenable |
 | any event signed by a key on `NGIT_EVENT_BLACKLIST` (upstream's check) | `Event author <npub> is blacklisted` (`blocked:`; the same text on a blob route `403`) | genuine |
+| 30640 or stream wrap with an `e`/`E`/`q`/`a`/`A` tag | `registrations and stream wraps carry no e, E, q, a or A tag` (`invalid:`) | genuine, **not** widenable |
+| 30641 with an `e`/`E`/`q`/`A` tag or a second `a` tag | `a state root carries one a tag and no e, E, q or A tag` (`invalid:`) | genuine |
+| any private kind with `["t", "grasp-audit-test-event"]` | `private repository events cannot carry the t tag grasp-audit-test-event` (`invalid:`) | genuine |
+| any other kind but 5, 62 and 1984 that references a private event | `events that reference private repositories are not stored on this service` | genuine |
+| kind 1984 that points at private-repository content | `reports about private repositories are not stored on this service` | genuine |
+| more than 2048 distinct `e`/`E`/`q` ids, or a 1984 with more than 2048 distinct 64-hex values or, beside an `x`, `server` values | `event carries too many references to check` (`invalid:`) | genuine |
 
 **[N]** The cord-git client treats any message containing the substring `unregistered` as its
 widenable case. The two transient identity-race strings are therefore deliberately worded to avoid
@@ -719,6 +749,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.4, §5.1 — upload answers listed; running out of upload slots answers `429` (per account) or `503` (node) with `Retry-After`, no longer `507`; an upload body that stalls or runs out of time is cut with `408`; the mirror takes no upload slot.
 - §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
 - §5.1, §5.2 — `policy_fingerprint` **v4**: the domains are the own address and the configured sync peers (no longer the bootstrap relay), the event blacklist joins as sorted hex keys, `NGIT_DELETION_REQUEST_DISRESPECTOR` joins, and the label also marks settled seats and who may delete; an account on the event blacklist is frozen (its write and aux keys' 30641s, wraps, 30640s and blob writes refused, from clients and sync, and its seats never displaced), its reads stay; new refusal strings, none containing `unregistered`.
+- §5.1, §5.2 — on a node that also serves public repositories, nothing of another kind may reference a 30640, 30641 or stream wrap (by coordinate, or by the id of a stored one), 10317s and the relay owner's events included; the kinds of §2 carry no reference tags beyond a 30641's own `a`, and never the audit hashtag; a kind 1984 that points at private-repository content is refused, logged and counted, and the blob key goes by direct mail only; new refusal strings, none containing `unregistered`.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.
 - §4.1 (new) — pending-epoch lifecycle; templates at `created_at = live+1`; no idle rekey-address admission; rival-resume guard; mint-time fork prevention; squat-tolerant widen; tenant-signed `scopes` + epoch-atomic fold.

@@ -6,7 +6,8 @@ infrastructure detail is deliberately left out; it lives with the maintainer.
 ## Context
 
 Upstream's GRASP-08 private mode is an access gate: the host still reads plaintext. GRASP-P with
-its client (`cord-git`) is the system built in July 2026 where the server holds ciphertext only.
+its client (`cord-git`) is the system built in July 2026 where the server holds only ciphertext of
+a private repository.
 The goal is to make it production ready as the paid private tier of **sovdev.pro**, for external
 paying customers.
 
@@ -220,7 +221,20 @@ project yet.
   each time, `open` mode refuses nobody before the proofs, and in `pow` mode one mined
   event with a bad proof can be re-sent.
 - **Events of other kinds can attach to GRASP-P events** through upstream's related-event
-  rule: uncharged plaintext stored on a ciphertext node.
+  rule: uncharged plaintext stored beside a private repository, and served for it. **Done**
+  (decisions of 2026-10-28, below): an event of any kind GRASP-P does not own, kinds 5 and
+  62 aside, is refused when it tags a registration, a state root or a wrap by a coordinate
+  of their kinds (judged from the event alone) or by the id of one stored here, whoever
+  signs it, so a 10317 and the relay owner's events too; a report (kind 1984) is refused,
+  logged and counted when it points at private content in any of the ways D10 needs (the
+  node's blobs and denylist, an `x` beside either node's name, a write or aux key in `p`),
+  and every other report is upstream's again, neither logged nor counted; registrations,
+  state roots and wraps carry no reference tags beyond the state root's own `a`, nor the
+  audit hashtag that upstream's cleanup deletes by. No seam in upstream's related-event
+  rule: no GRASP-P event can reach it or vouch through it. See "Nothing attaches to
+  private-repository events" in [`SEAMS.md`](SEAMS.md). Still open: an event naming a
+  private event by an id this node does not hold yet is stored (accepted, D15-5); what was
+  stored before stays.
 - **Blob responses** (done). Every response of the blob routes says
   `X-Content-Type-Options: nosniff`, and a served blob also carries a
   `Content-Security-Policy` that makes it inert in a browser. A blob is served
@@ -323,7 +337,9 @@ No private repo is live anywhere, so v0.2 breaks compatibility freely. Decisions
   records, invites and promotions are signed by the owner through their signer, inside encrypted
   content the server never sees. Members verify against the key committed in `community_id`.
   - The **hosting key** shrinks to a server-facing registration key: it signs kind 30640 only.
-    The server is unchanged; it still sees only the hosting key.
+    The server is unchanged; it still sees only the hosting key. The hosting (account) key must
+    never be the user's public npub: the node also serves public repositories, and one REQ for
+    kind 30640 by that author would answer whether someone is a customer of the private tier.
   - **One hosting key per customer, not per repository** (the maintainer, 2026-10-05; needed for
     per-account storage, M9). It is the customer's account on the node, and the key list holds
     it once. Design it in here, before the v0.2 wire format settles.
@@ -407,7 +423,9 @@ the maintainer, 2026-10-05: full management from the browser, with every login m
   `sovtech/git`. Overlay only, enabled only in the sovdev brand profile.
 - Signer bridge: the UI's `ISigner` (applesauce-signers) to the `Signer` trait. Any login whose
   signer does NIP-44 works; one that does not gets a clear message. Today's UI has extension,
-  bunker (NostrConnect), Amber and private-key accounts.
+  bunker (NostrConnect), Amber and private-key accounts. The login key signs the owner's records,
+  never a registration: the account key is a key of its own, never the user's public npub (M4),
+  since a REQ for kind 30640 by that npub on the shared node would show the user as a customer.
 - Features: my private repos (from the key list); browse code, commits, branches, tags (manifest
   and packs fetched, verified and decrypted in a Web Worker, fed to the UI's existing git reader);
   issues and patches, read and write; create repo; invite (to the invitee's inbox relays) and
@@ -427,9 +445,16 @@ the maintainer, 2026-10-05: full management from the browser, with every login m
   "no nsec login and no key generation" rule for that build.
 
 ### M8 - Deployment (maintainer; at launch only)
-Nothing is deployed until M2 to M7 are done. The storage node runs on a third-party host, which
-is acceptable because it only ever holds ciphertext. A second node provides replication and the
-watchdog pair.
+Nothing is deployed until M2 to M7 are done. The private tier runs in the public git service's own
+process and under its hostname (decided 2026-10-05): the public git service runs this fork's
+binary with GRASP-P enabled, on a third-party host. That host holds the public repositories in the
+clear, as it does today, and only ciphertext of the private ones. A second node provides
+replication and the watchdog pair. Each node lists the other by its public `NGIT_DOMAIN`: in
+`NGIT_GRASP_P_SYNC_PEER_URLS` over `wss://`, and in `NGIT_GRASP_P_MIRROR_PEER_URLS` over
+`https://`. On a private link it may use `ws://` and `http://` with
+`NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`, but only when that address is the peer's
+`NGIT_DOMAIN`, the name the fingerprint's domain set holds; a sync peer listed by another address
+never matches. The same two lists name the pair when a report's `server` tag is judged.
 
 ### M9 - Paid tier and launch
 - A payment webhook drives the tenant allowlist and per-plan quotas; NIP-11 `fees`.
@@ -502,7 +527,7 @@ so it needs the maintainer's go-ahead at the time.
   revoke the second account and confirm it can no longer read new content. Nothing key-like in
   `localStorage`/IndexedDB after the session.
 - M8: verified at deployment time by the maintainer (replication between two nodes, the
-  watchdog parity checks, no plaintext on the data volume, a reboot).
+  watchdog parity checks, no plaintext of a private repository on the data volume, a reboot).
 - M9: a key that is not on the allowlist cannot register. Two repositories under one account
   share one allowance: the push that crosses it is refused, and raising the account's limit
   through the hook lets it through with no restart, on both nodes. A lapsed account can read
@@ -570,7 +595,9 @@ when the question was put.
   then refused: they are neither stored nor served. The runbook asks reporters to include the
   blob key, so a stored report would publish that key beside a public blob, and an accusation
   against a customer's repository with it. The log line and the counter stay the operator's
-  intake.
+  intake. On a node that also serves public repositories (D1) this covers only the reports that
+  point at private content; the others are the public service's, under upstream's rules, and
+  are neither logged nor counted (decided 2026-10-28, below; done in M3).
 - A denylist file that was loaded and then disappears keeps its takedowns: the node keeps its
   last-known entries and logs an error, and a takedown is lifted only by a readable file that no
   longer lists the hash. A file missing at boot is still tolerated.
@@ -581,3 +608,42 @@ when the question was put.
   checked. Each offer still needs the maintainer's go-ahead at the time. The unverified-sync
   report and the NIP-11 and NAT64 items went upstream on 2026-10-27; the `/metrics` and
   related-event items follow later.
+
+## Decisions taken for M3 merge request 15 (2026-10-28)
+
+Do not reopen these without the maintainer either. The node that hosts private repositories
+also serves public ones, in the same process and under the same hostname (decided 2026-10-05),
+so the written "private-only node switch" was re-scoped for a mixed node, in three merge
+requests (15a, 15b, 15c); every recommendation was taken.
+
+- No event of a kind GRASP-P does not own may reference private-repository content: not by a
+  coordinate of a registration, state root or stream-wrap kind, and not by the id of such an
+  event stored on the node. This covers every kind, not reports alone, so a 10317 and the relay
+  owner's events are covered too, and a public event that tags private content is refused even
+  when it also tags public content. Kinds 5 and 62 stay with the deletion rules.
+- The report intake (log line and counter) takes only the reports that point at private
+  content; every other report is upstream's.
+- A report that names in `p` a write or aux key held on the node points at private content; an
+  account key does not count.
+- A refused reporter gets one neutral fixed text. The runbook and the client spec tell reporters
+  to put the blob's sha256 in an `x` tag and to send the blob key only by direct mail to the
+  operator, never in an event.
+- A reference by id to a private event that the node does not hold yet (one still on its way
+  from the peer) is not recognised; this is accepted and documented.
+- Deletion requests shaped as offboard requests (a `["k", "30640"]` tag, or a 30640
+  coordinate) take the pure offboard shape for every signer, with caps and a whitelist refusal;
+  a vanish from a key that holds registrations must name every node of the pair or all relays
+  (15b).
+- A vanish dated before an account's registrations frees every claim, matching what upstream
+  actually deletes, with a test that fails if upstream ever bounds its vanish by date (15b).
+- The bootstrap relay and the publishing of the relay's identity keep `ws://` with a boot
+  warning; relays that events name are dialled over `wss://` only (15c).
+- The fingerprint over private links needs no code: M8 lists each peer by its public
+  `NGIT_DOMAIN`, over `wss://`, or over `ws://` on a private link only when that address is the
+  peer's `NGIT_DOMAIN` (M8, above).
+- A report's `server` tag names the pair only as this node's service address and the peers in
+  `NGIT_GRASP_P_SYNC_PEER_URLS` and `NGIT_GRASP_P_MIRROR_PEER_URLS`, never the `server` values of
+  registrations: an account writes those as it likes, so it could otherwise make the node refuse
+  public reports, at a cost no cap bounds (taken in the review of 15a).
+- Refused synced public events share the sync hold's id-only budget with GRASP-P's own
+  refusals until merge request 18 gives them a budget of their own (taken in the review of 15a).

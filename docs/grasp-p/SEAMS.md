@@ -14,7 +14,7 @@ Upstream's files carry thin seams only:
 
 | Upstream file | Seam |
 |---|---|
-| `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` passes over upstream's deletion gate for state roots and stream wraps (`grasp_p::offboard::deletion_gate_exempt`, see "Who may delete" below), calls `grasp_p::admission::admit` after the blacklist and the deletion gate, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
+| `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` passes over upstream's deletion gate for state roots and stream wraps (`grasp_p::offboard::deletion_gate_exempt`, see "Who may delete" below), calls `grasp_p::admission::admit` after the blacklist and the deletion gate and before its own dispatch, for every kind (GRASP-P's own kinds, and every other kind that references their content, which it refuses: see "Nothing attaches to private-repository events" below), frees key claims after an honored kind 5 / 62; `create_relay` builds the service; `RelayRuntime.grasp_p`. The GRASP-P arm for NIP-56 reports is gone: a report `admit` lets through takes upstream's generic arm and its words |
 | `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled; one call to `grasp_p::metrics_endpoint::start` ahead of every other background task, whose error stops startup; where `Metrics` is built, the builder call `with_relay_labels(RelayLabels::from_config(..))`, which passes `None` unless GRASP-P is enabled (see below) |
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
@@ -1138,10 +1138,12 @@ stay in the same way.
 - **The offboard request stays public** under upstream's request retention (served for
   months after its last use), naming the account key and the alias; it is what keeps a
   replay of the registration out (decision D7).
-- **A public event that tags a registration, a state root or a wrap** is still upstream's,
-  and upstream's cascade may remove it with a public repository it tags, or with one that
-  another public event links to the same registration, state root or wrap. What may
-  attach to a private repository at all is the attachment work of the private-only switch.
+- **A public event that tags a registration, a state root or a wrap** is refused now
+  ("Nothing attaches to private-repository events", below). One stored before that rule, or
+  one that names by id a state root or wrap this node did not hold yet when it arrived,
+  stays upstream's: upstream's cascade may remove it with a public repository it tags, or
+  with one that another such event links to the same registration, state root or wrap, and
+  the cascade exemption keeps the private events themselves in place.
 - **The hold-and-purge work** must remove state roots and wraps with GRASP-P's own store
   calls: on a GRASP-P node `archive_and_delete_filter` passes over them, and the cascade's
   plan over registrations too.
@@ -1150,6 +1152,225 @@ stay in the same way.
   the combination at boot comes with the hold-and-purge work.
 - **Every full re-issue** asks the peer for every offboard request it still serves, and each
   is a duplicate here: one filter, bounded by upstream's request retention.
+
+## Nothing attaches to private-repository events
+
+The maintainer's decisions of 2026-10-28 for a node that serves public repositories
+beside private ones (D1): no event of another kind may reference private-repository
+content (decision A); a report on it is refused, logged and counted (D10 with D15-1 to
+D15-3); an id this node does not hold yet is not recognised (D15-5). All of it is GRASP-P
+code: `src/grasp_p/attachment.rs`, `src/grasp_p/reports.rs`, the routing in
+`grasp_p::admission::admit`, `is_private_event_kind` and the intake's memory of the reports it
+logged in `src/grasp_p/mod.rs`, and the live sync path's skip of the ids admission keeps
+(`grasp_p_previously_rejected` in `src/sync/grasp_p_sync.rs`). The one change to upstream's
+code is a deletion: the GRASP-P arm for kind 1984 in `admit_event`'s dispatch
+(`src/nostr/builder.rs`, 6 lines out, the comment above the `admit` call reworded).
+`src/nostr/policy/related.rs` has no seam.
+
+### What upstream did on a GRASP-P node
+
+- **Backward anchors.** `RelatedEventPolicy` stores an event of an unhandled kind, a PR
+  included, when one of its `a`, `A` or `q` coordinates names any stored event of that kind
+  and author with that `d` tag, or one of its `e`, `E` or `q` ids is any stored event. A
+  registration's coordinate `30640:<account>:<alias>`, a state root's and the id of any
+  registration, state root or stored wrap all served as anchors, so anyone could store
+  plaintext against a private repository, uncharged and outside its quota and collection,
+  and have it served to whoever asked for `#a` or `#e` of those coordinates and ids.
+- **Forward vouching.** The same rule stores an event that any stored event tags. A GRASP-P
+  event could carry any tag (registrations and wraps were not checked for extra tags, a
+  state root's first `a` tag wins and the rest went unread), so a wrap or a state root
+  could vouch for a public event before it arrived, and upstream's recursive descendant
+  frontier (`sync/mod.rs`) took such a GRASP-P event into the threads it follows, asking
+  relays that are not peers for what tags it and making its signer an author it looks up.
+- **No check at all.** Every kind 10317 is accepted from anyone, with any tags, and the
+  relay owner's events of every kind without a dedicated policy are accepted; neither meets
+  the related-event rule.
+- **Reports.** A kind 1984 took a GRASP-P arm that logged it and counted it in
+  `ngit_private_report_events_total`, whatever it named, then went through the related-event
+  rule: a report that named a registration by id was stored on it, with whatever blob key
+  it carried, and every public report was logged with its reporter's key.
+- **The audit hashtag.** Upstream's audit cleanup (`src/audit_cleanup.rs`) hard-deletes every
+  event, of any kind, with `["t", "grasp-audit-test-event"]` once it is two hours old, past
+  every deletion hook: a GRASP-P event with that tag would go while its claims stayed.
+
+### The rule
+
+`admit` runs before upstream's dispatch, for client and synced events alike, after the
+blacklist and the tombstone gate. For an event of a kind GRASP-P does not own (not in
+`PRIVATE_EVENT_KINDS`: 30640, 30641, 3359, 23359, 1059 and 21059, whatever
+`NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND` says), other than kinds 5 and 62, which stay with the
+deletion guard:
+
+- **`attachment::judge`** refuses it when an `a`, `A` or `q` value with a colon has a
+  GRASP-P kind before its first colon, read as a number as upstream reads it (`030640`,
+  `+30640`), from the event alone and whether or not anything is stored under it; or when
+  one of its `e`, `E` or `q` ids (a `q` without a colon) is a stored GRASP-P event, found by
+  one query by id and kind against the relay store upstream's rule reads. The answer is
+  `restricted: events that reference private repositories are not stored on this
+  service`; it names nothing, and contains neither `unregistered` nor upstream's `event
+  must reference an accepted repository or accepted event`, which sync keeps an event for
+  and retries on. An event with more than 2048 distinct `e`, `E` and `q` ids that parse is
+  refused whole first, `invalid: event carries too many references to check`, whatever they
+  name: reading only the first ones would let a reference placed after them through. A `q`
+  coordinate, a repeated id and a value that does not parse cost no lookup and are not
+  counted. Every other event goes on to upstream as on a node without GRASP-P.
+- **`reports::judge`**, for a kind 1984, refuses it in the same cases and also when: a
+  64-hex value of any tag (in any case, compared in lower case) is a blob this node holds a
+  claim for or one on the loaded denylist; an `x` tag sits beside a `server` value that names
+  either node of the pair, the node itself or a blob's URL on it (`/<sha256>`, with or
+  without an extension), compared as the fingerprint compares names (`fingerprint_domain`,
+  once the scheme is in lower case and any user part is dropped), where the pair is this
+  node's service address and the peers its operator lists in `NGIT_GRASP_P_SYNC_PEER_URLS`
+  and `NGIT_GRASP_P_MIRROR_PEER_URLS`; or a `p` or `P` value is a write or aux key with a
+  claim here (D15-2). An account key in `p` does not count, even when its registration lists
+  it among its own write or aux keys. A report that points at private content is logged by
+  `admission::log_report` (the line `NIP-56 report event received`, its fields unchanged;
+  `sha256_tags` lists the `x` values first, in lower case and each once, up to 16), counted
+  in `ngit_private_report_events_total` and refused `restricted: reports about private
+  repositories are not stored on this service` (D15-3). It is refused each time it comes and
+  logged and counted once: the intake remembers the last 4096 report ids it logged, so a
+  report that sync fetches again does not page again. Any other report is upstream's, with
+  no GRASP-P log line and no count (D15-1): stored on a public anchor, or refused in
+  upstream's generic words. More than 2048 distinct 64-hex values, or beside an `x` tag more
+  than 2048 distinct `server` values: `invalid`, as above. Every id that parses is a 64-hex
+  value, so that bounds the ids too.
+- A refusal of a synced event is kept by id in the hold (`add_id_only`), as for a refused
+  deletion request, so the sync batch that asked for it completes; while the id is kept, the
+  live sync path skips the event, as it does a refused GRASP-P event
+  (`grasp_p_previously_rejected`, which took GRASP-P kinds only before). A store fault,
+  answered `error:`, is not kept.
+
+For GRASP-P's own kinds `attachment::reference_tag_refusal`, in `admit` after the size check
+and before the rate bucket, refuses a registration or a stream wrap (stored, ephemeral,
+legacy) with any `e`, `E`, `q`, `a` or `A` tag, a state root with an `e`, `E`, `q` or `A` tag
+or more than one `a` tag (the one it has must name its own registration, which the
+state-root path checks), and any of them with the audit hashtag. A tag counts by its name,
+whatever its values. The refusals are `invalid:`, final for sync (`Rejected(Invalid)`), no
+dependency rejection, so nothing is held for a registration and a synced one is remembered
+by id; each counts in `ngit_private_events_rejected_total`. cord-git sends none of these
+tags: a 30640 carries `d`, `w`, `aux`, `relays` and `server`, a 30641 `d`, one `a`, `m` and
+`pack`, an outer wrap none. The refusal comes before the key lookup, so a tagged wrap from an
+unregistered key now gets it rather than `unregistered key`.
+
+### Why upstream's related-event rule needs no seam
+
+`check_references` has one caller, `handle_related_event` (`src/nostr/builder.rs`), reached
+from the PR arm and the generic arm of the dispatch, both after `admit`.
+
+- **Backward.** A GRASP-P kind never reaches the dispatch on a GRASP-P node: `admit`
+  answers every one of them. An event of another kind with a coordinate of a GRASP-P kind,
+  or with the id of a stored GRASP-P event, is refused by `admit` before it gets there. The
+  rule reads coordinates and ids exactly as `extract_reference_tags` does, so no reference
+  the related-event rule would follow passes `admit`.
+- **Forward.** `is_referenced_by_accepted` asks whether any stored event tags the incoming
+  one. A GRASP-P event stored under this rule carries no `e`, `E`, `q`, `a` or `A` tag but a
+  state root's own `a`, which names a 30640, a kind that never reaches the rule.
+- **The descendant frontier** follows only events that tag a thread root or a member, and
+  a GRASP-P event tags none.
+
+What is left on that path is the race and the residuals below, none of which a seam in
+`related.rs` would close any better than `admit` does.
+
+### What is left
+
+- **An id this node does not hold yet** cannot be recognised (D15-5): an event that names a
+  registration, state root or wrap by an id still on its way from the peer, beside a public
+  anchor, is stored on this node, served here for `#e` of that id, and stays; the peer, which
+  holds the private event, refuses it. A coordinate is judged from the event alone and has
+  no such gap. The same holds for an id that is stored between `admit`'s query and the
+  related-event rule's own, for a stranger's kind 5 naming a wrap before it arrives (stored
+  as upstream stores it, and inert for the wrap), and for an event waiting in purgatory,
+  which is not judged again when it is promoted.
+- **What was stored before this rule** stays: public events that reference private
+  content, and GRASP-P events with reference tags (no GRASP-P node has run in production,
+  so there is nothing of ours to scan). The cascade exemption keeps the private events of a
+  deleted public repository whatever links them.
+- **Other ways to name private content.** A blob named only inside a URL (an `r` or `url`
+  value ending in a hash) or in an event's content is not matched; a report's hash is
+  matched as a bare 64-hex value. An accusation and a key in the content of an event that
+  references nothing private are upstream's.
+- **The pair's names are the operator's.** A report's `server` value counts only when it
+  names this node or a peer on the sync or mirror list; a registration's own `server` values
+  are not read, since an account writes them as it likes. A peer listed only by a link
+  address is matched by that address, not by its public name, so a report that names the
+  public name beside a hash not claimed here is upstream's: M8 lists each peer by its
+  `NGIT_DOMAIN`. A URL on the node that is not a blob's, a public repository's say, does not
+  count either.
+- **Hashes and keys an account chooses.** A state root claims every blob it declares before
+  any upload, and a removed repository's claims stay through the GC grace period, so any
+  write key can make this node refuse the reports that name a hash it chooses; uploading the
+  bytes of a public file claims that file's hash too. A key an account claims as a write or
+  aux key, with the key's proof, makes the reports that name it in `p` refused here, so a key
+  holder can keep reports on its own public key off this node. Each such report still
+  reaches the intake.
+- **A hash not claimed here yet.** A report that names a hash this node holds no claim for
+  yet, the state root still on its way from the peer, and carries no `server` tag naming the
+  pair, is upstream's and stays if it is stored.
+- **Ephemeral wraps** are never stored, so an event that names one by id is never
+  recognised.
+- **Keys in events of other kinds.** An event of another kind that names a write or aux key
+  in `p` beside a public anchor is upstream's and is served for `#p` of that key; only a
+  report counts such a `p` (D15-2).
+- **The hold's id budget is shared.** A refused synced event of a public kind is kept by id
+  in the same budget as GRASP-P's own refusals (61,440 ids within the TTL). A flood of
+  public events that each reference private content, from a relay this node follows, can
+  fill it; the peer's refused GRASP-P events are then not remembered, and are fetched and
+  judged again on each round until room frees. That is churn, not a wrong answer. Merge
+  request 18 gives them a budget of their own (decided 2026-10-28).
+- **Refusals of public events are not counted.** The rule refuses events of any kind, and a
+  counter labelled by kind would let any sender create series; the refusal is logged at
+  debug level with the event id, author and kind.
+- **The denylist now moves acceptance**, of reports only: two nodes with different lists
+  take different public reports. It stays out of the fingerprint, since GRASP-P replicates
+  no report.
+- **Retry churn.** A public event that sync brought before the private event it names, and
+  that upstream kept for its related-event retry, is retried when that private event is
+  saved, refused, and stays in upstream's retry index until it expires, bounded by
+  `RELATED_RETRY_CLOSURE_LIMIT`.
+- **The cap refuses public events** with more than 2048 distinct `e`, `E` and `q` ids, and
+  reports with more than 2048 distinct 64-hex values or, beside an `x` tag, more than 2048
+  distinct `server` values, whatever they name; upstream took them. Repeats and values that
+  do not parse are not counted.
+
+### Tests
+
+Unit tests in `src/grasp_p/attachment.rs`, over the real write policy and an in-memory
+relay database: `the_private_kinds_are_the_six_grasp_p_kinds_and_the_cascade_list` (also
+that the cascade passes over exactly these, for every kind),
+`references_are_read_as_upstream_reads_them`,
+`a_coordinate_of_a_grasp_p_kind_is_refused_beside_a_public_anchor` and
+`an_id_of_a_stored_grasp_p_event_is_refused_beside_a_public_anchor` (each event also tags a
+stored public note, so each fails when its check goes),
+`a_stored_legacy_wrap_counts_on_a_node_that_retired_the_kind`,
+`kinds_upstream_takes_unchecked_are_refused_too` (10317 and the relay owner),
+`public_references_are_upstreams`, `an_id_not_stored_yet_is_judged_when_it_is`,
+`with_grasp_p_off_upstream_decides_alone`, `past_the_cap_the_event_is_refused_whole`
+(repeated ids and junk not counted), `a_refused_synced_event_is_remembered_by_id`,
+`grasp_p_events_carry_no_reference_tags` (every kind and tag, client and sync, nothing
+held, untagged controls taken) and
+`a_tagged_wrap_from_an_unregistered_key_is_not_held`. In `src/grasp_p/reports.rs`:
+`a_report_pointing_at_private_content_is_refused` (coordinate, id, claimed and denylisted
+blob, `x` beside the names and blob URLs of this node, the sync peer and the mirror peer, a
+loosely spelled URL, write and aux key in `p` and `P`),
+`a_report_on_public_content_is_upstreams` (the account key, one listed as its own write key
+too, other servers, one a registration names among them, a public repository's URL on this
+node, and upstream's own answer to an orphan, which fails if the GRASP-P report arm comes
+back), `the_relay_owners_report_is_judged_too`,
+`a_refused_synced_report_is_remembered_by_id`,
+`a_report_is_logged_once_however_often_it_comes`,
+`the_intake_forgets_the_oldest_report_first` and `past_the_cap_a_report_is_refused_whole`
+(repeats counted once, and `server` values beside an `x`). In `src/grasp_p/admission.rs`:
+`the_intake_line_puts_the_reported_hashes_first`, and
+`only_dependency_rejections_are_holdable`, which lists the ban's messages as not held. The
+cascade test in `src/grasp_p/offboard.rs` now stores its bridge directly, after asserting
+that the write policy refuses it. Integration: `exit32_kind1984_report_intake` (rewritten:
+eight private reports refused and counted, the other node named by
+`NGIT_GRASP_P_MIRROR_PEER_URLS`, three public ones stored and not counted, one of them naming a server the registration lists, an
+orphan in upstream's words) and `exit43_nothing_attaches_to_private_repository_events` (a
+public repository beside a private one; coordinates before the registration exists, ids
+before and after the wrap is stored, a 10317, the tag ban and its count) in `private_repos`,
+where `exit3`'s tagged wrap from an unregistered key now gets the ban; and
+`exit24_nothing_attaches_to_private_events_on_either_node` in `private_two_node`.
 
 ## Configured peers: the only relays GRASP-P syncs with; kept, not muted, redialled
 
@@ -1490,9 +1711,12 @@ list (a reload is M9's).
 - **A pair reached by link addresses.** The domain set compares a peer's entry with that
   peer's own `NGIT_DOMAIN`, so a pair that lists each other by private-link addresses while
   serving public names never matches. Matching it would need a setting that names the peer's
-  service address; that is the maintainer's decision.
-- **Events of other kinds** that tag a frozen registration still pass upstream's related-event
-  rule (PLAN.md, "Events of other kinds can attach"), until the private-only switch.
+  service address; the maintainer decided on 2026-10-28 that no code is needed: each node
+  lists its peer by the peer's `NGIT_DOMAIN` (PLAN.md, M8).
+- **Events of other kinds** that tag a frozen registration are refused like any reference
+  to private-repository content ("Nothing attaches to private-repository events"); one that
+  names the frozen account's state root or wrap by an id this node does not hold yet is
+  upstream's, as on any node.
 - **The startup line's fields** (`sync_peers`, `policy_version`, `event_blacklist_keys`) and
   its two warnings are named in the runbook, but no test reads the log for them; only the
   predicate behind the peer warning is tested.

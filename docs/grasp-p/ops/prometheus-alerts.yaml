@@ -274,10 +274,12 @@ groups:
           description: "A takedown purge ran (reload purge-on-add or the GC denylist sweep). Confirm the denylist addition was intended and work the takedown runbook; an unexpected purge means the denylist files carry hashes you did not put there."
           runbook: "docs/grasp-p/ops/runbook.md#denylist-purged"
 
-      # NIP-56 report intake (Phase-4b D3). Kind-1984 events are
+      # NIP-56 report intake (D10). Kind-1984 events that point at
+      # private-repository content are refused, never stored, and
       # intake-logged (event id, reporter, sha256-looking tags; content never
-      # logged) and v1 takes NO automatic action — a rising count is a page
-      # to work the manual takedown runbook.
+      # logged); reports on public content are not counted. v1 takes NO
+      # automatic action — a rising count is a page to work the manual
+      # takedown runbook.
       - alert: NgitPrivateReportEvents
         expr: increase(ngit_private_report_events_total[1h]) > 0
         labels:
@@ -285,8 +287,8 @@ groups:
           service: ngit-grasp
           component: grasp-p
         annotations:
-          summary: "{{ $value | humanize }} NIP-56 report event(s) in 1h"
-          description: "Kind-1984 reports are arriving. Pull the intake log lines (event_id, reporter, sha256_tags), verify the evidence per the takedown runbook (decrypt-to-confirm), then denylist if actionable."
+          summary: "{{ $value | humanize }} NIP-56 report(s) on private repositories in 1h"
+          description: "Kind-1984 reports that point at private-repository content are arriving; each was refused and not stored. Pull the intake log lines (event_id, reporter, sha256_tags), get the blob key from the reporter by direct mail, verify the evidence per the takedown runbook (decrypt-to-confirm), then denylist if actionable."
           runbook: "docs/grasp-p/ops/runbook.md#report-events"
 
   # ---------------------------------------------------------------------------
