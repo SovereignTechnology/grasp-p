@@ -15,7 +15,7 @@
 //!   periodic full re-issue, both to configured peers only;
 //! - the event pipeline: refuse a GRASP-P event that relay sync brought from
 //!   a relay that is not a peer ([`SyncManager::grasp_p_gate`]), skip
-//!   known-rejected private events, reprocess held events after a 30640 is
+//!   events GRASP-P already refused, reprocess held events after a 30640 is
 //!   accepted, and hand rejected private events to the hold's decision
 //!   point;
 //! - negentropy: a requested GRASP-P event that this node holds or refused
@@ -747,8 +747,12 @@ impl SyncManager {
         }
     }
 
-    /// Whether `event` is a GRASP-P kind already known to be rejected, so the
-    /// event pipeline can skip it (refetch-loop protection).
+    /// Whether `event` is one GRASP-P already refused and remembers by id,
+    /// so the event pipeline can skip it (refetch-loop protection). That is
+    /// a GRASP-P kind, or a synced event of another kind that admission
+    /// refused for good: a deletion request, a reference to private
+    /// content, a report on it. Negentropy leaves out the same ids
+    /// (`grasp_p_rejected_ids`).
     pub(super) fn grasp_p_previously_rejected(
         write_policy: &Nip34WritePolicy,
         event: &Event,
@@ -756,11 +760,7 @@ impl SyncManager {
         let Some(service) = write_policy.grasp_p() else {
             return false;
         };
-        let kind = event.kind.as_u16();
-        let is_private_kind = kind == crate::grasp_p::KIND_REGISTRATION
-            || kind == crate::grasp_p::KIND_STATE_ROOT
-            || service.accepts_stream_wrap_kind(kind);
-        is_private_kind && service.sync_rejected().contains(&event.id)
+        service.sync_rejected().contains(&event.id)
     }
 
     /// The answer for a GRASP-P event that relay sync brought from a relay
@@ -1941,6 +1941,35 @@ mod tests {
             ),
             None
         );
+        manager.shutdown().await;
+    }
+
+    /// A synced event of another kind that admission refuses for a
+    /// reference to private-repository content is kept by id, and the live
+    /// sync path then skips it as it skips a refused GRASP-P event. Fails
+    /// if `grasp_p_previously_rejected` goes back to GRASP-P kinds only.
+    #[tokio::test]
+    async fn a_refused_event_of_another_kind_is_skipped_when_it_comes_again() {
+        let (mut manager, _directory) = peer_test_manager(None, |_| {}).await;
+        let wrap = unregistered_wrap();
+        manager.database.save_event(&wrap).await.unwrap();
+        let note = EventBuilder::new(Kind::TextNote, "")
+            .tags(vec![Tag::event(wrap.id)])
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert!(!SyncManager::grasp_p_previously_rejected(
+            &manager.write_policy,
+            &note
+        ));
+        assert_eq!(
+            synced_from(&manager, &note, PEER, SaveContext::RelaySync).await,
+            ProcessResult::Rejected(PolicyRejection::Restricted)
+        );
+        assert!(is_held(&manager, &note));
+        assert!(SyncManager::grasp_p_previously_rejected(
+            &manager.write_policy,
+            &note
+        ));
         manager.shutdown().await;
     }
 

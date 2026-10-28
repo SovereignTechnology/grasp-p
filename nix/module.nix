@@ -740,7 +740,9 @@ let
           of a pair can be given the same list. Empty (default): no blob
           peers, so no blob replicates to this node; with the mirror
           enabled the node warns at startup. The mirror uses no proxy from
-          the environment.
+          the environment. These hosts, this node's address and the sync
+          peers also name the pair when a kind 1984 report's `server` tag
+          is judged.
         '';
       };
 
@@ -779,8 +781,9 @@ let
           The relay in NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it
           is listed here too. The policy_fingerprint covers this node's
           address and these peers, so the two nodes of a pair must list each
-          other to match. Empty (default): no peers, so no private-repo
-          replication.
+          other to match. These peers also name the pair when a kind 1984
+          report's `server` tag is judged. Empty (default): no peers, so no
+          private-repo replication.
         '';
       };
 

@@ -3,8 +3,13 @@
 //! The write policy calls [`admit`] only when the private-repo service is
 //! installed (`NGIT_GRASP_P_REPOS_ENABLE=true`), after its blacklist and,
 //! for every kind but state roots and stream wraps, upstream's deletion gate
-//! (see [`super::offboard`]). Deletion requests and vanishes are judged here
-//! first (`offboard::guard`) and, when they pass, left to upstream.
+//! (see [`super::offboard`]), and before its own dispatch. Deletion requests
+//! and vanishes are judged here first (`offboard::guard`) and, when they
+//! pass, left to upstream. Every other kind GRASP-P does not own is refused
+//! here when it references private-repository content, and a report when it
+//! points at it in any way (`attachment`, `reports`); otherwise it goes on
+//! to upstream as on a node without GRASP-P. GRASP-P's own kinds carry no
+//! reference tags (`attachment::reference_tag_refusal`).
 //!
 //! Which stream-wrap kinds route here is decided in one place
 //! (`PrivateService::accepts_*_stream_wrap_kind`), so the dual-accept window
@@ -18,7 +23,7 @@ use nostr_sdk::prelude::{Event, Kind, MachineReadablePrefix};
 
 use super::registration::REPLACE_CADENCE_REJECT_MESSAGE;
 use super::PrivateService;
-use crate::nostr::policy::reject_restricted;
+use crate::nostr::policy::{reject_invalid, reject_restricted};
 
 // -----------------------------------------------------------------------------
 // Rejection messages the out-of-order hold depends on
@@ -140,8 +145,31 @@ fn noted(
     result
 }
 
-/// Route a private-repo kind. `None` means the event is not one of GRASP-P's
-/// kinds and the caller continues with its own dispatch.
+/// Keep the id of a synced event of a kind GRASP-P does not own when this
+/// node refuses it. The peer took it and offers it again on every sync, so
+/// the id lets the batch that asked for it complete, as for a refused
+/// GRASP-P kind. A store fault may clear, so it is not kept, and neither is
+/// a refusal whose message is in `not_kept`.
+fn remember_synced_refusal(
+    service: &PrivateService,
+    event: &Event,
+    refusal: &Option<WritePolicyResult>,
+    not_kept: &[&str],
+) {
+    if let Some(WritePolicyResult::Reject {
+        prefix, message, ..
+    }) = refusal
+    {
+        let message: &str = message;
+        if !matches!(prefix, MachineReadablePrefix::Error) && !not_kept.contains(&message) {
+            service.sync_rejected().add_id_only(event.id);
+        }
+    }
+}
+
+/// Route an event before upstream's dispatch. `None` means GRASP-P has no
+/// objection and the caller continues with its own dispatch, as on a node
+/// without GRASP-P.
 ///
 /// Synced events (`is_synced`, loopback:0) get identical admission: a synced
 /// 30640/30641/stream wrap must apply under the same rules. They only bypass
@@ -155,26 +183,37 @@ pub async fn admit(
     // own, so a request the guard lets through goes on to upstream.
     if event.kind == Kind::EventDeletion || event.kind == Kind::RequestToVanish {
         let refusal = super::offboard::guard(service, event).await;
-        // A request the peer took and this node refuses is offered again on
-        // every sync. Keep its id, as for a refused GRASP-P kind, so the
-        // batch that asked for it completes. A store fault may clear, and
-        // the target cap is upstream's own answer, so neither is kept.
+        // The target cap is upstream's own answer, so it is not kept.
         if is_synced {
-            if let Some(WritePolicyResult::Reject {
-                prefix, message, ..
-            }) = &refusal
-            {
-                if !matches!(prefix, MachineReadablePrefix::Error)
-                    && *message != super::offboard::TOO_MANY_TARGETS_MESSAGE
-                {
-                    service.sync_rejected().add_id_only(event.id);
-                }
-            }
+            remember_synced_refusal(
+                service,
+                event,
+                &refusal,
+                &[super::offboard::TOO_MANY_TARGETS_MESSAGE],
+            );
         }
         return refusal;
     }
 
     let kind = event.kind.as_u16();
+
+    // Nothing of another kind attaches to private-repository events
+    // (decision A), whoever signs it and however it arrives: upstream
+    // would store it on a GRASP-P event as its anchor, and takes some kinds
+    // (10317, whatever the relay owner signs) with no reference check at
+    // all. A report has more ways to point at private content (D10).
+    if !super::is_private_event_kind(kind) {
+        let refusal = if kind == super::KIND_REPORT {
+            super::reports::judge(service, event).await
+        } else {
+            super::attachment::judge(service, event).await
+        };
+        if is_synced {
+            remember_synced_refusal(service, event, &refusal, &[]);
+        }
+        return refusal;
+    }
+
     let stored_wrap = service.accepts_stream_wrap_kind(kind);
     let ephemeral_wrap = service.accepts_ephemeral_stream_wrap_kind(kind);
 
@@ -192,6 +231,18 @@ pub async fn admit(
             is_synced,
             reject_restricted(OVERSIZE_REJECT_MESSAGE),
         ));
+    }
+
+    // A GRASP-P event that tags other events would vouch for them under
+    // upstream's related-event rule and draw upstream's thread-following
+    // sync to it. Decided by the event alone, so before the rate bucket and
+    // before any lookup, and final: no registration that arrives later
+    // makes it acceptable, so nothing is held.
+    if service.admits_kind(kind) {
+        if let Some(message) = super::attachment::reference_tag_refusal(kind, event) {
+            crate::metrics::record_private_event_rejected(kind);
+            return Some(noted(service, event, is_synced, reject_invalid(message)));
+        }
     }
 
     if kind == super::KIND_REGISTRATION {
@@ -272,18 +323,13 @@ pub async fn admit(
     None
 }
 
-/// Phase-4b D3: NIP-56 report intake, observe-then-defer. Logs the event id,
-/// the reporter and any sha256-looking tag values (the takedown evidence an
-/// operator needs); the content is never logged. Admission then runs through
-/// the related-event rules unchanged.
+/// NIP-56 report intake for a report that points at private-repository
+/// content, which is then refused (D10; `reports`). Logs the event id, the
+/// reporter and up to 16 sha256-looking tag values (the takedown evidence an
+/// operator needs); the content is never logged. A report on public content
+/// is not logged or counted (D15-1).
 pub fn log_report(event: &Event) {
-    let sha256_tags: Vec<String> = event
-        .tags
-        .iter()
-        .flat_map(|tag| tag.clone().to_vec())
-        .filter(|v| super::blossom_auth::is_lower_hex_64(v))
-        .take(16)
-        .collect();
+    let sha256_tags = report_hashes(event);
     tracing::info!(
         event_id = %event.id.to_hex(),
         reporter = %event.pubkey.to_hex(),
@@ -291,6 +337,36 @@ pub fn log_report(event: &Event) {
         "NIP-56 report event received"
     );
     crate::metrics::record_private_report_event();
+}
+
+/// The sha256-looking values `log_report` carries: the `x` values first,
+/// since reporters are asked to send the hash there, then the others; in
+/// lower case and each once, at most 16. A refused report is not stored, so
+/// this line is the operator's only record of the hash it was judged by,
+/// whatever case the report spelled it in.
+fn report_hashes(event: &Event) -> Vec<String> {
+    const MAX_LOGGED: usize = 16;
+    let mut hashes: Vec<String> = Vec::new();
+    for x_first in [true, false] {
+        for tag in event.tags.iter() {
+            let values = tag.as_slice();
+            if (values.first().map(String::as_str) == Some("x")) != x_first {
+                continue;
+            }
+            for value in values.iter().skip(1) {
+                if hashes.len() == MAX_LOGGED {
+                    return hashes;
+                }
+                if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let value = value.to_ascii_lowercase();
+                    if !hashes.contains(&value) {
+                        hashes.push(value);
+                    }
+                }
+            }
+        }
+    }
+    hashes
 }
 
 /// The first `d` tag value, the alias of a 30640/30641.
@@ -309,8 +385,8 @@ pub fn d_tag(event: &Event) -> Option<String> {
 mod tests {
     use super::*;
     use crate::grasp_p::{
-        KIND_EPHEMERAL_STREAM_WRAP, KIND_EPHEMERAL_WRAP, KIND_REGISTRATION, KIND_STATE_ROOT,
-        KIND_STREAM_WRAP, KIND_WRAP,
+        attachment, KIND_EPHEMERAL_STREAM_WRAP, KIND_EPHEMERAL_WRAP, KIND_REGISTRATION,
+        KIND_STATE_ROOT, KIND_STREAM_WRAP, KIND_WRAP,
     };
     use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
@@ -407,6 +483,13 @@ mod tests {
                 "legacy stream-wrap kind is not accepted on this node",
             ),
             (StreamWrap, "this event is deleted"),
+            // The reference-tag ban, on every kind: the event alone decides.
+            (StateRoot, attachment::STATE_ROOT_TAGS_MESSAGE),
+            (StateRoot, attachment::AUDIT_TAG_MESSAGE),
+            (StreamWrap, attachment::UNTAGGED_EVENT_MESSAGE),
+            (StreamWrap, attachment::AUDIT_TAG_MESSAGE),
+            (Registration, attachment::UNTAGGED_EVENT_MESSAGE),
+            (Registration, attachment::AUDIT_TAG_MESSAGE),
             // 30640: only the cadence rejection is held.
             (Registration, OVERSIZE_REJECT_MESSAGE),
             (Registration, "event created_at is too far in the future"),
@@ -638,5 +721,25 @@ mod tests {
         assert_eq!(roots[0].id, small_root.id);
         assert_eq!(hold.held_bytes(), 0);
         hold.assert_accounting();
+    }
+
+    /// The intake line carries the hash a report was judged by: the `x`
+    /// values come before any number of other hex values, a hash in
+    /// capitals is written in lower case, and a repeat is written once.
+    #[test]
+    fn the_intake_line_puts_the_reported_hashes_first() {
+        let hex = |n: u8| format!("{n:02x}").repeat(32);
+        let mut tags: Vec<Tag> = (0..20).map(|n| Tag::custom("e", vec![hex(n)])).collect();
+        tags.push(Tag::custom("x", vec![hex(0xab).to_ascii_uppercase()]));
+        tags.push(Tag::custom("x", vec![hex(0xab)]));
+        tags.push(Tag::custom("x", vec![hex(0xcd), "not a hash".to_string()]));
+        let report = EventBuilder::new(Kind::Reporting, "")
+            .tags(tags)
+            .finalize(&Keys::generate())
+            .expect("sign report");
+        let logged = report_hashes(&report);
+        assert_eq!(logged.len(), 16);
+        assert_eq!(logged[..2], [hex(0xab), hex(0xcd)]);
+        assert_eq!(logged[2..], (0..14).map(hex).collect::<Vec<_>>()[..]);
     }
 }

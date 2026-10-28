@@ -1909,6 +1909,84 @@ async fn exit23_peer_refuses_a_synced_state_root_of_an_account_it_lists() {
 }
 
 // ============================================================================
+// Exit test 24 — nothing attaches to private-repository events, on both nodes
+// ============================================================================
+
+/// Decision A across a pair. A registration and a wrap that A takes reach
+/// B by sync. A public note that tags the wrap, and a report that names the
+/// registration, are then refused on both nodes, each judging by its own
+/// store, and neither is served; each node counts the report it refused.
+/// Upstream alone would store both on the stored private event as their
+/// anchor.
+#[tokio::test]
+async fn exit24_nothing_attaches_to_private_events_on_either_node() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let (a, b) = start_pair(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())]).await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let registration = register_on(&a, &domain_refs, &tenant, &writer, &alias).await;
+    let wrap = wrap_event(&writer, 3359);
+    let (accepted, message) = publish_with_result(a.url(), &wrap).await;
+    assert!(accepted, "exit24: the wrap on A; got {message:?}");
+    for event in [&registration, &wrap] {
+        assert!(
+            wait_for_exact_event(b.url(), event.id, REPLICATION_BOUND).await,
+            "exit24: kind {} must replicate to B",
+            event.kind.as_u16()
+        );
+    }
+
+    let stranger = Keys::generate();
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let note = EventBuilder::new(Kind::TextNote, format!("a note sent to {name}"))
+            .tags(vec![Tag::event(wrap.id)])
+            .finalize(&stranger)
+            .expect("sign note");
+        let (accepted, message) = publish_with_result(node.url(), &note).await;
+        assert!(
+            !accepted
+                && message.contains(
+                    "restricted: events that reference private repositories are not stored on this service"
+                ),
+            "exit24: {name} must refuse a note that tags the wrap; got {message:?}"
+        );
+        let report = EventBuilder::new(Kind::Reporting, format!("a report sent to {name}"))
+            .tags(vec![Tag::event(registration.id)])
+            .finalize(&stranger)
+            .expect("sign report");
+        let (accepted, message) = publish_with_result(node.url(), &report).await;
+        assert!(
+            !accepted
+                && message.contains(
+                    "restricted: reports about private repositories are not stored on this service"
+                ),
+            "exit24: {name} must refuse a report on the registration; got {message:?}"
+        );
+        assert!(
+            fetch_from(node.url(), Filter::new().ids([note.id, report.id]))
+                .await
+                .is_empty(),
+            "exit24: {name} must serve neither"
+        );
+        assert!(
+            wait_for_metrics(node, Duration::from_secs(10), |m| {
+                m.counter("ngit_private_report_events_total", &[])
+                    .unwrap_or(0)
+                    == 1
+            })
+            .await,
+            "exit24: {name} counts the report it refused"
+        );
+    }
+
+    b.stop().await;
+    a.stop().await;
+}
+
+// ============================================================================
 // Exit test 9 — mirror finish() re-check + no re-enqueue after death (R2-C)
 // ============================================================================
 

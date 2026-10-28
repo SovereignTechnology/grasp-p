@@ -473,12 +473,12 @@ lazy_static! {
     static ref PRIVATE_REPORT_EVENTS_TOTAL: Counter = {
         let metric = Counter::with_opts(Opts::new(
             "ngit_private_report_events_total",
-            "Kind-1984 (NIP-56 report) events observed while private repos are \
-             enabled (Phase-4b D3). Reports are intake-logged with their \
-             sha256-looking tag values (takedown evidence) and then admitted \
-             under the unchanged related-event rules; v1 takes NO automatic \
-             action, so a rising count is an operator page to work the \
-             manual denylist runbook.",
+            "Kind-1984 (NIP-56 report) events that point at private-repository \
+             content, refused and not stored. Each is intake-logged with its \
+             sha256-looking tag values (takedown evidence); reports on public \
+             content are not counted. v1 takes NO automatic action, so a \
+             rising count is an operator page to work the manual denylist \
+             runbook.",
         ))
         .expect("build private report events metric");
         REGISTRY
@@ -995,7 +995,8 @@ pub fn record_private_denylist_purged(n: u64) {
     PRIVATE_DENYLIST_PURGED_TOTAL.inc_by(n as f64);
 }
 
-/// Record one observed kind-1984 (NIP-56 report) event (Phase-4b D3).
+/// Record one kind-1984 (NIP-56 report) event that pointed at
+/// private-repository content and was refused (D10).
 pub fn record_private_report_event() {
     PRIVATE_REPORT_EVENTS_TOTAL.inc();
 }

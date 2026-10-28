@@ -875,7 +875,9 @@ pub struct Config {
     /// itself is left out, so both nodes of a pair can be given the same
     /// list. Unset (default): no blob peers, so no blob replicates to this
     /// node; with the mirror enabled the node warns at startup. The mirror
-    /// uses no proxy from the environment.
+    /// uses no proxy from the environment. These hosts, this node's address
+    /// and the sync peers also name the pair when a kind 1984 report's
+    /// `server` tag is judged.
     #[arg(long, env = "NGIT_GRASP_P_MIRROR_PEER_URLS")]
     pub private_mirror_peer_urls: Option<String>,
 
@@ -904,7 +906,9 @@ pub struct Config {
     /// NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it is listed here
     /// too. The policy fingerprint covers this node's address and these
     /// peers, so the two nodes of a pair must list each other to match.
-    /// Unset (default): no peers, so no private-repo replication.
+    /// These peers also name the pair when a kind 1984 report's `server`
+    /// tag is judged. Unset (default): no peers, so no private-repo
+    /// replication.
     #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
     pub private_sync_peer_urls: Option<String>,
 

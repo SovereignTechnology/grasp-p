@@ -910,9 +910,11 @@ async fn exit3_wrap_admission() {
     // that references a STORED event must still be rejected (never the public
     // related-event path). This is what makes deregistered rekey addresses
     // unfloodable between rotations (§3.2: outer author must be registered).
-    // It carries exactly one `p` tag: since nostr-sdk 0.45 the relay refuses
-    // a 1059 without one before any write policy runs, and this case must
-    // reach the private arm to test it.
+    // A stream wrap carries no reference tags at all, so it is refused for
+    // the tag before its key is looked up, as final: no registration of the
+    // key would make it acceptable. It carries exactly one `p` tag: since
+    // nostr-sdk 0.45 the relay refuses a 1059 without one before any write
+    // policy runs, and this case must reach the private arm to test it.
     let referenced_junk = EventBuilder::new(
         Kind::Custom(1059),
         "AtQyM3BhY2VvcGFxdWUtY2lwaGVydGV4dC1zdGFuZC1pbg==",
@@ -925,7 +927,10 @@ async fn exit3_wrap_admission() {
     .expect("sign junk wrap");
     let (accepted, message) = publish_with_result(relay.url(), &referenced_junk).await;
     assert!(
-        !accepted && message.contains("restricted:") && message.contains("unregistered key"),
+        !accepted
+            && message
+                .contains("invalid: registrations and stream wraps carry no e, E, q, a or A tag")
+            && !message.contains("unregistered"),
         "exit3: referenced junk from an unregistered key must be rejected; \
          got accepted={accepted} {message:?}"
     );
@@ -4904,68 +4909,440 @@ async fn exit31_reload_removal_unblocks_read_but_bytes_stay_gone() {
 }
 
 // ============================================================================
-// Exit test 32 — Phase-4b D3: kind-1984 (NIP-56 report) intake
+// Exit test 32 — reports (kind 1984) on a node that also serves public content
 // ============================================================================
-// Reports are observed (metric) and then admitted under the UNCHANGED
-// related-event rules: one referencing the accepted 30640 is stored, one
-// orphan is rejected — both increment ngit_private_report_events_total.
 
+/// The `OK` text of a report that points at private-repository content.
+const REPORT_REFUSAL: &str =
+    "restricted: reports about private repositories are not stored on this service";
+
+/// The `OK` text of any other event that references private-repository
+/// content.
+const ATTACHMENT_REFUSAL: &str =
+    "restricted: events that reference private repositories are not stored on this service";
+
+/// Upstream's own words for an event with nothing stored to anchor it.
+const UPSTREAM_ORPHAN_TEXT: &str = "must reference an accepted repository or accepted event";
+
+/// Decisions D10 and D15-1 to D15-3. A report that points at private
+/// content is refused with one fixed text, is never served, and is counted
+/// in `ngit_private_report_events_total`: by the registration's id or
+/// coordinate, by a blob the node holds a claim for or has on its denylist,
+/// by a hash beside a `server` tag naming this node or the other node of the
+/// pair (named by the operator's mirror peer list), or by a write or aux key
+/// in `p`. Each also tags a public note, so upstream alone would store it. A
+/// report on public content is upstream's: stored on its anchor, or refused
+/// in upstream's words when it has none, and not counted. The account key in
+/// `p` does not make a report private, and neither does a hash beside a
+/// server that only the registration names.
 #[tokio::test]
 async fn exit32_kind1984_report_intake() {
+    let dir = tempfile::tempdir().expect("denylist tempdir");
+    let deny_path = dir.path().join("deny.txt");
+    let denied = sha256_hex(&blob_bytes(207, 64));
+    std::fs::write(&deny_path, format!("{denied}\n")).expect("write denylist");
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
-    let relay =
-        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
-            .await;
+    // The other node of the pair is named by the operator's mirror peer
+    // list. The mirror stays off, so nothing is dialled.
+    let relay = TestRelay::start_with_grasp_p(&[
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+        (
+            "NGIT_GRASP_P_DENYLIST_PATH",
+            &deny_path.display().to_string(),
+        ),
+        ("NGIT_GRASP_P_MIRROR_PEER_URLS", "https://peer.example"),
+    ])
+    .await;
+
+    // A repository with a write key and an aux key, whose registration also
+    // names a server that is not the pair's, and one uploaded blob.
     let writer = Keys::generate();
+    let aux = Keys::generate();
     let alias = random_alias();
-    let registration = register_alias(&relay, &tenant, &writer, &alias).await;
+    let mut tags = registration_tags(
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[key_entry(&aux, &tenant.public_key(), &alias)],
+        &relay.domain(),
+    );
+    tags.push(Tag::custom(
+        "server",
+        vec!["https://elsewhere.example".to_string()],
+    ));
+    let registration = EventBuilder::new(Kind::Custom(30640), "")
+        .tags(tags)
+        .finalize(&tenant)
+        .expect("sign 30640");
+    let (accepted, message) = publish_with_result(relay.url(), &registration).await;
+    assert!(accepted, "exit32: registration; got {message:?}");
+    let data = blob_bytes(205, 64);
+    let claimed = sha256_hex(&data);
+    let upload = blossom_auth_event(
+        &writer,
+        "upload",
+        &claimed,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, data, &claimed, &upload).await;
+    assert_eq!(status, 200, "exit32: upload; X-Reason: {reason}");
+
+    // A public note to anchor reports on: the relay owner may publish one.
+    let anchor = EventBuilder::new(Kind::TextNote, "a public note")
+        .finalize(relay.owner_keys())
+        .expect("sign note");
+    let (accepted, message) = publish_with_result(relay.url(), &anchor).await;
+    assert!(accepted, "exit32: the owner's note; got {message:?}");
+
     let reporter = Keys::generate();
+    let unseen = sha256_hex(&blob_bytes(206, 64));
+    let report = |mut tags: Vec<Tag>| {
+        tags.push(Tag::event(anchor.id));
+        EventBuilder::new(Kind::Reporting, "takedown request")
+            .tags(tags)
+            .finalize(&reporter)
+            .expect("sign report")
+    };
+    let private_reports = [
+        (
+            "the registration by id",
+            report(vec![Tag::event(registration.id)]),
+        ),
+        (
+            "the registration by coordinate",
+            report(vec![Tag::custom(
+                "a",
+                vec![reg_coord(&tenant.public_key(), &alias)],
+            )]),
+        ),
+        (
+            "a claimed blob",
+            report(vec![Tag::custom("x", vec![claimed.clone()])]),
+        ),
+        (
+            "a denylisted blob",
+            report(vec![Tag::custom("x", vec![denied.clone()])]),
+        ),
+        (
+            "a blob on this node",
+            report(vec![
+                Tag::custom("x", vec![unseen.clone()]),
+                server_tag(&relay.domain()),
+            ]),
+        ),
+        (
+            "a blob on the other node",
+            report(vec![
+                Tag::custom("x", vec![unseen.clone()]),
+                server_tag("peer.example"),
+            ]),
+        ),
+        (
+            "a write key",
+            report(vec![Tag::public_key(writer.public_key())]),
+        ),
+        (
+            "the aux key",
+            report(vec![Tag::public_key(aux.public_key())]),
+        ),
+    ];
+    for (what, event) in &private_reports {
+        let (accepted, message) = publish_with_result(relay.url(), event).await;
+        assert!(
+            !accepted && message.contains(REPORT_REFUSAL) && !message.contains("unregistered"),
+            "exit32: a report naming {what} must be refused; got {message:?}"
+        );
+    }
 
-    // (a) A report referencing the accepted registration (e tag) and
-    // carrying blob-sha evidence (x tag): stored per related-event rules.
-    let blob_sha = sha256_hex(&blob_bytes(205, 64));
-    let report = EventBuilder::new(Kind::Reporting, "takedown request")
-        .tags(vec![
-            Tag::custom("e", vec![registration.id.to_hex()]),
-            Tag::custom("x", vec![blob_sha.clone()]),
-        ])
-        .finalize(&reporter)
-        .expect("sign report");
-    let (accepted, message) = publish_with_result(relay.url(), &report).await;
-    assert!(
-        accepted,
-        "exit32: a report referencing accepted content must be stored; got {message:?}"
-    );
-    let served = fetch_from(relay.url(), Filter::new().kind(Kind::Reporting)).await;
-    assert!(
-        served.iter().any(|e| e.id == report.id),
-        "exit32: the accepted report must be fetchable"
-    );
-
-    // (b) An orphan report (references nothing accepted): rejected as
-    // today — observation happens regardless.
+    let public_reports = [
+        (
+            "the owner's note",
+            report(vec![Tag::public_key(relay.owner_keys().public_key())]),
+        ),
+        (
+            "the account key",
+            report(vec![Tag::public_key(tenant.public_key())]),
+        ),
+        (
+            "a blob on a server only the registration names",
+            report(vec![
+                Tag::custom("x", vec![unseen.clone()]),
+                server_tag("elsewhere.example"),
+            ]),
+        ),
+    ];
+    for (what, event) in &public_reports {
+        let (accepted, message) = publish_with_result(relay.url(), event).await;
+        assert!(
+            accepted,
+            "exit32: a report naming {what} is upstream's to store; got {message:?}"
+        );
+    }
     let orphan = EventBuilder::new(Kind::Reporting, "orphan report")
-        .tags(vec![Tag::custom(
-            "e",
-            vec![sha256_hex(&blob_bytes(206, 64))],
-        )])
+        .tags(vec![Tag::custom("e", vec![unseen.clone()])])
         .finalize(&reporter)
         .expect("sign orphan report");
-    let (accepted, _) = publish_with_result(relay.url(), &orphan).await;
+    let (accepted, message) = publish_with_result(relay.url(), &orphan).await;
     assert!(
-        !accepted,
-        "exit32: an orphan report must keep being rejected (admission unchanged)"
+        !accepted && message.contains(UPSTREAM_ORPHAN_TEXT) && !message.contains(REPORT_REFUSAL),
+        "exit32: an orphan report gets upstream's own answer; got {message:?}"
     );
 
-    // Both reports were observed by the intake arm.
+    let served: Vec<EventId> = fetch_from(relay.url(), Filter::new().kind(Kind::Reporting))
+        .await
+        .iter()
+        .map(|event| event.id)
+        .collect();
+    for (what, event) in &public_reports {
+        assert!(served.contains(&event.id), "exit32: {what} must be served");
+    }
+    for (what, event) in &private_reports {
+        assert!(
+            !served.contains(&event.id),
+            "exit32: {what} must not be served"
+        );
+    }
+
+    // Only the private reports were taken in: the counter, and the log
+    // line beside it, are the operator's intake (D15-1).
     let metrics = common::sync_helpers::ParsedMetrics::parse(&relay.grasp_p_metrics().await);
     assert_eq!(
         metrics
             .counter("ngit_private_report_events_total", &[])
             .unwrap_or(0),
-        2,
-        "exit32: both reports must increment ngit_private_report_events_total"
+        private_reports.len() as u64,
+        "exit32: only the reports that point at private content are counted"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 43 — nothing attaches to private-repository events
+// ============================================================================
+
+/// Decision A, on a node that serves a public repository beside a private
+/// one (D1). An event that tags only the public repository is stored, as
+/// upstream stores it. One that tags the registration, a state root or a
+/// wrap is refused, whatever else it tags: by coordinate whether or not the
+/// registration exists yet, judged from the event alone; by id once the
+/// private event is stored here (an id not held yet is not recognised,
+/// D15-5). A 10317, which upstream takes from anyone with no reference
+/// check, is refused the same way. GRASP-P events carry no reference tags.
+/// Nothing refused is served for the private repository's coordinate or
+/// its wrap's id.
+#[tokio::test]
+async fn exit43_nothing_attaches_to_private_repository_events() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let maintainer = Keys::generate();
+    let (_announcement, _fixture) = common::setup_announcement_on_relay(
+        &relay,
+        &maintainer,
+        &[&relay.domain()],
+        "exit43-public",
+    )
+    .await;
+    let public = format!("30617:{}:exit43-public", maintainer.public_key().to_hex());
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let coordinate = reg_coord(&tenant.public_key(), &alias);
+    let stranger = Keys::generate();
+    let a = |value: &str| Tag::custom("a", vec![value.to_string()]);
+    let tagged = |kind: u16, content: &str, tags: Vec<Tag>| {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags)
+            .finalize(&stranger)
+            .expect("sign")
+    };
+    let refused_with = |message: &str, expected: &str| {
+        !message.contains("unregistered")
+            && !message.contains(UPSTREAM_ORPHAN_TEXT)
+            && message.contains(expected)
+    };
+
+    // Before the registration exists, a note that tags the public
+    // repository and the registration's coordinate is refused already.
+    let early = tagged(1, "early", vec![a(&public), a(&coordinate)]);
+    let (accepted, message) = publish_with_result(relay.url(), &early).await;
+    assert!(
+        !accepted && refused_with(&message, ATTACHMENT_REFUSAL),
+        "exit43: a coordinate is judged from the event alone; got {message:?}"
+    );
+
+    let registration = register_alias(&relay, &tenant, &writer, &alias).await;
+    let manifest = sha256_hex(&blob_bytes(208, 64));
+    let root = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&manifest, 64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let wrap = wrap_event(&writer, 3359);
+    for (what, event) in [("state root", &root), ("wrap", &wrap)] {
+        let (accepted, message) = publish_with_result(relay.url(), event).await;
+        assert!(accepted, "exit43: {what}; got {message:?}");
+    }
+
+    // The public repository alone: upstream's, and stored.
+    let reply = tagged(1, "public", vec![a(&public)]);
+    let (accepted, message) = publish_with_result(relay.url(), &reply).await;
+    assert!(
+        accepted,
+        "exit43: a note on the public repository; got {message:?}"
+    );
+
+    let refused = [
+        (
+            "a note on the registration",
+            tagged(1, "", vec![a(&coordinate)]),
+        ),
+        (
+            "a note on both repositories",
+            tagged(1, "", vec![a(&public), a(&coordinate)]),
+        ),
+        (
+            "a note on the public repository and the wrap",
+            tagged(1, "", vec![a(&public), Tag::event(wrap.id)]),
+        ),
+        (
+            "a comment on the registration",
+            tagged(
+                1111,
+                "",
+                vec![
+                    a(&public),
+                    Tag::custom("A", vec![coordinate.clone()]),
+                    Tag::custom("K", vec!["30640".to_string()]),
+                ],
+            ),
+        ),
+        (
+            "a reaction to the registration",
+            tagged(7, "+", vec![a(&public), Tag::event(registration.id)]),
+        ),
+        (
+            "a quote of the state root",
+            tagged(
+                1,
+                "",
+                vec![a(&public), Tag::custom("q", vec![root.id.to_hex()])],
+            ),
+        ),
+        (
+            "a 10317 that tags the wrap",
+            tagged(10317, "", vec![Tag::event(wrap.id)]),
+        ),
+    ];
+    for (what, event) in &refused {
+        let (accepted, message) = publish_with_result(relay.url(), event).await;
+        assert!(
+            !accepted && refused_with(&message, ATTACHMENT_REFUSAL),
+            "exit43: {what} must be refused; got {message:?}"
+        );
+    }
+    let ok_10317 = tagged(10317, "", Vec::new());
+    let (accepted, message) = publish_with_result(relay.url(), &ok_10317).await;
+    assert!(
+        accepted,
+        "exit43: a 10317 that tags nothing private; got {message:?}"
+    );
+
+    // By id the order matters: a wrap this node does not hold yet is not
+    // recognised (D15-5), and once it is stored the same reference is
+    // refused.
+    let pending = wrap_event(&writer, 3359);
+    let before = tagged(1, "before", vec![a(&public), Tag::event(pending.id)]);
+    let (accepted, message) = publish_with_result(relay.url(), &before).await;
+    assert!(
+        accepted,
+        "exit43: an id this node does not hold is upstream's; got {message:?}"
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &pending).await;
+    assert!(accepted, "exit43: the second wrap; got {message:?}");
+    let after = tagged(1, "after", vec![a(&public), Tag::event(pending.id)]);
+    let (accepted, message) = publish_with_result(relay.url(), &after).await;
+    assert!(
+        !accepted && refused_with(&message, ATTACHMENT_REFUSAL),
+        "exit43: the same reference once the wrap is stored; got {message:?}"
+    );
+
+    // GRASP-P events carry no reference tags.
+    let mut second_a = root.tags.clone().to_vec();
+    second_a.push(a(&public));
+    let two_a_tags = EventBuilder::new(Kind::Custom(30641), "")
+        .tags(second_a)
+        .custom_created_at(Timestamp::from_secs(Timestamp::now().as_secs() + 1))
+        .finalize(&writer)
+        .expect("sign 30641");
+    let tagged_wrap = EventBuilder::new(Kind::Custom(3359), "ciphertext")
+        .tags(vec![a(&public)])
+        .finalize(&writer)
+        .expect("sign wrap");
+    let refused_state_roots = |text: &str| {
+        common::sync_helpers::ParsedMetrics::parse(text)
+            .counter("ngit_private_events_rejected_total", &[("kind", "30641")])
+            .unwrap_or(0)
+    };
+    let state_roots_before = refused_state_roots(&relay.grasp_p_metrics().await);
+    for (what, event, expected) in [
+        (
+            "a state root with a second a tag",
+            &two_a_tags,
+            "invalid: a state root carries one a tag and no e, E, q or A tag",
+        ),
+        (
+            "a wrap that tags the public repository",
+            &tagged_wrap,
+            "invalid: registrations and stream wraps carry no e, E, q, a or A tag",
+        ),
+    ] {
+        let (accepted, message) = publish_with_result(relay.url(), event).await;
+        assert!(
+            !accepted && refused_with(&message, expected),
+            "exit43: {what} must be refused; got {message:?}"
+        );
+    }
+    assert_eq!(
+        refused_state_roots(&relay.grasp_p_metrics().await),
+        state_roots_before + 1,
+        "exit43: the state root refused for its tags is counted"
+    );
+
+    // Nothing refused is served for what it tagged.
+    let refused_ids: Vec<EventId> = refused
+        .iter()
+        .map(|(_, event)| event.id)
+        .chain([early.id, after.id, two_a_tags.id, tagged_wrap.id])
+        .collect();
+    for filter in [
+        Filter::new().custom_tag(SingleLetterTag::LOWERCASE_A, coordinate.clone()),
+        Filter::new().custom_tag(SingleLetterTag::UPPERCASE_A, coordinate.clone()),
+        Filter::new().event(wrap.id),
+        Filter::new().event(registration.id),
+        Filter::new().ids(refused_ids.clone()),
+    ] {
+        let served = fetch_from(relay.url(), filter).await;
+        assert!(
+            served.iter().all(|event| !refused_ids.contains(&event.id)),
+            "exit43: a refused event was served"
+        );
+    }
+    let served = fetch_from(
+        relay.url(),
+        Filter::new().custom_tag(SingleLetterTag::LOWERCASE_A, public.clone()),
+    )
+    .await;
+    assert!(
+        served.iter().any(|event| event.id == reply.id),
+        "exit43: the public repository's note must be served"
     );
 
     relay.stop().await;

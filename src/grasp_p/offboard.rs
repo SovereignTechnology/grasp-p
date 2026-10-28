@@ -45,9 +45,10 @@
 //!   at request time can see, or accepted before this rule existed.
 //!   Registrations stay gated, because a deletion of a registration is
 //!   exactly what a later replay of that registration must not undo.
-//! - [`cascade_exempt`], which upstream's announcement cascade asks. Any key
-//!   can publish a public event that tags both a public repository and a
-//!   registration, its state roots or its wraps, and the cascade follows
+//! - [`cascade_exempt`], which upstream's announcement cascade asks. A
+//!   public event that tags both a public repository and a registration,
+//!   its state roots or its wraps is refused now (`attachment`), but one
+//!   stored before that rule may still link them, and the cascade follows
 //!   tags both ways, so a public repository's deletion must never reach
 //!   them.
 //! - [`removal_exempt`], which upstream asks for every stored event it is
@@ -138,9 +139,11 @@ pub(crate) fn deletion_gate_exempt(svc: &PrivateService, kind: u16) -> bool {
 
 /// Whether upstream's announcement cascade passes over a stored event of
 /// `kind` on a GRASP-P node: registrations, state roots and stream wraps,
-/// which go only with the registration's own offboard request.
+/// which go only with the registration's own offboard request. No event of
+/// another kind may reference them any more (`attachment`), so no cascade
+/// edge should reach them; this keeps those that were stored before.
 pub(crate) fn cascade_exempt(kind: u16) -> bool {
-    kind == KIND_REGISTRATION || is_service_kind(kind)
+    super::is_private_event_kind(kind)
 }
 
 /// Whether upstream's deletion paths keep a stored event of `kind` on a
@@ -1287,12 +1290,13 @@ mod tests {
         );
     }
 
-    /// Upstream's announcement cascade follows tags both ways, and any key
-    /// can publish a public event that tags a public repository and also a
-    /// registration, its state root and its wrap. The deletion of that
-    /// public repository, by kind 5 or by its owner's vanish, removes the
-    /// announcement and the bridge and leaves the registration, its claims,
-    /// the state root and the wrap.
+    /// Upstream's announcement cascade follows tags both ways. A public
+    /// event that tags a public repository and also a registration, its
+    /// state root and its wrap is refused now, but one stored before that
+    /// rule stays, so the bridge is put in the store directly. The deletion
+    /// of that public repository, by kind 5 or by its owner's vanish,
+    /// removes the announcement and the bridge and leaves the registration,
+    /// its claims, the state root and the wrap.
     #[tokio::test]
     async fn a_public_cascade_takes_no_registration_state_root_or_wrap() {
         for by_vanish in [false, true] {
@@ -1315,7 +1319,14 @@ mod tests {
                 ])
                 .finalize(&outsider)
                 .expect("sign the bridge");
-            accepted(node.send(&bridge).await, "the bridge");
+            assert_eq!(
+                refusal(node.send(&bridge).await, "the bridge"),
+                format!(
+                    "restricted: {}",
+                    crate::grasp_p::attachment::REFERENCES_PRIVATE_MESSAGE
+                )
+            );
+            node.store(&bridge).await;
 
             let request = if by_vanish {
                 vanish(&outsider)

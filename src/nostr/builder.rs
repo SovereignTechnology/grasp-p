@@ -940,10 +940,12 @@ impl WritePolicy for Nip34WritePolicy {
             // Sync uses localhost:0 as a dummy address
             let is_synced = addr.ip().is_loopback() && addr.port() == 0;
 
-            // GRASP-P private-repo kinds (30640, 30641, the stream wraps).
-            // Routed only when the subsystem is enabled; otherwise they fall
-            // through to the dispatch below unchanged. Synced events
-            // (loopback:0) get the same handling as client submissions.
+            // GRASP-P seam: its own kinds (30640, 30641, the stream wraps),
+            // and every other kind that references their content, which
+            // it refuses. Only when the subsystem is enabled; otherwise
+            // every event goes to the dispatch below unchanged. Synced
+            // events (loopback:0) get the same handling as client
+            // submissions.
             if let Some(service) = self.grasp_p.get() {
                 if let Some(result) =
                     crate::grasp_p::admission::admit(service, event, is_synced).await
@@ -1023,12 +1025,6 @@ impl WritePolicy for Nip34WritePolicy {
                         "Accepted event from relay-owner identity"
                     );
                     WritePolicyResult::Accept
-                }
-                // GRASP-P: NIP-56 reports are logged (ids and digests only),
-                // then admitted by the related-event rules as before.
-                k if self.grasp_p.get().is_some() && k.as_u16() == crate::grasp_p::KIND_REPORT => {
-                    crate::grasp_p::admission::log_report(event);
-                    self.handle_related_event(event, "NIP-56 report").await
                 }
                 _ => self.handle_related_event(event, "Event").await,
             };

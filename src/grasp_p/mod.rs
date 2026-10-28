@@ -12,6 +12,7 @@
 //! `--version` whatever the flag says.
 
 pub mod admission;
+mod attachment;
 pub mod blacklist;
 pub mod blob_store;
 pub mod blossom_auth;
@@ -29,6 +30,7 @@ pub mod quota;
 pub mod rate;
 pub mod registration;
 pub mod relay_labels;
+mod reports;
 pub mod state_root;
 mod vetted_dns;
 pub mod write_keys;
@@ -71,8 +73,31 @@ pub const KIND_STREAM_WRAP: u16 = 3359;
 /// never quota-charged; a server admission capability only (no client
 /// currently emits it).
 pub const KIND_EPHEMERAL_STREAM_WRAP: u16 = 23359;
-/// NIP-56 report (Phase-4b D3 intake: log + metric only).
+/// NIP-56 report. One that points at private-repository content is logged,
+/// counted and refused (`reports`); any other is upstream's.
 pub const KIND_REPORT: u16 = 1984;
+
+/// Every kind GRASP-P owns: registrations, state roots, and the stream
+/// wraps of every kind, stored and ephemeral, the legacy kinds included
+/// whatever `accept_legacy_wrap_kind` says. A node that stopped taking the
+/// legacy kinds still holds the wraps it took before, and a GRASP-P node
+/// admits a 1059 as nothing but a stream wrap, so they count on every node.
+pub const PRIVATE_EVENT_KINDS: [u16; 6] = [
+    KIND_REGISTRATION,
+    KIND_STATE_ROOT,
+    KIND_STREAM_WRAP,
+    KIND_EPHEMERAL_STREAM_WRAP,
+    KIND_WRAP,
+    KIND_EPHEMERAL_WRAP,
+];
+
+/// Is `kind` one of [`PRIVATE_EVENT_KINDS`]? Kind membership only, whatever
+/// this node admits. The one list behind what upstream's cascade passes over
+/// (`offboard::cascade_exempt`) and behind what no event of another kind may
+/// reference (`attachment`), so the two cannot drift apart.
+pub fn is_private_event_kind(kind: u16) -> bool {
+    PRIVATE_EVENT_KINDS.contains(&kind)
+}
 
 /// Is `kind` an admissible STORED stream-wrap envelope?
 ///
@@ -422,8 +447,9 @@ pub struct PrivateConfig {
     /// The entries of `NGIT_GRASP_P_MIRROR_PEER_URLS`, as written: the only
     /// hosts the mirror fetches from, less the ones that name this node
     /// (`mirror::peer_servers_for`). Node-local and outside the
-    /// fingerprint: it decides where a node fetches blobs, never what it
-    /// accepts.
+    /// fingerprint: it decides where a node fetches blobs, never which
+    /// GRASP-P event it accepts. It does name the pair for a report's
+    /// `server` tag (`reports`), but GRASP-P replicates no report.
     pub mirror_peer_urls: Option<Vec<String>>,
     pub mirror_max_concurrency: u32,
     pub mirror_fetch_timeout_secs: u64,
@@ -449,11 +475,12 @@ pub struct PrivateConfig {
     /// `NGIT_GRASP_P_SYNC_PEER_URLS` that do not name this node
     /// (`sync::private_index::configured_peer_relay_keys`). Nothing else is
     /// a peer, the bootstrap relay included. It decides which relays
-    /// GRASP-P events may come from and go to, never whether an event is
-    /// admissible; the same event from a peer or a client is admitted under
-    /// the same rules. The fingerprint's domain set is read from the same
-    /// list (v4), so that a pair whose lists do not name each other shows a
-    /// mismatch.
+    /// GRASP-P events may come from and go to, never whether a GRASP-P
+    /// event is admissible; the same event from a peer or a client is
+    /// admitted under the same rules. It also names the pair when a
+    /// report's `server` tag is judged (`reports`). The fingerprint's
+    /// domain set is read from the same list (v4), so that a pair whose
+    /// lists do not name each other shows a mismatch.
     pub sync_peer_relays: HashSet<String>,
     /// R6 parity fingerprint over the admission-affecting config.
     pub policy_fingerprint: String,
@@ -612,7 +639,11 @@ fn policy_preimage(config: &Config) -> String {
         // with no convergence impact. The D1 denylist knobs are likewise
         // ABSENT: the denylist is node-local LEGAL config (per-jurisdiction
         // takedown lists legitimately differ across paired nodes) and its
-        // enforcement (451s, purges) never changes event acceptance.
+        // enforcement (451s, purges) never changes the acceptance of a
+        // GRASP-P event. It does decide whether a report naming a listed
+        // blob is refused, but a report is a public kind that GRASP-P does
+        // not replicate, so two nodes that differ there serve different
+        // public reports and the same private data.
         //
         // v2 -> v3 (wire-kind migration): `accept_legacy_wrap_kind` decides
         // which stream-wrap KINDS this node admits, which is DIRECT
@@ -642,7 +673,11 @@ fn policy_preimage(config: &Config) -> String {
         // deletion request from a write or aux key, or one naming a state
         // root or a stream wrap, is refused (the deletion guard). No node
         // runs v4 in a pair before the rest of M3 lands, so the knobs those
-        // changes add join under v4.
+        // changes add join under v4. The rules of merge requests 15a to 15c
+        // (nothing of another kind may reference a GRASP-P event, reports
+        // on private repositories are refused, GRASP-P events carry no
+        // reference tags, and the deletion and dialling rules after them)
+        // are code, not knobs, and join under v4 the same way.
         "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|blacklist={}|deletion_request_disrespector={}|domains={}",
         POLICY_VERSION,
         config.private_registration_mode,
@@ -788,6 +823,9 @@ pub struct PrivateService {
     /// are not peers, so each is reported once (see
     /// [`Self::note_foreign_sync_source`]).
     foreign_sync_sources: parking_lot::Mutex<HashSet<String>>,
+    /// The reports the intake has logged, so that one sync brings again is
+    /// logged and counted once (`reports::judge`).
+    logged_reports: parking_lot::Mutex<reports::LoggedReports>,
 }
 
 impl std::fmt::Debug for PrivateService {
@@ -850,6 +888,7 @@ impl PrivateService {
                 config.private_registration_replace_refill_per_hour as f64 / 3600.0,
             )),
             foreign_sync_sources: parking_lot::Mutex::new(HashSet::new()),
+            logged_reports: parking_lot::Mutex::new(reports::LoggedReports::default()),
         });
 
         svc.boot_reconcile().await?;
