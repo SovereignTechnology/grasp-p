@@ -773,6 +773,8 @@ curl -s 127.0.0.1:9464/metrics | grep '^ngit_private_events_rejected_total'
 
 Read the `kind` label mix: a single kind dominating = one misbehaving
 writer (e.g. 21059 spam from one key — also see [Rate limited](#rate-limited));
+kinds `5` and `62` are deletion requests and vanishes the node refused
+(§5: members cannot delete, and nothing may name a state root or a wrap);
 a broad mix = flood, or a policy misconfiguration rejecting legitimate
 members (check `NGIT_GRASP_P_TENANT_WHITELIST`, §1). Threshold is a starting
 default — tune to the instance baseline. Flood → tighten the nginx zones
@@ -1215,6 +1217,12 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | `restricted: registration requires N bits of NIP-13 proof of work` | pow mode, same place | genuine | re-mine the 30640 |
 | `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss, for a sender the mode admits: the holder's first edition is earlier, or the holder's seat is more than an hour old (`apply` in src/grasp_p/registration.rs) | genuine | pick another alias / minimal widen without the squatted keys |
 | `invalid: registration relays tag must list this node` / `invalid: registration server tag must list this node` | no value of the tag names this node: its host and port, and its mount path when it runs under `NGIT_BASE_PATH` (`parse_shape`) | genuine | publish the registration with this node's full URL in both tags |
+| `restricted: a repository's write and aux keys cannot delete; the account key deletes the whole repository` | kind 5 (except one naming only 30640 coordinates under the signer's own key, an offboard request) or kind 62 from a write or aux key of a registration on this node (`src/grasp_p/offboard.rs`) | genuine | none: members cannot delete from the server; the account deletes the repository |
+| `restricted: state roots and stream wraps are removed only with their repository's registration` | kind 5 naming a 30641 or a stream wrap this node holds by `e` id, or any by an `a` coordinate of those kinds | genuine | never send it; the server removes them with the registration |
+| `restricted: a registration can be deleted only by the account key that signed it` | kind 5 naming another pubkey's 30640, by coordinate or by `e` id | genuine | none |
+| `restricted: a registration is deleted by its coordinate (a tag), not by its event id alone` | kind 5 naming a stored 30640 by `e` id without its coordinate, or carrying `["k","30640"]` with no coordinate of the signer's own 30640 | genuine | send the coordinate `30640:<account>:<alias>` |
+| `invalid: deleting a registration requires a k tag of 30640` / `invalid: a registration coordinate must be written 30640:<pubkey>:<alias>` | offboard request without `["k","30640"]`, or with the kind spelled otherwise (`030640`) | genuine | fix the request; the k tag is what carries it to the other node |
+| `restricted: a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | kind 62 from a key with stored 30641s or wraps | genuine | offboard each repository by kind 5 |
 | HTTP 429 + `Retry-After: N` | `PUT /upload` write bucket empty (src/http/blossom.rs:167–172, 40–42) | transient | wait N seconds |
 | HTTP 451 + `X-Reason: content unavailable for legal reasons` | GET/HEAD/upload-preflight/commit on a denylisted sha (src/grasp_p/mod.rs:175, 189) | takedown | none — operator action only |
 | HTTP 507 + `X-Reason: quota exceeded` | blob routes over quota (src/grasp_p/mod.rs:176, 190) | genuine | DELETE blobs or ask for quota |
@@ -1581,6 +1589,14 @@ Pointers, not procedures:
 - **Three or more parties.** A chain of conflicts (A and B share one key,
   B and C another) is not order-independent at a replay or a rebuild: a
   later registrant can lose its seat there until sync redelivers it.
+- **Who may delete (D6).** Only the account key deletes, a whole
+  repository by its 30640 coordinate with `["k","30640"]`; members cannot
+  delete or vanish (§5), so a member who asks to delete is told to ask the
+  account. A vanish naming one node of a pair acts on that node only; a key
+  whose membership one node has not yet seen can vanish there, and its own
+  registrations go on that node only; with
+  `NGIT_DELETION_REQUEST_DISRESPECTOR=true` no registration is ever
+  deleted. See "Who may delete" in SEAMS.md.
 - **WS-path per-IP limiting gap**: nginx `limit_req` cannot inspect frames
   inside a long-lived WS connection — the per-IP outer layer covers the
   HTTP blob routes only; the inner layer is the per-write-key bucket

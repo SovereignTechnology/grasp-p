@@ -113,8 +113,19 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   alerts at most once per loser event id (1 h TTL), so boot-reconcile and sync redelivery of an
   already-resolved loser cannot re-alert forever; an **evicted stored** registration alerts
   unconditionally on every eviction.
-- **Claim death [N]**: key claims are also freed by an author-valid NIP-09 kind-5 deletion of a
-  30640 (by `a` coordinate or `e` id) and by a NIP-62 vanish, both honoring a `created_at` cutoff —
+- **Who may delete [N]** (decision D6): only the account key deletes a private repository's
+  data, and only the whole repository: a kind-5 naming its 30640 coordinate with
+  `["k","30640"]`, dated at most 900 s ahead (an `e` id only beside the coordinate), or its
+  NIP-62 vanish. A `w` or `aux` key sends no vanish and no kind-5 but one naming 30640
+  coordinates under its own key (an offboard request), with no `e` target but a stored 30640
+  it names that way; no request may name a 30641 or a stream wrap this node holds, by `e`
+  id, or any by `a` coordinate; a vanish from a key that signed stored 30641s or wraps is
+  refused; no tombstone blocks a 30641 or a wrap. The pair exchanges offboard requests and
+  the accounts' vanishes over the peer link. A deletion request removes no 30641 and no
+  wrap, and the cascade of a public repository's deletion removes no 30640, 30641 or wrap,
+  whatever public event tags them.
+- **Claim death [N]**: key claims are also freed by the account's NIP-09 kind-5 deletion of a
+  30640 (by `a` coordinate) and by its NIP-62 vanish, both honoring a `created_at` cutoff —
   an edition NEWER than the deletion keeps its claims, so a replayed stale deletion cannot wipe a
   live edition; vanish freeing runs only when the request targets this relay. Without this, a
   member could squat a future epoch's derivable rekey addresses, delete their own 30640, and wedge
@@ -380,7 +391,7 @@ retry. Honouring `Retry-After` is planned for a later client milestone.
   live 30640, verified against the tenant pubkey from the EXISTING keystore. The never-to-a-git-node
   delivery rule is enforced here by its own guard, independently of the invite path's — promotion
   carries `write_secret`, so it is the higher-value of the two leaks.
-- **export / offboard [D]**: decrypted portable bundle; kind-5 tombstone; retention purge.
+- **export / offboard [D]**: decrypted portable bundle; kind-5 tombstone (the 30640 coordinate with `["k","30640"]`, signed by the hosting key, sent to every node; never a kind-5 for 30641s or wraps, which the server refuses); retention purge.
 
 ### 4.1 Rotation: pending-epoch lifecycle and §3.3 sequencing [N]
 
@@ -595,6 +606,12 @@ lookup of its own).
 | 30641: `a` tag names another tenant than the alias's holder | `state root a tag does not match the live registration` | genuine |
 | 30641: author is not a `w` key of the live registration | `event author is not a registered write key for this alias` | genuine |
 | 1059/21059 while the legacy window is CLOSED | `legacy stream-wrap kind is not accepted on this node` | genuine, **not** widenable |
+| kind 5 or 62 from a `w` or `aux` key, except a kind 5 naming only 30640 coordinates under that key (and, by `e` id, stored 30640s it names that way) | `a repository's write and aux keys cannot delete; the account key deletes the whole repository` | genuine, **not** widenable |
+| kind 5 naming a 30641 or a stream wrap this node holds by `e` id, or any by an `a` coordinate of those kinds | `state roots and stream wraps are removed only with their repository's registration` | genuine |
+| kind 5 naming another pubkey's 30640, by coordinate or by `e` id | `a registration can be deleted only by the account key that signed it` | genuine |
+| kind 5 naming a stored 30640 by `e` id without its coordinate, or carrying `["k","30640"]` without a coordinate of a 30640 under its signer's key | `a registration is deleted by its coordinate (a tag), not by its event id alone` | genuine |
+| offboard kind 5 without `["k","30640"]`, or with the kind spelled other than `30640` | `deleting a registration requires a k tag of 30640` / `a registration coordinate must be written 30640:<pubkey>:<alias>` (`invalid:`) | genuine |
+| kind 62 from a key with stored 30641s or stream wraps | `a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | genuine |
 
 **[N]** The cord-git client treats any message containing the substring `unregistered` as its
 widenable case. The two transient identity-race strings are therefore deliberately worded to avoid
@@ -614,7 +631,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 | Operator / disk / coercion | Ciphertext-only; server verifies signatures against opaque keys |
 | Scraper / negentropy harvest | Same encryption; ciphertext harvest CONCEDED (not PQ) |
 | Non-member npub | No keys ⇒ cannot read; blob PUT and 30641 gated by registered write key + PoP. **Not** gated: `GET /<sha256>` is unauthenticated, so a non-member who learns a hash (state roots are public and name them) can download that (encrypted) blob. `GET /list/<pubkey>` answers only the listed pubkey (§1, §2.4) |
-| Malicious reader-member | Blobs content-addressed immutable; 30641 needs a `w` key; rekeys authenticated by the tenant signature, not by the derivable outer key |
+| Malicious reader-member | Blobs content-addressed immutable; 30641 needs a `w` key; rekeys authenticated by the tenant signature, not by the derivable outer key; no server-side deletion or vanish by a `w` or `aux` key, and no tombstone blocks a 30641 or a wrap (§2.1) |
 | Removed member | Forward-only: keeps old clone; post-rotation cannot push, learn new keys, or read new content |
 | Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat under an hour old loses to the live+1 widen and is evicted; an older one is a settled seat and keeps the address); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
 | Backdating tenant or member | Settled seats (§2.1): a seat over an hour old keeps its alias and its keys against another account's registration, however dated; inside the first hour the order decides, the eviction alerts with the offender's key and the account is closed; alias bound to the hosting key in v0.2 |
@@ -666,6 +683,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.1 — §3.2 deterministic merge + FIRST-edition anchor + winner exemptions + loser eviction (v0: bare "first-registrant-wins").
 - §2.1, §5, §6, §7 — settled seats: a seat whose first edition is more than an hour older than the node's clock is never the loser of a conflict, by alias or by key; the warning carries `incumbent_settled`; a boot reconcile judges the seats its meta index held by their age and the seats it creates by the order alone; no message text changed.
 - §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
+- §2.1, §5.2, §6 — who may delete (D6): the account key alone, a whole repository by its 30640 coordinate with `["k","30640"]`, not future-dated; members cannot delete or vanish; 30641s and wraps are never named by a request nor blocked by a tombstone, and no deletion path removes them; a public repository's cascade passes over 30640s too; offboard requests and account vanishes replicate between peers; new refusal strings, none containing `unregistered`.
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
 - §2.1, §5, §5.2 — order of checks in registration: shape (key cap first) before admission, admission before proofs of possession and before the conflict merge; an account that holds the alias is exempt from the mode; no message text changed. A node under a mount path is named by host and path in `relays`/`server`.
 - §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.

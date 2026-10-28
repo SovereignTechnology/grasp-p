@@ -197,9 +197,11 @@ Gaps being closed before production (tracked as issues on the two projects):
 - Every push uploads the full history as one pack. There is no fetch into an existing clone
   and no `git` remote helper; the working path is the `cord-git` CLI.
 - Member keys are passed as an nsec, and the keystore is unencrypted on disk.
-- No paid admission mode. Deleting a registration frees its alias and keys at once and drops
-  its claim on its blobs, which garbage collection removes after the grace period if nothing
-  else references them; the tombstone, the retention window and the purge of stored events
+- No paid admission mode. Only the account key deletes, and only a whole repository, by its
+  registration; members cannot delete from the server, and the deletion reaches both nodes of
+  a pair. Deleting a registration frees its alias and keys at once and drops its claim on its
+  blobs, which garbage collection removes after the grace period if nothing else references
+  them; the tombstone, the retention window and the purge of stored state roots and wraps
   are not implemented.
 
 The server runs on ngit-grasp v3.0.8. Its code is in `src/grasp_p/` and its settings are

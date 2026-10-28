@@ -163,9 +163,21 @@ project yet.
 - **Who may delete.** A kind 5 or a vanish request signed by a write key or a stream key is
   honoured for state roots and stream wraps, so a read-only or revoked member can delete a
   repository's stream history and block the shared stream key. Decided on 2026-10-27: only
-  the account key deletes, and only a whole repository (below).
+  the account key deletes, and only a whole repository (below). **Done:** a write or aux key
+  can send no vanish and no deletion request but a kind 5 naming 30640 coordinates under its
+  own key (an offboard request); no request may name a state root or a stream wrap the node
+  holds by id, or any by coordinate; the account deletes a repository by its registration's
+  coordinate with `["k", "30640"]`, dated at most 15 minutes ahead, and may vanish unless its
+  key is a write or aux key or signed stored state roots or wraps; tombstones no longer gate
+  state roots and stream wraps, so a request sent before a key was registered cannot block
+  it; upstream's deletion paths, the cascade of a public repository included, remove no
+  state root or wrap, and the cascade no registration. Offboard requests and the accounts'
+  vanishes ride the peer filters, so the other node of a pair sees the same deletion. See
+  "Who may delete" in [`SEAMS.md`](SEAMS.md). Still open: the hold, restore and purge (#1,
+  below).
 - **Offboarding (#1) is half there.** An accepted deletion of a registration already frees
-  the alias, the key claims and the blob claims. Missing: the tombstone and retention window
+  the alias, the key claims and the blob claims. A deletion accepted on one node of a pair
+  now reaches the other ("Who may delete", above). Missing: the tombstone and retention window
   (`NGIT_GRASP_P_OFFBOARD_RETENTION_SECS` is read and unused) and removal of the stored
   state roots and wraps. The text of issue 1 predates this. The hold is decided: 30 days,
   restorable by the same account key (below).
@@ -507,7 +519,7 @@ when the question was put.
   described. Objects are then bounded by bytes at every scope, and the per-account limit record
   of M9 needs no object field.
 - Only the account (hosting) key deletes anything from the server, and only a whole repository,
-  through its registration. Members cannot delete from the server: clients hide content through
+  through its registration (done in M3; above). Members cannot delete from the server: clients hide content through
   the encrypted stream, and the site says that the ciphertext stays until the repository is
   deleted. The server cannot tell members apart behind a shared key, so any deletion by a member
   would be a right for every member to delete everything.

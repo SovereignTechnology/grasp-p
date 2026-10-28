@@ -391,6 +391,23 @@ persist across restarts (`builder.rs:749-758,970`).
   therefore cannot wipe a *re-registered* newer edition. **Cutoff: satisfied.** Documented at
   `mod.rs:853-860`.
 
+- **Who may delete (decision D6), a restriction on top of the two NIPs:** on a GRASP-P node only
+  the account key deletes a private repository's data, and only the whole repository: a kind 5
+  naming its registration's coordinate with `["k", "30640"]`, not future-dated, or its vanish.
+  `grasp_p::offboard::guard`, called first in `grasp_p::admission::admit` for kinds 5 and 62,
+  refuses every request from a write or aux key but a kind 5 naming 30640 coordinates under its
+  own key (an offboard request), every request naming a state root or a stream wrap the node
+  holds by `e` id or any by an `a` coordinate of their kinds, a registration named by `e` id
+  alone or by another pubkey, and a vanish from a key that signed stored state roots or wraps.
+  NIP-09 lets an author delete its own events; refusing some of them is a relay's policy to
+  set, and every request that touches no GRASP-P key or event is upstream's, unchanged. The
+  tombstone gate is not run for state roots and the stream wraps the node takes
+  (`deletion_gate_exempt`), so no request blocks them; upstream's announcement cascade passes
+  over registrations, state roots and wraps (`cascade_exempt`), and its archive-and-delete step
+  over state roots and wraps (`removal_exempt`), so no other deletion removes them either.
+  Offboard requests (`#k` 30640) and the hosted accounts' vanishes are in the peer sync
+  filters. See "Who may delete" in `SEAMS.md`.
+
 **CONFORMANT.** Consuming these NIPs correctly requires no decryption and no NIP-44/59 linkage.
 
 ## 10. NIP-11 advert — `private_repos` + `policy_fingerprint`
@@ -612,6 +629,10 @@ had.
 
 1. **The NIP-59/NIP-09 deletion hazard does not apply to our wraps.** NIP-09 deletion of a gift wrap
    keys on a `p`-tag match; ours carry no `p` tag, so there is nothing to match. Not a risk we carry.
+   The signer's own deletion was the open path (any member holds the aux key that signs them); a
+   GRASP-P node now refuses every deletion request and vanish that names a stream wrap it holds,
+   upstream's deletion paths, the cascade of a public repository included, leave every wrap in
+   place, and no tombstone blocks one (§9).
 2. **Full NIP-59 conformance for these three is architecturally impossible, and the reason is *not*
    membership linkage.** The derived address pubkey already appears in the author field, so a `p` tag
    pointing at it would leak nothing new. The real reasons are structural: (a) NIP-59 rumors are

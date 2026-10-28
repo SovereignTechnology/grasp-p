@@ -14,7 +14,7 @@ Upstream's files carry thin seams only:
 
 | Upstream file | Seam |
 |---|---|
-| `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` calls `grasp_p::admission::admit` after the blacklist and deletion gates, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
+| `src/nostr/builder.rs` | `Nip34WritePolicy` holds the service (`set_grasp_p` / `grasp_p()`); `admit_event` passes over upstream's deletion gate for state roots and stream wraps (`grasp_p::offboard::deletion_gate_exempt`, see "Who may delete" below), calls `grasp_p::admission::admit` after the blacklist and the deletion gate, frees key claims after an honored kind 5 / 62, logs NIP-56 reports; `create_relay` builds the service; `RelayRuntime.grasp_p` |
 | `src/server.rs` | spawns GC, mirror and denylist reload (`grasp_p::spawn_background_tasks`); passes the service to HTTP; one call to `git::version::ensure_supported` before the storage migration, fatal only when GRASP-P is enabled; one call to `grasp_p::metrics_endpoint::start` ahead of every other background task, whose error stops startup; where `Metrics` is built, the builder call `with_relay_labels(RelayLabels::from_config(..))`, which passes `None` unless GRASP-P is enabled (see below) |
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
@@ -24,14 +24,16 @@ Upstream's files carry thin seams only:
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
 | `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one (see "Configured peers"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
 | `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
+| `src/nostr/lifecycle/deletion/cascade.rs` | the announcement cascade's plan leaves registrations, state roots and stream wraps out of the events it deletes on a GRASP-P node (`grasp_p::offboard::cascade_exempt`; one more argument to `plan_deleted_announcement_cascade`; see "Who may delete" below) |
+| `src/nostr/lifecycle/deletion/archival.rs` | `archive_and_delete_filter` leaves state roots and stream wraps in place on a GRASP-P node (`grasp_p::offboard::removal_exempt`; see "Who may delete" below) |
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
 | `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the two pair constructors also name their bootstrap peer in `NGIT_GRASP_P_SYNC_PEER_URLS` and, through `TestRelay::blob_peer_url`, in `NGIT_GRASP_P_MIRROR_PEER_URLS`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
-With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, blob
-routes, sync filters, timers, duplicate forwarding, the handling of configured peers (there
+With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, the
+deletion gate, cascade and removal exemptions, blob routes, sync filters, timers, duplicate forwarding, the handling of configured peers (there
 are none, and no connection carries the flag the dial check goes by), the metrics endpoint
 and the rewrite of relay labels are all gated on it, and `/metrics` is upstream's public route with upstream's
 labels; the GRASP-P metrics register lazily on first use. Two seams are deliberately not
@@ -1005,6 +1007,148 @@ what keeps a restart and a rebuild from changing what the node decided:
 - **The loser's blob claims** are still dropped at eviction; keeping them needs a claim
   state of its own, because claims are keyed by the alias the winner now holds.
 
+## Who may delete
+
+The maintainer's decision (D6, 2026-10-27): only the account key, the key that signs a
+repository's registration, deletes a private repository's data from the server, and only
+the whole repository, through that registration. Members cannot delete from the server at
+all. The server cannot tell members apart behind a shared key (every member holds the
+repository's aux key), so a right to delete for one member would be a right for every
+member, the read-only and the removed ones included, to erase everyone's history and to
+block the shared key for good. Clients hide content through the encrypted stream instead,
+and the ciphertext stays until the repository is deleted.
+
+### What upstream did on a GRASP-P node
+
+Upstream's tombstone gate (`DeletionService::gate`) runs before GRASP-P admission, for
+every kind, and upstream checks a kind 5 only for the authorship of the `e` targets it
+holds (`DeletionPolicy::validate_request`). So:
+
+- a write key could delete its stored state roots, by `e` id or by an `a` coordinate
+  `30641:<key>:<alias>`, and an aux key every stored wrap it signed, by `e` id or by one `a`
+  coordinate of the wrap kind: wraps are not addressable, so `3359:<key>:` names every
+  event of that kind by the key, dated up to the request;
+- a vanish (kind 62) from either removed every stored event of the key, and the gate then
+  refused all its later events; a vanish, or a coordinate deletion dated far ahead, sent
+  before the key was registered blocked the key once a registration listed it;
+- an account could delete its registration by event id alone, though the two nodes of a
+  pair can hold different editions for a while, and a far-future coordinate deletion
+  blocked its own later registrations of the alias;
+- upstream's announcement cascade, which a public repository's deletion, its owner's vanish
+  and a newer edition that no longer lists this node all run, follows tags both ways and
+  removes what no surviving public repository anchors. Any key may publish a public note
+  that tags a public repository it owns and also a registration, a state root or a wrap;
+  deleting that public repository then removed the registration, every state root that
+  tags it and the wraps the note named, with no request naming any of them.
+
+Kinds 5 and 62 were in no GRASP-P sync filter, and upstream's own filters ask only for
+events tagged with a public repository or one of its root events, so a deletion accepted on
+one node never reached the other: the registration stayed live there.
+
+### The rule, in four places
+
+- **The guard**, `grasp_p::offboard::guard`, which `grasp_p::admission::admit` calls first
+  for every kind 5 and kind 62, from a client or from sync. More than 2048 `e` and `a`
+  targets are refused first, in upstream's words and before any lookup; that refusal is
+  upstream's own, so it is neither counted nor logged as GRASP-P's. Then it refuses, in this
+  order: an `a` coordinate of a state root or a stream-wrap kind (stored, ephemeral and
+  legacy), its kind read as upstream reads it, as a number, so `030641` is 30641; an `a`
+  coordinate of a registration under another pubkey, or with its kind spelled other than
+  `30640` (upstream would delete the event, while the claim hook and the gate, which compare
+  text, would miss it); a request with `["k", "30640"]` that names no registration of its
+  signer by coordinate; any other request from a key that is a write or aux key of a
+  registration on this node (a claim row with no registration counts); an offboard request,
+  one naming registrations under its signer's own key by coordinate, without `["k",
+  "30640"]` or dated more than 15 minutes ahead (`check_not_future_dated`); from a write or
+  aux key, an offboard request that also names a coordinate of any other kind, or an `e`
+  target this node does not hold or that is anything but a registration the request names
+  by coordinate; and an `e` target this node holds that is a state root, a stream wrap,
+  another key's registration, or a registration whose coordinate the request does not name
+  too. A vanish is refused from a write or aux key, and from a key that signed a stored state
+  root or stream wrap: upstream would remove them, and a wrap names no repository, so there
+  is no telling whose history it is. Every other request returns `None`, and upstream
+  handles it exactly as on a node without GRASP-P (decision D1): a public repository's
+  deletion, an account deleting its own public notes, a stranger's vanish. A store that
+  cannot be read refuses with `error:` and deletes nothing. The refusals are `restricted:`,
+  or `invalid:` for a malformed offboard request, and none contains "unregistered", the word
+  the client widens on. Each counts in `ngit_private_events_rejected_total` under the kind
+  `5` or `62`. When the refused request came by sync, `admit` keeps its id in the hold
+  (`PrivateRejectedIndex::add_id_only`), as for a refused GRASP-P kind, so the negentropy
+  batch that asked for it completes instead of failing on every connect; a store fault and
+  the target cap keep nothing.
+- **The gate exemption**, in `admit_event` (`src/nostr/builder.rs`, 9 lines in place of 2,
+  inert with GRASP-P off): the gate is not called for a state root or a stream wrap of a
+  kind this node takes (`grasp_p::offboard::deletion_gate_exempt`). Only this stops a request
+  that got in before its key was registered, or before this rule, from blocking that key; no
+  check at request time can see the future. Registrations stay gated: a coordinate deletion
+  of a registration is exactly what must keep a replay of it out. A legacy kind the node
+  refuses keeps upstream's gate and upstream's answer, since admission refuses it anyway.
+- **Upstream's deletion paths**, two seams, both inert with GRASP-P off. The cascade's plan
+  (`plan_deleted_announcement_cascade` in `src/nostr/lifecycle/deletion/cascade.rs`) leaves
+  registrations, state roots and stream wraps out of the events it deletes
+  (`grasp_p::offboard::cascade_exempt`), so whatever public event tags them, a public
+  repository's deletion, vanish or de-listing does not remove them; they stay in the graph,
+  so what the cascade keeps or removes of every public event is upstream's.
+  `archive_and_delete_filter` (`archival.rs`, 8 lines added), the step every
+  NIP-09, NIP-62 and cascade deletion goes through, leaves a state root or a stream wrap in
+  place (`grasp_p::offboard::removal_exempt`): the backstop for a request whose target
+  arrived between the guard's lookup and upstream's delete, which no lock covers. Both count
+  the legacy kinds whatever the setting, since a node that stopped taking them still holds
+  the ones it took. GRASP-P's own removals (an evicted registration, and the hold-and-purge
+  work) delete from the store directly and are not affected.
+- **The sync filters**, `build_private_offboard_filter` and `build_private_vanish_filters`
+  in `src/sync/grasp_p_sync.rs`. The peer set (`grasp_p_filter_set`) carries
+  `{kinds:[5], #k:["30640"]}`, unscoped by author, so a node takes an offboard request
+  before it holds the registration and refuses the registration when it arrives, and
+  `{kinds:[62], authors:[...]}` for every 100 accounts that hold registrations here
+  (`PrivateRepoEntry::tenant_hex`, `PrivateSyncIndex::tenants`). Both go to configured peers
+  only, on connect, quick reconnect, consolidation and the full re-issue; the vanish filters
+  also ride the re-issue an index change sends (`grasp_p_index_filters`), and a change of a
+  registration's account is an index change. A synced request passes the same write
+  policy, so both nodes judge it alike and run the same claim hook.
+
+An accepted request is upstream's from there: its NIP-09 or NIP-62 handling, then the
+claim-freeing hooks in `builder.rs`, unchanged. A deletion request removes no state root and
+no wrap, the guard refusing every request that names one this node holds and the removal
+exemption keeping any other. They stay stored and served, and new ones are refused because
+the registration is gone, until the hold-and-purge work removes them with the repository. An
+account's vanish removes its registrations; the state roots and wraps its members signed
+stay in the same way.
+
+### What is left
+
+- **Requests accepted before this rule** keep their effect: what they deleted is gone. Their
+  tombstones still gate registrations, by design, and no longer gate state roots or wraps.
+- **An `e` target this node does not hold** cannot be judged. From a write or aux key the
+  request is refused; from any other key, for a state root or a wrap the exemptions make it
+  inert. An account's deletion of a registration edition by id alone and without the k tag,
+  sent to the node that does not hold that edition, is taken there, and that node then
+  refuses the edition when it arrives while the other keeps it; the account's next edition
+  heals the split.
+- **A request the two nodes judge differently** is acted on by one only: one node has seen a
+  key's membership or a target the other has not yet, or runs the previous build. The
+  refusing node keeps the request's id for the hold's time to live, so sync with its peer
+  completes, and is offered it again once the id expires.
+- **An account key that is also a member key cannot vanish.** A key that holds a write or
+  aux claim, or signed stored state roots or wraps, closes its repositories one by one with
+  offboard requests instead. A key whose membership one node has not seen yet can vanish on
+  that node, which then removes that key's own registrations there only.
+- **The offboard request stays public** under upstream's request retention (served for
+  months after its last use), naming the account key and the alias; it is what keeps a
+  replay of the registration out (decision D7).
+- **A public event that tags a registration, a state root or a wrap** is still upstream's,
+  and upstream's cascade may remove it with a public repository it tags, or with one that
+  another public event links to the same registration, state root or wrap. What may
+  attach to a private repository at all is the attachment work of the private-only switch.
+- **The hold-and-purge work** must remove state roots and wraps with GRASP-P's own store
+  calls: on a GRASP-P node `archive_and_delete_filter` passes over them, and the cascade's
+  plan over registrations too.
+- **Disrespector mode** (`NGIT_DELETION_REQUEST_DISRESPECTOR=true`): the guard refuses as
+  ever, upstream only records what passes, and no registration is ever deleted; refusing
+  the combination at boot comes with the hold-and-purge work.
+- **Every full re-issue** asks the peer for every offboard request it still serves, and each
+  is a duplicate here: one filter, bounded by upstream's request retention.
+
 ## Configured peers: the only relays GRASP-P syncs with; kept, not muted, redialled
 
 The relay connection a node keeps to the other node of its pair is how private
@@ -1506,6 +1650,51 @@ features. No package was added.
   redial. No test waits out the 300 seconds, runs a peer down for hours, or resolves a
   name to a NAT64 address, and no integration test has a relay send GRASP-P events it was
   not asked for: the gate is covered by the unit tests.
+- Who may delete ("Who may delete"). Unit tests in `src/grasp_p/offboard.rs` build a node's
+  write policy and stores as the server does, over an in-memory relay database, and send each
+  request both to the guard alone and through `admit_event`:
+  `member_keys_cannot_delete_or_vanish` (a live write key and aux key, whatever they name;
+  nothing is removed or blocked),
+  `a_member_key_names_nothing_beside_its_own_registration_coordinate` (beside a coordinate
+  under its own key, an id the node does not hold, its own public note and a public
+  repository are refused; the coordinate alone passes and changes nothing),
+  `dropped_keys_cannot_delete_what_they_signed` (state root and wraps of both stored kinds by
+  id, every coordinate form of their kinds, the vanishes),
+  `the_account_deletes_its_repository_by_the_registration_coordinate` (every malformed
+  offboard request refused; the accepted one frees the keys and leaves the state root and
+  the wrap), `an_offboard_request_by_coordinate_alone_passes`,
+  `a_registration_is_deleted_only_by_its_own_account`,
+  `an_own_registration_named_by_id_needs_its_own_coordinate` (by id without the k tag, and
+  beside another of the account's coordinates),
+  `requests_that_touch_no_grasp_p_key_or_event_are_upstreams` (a public repository among
+  them), `the_account_vanishes_and_a_member_key_does_not`,
+  `too_many_targets_are_refused_first`, `a_refused_synced_request_is_remembered_by_id` and
+  `other_kinds_are_not_judged`. The gate:
+  `the_gate_exemption_is_state_roots_and_stream_wraps_only` (also on a node that refuses the
+  legacy kinds, and the cascade and removal exemptions), and two that fail without the seam,
+  `a_vanish_sent_before_registration_does_not_block_the_key` and
+  `tombstones_recorded_earlier_block_no_state_root_or_wrap`. Upstream's deletion paths:
+  `a_public_cascade_takes_no_registration_state_root_or_wrap` (an outsider's note bridges
+  its public repository to a registration, its state root and its wrap; the repository's
+  deletion and the outsider's vanish each remove the note and nothing private), and
+  `upstream_removes_no_state_root_or_wrap_however_a_request_got_in` (a deletion request and a
+  vanish handed to upstream's deletion service directly, past the guard).
+  `with_grasp_p_off_upstream_decides_alone` fails if the gate seam or the guard acts with
+  GRASP-P off. The filters:
+  `private_deletion_filters_ask_for_offboard_requests_and_account_vanishes` and
+  `deletion_filters_go_only_to_configured_peers` in `src/sync/grasp_p_sync.rs` (the peer
+  set, the index-change set and upstream's live coverage builder),
+  `tenants_are_each_account_once_in_order` and the account case of `test_replace_all_diff`
+  in `src/sync/private_index.rs`. In `private_two_node`,
+  `exit22_offboard_request_reaches_the_peer_and_a_write_key_cannot_delete`: a write key's
+  deletion of its state root is refused on both nodes; the account's offboard request, sent
+  to A only, reaches B, where the registration is then no longer live; and a second
+  account's vanish, sent to A only, reaches B through the vanish filter B adds when its
+  index changes, and B stops serving that registration. In `private_repos`, `exit10` now
+  has an e-only deletion of a registration and another account's deletion refused, the
+  latter checked against a key the tenant still holds. No test makes a store fail, and none
+  reaches the `e`-id branch of `free_claims_for_deleted_registrations` any more: an
+  accepted offboard request names the coordinate, which frees the claims first.
 - The blob routes ("What the blob routes answer"). Unit tests carry the rules, without a
   server: in `src/http/blossom.rs` the headers of every error, of a served blob and of its
   `304`, the `If-None-Match` matching, and the order denylist, existence, conditional
