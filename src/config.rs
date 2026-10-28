@@ -685,6 +685,9 @@ pub struct Config {
 
     /// Event blacklist: comma-separated list of npubs whose events are rejected
     /// All events from these authors are blocked from both relay storage and purgatory
+    ///
+    /// GRASP-P (NGIT_GRASP_P_REPOS_ENABLE=true): also freezes the private repositories of a
+    /// listed account, and is part of the policy fingerprint (see the configuration reference).
     #[arg(long, env = "NGIT_EVENT_BLACKLIST", default_value = "")]
     pub event_blacklist: String,
 
@@ -899,7 +902,9 @@ pub struct Config {
     /// `relays` tags are advisory metadata and never trigger a connection
     /// (SSRF / membership-map-leak guard). The relay in
     /// NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it is listed here
-    /// too. Unset (default): no peers, so no private-repo replication.
+    /// too. The policy fingerprint covers this node's address and these
+    /// peers, so the two nodes of a pair must list each other to match.
+    /// Unset (default): no peers, so no private-repo replication.
     #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
     pub private_sync_peer_urls: Option<String>,
 
@@ -935,7 +940,7 @@ pub struct Config {
     /// unregistered 1059s outright. Nodes with private repos disabled are
     /// unaffected (1059 keeps its vanilla public handling).
     /// Cross-node acceptance knob — part of the policy_fingerprint
-    /// preimage (v3).
+    /// preimage (since v3).
     #[arg(
         long,
         env = "NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND",
@@ -995,7 +1000,7 @@ pub struct Config {
     /// retries. A rejected replacement is HELD locally and retried after
     /// bucket refill (the hourly re-issue is the backstop healer).
     /// Cross-node acceptance knob — part of the policy_fingerprint
-    /// preimage (v3).
+    /// preimage (since v2).
     #[arg(
         long,
         env = "NGIT_GRASP_P_REGISTRATION_REPLACE_CAPACITY",

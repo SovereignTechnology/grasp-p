@@ -490,7 +490,10 @@ fn fingerprint_detail(reason: String, a: &Option<String>, b: &Option<String>) ->
         ),
         (Some(x), Some(_)) => format!(
             "{reason}; both nodes report policy_version={x}: this is a SAME-VERSION knob \
-             split — a real acceptance divergence. Compare the preimage knobs (runbook §2)"
+             split — the nodes differ in a preimage knob or the event blacklist, a real \
+             acceptance divergence, or their peer lists do not name each other by their own \
+             addresses. Compare the boot lines' sync_peers and event_blacklist_keys, then the \
+             preimage knobs (runbook §2)"
         ),
         // Exactly one side advertises a label. That node is NOT on some
         // other version — the peer PREDATES the policy_version field, which

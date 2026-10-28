@@ -12,6 +12,7 @@
 //! `--version` whatever the flag says.
 
 pub mod admission;
+pub mod blacklist;
 pub mod blob_store;
 pub mod blossom_auth;
 pub mod build_info;
@@ -447,13 +448,22 @@ pub struct PrivateConfig {
     /// sync code files relays under: the entries of
     /// `NGIT_GRASP_P_SYNC_PEER_URLS` that do not name this node
     /// (`sync::private_index::configured_peer_relay_keys`). Nothing else is
-    /// a peer, the bootstrap relay included. Node-local and outside the
-    /// fingerprint: it decides which relays GRASP-P events may come from and
-    /// go to, never whether an event is admissible; the same event from a
-    /// peer or a client is admitted under the same rules.
+    /// a peer, the bootstrap relay included. It decides which relays
+    /// GRASP-P events may come from and go to, never whether an event is
+    /// admissible; the same event from a peer or a client is admitted under
+    /// the same rules. The fingerprint's domain set is read from the same
+    /// list (v4), so that a pair whose lists do not name each other shows a
+    /// mismatch.
     pub sync_peer_relays: HashSet<String>,
     /// R6 parity fingerprint over the admission-affecting config.
     pub policy_fingerprint: String,
+    /// The keys on `NGIT_EVENT_BLACKLIST`, as lowercase hex
+    /// (`blacklist::blacklisted_keys`), read once at start. A write signed
+    /// by one of them, or made under a registration of one of them, is
+    /// refused ([`PrivateService::write_blocked`]). Part of
+    /// `policy_fingerprint` (v4): it decides what a node accepts, synced
+    /// events included.
+    pub write_blacklist: HashSet<String>,
     /// Phase-4b A1: per-write-key token bucket capacity for CLIENT-submitted
     /// private writes (30641/1059/21059 events + blob PUTs). 0 = unlimited
     /// (limiter disabled). Node-local DoS protection only — synced/loopback
@@ -464,7 +474,7 @@ pub struct PrivateConfig {
     pub write_rate_refill_per_min: u32,
     /// Phase-4b A2: per-(tenant, alias) token bucket capacity for same-tenant
     /// kind-30640 REPLACEMENTS (0 = unlimited). Cross-node acceptance knob —
-    /// part of the `policy_fingerprint` preimage (v3): a same-tenant newer
+    /// part of the `policy_fingerprint` preimage (since v2): a same-tenant newer
     /// 30640 accepted on one node may be cadence-rejected on another running
     /// different knobs, and the divergence heals only via refill + sync
     /// redelivery, so paired nodes must run identical values.
@@ -523,6 +533,7 @@ impl PrivateConfig {
             .into_iter()
             .collect(),
             policy_fingerprint: policy_fingerprint(config),
+            write_blacklist: blacklist::blacklisted_keys(config).into_iter().collect(),
             write_rate_capacity: config.private_write_rate_capacity,
             write_rate_refill_per_min: config.private_write_rate_refill_per_min,
             registration_replace_capacity: config.private_registration_replace_capacity,
@@ -536,18 +547,9 @@ impl PrivateConfig {
     }
 }
 
-/// R6 config-parity fingerprint: a short hash of the admission-affecting
-/// private-repo config. Both nodes of a pair must advertise the SAME value
-/// (compare via NIP-11 `private_repos.policy_fingerprint` or the startup
-/// log); a mismatch means registrations can be accepted on one node and
-/// silently rejected on the other (per-repo desync).
-///
-/// The raw tenant whitelist feeds the hash but is never exposed. The domain
-/// set is `sorted({own service address} ∪ {bootstrap peer})` so a correctly-paired
-/// two-node setup (each bootstrapped to the other) hashes the same set on
-/// both sides.
-/// Label of the `policy_fingerprint` PREIMAGE FORMAT, bumped whenever a
-/// knob joins or leaves the preimage.
+/// Label of the `policy_fingerprint` PREIMAGE FORMAT, bumped when a knob
+/// joins or leaves the preimage, or a rule of acceptance changes without
+/// one, between two builds that may run side by side in a pair.
 ///
 /// Advertised verbatim alongside the digest (NIP-11
 /// `private_repos.policy_version`) because the digest alone cannot
@@ -557,36 +559,49 @@ impl PrivateConfig {
 /// bump) versus a same-version knob split (a real, lasting divergence in
 /// what the two nodes accept). Operators who cannot tell those apart learn
 /// to ignore the one signal that reveals a genuine split view.
-pub const POLICY_VERSION: &str = "grasp-p-policy-v3";
+pub const POLICY_VERSION: &str = "grasp-p-policy-v4";
 
+/// R6 config-parity fingerprint: a short hash of the admission-affecting
+/// private-repo config. Both nodes of a pair must advertise the SAME value
+/// (compare via NIP-11 `private_repos.policy_fingerprint` or the startup
+/// log); a mismatch means registrations can be accepted on one node and
+/// silently rejected on the other (per-repo desync).
+///
+/// The raw tenant whitelist and event blacklist feed the hash but are never
+/// exposed. The domain set is this node's service address and its
+/// configured sync peers, so the two nodes of a correctly paired pair, each
+/// of which lists the other, hash the same set.
 pub fn policy_fingerprint(config: &Config) -> String {
     use bitcoin_hashes::sha256;
 
-    fn strip_url(value: &str) -> String {
-        let v = value.trim().trim_end_matches('/');
-        for prefix in ["wss://", "ws://", "https://", "http://"] {
-            if let Some(rest) = v.strip_prefix(prefix) {
-                return rest.to_string();
-            }
-        }
-        v.to_string()
-    }
+    let digest = sha256::Hash::hash(policy_preimage(config).as_bytes()).to_string();
+    digest[..16].to_string()
+}
 
+/// The text [`policy_fingerprint`] hashes.
+fn policy_preimage(config: &Config) -> String {
     // The service address, not the bare domain: under NGIT_BASE_PATH the
-    // peer names this node by a URL that carries the mount path, and the two
-    // nodes of a pair must hash the same set. Identical to the domain for a
-    // root deployment.
-    let mut domains = vec![strip_url(&config.service_address())];
-    if let Some(ref bootstrap) = config.sync_bootstrap_relay_url {
-        domains.push(strip_url(bootstrap));
-    }
+    // peer names this node by a URL that carries the mount path. Identical
+    // to the domain for a root deployment. Each peer is the key the sync
+    // code files it under, as in `PrivateConfig::sync_peer_relays`, less
+    // the entries that name this node.
+    let own = config.service_address();
+    let mut domains = vec![fingerprint_domain(&own)];
+    domains.extend(
+        crate::sync::private_index::configured_peer_relay_keys(
+            &config.private_sync_peer_url_entries(),
+            &own,
+        )
+        .iter()
+        .map(|key| fingerprint_domain(key.as_str())),
+    );
     domains.sort();
     domains.dedup();
 
     let mut whitelist = config.private_tenant_whitelist_entries();
     whitelist.sort();
 
-    let preimage = format!(
+    format!(
         // v1 -> v2 (Phase-4b A2): the 30640 replacement-cadence knobs now
         // affect cross-node acceptance (a same-tenant newer edition can be
         // accepted on one node and cadence-rejected on another), so they
@@ -606,7 +621,29 @@ pub fn policy_fingerprint(config: &Config) -> String {
         // exactly the split-view divergence this fingerprint exists to
         // detect. The label bumps with it so a v2/v3 mismatch is itself the
         // signal an operator must see on a rolling upgrade.
-        "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|domains={}",
+        //
+        // v3 -> v4 (M3): `domains` is the service address and the configured
+        // sync peers, no longer the bootstrap relay. The peers are the only
+        // relays GRASP-P replicates with, and the bootstrap relay is one only
+        // when the list names it, so a pair whose lists do not name each
+        // other now shows, and a pair that bootstraps public sync from a
+        // third relay can match at all. `blacklist` joins, as sorted hex
+        // keys: a write by a listed account or key is refused on every path,
+        // synced events included, and no registration displaces a listed
+        // account's seat, so two nodes with different lists take and refuse
+        // different events. `deletion_request_disrespector`, upstream's
+        // archival switch, joins: it decides whether an honored deletion
+        // request frees a registration's alias and keys, so with it on one
+        // node only, a later registration that reuses them is taken there
+        // and refused on the other. Two rules changed acceptance with no knob
+        // since v3, and the label marks them as well, so that a pair half on
+        // an older build reads as a version skew: a seat whose first edition
+        // is more than an hour old is never displaced (settled seats), and a
+        // deletion request from a write or aux key, or one naming a state
+        // root or a stream wrap, is refused (the deletion guard). No node
+        // runs v4 in a pair before the rest of M3 lands, so the knobs those
+        // changes add join under v4.
+        "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|blacklist={}|deletion_request_disrespector={}|domains={}",
         POLICY_VERSION,
         config.private_registration_mode,
         config.private_pow_bits,
@@ -621,10 +658,47 @@ pub fn policy_fingerprint(config: &Config) -> String {
         config.private_registration_replace_capacity,
         config.private_registration_replace_refill_per_hour,
         config.private_accept_legacy_wrap_kind,
+        blacklist::blacklisted_keys(config).join(","),
+        config.deletion_request_disrespector,
         domains.join(","),
-    );
-    let digest = sha256::Hash::hash(preimage.as_bytes()).to_string();
-    digest[..16].to_string()
+    )
+}
+
+/// One member of the preimage's domain set: a relay URL or a service
+/// address as host, port and path, without the scheme.
+///
+/// A node's own member comes from its configuration and its peer's from the
+/// peer list, written by hand on another machine, so both are brought to the
+/// key the sync code files a relay under (`canonical_relay_key`: the host in
+/// lower case, no default port, no trailing slash) before the scheme is
+/// dropped. Otherwise `NGIT_DOMAIN=Git.Example` on one node and
+/// `wss://git.example/` in its peer's list would be two names for one node,
+/// and the pair could never match. The scheme is left out, as it always was,
+/// so a peer may be listed over `ws://`, but by its own `NGIT_DOMAIN`, port
+/// and mount path. A peer listed by another address, such as its address on a
+/// private link, is another name, and the two fingerprints differ for good.
+fn fingerprint_domain(value: &str) -> String {
+    fn without_scheme(value: &str) -> &str {
+        ["wss://", "ws://", "https://", "http://"]
+            .iter()
+            .find_map(|prefix| value.strip_prefix(*prefix))
+            .unwrap_or(value)
+    }
+    let bare = without_scheme(value.trim()).trim_end_matches('/');
+    let member = match crate::sync::canonical_relay_key(&format!("wss://{bare}")) {
+        Ok(key) => without_scheme(&key).trim_end_matches('/').to_string(),
+        Err(_) => bare.to_string(),
+    };
+    // A peer's key has already lost the default port of its own scheme, :80
+    // for ws:// and :443 for wss://, while this node's address has no scheme
+    // to lose one by. With the scheme gone neither default can be told from
+    // no port, so both go alike.
+    let (authority, path) = member.split_at(member.find('/').unwrap_or(member.len()));
+    let authority = authority
+        .strip_suffix(":80")
+        .or_else(|| authority.strip_suffix(":443"))
+        .unwrap_or(authority);
+    format!("{authority}{path}")
 }
 
 /// Upper bound on how far into the future a private event's `created_at` may
@@ -647,6 +721,17 @@ pub(crate) fn check_not_future_dated(event: &Event) -> Option<WritePolicyResult>
     } else {
         None
     }
+}
+
+/// Does this node look meant to be one of a pair, yet have no sync peer?
+///
+/// The mirror, or a bootstrap relay, says the operator expects another node;
+/// with no entry in `NGIT_GRASP_P_SYNC_PEER_URLS` that names another node,
+/// nothing replicates, and nothing at startup would say so. A node with
+/// neither is taken to stand alone on purpose and is not warned.
+fn lacks_expected_sync_peers(cfg: &PrivateConfig, bootstrap_relay: Option<&str>) -> bool {
+    let bootstrap_set = bootstrap_relay.is_some_and(|url| !url.trim().is_empty());
+    cfg.sync_peer_relays.is_empty() && (cfg.mirror_enable || bootstrap_set)
 }
 
 /// How many relays [`PrivateService::note_foreign_sync_source`] reports by
@@ -769,15 +854,56 @@ impl PrivateService {
 
         svc.boot_reconcile().await?;
         svc.refresh_gauges();
+        let mut sync_peers: Vec<&String> = svc.cfg.sync_peer_relays.iter().collect();
+        sync_peers.sort();
         tracing::info!(
             mode = %svc.cfg.registration_mode,
             policy_fingerprint = %svc.cfg.policy_fingerprint,
+            policy_version = POLICY_VERSION,
             mirror_enabled = svc.cfg.mirror_enable,
-            configured_peer = ?config.sync_bootstrap_relay_url,
+            sync_peers = ?sync_peers,
+            event_blacklist_keys = svc.cfg.write_blacklist.len(),
             build = build_info::version(),
             "GRASP-P private repositories enabled"
         );
+        if lacks_expected_sync_peers(&svc.cfg, config.sync_bootstrap_relay_url.as_deref()) {
+            tracing::warn!(
+                "NGIT_GRASP_P_SYNC_PEER_URLS names no peer of this node: it takes no private \
+                 repository from any relay, and its policy_fingerprint covers no peer. The relay \
+                 in NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when that list names it too"
+            );
+        }
+        // Upstream exempts this node's own key from the list, so the
+        // registrations and deletion requests it signs are taken here and
+        // refused by a peer with another key: a split the fingerprint cannot
+        // show, since both nodes hash the same list.
+        if let Ok(owner) = config.relay_owner_keys() {
+            if svc
+                .cfg
+                .write_blacklist
+                .contains(&owner.public_key().to_hex())
+            {
+                tracing::warn!(
+                    "NGIT_EVENT_BLACKLIST names this node's own key, which upstream exempts from \
+                     the list: this node takes the registrations and deletion requests it signs \
+                     and a peer with another key refuses them, which the policy_fingerprint \
+                     cannot show"
+                );
+            }
+        }
         Ok(svc)
+    }
+
+    /// Why a write is refused by the operator's event blacklist, if it is:
+    /// `signer_hex` signed it, under a registration of the account
+    /// `tenant_hex` ([`blacklist`]). Asked by every write path, for client
+    /// writes and synced events alike, once the registration the write is
+    /// made under is known: state roots, stream wraps, and the uploads,
+    /// upload preflights and deletes of the blob routes; and by a live
+    /// registration, under the registration that lists its signer, if one
+    /// does. No read asks.
+    pub(crate) fn write_blocked(&self, signer_hex: &str, tenant_hex: &str) -> Option<String> {
+        blacklist::write_refusal(&self.cfg.write_blacklist, signer_hex, tenant_hex)
     }
 
     /// Phase 2: the out-of-order rejected-event hold (30641 by alias, 1059
@@ -1185,6 +1311,15 @@ impl PrivateService {
             }
         }
 
+        // Decision D9: the wraps of a listed account are refused whichever
+        // of its keys signs them, stored or ephemeral, from a client or from
+        // sync. Upstream refused only those its listed key signed itself.
+        if let Some(reason) = self.write_blocked(&author_hex, &record.tenant_hex) {
+            let result = blacklist::reject_blocked(reason);
+            record_event_metric(kind, &result);
+            return Some(result);
+        }
+
         // Quota: charge only stored wraps (3359/1059), never ephemeral
         // (23359/21059).
         // §4b idempotency: admit_event runs BEFORE the library's save_event,
@@ -1402,6 +1537,15 @@ impl PrivateService {
             return Err(BlobError::Forbidden(
                 "signing key is not a write key for this alias".into(),
             ));
+        }
+        // Decision D9: a listed account's uploads, upload preflights and
+        // deletes are refused, and so are a listed key's. `GET /<sha256>`
+        // and `GET /list` never come here, so a frozen account can still
+        // take its data. Asked only once the write would otherwise pass, so
+        // only a write key of the repository learns that its account is
+        // listed.
+        if let Some(reason) = self.write_blocked(&auth.pubkey_hex, &record.tenant_hex) {
+            return Err(BlobError::Forbidden(reason));
         }
         Ok(auth)
     }
@@ -2222,20 +2366,238 @@ mod tests {
         );
     }
 
-    /// A pair mounted under a base path names each other with the path, so
-    /// each node's own entry in the preimage has to carry it too, or the two
-    /// fingerprints can never match.
+    /// One node of a pair: served at `domain` under `base_path`, listing
+    /// `peers` in `NGIT_GRASP_P_SYNC_PEER_URLS`.
+    fn pair_node(domain: &str, base_path: &str, peers: &str) -> Config {
+        let mut config = Config::for_testing();
+        config.domain = domain.to_string();
+        config.base_path = base_path.to_string();
+        config.private_sync_peer_urls = Some(peers.to_string());
+        config
+    }
+
+    /// One field of the preimage, by name.
+    fn preimage_field(config: &Config, name: &str) -> String {
+        let preimage = policy_preimage(config);
+        let prefix = format!("{name}=");
+        preimage
+            .split('|')
+            .find_map(|field| field.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no {name} in {preimage}"))
+            .to_string()
+    }
+
+    /// The domain set is the service address and the configured sync peers.
+    /// Two nodes that list each other hash one set however each operator
+    /// spelled the other node, with or without a mount path, and one list
+    /// can serve both; a list that leaves the other node out shows.
     #[test]
-    fn fingerprint_is_symmetric_for_a_pair_under_a_base_path() {
-        let mut a = Config::for_testing();
-        a.domain = "a.example".to_string();
-        a.base_path = "/grasp".to_string();
-        a.sync_bootstrap_relay_url = Some("wss://b.example/grasp".to_string());
-        let mut b = Config::for_testing();
-        b.domain = "b.example".to_string();
-        b.base_path = "/grasp".to_string();
-        b.sync_bootstrap_relay_url = Some("wss://a.example/grasp".to_string());
+    fn fingerprint_domains_are_the_service_and_its_sync_peers() {
+        let a = pair_node("a.example", "/", "wss://b.example");
+        let b = pair_node("b.example", "/", "wss://a.example");
+        assert_eq!(preimage_field(&a, "domains"), "a.example,b.example");
         assert_eq!(policy_fingerprint(&a), policy_fingerprint(&b));
+
+        // One list for both nodes: each leaves itself out.
+        let shared = "wss://a.example,wss://b.example";
+        for own in ["a.example", "b.example"] {
+            assert_eq!(
+                policy_fingerprint(&pair_node(own, "/", shared)),
+                policy_fingerprint(&a),
+                "{own}"
+            );
+        }
+
+        // Spellings of one node, in the list and in NGIT_DOMAIN.
+        for spelling in [
+            "https://B.Example/",
+            "wss://b.example:443",
+            "b.example",
+            " wss://b.example/ ",
+        ] {
+            assert_eq!(
+                policy_fingerprint(&pair_node("a.example", "/", spelling)),
+                policy_fingerprint(&a),
+                "{spelling:?}"
+            );
+        }
+        assert_eq!(
+            policy_fingerprint(&pair_node("A.Example", "/", "wss://b.example")),
+            policy_fingerprint(&a)
+        );
+        // A peer may be listed over ws://, under its own NGIT_DOMAIN.
+        let a_link = pair_node("10.20.0.1:8080", "/", "ws://10.20.0.2:8080");
+        let b_link = pair_node("10.20.0.2:8080", "/", "ws://10.20.0.1:8080");
+        assert_eq!(policy_fingerprint(&a_link), policy_fingerprint(&b_link));
+        // Listed by a link address that is not its NGIT_DOMAIN, it is
+        // another node (runbook §2).
+        assert_ne!(
+            policy_fingerprint(&pair_node("a.example", "/", "ws://10.20.0.2:8080")),
+            policy_fingerprint(&pair_node("b.example", "/", "ws://10.20.0.1:8080"))
+        );
+        // A default port written out, in NGIT_DOMAIN or in the list, under
+        // either scheme, is no port: the ws:// key has already dropped :80.
+        assert_eq!(
+            policy_fingerprint(&pair_node("10.20.0.1:80", "/", "ws://10.20.0.2:80")),
+            policy_fingerprint(&pair_node("10.20.0.2:80", "/", "ws://10.20.0.1:80"))
+        );
+        assert_eq!(
+            policy_fingerprint(&pair_node("a.example:80", "/", "ws://b.example")),
+            policy_fingerprint(&b)
+        );
+        assert_eq!(
+            policy_fingerprint(&pair_node("a.example:443", "/", "wss://b.example")),
+            policy_fingerprint(&b)
+        );
+
+        // Under a mount path the path is part of each name.
+        let a_mounted = pair_node("a.example", "/grasp", "wss://b.example/grasp");
+        let b_mounted = pair_node("b.example", "/grasp", "wss://a.example/grasp/");
+        assert_eq!(
+            preimage_field(&a_mounted, "domains"),
+            "a.example/grasp,b.example/grasp"
+        );
+        assert_eq!(
+            policy_fingerprint(&a_mounted),
+            policy_fingerprint(&b_mounted)
+        );
+        let b_without_path = pair_node("b.example", "/grasp", "wss://a.example");
+        assert_ne!(
+            policy_fingerprint(&a_mounted),
+            policy_fingerprint(&b_without_path)
+        );
+
+        // A list that names only one side, or a third node besides, shows.
+        assert_ne!(
+            policy_fingerprint(&a),
+            policy_fingerprint(&pair_node("b.example", "/", ""))
+        );
+        assert_ne!(
+            policy_fingerprint(&pair_node(
+                "a.example",
+                "/",
+                "wss://b.example,wss://c.example"
+            )),
+            policy_fingerprint(&b)
+        );
+    }
+
+    /// The bootstrap relay is no peer unless the list names it, so it is not
+    /// in the domain set either: a pair can bootstrap public sync from a
+    /// third relay and still match, and a pair wired through the bootstrap
+    /// setting alone, which replicates nothing, does not look paired.
+    #[test]
+    fn fingerprint_ignores_the_bootstrap_relay() {
+        let a = pair_node("a.example", "/", "wss://b.example");
+        let mut bootstrapped = a.clone();
+        bootstrapped.sync_bootstrap_relay_url = Some("wss://index.example".to_string());
+        assert_eq!(policy_fingerprint(&a), policy_fingerprint(&bootstrapped));
+
+        let mut a_by_bootstrap = pair_node("a.example", "/", "");
+        a_by_bootstrap.sync_bootstrap_relay_url = Some("wss://b.example".to_string());
+        let mut b_by_bootstrap = pair_node("b.example", "/", "");
+        b_by_bootstrap.sync_bootstrap_relay_url = Some("wss://a.example".to_string());
+        assert_eq!(preimage_field(&a_by_bootstrap, "domains"), "a.example");
+        assert_ne!(
+            policy_fingerprint(&a_by_bootstrap),
+            policy_fingerprint(&b_by_bootstrap)
+        );
+    }
+
+    /// The event blacklist is in the preimage as the set of keys it refuses:
+    /// the order and repeats of its entries do not move the digest, and
+    /// neither does an entry that refuses no key; a different set does.
+    #[test]
+    fn fingerprint_covers_the_event_blacklist() {
+        fn npub(key: &PublicKey) -> String {
+            use nostr::prelude::ToBech32;
+            key.to_bech32().expect("npub")
+        }
+        fn listing(entries: &[String]) -> Config {
+            let mut config = Config::for_testing();
+            config.event_blacklist = entries.join(",");
+            config
+        }
+
+        let one = nostr_sdk::prelude::Keys::generate().public_key();
+        let two = nostr_sdk::prelude::Keys::generate().public_key();
+
+        let unlisted = listing(&[]);
+        let base = listing(&[npub(&one), npub(&two)]);
+        let mut sorted = [one.to_hex(), two.to_hex()];
+        sorted.sort();
+        assert_eq!(preimage_field(&base, "blacklist"), sorted.join(","));
+        assert_eq!(preimage_field(&unlisted, "blacklist"), "");
+
+        for same in [
+            listing(&[npub(&two), npub(&one)]),
+            listing(&[npub(&one), npub(&two), npub(&one)]),
+            listing(&[npub(&one), "not a key".to_string(), npub(&two)]),
+            listing(&[npub(&one), two.to_hex(), npub(&two)]),
+        ] {
+            assert_eq!(policy_fingerprint(&base), policy_fingerprint(&same));
+        }
+        for different in [listing(&[npub(&one)]), listing(&[]), listing(&[npub(&two)])] {
+            assert_ne!(policy_fingerprint(&base), policy_fingerprint(&different));
+        }
+        assert_ne!(policy_fingerprint(&unlisted), policy_fingerprint(&base));
+    }
+
+    /// Upstream's archival switch decides whether an honored deletion
+    /// request frees a registration's alias and keys, so it moves the digest.
+    #[test]
+    fn fingerprint_covers_the_deletion_request_disrespector() {
+        let honoring = Config::for_testing();
+        let mut archival = honoring.clone();
+        archival.deletion_request_disrespector = true;
+        assert_eq!(
+            preimage_field(&honoring, "deletion_request_disrespector"),
+            "false"
+        );
+        assert_eq!(
+            preimage_field(&archival, "deletion_request_disrespector"),
+            "true"
+        );
+        assert_ne!(policy_fingerprint(&honoring), policy_fingerprint(&archival));
+    }
+
+    /// The label moved to v4 with this preimage, and the advert and the
+    /// preimage carry the same label.
+    #[test]
+    fn policy_version_is_v4_in_the_preimage_and_the_advert() {
+        assert_eq!(POLICY_VERSION, "grasp-p-policy-v4");
+        let mut config = Config::for_testing();
+        assert!(policy_preimage(&config).starts_with("grasp-p-policy-v4|"));
+        config.private_repos_enable = true;
+        let advert = nip11_private_repos_from_config(&config).expect("GRASP-P is enabled");
+        assert_eq!(advert["policy_version"], "grasp-p-policy-v4");
+        assert_eq!(advert["policy_fingerprint"], policy_fingerprint(&config));
+    }
+
+    /// The startup warning: a node with the mirror on, or a bootstrap relay,
+    /// is meant to be one of a pair, and without a sync peer it replicates
+    /// nothing. A node with neither stands alone on purpose.
+    #[test]
+    fn a_node_meant_for_a_pair_without_a_sync_peer_is_warned() {
+        let cfg = |mirror: bool, peers: &str| {
+            let mut config = pair_node("a.example", "/", peers);
+            config.private_mirror_enable = mirror;
+            PrivateConfig::from_config(&config)
+        };
+        let bootstrap = Some("wss://b.example");
+        assert!(lacks_expected_sync_peers(&cfg(true, ""), None));
+        assert!(lacks_expected_sync_peers(&cfg(false, ""), bootstrap));
+        // A list that names only this node is no peer either.
+        assert!(lacks_expected_sync_peers(
+            &cfg(true, "wss://a.example"),
+            None
+        ));
+        assert!(!lacks_expected_sync_peers(&cfg(false, ""), None));
+        assert!(!lacks_expected_sync_peers(&cfg(false, ""), Some(" ")));
+        assert!(!lacks_expected_sync_peers(
+            &cfg(true, "wss://b.example"),
+            bootstrap
+        ));
     }
 
     /// The blob routes are matched below the mount path, so the advert has

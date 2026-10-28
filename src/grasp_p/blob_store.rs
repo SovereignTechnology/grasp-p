@@ -515,6 +515,7 @@ mod tests {
             mirror_allow_private_ips: false,
             sync_peer_relays: Default::default(),
             policy_fingerprint: String::new(),
+            write_blacklist: Default::default(),
             write_rate_capacity: 0,
             write_rate_refill_per_min: 0,
             registration_replace_capacity: 0,

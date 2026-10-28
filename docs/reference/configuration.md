@@ -1478,6 +1478,8 @@ Event blacklist does **not** affect NIP-11 metadata:
 - Blacklist is transparent to clients (rejected with specific reason)
 - Operators can use blacklist without advertising moderation
 
+**GRASP-P private repositories** (`NGIT_GRASP_P_REPOS_ENABLE=true`): unlike the author check above, which runs first, the GRASP-P checks run once the registration a write is made under is known. An account (the key that signs a repository's kind-30640 registration) on this list is **frozen** on both nodes of a pair. Its new registrations and deletion requests are refused by the author check, since it signs them. In addition, every write made under a registration it holds is refused whichever key signs it: kind-30641 state roots, stream wraps (3359/23359, and 1059/21059 while accepted), and on the blob routes the upload preflight (`HEAD /upload`), `PUT /upload` and `DELETE /<sha256>`. A registration signed by a key that its registrations list is refused, and no registration displaces one of its seats, however young (that one is refused as a conflict: `alias already registered` or `write key already registered`). A listed key's own blob writes are refused under any registration. The events are refused with `blocked: Account <npub> is blacklisted` (`blocked: Event author <npub> is blacklisted` when the signer itself is listed), from clients and from sync alike, and the blob routes answer `403` with the same text in `X-Reason`. What the account stored stays served: its events to any `REQ`, its blobs to `GET`/`HEAD /<sha256>`, and its own `GET /list`, so the customer can take their data and leave; removing content is the GRASP-P denylist's job. The keys on this list are part of the `policy_fingerprint` (a nonsense entry, a hex key or an nprofile refuses nothing and does not count), so both nodes of a pair need the same list, and a change needs a restart of both.
+
 ---
 
 ### Deletion Requests (NIP-09 and NIP-62)
@@ -1530,6 +1532,8 @@ NGIT_DELETION_REQUEST_DISRESPECTOR=false
 
 See [`docs/explanation/repository-lifecycle.md`](../explanation/repository-lifecycle.md)
 for the full lifecycle design rationale.
+
+**GRASP-P private repositories** (`NGIT_GRASP_P_REPOS_ENABLE=true`): with `true`, a deletion request for a private repository's registration frees neither its alias nor its keys, and the deleted registration sent again is taken. The setting is therefore part of the `policy_fingerprint`, and both nodes of a pair need the same value.
 
 ---
 
@@ -1677,12 +1681,17 @@ ledger. Every `NGIT_GRASP_P_*` knob is a no-op unless
 `NGIT_GRASP_P_REPOS_ENABLE=true`.
 
 The admission-affecting knobs (mode, pow bits, whitelist, event/blob caps,
-the three quota scopes, alias/key limits, and the Phase-4b
-replacement-cadence pair) form the `policy_fingerprint` preimage
-(`grasp-p-policy-v3`): paired nodes MUST run identical values or
-registrations accepted on one node can be silently rejected on the other.
-Compare fingerprints via NIP-11 `private_repos.policy_fingerprint` or the
-startup log line.
+the three quota scopes, alias/key limits, the Phase-4b
+replacement-cadence pair, legacy wrap-kind acceptance, the keys on
+`NGIT_EVENT_BLACKLIST`, and `NGIT_DELETION_REQUEST_DISRESPECTOR`, which
+decides whether an honored deletion request frees a registration's alias
+and keys) form the `policy_fingerprint` preimage (`grasp-p-policy-v4`),
+together with this node's address and the peers in
+`NGIT_GRASP_P_SYNC_PEER_URLS`. Paired nodes MUST run identical values, or
+registrations accepted on one node can be silently rejected on the other,
+and MUST list each other, or they replicate nothing and their fingerprints
+differ. Compare fingerprints via NIP-11 `private_repos.policy_fingerprint`
+or the startup log line.
 
 #### `NGIT_GRASP_P_REPOS_ENABLE`
 
@@ -1816,7 +1825,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_SYNC_PEER_URLS`
 
-**Description:** Comma-separated relay URLs of the nodes this one replicates private repositories with. GRASP-P events (registrations, state roots, stream wraps) travel between these peers alone, in both directions: only they are sent the private sync filters, which name every alias and write key the node holds, and a GRASP-P event that relay sync brings from any other relay is refused before admission and counted in `ngit_private_sync_foreign_source_total`. Clients still publish to the node directly. Tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when it is listed here too; otherwise it carries public sync alone, as upstream's does. When unset, the node has no peers and replicates no private repository. A peer named here is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it. An entry that names this node itself is left out, so both nodes of a pair can be given the same list.  
+**Description:** Comma-separated relay URLs of the nodes this one replicates private repositories with. GRASP-P events (registrations, state roots, stream wraps) travel between these peers alone, in both directions: only they are sent the private sync filters, which name every alias and write key the node holds, and a GRASP-P event that relay sync brings from any other relay is refused before admission and counted in `ngit_private_sync_foreign_source_total`. Clients still publish to the node directly. Tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when it is listed here too; otherwise it carries public sync alone, as upstream's does. When unset, the node has no peers and replicates no private repository. A peer named here is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it. An entry that names this node itself is left out, so both nodes of a pair can be given the same list. The `policy_fingerprint` covers this node's address and these peers (not the bootstrap relay), so the two nodes of a correctly paired pair, each listing the other, advertise the same fingerprint, and a list that leaves the other node out shows as a mismatch. With GRASP-P on and no peer here, a node with the blob mirror on or a bootstrap relay set warns at startup (`NGIT_GRASP_P_SYNC_PEER_URLS names no peer of this node`).  
 **Type:** String (CSV URLs)  
 **Default:** unset (no private-sync peers)  
 **Required:** No
@@ -1834,7 +1843,7 @@ startup log line.
 
 #### `NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND`
 
-**Description:** Also accept the **legacy** stream-wrap kinds `1059`/`21059` alongside the dedicated CORD stream-wrap kinds `3359`/`23359`. GRASP-P stream wraps were never NIP-59 gift wraps (no `p` tag, no kind-13 seal, symmetric AEAD, derived deterministic signer), so they moved to their own kind. The default `true` is the migration window: a node must accept `3359` **before** any client emits it, and wraps already published on `1059` (or held for out-of-order reprocess) must keep draining. Set `false` only once every client writing to this node has migrated — the legacy kinds are then **retired**: while private repos are enabled, a `1059`/`21059` is refused outright with `restricted: legacy stream-wrap kind is not accepted on this node`. It is deliberately **not** reclassified onto the public related-event path. That path stores any event carrying an `a`/`e` tag that references accepted content, from **any** key — no §3.2 registered-key gate, no `NGIT_GRASP_P_MAX_EVENT_BYTES` cap, no private quota charge, and never swept by the private GC — which would make the `false` position of this knob *wider* than the default (where an unregistered `1059` is rejected outright). Nodes with `NGIT_GRASP_P_REPOS_ENABLE=false` are unaffected: `1059` keeps its vanilla public related-event handling there. Genuine NIP-59 gift-wrapped invites are unaffected either way: they go to inbox relays, not the git node. This is a **cross-node acceptance** knob — it feeds the `policy_fingerprint` (`v3`), so both nodes of a pair must agree on it or wraps accepted on one are rejected on the other; flip it on both nodes in a single maintenance window (see the ops runbook §2).
+**Description:** Also accept the **legacy** stream-wrap kinds `1059`/`21059` alongside the dedicated CORD stream-wrap kinds `3359`/`23359`. GRASP-P stream wraps were never NIP-59 gift wraps (no `p` tag, no kind-13 seal, symmetric AEAD, derived deterministic signer), so they moved to their own kind. The default `true` is the migration window: a node must accept `3359` **before** any client emits it, and wraps already published on `1059` (or held for out-of-order reprocess) must keep draining. Set `false` only once every client writing to this node has migrated — the legacy kinds are then **retired**: while private repos are enabled, a `1059`/`21059` is refused outright with `restricted: legacy stream-wrap kind is not accepted on this node`. It is deliberately **not** reclassified onto the public related-event path. That path stores any event carrying an `a`/`e` tag that references accepted content, from **any** key — no §3.2 registered-key gate, no `NGIT_GRASP_P_MAX_EVENT_BYTES` cap, no private quota charge, and never swept by the private GC — which would make the `false` position of this knob *wider* than the default (where an unregistered `1059` is rejected outright). Nodes with `NGIT_GRASP_P_REPOS_ENABLE=false` are unaffected: `1059` keeps its vanilla public related-event handling there. Genuine NIP-59 gift-wrapped invites are unaffected either way: they go to inbox relays, not the git node. This is a **cross-node acceptance** knob — it feeds the `policy_fingerprint` (since `v3`), so both nodes of a pair must agree on it or wraps accepted on one are rejected on the other; flip it on both nodes in a single maintenance window (see the ops runbook §2).
 
 **Clients must emit exactly one wrap kind per logical wrap.** Dual-accept exists so a client can *switch* kinds, not *duplicate* them: the quota charge is keyed on `event.id` and the kind is part of the id preimage, so the same plaintext published as both `1059` and `3359` is two ids — charged twice and stored twice, with no credit path (wrap event bytes are released only when the registration dies).  
 **Type:** Boolean  
@@ -1860,7 +1869,7 @@ section above.)
 **Notes:**
 
 - **Default changed in WP-E (was `open` in Phase 1–4b).** The locked operator decision: launch posture is whitelist — in open mode every fresh key receives the full per-tenant blob quota, so ~50 pseudonymous tenants can lawfully exhaust the whole-subsystem storage budget (server issue !7). `open` is intended for staging/self-use only and must now be selected explicitly.
-- **`policy_fingerprint` change on upgrade.** The mode is part of the `grasp-p-policy-v3` fingerprint preimage. An operator who never set the mode explicitly will see their fingerprint change on upgrade (`open` → `whitelist`): paired nodes must upgrade together (or set the mode explicitly on both) to keep fingerprints — and therefore cross-node acceptance — in parity.
+- **`policy_fingerprint` change on upgrade.** The mode is part of the fingerprint preimage (`grasp-p-policy-v4` today). An operator who never set the mode explicitly will see their fingerprint change on upgrade (`open` → `whitelist`): paired nodes must upgrade together (or set the mode explicitly on both) to keep fingerprints — and therefore cross-node acceptance — in parity.
 - **Empty whitelist = accept-nothing (safe default).** `whitelist` mode with an empty `NGIT_GRASP_P_TENANT_WHITELIST` rejects every new registration; startup emits a loud `tracing::warn!` ("all new private-repo registrations will be rejected") so an operator who expected open mode sees it immediately.
 
 **Boot-time re-enforcement (exact behavior, pinned by the exit12 integration test):**
@@ -1991,8 +2000,8 @@ within seconds. These knobs bound the same-tenant replacement rate per
 `(tenant, alias)`. Unlike the write-rate bucket above, these knobs affect
 **cross-node acceptance** (a same-tenant newer edition can be accepted on
 one node and cadence-rejected on another), so they are part of the
-`policy_fingerprint` preimage (label `grasp-p-policy-v3`) — paired nodes
-MUST run identical values.
+`policy_fingerprint` preimage (label `grasp-p-policy-v4` today) — paired
+nodes MUST run identical values.
 
 Rejected replacements are HELD by the relay and retried without any client
 republish (FS-2/R2-1): the newest cadence-rejected edition per

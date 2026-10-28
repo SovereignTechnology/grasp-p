@@ -6605,3 +6605,217 @@ async fn exit41_stalled_upload_is_cut_and_frees_its_slot() {
 
     relay.stop().await;
 }
+
+// ============================================================================
+// Exit test 42 — an account on the event blacklist is frozen, not removed
+// ============================================================================
+
+/// Decision D9. An account the operator puts on `NGIT_EVENT_BLACKLIST`, with
+/// a restart, keeps its repository: its registration is still served, its
+/// blob still answers `GET`, `HEAD` and its own `GET /list`, so the customer
+/// can take the data and leave. Every write under it is refused, by its
+/// write key and by its aux key, on the relay and on the blob routes, and
+/// what the refused delete named is still there. Upstream refused only what
+/// the account key itself signs. Another account on the same node writes
+/// as before.
+#[tokio::test]
+async fn exit42_blacklisted_account_is_frozen_and_stays_readable() {
+    let tenant = Keys::generate();
+    let other_tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant, &other_tenant]);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (git_path, relay_path) = (dir.path().join("git"), dir.path().join("relay"));
+    let start = |extra: Vec<(&'static str, String)>| {
+        let (git_path, relay_path, whitelist) =
+            (git_path.clone(), relay_path.clone(), whitelist.clone());
+        async move {
+            let mut env = vec![("NGIT_GRASP_P_TENANT_WHITELIST", whitelist)];
+            env.extend(extra);
+            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            TestRelay::start_grasp_p_pair_node(
+                common::port::reserve_port(),
+                None,
+                true,
+                Some(git_path),
+                Some(relay_path),
+                &env,
+            )
+            .await
+        }
+    };
+
+    // Before the list: the account registers a repository with a write key
+    // and an aux key, and stores a blob; the other account registers too.
+    let relay = start(Vec::new()).await;
+    let writer = Keys::generate();
+    let aux = Keys::generate();
+    let alias = random_alias();
+    let registration = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[key_entry(&aux, &tenant.public_key(), &alias)],
+        &relay.domain(),
+        None,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &registration).await;
+    assert!(accepted, "exit42: registration; got {message:?}");
+    let other_writer = Keys::generate();
+    let other_alias = random_alias();
+    register_alias(&relay, &other_tenant, &other_writer, &other_alias).await;
+
+    let kept = blob_bytes(150, 1024);
+    let kept_sha = sha256_hex(&kept);
+    let upload = blossom_auth_event(
+        &writer,
+        "upload",
+        &kept_sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, kept.clone(), &kept_sha, &upload).await;
+    assert_eq!(
+        status, 200,
+        "exit42: upload before the list; X-Reason: {reason}"
+    );
+    relay.stop().await;
+
+    // The operator lists the account and restarts the node.
+    let listed = tenant.public_key().to_bech32().expect("npub");
+    let relay = start(vec![("NGIT_EVENT_BLACKLIST", listed.clone())]).await;
+    let account_refusal = format!("Account {listed} is blacklisted");
+
+    // Reads stay.
+    let served = fetch_from(
+        relay.url(),
+        Filter::new().kind(Kind::Custom(30640)).identifier(&alias),
+    )
+    .await;
+    assert!(
+        served.iter().any(|event| event.id == registration.id),
+        "exit42: the frozen account's registration must still be served"
+    );
+    let (status, body) = get_blob(&relay, &kept_sha).await;
+    assert_eq!(
+        status, 200,
+        "exit42: GET of a stored blob must still answer"
+    );
+    assert_eq!(body, kept);
+    assert_eq!(head_blob(&relay, &kept_sha).await, 200);
+    assert_eq!(
+        list_blob_shas(&relay, &tenant).await,
+        vec![kept_sha.clone()],
+        "exit42: the account's own list must still answer"
+    );
+
+    // Blob writes are refused, the preflight first.
+    let new_blob = blob_bytes(151, 2048);
+    let new_sha = sha256_hex(&new_blob);
+    let new_upload = blossom_auth_event(
+        &writer,
+        "upload",
+        &new_sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, reason) =
+        head_upload(&relay, &new_sha, new_blob.len() as u64, Some(&new_upload)).await;
+    assert_eq!(status, 403, "exit42: upload preflight; X-Reason: {reason}");
+    assert_eq!(reason, account_refusal);
+    let (status, _, reason) = put_blob(&relay, new_blob, &new_sha, &new_upload).await;
+    assert_eq!(status, 403, "exit42: upload; X-Reason: {reason}");
+    assert_eq!(reason, account_refusal);
+    assert_eq!(
+        get_blob(&relay, &new_sha).await.0,
+        404,
+        "exit42: nothing stored"
+    );
+    let delete = blossom_auth_event(
+        &writer,
+        "delete",
+        &kept_sha,
+        &tenant.public_key(),
+        &alias,
+        future_expiration(),
+    );
+    let (status, reason) = delete_blob(&relay, &kept_sha, &delete).await;
+    assert_eq!(status, 403, "exit42: delete; X-Reason: {reason}");
+    assert_eq!(reason, account_refusal);
+    assert_eq!(
+        list_blob_shas(&relay, &tenant).await,
+        vec![kept_sha.clone()],
+        "exit42: a refused delete must leave the claim in place"
+    );
+
+    // Events are refused: a state root by the write key, wraps by the aux key.
+    let root = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&kept_sha, kept.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    for (what, event) in [
+        ("state root", root),
+        ("stream wrap", wrap_event(&aux, 3359)),
+        ("ephemeral wrap", wrap_event(&aux, 23359)),
+    ] {
+        let (accepted, message) = publish_with_result(relay.url(), &event).await;
+        assert!(!accepted, "exit42: {what} must be refused");
+        assert!(
+            message.contains(&format!("blocked: {account_refusal}")),
+            "exit42: {what}; got {message:?}"
+        );
+        assert!(!message.contains("unregistered"), "exit42: {what}");
+    }
+    // What the account key signs was upstream's to refuse all along.
+    let edition = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[key_entry(&aux, &tenant.public_key(), &alias)],
+        &relay.domain(),
+        Some(Timestamp::now().as_secs()),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &edition).await;
+    assert!(!accepted, "exit42: a new edition must be refused");
+    assert!(
+        message.contains(&format!("blocked: Event author {listed} is blacklisted")),
+        "exit42: a new edition; got {message:?}"
+    );
+
+    // The other account is not touched.
+    let theirs = blob_bytes(152, 512);
+    let theirs_sha = sha256_hex(&theirs);
+    let theirs_upload = blossom_auth_event(
+        &other_writer,
+        "upload",
+        &theirs_sha,
+        &other_tenant.public_key(),
+        &other_alias,
+        future_expiration(),
+    );
+    let (status, _, reason) = put_blob(&relay, theirs.clone(), &theirs_sha, &theirs_upload).await;
+    assert_eq!(
+        status, 200,
+        "exit42: another account uploads; X-Reason: {reason}"
+    );
+    let theirs_root = state_root_event(
+        &other_writer,
+        &other_tenant.public_key(),
+        &other_alias,
+        (&theirs_sha, theirs.len() as u64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &theirs_root).await;
+    assert!(
+        accepted,
+        "exit42: another account's state root; got {message:?}"
+    );
+
+    relay.stop().await;
+}

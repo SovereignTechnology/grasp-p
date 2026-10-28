@@ -447,7 +447,7 @@ async fn start_pair_with_b_paths(
 /// mixed-version pair a rolling upgrade actually produces.
 ///
 /// Callers must NOT assert policy-fingerprint parity here: any knob in the
-/// v3 preimage that differs between the two envs makes the fingerprints
+/// policy preimage that differs between the two envs makes the fingerprints
 /// diverge by design (that divergence is the operator-visible signal).
 async fn start_pair_with_split_env(
     a_env: &[(&str, &str)],
@@ -864,7 +864,8 @@ async fn exit3_kill_node_backfill() {
     // Restart B on the SAME data paths (fresh port; it re-bootstraps to A —
     // backfill comes from its own since=None historic sync + boot mirror
     // repair scan, not from A dialing in). Same whitelist as before the
-    // kill — policy-fingerprint parity must survive the restart.
+    // kill. A still lists B's old address, so the fingerprints differ from
+    // here on; nothing below compares them.
     let res_b2 = reserve_port();
     let b = TestRelay::start_grasp_p_pair_node(
         res_b2,
@@ -1782,6 +1783,129 @@ async fn exit22_offboard_request_reaches_the_peer_and_a_write_key_cannot_delete(
 
     a.stop().await;
     b.stop().await;
+}
+
+// ============================================================================
+// Exit test 23 — the peer refuses a synced write of an account it lists
+// ============================================================================
+
+/// Decision D9 across a pair. B holds an account's registration when its
+/// operator lists the account on `NGIT_EVENT_BLACKLIST` and restarts it; A,
+/// whose list is still empty, takes a new state root of that account. When
+/// sync brings it to B, B refuses it as it refuses a client's, while a state
+/// root of another account published after it replicates. Upstream checked
+/// only the author, a write key the operator never sees, so B took it.
+#[tokio::test]
+async fn exit23_peer_refuses_a_synced_state_root_of_an_account_it_lists() {
+    let b_git_dir = tempfile::tempdir().expect("b git dir");
+    let b_relay_dir = tempfile::tempdir().expect("b relay dir");
+    let b_paths = (
+        b_git_dir.path().to_path_buf(),
+        b_relay_dir.path().to_path_buf(),
+    );
+
+    let frozen = Keys::generate();
+    let free = Keys::generate();
+    let whitelist = whitelist_npubs(&[&frozen, &free]);
+    let (a, b) = start_pair_with_b_paths(
+        &[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())],
+        Some(b_paths.clone()),
+    )
+    .await;
+    let domains = [a.domain(), b.domain()];
+    let domain_refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+
+    let frozen_writer = Keys::generate();
+    let frozen_alias = random_alias();
+    let frozen_registration =
+        register_on(&a, &domain_refs, &frozen, &frozen_writer, &frozen_alias).await;
+    let free_writer = Keys::generate();
+    let free_alias = random_alias();
+    let free_registration = register_on(&a, &domain_refs, &free, &free_writer, &free_alias).await;
+    for registration in [&frozen_registration, &free_registration] {
+        assert!(
+            wait_for_exact_event(b.url(), registration.id, REPLICATION_BOUND).await,
+            "exit23: both registrations must reach B before it is restarted"
+        );
+    }
+
+    // B's operator lists the account and restarts B on the same data.
+    b.stop().await;
+    let listed = frozen.public_key().to_bech32().expect("npub");
+    let b = TestRelay::start_grasp_p_pair_node(
+        reserve_port(),
+        Some(a.url().to_string()),
+        true,
+        Some(b_paths.0.clone()),
+        Some(b_paths.1.clone()),
+        &[
+            ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+            ("NGIT_EVENT_BLACKLIST", listed.as_str()),
+        ],
+    )
+    .await;
+    // A takes a state root of the listed account, then one of the other.
+    let now = Timestamp::now().as_secs();
+    let manifest = sha256_hex(&blob_bytes(98, 64));
+    let frozen_root = state_root_event(
+        &frozen_writer,
+        &frozen.public_key(),
+        &frozen_alias,
+        (&manifest, 64),
+        &[],
+        now,
+    );
+    let (accepted, message) = publish_with_result(a.url(), &frozen_root).await;
+    assert!(accepted, "exit23: A has no list; got {message:?}");
+    let free_root = state_root_event(
+        &free_writer,
+        &free.public_key(),
+        &free_alias,
+        (&manifest, 64),
+        &[],
+        now,
+    );
+    let (accepted, message) = publish_with_result(a.url(), &free_root).await;
+    assert!(
+        accepted,
+        "exit23: the other state root on A; got {message:?}"
+    );
+
+    // B takes the other account's state root and refuses this one, which it
+    // was sent: the refusal is counted, and nothing is stored.
+    assert!(
+        wait_for_exact_event(b.url(), free_root.id, REPLICATION_BOUND).await,
+        "exit23: the other account's state root must replicate to B"
+    );
+    assert!(
+        wait_for_metrics(&b, REPLICATION_BOUND, |m| {
+            m.counter("ngit_private_events_rejected_total", &[("kind", "30641")])
+                .unwrap_or(0)
+                >= 1
+        })
+        .await,
+        "exit23: B must refuse the listed account's state root when sync brings it"
+    );
+    assert!(
+        fetch_from(b.url(), Filter::new().id(frozen_root.id))
+            .await
+            .is_empty(),
+        "exit23: B must not store the listed account's state root"
+    );
+
+    // A client is told why, and what the account stored before stays served.
+    let (accepted, message) = publish_with_result(b.url(), &frozen_root).await;
+    assert!(
+        !accepted && message.contains(&format!("blocked: Account {listed} is blacklisted")),
+        "exit23: B's answer to a client; got {message:?}"
+    );
+    assert!(
+        wait_for_exact_event(b.url(), frozen_registration.id, Duration::from_secs(10)).await,
+        "exit23: B must still serve the listed account's registration"
+    );
+
+    b.stop().await;
+    a.stop().await;
 }
 
 // ============================================================================

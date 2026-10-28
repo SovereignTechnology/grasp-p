@@ -161,6 +161,15 @@ pub(crate) async fn handle(svc: &PrivateService, event: &Event) -> WritePolicyRe
         return reject_restricted(super::admission::STATE_ROOT_AUTHOR_NOT_WRITE_KEY);
     }
 
+    // Decision D9: a listed account's state roots are refused, from a client
+    // and from sync; upstream refused only those its listed key signed. After
+    // the key checks, so only a write key of the repository learns that its
+    // account is listed, and before the replay check, so no edition of a
+    // frozen account counts as accepted.
+    if let Some(reason) = svc.write_blocked(&author_hex, &record.tenant_hex) {
+        return super::blacklist::reject_blocked(reason);
+    }
+
     // §4b: apply meta changes (ring append + quota charge) ONLY when the relay
     // DB will actually store this edition. Ring membership alone is not a
     // sufficient dedup: a replayed edition older than the retained ring (or

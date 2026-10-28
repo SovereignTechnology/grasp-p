@@ -518,6 +518,14 @@ let
           ALL events from these authors are rejected from relay storage and purgatory.
           Applies to announcements, state events, PRs, and all other event types.
           Does not affect NIP-11 metadata (operational, not curation policy).
+          GRASP-P (privateReposEnable): a listed account is frozen. The state
+          roots, stream wraps, uploads and blob deletes made under its
+          registrations are refused whichever key signs them, and a listed
+          key's own blob writes are refused too. A registration signed by
+          one of the keys its registrations list is refused, and no
+          registration displaces one of its seats; what it stored stays
+          readable. The listed keys are part of the policy_fingerprint, so
+          both nodes of a pair need the same list.
         '';
       };
 
@@ -565,7 +573,7 @@ let
           open mode any fresh key receives the full per-tenant quota, so
           ~50 pseudonymous tenants can exhaust the global budget). paid is
           reserved and fails validation. Part of the policy_fingerprint
-          preimage (grasp-p-policy-v3): operators who never set the mode
+          preimage (grasp-p-policy-v4 today): operators who never set the mode
           will see their fingerprint change on upgrade — paired nodes must
           run identical values.
         '';
@@ -769,7 +777,9 @@ let
           refused. Tenant 30640 `relays` tags are advisory metadata and
           never trigger a connection (SSRF / membership-map-leak guard).
           The relay in NGIT_SYNC_BOOTSTRAP_RELAY_URL is a peer only when it
-          is listed here too. Empty (default): no peers, so no private-repo
+          is listed here too. The policy_fingerprint covers this node's
+          address and these peers, so the two nodes of a pair must list each
+          other to match. Empty (default): no peers, so no private-repo
           replication.
         '';
       };
@@ -806,7 +816,7 @@ let
           related-event path (which would store an a/e-tagged 1059 from
           any key, uncharged and outside private quota/GC). Nodes with
           private repos disabled are unaffected. Cross-node acceptance
-          knob: it feeds the policy_fingerprint (v3), so a node pair MUST
+          knob: it feeds the policy_fingerprint (since v3), so a node pair MUST
           agree on it.
         '';
       };
@@ -871,7 +881,7 @@ let
           succession plus retries. Rejected replacements are HELD locally
           and retried after bucket refill (the hourly re-issue is the
           backstop healer). Cross-node acceptance knob (part of the
-          policy_fingerprint preimage, v3) — paired nodes must run
+          policy_fingerprint preimage since v2) — paired nodes must run
           identical values.
         '';
       };

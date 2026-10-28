@@ -706,10 +706,17 @@ fn apply(
                 && !is_newer_than_stored(created_at, &event_id_hex, r)
         );
         let settle_clock = |holder: &RegistrationRecord| {
-            if judged_by_age {
-                admission.settle_clock(holder)
-            } else {
+            if !judged_by_age {
                 None
+            } else if admission_first && cfg.write_blacklist.contains(&holder.tenant_hex) {
+                // Decision D9: a listed account's seat is settled whatever
+                // its age, so no registration displaces it, on either node:
+                // its keys stay frozen, and what it stored stays claimed and
+                // readable. A replay is judged as before, so it seats again
+                // what this node held before the list.
+                Some(u64::MAX)
+            } else {
+                admission.settle_clock(holder)
             }
         };
         // A replay's refusal by a seat's age deletes nothing. The meta store
@@ -739,6 +746,20 @@ fn apply(
         };
         if let Some(rejection) = refused_at_the_door {
             return Ok(TxnOutcome::reject(rejection));
+        }
+
+        // Decision D9: no new registration by a key that a listed account's
+        // registration lists. Upstream has already refused what a listed key
+        // signs itself. A replay does not ask, so a registration this node
+        // took before the list is seated again.
+        if admission_first {
+            if let Some(holder_alias) = meta.get_key_claim(txn, &tenant_hex)? {
+                if let Some(holder) = meta.get_registration(txn, &holder_alias)? {
+                    if let Some(reason) = svc.write_blocked(&tenant_hex, &holder.tenant_hex) {
+                        return Ok(TxnOutcome::reject(super::blacklist::reject_blocked(reason)));
+                    }
+                }
+            }
         }
 
         // §3.2 alias conflict: the alias is held by a DIFFERENT tenant.
@@ -921,7 +942,7 @@ fn apply(
         // A rejected replacement is HELD (FS-2: PrivateRejectedIndex) and
         // retried by the sync layer after bucket refill, with the hourly
         // re-issue as backstop; the knob values are part of the
-        // policy_fingerprint preimage (v3) so paired nodes run identical
+        // policy_fingerprint preimage (since v2) so paired nodes run identical
         // cadence config. Bucket state itself is node-local, so a transient
         // divergence after a flood is possible — it heals on refill +
         // redelivery, unless the retried edition meets, on this node only, a
