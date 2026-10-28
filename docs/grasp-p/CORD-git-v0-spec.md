@@ -549,16 +549,31 @@ lookup of its own).
   refill (hourly full re-issue as backstop) — convergence must not depend on the client retrying.
   Applies to live admission from clients AND peers; boot-reconcile replays and merge winners are
   exempt.
-- **`policy_fingerprint` v3**: `sha256(preimage)[..16]`, label `grasp-p-policy-v3`
-  (`src/grasp_p/mod.rs:326`), over
+- **`policy_fingerprint` v4**: `sha256(preimage)[..16]`, label `grasp-p-policy-v4`
+  (`POLICY_VERSION`, `policy_preimage` in `src/grasp_p/mod.rs`), over
   `mode, pow_bits, whitelist, max_event_bytes, max_blob_bytes, quota_tenant, quota_repo,
   global_budget, max_aliases, max_keys, replace_capacity, replace_refill_per_hour,
-  accept_legacy_wrap_kind, domains`
-  (domains = sorted `{own domain} ∪ {bootstrap peer}`; the raw whitelist feeds the hash but is
-  never exposed). Everything not named in that preimage is excluded; among the excluded knobs are
-  client-write-rate, denylist, sync-re-issue and mirror-retry, GC grace/interval,
-  offboard retention, the mirror knobs, and **`state_history_editions`** (the §2.2 ring depth) —
-  the rationale being that they are node-local and do not affect acceptance. **[N] That rationale
+  accept_legacy_wrap_kind, blacklist, deletion_request_disrespector, domains`
+  (domains = the sorted set of the node's own service address and its configured sync peers,
+  `NGIT_GRASP_P_SYNC_PEER_URLS` less the entries naming the node, each with the host in lower
+  case, no default port (neither `:80` nor `:443`, whatever the scheme), no trailing slash and no
+  scheme, so a peer is listed under its own `NGIT_DOMAIN` and mount path; blacklist = the keys on
+  `NGIT_EVENT_BLACKLIST` as sorted hex, counting an entry only when it is exactly an npub; the raw
+  whitelist and blacklist feed the hash and are not published, but anyone who can guess the other
+  inputs can test a guess of either list against the digest, for instance whether a given
+  registered account is frozen). **v3 → v4**: in v3 the domains were the own address and the
+  bootstrap relay, which matched only for a pair that bootstrapped
+  to each other and since the peers-only rule (§5) said nothing about replication; now the two
+  nodes of a pair, which every registration names, each list the other and hash the same set.
+  The blacklist joined because a listed account's writes are refused on every path, synced events
+  included (below). Upstream's `NGIT_DELETION_REQUEST_DISRESPECTOR` joined because it decides
+  whether an honored deletion request frees a registration's alias and keys (§5.2): with it on one
+  node only, a later registration reusing them is accepted there and refused on the other. The
+  label also marks two rules that changed acceptance with no knob since
+  v3: settled seats (§2.1) and who may delete (§2.1, §5.2). Everything not named in that
+  preimage is excluded; among the excluded knobs are client-write-rate, denylist, sync-re-issue
+  and mirror-retry, GC grace/interval, offboard retention, the mirror knobs, and
+  **`state_history_editions`** (the §2.2 ring depth) — the rationale being that they are node-local and do not affect acceptance. **[N] That rationale
   does not fully hold for `state_history_editions`**: ring depth decides which editions are trimmed,
   trimming releases blob claims and their speculative charges, released charges change the quota
   ledger, and quota decides acceptance. Two paired nodes on different ring depths can therefore
@@ -567,8 +582,17 @@ lookup of its own).
   decides which stream-wrap KINDS a node admits, which is direct acceptance behaviour: a peer with
   the legacy window closed rejects a 1059 wrap its pair accepted and stored — exactly the split view
   the fingerprint exists to detect. Paired nodes must advertise the same fingerprint; a label
-  mismatch (v2/v3) is itself the divergence signal, and is published as `policy_version` (§5) so an
+  mismatch (v3/v4) is itself the divergence signal, and is published as `policy_version` (§5) so an
   operator can tell an unfinished rolling upgrade from a genuine knob split.
+- **Event blacklist [N]**: an account (the key that signs a 30640) on the operator's
+  `NGIT_EVENT_BLACKLIST` is frozen on both nodes. Upstream already refuses every event its key
+  signs (its 30640s, kind 5 and 62); a GRASP-P node also refuses, from clients and from sync, every
+  30641 and stream wrap (stored or ephemeral) made under a registration the account holds,
+  whichever key signs it, every 30640 signed by a key such a registration lists, and the blob
+  upload preflight, `PUT /upload` and `DELETE` authorized under such a registration or signed by a
+  listed key (`403`); and no 30640 displaces one of the account's seats, however young (§2.1).
+  Reads are not gated: the account's events, blobs and own `GET /list` stay served, so its data
+  can be taken away. Read once at start; part of the fingerprint.
 - **Denylist → 451**: node-local, multi-file, periodically reloaded (default 60 s), enforced on the
   read path AND the upload preflight, with purge-on-add and a GC sweep that bypasses the grace
   period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ. A file that
@@ -612,6 +636,8 @@ lookup of its own).
 | kind 5 naming a stored 30640 by `e` id without its coordinate, or carrying `["k","30640"]` without a coordinate of a 30640 under its signer's key | `a registration is deleted by its coordinate (a tag), not by its event id alone` | genuine |
 | offboard kind 5 without `["k","30640"]`, or with the kind spelled other than `30640` | `deleting a registration requires a k tag of 30640` / `a registration coordinate must be written 30640:<pubkey>:<alias>` (`invalid:`) | genuine |
 | kind 62 from a key with stored 30641s or stream wraps | `a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | genuine |
+| 30641 or stream wrap under a registration of an account on `NGIT_EVENT_BLACKLIST`, or a 30640 signed by a key such a registration lists | `Account <npub> is blacklisted` (`blocked:`; blob routes `403` with the same `X-Reason`) | genuine, **not** widenable |
+| any event signed by a key on `NGIT_EVENT_BLACKLIST` (upstream's check) | `Event author <npub> is blacklisted` (`blocked:`; the same text on a blob route `403`) | genuine |
 
 **[N]** The cord-git client treats any message containing the substring `unregistered` as its
 widenable case. The two transient identity-race strings are therefore deliberately worded to avoid
@@ -692,6 +718,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.4 — authorization window narrowed from ±24 h to one hour back and 15 minutes ahead; BUD-11 `server` tag (required for list); no used-id record, and why; response headers (`nosniff`, CSP, `no-cache` + `ETag` in place of a one-year `immutable`, `no-store` on errors, `WWW-Authenticate` on 401 only); `uploaded` is the stored time.
 - §2.4, §5.1 — upload answers listed; running out of upload slots answers `429` (per account) or `503` (node) with `Retry-After`, no longer `507`; an upload body that stalls or runs out of time is cut with `408`; the mirror takes no upload slot.
 - §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
+- §5.1, §5.2 — `policy_fingerprint` **v4**: the domains are the own address and the configured sync peers (no longer the bootstrap relay), the event blacklist joins as sorted hex keys, `NGIT_DELETION_REQUEST_DISRESPECTOR` joins, and the label also marks settled seats and who may delete; an account on the event blacklist is frozen (its write and aux keys' 30641s, wraps, 30640s and blob writes refused, from clients and sync, and its seats never displaced), its reads stay; new refusal strings, none containing `unregistered`.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.
 - §4 — invite/join, #collab, revoke/rotate/demote/promote re-marked **[N]**; `ACCEPT_DIRECT_INVITES` noted unenforced server-side.
 - §4.1 (new) — pending-epoch lifecycle; templates at `created_at = live+1`; no idle rekey-address admission; rival-resume guard; mint-time fork prevention; squat-tolerant widen; tenant-signed `scopes` + epoch-atomic fold.

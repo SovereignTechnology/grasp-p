@@ -19,7 +19,7 @@ Upstream's files carry thin seams only:
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
-| `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion |
+| `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion; two GRASP-P lines in the help text of upstream's `NGIT_EVENT_BLACKLIST` (see "Policy fingerprint v4 and the event blacklist") |
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`, for a configured peer only (`grasp_p_filters_for`); `register_relay` builds each connection with the GRASP-P node's address check (`with_grasp_p_address_check`) and with duplicate forwarding on a configured peer's connection only (`with_duplicate_event_forwarding`), and takes its outbound policy from `grasp_p_peer_policy` when that gives one; timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`); the source gate in `process_event_static_inner` (`grasp_p_gate`), directly after the id and signature check (see below); the GRASP-P ids counted as delivered in the negentropy completion check of `handle_eose` (`grasp_p_settled_ids`); see "Configured peers" below for these; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
 | `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one (see "Configured peers"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
@@ -29,7 +29,7 @@ Upstream's files carry thin seams only:
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
 | `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the two pair constructors also name their bootstrap peer in `NGIT_GRASP_P_SYNC_PEER_URLS` and, through `TestRelay::blob_peer_url`, in `NGIT_GRASP_P_MIRROR_PEER_URLS`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
-| `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources) |
+| `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources), and a GRASP-P paragraph on upstream's `NGIT_EVENT_BLACKLIST` in each, at the end of upstream's text; in the configuration reference also one on upstream's `NGIT_DELETION_REQUEST_DISRESPECTOR`, at the end of its section |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
 With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission arms, the
@@ -848,7 +848,8 @@ setting that itself carries a path counts as mounted at that path: put the path 
 
 No setting is added. The fingerprint's `domains` input already was the service address
 plus the bootstrap relay, so its inputs and its label stay as they are: both nodes of a
-pair run the same build, and at the root nothing a node accepts has changed. Upstream
+pair run the same build, and at the root nothing a node accepts has changed. (v4 later
+replaced the bootstrap relay with the peer list; the service address keeps its path.) Upstream
 has its own matcher for its own tags (`outbound::relay_url_matches_service`); it parses
 more leniently and is not used for the GRASP-P checks, which stay strict about the URL.
 
@@ -857,7 +858,8 @@ more leniently and is not used for the GRASP-P checks, which stay strict about t
 All of it is in `src/grasp_p/registration.rs` (`SEAT_SETTLE_SECS`, `seat_is_settled`,
 `challenge`, the two conflict checks in `apply`). No upstream file is touched, no setting
 is added, and the fingerprint keeps its inputs and its label: the two nodes of a pair run
-the same build, and no node runs the old rule.
+the same build, and no node runs the old rule. The label `grasp-p-policy-v4`, two changes
+later, marks this rule as well ("Policy fingerprint v4 and the event blacklist").
 
 ### Why
 
@@ -1204,9 +1206,9 @@ extend with is narrower now.
   as the bootstrap relay and a peer is never retired. Upstream reads the bootstrap URL
   through `canonical_relay_key` alone, without `normalize_relay_url`: spell it as the
   list entry is spelled (a trailing slash after a path makes a different key, and then
-  a second connection, which is not a peer). `policy_fingerprint` still takes its
-  `domains` from the bootstrap relay; that changes with the next label of the
-  fingerprint, not here.
+  a second connection, which is not a peer). `policy_fingerprint` took its `domains`
+  from the bootstrap relay until v4, and takes them from the list now ("Policy
+  fingerprint v4 and the event blacklist", below).
 - **Egress: the private filters go to peers only** (seams 7 to 9). They name every alias
   and write key the node holds. Every way they reach a relay goes through
   `grasp_p_filters_for(relay_url)`: the live and historic sync at connect
@@ -1363,10 +1365,166 @@ still subject to that connection's idle retirement and comes back through the ti
 address check is not pinned to the connection (issue 3); a peer reached under a second
 name (another host name, a path, another scheme) is no peer on that connection, and
 GRASP-P events from it there are refused and counted; on the peer link the GRASP-P and
-announcement filters still share one subscription budget; no alert reads
-`ngit_private_sync_foreign_source_total`; `policy_fingerprint` still takes its domains
-from the bootstrap relay and not from the peer list; and the startup line `GRASP-P
-private repositories enabled` still prints the bootstrap relay as `configured_peer`.
+announcement filters still share one subscription budget; and no alert reads
+`ngit_private_sync_foreign_source_total`. The fingerprint's domains and the startup line
+`GRASP-P private repositories enabled` follow the list since v4 ("Policy fingerprint v4
+and the event blacklist").
+
+## Policy fingerprint v4 and the event blacklist
+
+The maintainer's decisions D2 (the two nodes of a pair have two names, and every
+registration lists both), D3 (only the operator's configured peers are sources of GRASP-P
+data) and D9 (an account on `NGIT_EVENT_BLACKLIST` is frozen on both nodes) set what the
+fingerprint covers and what the blacklist does on a GRASP-P node. All of it is in GRASP-P's
+files: `src/grasp_p/mod.rs` (`policy_fingerprint`, `policy_preimage`, `fingerprint_domain`,
+`PrivateService::write_blocked`, the wrap path, `verify_blossom_auth`, the startup line and
+its two warnings), `src/grasp_p/state_root.rs`, `src/grasp_p/registration.rs` (`apply`),
+`src/grasp_p/blacklist.rs`, and the watchdog's same-version text. No upstream code changes.
+In `src/config.rs` the help text of `NGIT_EVENT_BLACKLIST`, upstream's setting, and of
+`NGIT_GRASP_P_SYNC_PEER_URLS` gained sentences, as did the other three configuration
+sources.
+
+### The preimage
+
+- **Domains.** v3 hashed the node's service address and the bootstrap relay. That matched
+  only when each node bootstrapped to the other, and since the bootstrap relay is no peer
+  unless the list names it ("Configured peers"), it said nothing about replication. v4
+  hashes the service address and the configured sync peers, the set the sync code uses
+  (`configured_peer_relay_keys`, so an entry that names this node is left out). Each member
+  is first brought to the sync key (host in lower case, no default port, no trailing slash)
+  and then written without its scheme (`fingerprint_domain`), so `NGIT_DOMAIN=Git.Example` and
+  `wss://git.example/` in the peer's list are one name. With the scheme gone, `:80` and `:443`
+  are both dropped: a `ws://` key has already lost `:80` and a `wss://` key `:443`, while the
+  node's own address has no scheme to lose one by. A peer may be listed over `ws://`, though
+  only under its own NGIT_DOMAIN, port and path: a pair that lists each other by private-link
+  addresses never matches. Each node of a correctly paired pair lists the other, so both hash
+  `{A, B}`; one list for both nodes works too. A list that leaves the other node out, names a
+  third, or spells a node under a mount path without its path shows as a mismatch. The
+  bootstrap relay is out of it, so a pair may bootstrap its public sync from any relay.
+- **Blacklist.** The field `blacklist=` holds the keys on `NGIT_EVENT_BLACKLIST` as sorted
+  lowercase hex (`blacklist::blacklisted_keys`). An entry counts only when it is exactly the
+  npub of a key, the text upstream's check compares (`EventBlacklistConfig::check`): an
+  nprofile, a hex key, an npub in capitals refuse nothing upstream and nothing here, and do
+  not count. Order and repeats do not move the digest.
+- **Deletion requests.** `deletion_request_disrespector=` is upstream's archival switch,
+  `NGIT_DELETION_REQUEST_DISRESPECTOR`. It decides whether an honored kind 5 or 62 frees a
+  registration's alias and keys (the `src/nostr/builder.rs` seam asks `actions_deletions`) and
+  whether the tombstone gate refuses a deleted registration sent again. With it on one node
+  only, an offboard frees the claims there and not on the other, and a later registration that
+  reuses them is taken on one node and refused on the other. It had been missing from the
+  preimage since v1.
+- **Label.** `grasp-p-policy-v4`. It also marks the two rules that changed acceptance with no
+  setting since v3, settled seats ("A settled seat is not displaced") and the deletion guard
+  ("Who may delete"), so that a pair half on an older build reads as a version skew. No node
+  runs v4 in a pair before the rest of M3 lands, so the knobs later M3 changes add join under
+  v4; M4 takes v5.
+- **Startup.** The line `GRASP-P private repositories enabled` now carries `policy_version`,
+  `sync_peers` (the peer set, sorted) where it printed the bootstrap relay as
+  `configured_peer`, and `event_blacklist_keys` (how many keys the list refuses). A node with
+  GRASP-P on and no peer warns once when its blob mirror is on or a bootstrap relay is set:
+  `NGIT_GRASP_P_SYNC_PEER_URLS names no peer of this node`. A node with neither is taken to
+  stand alone on purpose.
+- **What the published digest gives away.** The whitelist and the blacklist feed the hash
+  and are never shown, but a reader who can guess every other input (the defaults, the two
+  names) can test a guess of either list against the digest: whether one known account is
+  listed, say. The whitelist has had that property since v1.
+
+### The blacklist on GRASP-P writes
+
+Upstream checks the list in `admit_event` (`check_event_blacklist`, `src/nostr/builder.rs`),
+first, for events from clients and from sync alike: an event whose author's npub is on it is
+refused with `blocked: Event author <npub> is blacklisted`, unless the node's own key signed
+it. On a GRASP-P node that refused what the account key signs, its registrations, deletion
+requests and vanish, and nothing its write and aux keys sign: state roots and stream wraps
+were taken from a client and from the peer. The blob routes never read the list, not even
+for a listed signer. An account the operator listed could therefore keep pushing.
+
+`PrivateService::write_blocked(signer, account)` refuses a write when its signer is listed or
+the account that holds the registration the write is made under is listed. It is asked in
+four places, each once that registration is known, the first three once the write would
+otherwise pass, so only a key of that repository learns of the block:
+
+- `state_root::handle`, after the coordinate and write-key checks and before the replay
+  check, so no edition of a frozen account counts as accepted;
+- `try_handle_wrap`, after the key-claim lookup and the liveness check, for stored and
+  ephemeral wraps, whether the write key or the aux key signs;
+- `verify_blossom_auth`, after the write-key check: `HEAD /upload` (the preflight),
+  `PUT /upload` and `DELETE /<sha256>`;
+- `registration::apply`, for a live registration whose signer is a write or aux key that a
+  registration holds, after the admission mode: a frozen account's key does not register an
+  account of its own. In the same function a listed account's seat counts as settled
+  whatever its age (`settle_clock`), so no registration displaces it, for its alias or its
+  keys: an earlier-dated registration that lists its keys with valid proofs, which only its
+  own keys can make, would otherwise evict it on both nodes within its first hour, free its
+  keys under another account and strip its blob claims. A replay asks neither question, so a
+  registration the node took before the list is seated again at a restart.
+
+`GET`/`HEAD /<sha256>`, `GET /list` and REQs never ask, so the account's events and blobs
+stay served and the customer can take them and leave; removing content stays the denylist's
+job. Kinds 5 and 62 need nothing new: the account's own are refused upstream, and the
+deletion guard already refuses those of its write and aux keys. An event is refused
+`blocked: Account <npub> is blacklisted`, or in upstream's words when the signer itself is
+listed; a blob route answers `403` with the same text in `X-Reason`. Neither contains
+`unregistered`, the word the client widens on. Refused events count in
+`ngit_private_events_rejected_total`; the blob refusals, like the other `403`s, are not
+counted. For relay sync `blocked` is a final answer (`Rejected(Blocked)`), so the batch that
+brought the event completes; it is no dependency rejection, so the sync hook keeps its id and
+not the event, and the peer is not asked for it again until the hold's time to live runs
+out. A node that lists the account refuses what its peer took, which is why the list is in
+the fingerprint. It is read once at start: a change needs both nodes restarted with the same
+list (a reload is M9's).
+
+### What is left
+
+- **The node's own key.** Upstream lets the relay owner's events pass the list; the GRASP-P
+  check makes no such exception. Each node of a pair has its own owner key, so upstream's
+  exception already differs between the two: a node whose list names its own key takes the
+  registrations and deletion requests that key signs, and a peer with another key refuses
+  them, with equal fingerprints. A list that names a node's own key is not meaningful; the
+  node warns at start (`NGIT_EVENT_BLACKLIST names this node's own key`).
+- **Writes in flight when the list arrives.** A write one node took before its restart with
+  the list, and the other had not received yet, is refused there for good: `write_blocked`
+  cannot tell a write made before the list from a backdated new one. The two nodes then serve
+  different data, and an offboard that reached one node only leaves the other holding the
+  claims. The runbook says to list an account only once the pair is in step.
+- **A pair reached by link addresses.** The domain set compares a peer's entry with that
+  peer's own `NGIT_DOMAIN`, so a pair that lists each other by private-link addresses while
+  serving public names never matches. Matching it would need a setting that names the peer's
+  service address; that is the maintainer's decision.
+- **Events of other kinds** that tag a frozen registration still pass upstream's related-event
+  rule (PLAN.md, "Events of other kinds can attach"), until the private-only switch.
+- **The startup line's fields** (`sync_peers`, `policy_version`, `event_blacklist_keys`) and
+  its two warnings are named in the runbook, but no test reads the log for them; only the
+  predicate behind the peer warning is tested.
+- **What was accepted before stays.** A registration in the meta store is kept at a restart
+  (`boot_reconcile` asks no admission question of one it holds), and the blob mirror still
+  fetches blobs that state roots accepted before the list reference: that is replication of
+  what was accepted, and it keeps reads alike on both nodes.
+- **The other node keeps asking.** A node that lists an account still names its alias and
+  keys in the filters it sends its peer, and refuses what comes again once the hold's time to
+  live has run out. When both nodes list it, nothing new reaches either.
+- **A listed key in another account's registration** blocks that key's blob writes and,
+  upstream, its events; the account's other keys write as before.
+
+### Tests
+
+Unit tests in `src/grasp_p/mod.rs`: `fingerprint_domains_are_the_service_and_its_sync_peers`
+(a pair that lists each other, one shared list, spellings of a node, a private link, a mount
+path, a one-sided list and a third node; it replaces
+`fingerprint_is_symmetric_for_a_pair_under_a_base_path`), `fingerprint_ignores_the_bootstrap_relay`,
+`fingerprint_covers_the_event_blacklist`, `fingerprint_covers_the_deletion_request_disrespector`,
+`policy_version_is_v4_in_the_preimage_and_the_advert` and
+`a_node_meant_for_a_pair_without_a_sync_peer_is_warned`; the first also pins written-out
+default ports and a pair listed by link addresses. In `src/grasp_p/blacklist.rs`:
+`blacklisted_keys_are_the_keys_upstream_refuses`, `write_refusal_names_the_listed_key` and
+`a_listed_account_is_frozen_on_every_write_path`, which runs the real write policy over an
+in-memory relay database, seats a registration as one accepted before the list, and sends
+state roots and wraps from a client and from sync, blob authorizations, an earlier-dated
+registration that claims the frozen keys, and registrations signed by them. Integration:
+`exit42_blacklisted_account_is_frozen_and_stays_readable` in `private_repos` (a node
+restarted with the list: reads answer, every write is refused, another account writes) and
+`exit23_peer_refuses_a_synced_state_root_of_an_account_it_lists` in `private_two_node` (B
+restarted with the list refuses a state root A took, while another account's replicates).
 
 ## Decisions made during the port
 

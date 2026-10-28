@@ -419,13 +419,23 @@ populated from config at `nip11.rs:147` via `private::nip11_private_repos_from_c
 `policy_version`, and `pow_bits` when in PoW mode (`mod.rs:1564-1601`). Absent entirely when private
 repos are disabled (`mod.rs:1611-1613`).
 
-**`policy_version` (`mod.rs:1596`, value `grasp-p-policy-v3` from `mod.rs:326`) is new since the
-first revision of this inventory.** It publishes the `policy_fingerprint` PREIMAGE-FORMAT label
-verbatim beside the digest, because the digest alone cannot distinguish the two very different
-reasons a pair's fingerprints differ: a version skew mid-rolling-upgrade (every node's digest moves
-on a label bump) versus a same-version knob split, which is a real and lasting divergence in what
-the two nodes accept. Not a NIP question — NIP-11 permits the field — but it is part of the advert a
-standards reader will enumerate.
+**`policy_version` (value `grasp-p-policy-v4`, `POLICY_VERSION` in `src/grasp_p/mod.rs`) is new
+since the first revision of this inventory.** It publishes the `policy_fingerprint` PREIMAGE-FORMAT
+label verbatim beside the digest, because the digest alone cannot distinguish the two very
+different reasons a pair's fingerprints differ: a version skew mid-rolling-upgrade (every node's
+digest moves on a label bump) versus a same-version knob split, which is a real and lasting
+divergence in what the two nodes accept. Not a NIP question — NIP-11 permits the field — but it is
+part of the advert a standards reader will enumerate.
+
+**The v4 preimage** (`policy_preimage`) takes its domain set from the node's own service address
+and its configured sync peers (`NGIT_GRASP_P_SYNC_PEER_URLS`), no longer from the bootstrap relay,
+so the two nodes of a pair, each listing the other, advertise one digest; and it adds the keys on
+`NGIT_EVENT_BLACKLIST`, which on a GRASP-P node refuse every write under a listed account's
+registrations as well as the account's own events (`src/grasp_p/blacklist.rs`), and upstream's
+`NGIT_DELETION_REQUEST_DISRESPECTOR`, which decides whether an honored deletion request frees a
+registration's alias and keys. The raw whitelist and blacklist are hashed, not advertised; a reader
+who can guess the other inputs can still test a guess of either list against the digest. Nothing in
+the advert's shape changed: the same two fields carry a different digest and label.
 
 **The advertised `kinds` array moved with item 12, and now cannot drift.** `mod.rs:1577-1579` builds
 it from the *same* helpers the admission arms and sync filters use
@@ -519,7 +529,7 @@ stream wrap", with **23359** as its ephemeral analog. Genuine NIP-59 wraps staye
 **Transitional window on the server, not in the protocol.** `NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND`
 (`src/config.rs:746-767`, default **true**) keeps 1059/21059 admissible alongside 3359/23359 so a
 node accepts the new kind before any client emits it and pre-migration wraps keep draining; it is in
-the `policy_fingerprint` preimage (v3) because it is direct acceptance behaviour. Setting it false
+the `policy_fingerprint` preimage (since v3) because it is direct acceptance behaviour. Setting it false
 retires the legacy kinds with `restricted: legacy stream-wrap kind is not accepted on this node`
 (`src/nostr/builder.rs:889-910`) rather than letting them fall through to the public related-event
 path, which would be *wider* than the default. The client took **no** dual-kind read window

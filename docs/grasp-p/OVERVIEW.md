@@ -144,11 +144,19 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
 - **Quotas**: per tenant, per repo and global byte budgets. A state root is charged for the
   blobs it declares even before they are uploaded.
 - **Rate limits**: per write key, and on how often a registration may be replaced.
-- **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports.
+- **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports. An
+  account on the operator's event blacklist is frozen: no state root, stream wrap, upload or
+  blob delete is accepted under its registrations, whichever of its keys signs it, and no
+  registration by one of those keys, from clients or from the peer, while everything it
+  stored stays readable. Events of other kinds that tag its registration still pass
+  upstream's related-event rule until the private-only switch.
 - **Garbage collection**: blobs no state root references are removed after a grace period.
 
 It advertises all of this in its NIP-11 document under `private_repos`, including a
-`policy_fingerprint` so that paired nodes can prove they run the same rules.
+`policy_fingerprint` so that paired nodes can prove they run the same rules. The fingerprint
+covers the admission settings, the event blacklist, and the node's own address together with
+the peers it lists, so two nodes that list each other and run the same rules show the same
+value.
 
 ## Replication
 

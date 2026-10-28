@@ -221,16 +221,15 @@ project yet.
   event with a bad proof can be re-sent.
 - **Events of other kinds can attach to GRASP-P events** through upstream's related-event
   rule: uncharged plaintext stored on a ciphertext node.
-- **Blob responses** (done, except the blacklist). Every response of the blob routes says
+- **Blob responses** (done). Every response of the blob routes says
   `X-Content-Type-Options: nosniff`, and a served blob also carries a
   `Content-Security-Policy` that makes it inert in a browser. A blob is served
   `Cache-Control: no-cache` with its sha256 as `ETag`, no longer cacheable for a year: a
   cache may keep it but asks the node before each reuse, and that question is answered 304
   only after the denylist and existence checks, so a taken-down blob gets the 451. Errors
   and 404s say `no-store`. Upload temp files left by an earlier run are removed when the
-  store is opened. Still open: the operator's event blacklist does not apply to the blob
-  routes; decided on 2026-10-27 that a blocked account's writes are frozen on both nodes
-  (below).
+  store is opened. The operator's event blacklist now applies to the blob routes' writes
+  ("The event blacklist", below).
 - **Denylist reload** (done). The reload now starts from what the boot load read, so a file
   that can no longer be read or parsed keeps the entries it had at boot when another file
   changes. Still open: **what a missing denylist file means.** Today a file that is absent
@@ -260,6 +259,31 @@ project yet.
   and announcement filters share one subscription budget, and the watchdog's discovery
   filter does not page past 500 events; the sync filters do, through upstream's historic
   sync.
+- **The fingerprint matched only a pair that bootstrapped to each other** (done). Its domain
+  set was the node's address and the bootstrap relay, which since the point above says
+  nothing about replication. With fingerprint v4 (`grasp-p-policy-v4`) it is the node's
+  address and its configured sync peers, each spelled as the sync code files it, so two nodes
+  that list each other hash one set and a list that leaves the other out shows; the
+  bootstrap relay is out of it. The startup line names the peer set, and a node with the
+  mirror on or a bootstrap relay set but no sync peer warns. The label also marks settled
+  seats and who may delete, which changed acceptance with no setting since v3, and upstream's
+  `NGIT_DELETION_REQUEST_DISRESPECTOR` joined, since it decides whether an offboard frees a
+  registration's claims; later M3 changes add their knobs under v4, and M4 takes v5. See
+  "Policy fingerprint v4 and the event blacklist" in [`SEAMS.md`](SEAMS.md). Still open: a
+  pair that reaches each other by link addresses that are not their NGIT_DOMAINs cannot
+  match without a setting that names the peer's service address.
+- **The event blacklist** (done). It was checked against the author of an event only, so a
+  listed account's write and aux keys kept writing, and the blob routes never read it. Now a
+  state root, a stream wrap (stored or ephemeral), an upload preflight, an upload or a blob
+  delete is refused when its signer is listed or the account holding the registration it is
+  made under is, from clients and from sync alike (`blocked: Account <npub> is
+  blacklisted`, `403` on the blob routes). A registration signed by one of a listed
+  account's keys is refused, and no registration displaces a listed account's seat, however
+  young. Reads, `GET` and `/list` stay open. The listed keys
+  joined the fingerprint. Still open: the list is read at start, so each change needs both
+  nodes restarted with the same list (M9's reload path); the published digest lets someone
+  who can guess every other input test a guess of the list, as it always could for the
+  whitelist.
 - **Base path** (done). The check that a registration names this node ignored
   `NGIT_BASE_PATH`, and no test ran GRASP-P under one. A node under a mount path is now
   named by its host and that path together: in the `relays` and `server` tags of a
@@ -426,7 +450,8 @@ watchdog pair.
   - **Server, lapsed accounts (with M3 #1).** The admission mode gates NEW aliases only, so
     leaving the allowlist does not stop existing repositories. A lapsed account goes read-only
     (no new state roots or uploads, reads keep working), then offboards after the retention
-    window.
+    window. The blacklist's freeze (M3) already asks one question on every write path
+    (`PrivateService::write_blocked`); a lapsed account can be one more answer to it.
   - **Client, one hosting key per customer (M4).** `cord-git create` mints a fresh hosting key
     per repository by default, and the server treats each hosting key as a separate account.
     All of a customer's repositories register under one account key. Cost, known when this was
@@ -535,8 +560,9 @@ when the question was put.
   the account is closed. Accepted with it: the node's clock enters a merge decision, so the two
   nodes can disagree about a challenger that arrives just as a repository turns one hour old, and
   the tool to repair that arrives only with the offboarding work.
-- An account on `NGIT_EVENT_BLACKLIST` is frozen on both nodes: no new registrations, state
-  roots, stream wraps, uploads or deletions, by the account or by any of its registered keys.
+- An account on `NGIT_EVENT_BLACKLIST` is frozen on both nodes (done in M3; above): no new
+  registrations, state roots, stream wraps, uploads or deletions, by the account or by any of
+  its registered keys.
   Reads and `/list` keep working, so a customer can take their data and leave; removing content
   stays the denylist's job. The list joins the policy fingerprint, so each change needs both
   nodes restarted with the same list until M9's reload path takes it over.

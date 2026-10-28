@@ -93,13 +93,19 @@ check 4, never the run.
 ### Checks
 
 1. **fingerprint-parity** — NIP-11 `private_repos.policy_fingerprint` must
-   be present and equal on both nodes (a correctly paired setup hashes the
-   same sorted `{own domain} ∪ {bootstrap peer}` set on both sides).
+   be present and equal on both nodes (a correctly paired setup, each node
+   listing the other in `NGIT_GRASP_P_SYNC_PEER_URLS` by its own
+   `NGIT_DOMAIN` and mount path, hashes the same sorted set of the two node
+   addresses on both sides, and both must run the same
+   `NGIT_EVENT_BLACKLIST`; runbook §2).
    `registration_mode` and `policy_version` are reported for each side. On a
    mismatch the detail names which case it is: a **VERSION SKEW** (the
    `grasp-p-policy-vN` labels differ — a label bump moves every node's
    digest, so a rolling upgrade fails this check for the whole window) or a
-   **SAME-VERSION knob split** (a real acceptance divergence).
+   **SAME-VERSION knob split**: a preimage knob or the event blacklist
+   differs (a real acceptance divergence), or the peer lists do not name
+   each other by their own addresses (nothing replicates, or the pair
+   replicates under names the fingerprint does not match).
 1b. **kinds-parity** — NIP-11 `private_repos.kinds` must be the same SET on
    both nodes; the line names the kinds only one side admits (`only-a=` /
    `only-b=`). Its own check because the fingerprint digest folds a dozen
@@ -139,7 +145,7 @@ check 4, never the run.
 Human mode prints one line per check to stdout:
 
 ```
-PASS fingerprint-parity fingerprint=f9d937ac1a5851d8 policy-a=grasp-p-policy-v3 policy-b=grasp-p-policy-v3 mode-a=open mode-b=open
+PASS fingerprint-parity fingerprint=f9d937ac1a5851d8 policy-a=grasp-p-policy-v4 policy-b=grasp-p-policy-v4 mode-a=open mode-b=open
 PASS kinds-parity kinds=1059,3359,21059,23359,30640,30641
 PASS registration-parity alias=0123… event=ab12cd34
 FAIL manifest-parity alias=0123… author=deadbeef reason=withheld-30641 -- kind-30641 present on A but absent on B; created_at=1785000000 age=912s exceeds --max-skew-secs=300
