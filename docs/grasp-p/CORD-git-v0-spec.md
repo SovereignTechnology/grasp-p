@@ -115,21 +115,44 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   unconditionally on every eviction.
 - **Who may delete [N]** (decision D6): only the account key deletes a private repository's
   data, and only the whole repository: a kind-5 naming its 30640 coordinate with
-  `["k","30640"]`, dated at most 900 s ahead (an `e` id only beside the coordinate), or its
-  NIP-62 vanish. A `w` or `aux` key sends no vanish and no kind-5 but one naming 30640
-  coordinates under its own key (an offboard request), with no `e` target but a stored 30640
-  it names that way; no request may name a 30641 or a stream wrap this node holds, by `e`
-  id, or any by `a` coordinate; a vanish from a key that signed stored 30641s or wraps is
-  refused; no tombstone blocks a 30641 or a wrap. The pair exchanges offboard requests and
-  the accounts' vanishes over the peer link. A deletion request removes no 30641 and no
-  wrap, and the cascade of a public repository's deletion removes no 30640, 30641 or wrap,
-  whatever public event tags them.
+  `["k","30640"]`, dated at most 900 s ahead, or its NIP-62 vanish. A `w` or `aux` key sends
+  no vanish and no kind-5 but one naming 30640 coordinates under its own key (an offboard
+  request); no request may name a 30641 or a stream wrap this node holds, by `e` id, or any
+  by `a` coordinate; a vanish from a key that signed stored 30641s or wraps is refused; no
+  tombstone blocks a 30641 or a wrap. The pair exchanges offboard requests and the accounts'
+  vanishes over the peer link. A deletion request removes no 30641 and no wrap, and the
+  cascade of a public repository's deletion removes no 30640, 30641 or wrap, whatever
+  public event tags them; a 30640 leaves the store only by its coordinate or its account's
+  vanish, never by an `e` id.
+- **Offboard requests and account closure on a shared node [N]** (decision D15-6; the node
+  also serves public repositories). A kind-5 that carries `["k","30640"]`, that text
+  exactly, or names an `a` coordinate whose kind reads as 30640 as a number (`030640:`
+  counts), is an offboard request, and the server refuses one, from any signer, that names
+  anything but 30640 coordinates under its signer's own key and `["k","30640"]`; that
+  carries another `k` value; that carries any `e` id; that names more coordinates than
+  `NGIT_GRASP_P_MAX_ALIASES_PER_TENANT`; that exceeds `NGIT_GRASP_P_MAX_EVENT_BYTES`; or,
+  in whitelist mode, that comes from a key neither listed nor holding a registration there.
+  A `k` value that only reads as 30640 (`030640`) marks nothing: such a request is the public
+  relay's. **A client's offboard request MUST name only its own 30640 coordinates and
+  `["k","30640"]`**, with no `e` id (whether an id is one of the account's editions depends
+  on which editions each node holds, so the server refuses any), and public events are
+  deleted by a separate request without the k tag. **A client closing an account MUST send
+  a vanish with `["relay","ALL_RELAYS"]` or with a `relay` tag naming each node of the
+  pair** and each node that any `server` value of its registrations lists, each as `wss://`
+  and the host, port and mount path that value gives: the server refuses an account's
+  vanish that names fewer, since a node acts on a vanish only when it names that node, and
+  one naming a single node would close the account there alone. `ALL_RELAYS` is the simple
+  choice. An account's vanish is held to `NGIT_GRASP_P_MAX_EVENT_BYTES` too. Every other
+  deletion request and vanish is the public relay's, as without GRASP-P.
 - **Claim death [N]**: key claims are also freed by the account's NIP-09 kind-5 deletion of a
-  30640 (by `a` coordinate) and by its NIP-62 vanish, both honoring a `created_at` cutoff —
+  30640 (by `a` coordinate only; an `e` id frees nothing), honoring a `created_at` cutoff —
   an edition NEWER than the deletion keeps its claims, so a replayed stale deletion cannot wipe a
-  live edition; vanish freeing runs only when the request targets this relay. Without this, a
-  member could squat a future epoch's derivable rekey addresses, delete their own 30640, and wedge
-  every later rotation.
+  live edition — and by its NIP-62 vanish, which frees every claim of the account whatever its
+  date (decision D15-7): the server's vanish removes every event of its author with no date
+  bound, so a claim kept for a newer edition would outlive its event. A replayed old vanish
+  therefore closes the account. Vanish freeing runs only when the request targets this
+  relay. Without this, a member could squat a future epoch's derivable rekey addresses,
+  delete their own 30640, and wedge every later rotation.
 
 ### 2.2 kind 30641 — state root [N]
 Addressable event signed by a **registered write key** (aux keys refused).
@@ -391,7 +414,7 @@ retry. Honouring `Retry-After` is planned for a later client milestone.
   live 30640, verified against the tenant pubkey from the EXISTING keystore. The never-to-a-git-node
   delivery rule is enforced here by its own guard, independently of the invite path's — promotion
   carries `write_secret`, so it is the higher-value of the two leaks.
-- **export / offboard [D]**: decrypted portable bundle; kind-5 tombstone (the 30640 coordinate with `["k","30640"]`, signed by the hosting key, sent to every node; never a kind-5 for 30641s or wraps, which the server refuses); retention purge.
+- **export / offboard [D]**: decrypted portable bundle; kind-5 tombstone (the 30640 coordinate with `["k","30640"]` and nothing else, signed by the hosting key, sent to every node; never a kind-5 for 30641s or wraps, which the server refuses); account closure by a vanish with `["relay","ALL_RELAYS"]` or naming both nodes (§2.1); retention purge.
 
 ### 4.1 Rotation: pending-epoch lifecycle and §3.3 sequencing [N]
 
@@ -660,6 +683,12 @@ lookup of its own).
 | kind 5 naming a stored 30640 by `e` id without its coordinate, or carrying `["k","30640"]` without a coordinate of a 30640 under its signer's key | `a registration is deleted by its coordinate (a tag), not by its event id alone` | genuine |
 | offboard kind 5 without `["k","30640"]`, or with the kind spelled other than `30640` | `deleting a registration requires a k tag of 30640` / `a registration coordinate must be written 30640:<pubkey>:<alias>` (`invalid:`) | genuine |
 | kind 62 from a key with stored 30641s or stream wraps | `a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | genuine |
+| offboard kind 5 (`["k","30640"]` or a 30640 coordinate) that names a coordinate of another kind or carries another `k` value, from any signer | `an offboard request names nothing but its signer's registration coordinates and the k tag 30640` (`invalid:`) | genuine |
+| offboard kind 5 with any `e` tag | `an offboard request names its registrations by coordinate only, with no event id` (`invalid:`) | genuine |
+| offboard kind 5 with more `a` tags than the alias cap | `an offboard request names more registrations than an account may hold` (`invalid:`) | genuine |
+| offboard kind 5, or an account's kind 62, over `max_event_bytes` | `an offboard request or an account's vanish exceeds the private event size limit` (`invalid:`) | genuine |
+| whitelist mode: offboard kind 5 from a key neither listed nor holding a registration | `offboard requests are taken only from accounts this node admits` (`invalid:`) | genuine |
+| kind 62 from a key holding live registrations, naming neither `ALL_RELAYS` nor every node of the pair (this node, its configured peers) and every node in their `server` tags | `an account's vanish names ALL_RELAYS or every node its registrations list` (`invalid:`) | genuine |
 | 30641 or stream wrap under a registration of an account on `NGIT_EVENT_BLACKLIST`, or a 30640 signed by a key such a registration lists | `Account <npub> is blacklisted` (`blocked:`; blob routes `403` with the same `X-Reason`) | genuine, **not** widenable |
 | any event signed by a key on `NGIT_EVENT_BLACKLIST` (upstream's check) | `Event author <npub> is blacklisted` (`blocked:`; the same text on a blob route `403`) | genuine |
 | 30640 or stream wrap with an `e`/`E`/`q`/`a`/`A` tag | `registrations and stream wraps carry no e, E, q, a or A tag` (`invalid:`) | genuine, **not** widenable |
@@ -739,6 +768,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.1 — §3.2 deterministic merge + FIRST-edition anchor + winner exemptions + loser eviction (v0: bare "first-registrant-wins").
 - §2.1, §5, §6, §7 — settled seats: a seat whose first edition is more than an hour older than the node's clock is never the loser of a conflict, by alias or by key; the warning carries `incumbent_settled`; a boot reconcile judges the seats its meta index held by their age and the seats it creates by the order alone; no message text changed.
 - §2.1 — kind-5/kind-62 claim freeing with the created_at cutoff; vanish must target this relay.
+- §2.1, §5.2 — offboard requests and account closure on a node that also serves public repositories (D15-6, D15-7): a kind-5 with `["k","30640"]` or a 30640 coordinate has the pure offboard shape from every signer (own coordinates and the k tag only, no `e` id, the alias cap on coordinates, the private event size, the whitelist); a `k` value that only reads as 30640 marks nothing; a client names only coordinates; an account's vanish names `ALL_RELAYS` or every node of the pair and of its registrations' `server` values, and fits the size; a vanish frees every claim of its account whatever its date; a 30640 is never removed by `e` id and an `e` id frees no claim; new refusal strings, none containing `unregistered`.
 - §2.1, §5.2, §6 — who may delete (D6): the account key alone, a whole repository by its 30640 coordinate with `["k","30640"]`, not future-dated; members cannot delete or vanish; 30641s and wraps are never named by a request nor blocked by a tombstone, and no deletion path removes them; a public repository's cascade passes over 30640s too; offboard requests and account vanishes replicate between peers; new refusal strings, none containing `unregistered`.
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
 - §2.1, §5, §5.2 — order of checks in registration: shape (key cap first) before admission, admission before proofs of possession and before the conflict merge; an account that holds the alias is exempt from the mode; no message text changed. A node under a mount path is named by host and path in `relays`/`server`.

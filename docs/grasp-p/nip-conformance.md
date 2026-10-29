@@ -45,7 +45,7 @@ GRASP-08-composition phase; `landed` = shipped since the inventory was first tak
 | 7 | Client-side AUTH | NIP-42 | not implemented (client) | **ADOPT** | P3 |
 | 7b | Relay AUTH-gating of stored stream wraps | NIP-59 SHOULD | deliberately **not** gated; the missing tagless gate has been **written** (exit36/exit39) | **N-A** — the wraps left kind 1059 (item 12), so there is no NIP-59 rule to except | landed |
 | 8 | HTTP auth on the private surface | NIP-98 / NWT (PR #2187) | no NIP-98 surface anywhere | **N-A** | — |
-| 9 | Deletion / vanish claim freeing | NIP-09 / NIP-62 | implemented with cutoff + relay targeting | **CONFORMANT** | — |
+| 9 | Deletion / vanish claim freeing | NIP-09 / NIP-62 | kind 5 with the created_at cutoff; a vanish frees every claim (D15-7, matching upstream's undated removal, pinned by a canary) + relay targeting | **CONFORMANT** | — |
 | 10 | NIP-11 `private_repos` advert | NIP-11 | custom top-level object, no `limitation` | **CONFORMANT-BY-EXTENSION** + **ADOPT** companions | P3 |
 | 11 | Kind-number registration | nips `README.md` kind table | all 7 unregistered — 3359/23359 now in use but still unminted | **ADOPT** (open a README-table PR) | v0.2 |
 | 12 | kind-1059 semantic overload | NIP-59 | resolved — the 3 shaped-not-conformant uses are on 3359; 1059 keeps only the genuine gift wraps | **MIGRATED** to 3359 / 23359 — **SHIPPED both sides** | landed |
@@ -384,12 +384,18 @@ persist across restarts (`builder.rs:749-758,970`).
   `nip62::is_valid_vanish_request_for_relay`, checking every `RelayUrl` candidate derived from the
   configured domain and falling back to `ALL_RELAYS`-only matching when the domain yields no valid
   `RelayUrl` (`:458-462`). **Relay-targeting requirement: satisfied.**
-- **`created_at` cutoff:** both paths pass the death event's `created_at` as `max_created_at` into
-  `free_registration_claims` — kind 5 at `src/grasp_p/mod.rs:792` (cutoff) with the calls at `:824`
-  (`a` coordinate) and `:835` (`e` id), vanish at `:863`/`:868` — which returns 0 without freeing anything
-  when `record.created_at > max_created_at` (`mod.rs:1293-1295`). A replayed stale vanish or deletion
-  therefore cannot wipe a *re-registered* newer edition. **Cutoff: satisfied.** Documented at
-  `mod.rs:853-860`.
+- **`created_at` cutoff:** the kind-5 path passes the deletion's `created_at` as `max_created_at`
+  into `free_registration_claims`, by `a` coordinate only (`free_claims_for_deleted_registrations`
+  in `src/grasp_p/mod.rs`), which returns 0 without freeing anything when
+  `record.created_at > max_created_at`, as upstream's coordinate path removes only editions up to
+  that date. A replayed stale deletion therefore cannot wipe a *re-registered* newer edition.
+  **Cutoff: satisfied.** The vanish path passes no cutoff (`u64::MAX`, decision D15-7):
+  upstream's vanish removes every event of its author whatever its date and refuses all its later
+  events, where NIP-62 removes only those up to the vanish's `created_at`, so the claims go with
+  the events they belong to. That departure is upstream's; the canary
+  `upstream_vanish_removes_events_of_every_date` in `src/grasp_p/offboard.rs` fails if upstream
+  adopts the NIP's bound, and the cutoff then comes back. An `e` id frees no claim: on a
+  GRASP-P node upstream's `e` path removes no registration (`offboard::removal_exempt`).
 
 - **Who may delete (decision D6), a restriction on top of the two NIPs:** on a GRASP-P node only
   the account key deletes a private repository's data, and only the whole repository: a kind 5
@@ -399,12 +405,17 @@ persist across restarts (`builder.rs:749-758,970`).
   own key (an offboard request), every request naming a state root or a stream wrap the node
   holds by `e` id or any by an `a` coordinate of their kinds, a registration named by `e` id
   alone or by another pubkey, and a vanish from a key that signed stored state roots or wraps.
+  A kind 5 with `["k", "30640"]` or a 30640 coordinate has the pure offboard shape whoever signs
+  it, with no event id, and the vanish of a key that holds registrations must carry `ALL_RELAYS`
+  or name every node of the pair and every node its registrations' `server` tags list
+  (decision D15-6).
   NIP-09 lets an author delete its own events; refusing some of them is a relay's policy to
   set, and every request that touches no GRASP-P key or event is upstream's, unchanged. The
   tombstone gate is not run for state roots and the stream wraps the node takes
   (`deletion_gate_exempt`), so no request blocks them; upstream's announcement cascade passes
   over registrations, state roots and wraps (`cascade_exempt`), and its archive-and-delete step
-  over state roots and wraps (`removal_exempt`), so no other deletion removes them either.
+  over state roots and wraps, and over a registration on any path not bound to its author, the
+  `e` path among them (`removal_exempt`), so no other deletion removes them either.
   Offboard requests (`#k` 30640) and the hosted accounts' vanishes are in the peer sync
   filters. See "Who may delete" in `SEAMS.md`.
 

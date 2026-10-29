@@ -217,10 +217,16 @@ Gaps being closed before production (tracked as issues on the two projects):
 - Member keys are passed as an nsec, and the keystore is unencrypted on disk.
 - No paid admission mode. Only the account key deletes, and only a whole repository, by its
   registration; members cannot delete from the server, and the deletion reaches both nodes of
-  a pair. Deleting a registration frees its alias and keys at once and drops its claim on its
-  blobs, which garbage collection removes after the grace period if nothing else references
-  them; the tombstone, the retention window and the purge of stored state roots and wraps
-  are not implemented.
+  a pair. A deletion request that names a registration carries nothing but its signer's
+  registration coordinates and the k tag, no event id either, whoever sends it; other
+  deletion requests and vanishes go to upstream as on a node without private repositories,
+  unless a member key signs them, they name a repository's state, or, for a vanish, its key
+  signed stored state roots or wraps. An account closes with a vanish that names both nodes
+  of the pair or all relays, and that vanish frees every registration of the account
+  whatever its date. Deleting a registration
+  frees its alias and keys at once and drops its claim on its blobs, which garbage collection
+  removes after the grace period if nothing else references them; the tombstone, the
+  retention window and the purge of stored state roots and wraps are not implemented.
 
 The server runs on ngit-grasp v3.0.8. Its code is in `src/grasp_p/` and its settings are
 `NGIT_GRASP_P_*`; `src/private/` and `NGIT_PRIVATE_*` belong to upstream's GRASP-08 mode,

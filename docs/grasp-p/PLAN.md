@@ -173,9 +173,21 @@ project yet.
   state roots and stream wraps, so a request sent before a key was registered cannot block
   it; upstream's deletion paths, the cascade of a public repository included, remove no
   state root or wrap, and the cascade no registration. Offboard requests and the accounts'
-  vanishes ride the peer filters, so the other node of a pair sees the same deletion. See
-  "Who may delete" in [`SEAMS.md`](SEAMS.md). Still open: the hold, restore and purge (#1,
-  below).
+  vanishes ride the peer filters, so the other node of a pair sees the same deletion. **Done
+  in merge request 15b** (decisions D15-6 and D15-7, below): a kind 5 with `["k", "30640"]`
+  or a 30640 coordinate, the coordinate's kind read as a number, has the pure offboard shape
+  whoever signs it (the signer's own coordinates and `["k", "30640"]` only, no event id, no
+  more coordinates than the alias cap, within the private event size, and in whitelist mode
+  only from a listed or registered key); an account's vanish names all relays or every node
+  of the pair (the configured peers) and every node its registrations' `server` tags list,
+  each value as written, and fits the size; a vanish frees every claim of its account whatever its date, with a canary
+  test that fails if upstream ever bounds its vanish by date; a registration leaves the
+  store only by its coordinate or its account's vanish, and an `e` id frees no claim. Other
+  deletion requests and vanishes are upstream's, so strangers keep deleting their public
+  events. See "Offboard requests and account vanishes on a shared node" in
+  [`SEAMS.md`](SEAMS.md). Still open: the hold, restore and purge (#1, below); a vanish that
+  reaches one node before the account's registration does, and names only that node, splits
+  the pair.
 - **Offboarding (#1) is half there.** An accepted deletion of a registration already frees
   the alias, the key claims and the blob claims. A deletion accepted on one node of a pair
   now reaches the other ("Who may delete", above). Missing: the tombstone and retention window
@@ -633,9 +645,15 @@ requests (15a, 15b, 15c); every recommendation was taken.
 - Deletion requests shaped as offboard requests (a `["k", "30640"]` tag, or a 30640
   coordinate) take the pure offboard shape for every signer, with caps and a whitelist refusal;
   a vanish from a key that holds registrations must name every node of the pair or all relays
-  (15b).
+  (15b, done). Review narrowed two points, both so that the two nodes of a pair answer
+  alike: an offboard request names no event id at all (the decision allowed ids of the
+  account's own editions beside their coordinate, but whether an id is one depends on which
+  editions each node holds), and the vanish names the configured peers and every `server`
+  value as written, this node's included (each node knows the other's own address only from
+  its peer list).
 - A vanish dated before an account's registrations frees every claim, matching what upstream
-  actually deletes, with a test that fails if upstream ever bounds its vanish by date (15b).
+  actually deletes, with a test that fails if upstream ever bounds its vanish by date (15b,
+  done).
 - The bootstrap relay and the publishing of the relay's identity keep `ws://` with a boot
   warning; relays that events name are dialled over `wss://` only (15c).
 - The fingerprint over private links needs no code: M8 lists each peer by its public

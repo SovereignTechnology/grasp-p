@@ -872,7 +872,9 @@ curl -s 127.0.0.1:9464/metrics | grep '^ngit_private_events_rejected_total'
 Read the `kind` label mix: a single kind dominating = one misbehaving
 writer (e.g. 21059 spam from one key — also see [Rate limited](#rate-limited));
 kinds `5` and `62` are deletion requests and vanishes the node refused
-(§5: members cannot delete, and nothing may name a state root or a wrap);
+(§5: members cannot delete, nothing may name a state root or a wrap, a
+request that names a registration has the offboard shape whoever sends it,
+and an account's vanish names both nodes);
 a broad mix = flood, or a policy misconfiguration rejecting legitimate
 members (check `NGIT_GRASP_P_TENANT_WHITELIST`, §1). Threshold is a starting
 default — tune to the instance baseline. Flood → tighten the nginx zones
@@ -1343,12 +1345,18 @@ rendered `{prefix}: {message}` (src/nostr/policy/result.rs:11–13).
 | `restricted: registration requires N bits of NIP-13 proof of work` | pow mode, same place | genuine | re-mine the 30640 |
 | `restricted: alias already registered` / `restricted: write key already registered` | §3.2 conflict-merge loss, for a sender the mode admits: the holder's first edition is earlier, or the holder's seat is more than an hour old (`apply` in src/grasp_p/registration.rs) | genuine | pick another alias / minimal widen without the squatted keys |
 | `invalid: registration relays tag must list this node` / `invalid: registration server tag must list this node` | no value of the tag names this node: its host and port, and its mount path when it runs under `NGIT_BASE_PATH` (`parse_shape`) | genuine | publish the registration with this node's full URL in both tags |
-| `restricted: a repository's write and aux keys cannot delete; the account key deletes the whole repository` | kind 5 (except one naming only 30640 coordinates under the signer's own key, an offboard request) or kind 62 from a write or aux key of a registration on this node (`src/grasp_p/offboard.rs`) | genuine | none: members cannot delete from the server; the account deletes the repository |
+| `restricted: a repository's write and aux keys cannot delete; the account key deletes the whole repository` | kind 5 (except an offboard request: one with `["k","30640"]` or a 30640 coordinate, judged by the rows below) or kind 62 from a write or aux key of a registration on this node (`src/grasp_p/offboard.rs`) | genuine | none: members cannot delete from the server; the account deletes the repository |
 | `restricted: state roots and stream wraps are removed only with their repository's registration` | kind 5 naming a 30641 or a stream wrap this node holds by `e` id, or any by an `a` coordinate of those kinds | genuine | never send it; the server removes them with the registration |
 | `restricted: a registration can be deleted only by the account key that signed it` | kind 5 naming another pubkey's 30640, by coordinate or by `e` id | genuine | none |
 | `restricted: a registration is deleted by its coordinate (a tag), not by its event id alone` | kind 5 naming a stored 30640 by `e` id without its coordinate, or carrying `["k","30640"]` with no coordinate of the signer's own 30640 | genuine | send the coordinate `30640:<account>:<alias>` |
 | `invalid: deleting a registration requires a k tag of 30640` / `invalid: a registration coordinate must be written 30640:<pubkey>:<alias>` | offboard request without `["k","30640"]`, or with the kind spelled otherwise (`030640`) | genuine | fix the request; the k tag is what carries it to the other node |
 | `restricted: a key that signed state roots or stream wraps cannot vanish; the account key deletes each repository by its registration` | kind 62 from a key with stored 30641s or wraps | genuine | offboard each repository by kind 5 |
+| `invalid: an offboard request names nothing but its signer's registration coordinates and the k tag 30640` | a kind 5 with `["k","30640"]` (that text exactly) or a 30640 coordinate (its kind read as a number, so `030640:` counts) that also names a coordinate of another kind or a malformed one, or carries another `k` value (`030640` included), from any signer (D15-6) | genuine, final | send the offboard request alone; delete public events in a separate request without the k tag |
+| `invalid: an offboard request names its registrations by coordinate only, with no event id` | an offboard request with any `e` tag, its own registration's id included: whether an id is one of the account's editions depends on which editions each node holds, so the two nodes would answer differently | genuine, final | send the coordinates alone |
+| `invalid: an offboard request names more registrations than an account may hold` | an offboard request with more `a` tags than `NGIT_GRASP_P_MAX_ALIASES_PER_TENANT`, repeats counted | genuine, final | split it |
+| `invalid: an offboard request or an account's vanish exceeds the private event size limit` | an offboard request, or the vanish of a key that holds registrations here, over `NGIT_GRASP_P_MAX_EVENT_BYTES` | genuine, final | send it with no content beyond what the request needs |
+| `invalid: offboard requests are taken only from accounts this node admits` | whitelist mode: an offboard request from a key that is neither on `NGIT_GRASP_P_TENANT_WHITELIST` nor holds a registration here | genuine, final | none: such a key holds no repository on either node |
+| `invalid: an account's vanish names ALL_RELAYS or every node its registrations list` | kind 62 from a key that holds live registrations here, with neither `["relay","ALL_RELAYS"]` nor a `relay` tag for this node, for each configured sync peer and for every node its registrations' `server` tags list, each value as written | genuine, final | send `["relay","ALL_RELAYS"]` |
 | `blocked: Account <npub> is blacklisted` | 30641 or stream wrap (stored or ephemeral) made under a registration whose account is on `NGIT_EVENT_BLACKLIST` (`grasp_p::blacklist`), from a client or from sync | operator block | none — the account is frozen; reads still work (§2, "The event blacklist"); deliberately does NOT contain `unregistered` |
 | `blocked: Event author <npub> is blacklisted` | any event signed by a key on `NGIT_EVENT_BLACKLIST` (upstream's check; the account's own registrations and deletions included) | operator block | none |
 | `invalid: registrations and stream wraps carry no e, E, q, a or A tag` / `invalid: a state root carries one a tag and no e, E, q or A tag` | a 30640 or a stream wrap (any kind) with a reference tag; a 30641 with one beside its own `a`, or a second `a` (`attachment::reference_tag_refusal`) | genuine, final | none: cord-git sends no such tag; decided before the key lookup, so never held |
@@ -1727,11 +1735,27 @@ Pointers, not procedures:
 - **Who may delete (D6).** Only the account key deletes, a whole
   repository by its 30640 coordinate with `["k","30640"]`; members cannot
   delete or vanish (§5), so a member who asks to delete is told to ask the
-  account. A vanish naming one node of a pair acts on that node only; a key
-  whose membership one node has not yet seen can vanish there, and its own
-  registrations go on that node only; with
-  `NGIT_DELETION_REQUEST_DISRESPECTOR=true` no registration is ever
-  deleted. See "Who may delete" in SEAMS.md.
+  account. A request that names a registration, by `["k","30640"]` or a
+  30640 coordinate, carries nothing else, no event id either, and is
+  refused otherwise, whoever sends it (D15-6); an account that also
+  deletes public notes sends a second, ordinary request for them. A key whose membership one node has
+  not yet seen can vanish there, and its own registrations go on that node
+  only; with `NGIT_DELETION_REQUEST_DISRESPECTOR=true` no registration is
+  ever deleted. See "Who may delete" in SEAMS.md.
+- **Account closure.** A customer closes an account with a NIP-62 vanish
+  that carries `["relay","ALL_RELAYS"]` or names both nodes of the pair
+  (and every node its registrations' `server` values list, as written);
+  each node refuses an account's vanish that names only one of them, which
+  would close the account there and leave it open on the other. The vanish
+  removes every registration of the account whatever its date, frees every
+  alias and key at once (D15-7: there is no hold until merge request 18),
+  and refuses the account key on both nodes for as long as upstream keeps
+  the vanish (the `NGIT_DELETION_REQUEST_RETENTION_*` settings: by default
+  360 days after it last removed or refused an event). A replayed old
+  vanish of an account key closes the account the same way. A vanish that
+  reached a node before the account registered there is that node's alone:
+  if it named only that node, the account is refused there and stays open
+  on the other; an `ALL_RELAYS` vanish closes it on both.
 - **WS-path per-IP limiting gap**: nginx `limit_req` cannot inspect frames
   inside a long-lived WS connection — the per-IP outer layer covers the
   HTTP blob routes only; the inner layer is the per-write-key bucket
