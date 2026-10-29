@@ -1807,12 +1807,15 @@ mod fetch_helper_tests {
             "test.example",
             "fetch_batch",
             GitFetchRole::Primary,
+            // SovTech seam: on a slow CI runner a 50 ms limit killed the group
+            // before `sh` had recorded its descendant, so the pid never came
+            // and the bound below expired instead of the assertion running.
             GitProcessPolicy {
-                inactivity_limit: Duration::from_millis(50),
+                inactivity_limit: Duration::from_secs(1),
                 termination_grace: Duration::from_millis(50),
             },
         );
-        let (pid, output) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (pid, output) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(wait_for_pid, run)
         })
         .await

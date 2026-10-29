@@ -245,6 +245,21 @@ async fn startup_historic_sync_stays_within_relay_req_concurrency_limit() {
         "{}",
         String::from_utf8_lossy(&clone.stderr)
     );
+    // SovTech seam: a bare clone is the legacy storage layout, so the relay
+    // would first migrate it to identifier families, before serving HTTP and
+    // inside the harness's 5 s readiness budget, which a slow CI runner
+    // overran. A node that ran before already has current storage.
+    let migration = ngit_grasp::git::migration::migrate_on_startup(
+        &ngit_grasp::git::storage::LocalGitStorage::new(syncing_git_dir.path()),
+    )
+    .await
+    .expect("migrate persisted repository");
+    // A retained backup would leave the relay its own retirement to finish.
+    assert_eq!(
+        (migration.migrated_views, migration.retained_backups),
+        (1, 0),
+        "the persisted repository must be on current storage before startup"
+    );
     {
         let database = NostrLmdb::builder(syncing_data_dir.path())
             .process_nip09(false)
