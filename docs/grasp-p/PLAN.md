@@ -218,7 +218,32 @@ project yet.
   not retry these answers yet.
 - **#5 has a hostile form.** A tenant that references another tenant's stored blob keeps the
   charge on the uploader for good, at no cost to itself. Decided on 2026-10-27: every
-  referencing repository pays the full size (below).
+  referencing repository pays the full size (below). **Done in merge request 16:** a claim
+  carries one charge per referencing repository, each with its own byte count, kept by
+  `src/grasp_p/claims.rs` for every path that changes a reference (state roots, uploads and
+  their preflight, Blossom DELETE, the three deaths of a registration, GC and takedowns, the
+  mirror). A repository pays a blob's declared size until the bytes are stored on the node (the
+  size its newest edition naming the blob declares) and their stored size after, whoever stored
+  them; one that declared fewer bytes than were stored and cannot afford the difference stops
+  referencing the blob instead of being carried over its caps by another account's upload. One
+  that stops referencing a blob, or dies, is released at once while another references it, and
+  as the last referrer of stored bytes it pays until GC removes them, so that an upload followed
+  by a delete, or by the registration's deletion, is not free storage for the grace period (the
+  timing of a death is unchanged until the hold of #1, merge request 18). A blob nobody stored
+  loses its claim with its last reference, so a claim that exists is charged or on disk, and GC
+  settles a declared claim whose file an interrupted upload left on disk. The node's ledger is
+  the sum of the charges, not the bytes on disk. The mirror stores bytes only for a repository
+  that references them, adds no reference of its own, and judges each repository it fetches
+  for at that repository's own declared size. Both nodes of a pair reach the same ledger in any
+  arrival order once both hold the bytes, except: who pays during a grace period, and that
+  difference can make one node refuse a state root or an upload the other accepts until GC
+  removes the bytes; a reference made by an upload alone, which only the node that took the
+  upload knows of until the repository's next state root, which may never come; and whether a
+  repository that declared too few bytes could afford the stored size when it arrived. A claim
+  written in the old single-payer shape is refused rather than read. Still open: the minimum
+  billable size (#25, merge request 17); and, older than this change, a state root that
+  reaches a node after a newer one by the same write key is not retained there, so the references
+  the two nodes charge for can differ until enough newer editions have passed.
 - **Order of checks in registration** (done). Proofs of possession were verified before
   the key count was capped and before the admission mode was consulted, and the mode was
   consulted after the conflict merge, so an anonymous sender could cost CPU and raise the
@@ -258,11 +283,13 @@ project yet.
   ("The event blacklist", below).
 - **Denylist reload** (done). The reload now starts from what the boot load read, so a file
   that can no longer be read or parsed keeps the entries it had at boot when another file
-  changes. Still open: **what a missing denylist file means.** Today a file that is absent
-  counts as empty, at boot and on reload, so a file that disappears (an unmounted volume, a
-  deploy that is not atomic) lifts its takedowns within one reload interval. Decided on
-  2026-10-27, not built yet: keep its last-known entries until a readable file no longer
-  lists them (below).
+  changes. **A missing denylist file** (decided on 2026-10-27, D11; done in merge request 16):
+  a file that disappears after it was read keeps its last-known entries and logs an error on
+  every reload tick until it is back, so an unmounted volume or a deploy that is not atomic
+  lifts no takedown; a takedown is lifted only by a readable file that no longer lists the
+  hash. A file that had entries and reads back empty keeps them too (a deploy that truncates
+  before it writes), and a comment line clears a list on purpose. A file missing at boot is
+  still tolerated.
 - **Peers** (done). A configured peer, which is an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`
   (the bootstrap relay counted as well at first, and no longer does; see the next point),
   is kept when its session ends, is not muted by the naughty list, and is dialled
@@ -521,8 +548,8 @@ the pair when a report's `server` tag is judged.
     today.
   - **Order.** Not before delta packs (M5 #4): today every push is one full pack and the last
     16 editions stay charged, so an account pays for up to 16 copies of each repository, and a
-    repository cannot exceed the 256 MiB blob cap. Not before cross-tenant charge pinning is
-    fixed (issue 5, M3): one tenant can keep bytes charged to another.
+    repository cannot exceed the 256 MiB blob cap. Cross-tenant charge pinning (issue 5) is
+    fixed in M3: every referencing repository pays its own charge.
   - The allowance per plan is not decided.
 - Launch review: a full adversarial pass on the server, the client library, the ngit fork and the
   web UI, then tag `sovtech-v1.0.0` on each.
@@ -595,8 +622,9 @@ when the question was put.
 
 - A stored blob that several repositories reference is paid by every one of them, at its full
   size, while it references it; two repositories of one account count it twice in v1, and the
-  disk keeps one copy (#5). An account's bill then depends on its own repositories alone, and
-  both nodes of a pair compute the same ledger in any arrival order.
+  disk keeps one copy (#5; done in M3, above). An account's bill then depends on its own
+  repositories alone, and both nodes of a pair compute the same ledger in any arrival order
+  (with the exceptions the M3 entry above lists).
 - Small objects are billed at a minimum of 16 KiB per stored or declared blob, with no separate
   count of objects (#25). The minimum is advertised in NIP-11 and stated wherever plans are
   described. Objects are then bounded by bytes at every scope, and the per-account limit record
@@ -633,7 +661,7 @@ when the question was put.
   are neither logged nor counted (decided 2026-10-28, below; done in M3).
 - A denylist file that was loaded and then disappears keeps its takedowns: the node keeps its
   last-known entries and logs an error, and a takedown is lifted only by a readable file that no
-  longer lists the hash. A file missing at boot is still tolerated.
+  longer lists the hash. A file missing at boot is still tolerated (done in M3).
 - Findings in upstream's own code go upstream in two batches. Ordinary robustness and
   documentation fixes are offered as they land here. The security-relevant ones (the NIP-11
   probe, `/metrics` open with CORS `*`, the related-event anchors, the NAT64 and 6to4 gap) go

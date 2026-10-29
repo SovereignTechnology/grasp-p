@@ -778,7 +778,7 @@ of src/grasp_p/mirror.rs):
 | `network` | same backoff | no | transport failure, no answer within `NGIT_GRASP_P_MIRROR_FETCH_TIMEOUT_SECS`, a body that stalled or outran its deadline, or a peer name that did not resolve or resolved to no address — DNS/TLS, peer down, egress firewall, a very slow link. The mirror uses no proxy from the environment: a peer reachable only through `HTTPS_PROXY` fails here |
 | `http_status` | same backoff; `404` from every peer always waits `NGIT_GRASP_P_MIRROR_RETRY_MAX_SECS` | no | 5xx: peer erroring; 404 on all peers: late upload, benign, self-heals; other codes: proxy/edge oddity |
 | `quota` | same backoff | yes | local ledger/budget full — [Ledger budget](#ledger-budget). Refused before any request is sent when the ledgers already show it |
-| `store` / `reserve` / `sink` / `write` | same backoff | yes | this node's own state (registration gone, denylisted mid-fetch, meta store or disk error) — read the full reason in the warn line |
+| `store` / `reserve` / `sink` / `write` | same backoff | yes | this node's own state (registration gone, the repository no longer references the blob, denylisted mid-fetch, meta store or disk error) — read the full reason in the warn line |
 | `blocked` | always the max interval | no | SSRF guard: peer is non-https, carries credentials, uses a local name, or resolves to a non-global address, either at the check before the request or at the connection (`blocked: <host> resolved to <address>, ...` in the warn line: the answer held an address the mirror may not reach, and the whole answer was refused) — fix the entry or the peer's DNS, or, for a pair on a private link, set `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` |
 | `too_large` | always the max interval | no | the peer announced more than `NGIT_GRASP_P_MAX_BLOB_BYTES`, or sent more bytes than the fetch expected (the announced length, or the declared size when none was announced), or the state root declared more than the maximum — check that both nodes run the same maximum; a body longer than expected means the peer serves other bytes: investigate it |
 | `verify` | always the max interval | no | peer served wrong bytes: they do not hash to the blob's name, or a body sent without a length ended short of the declared size — investigate the peer |
@@ -790,8 +790,11 @@ peer and a timeout from another count as `network`.
 
 A peer is believed about a blob's length up to
 `NGIT_GRASP_P_MAX_BLOB_BYTES`: a blob whose state root declared the wrong
-size is mirrored and charged at its real size. Every peer is one the
-operator listed.
+size is mirrored and charged at its real size, to every repository that
+references it. The mirror stores a blob only for a repository that still
+references it on this node and adds no reference of its own; a fetch that
+outlived its reference fails as `store` and the blob is left to the
+repositories that still want it. Every peer is one the operator listed.
 
 Because every class backs off, a few blobs that stay stuck fail a few times
 an hour and this alert goes quiet; [Mirror lag](#mirror-lag) keeps firing
@@ -900,23 +903,31 @@ a restart can re-fire at most one alert per TTL window for an old loser.
 
 **Alerts:** `NgitPrivateLedgerBudgetHigh` — `ngit_private_ledger_bytes{scope="global"} > 80%` of budget for 30m; `NgitPrivateLedgerBudgetCritical` — `> 95%` for 15m.
 
-What it means: the whole-subsystem ledger (events + blobs + speculative
-charges) is pressing on `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES` (default
+What it means: the whole-subsystem ledger (events + the charges for blobs)
+is pressing on `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES` (default
 53687091200 = 50 GiB). The literal in the rule file must match the deployed
 value (prometheus-alerts.yaml:70–75). At 100%, new admissions and uploads
 start failing with `quota exceeded` / HTTP 507.
+
+The ledger counts charges, not bytes on disk. Every repository that
+references a stored blob is charged its full size, so a blob that three
+repositories reference counts three times here and once on disk (decision
+D4), and the global gauge can be above what the blob store holds. Stored
+bytes nobody references any more stay charged to their last referrer, a
+repository that died included, until GC removes them.
 
 Remediate:
 
 1. Verify GC is running: `journalctl -u ngit-grasp | grep 'private blob GC'`.
    Passes run every `NGIT_GRASP_P_GC_INTERVAL_SECS` (default 3600) and free
    grace-expired (default `NGIT_GRASP_P_GC_GRACE_SECS` = 86400) unreferenced
-   blobs, releasing their stored charges (src/grasp_p/gc.rs:63–100).
-2. Have tenants **Blossom-DELETE** unneeded blobs: DELETE removes the
-   alias's claim; once the claim is unreferenced and grace expires, GC's
-   `purge_blob` unlinks the bytes and refunds the ledger — this is the
-   tenant-driven refund path (src/grasp_p/mod.rs:1101–1145,
-   src/grasp_p/gc.rs:63–100).
+   blobs, releasing the charge their last referrer still pays (`purge_blob`
+   in src/grasp_p/gc.rs).
+2. Have tenants **Blossom-DELETE** unneeded blobs: DELETE releases the
+   repository's charge at once while another repository references the
+   blob; as the last referrer it pays until GC's `purge_blob` unlinks the
+   bytes after grace — this is the tenant-driven refund path
+   (`blob_delete` in src/grasp_p/mod.rs, `claims.rs`).
 3. Review quotas (`NGIT_GRASP_P_QUOTA_TENANT_BYTES` default 1 GiB,
    `NGIT_GRASP_P_QUOTA_REPO_BYTES` default 512 MiB) or raise the budget on
    BOTH nodes — the quota/budget knobs feed the fingerprint (§2) — and
@@ -924,10 +935,12 @@ Remediate:
 
 Known stranding: ledger bytes billed to a registration that died
 (merge-evicted / vanished / kind-5) are NOT fully reclaimed — the
-event-bytes columns ride server issue **!1**; a stored blob claim still
-shared with a surviving alias keeps its charge until the new holder
-Blossom-DELETEs or the claim dies (accepted residual, also riding !1). Do
-not chase these to zero; budget headroom is the remedy.
+event-bytes columns of `t:` and `g:` ride server issue **!1**. Blob
+charges are not stranded: a dying registration's charges on blobs another
+alias references, or that nobody stored, are released at once, those on
+stored bytes it was the last to reference go with the bytes at GC, and a
+surviving alias pays only its own. Do not chase the event bytes to zero;
+budget headroom is the remedy.
 
 ### Admission rejection spike
 
@@ -1124,19 +1137,21 @@ detection.
 `delta(ngit_private_denylist_entries[1h]) < 0` for 5m.
 
 What it means: the live denylist shrank (gauge set at boot and on every
-reload swap — src/metrics/mod.rs:367–379). Either the files were edited
-(intended removal) or they went missing/shrunk on disk (unintended). A drop
-to 0 on a node that should be enforcing a list = the files are gone.
+reload swap — `PRIVATE_DENYLIST_ENTRIES` in src/metrics/mod.rs). A file that
+disappears, cannot be read, or had entries and reads back empty keeps its
+entries (§9), so a drop means a readable file now lists
+fewer hashes: an edit, intended or not, or a restart that came up with a
+file missing (a file missing at boot is tolerated and counts as empty).
 Already-purged bytes stay gone either way; any taken-down blob still on
-disk becomes readable again after one reload interval
-(`NGIT_GRASP_P_DENYLIST_RELOAD_SECS`, default 60).
+disk becomes readable again at once.
 
 Remediate: confirm whether the edit was intended (change management). If
-not: restore the files (§9 — a missing file is tolerated with a boot warn
-and treated as empty), watch the gauge recover on the next reload, and
-re-check mounts/permissions. Un-blocked blobs that a peer still holds will
-re-mirror; the §4 takedown procedure re-applies if the purge must be
-re-driven.
+not: restore the files, watch the gauge recover on the next reload, and
+re-check mounts/permissions, above all after a restart. Un-blocked blobs
+that a peer still holds will re-mirror; the §4 takedown procedure
+re-applies if the purge must be re-driven. A file that went missing while
+the node ran shows as the error `has disappeared; keeping last-known
+entries`, not as a drop.
 
 ### Denylist purged
 
@@ -1671,31 +1686,40 @@ Assert:
 
 - Per-node / per-jurisdiction: `NGIT_GRASP_P_DENYLIST_PATH` takes a
   comma-separated list; mount only the lists this jurisdiction enforces.
-- A MISSING file is tolerated (boot warn `private denylist file <path> not
-  found; treating it as empty`); a present-but-UNREADABLE file is a hard
-  boot error (`load_boot` in src/grasp_p/denylist.rs). During reload an
-  unreadable file, or one that no longer parses (over the size or line
-  cap), keeps its last-known entries and is retried every tick
-  (error-logged: `keeping last-known entries`) — a transient read error
-  never silently unblocks taken-down content.
+- A file MISSING AT BOOT is tolerated (boot warn `private denylist file
+  <path> not found; treating it as empty`); a present-but-UNREADABLE file is
+  a hard boot error (`load_boot` in src/grasp_p/denylist.rs). During reload
+  an unreadable file, one that no longer parses (over the size or line
+  cap), or one that has disappeared keeps its last-known entries and is
+  retried every tick (error-logged: `keeping last-known entries`) — a
+  transient read error, an unmounted volume or a deploy that deletes before
+  it writes never silently unblocks taken-down content.
 - The reload starts from what the boot load read, file by file. The first
   reload after boot therefore changes nothing unless a file changed on
   disk, and "last-known entries" includes the ones a file had at boot.
   (Before this, a file that became unreadable after boot lost its boot
   entries as soon as any other file was reloaded.)
-- A file that DISAPPEARS after boot still counts as empty: its entries are
-  dropped at the next reload (warn `no longer found; treating it as
-  empty`) and `ngit_private_denylist_entries` falls. Replace denylist
-  files atomically (write a temp file, then rename) and never by
-  delete-then-write, and treat the "Denylist entries dropped" alert as a
-  possible unmounted volume. Whether a missing file should keep its
-  entries instead is an open decision (`PLAN.md`).
+- A file that DISAPPEARS after it was read keeps its entries (decision
+  D11): the error `has disappeared; keeping last-known entries` repeats on
+  every reload tick until the file is back, and
+  `ngit_private_denylist_entries` does not fall. A takedown is lifted only
+  by a readable file that no longer lists the hash: to lift one, edit the
+  file; to retire a whole list, replace its contents with a comment line
+  (an emptied file keeps its entries, as a deploy that truncates before it
+  writes would leave it), let one reload pass, then remove it from
+  `NGIT_GRASP_P_DENYLIST_PATH` at the next restart. A list
+  removed from disk alone stays enforced until the node restarts, and a
+  restart reads a missing file as empty, so check the mounts before every
+  restart. Still replace denylist files atomically (write a temp file,
+  then rename): a write read half-done is read as it is.
 - Reload every `NGIT_GRASP_P_DENYLIST_RELOAD_SECS` (default 60; 0 disables
   reload — the boot-time set is kept). Only mtime-changed files are
   re-read; the live set swaps atomically.
 - Watch `ngit_private_denylist_entries`: a drop to 0 on a node that should
-  be enforcing a list means the files went missing (metric help,
-  src/metrics/mod.rs:367–379).
+  be enforcing a list means its files were cleared, or were missing at the
+  last restart (metric help, `PRIVATE_DENYLIST_ENTRIES` in
+  src/metrics/mod.rs); a file that goes missing or reads back empty while
+  the node runs shows as the error above instead.
 
 **Backups.** The relay DB under `NGIT_RELAY_DATA_PATH` (default
 `./data/relay`) is the source of truth for registrations — the private meta
@@ -1747,12 +1771,12 @@ Pointers, not procedures:
 
 - **Server issue !1** — offboard/tombstone worker + event-byte stranding:
   kind-5'd / merge-evicted / vanished registrations leave `t:`/`g:` event
-  bytes (and stored shared-claim charges) stranded; the tombstone purge
-  worker is unbuilt. Operator-visible effect: ledger drift after
-  registration deaths (§3 Ledger budget).
+  bytes stranded; the tombstone purge worker is unbuilt. Operator-visible
+  effect: ledger drift after registration deaths (§3 Ledger budget).
 - **Server issue !4** — ledger refund-on-replace: replaced 30641 editions
   are not refunded; bounded, documented drift (docs/grasp-p/phase1-report.md:37).
-- **Server issue !5** — dedup pinning.
+- **Server issue !5** — dedup pinning: fixed in M3 (decision D4); every
+  referencing repository pays its own charge (§3 Ledger budget).
 - **Accepted residuals from prior verify rounds** (documented in code/issues):
   an active squatter who keeps their registration live AND saturates their
   own quota blocks the genuine rekey at the claimed address until operator

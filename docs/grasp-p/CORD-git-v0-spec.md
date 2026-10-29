@@ -107,7 +107,8 @@ Addressable event signed by the **hosting npub** (a fresh pseudonym per repo by 
   evaluated: a sender the mode refuses is neither winner nor loser of anything. The node's clock is
   the one exception to the first rule, by decision, through the settled-seat rule above.
 - **Loser eviction [N]**: in the winner's meta txn the loser's record, key claims, alias slot,
-  blob-claim references, orphaned speculative charges, alias event-bytes column, and state-ring
+  blob-claim references with their charges (stored bytes it was the last to reference stay
+  charged to it until GC), alias event-bytes column, and state-ring
   editions are all freed; its relay-DB 30640 coordinate is pruned by the async caller. Both conflict
   arms fire an operator alert, but only one is deduped: an **incoming** registration that loses
   alerts at most once per loser event id (1 h TTL), so boot-reconcile and sync redelivery of an
@@ -167,18 +168,37 @@ Addressable event signed by a **registered write key** (aux keys refused).
   separately per `(author, alias)`, as NIP-01 requires. **[N]** Consequence for multi-writer
   aliases (§2.1 permits `|w| + |aux| ≤ 64`): two active pushers share one 16-slot ring, so they
   halve each other's retained history and can trim-supersede each other's blob claims — a trimmed
-  edition's referenced hashes lose this alias's claim, which releases the speculative charge *if
-  other aliases still reference it*, or starts the GC grace clock *if it was the last*.
-- **Speculative blob-claim charging [N]**: a referenced sha256 that is not yet stored and carries
-  no earlier speculative charge is charged NOW, at its DECLARED size, to the declaring
-  `(tenant, alias)` as a `stored=false` claim (`SpecCharge{tenant, alias, bytes}`); the quota
-  decision covers event bytes + all new speculative bytes in one check. Released **exactly once**,
-  against the recorded scope/bytes (never `claim.size`): (a) on upload — the upload txn releases
-  before it charges, so a same-scope declare-then-upload nets out; (b) when the CHARGING alias
-  stops referencing it while others remain (ring-trim supersede, registration death, Blossom
-  DELETE), the survivor re-charging on its next 30641 (a deliberate bounded unbilled window);
-  (c) on GC deletion after the claim loses its last alias and grace expires. `Option::take()`
-  makes double-release structurally impossible.
+  edition's referenced hashes lose this alias's reference, which releases its charge *if other
+  aliases still reference the blob*, keeps it until GC *if it was the last reference to stored
+  bytes*, and deletes the claim with its charge *if nobody stored the blob*.
+- **Every referencing repository pays [N]** (decision D4): each alias that references a blob
+  (by a retained 30641 edition, or by its own upload until its next 30641 drops it; such an
+  upload-only reference exists only on the node that took the upload) carries one charge for
+  it, at its repository, account and node scopes; two repositories of one account are charged
+  twice, and the disk keeps one copy. The charge is the alias's own DECLARED size while the blob
+  is not stored on the node (the size its newest retained edition naming the blob declares) and
+  the STORED size once it is, whoever stored it (an upload, the mirror, a file already on disk);
+  when the bytes arrive every charge is set to their size, and an alias that declared fewer
+  bytes and cannot afford the difference at its own scopes stops referencing the blob instead
+  (its next 30641 naming it is judged at the stored size). Each charge records its own bytes and
+  is released by exactly them. A 30641 or an upload is quota-checked for the charges it adds,
+  together with the 30641's event bytes, in one decision; an alias already charged for a blob is not charged again, so a declare-then-upload
+  nets out. An alias that stops referencing a blob (ring trim, Blossom DELETE) is released at
+  once while another alias references it; the last referrer of stored bytes keeps its charge
+  until GC deletes them or another alias takes them up, so an upload followed by a DELETE is no
+  free storage for the grace period. A blob nobody stored loses its claim with its last
+  reference, so a claim that exists is charged or on disk. A registration's death (eviction,
+  kind-5, vanish) drops every reference of its alias the same way: its charge on a blob another
+  alias references, or that nobody stored, goes at once, and stored bytes it was the last to
+  reference stay charged to it until GC deletes them. The node's ledger is the sum of the
+  charges, not the bytes on disk. A paired node computes the same ledger from the same
+  references whatever order the 30641s, uploads and mirror fetches arrive in, once it holds the
+  bytes too; until then an alias pays its own declared size there. Who pays during a grace
+  period follows each node's own order, and that difference can make one node refuse a 30641 or
+  an upload the other accepts until GC deletes the bytes; an upload-only reference, and whether
+  an alias that declared too few bytes could afford them when they arrived, follow each node
+  too. No alias's declaration sets what another alias pays or the size the mirror fetches for
+  it.
 - **In-transaction identity re-check [N]**: liveness is read outside the meta write txn, so the txn
   re-verifies `(alias, tenant, latest event id)` before ANY mutation and rejects otherwise — a
   footprint born after a death would have no cleanup trigger left.
@@ -291,7 +311,14 @@ down would have stayed in caches for that long.
 `uploaded` is the time this node first stored the bytes, by upload or by mirroring, so the two
 nodes of a pair report different times for one blob, and a repeat upload reports the first time.
 `blob sha256 = SHA256(exact PUT bytes)`. `/list` aggregates only that tenant's own aliases via the
-per-alias claim index (never a cross-tenant scan).
+per-alias claim index (never a cross-tenant scan), and lists the stored blobs they reference: a blob
+an alias stopped referencing is not listed, even while that alias still pays for it until GC.
+
+**Who pays [N].** A `PUT /upload` makes its alias a referrer of the blob and charges it as §2.2
+says, also for bytes another account stored or that were already on disk; an alias that already
+pays for the blob is not charged again. `HEAD /upload` forecasts the same charge. A `DELETE`
+releases the alias at once while another alias references the blob; as the last referrer of
+stored bytes the alias pays until GC deletes them.
 
 Size limits **[N]**: event JSON ≤ 128 KiB; blob ≤ 256 MiB (both configurable). Concurrent uploads
 are capped and reserved against the global byte budget BEFORE any body byte lands on disk.
@@ -598,7 +625,7 @@ lookup of its own).
   and mirror-retry, GC grace/interval, offboard retention, the mirror knobs, and
   **`state_history_editions`** (the §2.2 ring depth) — the rationale being that they are node-local and do not affect acceptance. **[N] That rationale
   does not fully hold for `state_history_editions`**: ring depth decides which editions are trimmed,
-  trimming releases blob claims and their speculative charges, released charges change the quota
+  trimming releases blob claims and their charges, released charges change the quota
   ledger, and quota decides acceptance. Two paired nodes on different ring depths can therefore
   diverge on a `quota exceeded` verdict for the same 30641. Pair them on the same value, or add it
   to a future preimage revision. **`accept_legacy_wrap_kind` joined the preimage at v3** because it
@@ -619,8 +646,10 @@ lookup of its own).
 - **Denylist → 451**: node-local, multi-file, periodically reloaded (default 60 s), enforced on the
   read path AND the upload preflight, with purge-on-add and a GC sweep that bypasses the grace
   period. Deliberately not fingerprinted — per-jurisdiction lists legitimately differ. A file that
-  cannot be read or parsed on a reload keeps the entries it last had, those read at boot included;
-  a file that is missing counts as empty (an open question, see `PLAN.md`). Blobs are served
+  cannot be read or parsed on a reload, has disappeared, or had entries and reads back empty, keeps
+  the entries it last had, those read at boot included (decision D11): a takedown is lifted only by
+  a readable file that no longer lists the hash (a comment line clears a list). A file missing at
+  boot counts as empty. Blobs are served
   `no-cache` (§2.4) so that a takedown reaches HTTP caches as well.
 - **Authorization window and `server` tag** (§2.4): fixed in the code, the same on every node, and
   not in the fingerprint, because authorization events are never replicated.
@@ -721,7 +750,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 | Rekey-address squatter | PoP + §3.2 merge (an honest-created_at squat under an hour old loses to the live+1 widen and is evicted; an older one is a settled seat and keeps the address); minimal-widen fallback for claim-winning squats; claim death on kind-5/vanish |
 | Backdating tenant or member | Settled seats (§2.1): a seat over an hour old keeps its alias and its keys against another account's registration, however dated; inside the first hour the order decides, the eviction alerts with the offender's key and the account is closed; alias bound to the hosting key in v0.2 |
 | Cross-node split-brain | First-edition-anchored deterministic merge; node-local state never gates a winner, the clock of the settled-seat rule excepted; boot reconcile judges held seats by age and the seats it creates by the order; `policy_fingerprint` parity; watchdog |
-| Malicious tenant (abuse) | Quotas, speculative-claim charging, global budget, admission modes, per-write-key + cadence buckets, per-IP nginx zones, denylist/451, 1984 intake |
+| Malicious tenant (abuse) | Quotas, a charge per referencing repository (declared blobs included), global budget, admission modes, per-write-key + cadence buckets, per-IP nginx zones, denylist/451, 1984 intake |
 | Mirror SSRF | Private-IP block, no redirect-follow, https-only default, sha+size-bounded, peer allowlist |
 
 ## 7. Conformance & residuals
@@ -745,9 +774,12 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
   account's seat while it is under an hour old; if edition 1 is purged from every sync source, a late-joining
   node anchors on its first-witnessed edition until the victim re-mints an earlier registration,
   which wins there only while the squatter's seat is under an hour old; ≥3-party conflict chains
-  converge only with sync redelivery (the earliest registrant always keeps its seat); spec
-  charges carried by a dead scope leave a bounded unbilled window until the survivor's next 30641;
-  `t:`/`g:` event-byte stranding on registration death; a live squatter saturating their own quota
+  converge only with sync redelivery (the earliest registrant always keeps its seat);
+  `t:`/`g:` event-byte stranding on registration death; the payer of a blob's grace charge, and
+  with it a quota verdict, can differ between the two nodes until GC deletes the bytes; an
+  edition that reaches a node after a newer one by the same write key is not retained there, so the two
+  nodes' rings, and the references they charge for, can differ until enough newer editions
+  have passed; a live squatter saturating their own quota
   blocks a rekey at their claimed address until operator action; byte quotas do not bound
   claim/file COUNTS (server issue !25).
 - **Landed since v0.1**: the **1059→3359 / 21059→23359 stream-wrap migration** (§2.3), on both the
@@ -773,6 +805,8 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.1 — `relays`/`server` matching is exact-host, not substring; key-count and duplicate-key rules.
 - §2.1, §5, §5.2 — order of checks in registration: shape (key cap first) before admission, admission before proofs of possession and before the conflict merge; an account that holds the alias is exempt from the mode; no message text changed. A node under a mount path is named by host and path in `relays`/`server`.
 - §2.2 — speculative (`stored=false`) claim charging + exactly-once release; 256-ref cap; in-txn identity re-check.
+- §2.1, §2.2, §2.4 — every referencing repository pays (D4): one charge per referencing alias with its own byte count, declared size until stored and stored size after; released at once while another alias references the blob, kept by the last referrer of stored bytes until GC, and with the claim when nobody stored the blob; a registration's death drops its references the same way; the newest retained edition's declaration sets an unstored blob's charge; an alias the stored size raises past its own caps stops referencing the blob; the mirror adds no reference and judges each alias it fetches for at that alias's own declared size. Replaces single-payer and speculative charging.
+- §5.1 — a denylist file that disappears after it was read, or reads back empty, keeps its entries and logs an error (D11); a takedown is lifted only by a readable file that no longer lists the hash, and a comment line clears a list; a file missing at boot still counts as empty.
 - §2.3 — unregistered stream wraps rejected outright (never the public path); stored held, ephemeral not; **[D]** on collab rumors dropped.
 - §2.3 — **stream wraps moved to their own kinds 3359/23359** (server `c5301bb`, client `eb1e5e2`); 1059 retained ONLY for genuine NIP-59 invites/promotions; legacy 1059/21059 dual-accept as a transitional window, default on; retired-kind rejection string (§5.2); tagless-admission gate written (`tests/private_repos.rs:4881,4892`), closing the hole `nip-conformance.md` item 7b recorded.
 - §2.4 — authorization window narrowed from ±24 h to one hour back and 15 minutes ahead; BUD-11 `server` tag (required for list); no used-id record, and why; response headers (`nosniff`, CSP, `no-cache` + `ETag` in place of a one-year `immutable`, `no-store` on errors, `WWW-Authenticate` on 401 only); `uploaded` is the stored time.

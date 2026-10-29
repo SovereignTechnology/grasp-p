@@ -242,11 +242,12 @@ groups:
           runbook: "docs/grasp-p/ops/runbook.md#full-re-issue-silent"
 
       # Denylist entries dropped (Phase-4b D1). The gauge is set at boot and
-      # on every reload swap; any decrease means files were edited (intended)
-      # or went missing/shrunk (unintended). A drop to 0 on a node that
-      # should be enforcing a takedown list = the files are gone (metric help
-      # text, src/metrics/mod.rs:367-379). Already-purged bytes stay gone
-      # either way; reads re-open for anything still stored.
+      # on every reload swap; any decrease means a readable file lists fewer
+      # hashes: an edit (intended or not), or a restart that came up with a
+      # file missing. A file that disappears, cannot be read or reads back
+      # empty while the node runs keeps its entries and does not lower the
+      # gauge (decision D11; it logs an error instead). Already-purged bytes stay gone either way;
+      # reads re-open for anything still stored.
       - alert: NgitPrivateDenylistEntriesDropped
         expr: delta(ngit_private_denylist_entries[1h]) < 0
         for: 5m
@@ -256,7 +257,7 @@ groups:
           component: grasp-p
         annotations:
           summary: "Private denylist shrank by {{ $value | humanize }} entries in 1h"
-          description: "ngit_private_denylist_entries decreased. If you did not edit the denylist files, treat as missing files (mount/permission drift) — taken-down content still on disk becomes readable again after one reload interval."
+          description: "ngit_private_denylist_entries decreased: a readable denylist file lists fewer hashes. If you did not edit the files, check what wrote them, and the mounts after a restart (a file missing at boot counts as empty) — taken-down content still on disk is readable again already."
           runbook: "docs/grasp-p/ops/runbook.md#denylist-entries-dropped"
 
       # Denylist purge happened (Phase-4b D1/D2). Informational page: every

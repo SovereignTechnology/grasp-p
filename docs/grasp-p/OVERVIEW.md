@@ -141,8 +141,11 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
   date a registration early, that holds only while a repository is under an hour old: after
   that no other account can take its alias or any of its keys. In its first hour another
   admitted account can still take it; the node alerts with that account's key.
-- **Quotas**: per tenant, per repo and global byte budgets. A state root is charged for the
-  blobs it declares even before they are uploaded.
+- **Quotas**: per tenant, per repo and global byte budgets. Every repository that references
+  a blob pays its full size, even when another account stored it, and a state root is charged
+  for the blobs it declares before they are uploaded; the disk keeps one copy. A repository
+  that stops referencing a blob is released at once while another references it; the last one
+  pays until GC deletes the bytes.
 - **Rate limits**: per write key, and on how often a registration may be replaced.
 - **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports that
   point at a private repository: they are logged and counted for the operator, and refused,

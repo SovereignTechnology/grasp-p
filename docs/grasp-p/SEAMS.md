@@ -341,13 +341,14 @@ seam to a file upstream owns, no setting, and nothing to `policy_fingerprint`.
 - **`uploaded` is real.** `BlobClaim.stored_at` records when this node first stored a
   blob, by upload or by mirroring. `GET /list` and the `PUT /upload` descriptor report it,
   and a repeat upload reports the first time, not the time of the repeat. It is per node:
-  the two nodes of a pair report different times for one blob. Claims are stored as JSON
-  (`heed`'s `SerdeJson`), so the field is optional with a default: a claim written by an
-  older build reads as "time unknown" and is listed with `uploaded: 0` until the blob is
-  uploaded again, which records the time of that upload; an older build reading a newer
-  claim ignores the field, and drops it from any claim it rewrites, so after a roll-back
-  the time is unknown again until the next upload. The time belongs to the claim: when GC
-  or a takedown deletes the claim and the blob is stored again, that is a new first time.
+  the two nodes of a pair report different times for one blob. The time belongs to the
+  claim: when GC or a takedown deletes the claim and the blob is stored again, that is a
+  new first time. Since merge request 16 a claim carries one charge per referencing
+  repository (`charges`, decision D4), and a claim written in the earlier single-payer
+  shape (`charged_tenant`, `charged_alias`, `spec_charge`) fails to read, so every path
+  that touches it fails; no GRASP-P node had run, so nothing is migrated. A build from
+  before that change would read a new claim as charged to nobody, so it is no roll-back
+  target.
   No migration.
 - **Authorization events (kind 24242)** are accepted only with `created_at` between one
   hour before and fifteen minutes after the node's clock (it was 24 hours either way),
@@ -377,8 +378,11 @@ seam to a file upstream owns, no setting, and nothing to `policy_fingerprint`.
   state. It used to start from nothing, so a file that could not be read or parsed again
   after boot had no entries to keep, and the next change to any other file swapped in a
   set without them. Now the first reload after boot changes nothing unless a file changed,
-  and such a file keeps what it had. What a **missing** file means is not changed: it
-  counts as empty, at boot and on reload. That is an open decision (`PLAN.md`).
+  and such a file keeps what it had. A file that **disappears** after it was read, or had
+  entries and reads back empty, keeps what it had too, with an error on every tick, since
+  merge request 16 (decision D11), and the reload re-reads a file whose length changed even
+  when its time did not; a comment line clears a list, and a file missing at boot still
+  counts as empty.
 - **Upload temp files are swept at startup.** `BlobStore::open` unlinks every regular
   file and symlink directly in `<blob root>/tmp`, judged with `symlink_metadata`, so a
   link is removed and not followed, and a directory is neither removed nor entered. A
@@ -570,8 +574,9 @@ preflight cut out as `blob_quota_preflight` in `src/grasp_p/mod.rs`), plus one s
 - **The scan.** Runs under `spawn_blocking`, one at a time, asks the file system once
   per claim and looks each alias up once. A blob claimed by several accounts is fetched
   for the live claimant whose account has the fewest missing blobs; within one account,
-  for the alias the blob's speculative charge is booked to, since the quota forecast
-  nets that charge for no other alias. Up to three more accounts are kept as fallbacks:
+  for the alias that sorts first (since merge request 16 every referencing alias pays its
+  own charge, and each alias the blob is fetched for is judged at its own declared size). Up to
+  three more accounts are kept as fallbacks:
   when this node's own state refuses the blob for one account, the same attempt goes on
   for the next, and a peer that already gave an answer of its own is not asked again.
   Without the fallbacks an account with a short queue and no room left would be chosen
@@ -2479,7 +2484,8 @@ features. No package was added.
   including that a refused list has one reason whatever failed; in
   `src/grasp_p/blob_store.rs` the stored time and the temp sweep (with symlinks and a
   subdirectory); in `src/grasp_p/denylist.rs` the seeded reload, with a file that became
-  unreadable and one that stopped parsing, and the unchanged meaning of a missing file;
+  unreadable and one that stopped parsing (and, since merge request 16, one that
+  disappeared and one read back empty);
   in `src/grasp_p/meta.rs` that a claim without the new field still reads. In
   `private_repos`, `exit5` checks the challenge on each `401` and its absence on `403`,
   `400` and `200`, and an authorization for another server; `exit29` checks the headers
