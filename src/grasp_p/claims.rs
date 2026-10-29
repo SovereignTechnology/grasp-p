@@ -958,10 +958,8 @@ mod tests {
                             }
                         }
                     }
-                    9 => {
-                        if claim(&meta, x).is_some_and(|c| c.aliases.is_empty()) {
-                            purge(&meta, x);
-                        }
+                    9 if claim(&meta, x).is_some_and(|c| c.aliases.is_empty()) => {
+                        purge(&meta, x);
                     }
                     _ => {}
                 }
