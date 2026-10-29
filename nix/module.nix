@@ -129,7 +129,13 @@ let
         type = types.nullOr types.str;
         default = null;
         example = "wss://relay.ngit.dev";
-        description = "Bootstrap relay URL to sync from on startup (optional)";
+        description = ''
+          Bootstrap relay URL to sync from on startup (optional).
+          GRASP-P (privateReposEnable): keeps the scheme it is given; a
+          ws:// value draws a warning at startup, and stops the node when
+          privateSyncPeerUrls lists it too, unless
+          privateMirrorAllowPrivateIps or syncAllowNonGlobalTargets is true.
+        '';
       };
 
       syncPlusEnabled = mkOption {
@@ -152,7 +158,9 @@ let
         description = ''
           Relays receiving the relay-owner kind-0/kind-10002 identity events
           and used to discover eligible accepted repository participants'
-          NIP-65 relay lists.
+          NIP-65 relay lists. GRASP-P (privateReposEnable): a ws:// entry
+          still receives the identity events, but is not dialled for NIP-65
+          discovery (wss:// only).
         '';
       };
 
@@ -167,6 +175,8 @@ let
         description = ''
           Bounded inbox fallback relays used for eligible Sync+ authors only
           after a user-index query succeeds without a NIP-65 relay list.
+          GRASP-P (privateReposEnable): a ws:// entry is not dialled
+          (wss:// only).
         '';
       };
 
@@ -267,6 +277,10 @@ let
           Disables the SSRF protection for untrusted announcement/PR URLs;
           intended only for tests and closed development networks. The
           operator-configured bootstrap relay is always allowed regardless.
+          GRASP-P (privateReposEnable): such a node dials a relay that an
+          event names over wss:// only, and true here lifts that rule as
+          well, with a warning at startup. A GRASP-P pair on a private link
+          needs privateMirrorAllowPrivateIps instead.
         '';
       };
 
@@ -558,7 +572,8 @@ let
         description = ''
           GRASP-P master switch: enable private repository hosting
           (kind-30640/30641/1059/21059 + blob routes). Every other
-          private* option is a no-op unless this is true. Cannot be
+          private* option is a no-op unless this is true. Such a node
+          dials a relay that an event names over wss:// only. Cannot be
           combined with GRASP-08 private mode (NGIT_PRIVATE_MODE): the
           relay refuses to start.
         '';
@@ -782,8 +797,12 @@ let
           is listed here too. The policy_fingerprint covers this node's
           address and these peers, so the two nodes of a pair must list each
           other to match. These peers also name the pair when a kind 1984
-          report's `server` tag is judged. Empty (default): no peers, so no
-          private-repo replication.
+          report's `server` tag is judged. A peer is sent every alias and
+          key the node holds, so list it over wss:// (a bare host is read as
+          wss://). A ws:// entry, or an http:// one (read as ws://), stops
+          the node at startup unless privateMirrorAllowPrivateIps or
+          syncAllowNonGlobalTargets is true. Empty (default): no peers, so
+          no private-repo replication.
         '';
       };
 
@@ -795,8 +814,11 @@ let
           mirror fetch peers resolving to loopback/private/link-local IPs
           are dropped and only https/wss public hosts are contacted. When
           true, the blob mirror and the relay connection to a configured
-          private-sync peer may use an internal address; every other relay
-          stays under the outbound target policy. Set true for a pair on a
+          private-sync peer may use an internal address and plain http/ws;
+          every relay that an event names stays under the outbound target
+          policy and is dialled over wss:// only. When false, a ws:// entry of
+          privateSyncPeerUrls stops the node at startup (unless
+          syncAllowNonGlobalTargets is true). Set true for a pair on a
           private network or for local testing. It applies only to the
           peers the operator lists in NGIT_GRASP_P_MIRROR_PEER_URLS and
           NGIT_GRASP_P_SYNC_PEER_URLS: no host a registration names is

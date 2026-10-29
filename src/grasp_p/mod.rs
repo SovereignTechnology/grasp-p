@@ -20,6 +20,7 @@ pub mod build_info;
 #[cfg(test)]
 mod config_sources;
 pub mod denylist;
+pub(crate) mod egress;
 pub mod gc;
 pub mod host;
 pub mod meta;

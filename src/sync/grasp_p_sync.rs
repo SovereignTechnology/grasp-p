@@ -430,6 +430,42 @@ impl SyncManager {
         })
     }
 
+    /// Whether `relay_url` may be registered as an event-directed relay, as
+    /// far as GRASP-P is concerned: over `wss://` only on a GRASP-P node,
+    /// unless it is a configured peer on a link the operator declared
+    /// private, the peer [`Self::grasp_p_peer_policy`] exempts, or
+    /// `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is on (`grasp_p::egress`).
+    /// The bootstrap relay always passes. Always `Ok` when GRASP-P is
+    /// disabled.
+    pub(super) fn grasp_p_event_relay_allowed(&self, relay_url: &str) -> Result<(), String> {
+        // Once the bootstrap relay's session has ended, upstream registers
+        // it again as event-directed; it is still the operator's own target,
+        // and keeps the scheme it was given.
+        let is_bootstrap = self
+            .bootstrap_relay_url
+            .as_deref()
+            .and_then(|url| canonical_relay_key(url).ok())
+            .is_some_and(|bootstrap| bootstrap == relay_url);
+        if is_bootstrap {
+            return Ok(());
+        }
+        crate::grasp_p::egress::DialSettings::from_config(&self.config)
+            .event_relay_allowed(relay_url, self.grasp_p_is_peer(relay_url))
+    }
+
+    /// Whether NIP-65 discovery passes over `source` when it picks the one
+    /// new source a pass dials: a source the `wss://` rule has refused, and
+    /// `register_relay` has logged and remembered. It never connects, so it
+    /// never backs off, and a `ws://` key sorts before every `wss://` one: it
+    /// would be picked on every pass and no other new source would ever be
+    /// dialled. The other callers already skip what that memo holds. A
+    /// source refused by upstream's policy alone is left to upstream. Always
+    /// false when GRASP-P is disabled.
+    pub(super) fn grasp_p_discovery_source_refused(&self, source: &str) -> bool {
+        self.rejected_relay_targets.contains(source)
+            && self.grasp_p_event_relay_allowed(source).is_err()
+    }
+
     /// Dial every configured peer that has been disconnected, with no dial
     /// and no failure, for `interval`.
     ///
@@ -1548,6 +1584,161 @@ mod tests {
                 !manager.register_relay(stranger.clone(), false, false).await,
                 "{case}"
             );
+            manager.shutdown().await;
+        }
+    }
+
+    /// On a GRASP-P node a relay that an event names is registered over
+    /// wss:// only, on the repository path and the NIP-65 path alike, and a
+    /// ws:// one is refused through upstream's own branch: no connection,
+    /// remembered as refused. A configured peer keeps ws:// only on a link
+    /// declared private, and `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` lifts the
+    /// rule. The bootstrap relay is the operator's: registered as written in
+    /// every case, an event that names exactly its URL shares its
+    /// connection, and once its session has ended upstream registers it
+    /// again as event-directed, still as written. With GRASP-P off every row
+    /// is upstream's. The names are
+    /// public, so upstream's policy passes all of them without a lookup:
+    /// every refusal here is the scheme's.
+    #[tokio::test]
+    async fn a_relay_an_event_names_is_registered_over_wss_only() {
+        const PLAIN: &str = "ws://relay.example.com";
+        const PLAIN_OUTBOX: &str = "ws://outbox.example.com";
+        const TLS: &str = "wss://relay.example.com";
+        const PLAIN_PEER: &str = "ws://peer.example.com";
+        const PLAIN_BOOTSTRAP: &str = "ws://bootstrap.example.com";
+
+        // (GRASP-P, non-global targets allowed, link declared private) ->
+        // whether a ws:// relay an event names, and the ws:// peer, register
+        for (grasp_p, allow_non_global, private_link, stranger_registered, peer_registered) in [
+            (true, false, false, false, false),
+            (true, false, true, false, true),
+            (true, true, false, true, true),
+            (false, false, false, true, true),
+        ] {
+            let (mut manager, _directory) = peer_test_manager(Some(PLAIN_BOOTSTRAP), |config| {
+                config.private_repos_enable = grasp_p;
+                config.sync_allow_non_global_targets = allow_non_global;
+                config.private_mirror_allow_private_ips = private_link;
+                config.private_sync_peer_urls = Some(PLAIN_PEER.to_string());
+            })
+            .await;
+            let case = format!(
+                "GRASP-P {grasp_p}, non-global {allow_non_global}, private link {private_link}"
+            );
+
+            assert!(
+                manager
+                    .register_relay(key(PLAIN_BOOTSTRAP), true, false)
+                    .await,
+                "{case}"
+            );
+            assert!(
+                manager
+                    .register_relay(key(PLAIN_BOOTSTRAP), false, false)
+                    .await,
+                "{case}"
+            );
+            assert!(
+                manager.register_relay(key(TLS), false, false).await,
+                "{case}"
+            );
+
+            for (relay, nip65_discovery_only) in [(PLAIN, false), (PLAIN_OUTBOX, true)] {
+                let relay = key(relay);
+                assert_eq!(
+                    manager
+                        .register_relay(relay.clone(), false, nip65_discovery_only)
+                        .await,
+                    stranger_registered,
+                    "{case}: {relay}"
+                );
+                assert_eq!(
+                    manager.connections.contains_key(&relay),
+                    stranger_registered,
+                    "{case}: {relay}"
+                );
+                assert_eq!(
+                    manager.rejected_relay_targets.contains(&relay),
+                    !stranger_registered,
+                    "{case}: {relay}"
+                );
+            }
+
+            assert_eq!(
+                manager.register_relay(key(PLAIN_PEER), false, false).await,
+                peer_registered,
+                "{case}"
+            );
+            assert!(
+                !manager.rejected_relay_targets.contains(&key(TLS)),
+                "{case}"
+            );
+
+            // Its session over and nothing owning it, the bootstrap relay
+            // loses its connection; upstream's ways back register it as
+            // event-directed.
+            manager
+                .complete_ended_session(&key(PLAIN_BOOTSTRAP), false)
+                .await;
+            assert!(
+                !manager.connections.contains_key(&key(PLAIN_BOOTSTRAP)),
+                "{case}"
+            );
+            assert!(
+                manager
+                    .register_relay(key(PLAIN_BOOTSTRAP), false, true)
+                    .await,
+                "{case}: the bootstrap relay keeps ws:// after its session ends"
+            );
+            assert!(
+                !manager
+                    .rejected_relay_targets
+                    .contains(&key(PLAIN_BOOTSTRAP)),
+                "{case}"
+            );
+            manager.shutdown().await;
+        }
+    }
+
+    /// NIP-65 discovery dials one new source per pass, the lowest key it has
+    /// no connection to, and a ws:// key sorts before every wss:// one. A
+    /// source the wss:// rule refused never connects, so it must not be
+    /// picked again: the first pass refuses it through upstream's branch
+    /// (logged once and remembered), and the next dials the wss:// source.
+    /// With GRASP-P off the ws:// source is dialled, as upstream picks it.
+    #[tokio::test]
+    async fn a_refused_discovery_source_does_not_hold_back_the_others() {
+        let plain = key("ws://outbox.example.com");
+        let tls = key("wss://outbox.example.com");
+        for grasp_p in [true, false] {
+            let (mut manager, _directory) = peer_test_manager(None, |config| {
+                config.private_repos_enable = grasp_p;
+                config.sync_allow_non_global_targets = false;
+                config.sync_plus_enabled = true;
+            })
+            .await;
+            // No inventory is due, so each pass works from these sources.
+            manager.nip65_discovery.next_inventory_at =
+                Some(Instant::now() + Duration::from_secs(3600));
+            manager.nip65_discovery.author_sources.insert(
+                Keys::generate().public_key(),
+                HashSet::from([plain.clone(), tls.clone()]),
+            );
+
+            manager.schedule_nip65_discovery().await;
+            assert_eq!(manager.connections.contains_key(&plain), !grasp_p);
+            assert_eq!(manager.rejected_relay_targets.contains(&plain), grasp_p);
+            assert!(!manager.connections.contains_key(&tls), "GRASP-P {grasp_p}");
+
+            if grasp_p {
+                manager.schedule_nip65_discovery().await;
+                assert!(
+                    manager.connections.contains_key(&tls),
+                    "the wss:// source is dialled on the next pass"
+                );
+                assert!(!manager.connections.contains_key(&plain));
+            }
             manager.shutdown().await;
         }
     }

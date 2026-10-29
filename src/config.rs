@@ -448,6 +448,12 @@ pub struct Config {
     /// Sync discovers additional relays from repository announcements that list our service
     /// If no scheme is provided (wss:// or ws://), wss:// is assumed
     /// Examples: "relay.example.com" -> "wss://relay.example.com", "wss://relay.example.com" -> unchanged
+    ///
+    /// GRASP-P (NGIT_GRASP_P_REPOS_ENABLE=true): keeps the scheme it is
+    /// given; a ws:// value draws a warning at startup, and stops the node
+    /// when NGIT_GRASP_P_SYNC_PEER_URLS lists it too, unless
+    /// NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS or
+    /// NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS is true.
     #[arg(long, env = "NGIT_SYNC_BOOTSTRAP_RELAY_URL")]
     pub sync_bootstrap_relay_url: Option<String>,
 
@@ -462,6 +468,10 @@ pub struct Config {
 
     /// Comma-separated relays used to publish the relay-owner identity and to discover
     /// eligible accepted repository participants' NIP-65 relay lists.
+    ///
+    /// GRASP-P (NGIT_GRASP_P_REPOS_ENABLE=true): a ws:// entry still
+    /// receives the identity events, but is not dialled for NIP-65 discovery
+    /// (wss:// only).
     #[arg(
         long,
         env = "NGIT_USER_INDEX_RELAYS",
@@ -470,6 +480,9 @@ pub struct Config {
     pub user_index_relays: String,
 
     /// Comma-separated inbox fallbacks for eligible authors whose NIP-65 relay list is absent.
+    ///
+    /// GRASP-P (NGIT_GRASP_P_REPOS_ENABLE=true): a ws:// entry is not
+    /// dialled (wss:// only).
     #[arg(
         long,
         env = "NGIT_SYNC_PLUS_FALLBACK_RELAYS",
@@ -524,6 +537,11 @@ pub struct Config {
     /// for integration tests and closed development networks; production
     /// relays must leave it false. The operator-configured bootstrap relay is
     /// always allowed regardless of this setting.
+    ///
+    /// GRASP-P (NGIT_GRASP_P_REPOS_ENABLE=true): such a node dials a relay
+    /// that an event names over wss:// only, and true here lifts that rule
+    /// as well, with a warning at startup. A GRASP-P pair on a private link
+    /// needs NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS instead.
     #[arg(
         long,
         env = "NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS",
@@ -742,7 +760,8 @@ pub struct Config {
     // ------------------------------------------------------------------
     /// GRASP-P master switch: enable private repository hosting
     /// (30640/30641 + stream wraps 3359/23359, and 1059/21059 while
-    /// NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND is on, + blob routes)
+    /// NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND is on, + blob routes). Such a
+    /// node dials a relay that an event names over wss:// only.
     #[arg(long, env = "NGIT_GRASP_P_REPOS_ENABLE", default_value_t = false)]
     pub private_repos_enable: bool,
 
@@ -907,8 +926,12 @@ pub struct Config {
     /// too. The policy fingerprint covers this node's address and these
     /// peers, so the two nodes of a pair must list each other to match.
     /// These peers also name the pair when a kind 1984 report's `server`
-    /// tag is judged. Unset (default): no peers, so no private-repo
-    /// replication.
+    /// tag is judged. A peer is sent every alias and key the node holds, so
+    /// list it over wss:// (a bare host is read as wss://). A ws:// entry,
+    /// or an http:// one (read as ws://), stops the node at startup unless
+    /// NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS or
+    /// NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS is true. Unset (default): no
+    /// peers, so no private-repo replication.
     #[arg(long, env = "NGIT_GRASP_P_SYNC_PEER_URLS")]
     pub private_sync_peer_urls: Option<String>,
 
@@ -916,8 +939,11 @@ pub struct Config {
     /// that resolve to loopback/private/link-local IPs (and over plain http),
     /// and the relay connection to a configured private-sync peer over plain
     /// ws:// or on an internal IP. Only that connection is exempt from the
-    /// outbound target policy. Default false: such peers are dropped and the
-    /// node fetches only over https/wss from public hosts. Set true for a
+    /// outbound target policy, and from the wss:// rule for relays that
+    /// events name. Default false: such peers are dropped, a ws:// entry of
+    /// NGIT_GRASP_P_SYNC_PEER_URLS stops the node at startup (unless
+    /// NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS is true), and the node fetches
+    /// only over https/wss from public hosts. Set true for a
     /// pair on a private network or for local testing. It applies only to
     /// the peers the operator lists in NGIT_GRASP_P_MIRROR_PEER_URLS and
     /// NGIT_GRASP_P_SYNC_PEER_URLS: no host a registration names is fetched
@@ -1705,6 +1731,8 @@ impl Config {
                      there are no metrics to serve. Unset it, or enable metrics"
                 ));
             }
+            // A plaintext peer stops the node; the operator's other plaintext choices draw warnings.
+            crate::grasp_p::egress::validate_dial_settings(self)?;
         }
 
         Ok(())
@@ -3974,5 +4002,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What `run` logs at warn level and above, as text.
+    fn logged_warnings(run: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let log = bytes.lock().unwrap().clone();
+        String::from_utf8(log).unwrap()
+    }
+
+    /// Validation stops a GRASP-P node whose configured peer is plaintext
+    /// ws:// on a link not declared private, and logs the two warnings about
+    /// the operator's own plaintext choices. The rules themselves are tested
+    /// in `grasp_p::egress`; this pins that validation applies them.
+    #[test]
+    fn test_grasp_p_dial_settings_are_checked_at_validation() {
+        let plaintext_peer = Config {
+            private_repos_enable: true,
+            private_sync_peer_urls: Some("ws://peer.example.com".to_string()),
+            ..Config::for_testing()
+        };
+        let error = plaintext_peer
+            .validate()
+            .expect_err("a plaintext peer must stop the node");
+        assert!(
+            error.to_string().contains("NGIT_GRASP_P_SYNC_PEER_URLS"),
+            "unexpected error: {error}"
+        );
+        let on_a_private_link = Config {
+            private_mirror_allow_private_ips: true,
+            ..plaintext_peer.clone()
+        };
+        assert!(on_a_private_link.validate().is_ok());
+        let upstream = Config {
+            private_repos_enable: false,
+            ..plaintext_peer
+        };
+        assert!(upstream.validate().is_ok());
+
+        let plaintext_choices = Config {
+            private_repos_enable: true,
+            sync_bootstrap_relay_url: Some("ws://bootstrap.example.com".to_string()),
+            sync_allow_non_global_targets: true,
+            ..Config::for_testing()
+        };
+        let log = logged_warnings(|| {
+            plaintext_choices
+                .validate()
+                .expect("plaintext choices of the operator draw warnings only");
+        });
+        assert!(
+            log.contains("NGIT_SYNC_BOOTSTRAP_RELAY_URL is ws://bootstrap.example.com")
+                && log.contains("NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true on a node"),
+            "both warnings must be logged: {log}"
+        );
+        let upstream = Config {
+            private_repos_enable: false,
+            ..plaintext_choices
+        };
+        let log = logged_warnings(|| {
+            upstream.validate().expect("upstream's node starts");
+        });
+        assert!(
+            !log.contains("NGIT_SYNC_BOOTSTRAP_RELAY_URL")
+                && !log.contains("NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS"),
+            "upstream's node warns about neither: {log}"
+        );
     }
 }

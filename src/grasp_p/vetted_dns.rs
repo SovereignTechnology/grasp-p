@@ -135,7 +135,8 @@ fn vet_answer(host: &str, answer: &[IpAddr], allow_private: bool) -> Result<(), 
 /// (`mirror::wraps_non_global`). That check adds the mirror's own list, and
 /// refuses a NAT64 or 6to4 form that wraps an address either list refuses,
 /// and the local-use NAT64 prefix whatever it carries: upstream counts both
-/// prefixes as global.
+/// prefixes as global. It also refuses IPv6 space outside `2000::/3` or
+/// inside `2001::/23` (Teredo, SIIT, SRv6).
 fn reachable(address: IpAddr) -> bool {
     crate::outbound::is_globally_reachable(address) && !super::mirror::wraps_non_global(&address)
 }
@@ -216,6 +217,10 @@ mod tests {
             ip("2606:4700:4700::1111"),
             // 6to4 around a public address.
             ip("2002:808:808::"),
+            // 2001::/16 past the protocol assignments, and an IPv4-mapped
+            // public address.
+            ip("2001:4860:4860::8888"),
+            ip("::ffff:8.8.8.8"),
         ];
         let resolver = VettedResolver::with_lookup(false, answering(answer.clone()));
 
@@ -253,7 +258,8 @@ mod tests {
     /// so is what an address wraps: 198.18.0.1 is known to upstream's list
     /// only, a NAT64 or 6to4 form around an internal address to the mirror's
     /// only, the same forms around 198.18.0.1 or 240.0.0.1 to neither bare,
-    /// and the local-use NAT64 prefix is refused whatever it carries.
+    /// the local-use NAT64 prefix is refused whatever it carries, and so are
+    /// Teredo, SIIT and SRv6.
     #[tokio::test]
     async fn resolver_refuses_a_mixed_answer_whole() {
         for (answer, refused) in [
@@ -282,6 +288,16 @@ mod tests {
                 vec![ip("2606:4700:4700::1111"), ip("64:ff9b:1::a00:5")],
                 ip("64:ff9b:1::a00:5"),
             ),
+            // Teredo next to a public address, SIIT, and SRv6.
+            (
+                vec![
+                    ip("2001:4860:4860::8888"),
+                    ip("2001:0:4136:e378:8000:63bf:3fff:fdd2"),
+                ],
+                ip("2001:0:4136:e378:8000:63bf:3fff:fdd2"),
+            ),
+            (vec![ip("::ffff:0:a00:5")], ip("::ffff:0:a00:5")),
+            (vec![ip("5f00::1")], ip("5f00::1")),
         ] {
             let resolver = VettedResolver::with_lookup(false, answering(answer.clone()));
 

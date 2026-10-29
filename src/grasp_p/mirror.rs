@@ -308,7 +308,8 @@ pub(crate) async fn relay_peer_allowed(relay_url: &str, allow_private: bool) -> 
 /// Upstream's check counts the NAT64 prefix `64:ff9b::/96` and the 6to4
 /// prefix `2002::/16` as public, so a name that resolves to an address there
 /// which wraps an internal IPv4 address passes it. [`wraps_non_global`]
-/// decodes both. A node that hosts private repositories dials relays that
+/// decodes both, and also refuses IPv6 space public hosts are not numbered
+/// from. A node that hosts private repositories dials relays that
 /// customers' events name, and must not be pointed at its own network that
 /// way.
 ///
@@ -329,7 +330,7 @@ pub(crate) fn vet_relay_dial(
         .find(|address| wraps_non_global(address))
     {
         Some(address) => Err(format!(
-            "address {address} wraps an address that is not globally reachable"
+            "address {address} is not globally reachable, or wraps an address that is not"
         )),
         None => Ok(vetted),
     }
@@ -338,10 +339,23 @@ pub(crate) fn vet_relay_dial(
 /// Whether a relay dial, or a blob fetch, must not go to `address`, which
 /// upstream's policy has passed: the relay dial of a GRASP-P node, the
 /// mirror's early check and the mirror client's resolver all apply it. The
-/// mirror's own check comes first. An IPv6 form that carries an IPv4
-/// address is then held to upstream's verdict on that address, which knows
+/// mirror's own check comes first.
+///
+/// An IPv6 address must then lie in the global unicast block `2000::/3`,
+/// outside the IETF protocol assignments `2001::/23`: the space public hosts
+/// are numbered from. Anything else is refused without being decoded,
+/// Teredo (`2001::/32`), SIIT (`::ffff:0:0:0/96`) and SRv6 (`5f00::/16`)
+/// among it, since a translator or tunnel on the node's path can carry such
+/// an address to an internal host. Two forms outside the block keep being
+/// judged by the IPv4 address they carry, as before: IPv4-mapped addresses,
+/// and the NAT64 prefix `64:ff9b::/96`, which a DNS64 resolver answers for
+/// every IPv4-only host. The local-use NAT64 prefix `64:ff9b:1::/48` is
+/// outside the block and refused whatever it carries.
+///
+/// An IPv6 form that carries an IPv4 address (those two, and 6to4 inside
+/// the block) is held to upstream's verdict on that address, which knows
 /// ranges the mirror's list lacks (benchmarking, reserved, protocol
-/// assignments). The local-use NAT64 prefix `64:ff9b:1::/48` is never global.
+/// assignments).
 pub(super) fn wraps_non_global(address: &IpAddr) -> bool {
     if is_disallowed_ip(address) {
         return true;
@@ -349,9 +363,25 @@ pub(super) fn wraps_non_global(address: &IpAddr) -> bool {
     let IpAddr::V6(v6) = address else {
         return false;
     };
-    v6.octets()[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
-        || embedded_ipv4(v6)
-            .is_some_and(|v4| !crate::outbound::is_globally_reachable(IpAddr::V4(v4)))
+    if !carries_ipv4_by_translation(v6) && outside_global_unicast(v6) {
+        return true;
+    }
+    embedded_ipv4(v6).is_some_and(|v4| !crate::outbound::is_globally_reachable(IpAddr::V4(v4)))
+}
+
+/// Whether `v6` is an IPv4-mapped address (`::ffff:0:0/96`) or one in the
+/// NAT64 well-known prefix (`64:ff9b::/96`).
+fn carries_ipv4_by_translation(v6: &Ipv6Addr) -> bool {
+    let o = v6.octets();
+    v6.to_ipv4_mapped().is_some()
+        || (o[..4] == [0x00, 0x64, 0xff, 0x9b] && o[4..12].iter().all(|b| *b == 0))
+}
+
+/// Whether `v6` lies outside the global unicast block `2000::/3`, or inside
+/// its IETF protocol assignments `2001::/23`.
+fn outside_global_unicast(v6: &Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    (segments[0] & 0xe000) != 0x2000 || (segments[0] == 0x2001 && segments[1] < 0x0200)
 }
 
 /// What the address guard says about a peer.
@@ -2901,8 +2931,9 @@ mod tests {
 
     /// Upstream's policy passes a NAT64 or 6to4 address whatever it wraps;
     /// the check of a GRASP-P node's relay dial refuses the ones that wrap an
-    /// address upstream would refuse bare, and the local-use NAT64 prefix,
-    /// and nothing else that upstream passed.
+    /// address upstream would refuse bare, the local-use NAT64 prefix, and
+    /// IPv6 space public hosts are not numbered from, and passes the public
+    /// addresses.
     #[tokio::test]
     async fn relay_dial_check_refuses_wrapped_internal_addresses() {
         use crate::outbound::{OutboundTargetKind, OutboundTargetPolicy};
@@ -2932,6 +2963,15 @@ mod tests {
             "wss://[2002:f000:1::1]",
             // The local-use NAT64 prefix, whatever it carries.
             "wss://[64:ff9b:1::a00:5]",
+            // IPv6 space public hosts are not numbered from: Teredo and the
+            // rest of 2001::/23, SIIT, SRv6, and the space past 2000::/3.
+            "wss://[2001:0:4136:e378:8000:63bf:3fff:fdd2]",
+            "wss://[2001::1]",
+            "wss://[2001:1ff:ffff::1]",
+            "wss://[::ffff:0:a00:5]",
+            "wss://[::ffff:0:808:808]",
+            "wss://[5f00::1]",
+            "wss://[4000::1]",
         ] {
             let target = vetted(strict, wrapped).await;
             assert_eq!(target.addresses.len(), 1, "{wrapped}");
@@ -2945,9 +2985,14 @@ mod tests {
         for public in [
             "wss://8.8.8.8",
             "wss://[2606:4700:4700::1111]",
-            // The same two forms around a public address.
+            // The same two forms around a public address, and an IPv4-mapped
+            // one: judged by what they carry, as before.
             "wss://[64:ff9b::808:808]",
             "wss://[2002:808:808::1]",
+            "wss://[::ffff:8.8.8.8]",
+            // 2001::/16 past the protocol assignments.
+            "wss://[2001:200::1]",
+            "wss://[2001:4860:4860::8888]",
         ] {
             let target = vetted(strict, public).await;
             let passed = vet_relay_dial(true, target.clone()).expect("a public address passes");
@@ -2962,6 +3007,58 @@ mod tests {
         let target = vetted(permissive, "ws://[64:ff9b::a9fe:a9fe]:7777").await;
         assert!(target.addresses.is_empty());
         assert!(vet_relay_dial(true, target).is_ok());
+    }
+
+    /// The IPv6 rule of [`wraps_non_global`] alone: outside 2000::/3, or
+    /// inside 2001::/23, is refused; IPv4-mapped and NAT64 addresses are
+    /// judged by what they carry, as before; and so is 6to4, inside the
+    /// block.
+    #[test]
+    fn ipv6_outside_the_global_unicast_block_is_refused() {
+        let ip = |text: &str| -> IpAddr { text.parse().expect("an address") };
+
+        for refused in [
+            // Teredo, at the start of 2001::/23, and the block's last /32.
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::1",
+            "2001:1ff:ffff:ffff::1",
+            // SIIT, around an internal and around a public IPv4 address.
+            "::ffff:0:a00:5",
+            "::ffff:0:808:808",
+            // SRv6, and the rest of the space past 2000::/3.
+            "5f00::1",
+            "4000::1",
+            "e000::1",
+            // Just below 2000::/3.
+            "1fff:ffff:ffff::1",
+            // The local-use NAT64 prefix, around a public address too.
+            "64:ff9b:1::a00:5",
+            "64:ff9b:1::808:808",
+            // NAT64 and IPv4-mapped forms around what upstream refuses.
+            "64:ff9b::a00:5",
+            "64:ff9b::c612:1",
+            "::ffff:10.0.0.5",
+            "::ffff:198.18.0.1",
+        ] {
+            assert!(wraps_non_global(&ip(refused)), "{refused} must be refused");
+        }
+
+        for passed in [
+            "2606:4700:4700::1111",
+            // The upper half of 2000::/3, which a narrower mask would refuse.
+            "3000::1",
+            // 2001::/16 past the protocol assignments.
+            "2001:200::1",
+            "2001:4860:4860::8888",
+            // The translation forms around a public address.
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            // IPv4 is not touched by the IPv6 rule.
+            "8.8.8.8",
+        ] {
+            assert!(!wraps_non_global(&ip(passed)), "{passed} must pass");
+        }
     }
 
     #[test]
@@ -3001,9 +3098,10 @@ mod tests {
     /// the early check is all that stands between it and a connection. It
     /// refuses the literals each list knows: a NAT64 and a 6to4 form that
     /// upstream's list passes, addresses that upstream's list refuses, the
-    /// same forms around addresses only upstream's list knows, and the
-    /// local-use NAT64 prefix, as the resolver does. On a private link they
-    /// pass, as the operator said.
+    /// same forms around addresses only upstream's list knows, the
+    /// local-use NAT64 prefix, and IPv6 space outside 2000::/3 or inside
+    /// 2001::/23, as the resolver does. On a private link they pass, as the
+    /// operator said.
     #[tokio::test]
     async fn peer_allowed_refuses_internal_literals_the_resolver_never_sees() {
         for literal in [
@@ -3019,6 +3117,10 @@ mod tests {
             // cloud metadata address.
             "https://[64:ff9b:1::a00:5]",
             "https://[64:ff9b:1::a9fe:a9fe]",
+            // Teredo, SIIT and SRv6.
+            "https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]",
+            "https://[::ffff:0:a00:5]",
+            "https://[5f00::1]",
         ] {
             assert_eq!(
                 peer_allowed(literal, false).await,
@@ -3061,6 +3163,9 @@ mod tests {
         assert!(!relay_peer_allowed("wss://169.254.169.254", false).await);
         assert!(!relay_peer_allowed("wss://127.0.0.1:8080", false).await);
         assert!(!relay_peer_allowed("wss://10.0.0.5", false).await);
+        // IPv6 space public hosts are not numbered from: Teredo and SRv6.
+        assert!(!relay_peer_allowed("wss://[2001::1]", false).await);
+        assert!(!relay_peer_allowed("wss://[5f00::1]", false).await);
         // Unresolvable host rejected (fails closed).
         assert!(!relay_peer_allowed("wss://nonexistent.invalid", false).await);
     }

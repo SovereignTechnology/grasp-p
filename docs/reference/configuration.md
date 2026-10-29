@@ -507,6 +507,16 @@ NGIT_SYNC_BOOTSTRAP_RELAY_URL=ws://127.0.0.1:8081
 - The bootstrap relay is operator-configured and therefore exempt from the
   outbound target policy (see `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), so a
   local bootstrap relay keeps working even with the policy enforced
+- On a node with `NGIT_GRASP_P_REPOS_ENABLE=true`, which dials a relay that
+  an event names over `wss://` only, the bootstrap relay keeps the scheme it
+  is given, also when upstream registers it again after its session ended.
+  A `ws://` value draws a warning at startup
+  (`NGIT_SYNC_BOOTSTRAP_RELAY_URL is ws://..., a plaintext ws:// relay`). A
+  bootstrap relay that `NGIT_GRASP_P_SYNC_PEER_URLS` lists as well is a
+  peer, and is held to that setting's rule: `ws://` stops the node at
+  startup unless `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` (or
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`, which is not meant for
+  production)
 
 ---
 
@@ -538,6 +548,12 @@ local rejections block relay startup. With no user-index relays configured —
 or when `NGIT_PRIVATE_MODE` is enabled — missing identity events are seeded
 locally right away and published nowhere.
 
+On a node with `NGIT_GRASP_P_REPOS_ENABLE=true`, a `ws://` entry still
+receives the owner's identity events, but is not dialled for NIP-65
+discovery: upstream registers those connections as relays that events name,
+and such a node dials them over `wss://` only (see
+`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`).
+
 ---
 
 #### `NGIT_SYNC_PLUS_FALLBACK_RELAYS`
@@ -556,6 +572,8 @@ starts only after a successful user-index query returns no accepted kind
 `10002` for an eligible author. A subsequently discovered relay list replaces
 the fallback in desired coverage without eagerly closing shared subscriptions.
 Set the list empty to disable this recovery while retaining ordinary Sync+.
+On a node with `NGIT_GRASP_P_REPOS_ENABLE=true` a `ws://` entry is not dialled
+(see `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`).
 
 ---
 
@@ -593,9 +611,27 @@ NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true
   GRASP-P peer, and only that one, is exempt from this policy. On a node
   with `NGIT_GRASP_P_REPOS_ENABLE=true` an event-directed relay is also
   refused when it resolves to a NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`)
-  address that wraps an address this policy refuses, or to an address in the
-  local-use NAT64 prefix (`64:ff9b:1::/48`); `true` here lifts that check
-  with the rest
+  address that wraps an address this policy refuses, to an address in the
+  local-use NAT64 prefix (`64:ff9b:1::/48`), or to an IPv6 address outside
+  `2000::/3` or inside `2001::/23` (Teredo, SIIT, SRv6); `true` here lifts
+  that check with the rest
+- On a node with `NGIT_GRASP_P_REPOS_ENABLE=true`, which serves public
+  repositories beside private ones, an event-directed relay is dialled over
+  `wss://` only: the relays of announcements, purgatory's dependency relays,
+  and the NIP-65 discovery and mailbox relays, the entries of
+  `NGIT_USER_INDEX_RELAYS` and `NGIT_SYNC_PLUS_FALLBACK_RELAYS` included,
+  because upstream registers them the same way. A `ws://` one is refused
+  before any connection, once per relay in the log: `Rejecting
+  event-directed sync relay target` with the reason `a node that hosts
+  private repositories dials event-directed relays over wss:// only
+  (relays that events name, and the entries of NGIT_USER_INDEX_RELAYS and
+  NGIT_SYNC_PLUS_FALLBACK_RELAYS)`. NIP-65 discovery then passes over such
+  a source when it picks the next one to dial. The bootstrap relay keeps
+  its scheme, and so does a configured
+  GRASP-P peer on a link `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`
+  declares private. `true` here lifts the rule as well, and such a node
+  warns at startup (`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true on a node that
+  hosts private repositories`)
 - Leave `false` in production; `true` is intended for tests and closed
   development networks
 - See `docs/explanation/defensive-measures.md` for the full outbound target
@@ -1695,7 +1731,7 @@ or the startup log line.
 
 #### `NGIT_GRASP_P_REPOS_ENABLE`
 
-**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay behaves as a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section. (Four differences from upstream are not behind this switch: synced and fetched events are checked for a valid id and signature; the NIP-11 request that sync makes before and after a relay dial follows no redirect, uses no proxy, reads at most 256 KiB and, for every relay that is not registered as the bootstrap relay, is checked against the outbound target policy every time and, unless `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is on, connects only to the addresses that check vetted; `--version` also names the GRASP-P build; and a git older than 2.42 draws one warning at startup, which is a fatal error once this switch is on. See `docs/grasp-p/SEAMS.md`.) Mutually exclusive with GRASP-08 private mode: startup fails when both `NGIT_GRASP_P_REPOS_ENABLE=true` and `NGIT_PRIVATE_MODE=true`, because GRASP-08 gates every read behind NIP-42 and GRASP-P relies on anonymous reads.  
+**Description:** Master switch for GRASP-P private repository hosting. When `false` (default) the relay behaves as a public-only relay: 30640/30641 are orphan-rejected, the blob routes 404, and NIP-11 carries no `private_repos` section. (Four differences from upstream are not behind this switch: synced and fetched events are checked for a valid id and signature; the NIP-11 request that sync makes before and after a relay dial follows no redirect, uses no proxy, reads at most 256 KiB and, for every relay that is not registered as the bootstrap relay, is checked against the outbound target policy every time and, unless `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` is on, connects only to the addresses that check vetted; `--version` also names the GRASP-P build; and a git older than 2.42 draws one warning at startup, which is a fatal error once this switch is on. See `docs/grasp-p/SEAMS.md`.) With `true` the node also dials a relay that an event names over `wss://` only (see `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), and refuses at startup a sync peer listed over `ws://` on a link not declared private (see `NGIT_GRASP_P_SYNC_PEER_URLS`). Mutually exclusive with GRASP-08 private mode: startup fails when both `NGIT_GRASP_P_REPOS_ENABLE=true` and `NGIT_PRIVATE_MODE=true`, because GRASP-08 gates every read behind NIP-42 and GRASP-P relies on anonymous reads.  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No
@@ -1825,7 +1861,7 @@ or the startup log line.
 
 #### `NGIT_GRASP_P_SYNC_PEER_URLS`
 
-**Description:** Comma-separated relay URLs of the nodes this one replicates private repositories with. GRASP-P events (registrations, state roots, stream wraps) travel between these peers alone, in both directions: only they are sent the private sync filters, which name every alias and write key the node holds, and a GRASP-P event that relay sync brings from any other relay is refused before admission and counted in `ngit_private_sync_foreign_source_total`. Clients still publish to the node directly. Tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when it is listed here too; otherwise it carries public sync alone, as upstream's does. When unset, the node has no peers and replicates no private repository. A peer named here is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it. An entry that names this node itself is left out, so both nodes of a pair can be given the same list. The `policy_fingerprint` covers this node's address and these peers (not the bootstrap relay), so the two nodes of a correctly paired pair, each listing the other, advertise the same fingerprint, and a list that leaves the other node out shows as a mismatch. With GRASP-P on and no peer here, a node with the blob mirror on or a bootstrap relay set warns at startup (`NGIT_GRASP_P_SYNC_PEER_URLS names no peer of this node`). These peers also name the pair when a kind 1984 report's `server` tag is judged (see `NGIT_GRASP_P_MIRROR_PEER_URLS`).  
+**Description:** Comma-separated relay URLs of the nodes this one replicates private repositories with. GRASP-P events (registrations, state roots, stream wraps) travel between these peers alone, in both directions: only they are sent the private sync filters, which name every alias and write key the node holds, and a GRASP-P event that relay sync brings from any other relay is refused before admission and counted in `ngit_private_sync_foreign_source_total`. Clients still publish to the node directly. Tenant 30640 `relays` tags are advisory metadata and never trigger a connection (SSRF / membership-map-leak guard). The relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` is a peer only when it is listed here too; otherwise it carries public sync alone, as upstream's does. When unset, the node has no peers and replicates no private repository. A peer named here is never dropped: after an ended session or a failed dial it is dialled again, at least once every 5 minutes, and the 12-hour naughty list does not apply to it. An entry that names this node itself is left out, so both nodes of a pair can be given the same list. The `policy_fingerprint` covers this node's address and these peers (not the bootstrap relay), so the two nodes of a correctly paired pair, each listing the other, advertise the same fingerprint, and a list that leaves the other node out shows as a mismatch. With GRASP-P on and no peer here, a node with the blob mirror on or a bootstrap relay set warns at startup (`NGIT_GRASP_P_SYNC_PEER_URLS names no peer of this node`). These peers also name the pair when a kind 1984 report's `server` tag is judged (see `NGIT_GRASP_P_MIRROR_PEER_URLS`). A peer is sent every alias and key the node holds, so list it over `wss://`, by the peer's public `NGIT_DOMAIN` (a bare host is read as `wss://`). A `ws://` entry, or an `http://` one (read as `ws://`), stops the node at startup with `NGIT_GRASP_P_SYNC_PEER_URLS lists ws://..., a plaintext ws:// peer`, unless `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true` declares the pair's link private (list the peer by its address on that link, which should be its `NGIT_DOMAIN` for the fingerprints to match) or `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`. This holds for a peer that is also the bootstrap relay: that connection is the operator's own and is dialled as written, with no check at dial time. An entry that names this node is no peer and is not checked.  
 **Type:** String (CSV URLs)  
 **Default:** unset (no private-sync peers)  
 **Required:** No
@@ -1836,7 +1872,7 @@ or the startup log line.
 
 #### `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS`
 
-**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under it. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair). It applies only to the peers the operator lists in `NGIT_GRASP_P_MIRROR_PEER_URLS` and `NGIT_GRASP_P_SYNC_PEER_URLS`: no host a registration names is fetched from or dialled as a peer. Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link and refuses a peer that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (a peer that is also the bootstrap relay is still dialled, as written).  
+**Description:** The operator's statement that the pair's link is private. When `true`, the blob mirror may fetch from peers resolving to loopback/private/link-local IPs (and over plain `http`), and the relay connection to a configured private-sync peer (an entry of `NGIT_GRASP_P_SYNC_PEER_URLS`) may use plain `ws://` and an internal address: that connection, and no other, is exempt from the outbound target policy and from the rule that a relay an event names is dialled over `wss://` only, so `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS` can stay `false` and relays named by events stay under both. The default `false` drops such listed peers: the node then fetches only over `https`/`wss` from public hosts, and dials only the relay in `NGIT_SYNC_BOOTSTRAP_RELAY_URL` as written; and a `ws://` entry of `NGIT_GRASP_P_SYNC_PEER_URLS` stops the node at startup, unless `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`. Set `true` for a pair that talks over a private network, and for local testing (e.g. a `127.0.0.1` node pair). It applies only to the peers the operator lists in `NGIT_GRASP_P_MIRROR_PEER_URLS` and `NGIT_GRASP_P_SYNC_PEER_URLS`: no host a registration names is fetched from or dialled as a peer. Node-local and not part of the `policy_fingerprint`: on a pair whose nodes differ here, the node without it mirrors no blob over the private link, does not start when its sync peer is listed over `ws://`, and refuses a `wss://` peer on an internal address that only `NGIT_GRASP_P_SYNC_PEER_URLS` names (one that is also the bootstrap relay is still dialled, as written).  
 **Type:** Boolean  
 **Default:** `false`  
 **Required:** No

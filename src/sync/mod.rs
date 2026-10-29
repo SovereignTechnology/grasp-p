@@ -5420,7 +5420,11 @@ impl SyncManager {
             // they never enter the reconnect lifecycle. The connection worker
             // re-checks (with DNS vetting) immediately before every dial.
             if source == RelayTargetSource::EventDirected {
-                if let Err(reason) = policy.authorize(OutboundTargetKind::EventRelay, &relay_url) {
+                if let Err(reason) = policy
+                    .authorize(OutboundTargetKind::EventRelay, &relay_url)
+                    // GRASP-P seam: a GRASP-P node dials what events name over wss:// only.
+                    .and_then(|_| self.grasp_p_event_relay_allowed(&relay_url))
+                {
                     // Warn once per target; sync passes keep re-deriving the
                     // same URLs from stored events.
                     if self.rejected_relay_targets.insert(relay_url.clone()) {
@@ -5969,6 +5973,8 @@ impl SyncManager {
             if let Some(source) = candidates
                 .keys()
                 .filter(|source| !self.connections.contains_key(*source))
+                // GRASP-P seam: a source the wss:// rule refused never connects, and sorts first.
+                .filter(|source| !self.grasp_p_discovery_source_refused(source))
                 .min()
                 .cloned()
             {
