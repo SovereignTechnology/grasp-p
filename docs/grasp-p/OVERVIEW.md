@@ -174,7 +174,11 @@ wraps travel only between the relays an operator lists in `NGIT_GRASP_P_SYNC_PEE
 both directions: only those are sent the GRASP-P filters, and a GRASP-P event that relay sync
 brings from any other relay is refused before admission. The node's public sync, to the
 bootstrap relay and every relay its public repositories name, runs beside it as upstream's
-does; the bootstrap relay is a peer only when the list names it. Relay and server tags in a
+does, except that a relay an event names is dialled over `wss://` only; the bootstrap relay
+keeps the scheme the operator gave it, and is a peer only when the list names it. A peer is
+listed over `wss://`, or over `ws://` only on a link the operator declares private; the node
+does not start with any other `ws://` peer unless `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`, which
+is for tests and closed networks. Relay and server tags in a
 registration never decide who the node syncs events with, or where it fetches blobs from:
 blob peers are the operator's list `NGIT_GRASP_P_MIRROR_PEER_URLS` alone, and a node without
 one mirrors nothing. The mirror connects only to addresses its client's resolver vetted for a
@@ -183,7 +187,8 @@ peer; the connection makes no lookup of its own.
 The relay connection to a configured peer is kept for the life of the process: when it
 drops, or a dial fails for any reason, the node dials again by itself, at least once every
 five minutes. The two nodes may talk over a private network while every relay that an
-event names stays barred from internal addresses.
+event names stays barred from internal addresses, including those reached through IPv6
+translation or tunnel prefixes.
 
 Missing blobs wait in one queue per account, and the accounts are served in turn, each
 with at most half of the concurrent fetches, so one account whose blobs come slowly cannot

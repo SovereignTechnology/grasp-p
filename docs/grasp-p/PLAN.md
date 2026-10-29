@@ -274,6 +274,25 @@ project yet.
   with upstream's guard on. Still open: the dial is vetted and not pinned (#3), a naughty
   list entry outlives the peer's recovery by up to 12 hours, and no test runs with GRASP-P's
   own guard on. See "Configured peers" in [`SEAMS.md`](SEAMS.md).
+- **Egress on a node that also serves public repositories** (done in merge request 15c,
+  decision C below). A GRASP-P node dials a relay that an event names over `wss://` only:
+  the relays of announcements, purgatory's dependency relays, and the NIP-65 discovery and
+  mailbox relays, the operator's index and fallback relays among them, since upstream
+  registers them the same way. A `ws://` one is refused through upstream's own refusal
+  branch, never dialled, and NIP-65 discovery passes over it when it picks the next source
+  to dial. The bootstrap relay and the publishing of the relay's identity keep the scheme
+  they are given, the bootstrap relay also when upstream registers it again after its
+  session ended, and a `ws://` bootstrap relay draws a warning at startup;
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true` lifts the rule, and draws a warning too. A
+  configured peer keeps `ws://` only under `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`,
+  and without it a `ws://` peer stops the node at startup (unless
+  `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true`, for tests and closed networks): a peer that is
+  also the bootstrap relay is dialled as written and sent every alias and key. The relay
+  dial and the blob mirror also refuse IPv6 outside `2000::/3` or inside `2001::/23`
+  (Teredo, SIIT, SRv6), and still judge IPv4-mapped and NAT64 addresses by what they carry.
+  No setting was added. See "Egress on a node that also serves public repositories" in
+  [`SEAMS.md`](SEAMS.md). Still open, for merge request 20: git fetches get upstream's
+  address check only; refused `ws://` entries still take an author's NIP-65 places.
 - **#10 is wider on v3** (the reach of sync: done). The GRASP-P filters went to every live
   relay, including upstream's NIP-65 discovery connections, and any relay could bring a
   GRASP-P event into admission. The maintainer decided that GRASP-P data replicates only
@@ -466,7 +485,9 @@ replication and the watchdog pair. Each node lists the other by its public `NGIT
 `https://`. On a private link it may use `ws://` and `http://` with
 `NGIT_GRASP_P_MIRROR_ALLOW_PRIVATE_IPS=true`, but only when that address is the peer's
 `NGIT_DOMAIN`, the name the fingerprint's domain set holds; a sync peer listed by another address
-never matches. The same two lists name the pair when a report's `server` tag is judged.
+never matches. A `ws://` sync peer without that setting stops the node at startup, unless
+`NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS=true` (tests and closed networks). The same two lists name
+the pair when a report's `server` tag is judged.
 
 ### M9 - Paid tier and launch
 - A payment webhook drives the tenant allowlist and per-plan quotas; NIP-11 `fees`.
@@ -655,10 +676,12 @@ requests (15a, 15b, 15c); every recommendation was taken.
   actually deletes, with a test that fails if upstream ever bounds its vanish by date (15b,
   done).
 - The bootstrap relay and the publishing of the relay's identity keep `ws://` with a boot
-  warning; relays that events name are dialled over `wss://` only (15c).
+  warning; relays that events name are dialled over `wss://` only (15c, done). A configured
+  peer keeps `ws://` only on a link declared private, checked at startup.
 - The fingerprint over private links needs no code: M8 lists each peer by its public
   `NGIT_DOMAIN`, over `wss://`, or over `ws://` on a private link only when that address is the
-  peer's `NGIT_DOMAIN` (M8, above).
+  peer's `NGIT_DOMAIN` (M8, above). 15c refuses at startup a `ws://` peer on a link not declared
+  private.
 - A report's `server` tag names the pair only as this node's service address and the peers in
   `NGIT_GRASP_P_SYNC_PEER_URLS` and `NGIT_GRASP_P_MIRROR_PEER_URLS`, never the `server` values of
   registrations: an account writes those as it likes, so it could otherwise make the node refuse
