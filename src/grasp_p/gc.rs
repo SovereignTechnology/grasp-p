@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+use super::claims;
 use super::meta::BlobClaim;
-use super::{quota, PrivateService};
+use super::PrivateService;
 
 pub(crate) fn spawn(svc: Arc<PrivateService>) -> JoinHandle<()> {
     let interval_secs = svc.cfg.gc_interval_secs.max(1);
@@ -54,12 +55,12 @@ pub(crate) struct PurgeOutcome {
 /// file and fresh claim. On unlink failure the txn aborts, the claim
 /// survives, and a later pass retries.
 ///
-/// After the unlink: a stored claim's ledger charge is released (a no-op
-/// for never-charged/adopted claims per `quota::release_claim`), any
-/// pending speculative charge is released (issue !12: a never-stored claim
-/// dies with its speculative charge or the declared bytes leak in the
-/// ledger), and the claim row is deleted. The unlink is idempotent
-/// (`NotFound` → Ok) so claim-less orphan files are swept too.
+/// After the unlink every charge the claim carries is released, each by
+/// the bytes it recorded (`claims::release_all`): the grace charge of the
+/// last referrer, or, for a takedown, the charge of every repository that
+/// still references the blob. The claim row and its index entries are
+/// deleted. The unlink is idempotent (`NotFound` → Ok) so claim-less orphan
+/// files are swept too.
 pub(crate) fn purge_blob(
     svc: &PrivateService,
     sha: &str,
@@ -85,13 +86,9 @@ pub(crate) fn purge_blob(
                 unlinked: file_present,
             });
         };
-        if claim.stored {
-            quota::release_claim(meta, txn, &claim)?;
-        }
-        if let Some(ref spec) = claim.spec_charge {
-            quota::release_spec_charge(meta, txn, spec)?;
-        }
-        meta.delete_blob_claim(txn, sha)?;
+        let mut released = claim.clone();
+        let moves = claims::release_all(&mut released);
+        claims::commit(meta, txn, sha, Some(&claim), None, &moves)?;
         Ok(PurgeOutcome {
             freed: Some((claim.stored, claim.size)),
             unlinked: file_present,
@@ -99,20 +96,48 @@ pub(crate) fn purge_blob(
     })
 }
 
+/// Settle a claim whose bytes are on disk although it says they were never
+/// stored: an upload whose rename landed and whose meta commit was lost to
+/// a crash. `finish()` renames only after verifying the hash, so the file
+/// is the blob. Left declared, the claim would go with its last reference
+/// and leave the file on disk with nothing to remove it. Re-checked under
+/// the write lock, which `finish()` holds too. The other referrers are set
+/// to the stored size without a quota check: nobody acted, and a crash is
+/// not something a client can bring about.
+fn settle_file_on_disk(svc: &PrivateService, sha: &str, now: u64) -> anyhow::Result<bool> {
+    svc.meta.with_write(|meta, txn| {
+        let Some(before) = meta.get_blob_claim(txn, sha)? else {
+            return Ok(false);
+        };
+        if before.stored || before.aliases.is_empty() {
+            return Ok(false);
+        }
+        let Some(len) = svc.blobs.size_of(sha) else {
+            return Ok(false);
+        };
+        let mut claim = before.clone();
+        let moves = claims::settle_stored(&mut claim, len, now);
+        claims::commit(meta, txn, sha, Some(&before), Some(&claim), &moves)?;
+        Ok(true)
+    })
+}
+
 /// One GC pass: remove blobs unreferenced for longer than the grace period,
 /// PLUS any blob whose sha is denylisted (Phase-4b D2 — takedown bypasses
-/// both the grace period and the unreferenced requirement). Public so
-/// tests / operators can trigger it deterministically later.
+/// both the grace period and the unreferenced requirement), and settle a
+/// declared claim whose file is on disk ([`settle_file_on_disk`]). Public
+/// so tests / operators can trigger it deterministically later.
 pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
     let now = nostr::prelude::Timestamp::now().as_secs();
     let grace = svc.cfg.gc_grace_secs;
 
     let mut removed = 0_usize;
     let mut purged = 0_u64;
-    let (expired, denylisted): (Vec<String>, Vec<String>) = {
+    let (expired, denylisted, unsettled): (Vec<String>, Vec<String>, Vec<String>) = {
         let txn = svc.meta.read_txn()?;
         let mut expired = Vec::new();
         let mut denylisted = Vec::new();
+        let mut unsettled = Vec::new();
         for (sha, claim) in svc.meta.all_blob_claims(&txn)? {
             // D2: the denylist sweep makes purge durable even when the
             // reload's purge-on-add raced a claim that appeared later (or
@@ -120,6 +145,10 @@ pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
             // still-referenced blob: takedown = immediate.
             if svc.is_denylisted(&sha) {
                 denylisted.push(sha);
+                continue;
+            }
+            if !claim.stored && !claim.aliases.is_empty() && svc.blobs.exists(&sha) {
+                unsettled.push(sha);
                 continue;
             }
             if claim.aliases.is_empty()
@@ -131,8 +160,20 @@ pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
                 expired.push(sha);
             }
         }
-        (expired, denylisted)
+        (expired, denylisted, unsettled)
     };
+
+    let mut settled = 0_usize;
+    for sha in unsettled {
+        match settle_file_on_disk(svc, &sha, now) {
+            Ok(true) => {
+                settled += 1;
+                tracing::info!(sha256 = %sha, "private blob GC settled a stored file");
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("private blob GC could not settle {sha}: {e}"),
+        }
+    }
 
     for sha in denylisted {
         // Same purge primitive as the reload's purge-on-add (single code
@@ -186,7 +227,7 @@ pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
     if purged > 0 {
         crate::metrics::record_private_denylist_purged(purged);
     }
-    if removed > 0 {
+    if removed > 0 || settled > 0 {
         svc.refresh_gauges();
     }
     Ok(removed)
@@ -195,12 +236,17 @@ pub fn run_pass(svc: &PrivateService) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grasp_p::meta::{BlobClaim, LEDGER_GLOBAL_KEY};
+    use crate::grasp_p::meta::LEDGER_GLOBAL_KEY;
 
     async fn harness() -> (tempfile::TempDir, Arc<PrivateService>) {
+        harness_with_grace(crate::config::Config::for_testing().private_gc_grace_secs).await
+    }
+
+    async fn harness_with_grace(grace_secs: u64) -> (tempfile::TempDir, Arc<PrivateService>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::config::Config::for_testing();
         config.private_repos_enable = true;
+        config.private_gc_grace_secs = grace_secs;
         config.private_meta_data_path =
             Some(dir.path().join("meta").to_string_lossy().into_owned());
         config.private_blob_data_path =
@@ -226,24 +272,16 @@ mod tests {
             sha256::Hash::hash(&data).to_string()
         };
 
-        // Stored + referenced + charged claim (the least GC-able shape).
+        // Stored + referenced + charged claim (the least GC-able shape), with
+        // two repositories paying for it.
         svc.meta
             .with_write(|meta, txn| {
-                quota::charge(meta, txn, "tenant", "alias", 512, true)?;
-                meta.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 512,
-                        aliases: vec!["alias".to_string()],
-                        unreferenced_since: None,
-                        stored: true,
-                        charged_tenant: Some("tenant".to_string()),
-                        charged_alias: Some("alias".to_string()),
-                        spec_charge: None,
-                        stored_at: None,
-                    },
-                )
+                claims::attach_to(meta, txn, &sha, "tenant", "alias", 512)?;
+                claims::attach_to(meta, txn, &sha, "tenant-2", "alias-2", 512)?;
+                let before = meta.get_blob_claim(txn, &sha)?;
+                let mut claim = before.clone().expect("declared");
+                let moves = claims::settle_stored(&mut claim, 512, 1);
+                claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
             })
             .unwrap();
         let path = svc.blobs.path_for(&sha);
@@ -269,11 +307,113 @@ mod tests {
                 .unwrap()
                 .total(),
             0,
-            "the stored charge must be released"
+            "every repository's charge must be released"
         );
+        for alias in ["alias", "alias-2"] {
+            assert!(
+                svc.meta.alias_claim_shas(&txn, alias).unwrap().is_empty(),
+                "{alias} no longer lists the purged blob"
+            );
+        }
 
         // Idempotent: a later pass finds nothing.
         drop(txn);
         assert_eq!(run_pass(&svc).unwrap(), 0);
+    }
+
+    /// The last repository to stop referencing stored bytes pays until GC
+    /// removes them, and no longer: the pass that deletes the blob releases
+    /// that grace charge, and before the grace period is over nothing is
+    /// removed or released.
+    #[tokio::test]
+    async fn gc_releases_the_grace_charge_with_the_blob() {
+        let data = vec![9u8; 64];
+        let sha = {
+            use bitcoin_hashes::sha256;
+            sha256::Hash::hash(&data).to_string()
+        };
+        fn global(svc: &PrivateService) -> u64 {
+            let txn = svc.meta.read_txn().unwrap();
+            svc.meta
+                .get_ledger_txn(&txn, LEDGER_GLOBAL_KEY)
+                .unwrap()
+                .blob_bytes
+        }
+        for (grace, removed) in [(86_400, 0), (0, 1)] {
+            let (_dir, svc) = harness_with_grace(grace).await;
+            svc.meta
+                .with_write(|meta, txn| {
+                    claims::attach_to(meta, txn, &sha, "tenant", "alias", 64)?;
+                    let before = meta.get_blob_claim(txn, &sha)?;
+                    let mut claim = before.clone().expect("declared");
+                    let moves = claims::settle_stored(&mut claim, 64, 1);
+                    claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)?;
+                    let now = nostr::prelude::Timestamp::now().as_secs();
+                    claims::detach_from(meta, txn, &sha, "alias", now)
+                })
+                .unwrap();
+            let path = svc.blobs.path_for(&sha);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &data).unwrap();
+            assert_eq!(global(&svc), 64, "the last referrer still pays");
+
+            assert_eq!(run_pass(&svc).unwrap(), removed, "grace {grace}");
+            if removed == 0 {
+                assert!(svc.blobs.exists(&sha));
+                assert_eq!(global(&svc), 64, "inside the grace period");
+            } else {
+                assert!(!svc.blobs.exists(&sha));
+                assert_eq!(global(&svc), 0, "released with the bytes");
+                let txn = svc.meta.read_txn().unwrap();
+                assert!(svc.meta.get_blob_claim(&txn, &sha).unwrap().is_none());
+                assert!(svc.meta.alias_claim_shas(&txn, "alias").unwrap().is_empty());
+            }
+        }
+    }
+
+    /// A file beside a claim that says it was never stored (a crash between
+    /// an upload's rename and its meta commit) is settled by the next pass:
+    /// stored, and its referrer charged the file's size. Left declared, the
+    /// claim would go with its last reference and the file would stay on
+    /// disk for good; settled, the bytes wait for GC like any others.
+    #[tokio::test]
+    async fn gc_settles_a_file_left_beside_a_declared_claim() {
+        let data = vec![7u8; 96];
+        let sha = {
+            use bitcoin_hashes::sha256;
+            sha256::Hash::hash(&data).to_string()
+        };
+        let (_dir, svc) = harness_with_grace(86_400).await;
+        svc.meta
+            .with_write(|meta, txn| claims::attach_to(meta, txn, &sha, "tenant", "alias", 500))
+            .unwrap();
+        let path = svc.blobs.path_for(&sha);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &data).unwrap();
+
+        assert_eq!(run_pass(&svc).unwrap(), 0, "nothing is removed");
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            let claim = svc.meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
+            assert!(claim.stored, "{claim:?}");
+            assert_eq!(claims::charge_of(&claim, "alias"), Some(96));
+            assert_eq!(
+                svc.meta
+                    .get_ledger_txn(&txn, LEDGER_GLOBAL_KEY)
+                    .unwrap()
+                    .blob_bytes,
+                96
+            );
+        }
+
+        let now = nostr::prelude::Timestamp::now().as_secs();
+        svc.meta
+            .with_write(|meta, txn| claims::detach_from(meta, txn, &sha, "alias", now))
+            .unwrap();
+        let txn = svc.meta.read_txn().unwrap();
+        assert!(
+            svc.meta.get_blob_claim(&txn, &sha).unwrap().is_some(),
+            "kept, with its file, for GC"
+        );
     }
 }

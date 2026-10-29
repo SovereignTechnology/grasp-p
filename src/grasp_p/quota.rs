@@ -8,7 +8,8 @@
 use anyhow::Result;
 use heed::{RoTxn, RwTxn};
 
-use super::meta::{BlobClaim, LedgerEntry, MetaEnv, SpecCharge, LEDGER_GLOBAL_KEY};
+use super::claims::Move;
+use super::meta::{LedgerEntry, MetaEnv, LEDGER_GLOBAL_KEY};
 use super::PrivateConfig;
 
 /// Ledger key for a tenant scope.
@@ -42,6 +43,50 @@ pub fn check(
     )
 }
 
+/// Would a write by (tenant, alias) that charges `event_bytes` and makes the
+/// blob `moves` keep the alias, the account and the node within their caps?
+/// Returns `false` when over quota.
+///
+/// The blob moves of one write can release as well as charge (a grace
+/// charge taken over, a declared size set to the stored one), so each scope
+/// is judged by what the write adds to it: a scope that does not grow is not
+/// refused, even one already above its cap. Other repositories' scopes that
+/// the moves touch are not judged: their owners did not act. The alias and
+/// account scopes count only the moves booked to them; the node counts
+/// every move.
+pub(crate) fn fits(
+    meta: &MetaEnv,
+    txn: &RoTxn,
+    cfg: &PrivateConfig,
+    tenant_hex: &str,
+    alias: &str,
+    event_bytes: u64,
+    moves: &[Move],
+) -> Result<bool> {
+    let event = i128::from(event_bytes);
+    let (mut repo_add, mut account_add, mut node_add) = (event, event, event);
+    for change in moves {
+        let delta = change.delta();
+        node_add += delta;
+        if change.tenant == tenant_hex {
+            account_add += delta;
+        }
+        if change.alias == alias {
+            repo_add += delta;
+        }
+    }
+    let within = |key: &str, add: i128, cap: u64| -> Result<bool> {
+        if add <= 0 {
+            return Ok(true);
+        }
+        let total = i128::from(meta.get_ledger_txn(txn, key)?.total());
+        Ok(total + add <= i128::from(cap))
+    };
+    Ok(within(&alias_key(alias), repo_add, cfg.quota_repo_bytes)?
+        && within(&tenant_key(tenant_hex), account_add, cfg.quota_tenant_bytes)?
+        && within(LEDGER_GLOBAL_KEY, node_add, cfg.global_budget_bytes)?)
+}
+
 /// Charge `bytes` to the tenant, alias, and global ledgers. `blob` selects the
 /// blob-bytes column, otherwise event bytes. Caller must have checked quota.
 pub fn charge(
@@ -64,7 +109,7 @@ pub fn charge(
     Ok(())
 }
 
-/// Release `bytes` from the given scopes (used by GC / offboarding).
+/// Release `bytes` from the given scopes.
 pub fn release(
     meta: &MetaEnv,
     txn: &mut RwTxn,
@@ -98,51 +143,15 @@ pub fn global_total(meta: &MetaEnv, txn: &RoTxn) -> Result<u64> {
 /// wrap/30641 event bytes a dead registration charged there would otherwise
 /// outlive it and brick the seat for a conflict-merge winner: those bytes
 /// are unattributable per tenant and every prior event charge belonged to
-/// the dead holder(s). Blob/spec columns stay intact — those are real bytes
-/// on disk (or recorded speculative charges) that the GC/grace paths
-/// release. Pure function of meta state; ledger timing stays node-local, so
-/// the deterministic merge is unaffected.
+/// the dead holder(s). The blob column is not touched here: every blob
+/// charge is recorded on its claim, and the death path releases each one
+/// through `claims.rs`. Pure function of meta state; ledger timing stays
+/// node-local, so the deterministic merge is unaffected.
 pub fn reset_alias_event_bytes(meta: &MetaEnv, txn: &mut RwTxn, alias: &str) -> Result<()> {
     let key = alias_key(alias);
     let mut entry = meta.get_ledger_txn(txn, &key)?;
     entry.event_bytes = 0;
     meta.put_ledger(txn, &key, &entry)
-}
-
-/// Release the ledger charge attached to a stored blob claim (GC).
-///
-/// No-op when the claim was never charged: adopted orphans carry
-/// `stored = true` with `charged_tenant = None` (the bytes were already on
-/// disk, so no charge was taken). Releasing anyway would subtract `size`
-/// from the global ledger without any matching charge, silently inflating
-/// the global budget by every adopted-then-GC'd orphan.
-pub fn release_claim(meta: &MetaEnv, txn: &mut RwTxn, claim: &BlobClaim) -> Result<()> {
-    if claim.charged_tenant.is_none() {
-        return Ok(());
-    }
-    release(
-        meta,
-        txn,
-        claim.charged_tenant.as_deref(),
-        claim.charged_alias.as_deref(),
-        claim.size,
-        true,
-    )
-}
-
-/// Release a speculative (pre-upload) charge (issue !12). Releases exactly
-/// the bytes that were charged at 30641 declaration time, against the same
-/// (tenant, alias) scope — never `claim.size`, which the upload path may
-/// have since overwritten with the actual byte count.
-pub fn release_spec_charge(meta: &MetaEnv, txn: &mut RwTxn, spec: &SpecCharge) -> Result<()> {
-    release(
-        meta,
-        txn,
-        Some(&spec.tenant),
-        Some(&spec.alias),
-        spec.bytes,
-        true,
-    )
 }
 
 fn apply(entry: &mut LedgerEntry, bytes: u64, blob: bool, add: bool) {
@@ -162,54 +171,68 @@ fn apply(entry: &mut LedgerEntry, bytes: u64, blob: bool, add: bool) {
 mod tests {
     use super::*;
 
-    fn stored_claim(tenant: Option<&str>, alias: Option<&str>, size: u64) -> BlobClaim {
-        BlobClaim {
-            size,
-            aliases: vec![],
-            unreferenced_since: None,
-            stored: true,
-            charged_tenant: tenant.map(str::to_string),
-            charged_alias: alias.map(str::to_string),
-            spec_charge: None,
-            stored_at: None,
+    fn limits(repo: u64, tenant: u64, global: u64) -> PrivateConfig {
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+        cfg.quota_repo_bytes = repo;
+        cfg.quota_tenant_bytes = tenant;
+        cfg.global_budget_bytes = global;
+        cfg
+    }
+
+    fn change(tenant: &str, alias: &str, bytes: u64, add: bool) -> Move {
+        Move {
+            tenant: tenant.to_string(),
+            alias: alias.to_string(),
+            bytes,
+            add,
         }
     }
 
-    /// release_claim must release exactly what was charged — and nothing for
-    /// adopted orphans (`stored = true` but never charged): releasing those
-    /// would subtract bytes from the global ledger that it never gained.
+    /// Each scope is judged by what the write adds to it, counting only the
+    /// moves booked to it, and a write that adds nothing to a scope already
+    /// over its cap is not refused for it.
     #[test]
-    fn release_claim_releases_only_what_was_charged() {
+    fn fits_judges_each_scope_by_what_the_write_adds() {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaEnv::open(dir.path()).unwrap();
-
         meta.with_write(|m, txn| {
-            charge(m, txn, "t1", "a1", 100, true)?;
-            assert_eq!(global_total(m, txn)?, 100);
-
-            // Adopted orphan: stored, no charged scopes — release is a no-op.
-            release_claim(m, txn, &stored_claim(None, None, 50))?;
-            assert_eq!(
-                global_total(m, txn)?,
-                100,
-                "never-charged claim must not touch the ledger"
-            );
-
-            // Really charged claim: full release across all three scopes.
-            release_claim(m, txn, &stored_claim(Some("t1"), Some("a1"), 100))?;
-            assert_eq!(global_total(m, txn)?, 0);
-            assert_eq!(
-                m.get_ledger_txn(txn, &tenant_key("t1"))?.blob_bytes,
-                0,
-                "tenant scope must be released"
-            );
-            assert_eq!(
-                m.get_ledger_txn(txn, &alias_key("a1"))?.blob_bytes,
-                0,
-                "alias scope must be released"
-            );
-            Ok(())
+            charge(m, txn, "t1", "a1", 900, true)?;
+            charge(m, txn, "t2", "a2", 50, true)
         })
         .unwrap();
+        let txn = meta.read_txn().unwrap();
+        let cfg = limits(1000, 1000, 2000);
+
+        // 100 more fits the alias exactly; 101 does not.
+        let more = [change("t1", "a1", 100, true)];
+        assert!(fits(&meta, &txn, &cfg, "t1", "a1", 0, &more).unwrap());
+        assert!(!fits(&meta, &txn, &cfg, "t1", "a1", 1, &more).unwrap());
+
+        // Taking over another account's charge adds nothing to the node
+        // and is judged at the taker's scopes alone.
+        let takeover = [change("t2", "a2", 50, false), change("t1", "a1", 50, true)];
+        assert!(fits(&meta, &txn, &cfg, "t1", "a1", 0, &takeover).unwrap());
+
+        // Over its cap and adding nothing: not refused; adding: refused.
+        let tight = limits(800, 1000, 2000);
+        let same = [
+            change("t1", "a1", 900, false),
+            change("t1", "a1", 900, true),
+        ];
+        assert!(fits(&meta, &txn, &tight, "t1", "a1", 0, &same).unwrap());
+        assert!(!fits(&meta, &txn, &tight, "t1", "a1", 0, &more).unwrap());
+
+        // The node counts every move, the account only its own.
+        let small_node = limits(1000, 1000, 1000);
+        let other = [change("t2", "a2", 100, true)];
+        assert!(!fits(&meta, &txn, &small_node, "t1", "a1", 0, &other).unwrap());
+        assert!(fits(&meta, &txn, &cfg, "t1", "a1", 0, &other).unwrap());
+
+        // Taking over another account's charge is judged at the taker's own
+        // scopes: the release booked to t2/a2 does not offset it.
+        let tight_account = limits(1000, 920, 2000);
+        assert!(!fits(&meta, &txn, &tight_account, "t1", "a1", 0, &takeover).unwrap());
+        let tight_repo = limits(920, 1000, 2000);
+        assert!(!fits(&meta, &txn, &tight_repo, "t1", "a1", 0, &takeover).unwrap());
     }
 }

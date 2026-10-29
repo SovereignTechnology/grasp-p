@@ -2067,9 +2067,10 @@ async fn exit9_mirror_finish_recheck_and_no_reenqueue_after_death() {
 
     // Settle: B's ledger falls back to registration + edition event bytes
     // only — the 1024 declared/stored bytes are gone in every interleaving
-    // (spec released at death; stored charge released by GC after the
-    // strip; or never charged because finish() rejected). This also proves
-    // the death was processed.
+    // (the declared charge is released at the death; a stored one, which
+    // the repository pays as the blob's last referrer, by GC after it; or
+    // nothing was charged, because the mirror's finish() refused once the
+    // registration was gone). This also proves the death was processed.
     let want = reg.as_json().len() as i64 + edition.as_json().len() as i64;
     let mut settled = -1;
     for _ in 0..100 {
@@ -2211,7 +2212,7 @@ async fn exit10_full_reissue_heals_missed_state_root_inner(disable_negentropy: b
     let filler = blob_bytes(62, 4096);
 
     // B's tenant quota: both registrations + the filler + 100 bytes of
-    // slack. The 30641 (event bytes + 1024 speculative manifest bytes)
+    // slack. The 30641 (event bytes + 1024 declared manifest bytes)
     // does NOT fit until the filler is deleted; after the delete it does.
     let reg_bytes = (reg1.as_json().len() + reg2.as_json().len()) as u64;
     let tenant_quota = reg_bytes + filler.len() as u64 + 100;

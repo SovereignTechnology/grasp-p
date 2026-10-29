@@ -2215,21 +2215,26 @@ async fn exit13_conflict_winner_exempt_from_node_local_quota() {
 }
 
 // ============================================================================
-// Exit test 12 — speculative 30641 blob claims are charged + GC'd (issue !12)
+// Exit test 12 — declared 30641 blob claims are charged + released (issue !12)
 // ============================================================================
 
 /// A 30641 declaring never-uploaded blobs must charge the declared bytes to
-/// the declaring (tenant, alias) — speculative claims can no longer grow the
+/// the declaring (tenant, alias) — declared claims can no longer grow the
 /// meta store unbilled — and the charge must be released when the claim dies
-/// (edition superseded → ring trim → GC). Over-quota speculation is rejected
-/// up front.
+/// (edition superseded → ring trim). Over-quota declarations are rejected up
+/// front.
+///
+/// Expected values unchanged by decision D4 (merge request 16); only the
+/// moment of the release moved: a claim nobody stored is now deleted with
+/// its last reference, in the superseding edition's own transaction, where
+/// it used to wait for GC.
 #[tokio::test]
 async fn exit12_speculative_blob_claims_charged_and_released() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
     let relay = TestRelay::start_with_grasp_p(&[
-        // One retained edition + immediate GC so a superseded edition's
-        // speculative claim is collectable within the test bound.
+        // One retained edition, so that v2 drops v1's reference: the claim
+        // nobody stored then goes in v2's own transaction, without GC.
         ("NGIT_GRASP_P_STATE_HISTORY_EDITIONS", "1"),
         ("NGIT_GRASP_P_GC_GRACE_SECS", "0"),
         ("NGIT_GRASP_P_GC_INTERVAL_SECS", "1"),
@@ -2251,7 +2256,7 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     assert!(g0 > 0, "exit12: registration must already be on the ledger");
 
     // (a) v1 declares a never-uploaded 4096-byte manifest blob: accepted,
-    // and the declared bytes are charged (speculative claim).
+    // and the declared bytes are charged.
     let t0 = Timestamp::now().as_secs();
     let fake_sha = sha256_hex(&blob_bytes(91, 64));
     let v1 = state_root_event(
@@ -2277,11 +2282,11 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     assert_eq!(
         g1,
         g0 + v1_bytes + 4096,
-        "exit12: declared-but-unstored bytes must be charged speculatively"
+        "exit12: declared-but-unstored bytes must be charged"
     );
 
-    // (b) Speculation cannot exceed quota: an edition declaring more bytes
-    // than the repo has left is rejected outright.
+    // (b) A declaration cannot exceed quota: an edition declaring more
+    // bytes than the repo has left is rejected outright.
     let big_sha = sha256_hex(&blob_bytes(92, 64));
     let over = state_root_event(
         &writer,
@@ -2294,11 +2299,11 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     let (accepted, message) = publish_with_result(relay.url(), &over).await;
     assert!(
         !accepted && message.contains("quota exceeded"),
-        "exit12: over-quota speculation must be rejected; got {message:?}"
+        "exit12: an over-quota declaration must be rejected; got {message:?}"
     );
 
     // (c) v2 supersedes v1 (ring keeps 1 edition): v1's fake ref loses its
-    // alias, GC (grace 0) deletes the claim and refunds the 4096.
+    // last reference, so the claim and its 4096 go in v2's transaction.
     let sha2 = sha256_hex(&blob_bytes(93, 64));
     let v2 = state_root_event(
         &writer,
@@ -2323,8 +2328,8 @@ async fn exit12_speculative_blob_claims_charged_and_released() {
     }
     assert_eq!(
         g2, expected,
-        "exit12: the superseded edition's speculative charge must be GC-refunded \
-         (v2's own 100-byte speculation stays charged)"
+        "exit12: the superseded edition's declared charge must be refunded \
+         (v2's own 100-byte declaration stays charged)"
     );
 
     relay.stop().await;
@@ -2688,15 +2693,19 @@ async fn exit16_conflict_winner_exempt_from_alias_limit() {
 // ============================================================================
 
 /// FC/FD (subsumes Lens-4 F3): the squatter saturates `r:<alias>` with
-/// wraps, declares unstored blobs (speculatively charged), and stores one
-/// real blob; the genuine earlier registration then wins the merge. In the
-/// eviction's own txn the loser must lose its whole footprint: the alias
-/// scope's EVENT column is reset (the winner is not quota-bricked), the
-/// orphaned speculative charge is released from t:/r:/g: immediately, and
-/// the stored blob's claim is stripped so GC releases its charge after
-/// grace. (Ring-edition deletion is pinned at meta level in
-/// `registration::tests::eviction_cleans_loser_footprint` — the ring has no
-/// externally visible surface.)
+/// wraps, declares unstored blobs (charged at their declared size), and
+/// stores one real blob; the genuine earlier registration then wins the
+/// merge. In the eviction's own txn the loser must lose its whole
+/// footprint: the alias scope's EVENT column is reset (the winner is not
+/// quota-bricked), the declared blob's charge is released from t:/r:/g:
+/// immediately, and the stored blob loses its reference, so GC releases
+/// the loser's charge for it after grace. (Ring-edition deletion is pinned
+/// at meta level in `registration::tests::eviction_cleans_loser_footprint`
+/// — the ring has no externally visible surface.)
+///
+/// No expected value changed with decision D4 (merge request 16): the
+/// loser was the only referrer of both blobs, and the last referrer of
+/// stored bytes pays until GC, as before.
 #[tokio::test]
 async fn exit17_eviction_releases_loser_footprint() {
     let squatter = Keys::generate();
@@ -2704,8 +2713,9 @@ async fn exit17_eviction_releases_loser_footprint() {
     let whitelist = whitelist_npubs(&[&squatter, &victim]);
     let relay = TestRelay::start_with_grasp_p(&[
         ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "16384"),
-        // Short (non-zero) grace so the post-eviction spec-release sample is
-        // race-free while GC still collects within the test bound.
+        // Short (non-zero) grace, so that the sample taken right after the
+        // eviction comes before GC releases the stored blob's charge, while
+        // GC still collects within the test bound.
         ("NGIT_GRASP_P_GC_GRACE_SECS", "3"),
         ("NGIT_GRASP_P_GC_INTERVAL_SECS", "1"),
         ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
@@ -2725,7 +2735,8 @@ async fn exit17_eviction_releases_loser_footprint() {
     };
 
     // The squatter takes the alias (later created_at), stores one real blob,
-    // and declares a never-uploaded 4096-byte blob (speculatively charged).
+    // and declares a never-uploaded 4096-byte blob (charged at its declared
+    // size).
     let squat = registration_event(
         &squatter,
         &alias,
@@ -2756,8 +2767,8 @@ async fn exit17_eviction_releases_loser_footprint() {
         "exit17: squatter blob PUT failed; X-Reason: {reason}"
     );
 
-    // The 30641 declares a never-uploaded 4096-byte blob (speculatively
-    // charged) AND references the stored blob — an unreferenced PUT blob is
+    // The 30641 declares a never-uploaded 4096-byte blob (charged at its
+    // declared size) AND references the stored blob — an unreferenced PUT blob is
     // unclaimed by the ring release loop at the next edition, and this test
     // needs the stored claim alive (and charged) until the eviction.
     let fake_sha = sha256_hex(&blob_bytes(64, 64));
@@ -2809,10 +2820,10 @@ async fn exit17_eviction_releases_loser_footprint() {
     );
     let winner_reg_bytes = genuine.as_json().len() as i64;
 
-    // (b) The loser's speculative 4096 was released from the ledger IN the
-    // eviction txn (not after GC grace): global drops by exactly the spec
-    // bytes and rises by exactly the winner's registration bytes. GC grace
-    // is 3s, so this sample (taken immediately) is race-free.
+    // (b) The loser's declared 4096 was released from the ledger IN the
+    // eviction txn (not after GC grace): global drops by exactly the
+    // declared bytes and rises by exactly the winner's registration bytes.
+    // GC grace is 3s, so this sample (taken immediately) is race-free.
     let mut g_after = -1;
     for _ in 0..50 {
         g_after = global_ledger().await;
@@ -2824,7 +2835,7 @@ async fn exit17_eviction_releases_loser_footprint() {
     assert_eq!(
         g_after,
         g_before - 4096 + winner_reg_bytes,
-        "exit17: the orphaned spec charge must be released in the eviction txn"
+        "exit17: the declared blob's charge must be released in the eviction txn"
     );
 
     // (a) The winner is NOT quota-bricked: 30641, wrap, and upload all pass
@@ -2878,10 +2889,10 @@ async fn exit17_eviction_releases_loser_footprint() {
     );
     let wrap2_bytes = wrap2.as_json().len() as i64;
 
-    // (c) The loser's stored-blob claim was stripped at eviction: after GC
+    // (c) The loser's stored blob lost its reference at eviction: after GC
     // grace its 512 bytes are released (and the file removed). The winner's
-    // own claims (256-byte stored blob + 100-byte spec) are referenced and
-    // survive.
+    // own claims (256-byte stored blob + 100-byte declaration) are
+    // referenced and survive.
     let settled = g_after + state_bytes + wrap_bytes + 100 + 256 + wrap2_bytes - 512;
     let mut g_settled = -1;
     for _ in 0..150 {
@@ -2894,7 +2905,7 @@ async fn exit17_eviction_releases_loser_footprint() {
     if g_settled != settled {
         let (loser_status, _) = get_blob(&relay, &stored_sha).await;
         panic!(
-            "exit17: GC must release the stripped stored-blob charge after grace \
+            "exit17: GC must release the stored blob's charge after grace \
              (port {}): gauge {g_settled} != expected {settled}; loser blob GET \
              status {loser_status} (200 = GC never collected, 404 = collected)",
             relay_port(&relay),
@@ -2916,9 +2927,9 @@ async fn exit17_eviction_releases_loser_footprint() {
 // Exit test 18 — kind-5 death releases the speculative footprint (verify FD)
 // ============================================================================
 
-/// FD: a tenant declares never-uploaded blobs (speculatively charged) and
+/// FD: a tenant declares never-uploaded blobs (charged at their declared size) and
 /// then kind-5-deletes its own registration — the death path must strip the
-/// dead alias from its blob claims and release the orphaned spec charges,
+/// dead alias from its blob claims and release their declared charges,
 /// not strand them in the ledger forever. The NIP-09 cutoff discipline is
 /// preserved: a kind-5 dated BEFORE the latest edition is partial survival
 /// and must NOT strip or release anything.
@@ -2974,7 +2985,11 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(g1, g0 + v1_bytes + 4096, "exit18: spec charge must land");
+    assert_eq!(
+        g1,
+        g0 + v1_bytes + 4096,
+        "exit18: the declared charge must land"
+    );
 
     // Rotate (t0+20, anchor preserved) so a deletion dated between the
     // editions is a PARTIAL-survival cutoff case.
@@ -2992,7 +3007,7 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
     let g2 = g1 + reg2_bytes;
 
     // NEGATIVE: a kind-5 dated t0+15 — BEFORE the latest edition (t0+20) —
-    // must NOT strip claims or release the spec charge, and the seat stays
+    // must NOT strip claims or release the declared charge, and the seat stays
     // live.
     let stale = EventBuilder::new(Kind::EventDeletion, "stale")
         .tags(vec![
@@ -3009,7 +3024,7 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
         assert_eq!(
             global_ledger().await,
             g2,
-            "exit18: partial-survival kind-5 must not release the spec charge"
+            "exit18: partial-survival kind-5 must not release the declared charge"
         );
     }
     let state = state_root_event(
@@ -3029,7 +3044,7 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
     let g3 = g2 + v2_bytes;
 
     // POSITIVE: a kind-5 dated AFTER the latest edition is honored — the
-    // death cleanup releases the orphaned 4096 spec charge and strips the
+    // death cleanup releases the 4096 declared charge and strips the
     // dead alias from its claims.
     let deletion = EventBuilder::new(Kind::EventDeletion, "offboarding")
         .tags(vec![
@@ -3053,7 +3068,7 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
     assert_eq!(
         g4,
         g3 - 4096,
-        "exit18: honored kind-5 must release the dead registration's spec charge"
+        "exit18: honored kind-5 must release the dead registration's declared charge"
     );
 
     // The registration is gone and the seat is dead for new editions.
@@ -3092,16 +3107,21 @@ async fn exit18_kind5_death_releases_speculative_footprint() {
 }
 
 // ============================================================================
-// Exit test 19 — upload preflight nets the pending spec release (verify FF)
+// Exit test 19 — upload preflight nets the uploader's own declared charge
+// (verify FF)
 // ============================================================================
 
-/// FF: a blob declared by a 30641 (speculatively charged) and then PUT must
-/// not be double-counted at preflight: finish() releases the spec charge
-/// before its quota check, and the preflight/reserve paths now mirror that
-/// netting. With the alias scope within `len` of the cap, preflight and PUT
-/// must be 200 — pre-FF both came back 507 until un-declare + GC grace.
+/// FF: a blob declared by a 30641 (charged at its declared size) and then
+/// PUT must not be double-counted at preflight: storing sets the
+/// declarer's charge to the stored size instead of adding one, and the
+/// preflight/reserve paths net the uploader's own charge the same way.
+/// With the alias scope within `len` of the cap, preflight and PUT must be
+/// 200 — pre-FF both came back 507 until un-declare + GC grace.
+///
+/// No expected value changed with decision D4 (merge request 16): the
+/// test reads no ledger, and the uploader is the declarer.
 #[tokio::test]
-async fn exit19_upload_preflight_nets_pending_spec_release() {
+async fn exit19_upload_preflight_nets_the_uploaders_own_declared_charge() {
     let tenant = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant]);
     let relay = TestRelay::start_with_grasp_p(&[
@@ -3115,9 +3135,9 @@ async fn exit19_upload_preflight_nets_pending_spec_release() {
     register_alias(&relay, &tenant, &writer, &alias).await;
 
     // Declare the real blob's sha at its true size: the ledger then holds
-    // 4096 speculative bytes for the claim (repo scope ≈ registration ~750
-    // + edition ~700 + spec 4096 ≈ 5.4k of the 8192 cap — within 4096 of it,
-    // so the un-netted preflight would see ≈9.6k and 507).
+    // 4096 declared bytes for the claim (repo scope ≈ registration ~750
+    // + edition ~700 + declared 4096 ≈ 5.4k of the 8192 cap — within 4096
+    // of it, so the un-netted preflight would see ≈9.6k and 507).
     let data = blob_bytes(68, 4096);
     let sha = sha256_hex(&data);
     let t0 = Timestamp::now().as_secs();
@@ -3128,8 +3148,8 @@ async fn exit19_upload_preflight_nets_pending_spec_release() {
         "exit19: declaration must be accepted; got {message:?}"
     );
 
-    // Preflight must net the pending spec release for the same (tenant,
-    // alias): effective additional bytes = 4096 - 4096 = 0 → 200, not 507.
+    // Preflight must net the uploader's own declared charge: effective
+    // additional bytes = 4096 - 4096 = 0 → 200, not 507.
     let auth = blossom_auth_event(
         &writer,
         "upload",
@@ -3141,7 +3161,7 @@ async fn exit19_upload_preflight_nets_pending_spec_release() {
     let (status, reason) = head_upload(&relay, &sha, data.len() as u64, Some(&auth)).await;
     assert_eq!(
         status, 200,
-        "exit19: preflight must net the pending spec release; X-Reason: {reason}"
+        "exit19: preflight must net the uploader's own charge; X-Reason: {reason}"
     );
 
     // The PUT itself (begin_upload re-runs preflight + reserve) → 200.
@@ -3258,17 +3278,22 @@ async fn exit20_conflict_alert_deduped_on_replay() {
 }
 
 // ============================================================================
-// Exit test 21 — spec charge released on declarer's supersede when a second
-// alias references the sha (verify FH)
+// Exit test 21 — the declarer's charge is released on its supersede when a
+// second alias references the sha (verify FH, decision D4)
 // ============================================================================
 
 /// FH: two aliases (different tenants) reference one unstored sha; the
-/// declarer's speculative charge must be released when its own edition
-/// flushes the reference (pre-FH it kept paying until claim death/upload).
-/// The claim survives for the second referrer, which is then charged on its
-/// next referencing 30641 (the dedup upgrade path). Exactly-once throughout.
+/// declarer's charge must be released when its own edition flushes the
+/// reference (pre-FH it kept paying until claim death/upload). The claim
+/// survives for the second referrer, which pays its own charge throughout.
+/// One charge per referencing repository throughout.
+///
+/// Expected values changed by decision D4 (merge request 16): the second
+/// referrer is charged when it first references the sha (g2), not on its
+/// next edition after the declarer leaves (g4). The total at the end is the
+/// same.
 #[tokio::test]
-async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
+async fn exit21_declarer_released_on_supersede_with_second_referrer() {
     let tenant_v = Keys::generate();
     let tenant_a = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_v, &tenant_a]);
@@ -3308,7 +3333,7 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     assert!(g0 > 0, "exit21: registrations must be on the ledger");
     let t0 = Timestamp::now().as_secs();
 
-    // V declares the never-uploaded 4096-byte sha: speculatively charged.
+    // V declares the never-uploaded 4096-byte sha: charged.
     let fake_sha = sha256_hex(&blob_bytes(69, 64));
     let v1 = state_root_event(
         &writer_v,
@@ -3327,8 +3352,8 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
         "exit21: V charged"
     );
 
-    // A references the same sha: NOT charged again (single-charge dedup —
-    // second referrers stay free).
+    // A references the same sha: A pays for it too (D4: every referencing
+    // repository pays the full size).
     let a1 = state_root_event(
         &writer_a,
         &tenant_a.public_key(),
@@ -3339,11 +3364,11 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     );
     let (accepted, message) = publish_with_result(relay.url(), &a1).await;
     assert!(accepted, "exit21: a1 must be accepted; got {message:?}");
-    let g2 = poll_gauge(g1 + a1.as_json().len() as i64).await;
+    let g2 = poll_gauge(g1 + a1.as_json().len() as i64 + 4096).await;
     assert_eq!(
         g2,
-        g1 + a1.as_json().len() as i64,
-        "exit21: second referrer must not be double-charged"
+        g1 + a1.as_json().len() as i64 + 4096,
+        "exit21: the second referrer pays its own charge"
     );
 
     // V supersedes with an edition that drops the sha (small replacement
@@ -3367,8 +3392,8 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
         "exit21: the declarer must be refunded on supersede (FH)"
     );
 
-    // The claim survived for A: A's next edition still references the sha,
-    // and the upgrade path charges A exactly once for it now.
+    // The claim survived for A: A's next edition still references the sha
+    // and is not charged for it a second time.
     let a2 = state_root_event(
         &writer_a,
         &tenant_a.public_key(),
@@ -3379,11 +3404,11 @@ async fn exit21_spec_released_when_declarer_supersedes_with_second_referrer() {
     );
     let (accepted, message) = publish_with_result(relay.url(), &a2).await;
     assert!(accepted, "exit21: a2 must be accepted; got {message:?}");
-    let g4 = poll_gauge(g3 + a2.as_json().len() as i64 + 4096).await;
+    let g4 = poll_gauge(g3 + a2.as_json().len() as i64).await;
     assert_eq!(
         g4,
-        g3 + a2.as_json().len() as i64 + 4096,
-        "exit21: the surviving referrer is charged exactly once on its next edition"
+        g3 + a2.as_json().len() as i64,
+        "exit21: the surviving referrer is charged once, not again on its next edition"
     );
 
     relay.stop().await;
@@ -3603,8 +3628,8 @@ async fn exit22_key_conflict_merge_and_stale_edition_prune_guard() {
 // Exit test 23 — duplicate sha within one edition is charged once
 // ============================================================================
 
-/// The single-charge dedup at state_root.rs: a 30641 whose `m` and `pack`
-/// tags name the SAME sha must speculatively charge it ONCE, not per tag.
+/// One charge per repository: a 30641 whose `m` and `pack` tags name the
+/// SAME sha must charge it ONCE, not per tag. (Unchanged by decision D4.)
 #[tokio::test]
 async fn exit23_duplicate_sha_in_one_edition_charged_once() {
     let tenant = Keys::generate();
@@ -3658,19 +3683,23 @@ async fn exit23_duplicate_sha_in_one_edition_charged_once() {
 }
 
 // ============================================================================
-// Exit test 24 — eviction releases the dead charger's spec charge even when
+// Exit test 24 — eviction releases the dead repository's charge even when
 // a second live alias references the sha (verify round 2, R2-A scenario B)
 // ============================================================================
 
-/// R2-A: the squatter holds alias X, declares never-uploaded shas under X
-/// (speculatively charged), and re-references them under its own second live
-/// alias Y. The victim's earlier registration wins the merge for X: the dead
-/// charger's spec bytes must leave the r:X blob column even though Y keeps
+/// R2-A: the squatter holds alias X, declares never-uploaded shas under X,
+/// and re-references them under its own second live alias Y. The victim's
+/// earlier registration wins the merge for X: the dead repository's
+/// declared bytes must leave the r:X blob column even though Y keeps
 /// referencing — otherwise every victim upload 507s against a cap of dead
-/// bytes (and the global scope stays billed forever). The survivor is
-/// re-charged on its next referencing 30641 (exactly-once migration).
+/// bytes (and the global scope stays billed forever). Y pays its own charge
+/// throughout and is not charged again on its next 30641.
+///
+/// Expected values changed by decision D4 (merge request 16): Y is charged
+/// when it first references the sha (in g_before), not on its next edition
+/// after the eviction (g_migrated loses one 4096).
 #[tokio::test]
-async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
+async fn exit24_eviction_releases_the_dead_repositorys_charge_on_shared_claims() {
     let squatter = Keys::generate();
     let victim = Keys::generate();
     let whitelist = whitelist_npubs(&[&squatter, &victim]);
@@ -3714,7 +3743,7 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
         );
     }
 
-    // X declares the never-uploaded 4096-byte sha (speculatively charged to
+    // X declares the never-uploaded 4096-byte sha (charged to
     // (squatter, X))…
     let fake_sha = sha256_hex(&blob_bytes(73, 64));
     let x1 = state_root_event(
@@ -3728,8 +3757,8 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     let (accepted, message) = publish_with_result(relay.url(), &x1).await;
     assert!(accepted, "exit24: X declaration failed: {message:?}");
 
-    // …and Y re-references the same sha (dedup: no second charge; the claim
-    // now lists both aliases while the charge stays on X's scope).
+    // …and Y references the same sha: Y pays its own 4096 too (D4), and
+    // the claim lists both aliases, each with its charge.
     let y1 = state_root_event(
         &squat_wy,
         &squatter.public_key(),
@@ -3759,8 +3788,8 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     );
     let winner_reg_bytes = genuine.as_json().len() as i64;
 
-    // The dead charger's 4096 spec bytes are released in the eviction txn
-    // even though Y still references the claim.
+    // The dead repository's 4096 declared bytes are released in the
+    // eviction txn even though Y still references the claim.
     let mut g_after = -1;
     for _ in 0..50 {
         g_after = global_ledger().await;
@@ -3772,7 +3801,7 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     assert_eq!(
         g_after,
         g_before - 4096 + winner_reg_bytes,
-        "exit24: the dead charger's spec charge must be released at eviction"
+        "exit24: the dead repository's charge must be released at eviction"
     );
 
     // The r:X blob column dropped the dead spec bytes: the victim's 4096-byte
@@ -3790,10 +3819,10 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     let (status, _, reason) = put_blob(&relay, blob.clone(), &sha, &auth).await;
     assert_eq!(
         status, 200,
-        "exit24: the winner's upload must not be quota-bricked by dead spec bytes; X-Reason: {reason}"
+        "exit24: the winner's upload must not be quota-bricked by dead bytes; X-Reason: {reason}"
     );
 
-    // The survivor is re-charged exactly once on its next referencing 30641.
+    // The survivor is not charged again on its next referencing 30641.
     let y2 = state_root_event(
         &squat_wy,
         &squatter.public_key(),
@@ -3806,8 +3835,9 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     assert!(accepted, "exit24: Y's next edition failed: {message:?}");
     let mut g_migrated = -1;
     // y2's accept also refreshes the gauge past the victim's PUT (finish()
-    // charges the ledger but does not refresh the gauge).
-    let want = g_after + 4096 + y2.as_json().len() as i64 + 4096;
+    // charges the ledger but does not refresh the gauge): the victim's 4096
+    // and y2's event bytes, no second charge for Y.
+    let want = g_after + 4096 + y2.as_json().len() as i64;
     for _ in 0..50 {
         g_migrated = global_ledger().await;
         if g_migrated == want {
@@ -3817,24 +3847,29 @@ async fn exit24_eviction_releases_dead_charger_spec_on_shared_claims() {
     }
     assert_eq!(
         g_migrated, want,
-        "exit24: the surviving referrer must be re-charged exactly once"
+        "exit24: the surviving referrer must not be charged twice"
     );
 
     relay.stop().await;
 }
 
 // ============================================================================
-// Exit test 25 — Blossom DELETE releases the deleting charger's spec charge
+// Exit test 25 — Blossom DELETE releases the deleting repository's charge
 // (verify round 2, R2-D)
 // ============================================================================
 
 /// R2-D: the Blossom DELETE path strips the deleting alias but used to leave
-/// its spec_charge pinned while another alias referenced the sha (the same
-/// FH-class hole on a path FH didn't touch). The deleting charger's charge
-/// is released; the claim survives for the remaining referrer, which is
-/// re-charged exactly once on its next referencing 30641.
+/// its charge pinned while another alias referenced the sha (the same
+/// FH-class hole on a path FH didn't touch). The deleting repository's
+/// charge is released; the claim survives for the remaining referrer, which
+/// pays its own charge throughout and is not charged again on its next
+/// 30641.
+///
+/// Expected values changed by decision D4 (merge request 16): A is charged
+/// when it first references the sha (g2), not on its next edition after the
+/// DELETE (g4). The total at the end is the same.
 #[tokio::test]
-async fn exit25_blob_delete_releases_deleting_charger_spec() {
+async fn exit25_blob_delete_releases_the_deleting_repositorys_charge() {
     let tenant_v = Keys::generate();
     let tenant_a = Keys::generate();
     let whitelist = whitelist_npubs(&[&tenant_v, &tenant_a]);
@@ -3868,7 +3903,7 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     let g0 = global_ledger().await;
     let t0 = Timestamp::now().as_secs();
 
-    // V declares the never-uploaded 4096-byte sha: speculatively charged.
+    // V declares the never-uploaded 4096-byte sha: charged.
     let fake_sha = sha256_hex(&blob_bytes(75, 64));
     let v1 = state_root_event(
         &writer_v,
@@ -3887,7 +3922,7 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
         "exit25: V charged"
     );
 
-    // A references the same sha: not charged again (dedup).
+    // A references the same sha: A pays its own 4096 too (D4).
     let a1 = state_root_event(
         &writer_a,
         &tenant_a.public_key(),
@@ -3898,10 +3933,14 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     );
     let (accepted, message) = publish_with_result(relay.url(), &a1).await;
     assert!(accepted, "exit25: a1 failed: {message:?}");
-    let g2 = poll_gauge(g1 + a1.as_json().len() as i64).await;
-    assert_eq!(g2, g1 + a1.as_json().len() as i64, "exit25: dedup holds");
+    let g2 = poll_gauge(g1 + a1.as_json().len() as i64 + 4096).await;
+    assert_eq!(
+        g2,
+        g1 + a1.as_json().len() as i64 + 4096,
+        "exit25: the second referrer pays its own charge"
+    );
 
-    // V DELETEs the blob: its spec charge is released even though A still
+    // V DELETEs the blob: its charge is released even though A still
     // references the sha (pre-R2-D the charge stayed pinned on V's scope).
     let delete_auth = blossom_auth_event(
         &writer_v,
@@ -3920,11 +3959,11 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     assert_eq!(
         g3,
         g2 - 4096,
-        "exit25: the deleting charger's spec charge must be released"
+        "exit25: the deleting repository's charge must be released"
     );
 
     // The claim survives for A: A's next edition still references the sha
-    // and the upgrade path charges A exactly once.
+    // and is not charged for it again.
     let a2 = state_root_event(
         &writer_a,
         &tenant_a.public_key(),
@@ -3935,11 +3974,11 @@ async fn exit25_blob_delete_releases_deleting_charger_spec() {
     );
     let (accepted, message) = publish_with_result(relay.url(), &a2).await;
     assert!(accepted, "exit25: a2 failed: {message:?}");
-    let g4 = poll_gauge(g3 + a2.as_json().len() as i64 + 4096).await;
+    let g4 = poll_gauge(g3 + a2.as_json().len() as i64).await;
     assert_eq!(
         g4,
-        g3 + a2.as_json().len() as i64 + 4096,
-        "exit25: the surviving referrer is charged exactly once"
+        g3 + a2.as_json().len() as i64,
+        "exit25: the surviving referrer is charged once, not again"
     );
 
     relay.stop().await;
@@ -7599,6 +7638,143 @@ async fn exit46_a_stale_vanish_frees_the_alias_for_a_new_registration() {
         !accepted && message.contains("this pubkey has requested to vanish"),
         "exit46: the vanished key stays refused; got accepted={accepted} {message:?}"
     );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit test 47 — every referencing repository pays, and none pins another's
+// bytes (issue 5, decision D4)
+// ============================================================================
+
+/// Issue 5's hostile form, end to end: account B names account A's stored
+/// blob in its state root. B pays for it at once, so its next blob no
+/// longer fits, and when A's next edition drops the blob A is released at
+/// once although B still references it, so A can fill its quota again. The
+/// blob stays for B. Before decision D4 the first uploader kept paying
+/// while anyone referenced the blob, and the second account paid nothing.
+#[tokio::test]
+async fn exit47_every_referencing_repository_pays_and_none_pins_another() {
+    let tenant_a = Keys::generate();
+    let tenant_b = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant_a, &tenant_b]);
+    let relay = TestRelay::start_with_grasp_p(&[
+        // One retained edition, so that a2 drops what a1 named.
+        ("NGIT_GRASP_P_STATE_HISTORY_EDITIONS", "1"),
+        // Room for one 4096-byte blob per repository beside its events,
+        // not for two.
+        ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "8192"),
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+    ])
+    .await;
+
+    let writer_a = Keys::generate();
+    let writer_b = Keys::generate();
+    let alias_a = random_alias();
+    let alias_b = random_alias();
+    register_alias(&relay, &tenant_a, &writer_a, &alias_a).await;
+    register_alias(&relay, &tenant_b, &writer_b, &alias_b).await;
+    let upload = |writer: &Keys, tenant: &Keys, alias: &str, sha: &str| {
+        blossom_auth_event(
+            writer,
+            "upload",
+            sha,
+            &tenant.public_key(),
+            alias,
+            future_expiration(),
+        )
+    };
+    let t0 = Timestamp::now().as_secs();
+
+    // A stores X and names it.
+    let x = blob_bytes(110, 4096);
+    let x_sha = sha256_hex(&x);
+    let (status, _, reason) = put_blob(
+        &relay,
+        x.clone(),
+        &x_sha,
+        &upload(&writer_a, &tenant_a, &alias_a, &x_sha),
+    )
+    .await;
+    assert_eq!(status, 200, "exit47: A's upload; X-Reason: {reason}");
+    let a1 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&x_sha, 4096),
+        &[],
+        t0 + 1,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a1).await;
+    assert!(accepted, "exit47: a1 must be accepted; got {message:?}");
+    let g1 = global_ledger_bytes(&relay).await;
+
+    // B names X: B pays 4096 for it, like A.
+    let b1 = state_root_event(
+        &writer_b,
+        &tenant_b.public_key(),
+        &alias_b,
+        (&x_sha, 4096),
+        &[],
+        t0 + 1,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &b1).await;
+    assert!(accepted, "exit47: b1 must be accepted; got {message:?}");
+    let want = g1 + b1.as_json().len() as i64 + 4096;
+    let g2 = poll_until(want, || global_ledger_bytes(&relay)).await;
+    assert_eq!(g2, want, "exit47: B pays for the blob A stored");
+
+    // ...so another 4096-byte blob no longer fits B's repository.
+    let y_sha = sha256_hex(&blob_bytes(111, 4096));
+    let (status, reason) = head_upload(
+        &relay,
+        &y_sha,
+        4096,
+        Some(&upload(&writer_b, &tenant_b, &alias_b, &y_sha)),
+    )
+    .await;
+    assert_eq!(
+        status, 507,
+        "exit47: B's own quota holds X now; X-Reason: {reason}"
+    );
+
+    // A moves on to a small declared blob: A is released from X at once,
+    // although B still references it.
+    let z_sha = sha256_hex(&blob_bytes(112, 64));
+    let a2 = state_root_event(
+        &writer_a,
+        &tenant_a.public_key(),
+        &alias_a,
+        (&z_sha, 100),
+        &[],
+        t0 + 2,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &a2).await;
+    assert!(accepted, "exit47: a2 must be accepted; got {message:?}");
+    let want = g2 + a2.as_json().len() as i64 + 100 - 4096;
+    let g3 = poll_until(want, || global_ledger_bytes(&relay)).await;
+    assert_eq!(
+        g3, want,
+        "exit47: A is released from X while B still references it"
+    );
+
+    // A has room for a whole 4096-byte blob again, and X stays for B.
+    let w = blob_bytes(113, 4096);
+    let w_sha = sha256_hex(&w);
+    let (status, _, reason) = put_blob(
+        &relay,
+        w,
+        &w_sha,
+        &upload(&writer_a, &tenant_a, &alias_a, &w_sha),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "exit47: B's reference must not pin A's quota; X-Reason: {reason}"
+    );
+    let (status, body) = get_blob(&relay, &x_sha).await;
+    assert_eq!(status, 200, "exit47: X stays for B");
+    assert!(body == x, "exit47: X reads back whole");
 
     relay.stop().await;
 }

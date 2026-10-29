@@ -2210,14 +2210,14 @@ acceptance.
 
 #### `NGIT_GRASP_P_DENYLIST_PATH`
 
-**Description:** Comma-separated list of denylist files (per-node / per-jurisdiction lists), each containing one sha256 hex digest per line (trimmed, lowercased; blank/comment/garbage lines ignored). A **missing** file is tolerated (warning + treated as empty); a **present-but-unreadable** file is a hard boot error (fail loud on misconfiguration). Each file is capped at **64 MiB / 1M lines** (FS-6): exceeding either cap is a hard boot error, and on reload the file keeps its last-known entries with an error log every tick — the same boot-loud / reload-keep semantics as an unreadable file. Writers MUST update files **atomically** (write a temp file, then rename over the live path): the reload keys off mtime, and a torn write is a known staleness window. Unset = empty denylist.  
+**Description:** Comma-separated list of denylist files (per-node / per-jurisdiction lists), each containing one sha256 hex digest per line (trimmed, lowercased; blank/comment/garbage lines ignored). A file **missing at boot** is tolerated (warning + treated as empty); a **present-but-unreadable** file is a hard boot error (fail loud on misconfiguration). A file that disappears after it was read, or reads back empty, keeps its last-known entries and logs an error on every reload until it is back, so a takedown is lifted only by a readable file that no longer lists the hash (clear a list by leaving a comment line in it). Each file is capped at **64 MiB / 1M lines** (FS-6): exceeding either cap is a hard boot error, and on reload the file keeps its last-known entries with an error log every tick — the same boot-loud / reload-keep semantics as an unreadable file. Writers MUST update files **atomically** (write a temp file, then rename over the live path): the reload keys off mtime and length, and a torn write is a known staleness window. Unset = empty denylist.  
 **Type:** String (comma-separated paths)  
 **Default:** unset  
 **Required:** No
 
 #### `NGIT_GRASP_P_DENYLIST_RELOAD_SECS`
 
-**Description:** Interval in seconds between denylist file reloads. Only changed files are re-read; the live set is swapped atomically. Hashes **newly present** after a reload are purged immediately (see above); hashes **removed** from the files unblock reads, but bytes already purged stay gone — clients must re-upload. `0` = reload disabled (the boot-time set is kept). During reload a present-but-unreadable file keeps its last-known entries and is retried every tick (a transient read error must not silently unblock taken-down content).  
+**Description:** Interval in seconds between denylist file reloads. Only changed files are re-read; the live set is swapped atomically. Hashes **newly present** after a reload are purged immediately (see above); hashes **removed** from the files unblock reads, but bytes already purged stay gone — clients must re-upload. `0` = reload disabled (the boot-time set is kept). During reload a file that is unreadable, no longer parses, has disappeared or reads back empty keeps its last-known entries and is retried every tick (a transient read error, an unmounted volume or a non-atomic deploy must not silently unblock taken-down content).  
 **Type:** Integer  
 **Default:** `60`  
 **Required:** No

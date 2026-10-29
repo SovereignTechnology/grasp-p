@@ -1,26 +1,26 @@
 //! Kind-30641 state root: validation, edition-ring append (G7 amendment), and
-//! blob claim maintenance.
+//! blob claim maintenance (who pays: `claims.rs`).
 
 use nostr::prelude::{Event, Filter, Kind};
 use nostr_sdk::local_relay::WritePolicyResult;
 
 use crate::nostr::policy::{reject_error, reject_invalid, reject_restricted};
 
-use super::meta::{BlobClaim, MetaEnv, RegistrationRecord, SpecCharge};
+use super::claims;
+use super::meta::{MetaEnv, RegistrationRecord};
 use super::{quota, PrivateConfig, PrivateService};
 
 /// Hard cap on the number of blob references (`m` + `pack` tags) accepted per
 /// kind-30641. A 128 KiB event can pack ~1500 refs, and `handle()` creates a
-/// persistent `stored=false` [`BlobClaim`] per referenced sha, then rescans
+/// persistent `stored=false` [`BlobClaim`](super::meta::BlobClaim) per referenced sha, then rescans
 /// every retained edition under the global meta write lock. 256 refs is far
 /// above any realistic repo edition.
 ///
-/// Since issue !12, not-yet-stored declared blobs are also CHARGED to the
-/// declaring (tenant, alias) at their declared size ([`SpecCharge`]), so a
-/// flood of editions carrying fake pack refs runs into the tenant's own
-/// quota instead of growing the shared meta LMDB unbilled. The charge is
-/// released when the blob is actually stored (the upload path takes over
-/// the accounting) or when the claim is GC'd after losing its last alias.
+/// Every referenced blob is CHARGED to the referencing repository, at its
+/// declared size until the bytes are stored here and at the stored size
+/// after (`claims.rs`), so a flood of editions carrying fake pack refs runs
+/// into the tenant's own quota instead of growing the shared meta LMDB
+/// unbilled. A blob nobody stored loses its claim with its last reference.
 const MAX_BLOB_REFS_PER_STATE_ROOT: usize = 256;
 
 /// One manifest/pack reference from a 30641: (sha256, declared size).
@@ -241,7 +241,7 @@ pub(crate) fn apply_state_root_txn(
     // R2-C (verify round 2): FIRST, before any mutation, re-verify the
     // registration's identity inside the txn. Liveness was checked outside
     // it, and an eviction/death can land in between; committing with the
-    // stale record would re-create claims + spec charges billed to the dead
+    // stale record would re-create claims and charges billed to the dead
     // scope with no cleanup trigger left (GC needs empty aliases, the
     // release loop needs a live registration, the death path early-returns
     // on replays, and zombie ring editions actively defend the zombie
@@ -263,36 +263,43 @@ pub(crate) fn apply_state_root_txn(
         return Ok(None);
     }
 
-    // Issue !12: blobs this edition declares that are not yet stored and
-    // carry no earlier speculative charge get charged NOW, at declared
-    // size, to this (tenant, alias). Compute the total first so the
-    // quota check covers event bytes + all new speculative bytes in one
-    // decision (two separate checks could each pass while the sum
-    // exceeds a cap).
-    let mut spec_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut spec_new_bytes = 0u64;
+    // Decision D4: this repository pays for every blob the edition names
+    // that it does not pay for yet, stored or not, whoever else references
+    // it. The moves are worked out on copies first, so that one quota
+    // decision covers the event bytes and every new charge (two separate
+    // checks could each pass while the sum exceeds a cap), and the write
+    // below makes exactly those moves.
+    let mut named: Vec<(&str, u64)> = Vec::with_capacity(parsed.blobs.len());
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for blob in &parsed.blobs {
-        if spec_shas.contains(&blob.sha256) {
-            continue; // duplicate ref within one edition
-        }
-        let needs_spec_charge = match meta.get_blob_claim(txn, &blob.sha256)? {
-            None => true,
-            Some(c) => !c.stored && c.spec_charge.is_none(),
-        };
-        if needs_spec_charge {
-            spec_new_bytes = spec_new_bytes.saturating_add(blob.size);
-            spec_shas.insert(blob.sha256.clone());
+        // The first tag naming a sha decides its declared size.
+        if seen.insert(blob.sha256.as_str()) {
+            named.push((blob.sha256.as_str(), blob.size));
         }
     }
-
-    if !quota::check(
-        meta,
-        txn,
-        cfg,
-        tenant_hex,
-        alias,
-        event_bytes.saturating_add(spec_new_bytes),
-    )? {
+    // Before the bytes are here a repository pays what its newest edition
+    // naming a blob declares. A retained edition newer than this one (from
+    // another write key of the repository) that names the blob has set
+    // that already, so this one leaves it: the size then does not depend
+    // on the order a node applied the editions in, nor on whether it saw
+    // the older ones at all.
+    let mut named_later: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, json) in meta.state_ring_for_alias(txn, alias)? {
+        if key.as_str() > ring_key.as_str() {
+            named_later.extend(edition_shas(&json));
+        }
+    }
+    let mut moves = Vec::new();
+    for &(sha256, declared) in &named {
+        let mut claim = meta
+            .get_blob_claim(txn, sha256)?
+            .unwrap_or_else(|| claims::new_claim(declared));
+        moves.extend(claims::attach(&mut claim, tenant_hex, alias, declared));
+        if !named_later.contains(sha256) {
+            moves.extend(claims::redeclare(&mut claim, alias, declared));
+        }
+    }
+    if !quota::fits(meta, txn, cfg, tenant_hex, alias, event_bytes, &moves)? {
         return Ok(Some(reject_restricted("quota exceeded")));
     }
 
@@ -308,95 +315,46 @@ pub(crate) fn apply_state_root_txn(
     // Recompute the set of hashes referenced by ANY retained edition.
     let mut referenced = std::collections::HashSet::new();
     for (_, json) in &retained {
-        if let Ok(edition) = nostr::prelude::Event::from_json(json.as_bytes()) {
-            for tag in edition.tags.iter() {
-                let v = tag.clone().to_vec();
-                if v.len() >= 2 && (v[0] == "m" || v[0] == "pack") {
-                    referenced.insert(v[1].clone());
-                }
-            }
-        }
+        referenced.extend(edition_shas(json));
     }
 
     let now = nostr::prelude::Timestamp::now().as_secs();
 
-    // Claim the hashes of the new edition for this alias, attaching the
-    // speculative charge to the ones computed above (issue !12).
-    for blob in &parsed.blobs {
-        let mut claim = meta
-            .get_blob_claim(txn, &blob.sha256)?
-            .unwrap_or(BlobClaim {
-                size: blob.size,
-                aliases: Vec::new(),
-                unreferenced_since: None,
-                stored: false,
-                charged_tenant: None,
-                charged_alias: None,
-                spec_charge: None,
-                stored_at: None,
-            });
-        if spec_shas.remove(&blob.sha256) && !claim.stored && claim.spec_charge.is_none() {
-            claim.spec_charge = Some(SpecCharge {
-                tenant: tenant_hex.clone(),
-                alias: alias.clone(),
-                bytes: blob.size,
-            });
+    for &(sha256, declared) in &named {
+        claims::attach_to(meta, txn, sha256, tenant_hex, alias, declared)?;
+        if !named_later.contains(sha256) {
+            claims::redeclare_to(meta, txn, sha256, alias, declared)?;
         }
-        if !claim.aliases.contains(alias) {
-            claim.aliases.push(alias.clone());
-            meta.put_alias_claim(txn, alias, &blob.sha256)?;
-        }
-        claim.unreferenced_since = None;
-        meta.put_blob_claim(txn, &blob.sha256, &claim)?;
-    }
-    if spec_new_bytes > 0 {
-        // One aggregate blob-column charge for all new speculative
-        // declarations (all scoped to this same tenant + alias).
-        quota::charge(meta, txn, tenant_hex, alias, spec_new_bytes, true)?;
     }
 
-    // Release this alias's claim on hashes no retained edition references
-    // (alias-index prefix scan, not a cross-tenant table scan).
+    // Stop referencing what no retained edition names any more
+    // (alias-index prefix scan, not a cross-tenant table scan). Another
+    // repository that still references a blob keeps paying its own charge;
+    // as the last referrer of stored bytes this one pays until GC removes
+    // them.
     for sha in meta.alias_claim_shas(txn, alias)? {
         if referenced.contains(&sha) {
             continue;
         }
-        let Some(mut claim) = meta.get_blob_claim(txn, &sha)? else {
-            meta.delete_alias_claim(txn, alias, &sha)?;
-            continue;
-        };
-        if claim.aliases.contains(alias) {
-            claim.aliases.retain(|a| a != alias);
-            // FH (verify round 1): the removed alias was CARRYING the
-            // speculative charge and other aliases still reference the
-            // sha — release the charge (exactly once, against the
-            // recorded scope/bytes, never `claim.size`). The declarer no
-            // longer makes the declaration, so it must not keep paying;
-            // the remaining referrer is charged on its next referencing
-            // 30641 (spec_charge is `None` again, so the dedup above
-            // charges it then). Releasing only here — never while the
-            // charging alias still references the sha in a retained
-            // edition — keeps the declaration billed exactly once.
-            let release_spec = !claim.aliases.is_empty()
-                && claim
-                    .spec_charge
-                    .as_ref()
-                    .map(|spec| &spec.alias == alias)
-                    .unwrap_or(false);
-            if release_spec {
-                let spec = claim.spec_charge.take().expect("spec charge present");
-                quota::release_spec_charge(meta, txn, &spec)?;
-            }
-            if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
-                claim.unreferenced_since = Some(now);
-            }
-            meta.put_blob_claim(txn, &sha, &claim)?;
-        }
-        meta.delete_alias_claim(txn, alias, &sha)?;
+        claims::detach_from(meta, txn, &sha, alias, now)?;
     }
 
     quota::charge(meta, txn, tenant_hex, alias, event_bytes, false)?;
     Ok(None)
+}
+
+/// The blob hashes a stored edition names in its `m` and `pack` tags.
+fn edition_shas(json: &str) -> Vec<String> {
+    let mut shas = Vec::new();
+    if let Ok(edition) = nostr::prelude::Event::from_json(json.as_bytes()) {
+        for tag in edition.tags.iter() {
+            let v = tag.clone().to_vec();
+            if v.len() >= 2 && (v[0] == "m" || v[0] == "pack") {
+                shas.push(v[1].clone());
+            }
+        }
+    }
+    shas
 }
 
 #[cfg(test)]
@@ -442,6 +400,258 @@ mod tests {
             .err()
             .expect("over-cap must be rejected");
         assert!(err.contains("more than"), "unexpected reason: {err}");
+    }
+
+    fn record(keys: &Keys) -> RegistrationRecord {
+        RegistrationRecord {
+            tenant_hex: keys.public_key().to_hex(),
+            event_id: "01".repeat(32),
+            created_at: 1,
+            w_keys: vec![keys.public_key().to_hex()],
+            aux_keys: vec![],
+            relays: vec![],
+            servers: vec![],
+            quota_class: None,
+            registered_at: 1,
+            tombstoned_at: None,
+            first_created_at: None,
+            first_event_id: None,
+        }
+    }
+
+    /// A state root of `keys`'s own repository naming `blobs`, the first as
+    /// its manifest.
+    fn edition(keys: &Keys, alias: &str, blobs: &[(&str, u64)], created_at: u64) -> Event {
+        let (manifest, packs) = blobs.split_first().expect("a manifest");
+        let mut tags = vec![
+            Tag::custom("d", vec![alias.to_string()]),
+            Tag::custom(
+                "a",
+                vec![format!("30640:{}:{alias}", keys.public_key().to_hex())],
+            ),
+            Tag::custom("m", vec![manifest.0.to_string(), manifest.1.to_string()]),
+        ];
+        for (sha256, size) in packs {
+            tags.push(Tag::custom(
+                "pack",
+                vec![sha256.to_string(), size.to_string()],
+            ));
+        }
+        EventBuilder::new(Kind::Custom(KIND_STATE_ROOT), "")
+            .tags(tags)
+            .custom_created_at(nostr::prelude::Timestamp::from_secs(created_at))
+            .finalize(keys)
+            .expect("sign")
+    }
+
+    fn apply(
+        meta: &MetaEnv,
+        cfg: &PrivateConfig,
+        record: &RegistrationRecord,
+        event: &Event,
+    ) -> Option<WritePolicyResult> {
+        let parsed = parse_shape(event, u64::MAX).expect("a valid state root");
+        let json = event.as_json();
+        meta.with_write(|m, txn| apply_state_root_txn(m, txn, cfg, record, &parsed, event, &json))
+            .expect("the meta store")
+    }
+
+    fn blob_bytes(meta: &MetaEnv, key: &str) -> u64 {
+        let txn = meta.read_txn().unwrap();
+        meta.get_ledger_txn(&txn, key).unwrap().blob_bytes
+    }
+
+    /// Issue 5 at the state root: naming a blob another account stored costs
+    /// the naming repository the stored size, whatever it declares, and a
+    /// state root that cannot afford it is refused without a trace. Without
+    /// the charge (or without the check) the second account would hold the
+    /// bytes at no cost.
+    #[test]
+    fn naming_another_accounts_stored_blob_is_charged_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let (owner, other) = (Keys::generate(), Keys::generate());
+        let (alias_a, alias_b) = ("a".repeat(32), "b".repeat(32));
+        let (record_a, record_b) = (record(&owner), record(&other));
+        let x = sha(7);
+        meta.with_write(|m, txn| {
+            m.put_registration(txn, &alias_a, &record_a)?;
+            m.put_registration(txn, &alias_b, &record_b)?;
+            claims::attach_to(m, txn, &x, &record_a.tenant_hex, &alias_a, 512)?;
+            let before = m.get_blob_claim(txn, &x)?;
+            let mut claim = before.clone().expect("the claim just made");
+            let moves = claims::settle_stored(&mut claim, 512, 1);
+            claims::commit(m, txn, &x, before.as_ref(), Some(&claim), &moves)
+        })
+        .unwrap();
+
+        // B declares 10 bytes for a blob that is 512 on disk.
+        let event = edition(&other, &alias_b, &[(x.as_str(), 10)], 100);
+        let event_bytes = event.as_json().len() as u64;
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+
+        cfg.quota_repo_bytes = event_bytes + 511;
+        let refused = apply(&meta, &cfg, &record_b, &event);
+        assert!(
+            matches!(
+                &refused,
+                Some(WritePolicyResult::Reject { message, .. }) if message.contains("quota exceeded")
+            ),
+            "one byte short of event + stored size must be refused"
+        );
+        {
+            let txn = meta.read_txn().unwrap();
+            assert!(meta
+                .state_ring_for_alias(&txn, &alias_b)
+                .unwrap()
+                .is_empty());
+            let claim = meta.get_blob_claim(&txn, &x).unwrap().unwrap();
+            assert_eq!(claim.aliases, vec![alias_a.clone()], "nothing attached");
+        }
+        assert_eq!(blob_bytes(&meta, &quota::alias_key(&alias_b)), 0);
+
+        cfg.quota_repo_bytes = event_bytes + 512;
+        assert!(
+            apply(&meta, &cfg, &record_b, &event).is_none(),
+            "it fits exactly"
+        );
+        assert_eq!(blob_bytes(&meta, &quota::alias_key(&alias_b)), 512);
+        assert_eq!(
+            blob_bytes(&meta, &quota::tenant_key(&record_b.tenant_hex)),
+            512
+        );
+        assert_eq!(blob_bytes(&meta, &quota::alias_key(&alias_a)), 512);
+        assert_eq!(
+            blob_bytes(&meta, crate::grasp_p::meta::LEDGER_GLOBAL_KEY),
+            1024
+        );
+    }
+
+    /// A newer edition that no longer names a blob detaches the repository
+    /// from it: released at once while another repository references it,
+    /// kept as the grace charge of the last referrer of stored bytes, and a
+    /// declared blob nobody stored loses its claim with its charge. The
+    /// same sha named twice in one edition is charged once.
+    #[test]
+    fn superseding_editions_detach_what_they_no_longer_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let (owner, other) = (Keys::generate(), Keys::generate());
+        let (alias_a, alias_b) = ("c".repeat(32), "d".repeat(32));
+        let (record_a, record_b) = (record(&owner), record(&other));
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+        cfg.state_history_editions = 1;
+        meta.with_write(|m, txn| {
+            m.put_registration(txn, &alias_a, &record_a)?;
+            m.put_registration(txn, &alias_b, &record_b)
+        })
+        .unwrap();
+        let (x, y, z) = (sha(8), sha(9), sha(10));
+        let repo_a = || blob_bytes(&meta, &quota::alias_key(&alias_a));
+        let repo_b = || blob_bytes(&meta, &quota::alias_key(&alias_b));
+
+        // A cap with room for the event and one charge of 300: the forecast
+        // must count the sha named twice once, or the edition is refused.
+        let first = edition(
+            &owner,
+            &alias_a,
+            &[(x.as_str(), 300), (x.as_str(), 999)],
+            10,
+        );
+        let mut tight = cfg.clone();
+        tight.quota_repo_bytes = first.as_json().len() as u64 + 300;
+        assert!(
+            apply(&meta, &tight, &record_a, &first).is_none(),
+            "the forecast counts a sha named twice once"
+        );
+        assert_eq!(
+            repo_a(),
+            300,
+            "named twice, charged once, at the first size"
+        );
+        assert!(apply(
+            &meta,
+            &cfg,
+            &record_b,
+            &edition(&other, &alias_b, &[(x.as_str(), 300)], 10)
+        )
+        .is_none());
+        assert_eq!(repo_b(), 300);
+        meta.with_write(|m, txn| {
+            let before = m.get_blob_claim(txn, &x)?;
+            let mut claim = before.clone().expect("declared");
+            let moves = claims::settle_stored(&mut claim, 300, 20);
+            claims::commit(m, txn, &x, before.as_ref(), Some(&claim), &moves)
+        })
+        .unwrap();
+
+        // A moves on to y: released from x at once, B still pays its own.
+        assert!(apply(
+            &meta,
+            &cfg,
+            &record_a,
+            &edition(&owner, &alias_a, &[(y.as_str(), 40)], 30)
+        )
+        .is_none());
+        assert_eq!((repo_a(), repo_b()), (40, 300));
+
+        // B moves on to z: the last referrer of stored x keeps its charge.
+        assert!(apply(
+            &meta,
+            &cfg,
+            &record_b,
+            &edition(&other, &alias_b, &[(z.as_str(), 50)], 30)
+        )
+        .is_none());
+        assert_eq!(repo_b(), 300 + 50);
+        {
+            let txn = meta.read_txn().unwrap();
+            let kept = meta.get_blob_claim(&txn, &x).unwrap().unwrap();
+            assert!(kept.aliases.is_empty() && kept.unreferenced_since.is_some());
+        }
+
+        // A drops y, which was never stored: the claim and its charge go.
+        assert!(apply(
+            &meta,
+            &cfg,
+            &record_a,
+            &edition(&owner, &alias_a, &[(z.as_str(), 50)], 40)
+        )
+        .is_none());
+        assert_eq!(repo_a(), 50);
+        let txn = meta.read_txn().unwrap();
+        assert!(meta.get_blob_claim(&txn, &y).unwrap().is_none());
+    }
+
+    /// Before the bytes are here a repository pays what its newest edition
+    /// naming a blob declares, whichever order a node applied the editions
+    /// of two write keys in and whether it saw the older one at all, so the
+    /// two nodes of a pair charge the same.
+    #[test]
+    fn the_newest_edition_sets_a_declared_size_in_any_order() {
+        let (owner, first_key, second_key) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let alias = "e".repeat(32);
+        let record = record(&owner);
+        let x = sha(11);
+        let older = edition(&first_key, &alias, &[(x.as_str(), 100)], 10);
+        let newer = edition(&second_key, &alias, &[(x.as_str(), 200)], 20);
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+        cfg.state_history_editions = 4;
+        for order in [vec![&older, &newer], vec![&newer, &older], vec![&newer]] {
+            let dir = tempfile::tempdir().unwrap();
+            let meta = MetaEnv::open(dir.path()).unwrap();
+            meta.with_write(|m, txn| m.put_registration(txn, &alias, &record))
+                .unwrap();
+            let applied = order.len();
+            for event in order {
+                assert!(apply(&meta, &cfg, &record, event).is_none());
+            }
+            assert_eq!(
+                blob_bytes(&meta, &quota::alias_key(&alias)),
+                200,
+                "{applied} edition(s) applied"
+            );
+        }
     }
 
     /// A 30641 at exactly the cap still parses successfully.

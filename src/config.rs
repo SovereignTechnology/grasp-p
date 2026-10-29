@@ -865,13 +865,17 @@ pub struct Config {
     pub private_meta_data_path: Option<String>,
 
     /// Optional denylist file(s): comma-separated paths, one sha256 per
-    /// line; matching blob GETs return 451. A missing file is tolerated
-    /// (warn + treated as empty) so per-jurisdiction lists can be mounted
-    /// per node; a present-but-unreadable file is a hard boot error. Each
-    /// file is capped (64 MiB / 1M lines); an over-cap file is a hard boot
-    /// error and keeps its last-known entries on reload. Writers MUST
+    /// line; matching blob GETs return 451. A file missing at boot is
+    /// tolerated (warn + treated as empty) so per-jurisdiction lists can be
+    /// mounted per node; a present-but-unreadable file is a hard boot
+    /// error. A file that disappears after it was read, or reads back
+    /// empty, keeps its last-known entries and logs an error on every
+    /// reload until it is back: a takedown is lifted only by a readable
+    /// file that no longer lists the hash (a comment line clears a list).
+    /// Each file is capped (64 MiB / 1M lines); an over-cap file is a hard
+    /// boot error and keeps its last-known entries on reload. Writers MUST
     /// update files atomically (write-temp-then-rename): the reload keys
-    /// off mtime and a torn write is a known staleness window.
+    /// off mtime and length, and a torn write is a known staleness window.
     #[arg(long, env = "NGIT_GRASP_P_DENYLIST_PATH")]
     pub private_denylist_path: Option<String>,
 

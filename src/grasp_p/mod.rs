@@ -17,6 +17,7 @@ pub mod blacklist;
 pub mod blob_store;
 pub mod blossom_auth;
 pub mod build_info;
+pub(crate) mod claims;
 #[cfg(test)]
 mod config_sources;
 pub mod denylist;
@@ -678,7 +679,9 @@ fn policy_preimage(config: &Config) -> String {
         // (nothing of another kind may reference a GRASP-P event, reports
         // on private repositories are refused, GRASP-P events carry no
         // reference tags, and the deletion and dialling rules after them)
-        // are code, not knobs, and join under v4 the same way.
+        // are code, not knobs, and join under v4 the same way, as does the
+        // charging rule of merge request 16 (every repository that
+        // references a blob pays for it), which changes quota verdicts.
         "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|blacklist={}|deletion_request_disrespector={}|domains={}",
         POLICY_VERSION,
         config.private_registration_mode,
@@ -1450,9 +1453,9 @@ impl PrivateService {
     /// An `e`-tag id frees nothing: upstream's `e` path removes no
     /// registration on a GRASP-P node (`offboard::removal_exempt`), so the
     /// claims go exactly when the coordinate path removes the event. An
-    /// honored deletion also runs the shared death cleanup (blob-claim
-    /// stripping, spec release, event-column reset, ring deletion — see
-    /// `free_registration_claims`); the `t:`/`g:` event-byte stranding
+    /// honored deletion also runs the shared death cleanup (the
+    /// repository's blob references dropped, event-column reset, ring
+    /// deletion — see `free_registration_claims`); the `t:`/`g:` event-byte stranding
     /// remains the pre-existing !1/!4 backlog.
     pub fn free_claims_for_deleted_registrations(&self, event: &Event) {
         let author_hex = event.pubkey.to_hex();
@@ -1504,8 +1507,8 @@ impl PrivateService {
     /// them. NIP-62 bounds the removal by the vanish's date; if upstream ever
     /// does, the cutoff comes back (`offboard`'s canary test
     /// `upstream_vanish_removes_events_of_every_date` fails first). Death
-    /// cleanup (blob-claim stripping, spec release, event-column reset,
-    /// ring deletion) is shared with the other death paths via
+    /// cleanup (blob references dropped, event-column reset, ring
+    /// deletion) is shared with the other death paths via
     /// [`free_registration_claims`].
     pub fn free_claims_for_vanished_author(&self, event: &Event) {
         let author_hex = event.pubkey.to_hex();
@@ -1601,12 +1604,18 @@ impl PrivateService {
     /// Would storing `len` bytes of blob `sha256` for (tenant, alias) fit
     /// the alias, account and node ledgers as they stand?
     ///
-    /// Reads the meta store and asks the blob store whether the file is
-    /// there; no network and no lock held on return. It is the quota half
-    /// of the upload preflight, shared with the blob mirror, which asks it
-    /// before it sends a request so that a blob there is no room for costs
-    /// no download. An answer of yes is a forecast: `finish()` decides,
-    /// inside the transaction that charges.
+    /// Reads the meta store only; no network and no lock held on return.
+    /// It is the quota half of the upload preflight, shared with the blob
+    /// mirror, which asks it before it sends a request so that a blob there
+    /// is no room for costs no download. The moves are worked out by the
+    /// same `claims` functions `finish()` applies, on a copy: storing sets
+    /// every charge to the stored size and makes this repository a
+    /// referrer, so a repository that already pays for the blob is asked
+    /// for nothing more (its own declared charge nets out), and one that
+    /// does not pay for it yet is asked for its full size, whoever stored
+    /// it. Another repository the stored size would raise past its own
+    /// caps is left out, as `finish()` detaches it. An answer of yes is a
+    /// forecast: `finish()` decides, inside the transaction that charges.
     pub(crate) fn blob_quota_preflight(
         &self,
         tenant_hex: &str,
@@ -1614,64 +1623,29 @@ impl PrivateService {
         sha256: &str,
         len: u64,
     ) -> Result<(), BlobError> {
-        // Existing blobs re-upload for free (no double-charge).
-        let claim = {
-            let txn = self
-                .meta
-                .read_txn()
-                .map_err(|e| BlobError::Internal(e.to_string()))?;
-            self.meta
-                .get_blob_claim(&txn, sha256)
-                .map_err(|e| BlobError::Internal(e.to_string()))?
-        };
-        let needs_charge = match &claim {
-            Some(claim) if claim.stored => false,
-            _ => !self.blobs.exists(sha256),
-        };
-        if needs_charge {
-            let txn = self
-                .meta
-                .read_txn()
-                .map_err(|e| BlobError::Internal(e.to_string()))?;
-            // FF (verify round 1): net the claim's pending speculative
-            // release, mirroring finish()'s release-before-check ordering —
-            // otherwise a declare-then-upload near the cap is 507-rejected
-            // here while finish() would pass. finish() releases the spec
-            // charge globally regardless of uploader, so the GLOBAL scope
-            // nets for anyone; the tenant/alias scopes net only when the
-            // pending charge belongs to this same (tenant, alias).
-            let (same_scope, spec_bytes) = match &claim {
-                Some(meta::BlobClaim {
-                    spec_charge: Some(spec),
-                    ..
-                }) => (spec.tenant == tenant_hex && spec.alias == alias, spec.bytes),
-                _ => (false, 0),
-            };
-            let scoped_additional = if same_scope {
-                len.saturating_sub(spec_bytes)
-            } else {
-                len
-            };
-            let global_additional = len.saturating_sub(spec_bytes);
-            let ledger = |key: String| {
-                self.meta
-                    .get_ledger_txn(&txn, &key)
-                    .map_err(|e| BlobError::Internal(e.to_string()))
-            };
-            let tenant_entry = ledger(quota::tenant_key(tenant_hex))?;
-            let alias_entry = ledger(quota::alias_key(alias))?;
-            let global_entry = ledger(meta::LEDGER_GLOBAL_KEY.to_string())?;
-            let ok = alias_entry.total().saturating_add(scoped_additional)
-                <= self.cfg.quota_repo_bytes
-                && tenant_entry.total().saturating_add(scoped_additional)
-                    <= self.cfg.quota_tenant_bytes
-                && global_entry.total().saturating_add(global_additional)
-                    <= self.cfg.global_budget_bytes;
-            if !ok {
-                return Err(BlobError::QuotaExceeded);
-            }
+        let internal = |e: anyhow::Error| BlobError::Internal(e.to_string());
+        let txn = self.meta.read_txn().map_err(internal)?;
+        let mut claim = self
+            .meta
+            .get_blob_claim(&txn, sha256)
+            .map_err(internal)?
+            .unwrap_or_else(|| claims::new_claim(len));
+        // Bytes already stored here are the size finish() would find.
+        let size = if claim.stored { claim.size } else { len };
+        let now = nostr::prelude::Timestamp::now().as_secs();
+        let mut moves = claims::settle_stored(&mut claim, size, now);
+        moves.extend(claims::attach(&mut claim, tenant_hex, alias, size));
+        claims::detach_unaffordable(
+            &self.meta, &txn, &self.cfg, &mut claim, alias, &mut moves, now,
+        )
+        .map_err(internal)?;
+        if quota::fits(&self.meta, &txn, &self.cfg, tenant_hex, alias, 0, &moves)
+            .map_err(internal)?
+        {
+            Ok(())
+        } else {
+            Err(BlobError::QuotaExceeded)
         }
-        Ok(())
     }
 
     /// Reserve in-flight capacity for `declared_len` bytes BEFORE any body
@@ -1685,16 +1659,16 @@ impl PrivateService {
     /// `tenant_hex` is the account the upload is counted against: the
     /// tenant key of the alias its authorization names.
     ///
-    /// `pending_spec_release` is the upload's own claim's speculative charge
-    /// (0 when none): finish() releases it from the global scope before
-    /// charging, so the check nets it out (FF — same double-count the
-    /// preflight had near the cap).
+    /// `prior_charge` is what the uploading repository already pays for the
+    /// blob (0 when nothing): storing it sets that charge to the stored
+    /// size instead of adding one, so the check nets it out (FF — the same
+    /// double-count the preflight had near the cap).
     fn reserve_upload(
         &self,
         origin: UploadOrigin,
         tenant_hex: &str,
         declared_len: u64,
-        pending_spec_release: u64,
+        prior_charge: u64,
     ) -> Result<UploadReservation, BlobError> {
         let ledger_total = {
             let txn = self
@@ -1708,7 +1682,7 @@ impl PrivateService {
             origin,
             tenant_hex,
             declared_len,
-            ledger_total.saturating_sub(pending_spec_release),
+            ledger_total.saturating_sub(prior_charge),
             UploadLimits {
                 node_slots: MAX_CONCURRENT_UPLOADS,
                 tenant_slots: self.cfg.max_uploads_per_tenant,
@@ -1724,11 +1698,10 @@ impl PrivateService {
         self.cfg.upload_min_bytes_per_sec
     }
 
-    /// The speculative bytes still held against this upload's own claim
-    /// (released by finish() before it charges), 0 when there is no claim or
-    /// no pending charge. Read-only; used to net the preflight/reserve
-    /// quota math (FF).
-    fn pending_spec_release(&self, sha256: &str) -> Result<u64, BlobError> {
+    /// What `alias` already pays for the blob (its reference's charge or
+    /// its grace charge), 0 when nothing. Read-only; used to net the
+    /// reservation's quota math (FF).
+    pub(crate) fn prior_charge(&self, sha256: &str, alias: &str) -> Result<u64, BlobError> {
         let txn = self
             .meta
             .read_txn()
@@ -1737,8 +1710,7 @@ impl PrivateService {
             .meta
             .get_blob_claim(&txn, sha256)
             .map_err(|e| BlobError::Internal(e.to_string()))?
-            .and_then(|claim| claim.spec_charge)
-            .map(|spec| spec.bytes)
+            .and_then(|claim| claims::charge_of(&claim, alias))
             .unwrap_or(0))
     }
 
@@ -1758,7 +1730,7 @@ impl PrivateService {
             UploadOrigin::Client,
             &auth.tenant_hex,
             declared_len,
-            self.pending_spec_release(&auth.sha256)?,
+            self.prior_charge(&auth.sha256, &auth.alias)?,
         )?;
         UploadSink::create(
             self.meta.clone(),
@@ -1770,6 +1742,7 @@ impl PrivateService {
             declared_len,
             reservation,
             self.denylist.clone(),
+            UploadOrigin::Client,
         )
         .await
     }
@@ -1785,51 +1758,25 @@ impl PrivateService {
         denylist::read_set(&self.denylist).contains(sha256)
     }
 
-    /// Remove this alias's claim on a blob (Blossom DELETE). File removal is
-    /// GC's job after the grace period. Idempotent — 200 even if no claim.
+    /// Remove this alias's reference to a blob (Blossom DELETE). File
+    /// removal is GC's job after the grace period. Idempotent — 200 even if
+    /// no claim.
+    ///
+    /// The repository is released at once while another still references
+    /// the blob, and that one goes on paying its own charge. As the last
+    /// referrer of stored bytes it pays until GC removes them, or another
+    /// repository takes them up; a blob nobody stored loses its claim and
+    /// its charge here.
     pub async fn blob_delete(&self, auth: &BlossomAuth, sha256: &str) -> Result<(), BlobError> {
         if auth.sha256 != sha256 {
             return Err(BlobError::BadRequest(
                 "authorization does not cover this sha256".into(),
             ));
         }
-        let alias = auth.alias.clone();
+        let now = nostr::prelude::Timestamp::now().as_secs();
         self.meta
-            .with_write(|meta, txn| {
-                if let Some(mut claim) = meta.get_blob_claim(txn, sha256)? {
-                    if claim.aliases.iter().any(|a| a == &alias) {
-                        claim.aliases.retain(|a| a != &alias);
-                        // R2-D (verify round 2): same release condition as
-                        // the FH ring-trim / R2-A death cleanup — the
-                        // DELETING alias was carrying the speculative charge
-                        // and other aliases still reference the sha: release
-                        // it against the recorded scope/bytes, exactly once
-                        // (the survivor re-charges on its next referencing
-                        // 30641). Otherwise the DELETE pins the charge on
-                        // the deleting scope until claim death or upload.
-                        let release_spec = !claim.aliases.is_empty()
-                            && claim
-                                .spec_charge
-                                .as_ref()
-                                .map(|spec| spec.alias == alias)
-                                .unwrap_or(false);
-                        if release_spec {
-                            let spec = claim.spec_charge.take().expect("spec charge present");
-                            quota::release_spec_charge(meta, txn, &spec)?;
-                        }
-                        if claim.aliases.is_empty() && claim.unreferenced_since.is_none() {
-                            claim.unreferenced_since =
-                                Some(nostr::prelude::Timestamp::now().as_secs());
-                        }
-                        meta.put_blob_claim(txn, sha256, &claim)?;
-                        meta.delete_alias_claim(txn, &alias, sha256)?;
-                    }
-                }
-                Ok(())
-            })
+            .with_write(|meta, txn| claims::detach_from(meta, txn, sha256, &auth.alias, now))
             .map_err(|e| BlobError::Internal(format!("meta update failed: {e}")))?;
-        // The release above is ledger-visible: keep the gauge honest (the
-        // pre-R2-D path never touched the ledger and needed no refresh).
         self.refresh_gauges();
         Ok(())
     }
@@ -1862,7 +1809,10 @@ impl PrivateService {
                 let Ok(Some(claim)) = self.meta.get_blob_claim(&txn, &sha) else {
                     continue;
                 };
-                if !claim.stored {
+                // The index also lists a blob this repository stopped
+                // referencing and still pays for until GC; it is not the
+                // repository's any more.
+                if !claim.stored || !claim.aliases.iter().any(|a| a == alias) {
                     continue;
                 }
                 seen.insert(sha.clone());
@@ -1988,32 +1938,23 @@ pub fn spawn_background_tasks(
 /// footprint IN THE SAME TXN (verify round 1, FC/FD — applies to all three
 /// death paths: merge eviction, honored kind-5, NIP-62 vanish):
 ///
-/// 1. The dead alias is stripped from every blob claim it referenced (via
-///    the per-alias index — never a cross-tenant scan). A claim that loses
-///    its last alias is marked unreferenced (wall clock — cleanup state,
-///    not merge state) so GC collects it after the grace period, and GC's
-///    existing `release_claim` path refunds any stored charge (no
-///    hand-rolled refunds here).
-/// 2. A claim that became fully unreferenced dies with its speculative
-///    charge: released NOW against the recorded (tenant, alias, bytes) —
-///    never `claim.size` — closing the !12 zero-release leak without waiting
-///    for grace. GC cannot double-release (`spec_charge` is then `None`).
-///    R2-A (verify round 2): the same release runs when the CHARGING alias
-///    is the one dying even while other live aliases still reference the
-///    sha — otherwise the charge strands on the dead scope with zero
-///    release paths (GC needs empty aliases; upload needs a preimage; the
-///    dead alias's ring was just deleted, so no FH trim ever fires). The
-///    surviving referrer is re-charged on its next referencing 30641 via
-///    the `spec_charge.is_none()` upgrade path (the same accepted
-///    unbilled-window trade-off as FH; pre-fix zombie data is not covered).
-///    Stored charges of still-referenced claims stay — real bytes on disk.
-/// 3. The alias scope's EVENT-bytes column (`r:<alias>`) is reset: those
+/// 1. The repository stops referencing every blob, through
+///    `claims::detach_from`, as a state root that no longer names them
+///    would: its charge on a blob another repository references is
+///    released now, and that one goes on under its own charge (decision
+///    D4); a blob nobody stored loses its claim and its charge now. Stored
+///    bytes it was the last to reference keep its charge, as they did
+///    before decision D4, until GC removes them or another repository
+///    takes them up (marked unreferenced, wall clock — cleanup state, not
+///    merge state): released at the death, a register, upload, delete
+///    loop would hold bytes on disk that no quota counts for the grace
+///    period. The hold of merge request 18 is what will change this
+///    timing.
+/// 2. The alias scope's EVENT-bytes column (`r:<alias>`) is reset: those
 ///    wrap/30641 bytes are unattributable per tenant and belonged to dead
 ///    holders; leaving them would brick the seat for a conflict-merge
 ///    winner (whose own registration charge lands later in the same txn).
-///    The blob/spec columns stay intact — real bytes on disk that GC/grace
-///    handles.
-/// 4. The alias's state-ring editions are deleted: they belong to the dead
+/// 3. The alias's state-ring editions are deleted: they belong to the dead
 ///    tenant, and leaving them would let the next 30641's retained-edition
 ///    rescan keep stripped claims "referenced". The next holder starts a
 ///    fresh ring.
@@ -2050,41 +1991,7 @@ pub(crate) fn free_registration_claims(
 
     let now = nostr::prelude::Timestamp::now().as_secs();
     for sha in meta.alias_claim_shas(txn, alias)? {
-        let Some(mut claim) = meta.get_blob_claim(txn, &sha)? else {
-            meta.delete_alias_claim(txn, alias, &sha)?;
-            continue;
-        };
-        if claim.aliases.iter().any(|a| a == alias) {
-            claim.aliases.retain(|a| a != alias);
-            if claim.aliases.is_empty() {
-                if claim.unreferenced_since.is_none() {
-                    claim.unreferenced_since = Some(now);
-                }
-                if let Some(spec) = claim.spec_charge.take() {
-                    quota::release_spec_charge(meta, txn, &spec)?;
-                }
-            } else {
-                // R2-A (verify round 2): the DEAD alias was carrying the
-                // speculative charge and other aliases still reference the
-                // sha — release it against the recorded (tenant, alias,
-                // bytes), exactly once (take() → None; GC/upload/FH all
-                // guard on Some). The surviving referrer is re-charged on
-                // its next referencing 30641 (accepted unbilled window,
-                // same trade-off as FH). A charge belonging to a SURVIVING
-                // alias stays — that declaration is still live.
-                let release_spec = claim
-                    .spec_charge
-                    .as_ref()
-                    .map(|spec| spec.alias == alias)
-                    .unwrap_or(false);
-                if release_spec {
-                    let spec = claim.spec_charge.take().expect("spec charge present");
-                    quota::release_spec_charge(meta, txn, &spec)?;
-                }
-            }
-            meta.put_blob_claim(txn, &sha, &claim)?;
-        }
-        meta.delete_alias_claim(txn, alias, &sha)?;
+        claims::detach_from(meta, txn, &sha, alias, now)?;
     }
     quota::reset_alias_event_bytes(meta, txn, alias)?;
     for (key, _) in meta.state_ring_for_alias(txn, alias)? {
@@ -2107,7 +2014,7 @@ fn record_event_metric(kind: u16, result: &WritePolicyResult) {
 /// event id — existence covers kind-5/vanish death, identity covers a
 /// conflict-merge takeover. On false the caller must reject WITHOUT any
 /// mutation: cleanup runs once at death, and footprints born afterwards
-/// (zombie claims/spec charges billed to the dead scope) have no cleanup
+/// (zombie claims and charges billed to the dead scope) have no cleanup
 /// trigger left.
 pub(crate) fn registration_identity_intact(
     meta: &MetaEnv,
@@ -3186,5 +3093,188 @@ mod tests {
         drop((own, fetch));
         assert_eq!(counted(&svc.inflight), (0, 0, 0));
         assert_eq!(svc.upload_min_bytes_per_sec(), 16384);
+    }
+
+    /// The upload preflight forecasts what `finish()` charges: a repository
+    /// that does not pay for a blob yet is asked for its full size, whoever
+    /// stored it; one that pays for it already is asked for nothing more,
+    /// even above its cap; a declarer is asked for the difference between
+    /// its declared size and the length it uploads. Before decision D4 a
+    /// stored blob re-uploaded for free, so another account's bytes cost
+    /// nothing to take up.
+    #[tokio::test]
+    async fn upload_preflight_forecasts_the_uploaders_own_charge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_quota_repo_bytes = 1000;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let stored = "ab".repeat(32);
+        let declared = "cd".repeat(32);
+        svc.meta
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &stored, "tenant-a", "alias-a", 4096)?;
+                let before = meta.get_blob_claim(txn, &stored)?;
+                let mut claim = before.clone().expect("declared");
+                let moves = claims::settle_stored(&mut claim, 4096, 1);
+                claims::commit(meta, txn, &stored, before.as_ref(), Some(&claim), &moves)?;
+                claims::attach_to(meta, txn, &declared, "tenant-b", "alias-b", 900)
+            })
+            .unwrap();
+
+        assert!(
+            matches!(
+                svc.blob_quota_preflight("tenant-c", "alias-c", &stored, 4096),
+                Err(BlobError::QuotaExceeded)
+            ),
+            "taking up another account's stored blob costs its full size"
+        );
+        svc.blob_quota_preflight("tenant-a", "alias-a", &stored, 4096)
+            .expect("a repository already paying is asked for nothing more");
+        svc.blob_quota_preflight("tenant-b", "alias-b", &declared, 950)
+            .expect("declared 900, uploads 950: 50 more fits the 1000 cap");
+        assert!(matches!(
+            svc.blob_quota_preflight("tenant-b", "alias-b", &declared, 1001),
+            Err(BlobError::QuotaExceeded)
+        ));
+    }
+
+    /// `/list` names the stored blobs a tenant's repositories reference. A
+    /// blob a repository stopped referencing stays in its index while it
+    /// pays the grace charge, and must not be listed as the repository's.
+    #[tokio::test]
+    async fn list_leaves_out_a_blob_its_repository_stopped_referencing() {
+        let (_dir, svc) = hold_harness(true).await;
+        let tenant = nostr_sdk::prelude::Keys::generate().public_key();
+        let tenant_hex = tenant.to_hex();
+        let alias = "ab".repeat(16);
+        let sha = "ef".repeat(32);
+        svc.meta
+            .with_write(|meta, txn| {
+                meta.put_tenant_aliases(txn, &tenant_hex, &vec![alias.clone()])?;
+                claims::attach_to(meta, txn, &sha, &tenant_hex, &alias, 64)?;
+                let before = meta.get_blob_claim(txn, &sha)?;
+                let mut claim = before.clone().expect("declared");
+                let moves = claims::settle_stored(&mut claim, 64, 1);
+                claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
+            })
+            .unwrap();
+        let listed = svc.blob_list(&tenant).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sha256, sha);
+
+        svc.meta
+            .with_write(|meta, txn| claims::detach_from(meta, txn, &sha, &alias, 2))
+            .unwrap();
+        {
+            let txn = svc.meta.read_txn().unwrap();
+            assert_eq!(
+                svc.meta.alias_claim_shas(&txn, &alias).unwrap(),
+                vec![sha.clone()],
+                "the grace charge keeps the index entry"
+            );
+        }
+        assert!(svc.blob_list(&tenant).await.is_empty());
+    }
+
+    /// The byte reservation of an upload nets what the uploading repository
+    /// already pays for the blob, and only that: storing replaces its own
+    /// charge, while another repository's charge is no room of its own.
+    /// Without the netting a declare-then-upload near the node budget is
+    /// refused although `finish()` would fit it.
+    #[tokio::test]
+    async fn the_reservation_nets_the_uploaders_own_charge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_quota_repo_bytes = 5000;
+        config.private_quota_tenant_bytes = 5000;
+        config.private_global_budget_bytes = 5000;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let sha = "ab".repeat(32);
+        svc.meta
+            .with_write(|meta, txn| claims::attach_to(meta, txn, &sha, "tenant-a", "alias-a", 4096))
+            .unwrap();
+        assert_eq!(svc.prior_charge(&sha, "alias-a").unwrap(), 4096);
+        assert_eq!(svc.prior_charge(&sha, "alias-b").unwrap(), 0);
+
+        let own = svc
+            .reserve_upload(
+                UploadOrigin::Client,
+                "tenant-a",
+                4096,
+                svc.prior_charge(&sha, "alias-a").unwrap(),
+            )
+            .expect("its own declared charge is replaced, not added to");
+        drop(own);
+        assert!(matches!(
+            svc.reserve_upload(
+                UploadOrigin::Client,
+                "tenant-b",
+                4096,
+                svc.prior_charge(&sha, "alias-b").unwrap(),
+            ),
+            Err(BlobError::QuotaExceeded)
+        ));
+    }
+
+    /// A Blossom DELETE by the last repository that references stored bytes
+    /// keeps its charge until GC removes them: released at once, an upload
+    /// followed by a delete would be free storage for the grace period.
+    #[tokio::test]
+    async fn blob_delete_keeps_the_last_referrers_grace_charge() {
+        let (_dir, svc) = hold_harness(true).await;
+        let sha = "ab".repeat(32);
+        svc.meta
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &sha, "tenant-a", "alias-a", 64)?;
+                let before = meta.get_blob_claim(txn, &sha)?;
+                let mut claim = before.clone().expect("declared");
+                let moves = claims::settle_stored(&mut claim, 64, 1);
+                claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
+            })
+            .unwrap();
+        let auth = BlossomAuth {
+            pubkey_hex: String::new(),
+            tenant_hex: "tenant-a".to_string(),
+            alias: "alias-a".to_string(),
+            sha256: sha.clone(),
+        };
+        svc.blob_delete(&auth, &sha).await.unwrap();
+
+        let txn = svc.meta.read_txn().unwrap();
+        let claim = svc
+            .meta
+            .get_blob_claim(&txn, &sha)
+            .unwrap()
+            .expect("kept for GC");
+        assert!(claim.aliases.is_empty() && claim.unreferenced_since.is_some());
+        for key in [
+            quota::alias_key("alias-a"),
+            quota::tenant_key("tenant-a"),
+            meta::LEDGER_GLOBAL_KEY.to_string(),
+        ] {
+            assert_eq!(
+                svc.meta.get_ledger_txn(&txn, &key).unwrap().blob_bytes,
+                64,
+                "the last referrer pays until GC at {key}"
+            );
+        }
     }
 }

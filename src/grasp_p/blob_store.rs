@@ -12,9 +12,10 @@ use bitcoin_hashes::{sha256, HashEngine};
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
+use super::claims;
 use super::denylist::{self, SharedDenylist};
-use super::meta::{BlobClaim, MetaEnv};
-use super::{quota, BlobError, PrivateConfig, UploadReservation};
+use super::meta::MetaEnv;
+use super::{quota, BlobError, PrivateConfig, UploadOrigin, UploadReservation};
 
 /// BUD-01 style blob descriptor returned by upload and list routes.
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +183,10 @@ fn remove_placed_file(meta: &MetaEnv, store: &BlobStore, sha256: &str) -> Result
 /// sink hashes and counts while writing to a temp file, and `finish()`
 /// verifies + renames + claims + charges. Dropping an unfinished sink removes
 /// the temp file.
+///
+/// A client's upload makes its repository a referrer of the blob; the
+/// mirror's only stores bytes a referrer of this node already waits for
+/// (`origin`).
 pub struct UploadSink {
     meta: MetaEnv,
     store: BlobStore,
@@ -204,6 +209,8 @@ pub struct UploadSink {
     /// (Phase-4b D1): an upload whose hash became denylisted between PUT
     /// begin and finish must not land.
     denylist: SharedDenylist,
+    /// Who is storing: a client's `PUT /upload` or the blob mirror.
+    origin: UploadOrigin,
 }
 
 impl UploadSink {
@@ -218,6 +225,7 @@ impl UploadSink {
         declared_len: u64,
         reservation: UploadReservation,
         denylist: SharedDenylist,
+        origin: UploadOrigin,
     ) -> Result<Self, BlobError> {
         let tmp_path = store.new_tmp_path();
         let file = tokio::fs::File::create(&tmp_path)
@@ -240,6 +248,7 @@ impl UploadSink {
             finished: false,
             _reservation: reservation,
             denylist,
+            origin,
         })
     }
 
@@ -266,8 +275,8 @@ impl UploadSink {
     }
 
     /// Verify the streamed hash, move the temp file into place, and claim +
-    /// charge atomically. Idempotent for blobs that already exist (adds the
-    /// claim, no double-charge).
+    /// charge atomically. Idempotent for blobs that already exist: a
+    /// repository that already references the blob is not charged again.
     pub async fn finish(mut self) -> Result<BlobDescriptor, BlobError> {
         // Actual bytes must match the declared Content-Length.
         if self.written != self.declared_len {
@@ -309,6 +318,7 @@ impl UploadSink {
         let cfg = self.cfg.clone();
         let tmp_path = self.tmp_path.clone();
         let denylist = self.denylist.clone();
+        let origin = self.origin;
         let now = nostr::prelude::Timestamp::now().as_secs();
 
         // Existence check, rename, and claim/charge ALL inside the one meta
@@ -354,52 +364,44 @@ impl UploadSink {
                 return Err(anyhow::anyhow!("denylisted"));
             }
             let file_present = final_path.is_file();
-            let mut claim = meta.get_blob_claim(txn, &sha)?.unwrap_or(BlobClaim {
-                size,
-                aliases: Vec::new(),
-                unreferenced_since: None,
-                stored: false,
-                charged_tenant: None,
-                charged_alias: None,
-                spec_charge: None,
-                stored_at: None,
-            });
+            let before = meta.get_blob_claim(txn, &sha)?;
+            // The mirror adds no reference of its own: the pair's other node
+            // would know nothing of it, and the repository it fetched for
+            // may have stopped referencing the blob since. It stores only
+            // what a referrer here still waits for, and the bytes then
+            // settle that referrer's charge with every other one.
+            if origin == UploadOrigin::Mirror
+                && !before
+                    .as_ref()
+                    .is_some_and(|claim| claim.aliases.iter().any(|a| a == &alias))
+            {
+                return Err(anyhow::anyhow!("unreferenced"));
+            }
+            let newly_stored = !before.as_ref().is_some_and(|claim| claim.stored) && !file_present;
+            let mut claim = before.clone().unwrap_or_else(|| claims::new_claim(size));
 
-            // Issue !12: the claim is transitioning to stored — the upload
-            // path takes over the accounting, so release the speculative
-            // 30641-declaration charge first (before the quota check below,
-            // so a same-scope upload nets out instead of double-counting).
-            // Atomic with the charge: if this txn aborts, the release rolls
-            // back with it.
-            if let Some(spec) = claim.spec_charge.take() {
-                quota::release_spec_charge(meta, txn, &spec)?;
+            // Decision D4: the bytes set every repository's charge to their
+            // size, and a client's upload makes its repository pay for them
+            // like any other referrer, also for bytes another account
+            // stored or an earlier run left on disk. The uploader's own
+            // declared charge is part of the moves, so a declare-then-upload
+            // nets out. Another repository the stored size raises past its
+            // own caps stops referencing the blob rather than being carried
+            // over them; the uploader's scopes and the node's are judged
+            // with every move.
+            let mut moves = claims::settle_stored(&mut claim, size, now);
+            if origin == UploadOrigin::Client {
+                moves.extend(claims::attach(&mut claim, &tenant, &alias, size));
             }
-
-            let mut charged = false;
-            if !claim.stored && !file_present {
-                if !quota::check(meta, txn, &cfg, &tenant, &alias, size)? {
-                    return Err(anyhow::anyhow!("quota"));
-                }
-                quota::charge(meta, txn, &tenant, &alias, size, true)?;
-                claim.stored = true;
-                claim.size = size;
-                claim.charged_tenant = Some(tenant.clone());
-                claim.charged_alias = Some(alias.clone());
-                charged = true;
-            } else {
-                claim.stored = true;
-                claim.size = size;
+            claims::detach_unaffordable(meta, txn, &cfg, &mut claim, &alias, &mut moves, now)?;
+            if !quota::fits(meta, txn, &cfg, &tenant, &alias, 0, &moves)? {
+                return Err(anyhow::anyhow!("quota"));
             }
-            if !claim.aliases.contains(&alias) {
-                claim.aliases.push(alias.clone());
-                meta.put_alias_claim(txn, &alias, &sha)?;
-            }
-            claim.unreferenced_since = None;
             // Kept from the first time the bytes were stored here: a repeat
             // upload, or one that restores a lost file, reports that time
             // and does not move it.
-            let stored_at = *claim.stored_at.get_or_insert(now);
-            meta.put_blob_claim(txn, &sha, &claim)?;
+            let stored_at = claim.stored_at.unwrap_or(now);
+            claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)?;
             // Last fallible step: place the bytes. Skip when the file is
             // already there (idempotent re-upload / adopt); when the claim
             // said stored but the file is gone (crash window), this restores
@@ -409,17 +411,17 @@ impl UploadSink {
                     .map_err(|e| anyhow::anyhow!("rename failed: {e}"))?;
                 renamed.set(true);
             }
-            Ok((charged, stored_at))
+            Ok((newly_stored, stored_at))
         });
 
         match outcome {
-            Ok((charged, stored_at)) => {
+            Ok((newly_stored, stored_at)) => {
                 self.finished = true;
                 if !renamed.get() {
                     // Blob was already present: discard our tmp copy.
                     self.cleanup();
                 }
-                if charged {
+                if newly_stored {
                     crate::metrics::record_private_blob_upload(size);
                 }
                 Ok(BlobDescriptor {
@@ -457,6 +459,12 @@ impl UploadSink {
                     // shape as "registration gone" (re-check precedes the
                     // rename), but the status is the read path's 451.
                     Err(BlobError::Denylisted)
+                } else if e.to_string() == "unreferenced" {
+                    // The mirror's fetch outlived the reference it was for.
+                    // Same cleanup shape: nothing was placed.
+                    Err(BlobError::Forbidden(
+                        "the blob is no longer referenced by this repository".into(),
+                    ))
                 } else {
                     Err(BlobError::Internal(format!("meta update failed: {e}")))
                 }
@@ -484,7 +492,22 @@ impl Drop for UploadSink {
 mod tests {
     use super::*;
     use crate::config::RegistrationMode;
-    use crate::grasp_p::meta::LEDGER_GLOBAL_KEY;
+    use crate::grasp_p::meta::{BlobClaim, ClaimCharge, LEDGER_GLOBAL_KEY};
+
+    fn charge(tenant: &str, alias: &str, bytes: u64) -> ClaimCharge {
+        ClaimCharge {
+            tenant: tenant.to_string(),
+            alias: alias.to_string(),
+            bytes,
+        }
+    }
+
+    /// A blob `alias` of `tenant` declared at `declared` bytes and nobody
+    /// stored, as a 30641 leaves it.
+    fn declare(meta: &MetaEnv, sha: &str, tenant: &str, alias: &str, declared: u64) {
+        meta.with_write(|m, txn| claims::attach_to(m, txn, sha, tenant, alias, declared))
+            .unwrap();
+    }
 
     fn test_cfg(quota_repo_bytes: u64) -> PrivateConfig {
         PrivateConfig {
@@ -576,22 +599,66 @@ mod tests {
 
         /// One full streamed upload of `data` by tenant/alias ("tenant"/"alias").
         async fn upload(&self, data: &[u8]) -> Result<BlobDescriptor, BlobError> {
+            self.store_as("tenant", "alias", data, UploadOrigin::Client)
+                .await
+        }
+
+        /// A live registration of `alias` under `tenant`, besides the
+        /// harness's own.
+        fn register(&self, tenant: &str, alias: &str) {
+            self.meta
+                .with_write(|m, txn| {
+                    m.put_registration(txn, alias, &test_registration(tenant, "ed"))
+                })
+                .unwrap();
+        }
+
+        /// One full streamed store of `data` for tenant/alias by `origin`.
+        async fn store_as(
+            &self,
+            tenant: &str,
+            alias: &str,
+            data: &[u8],
+            origin: UploadOrigin,
+        ) -> Result<BlobDescriptor, BlobError> {
             let sha = sha256::Hash::hash(data).to_string();
             let reservation = UploadReservation::detached();
             let mut sink = UploadSink::create(
                 self.meta.clone(),
                 self.store.clone(),
                 self.cfg.clone(),
-                "tenant".to_string(),
-                "alias".to_string(),
+                tenant.to_string(),
+                alias.to_string(),
                 sha,
                 data.len() as u64,
                 reservation,
                 self.denylist.clone(),
+                origin,
             )
             .await?;
             sink.write_chunk(data).await?;
             sink.finish().await
+        }
+
+        /// (repository, account) blob-byte ledger totals of any pair.
+        fn scope_bytes(&self, tenant: &str, alias: &str) -> (u64, u64) {
+            let txn = self.meta.read_txn().unwrap();
+            let r = self
+                .meta
+                .get_ledger_txn(&txn, &quota::alias_key(alias))
+                .unwrap()
+                .blob_bytes;
+            let t = self
+                .meta
+                .get_ledger_txn(&txn, &quota::tenant_key(tenant))
+                .unwrap()
+                .blob_bytes;
+            (r, t)
+        }
+
+        fn claim(&self, sha: &str) -> Option<BlobClaim> {
+            let txn = self.meta.read_txn().unwrap();
+            self.meta.get_blob_claim(&txn, sha).unwrap()
         }
 
         /// (tenant, alias, global) blob-byte ledger totals.
@@ -635,8 +702,7 @@ mod tests {
         };
         assert!(claim.stored);
         assert_eq!(claim.aliases, vec!["alias".to_string()]);
-        assert_eq!(claim.charged_tenant.as_deref(), Some("tenant"));
-        assert_eq!(claim.charged_alias.as_deref(), Some("alias"));
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 512)]);
         assert_eq!(h.ledger_blob_bytes(), (512, 512, 512));
     }
 
@@ -692,10 +758,11 @@ mod tests {
     }
 
     /// An orphaned file (present on disk, no claim — e.g. a crash between the
-    /// rename and the LMDB commit) is adopted: claim committed `stored = true`
-    /// with no charge, matching the pre-B2 policy for existing content.
+    /// rename and the LMDB commit) is adopted, and the repository that
+    /// uploads it pays for it like for any blob it references (decision D4):
+    /// bytes already on disk are no free storage.
     #[tokio::test]
-    async fn orphan_file_is_adopted_without_charge() {
+    async fn orphan_file_is_adopted_and_charged() {
         let h = Harness::new(1 << 20);
         let data = vec![11u8; 128];
         let sha = sha256::Hash::hash(&data).to_string();
@@ -708,15 +775,13 @@ mod tests {
         assert!(h.store.exists(&sha));
         assert_eq!(
             h.ledger_blob_bytes(),
-            (0, 0, 0),
-            "adopting an already-present file must not charge"
+            (128, 128, 128),
+            "adopting an already-present file charges the uploader"
         );
-        let claim = {
-            let txn = h.meta.read_txn().unwrap();
-            h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap()
-        };
+        let claim = h.claim(&sha).unwrap();
         assert!(claim.stored);
         assert_eq!(claim.aliases, vec!["alias".to_string()]);
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 128)]);
     }
 
     #[tokio::test]
@@ -765,119 +830,51 @@ mod tests {
         );
     }
 
-    /// Issue !12: a 30641-declared (speculatively charged) blob that is then
-    /// actually uploaded must release the speculative charge and take the
-    /// normal stored charge — net exactly one charge, never two.
+    /// A blob a 30641 declared at a size it does not have, then uploaded:
+    /// the declarer's charge is set to the stored size, never doubled.
     #[tokio::test]
-    async fn speculative_charge_released_when_upload_stores_blob() {
-        use crate::grasp_p::meta::SpecCharge;
-
+    async fn upload_sets_the_declared_charge_to_the_stored_size() {
         let h = Harness::new(1 << 20);
         let data = vec![21u8; 300];
         let sha = sha256::Hash::hash(&data).to_string();
 
-        // Simulate the 30641 declaration path: stored=false claim carrying a
-        // speculative charge at a LYING declared size (500 ≠ actual 300) —
-        // the release must refund the declared bytes, not claim.size.
-        h.meta
-            .with_write(|m, txn| {
-                quota::charge(m, txn, "tenant", "alias", 500, true)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 500,
-                        aliases: vec!["alias".to_string()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: Some(SpecCharge {
-                            tenant: "tenant".to_string(),
-                            alias: "alias".to_string(),
-                            bytes: 500,
-                        }),
-                        stored_at: None,
-                    },
-                )
-            })
-            .unwrap();
+        declare(&h.meta, &sha, "tenant", "alias", 500);
         assert_eq!(h.ledger_blob_bytes(), (500, 500, 500));
 
         h.upload(&data).await.unwrap();
-
         assert_eq!(
             h.ledger_blob_bytes(),
             (300, 300, 300),
-            "spec charge (500) must be released and the actual size (300) charged"
+            "the declared 500 becomes the stored 300: one charge"
         );
-        let claim = {
-            let txn = h.meta.read_txn().unwrap();
-            h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap()
-        };
+        let claim = h.claim(&sha).unwrap();
         assert!(claim.stored);
-        assert!(
-            claim.spec_charge.is_none(),
-            "spec charge must be cleared on the stored transition"
-        );
-        assert_eq!(claim.charged_tenant.as_deref(), Some("tenant"));
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 300)]);
         assert_eq!(claim.size, 300);
     }
 
-    /// FF (verify round 1): finish() releases the speculative charge BEFORE
-    /// its quota check. With the repo cap BETWEEN the actual size and
-    /// spec+actual (cap 600, spec 500, actual 300), the upload passes ONLY
-    /// under release-before-check — check-before-release would see
-    /// 500 + 300 > 600 and reject. Pins the ordering the preflight mirrors.
+    /// FF (verify round 1): the uploader's own declared charge nets out of
+    /// the quota decision. With the repo cap BETWEEN the stored size and
+    /// declared + stored (cap 600, declared 500, stored 300), the upload
+    /// passes only if the declared charge is counted as replaced, not
+    /// added to.
     #[tokio::test]
-    async fn speculative_release_precedes_quota_check() {
-        use crate::grasp_p::meta::SpecCharge;
-
+    async fn upload_nets_the_uploaders_own_declared_charge() {
         let h = Harness::new(600);
         let data = vec![31u8; 300];
         let sha = sha256::Hash::hash(&data).to_string();
-
-        h.meta
-            .with_write(|m, txn| {
-                quota::charge(m, txn, "tenant", "alias", 500, true)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 500,
-                        aliases: vec!["alias".to_string()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: Some(SpecCharge {
-                            tenant: "tenant".to_string(),
-                            alias: "alias".to_string(),
-                            bytes: 500,
-                        }),
-                        stored_at: None,
-                    },
-                )
-            })
-            .unwrap();
+        declare(&h.meta, &sha, "tenant", "alias", 500);
 
         h.upload(&data)
             .await
-            .expect("upload must pass: spec (500) is released before the check");
-        assert_eq!(
-            h.ledger_blob_bytes(),
-            (300, 300, 300),
-            "spec released, actual size charged — net exactly one charge"
-        );
+            .expect("upload must pass: its own declared charge is replaced");
+        assert_eq!(h.ledger_blob_bytes(), (300, 300, 300));
     }
 
-    /// Issue !12: adopting an already-present file (no stored charge taken)
-    /// must STILL release the speculative charge — the claim leaves the
-    /// speculative state either way.
+    /// Adopting an already-present file keeps the declarer's charge, at the
+    /// stored size.
     #[tokio::test]
-    async fn speculative_charge_released_on_orphan_adoption() {
-        use crate::grasp_p::meta::SpecCharge;
-
+    async fn declared_charge_is_kept_when_an_orphan_file_is_adopted() {
         let h = Harness::new(1 << 20);
         let data = vec![23u8; 128];
         let sha = sha256::Hash::hash(&data).to_string();
@@ -885,43 +882,154 @@ mod tests {
         let path = h.store.path_for(&sha);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &data).unwrap();
-
-        h.meta
-            .with_write(|m, txn| {
-                quota::charge(m, txn, "tenant", "alias", 128, true)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 128,
-                        aliases: vec!["alias".to_string()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: Some(SpecCharge {
-                            tenant: "tenant".to_string(),
-                            alias: "alias".to_string(),
-                            bytes: 128,
-                        }),
-                        stored_at: None,
-                    },
-                )
-            })
-            .unwrap();
+        declare(&h.meta, &sha, "tenant", "alias", 128);
 
         h.upload(&data).await.unwrap();
-        assert_eq!(
-            h.ledger_blob_bytes(),
-            (0, 0, 0),
-            "adoption takes no stored charge, and the spec charge must be refunded"
-        );
-        let claim = {
-            let txn = h.meta.read_txn().unwrap();
-            h.meta.get_blob_claim(&txn, &sha).unwrap().unwrap()
-        };
+        assert_eq!(h.ledger_blob_bytes(), (128, 128, 128), "charged once");
+        let claim = h.claim(&sha).unwrap();
         assert!(claim.stored);
-        assert!(claim.spec_charge.is_none());
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 128)]);
+    }
+
+    /// Issue 5 at the upload: a repository that uploads bytes another
+    /// account already stored pays for them like the first one, and is
+    /// refused when it cannot afford them. Without the charge the second
+    /// account would hold the bytes at no cost; without the check it could
+    /// go past its quota.
+    #[tokio::test]
+    async fn uploading_another_accounts_stored_blob_charges_the_uploader() {
+        let mut h = Harness::new(1 << 20);
+        h.register("other-tenant", "other-alias");
+        h.register("third-tenant", "third-alias");
+        let data = vec![61u8; 400];
+        let sha = sha256::Hash::hash(&data).to_string();
+        h.upload(&data).await.unwrap();
+
+        h.store_as("other-tenant", "other-alias", &data, UploadOrigin::Client)
+            .await
+            .unwrap();
+        assert_eq!(h.scope_bytes("tenant", "alias"), (400, 400));
+        assert_eq!(h.scope_bytes("other-tenant", "other-alias"), (400, 400));
+        let claim = h.claim(&sha).unwrap();
+        assert_eq!(claim.aliases.len(), 2);
+        assert_eq!(claim.charges.len(), 2);
+
+        // A third repository with room for 399 bytes is refused.
+        h.cfg.quota_repo_bytes = 399;
+        let err = h
+            .store_as("third-tenant", "third-alias", &data, UploadOrigin::Client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::QuotaExceeded), "got {err:?}");
+        assert_eq!(h.scope_bytes("third-tenant", "third-alias"), (0, 0));
+        assert_eq!(h.claim(&sha).unwrap().aliases.len(), 2);
+    }
+
+    /// A repository that declared a blob at fewer bytes than were stored,
+    /// and cannot afford the difference, stops referencing the blob when
+    /// another account uploads it, instead of being carried over its own
+    /// caps; the uploader still pays, also after it drops the blob as its
+    /// last referrer. Without this one account declaring blobs at nothing
+    /// and another uploading and dropping each would hold bytes no quota
+    /// counts.
+    #[tokio::test]
+    async fn an_upload_never_carries_another_repository_over_its_caps() {
+        let mut h = Harness::new(1 << 20);
+        h.cfg.quota_repo_bytes = 1000;
+        h.register("short-tenant", "short-alias");
+        let data = vec![63u8; 400];
+        let sha = sha256::Hash::hash(&data).to_string();
+        h.meta
+            .with_write(|m, txn| quota::charge(m, txn, "short-tenant", "short-alias", 999, true))
+            .unwrap();
+        declare(&h.meta, &sha, "short-tenant", "short-alias", 1);
+        assert_eq!(h.scope_bytes("short-tenant", "short-alias"), (1000, 1000));
+
+        h.upload(&data).await.unwrap();
+        let claim = h.claim(&sha).unwrap();
+        assert_eq!(claim.aliases, vec!["alias".to_string()]);
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 400)]);
+        assert_eq!(
+            h.scope_bytes("short-tenant", "short-alias"),
+            (999, 999),
+            "its declared byte is released, and nothing more is charged"
+        );
+        assert_eq!(h.scope_bytes("tenant", "alias"), (400, 400));
+
+        let now = nostr::prelude::Timestamp::now().as_secs();
+        h.meta
+            .with_write(|m, txn| claims::detach_from(m, txn, &sha, "alias", now))
+            .unwrap();
+        assert_eq!(
+            h.scope_bytes("tenant", "alias"),
+            (400, 400),
+            "the uploader pays the grace charge"
+        );
+        assert_eq!(h.scope_bytes("short-tenant", "short-alias"), (999, 999));
+    }
+
+    /// A repository that declared fewer bytes than were stored and can
+    /// afford them pays the stored size, like any other referrer.
+    #[tokio::test]
+    async fn an_upload_raises_a_short_declaration_that_fits() {
+        let h = Harness::new(1 << 20);
+        h.register("other-tenant", "other-alias");
+        let data = vec![64u8; 400];
+        let sha = sha256::Hash::hash(&data).to_string();
+        declare(&h.meta, &sha, "other-tenant", "other-alias", 1);
+
+        h.upload(&data).await.unwrap();
+        let claim = h.claim(&sha).unwrap();
+        assert_eq!(claim.aliases.len(), 2);
+        assert_eq!(h.scope_bytes("other-tenant", "other-alias"), (400, 400));
+        assert_eq!(h.scope_bytes("tenant", "alias"), (400, 400));
+    }
+
+    /// The mirror stores bytes only for a repository that references the
+    /// blob here, and adds no reference: a fetch that outlived its
+    /// reference stores nothing, and one for a referrer sets every charge
+    /// to the stored size without a new one.
+    #[tokio::test]
+    async fn the_mirror_stores_for_a_referrer_and_adds_no_reference() {
+        let h = Harness::new(1 << 20);
+        h.register("other-tenant", "other-alias");
+        let data = vec![62u8; 256];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        // Nobody references it here: refused, nothing placed or charged.
+        let err = h
+            .store_as("tenant", "alias", &data, UploadOrigin::Mirror)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Forbidden(_)), "got {err:?}");
+        assert!(!h.store.exists(&sha));
+        assert!(h.claim(&sha).is_none());
+
+        // Another repository references it; the fetch was for this one.
+        declare(&h.meta, &sha, "other-tenant", "other-alias", 300);
+        h.store_as("tenant", "alias", &data, UploadOrigin::Mirror)
+            .await
+            .unwrap_err();
+        assert!(!h.store.exists(&sha));
+
+        // The fetch is for the referrer: stored, its charge set to the
+        // stored size, and no reference added.
+        h.store_as("other-tenant", "other-alias", &data, UploadOrigin::Mirror)
+            .await
+            .unwrap();
+        assert!(h.store.exists(&sha));
+        let claim = h.claim(&sha).unwrap();
+        assert_eq!(claim.aliases, vec!["other-alias".to_string()]);
+        assert_eq!(
+            claim.charges,
+            vec![charge("other-tenant", "other-alias", 256)]
+        );
+        assert_eq!(h.scope_bytes("other-tenant", "other-alias"), (256, 256));
+        assert_eq!(
+            h.ledger_blob_bytes().0,
+            0,
+            "the harness's repository pays nothing"
+        );
     }
 
     #[tokio::test]
@@ -950,9 +1058,7 @@ mod tests {
                         aliases: vec!["alias".to_string()],
                         unreferenced_since: None,
                         stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: None,
+                        charges: vec![charge("tenant", "alias", data.len() as u64)],
                         stored_at: None,
                     },
                 )
@@ -993,6 +1099,7 @@ mod tests {
                 data.len() as u64,
                 reservation,
                 h.denylist.clone(),
+                UploadOrigin::Client,
             )
         };
 
@@ -1061,6 +1168,7 @@ mod tests {
             data.len() as u64,
             reservation,
             h.denylist.clone(),
+            UploadOrigin::Client,
         )
         .await
         .unwrap();
@@ -1147,25 +1255,7 @@ mod tests {
         let h = Harness::new(1 << 20);
         let data = vec![52u8; 64];
         let sha = sha256::Hash::hash(&data).to_string();
-        h.meta
-            .with_write(|m, txn| {
-                m.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 64,
-                        aliases: vec!["alias".to_string()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: None,
-                        stored_at: None,
-                    },
-                )?;
-                m.put_alias_claim(txn, "alias", &sha)
-            })
-            .unwrap();
+        declare(&h.meta, &sha, "tenant", "alias", 64);
 
         let descriptor = h.upload(&data).await.unwrap();
         assert!(descriptor.uploaded > 0);

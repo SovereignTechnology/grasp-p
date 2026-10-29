@@ -447,8 +447,10 @@ lazy_static! {
         let metric = Gauge::with_opts(Opts::new(
             "ngit_private_denylist_entries",
             "Sha256 entries in the live private blob denylist (set at boot and on \
-             every reload swap; Phase-4b D1). A drop to 0 on a node that should be \
-             enforcing a takedown list means the files went missing.",
+             every reload swap; Phase-4b D1). A drop means a readable file lists \
+             fewer hashes, or a file was missing at the last restart; a file that \
+             disappears, cannot be read or reads back empty while the node runs \
+             keeps its entries and logs an error instead (D11).",
         ))
         .expect("build private denylist entries metric");
         REGISTRY

@@ -966,10 +966,11 @@ fn apply(
 
         // Evict the conflict losers: free their key claims and drop their
         // records + alias slots (same discipline as an author-valid kind-5
-        // deletion — `free_registration_claims` also strips the loser's
-        // blob claims, releases now-orphaned spec charges, resets the
-        // alias's event-bytes column, and deletes its state-ring editions,
-        // all in this txn).
+        // deletion — `free_registration_claims` also drops the loser's blob
+        // references (its charges go, but for stored bytes it was the last
+        // to reference, which it pays until GC), resets the alias's
+        // event-bytes column, and deletes its state-ring editions, all in
+        // this txn).
         let mut evicted: Vec<(String, String)> = Vec::new();
         for (loser_alias, loser) in &evict {
             super::free_registration_claims(meta, txn, &loser.tenant_hex, loser_alias, u64::MAX)?;
@@ -1577,26 +1578,28 @@ mod tests {
         }
     }
 
-    /// FC/FD (verify round 1) + R2-A (verify round 2): a merge eviction
-    /// frees the loser's whole footprint in the winner's txn — the dead
-    /// alias is stripped from its blob claims (last-alias claims marked for
-    /// GC with their spec charges released immediately against the recorded
-    /// scope/bytes), the alias scope's event-bytes column is reset before
-    /// the winner's own charge lands, and the loser's state-ring editions
-    /// are deleted. A claim still referenced by a live alias keeps its
-    /// STORED charge, but a spec charge CARRIED BY THE DEAD ALIAS is
-    /// released (R2-A) and re-lands on the surviving referrer's scope on its
-    /// next 30641 (exactly-once migration pinned below); the loser's `t:`
-    /// event bytes stay stranded (pre-existing !1/!4 backlog).
+    /// FC/FD (verify round 1) + decision D4: a merge eviction frees the
+    /// loser's footprint in the winner's txn — the dead alias stops
+    /// referencing every blob (a declared blob nobody else references loses
+    /// its claim and its charge; a blob another repository references goes
+    /// on under that one's own charge; stored bytes nobody else references
+    /// keep the loser's charge until GC, as before decision D4), the alias
+    /// scope's event-bytes column is reset before the winner's own charge
+    /// lands, and the loser's state-ring editions are deleted. The
+    /// survivor's next state root naming the shared blob charges it nothing
+    /// more: it was paying already. The loser's `t:` event bytes stay
+    /// stranded (pre-existing !1/!4 backlog).
     #[tokio::test]
     async fn eviction_cleans_loser_footprint() {
-        use super::super::meta::{BlobClaim, MetaEnv, SpecCharge};
+        use super::super::claims;
+        use super::super::meta::MetaEnv;
         use nostr_sdk::prelude::Keys;
 
         let h = harness().await;
         let svc = &h.svc;
         let loser = Keys::generate();
         let winner = Keys::generate();
+        let survivor = Keys::generate();
         let alias = "d".repeat(32);
         let other = "e".repeat(32);
 
@@ -1606,12 +1609,14 @@ mod tests {
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
         let reg1_bytes = reg1.as_json().len() as u64;
 
-        // Loser footprint: two ring editions; an unstored spec-charged claim;
-        // a stored + charged claim; a claim shared with a live alias; event
-        // bytes in the alias scope.
-        let sha_spec = "11".repeat(32);
+        // Loser footprint: two ring editions; a declared (unstored) claim; a
+        // stored claim; a claim shared with the survivor's alias, which pays
+        // its own charge; event bytes in the alias scope.
+        let sha_declared = "11".repeat(32);
         let sha_stored = "22".repeat(32);
         let sha_shared = "33".repeat(32);
+        let loser_hex = loser.public_key().to_hex();
+        let survivor_hex = survivor.public_key().to_hex();
         svc.meta
             .with_write(|m, txn| {
                 for (i, id) in ["aa", "bb"].iter().enumerate() {
@@ -1621,79 +1626,33 @@ mod tests {
                         "{}",
                     )?;
                 }
-                let loser_hex = loser.public_key().to_hex();
                 quota::charge(m, txn, &loser_hex, &alias, 5000, false)?;
-                quota::charge(m, txn, &loser_hex, &alias, 4096 + 512 + 100, true)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha_spec,
-                    &BlobClaim {
-                        size: 4096,
-                        aliases: vec![alias.clone()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: Some(SpecCharge {
-                            tenant: loser_hex.clone(),
-                            alias: alias.clone(),
-                            bytes: 4096,
-                        }),
-                        stored_at: None,
-                    },
-                )?;
-                m.put_alias_claim(txn, &alias, &sha_spec)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha_stored,
-                    &BlobClaim {
-                        size: 512,
-                        aliases: vec![alias.clone()],
-                        unreferenced_since: None,
-                        stored: true,
-                        charged_tenant: Some(loser_hex.clone()),
-                        charged_alias: Some(alias.clone()),
-                        spec_charge: None,
-                        stored_at: None,
-                    },
-                )?;
-                m.put_alias_claim(txn, &alias, &sha_stored)?;
-                m.put_blob_claim(
-                    txn,
-                    &sha_shared,
-                    &BlobClaim {
-                        size: 100,
-                        aliases: vec![alias.clone(), other.clone()],
-                        unreferenced_since: None,
-                        stored: false,
-                        charged_tenant: None,
-                        charged_alias: None,
-                        spec_charge: Some(SpecCharge {
-                            tenant: loser_hex.clone(),
-                            alias: alias.clone(),
-                            bytes: 100,
-                        }),
-                        stored_at: None,
-                    },
-                )?;
-                m.put_alias_claim(txn, &alias, &sha_shared)?;
-                m.put_alias_claim(txn, &other, &sha_shared)
+                claims::attach_to(m, txn, &sha_declared, &loser_hex, &alias, 4096)?;
+                claims::attach_to(m, txn, &sha_stored, &loser_hex, &alias, 512)?;
+                let before = m.get_blob_claim(txn, &sha_stored)?;
+                let mut stored = before.clone().expect("declared");
+                let moves = claims::settle_stored(&mut stored, 512, 1);
+                claims::commit(m, txn, &sha_stored, before.as_ref(), Some(&stored), &moves)?;
+                claims::attach_to(m, txn, &sha_shared, &loser_hex, &alias, 100)?;
+                claims::attach_to(m, txn, &sha_shared, &survivor_hex, &other, 100)
             })
             .unwrap();
+        let blob_column = |key: String| {
+            let txn = svc.meta.read_txn().unwrap();
+            svc.meta.get_ledger_txn(&txn, &key).unwrap().blob_bytes
+        };
+        assert_eq!(blob_column(quota::alias_key(&alias)), 4096 + 512 + 100);
 
         // The earlier-created winner takes the alias (the loser's seat is
         // young).
         let reg_w = registration_event(&winner, &alias, 1000);
         let outcome = handle_at(svc, &reg_w, WHILE_YOUNG);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
-        assert_eq!(
-            outcome.prune,
-            vec![(loser.public_key().to_hex(), alias.clone())]
-        );
+        assert_eq!(outcome.prune, vec![(loser_hex.clone(), alias.clone())]);
         let winner_bytes = reg_w.as_json().len() as u64;
 
         let txn = svc.meta.read_txn().unwrap();
-        // (4) Ring editions deleted — the winner starts a fresh ring.
+        // Ring editions deleted — the winner starts a fresh ring.
         assert!(
             svc.meta
                 .state_ring_for_alias(&txn, &alias)
@@ -1701,38 +1660,46 @@ mod tests {
                 .is_empty(),
             "loser ring editions must be deleted at eviction"
         );
-        // (1)+(2) Unstored spec-charged claim: stripped, marked for GC, and
-        // its spec charge released in the same txn.
-        let c = svc.meta.get_blob_claim(&txn, &sha_spec).unwrap().unwrap();
-        assert!(c.aliases.is_empty());
-        assert!(c.unreferenced_since.is_some());
+        // A declared blob nobody else references: claim and charge gone.
         assert!(
-            c.spec_charge.is_none(),
-            "orphaned spec charge must be released in the eviction txn"
+            svc.meta
+                .get_blob_claim(&txn, &sha_declared)
+                .unwrap()
+                .is_none(),
+            "a never-stored claim goes with its last reference"
         );
-        // (1) Stored claim: stripped + marked; its stored charge stays for
-        // GC's release_claim path (no hand-rolled refund here).
+        // Stored bytes nobody else references: kept for GC, and so is the
+        // loser's charge for them.
         let c = svc.meta.get_blob_claim(&txn, &sha_stored).unwrap().unwrap();
         assert!(c.aliases.is_empty());
         assert!(c.unreferenced_since.is_some());
-        assert!(c.stored && c.charged_tenant.is_some());
-        // R2-A: the shared claim keeps the live alias — and its spec
-        // charge, CARRIED BY THE DEAD ALIAS, is released in the same txn
-        // (pre-R2-A this stranded on the dead scope with zero release paths).
+        assert!(c.stored, "{c:?}");
+        assert_eq!(
+            c.charges,
+            vec![super::super::meta::ClaimCharge {
+                tenant: loser_hex.clone(),
+                alias: alias.clone(),
+                bytes: 512,
+            }],
+            "the last referrer of stored bytes pays until GC"
+        );
+        // The shared claim keeps the survivor and its own charge only.
         let c = svc.meta.get_blob_claim(&txn, &sha_shared).unwrap().unwrap();
         assert_eq!(c.aliases, vec![other.clone()]);
-        assert!(
-            c.spec_charge.is_none(),
-            "the dead charger's spec charge must be released even while a live alias references the sha"
+        assert_eq!(claims::charge_of(&c, &alias), None);
+        assert_eq!(claims::charge_of(&c, &other), Some(100));
+        assert_eq!(
+            svc.meta.alias_claim_shas(&txn, &alias).unwrap(),
+            vec![sha_stored.clone()],
+            "the index keeps the grace charge for GC to find"
         );
-        assert!(svc.meta.alias_claim_shas(&txn, &alias).unwrap().is_empty());
         assert_eq!(
             svc.meta.alias_claim_shas(&txn, &other).unwrap(),
             vec![sha_shared.clone()]
         );
-        // (3) The alias scope's event column was reset and the winner's own
+        // The alias scope's event column was reset and the winner's own
         // registration charge then landed in the same txn; the blob column
-        // keeps only the stored bytes (dead spec released).
+        // keeps only the stored bytes' grace charge.
         let r = svc
             .meta
             .get_ledger_txn(&txn, &quota::alias_key(&alias))
@@ -1740,10 +1707,10 @@ mod tests {
         assert_eq!(r.event_bytes, winner_bytes);
         assert_eq!(r.blob_bytes, 512);
         // The loser's tenant scope keeps its stranded event bytes (!1/!4);
-        // its blob column dropped by exactly the released spec charges.
+        // its blob column only the stored bytes' grace charge.
         let t = svc
             .meta
-            .get_ledger_txn(&txn, &quota::tenant_key(&loser.public_key().to_hex()))
+            .get_ledger_txn(&txn, &quota::tenant_key(&loser_hex))
             .unwrap();
         assert_eq!(t.event_bytes, 5000 + reg1_bytes);
         assert_eq!(t.blob_bytes, 512);
@@ -1757,11 +1724,7 @@ mod tests {
                 reg_w.id.to_hex().as_str()
             )
         );
-        assert!(svc
-            .meta
-            .get_key_claim(&txn, &loser.public_key().to_hex())
-            .unwrap()
-            .is_none());
+        assert!(svc.meta.get_key_claim(&txn, &loser_hex).unwrap().is_none());
         assert_eq!(
             svc.meta
                 .get_key_claim(&txn, &winner.public_key().to_hex())
@@ -1770,11 +1733,10 @@ mod tests {
         );
         drop(txn);
 
-        // R2-A: the surviving referrer is re-charged on its next referencing
-        // 30641 — the charge migrates exactly once to the SURVIVOR's scope.
-        // Register the survivor (w = its own tenant key) and make its 30640
-        // coordinate queryable (liveness checks the relay DB too).
-        let survivor = Keys::generate();
+        // The survivor's next state root naming the shared sha is charged
+        // nothing more for it: one charge per repository. Register the
+        // survivor (w = its own tenant key) and make its 30640 coordinate
+        // queryable (liveness checks the relay DB too).
         let reg_s = registration_event(&survivor, &other, 1500);
         let outcome = handle(svc, &reg_s);
         assert!(matches!(outcome.result, WritePolicyResult::Accept));
@@ -1791,27 +1753,11 @@ mod tests {
         );
         let txn = svc.meta.read_txn().unwrap();
         let c = svc.meta.get_blob_claim(&txn, &sha_shared).unwrap().unwrap();
-        let spec = c
-            .spec_charge
-            .expect("the survivor must be re-charged for the still-referenced sha");
-        assert_eq!(spec.tenant, survivor.public_key().to_hex());
-        assert_eq!(spec.alias, other);
-        assert_eq!(spec.bytes, 100);
-        assert_eq!(
-            svc.meta
-                .get_ledger_txn(&txn, &quota::tenant_key(&survivor.public_key().to_hex()))
-                .unwrap()
-                .blob_bytes,
-            100,
-            "the migrated charge lands on the survivor's tenant scope"
-        );
-        assert_eq!(
-            svc.meta
-                .get_ledger_txn(&txn, &quota::alias_key(&other))
-                .unwrap()
-                .blob_bytes,
-            100
-        );
+        assert_eq!(c.charges.len(), 1, "{c:?}");
+        assert_eq!(claims::charge_of(&c, &other), Some(100));
+        drop(txn);
+        assert_eq!(blob_column(quota::tenant_key(&survivor_hex)), 100);
+        assert_eq!(blob_column(quota::alias_key(&other)), 100);
     }
 
     /// A shape-valid 30641 for the harness: `d`, `a` coordinate of the
@@ -2000,7 +1946,7 @@ mod tests {
             .get_ledger_txn(&txn, &quota::alias_key(&alias))
             .unwrap();
         assert_eq!(r.event_bytes, winner_bytes, "ledger untouched");
-        assert_eq!(r.blob_bytes, 0, "no zombie spec charge");
+        assert_eq!(r.blob_bytes, 0, "no zombie charge");
     }
 
     /// R2-C: the wrap charge txn re-verifies registration identity inside
@@ -2958,7 +2904,8 @@ mod tests {
     /// and blob claim stay.
     #[tokio::test]
     async fn settled_seat_keeps_its_alias_against_a_backdated_claim() {
-        use super::super::meta::{BlobClaim, MetaEnv};
+        use super::super::claims;
+        use super::super::meta::MetaEnv;
         use nostr_sdk::prelude::Keys;
 
         let h = harness().await;
@@ -2981,21 +2928,7 @@ mod tests {
                     &MetaEnv::state_ring_key(&alias, SEATED_AT + 60, "aa"),
                     "{}",
                 )?;
-                m.put_blob_claim(
-                    txn,
-                    &sha,
-                    &BlobClaim {
-                        size: 512,
-                        aliases: vec![alias.clone()],
-                        unreferenced_since: None,
-                        stored: true,
-                        charged_tenant: Some(holder_hex.clone()),
-                        charged_alias: Some(alias.clone()),
-                        spec_charge: None,
-                        stored_at: None,
-                    },
-                )?;
-                m.put_alias_claim(txn, &alias, &sha)
+                claims::attach_to(m, txn, &sha, &holder_hex, &alias, 512)
             })
             .unwrap();
 
@@ -3040,6 +2973,11 @@ mod tests {
         );
         let claim = svc.meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
         assert_eq!(claim.aliases, vec![alias.clone()], "the claim is kept");
+        assert_eq!(
+            claim.charges.len(),
+            1,
+            "and so is the holder's charge for it"
+        );
         assert!(claim.unreferenced_since.is_none());
     }
 

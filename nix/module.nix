@@ -1000,13 +1000,16 @@ let
           takedown denylist files (one blob sha256 hex digest per line).
           Matching blobs are not served (GET/HEAD -> 451), not accepted
           (upload preflight -> 451), not stored (in-flight uploads fail at
-          commit), and not mirrored. A missing file is tolerated (warning +
-          treated as empty); a present-but-unreadable file is a hard boot
-          error. Each file is capped (64 MiB / 1M lines): an over-cap file
-          is a hard boot error and keeps its last-known entries on reload.
+          commit), and not mirrored. A file missing at boot is tolerated
+          (warning + treated as empty); a present-but-unreadable file is a
+          hard boot error. A file that disappears after it was read, or
+          reads back empty, keeps its last-known entries and logs an error
+          on every reload until it is back (a comment line clears a list).
+          Each file is capped (64 MiB / 1M lines): an over-cap file is a
+          hard boot error and keeps its last-known entries on reload.
           Writers MUST update files atomically (write-temp-then-rename) —
-          the reload keys off mtime and a torn write is a known staleness
-          window. Node-local legal config — deliberately NOT part of the
+          the reload keys off mtime and length, and a torn write is a known
+          staleness window. Node-local legal config — deliberately NOT part of the
           policy_fingerprint. Only has an effect when private repos are
           enabled (NGIT_GRASP_P_REPOS_ENABLE).
         '';

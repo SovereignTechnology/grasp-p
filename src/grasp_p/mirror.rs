@@ -48,8 +48,11 @@
 //! A blob that several accounts claim is fetched for the one with the
 //! fewest missing blobs. The other claimants are kept as fallbacks: when
 //! the first one's own state refuses the blob (its quota is full, its
-//! registration is gone), the fetch goes on for the next, so one account
-//! cannot stop a blob that another account can take.
+//! registration is gone, it no longer references the blob), the fetch goes
+//! on for the next, so one account cannot stop a blob that another account
+//! can take. A fetch adds no reference: it only stores bytes a repository
+//! here already references and pays for, and they set every such charge to
+//! their stored size (`claims::settle_stored`).
 //!
 //! The worker loop never waits for a free fetch slot. It takes new jobs,
 //! starts and collects repair scans and collects finished fetches as they
@@ -147,7 +150,10 @@ pub(crate) fn clock_now() -> Instant {
 #[derive(Debug, Clone)]
 pub struct WantBlob {
     pub sha256: String,
-    /// Declared size from the 30641 tag / blob claim.
+    /// Declared size: from the 30641 tag, or the charge of the repository
+    /// the repair scan chose first. A fallback repository is judged, and
+    /// read for, at its own charge instead (`fetch_from_peer`), so no
+    /// account's declaration sets the size fetched for another.
     pub size: u64,
 }
 
@@ -1148,15 +1154,16 @@ struct ScanOutcome {
 struct Claimant {
     account: String,
     alias: String,
-    /// Whether the blob's speculative charge is booked to this alias.
-    holds_charge: bool,
 }
 
 /// A missing blob as the scan sees it between its two passes.
 struct Wanted {
-    blob: WantBlob,
-    /// The alias the blob's speculative charge is booked to, if any.
-    charged_alias: Option<String>,
+    sha256: String,
+    /// The claim's size, for a claimant with no charge of its own (which
+    /// the claim's invariants rule out).
+    claim_size: u64,
+    /// What each referencing repository is charged: its own declared size.
+    charges: Vec<super::meta::ClaimCharge>,
     /// The live registrations that claim it.
     live: Vec<Arc<Route>>,
 }
@@ -1182,10 +1189,9 @@ const MAX_ROUTES_PER_BLOB: usize = 4;
 /// for a blob every time, be refused every time, and keep the blob from
 /// the account that can take it.
 ///
-/// Within one account the alias that holds the blob's speculative charge
-/// comes first, then the alias that sorts first. The quota forecast nets
-/// that charge only for the alias it is booked to; for a sibling alias it
-/// would count the blob twice against the account.
+/// Within one account the alias that sorts first is chosen: every
+/// referencing alias pays its own charge, and the quota forecast nets each
+/// one's own, so none of them is a better choice than another.
 fn rank_claimants(claimants: &[Claimant], account_lag: &HashMap<String, u64>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..claimants.len()).collect();
     order.sort_by_key(|&index| {
@@ -1193,7 +1199,6 @@ fn rank_claimants(claimants: &[Claimant], account_lag: &HashMap<String, u64>) ->
         (
             account_lag.get(&claimant.account).copied().unwrap_or(0),
             claimant.account.as_str(),
-            !claimant.holds_charge,
             claimant.alias.as_str(),
         )
     });
@@ -1286,11 +1291,9 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
             *account_lag.entry(account.to_string()).or_insert(0) += 1;
         }
         wanted.push(Wanted {
-            blob: WantBlob {
-                sha256: sha,
-                size: claim.size,
-            },
-            charged_alias: claim.spec_charge.map(|charge| charge.alias),
+            sha256: sha,
+            claim_size: claim.size,
+            charges: claim.charges,
             live,
         });
     }
@@ -1301,12 +1304,13 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
     // again.
     let mut derived: HashMap<String, usize> = HashMap::new();
     for Wanted {
-        blob,
-        charged_alias,
+        sha256,
+        claim_size,
+        charges,
         live,
     } in wanted
     {
-        if gated.contains(&blob.sha256) {
+        if gated.contains(&sha256) {
             continue;
         }
         let claimants: Vec<Claimant> = live
@@ -1314,7 +1318,6 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
             .map(|route| Claimant {
                 account: route.tenant_hex.clone(),
                 alias: route.alias.clone(),
-                holds_charge: charged_alias.as_deref() == Some(route.alias.as_str()),
             })
             .collect();
         let ranked = rank_claimants(&claimants, &account_lag);
@@ -1322,6 +1325,15 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
             continue;
         };
         let route = live[chosen].clone();
+        // The size the chosen repository declared, which is what it pays
+        // until the bytes arrive: a first declarer's size no longer decides
+        // the fetch for everyone.
+        let size = charges
+            .iter()
+            .find(|charge| charge.alias == route.alias)
+            .map(|charge| charge.bytes)
+            .unwrap_or(claim_size);
+        let blob = WantBlob { sha256, size };
         let count = derived.entry(route.tenant_hex.clone()).or_insert(0);
         if *count >= ACCOUNT_BACKLOG_CAP {
             continue;
@@ -1392,7 +1404,15 @@ async fn fetch_from_peer(
         PeerVerdict::Unresolved => return Err(UNRESOLVED_REASON.to_string()),
     }
 
-    local_preflight(svc, route, blob, blob.size)?;
+    // What this route's own repository declared, which is what it pays
+    // until the bytes arrive: for a fallback, `blob.size` is the first
+    // route's declaration.
+    let own = svc
+        .prior_charge(&blob.sha256, &route.alias)
+        .map_err(|e| format!("reserve: {}", e.reason()))?;
+    let declared = if own > 0 { own } else { blob.size };
+
+    local_preflight(svc, route, blob, declared)?;
 
     let started = tokio::time::Instant::now();
     let url = format!("{}/{}", peer_base, blob.sha256);
@@ -1410,24 +1430,24 @@ async fn fetch_from_peer(
         return Err(format!("http_status: {}", response.status().as_u16()));
     }
 
-    let expected = expected_len(response.content_length(), blob.size, svc.cfg.max_blob_bytes)?;
+    let expected = expected_len(response.content_length(), declared, svc.cfg.max_blob_bytes)?;
     // The preflight above used the declared size. The peer may have
     // announced a larger one; ask again before reading it.
-    if expected > blob.size {
+    if expected > declared {
         local_preflight(svc, route, blob, expected)?;
     }
 
     // Reserve in-flight bytes, then open the temp file (as a client PUT
-    // does: reservation, sink, stream, finish). finish() releases any
-    // pending speculative charge before its quota check, so the
-    // reservation nets it too.
+    // does: reservation, sink, stream, finish). Storing sets the route's
+    // own charge to the stored size instead of adding one, so the
+    // reservation nets that charge.
     //
     // The reservation is for bytes only. A fetch takes none of the upload
     // slots clients share, so clients that fill or stall those slots cannot
     // stop replication; the worker's own concurrency limit bounds how many
     // fetches run at once.
     let pending = svc
-        .pending_spec_release(&blob.sha256)
+        .prior_charge(&blob.sha256, &route.alias)
         .map_err(|e| format!("reserve: {}", e.reason()))?;
     let reservation = svc
         .reserve_upload(UploadOrigin::Mirror, &route.tenant_hex, expected, pending)
@@ -1445,6 +1465,7 @@ async fn fetch_from_peer(
         expected,
         reservation,
         svc.denylist.clone(),
+        UploadOrigin::Mirror,
     )
     .await
     .map_err(|e| format!("sink: {}", e.reason()))?;
@@ -2405,9 +2426,11 @@ mod tests {
                 aliases: vec![alias.clone()],
                 unreferenced_since: None,
                 stored: false,
-                charged_tenant: None,
-                charged_alias: None,
-                spec_charge: None,
+                charges: vec![crate::grasp_p::meta::ClaimCharge {
+                    tenant: record.tenant_hex.clone(),
+                    alias: alias.clone(),
+                    bytes: 100,
+                }],
                 stored_at: None,
             };
             svc.meta
@@ -2458,6 +2481,79 @@ mod tests {
         );
     }
 
+    /// The repair scan fetches a blob at the size the repository it fetches
+    /// for declared, not at the size the claim was first declared with: a
+    /// first declarer must not set what another account's fetch reads.
+    #[tokio::test]
+    async fn the_scan_fetches_at_the_chosen_repositorys_own_size() {
+        use crate::grasp_p::meta::{BlobClaim, ClaimCharge, RegistrationRecord};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: crate::nostr::SharedDatabase =
+            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+
+        let record = |tenant: &str| RegistrationRecord {
+            tenant_hex: tenant.to_string(),
+            event_id: "01".repeat(32),
+            created_at: 1,
+            w_keys: Vec::new(),
+            aux_keys: Vec::new(),
+            relays: Vec::new(),
+            servers: Vec::new(),
+            quota_class: None,
+            registered_at: 1,
+            tombstoned_at: None,
+            first_created_at: None,
+            first_event_id: None,
+        };
+        let charge = |tenant: &str, alias: &str, bytes: u64| ClaimCharge {
+            tenant: tenant.to_string(),
+            alias: alias.to_string(),
+            bytes,
+        };
+        let (tenant_a, tenant_b) = ("0a".repeat(32), "0b".repeat(32));
+        let (alias_a, alias_b) = ("aa".repeat(16), "bb".repeat(16));
+        let sha = "cd".repeat(32);
+        // B declared first, at 900; A declared 100.
+        let claim = BlobClaim {
+            size: 900,
+            aliases: vec![alias_b.clone(), alias_a.clone()],
+            unreferenced_since: None,
+            stored: false,
+            charges: vec![
+                charge(&tenant_b, &alias_b, 900),
+                charge(&tenant_a, &alias_a, 100),
+            ],
+            stored_at: None,
+        };
+        svc.meta
+            .with_write(|meta, txn| {
+                meta.put_registration(txn, &alias_a, &record(&tenant_a))?;
+                meta.put_registration(txn, &alias_b, &record(&tenant_b))?;
+                meta.put_blob_claim(txn, &sha, &claim)
+            })
+            .expect("seed the registrations and the claim");
+
+        let outcome = scan_missing(&svc, clock_now()).expect("the claim table reads");
+        assert_eq!(outcome.tasks.len(), 1);
+        let task = &outcome.tasks[0];
+        assert_eq!(
+            task.route.alias, alias_a,
+            "equal backlogs: the account that sorts first"
+        );
+        assert_eq!(task.blob.size, 100, "A's own declared size");
+        assert_eq!(task.fallbacks.len(), 1);
+    }
+
     #[test]
     fn fetch_deadline_grows_with_size() {
         let base = Duration::from_secs(120);
@@ -2480,7 +2576,6 @@ mod tests {
         Claimant {
             account: account.to_string(),
             alias: alias.to_string(),
-            holds_charge: false,
         }
     }
 
@@ -2507,19 +2602,17 @@ mod tests {
         let same_account = [claimant("aa", "repo-2"), claimant("aa", "repo-1")];
         assert_eq!(rank_claimants(&same_account, &even), vec![1]);
 
-        // Within an account, the alias the blob's charge is booked to.
-        let charged = [
+        // Within an account, the alias that sorts first, whatever the
+        // order of the claims: every alias pays its own charge.
+        let shared = [
+            claimant("aa", "repo-2"),
             claimant("aa", "repo-1"),
-            Claimant {
-                holds_charge: true,
-                ..claimant("aa", "repo-2")
-            },
             claimant("bb", "repo-3"),
         ];
-        assert_eq!(rank_claimants(&charged, &even), vec![1, 2]);
-        // The charge does not move a blob to a longer queue.
+        assert_eq!(rank_claimants(&shared, &even), vec![1, 2]);
+        // A longer queue still loses.
         let lagging: HashMap<String, u64> = [("aa".to_string(), 9)].into_iter().collect();
-        assert_eq!(rank_claimants(&charged, &lagging), vec![2, 1]);
+        assert_eq!(rank_claimants(&shared, &lagging), vec![2, 1]);
 
         // No more accounts than a fetch may try.
         let many: Vec<Claimant> = (0..10)
@@ -3817,6 +3910,77 @@ mod tests {
             reason.contains(PEER_NAME) && reason.contains("127.0.0.1"),
             "{reason}"
         );
+        assert_eq!(peer.accepted(), 0);
+    }
+
+    /// A fallback route is judged at its own repository's declared size,
+    /// not at the size of the route the scan chose first: at the first
+    /// route's 5000 bytes this repository's 1000-byte cap would refuse the
+    /// blob as `quota` before any request; at its own 100 the request goes
+    /// out, and here the resolver refuses it.
+    #[tokio::test]
+    async fn a_fallback_route_is_judged_at_its_own_declared_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_mirror_allow_private_ips = true;
+        config.private_quota_repo_bytes = 1000;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: crate::nostr::SharedDatabase =
+            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let route = Route {
+            tenant_hex: "ef".repeat(32),
+            alias: "ab".repeat(16),
+            peer_servers: Vec::new(),
+        };
+        let sha = "cd".repeat(32);
+        svc.meta
+            .with_write(|meta, txn| {
+                crate::grasp_p::claims::attach_to(
+                    meta,
+                    txn,
+                    &sha,
+                    &"0b".repeat(32),
+                    &"bb".repeat(16),
+                    5000,
+                )?;
+                crate::grasp_p::claims::attach_to(
+                    meta,
+                    txn,
+                    &sha,
+                    &route.tenant_hex,
+                    &route.alias,
+                    100,
+                )
+            })
+            .expect("both repositories declare the blob");
+        let blob = WantBlob {
+            sha256: sha.clone(),
+            size: 5000,
+        };
+        let peer = CountingPeer::start().await;
+        let resolver = VettedResolver::with_lookup(false, Arc::new(answer_loopback));
+        let client = http_client(Duration::from_secs(5), resolver).expect("the mirror's client");
+        let peer_base = format!("http://{PEER_NAME}:{}", peer.port);
+
+        let reason = fetch_from_peer(
+            &svc,
+            &client,
+            Duration::from_secs(5),
+            &route,
+            &blob,
+            &peer_base,
+        )
+        .await
+        .expect_err("the resolver refuses loopback");
+
+        assert_eq!(reason_label(&reason), "blocked", "{reason}");
         assert_eq!(peer.accepted(), 0);
     }
 

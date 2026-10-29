@@ -106,22 +106,33 @@ impl LedgerEntry {
     }
 }
 
-/// Speculative (pre-upload) ledger charge attached to a `stored = false`
-/// blob claim: the declared bytes a 30641 charged to its (tenant, alias)
-/// when it referenced a blob that was not yet stored (issue !12 — without
-/// this, speculative claims accumulate unbilled and a tenant can grow the
-/// shared meta LMDB at zero ledger cost). Released exactly once: when the
-/// claim transitions to `stored` (the upload/mirror path takes over the
-/// accounting) or when the claim is deleted by GC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpecCharge {
+/// What one repository is charged for one blob it references (decision D4:
+/// every referencing repository pays the blob's full size, at the
+/// repository, account and node scopes, and the disk keeps one copy).
+///
+/// The charge records its own bytes because they are what was taken from
+/// the ledger: a release gives back exactly that, whatever the claim's size
+/// says by then and whatever later rule decides how bytes are counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimCharge {
+    /// Account (tenant key, lowercase hex) the repository belonged to when
+    /// it was charged.
     pub tenant: String,
+    /// The repository (alias).
     pub alias: String,
+    /// Bytes charged at each of the three scopes.
     pub bytes: u64,
 }
 
 /// Claim record for one stored (or referenced) blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `aliases` and `charges` change only through `claims.rs`, which keeps
+/// them in step: every alias in `aliases` has exactly one charge, and a
+/// charge whose alias is not there is the grace charge of the last
+/// repository that stopped referencing stored bytes, the only charge left
+/// on its claim. A claim that exists is either charged or on disk: one
+/// that was never stored is deleted with its last reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobClaim {
     /// Size in bytes. For claims created by a 30641 before upload this is the
     /// declared size from the tag; replaced by the actual size at upload.
@@ -130,21 +141,22 @@ pub struct BlobClaim {
     pub aliases: Vec<String>,
     /// Unix seconds since the blob became unreferenced (GC grace anchor).
     pub unreferenced_since: Option<u64>,
-    /// Whether the blob file has actually been stored (charged to the ledger).
+    /// Whether the blob file has actually been stored.
     pub stored: bool,
-    /// Scope the stored bytes were charged to (released on GC delete).
-    pub charged_tenant: Option<String>,
-    pub charged_alias: Option<String>,
-    /// Speculative charge for a not-yet-stored declared blob (issue !12).
-    /// `serde(default)` keeps records written before this field readable.
-    #[serde(default)]
-    pub spec_charge: Option<SpecCharge>,
+    /// The charges this blob carries, one per referencing repository, plus
+    /// at most a grace charge when none references it.
+    ///
+    /// No default on purpose: a claim written before this field existed
+    /// carried its payer in `charged_tenant`, `charged_alias` and
+    /// `spec_charge`, which cannot be turned into per-repository charges
+    /// without guessing. Such a record fails to read, and every operation
+    /// that touches it fails with it, rather than being billed wrongly.
+    pub charges: Vec<ClaimCharge>,
     /// Unix seconds when THIS node first stored the bytes, whether a client
     /// uploaded them or the mirror fetched them. It is what `/list` and the
     /// upload descriptor report as `uploaded`, so the two nodes of a pair
     /// each report their own time for one blob. `None` while the blob is
-    /// only declared. Claims are stored as JSON, so `serde(default)` reads
-    /// a record written before this field existed as `None`.
+    /// only declared.
     #[serde(default)]
     pub stored_at: Option<u64>,
 }
@@ -156,9 +168,12 @@ struct MetaInner {
     tenant_aliases: Database<Str, SerdeJson<Vec<String>>>,
     ledger: Database<Str, SerdeJson<LedgerEntry>>,
     blob_claims: Database<Str, SerdeJson<BlobClaim>>,
-    /// Per-alias claim index: `<alias>:<sha256>` → sha256. Kept in lockstep
-    /// with `BlobClaim::aliases` inside the same write txn so tenant-scoped
-    /// listings never scan the whole cross-tenant `blob_claims` table.
+    /// Per-alias claim index: `<alias>:<sha256>` → sha256. An entry exists
+    /// while the alias references the blob or carries a charge on it (the
+    /// grace charge of the last referrer), kept in the same write txn as
+    /// the claim, so that a repository's death finds every charge it holds
+    /// and tenant-scoped listings never scan the whole cross-tenant
+    /// `blob_claims` table.
     alias_claims: Database<Str, Str>,
     state_ring: Database<Str, Str>,
     /// Set of kind-1059 wrap event ids (hex) whose bytes have already been
@@ -365,8 +380,10 @@ impl MetaEnv {
         Ok(())
     }
 
-    /// All sha256es claimed by `alias` (prefix scan over the alias index —
-    /// O(claims of this alias), never a cross-tenant table scan).
+    /// All sha256es `alias` references or is charged for (prefix scan over
+    /// the alias index — O(claims of this alias), never a cross-tenant
+    /// table scan). A caller that wants references only checks
+    /// `BlobClaim::aliases`.
     pub fn alias_claim_shas(&self, txn: &RoTxn, alias: &str) -> Result<Vec<String>> {
         let prefix = format!("{alias}:");
         let mut out = Vec::new();
@@ -489,15 +506,23 @@ impl MetaEnv {
 mod tests {
     use super::*;
 
-    /// A claim written before `stored_at` existed has no such key. It must
-    /// still read, as a blob whose storing time is unknown; a claim written
-    /// now must carry the time.
+    /// A claim of this shape written without `stored_at` reads as a blob
+    /// whose storing time is unknown, and a claim written now keeps the
+    /// time.
     #[test]
-    fn claim_written_before_stored_at_still_reads() {
-        let old = r#"{"size":7,"aliases":["a"],"unreferenced_since":null,"stored":true,"charged_tenant":"t","charged_alias":"a","spec_charge":null}"#;
-        let claim: BlobClaim = serde_json::from_str(old).expect("an old claim must read");
+    fn claim_without_stored_at_still_reads() {
+        let record = r#"{"size":7,"aliases":["a"],"unreferenced_since":null,"stored":true,"charges":[{"tenant":"t","alias":"a","bytes":7}]}"#;
+        let claim: BlobClaim = serde_json::from_str(record).expect("the claim must read");
         assert!(claim.stored);
         assert_eq!(claim.stored_at, None);
+        assert_eq!(
+            claim.charges,
+            vec![ClaimCharge {
+                tenant: "t".to_string(),
+                alias: "a".to_string(),
+                bytes: 7,
+            }]
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaEnv::open(dir.path()).unwrap();
@@ -510,7 +535,39 @@ mod tests {
             .unwrap();
         let txn = meta.read_txn().unwrap();
         let read = meta.get_blob_claim(&txn, &sha).unwrap().unwrap();
-        assert_eq!(read.stored_at, Some(1_700_000_000));
+        assert_eq!(read, written);
+    }
+
+    /// A claim in the shape that named one payer (`charged_tenant`,
+    /// `charged_alias`, `spec_charge`) has no per-repository charges to
+    /// read. It is refused, in the store as well as on its own, so that
+    /// nothing bills from a guess.
+    #[test]
+    fn claim_in_the_single_payer_shape_is_refused() {
+        let old = r#"{"size":7,"aliases":["a"],"unreferenced_since":null,"stored":true,"charged_tenant":"t","charged_alias":"a","spec_charge":null,"stored_at":5}"#;
+        let err = serde_json::from_str::<BlobClaim>(old).expect_err("an old claim must not read");
+        assert!(
+            err.to_string().contains("charges"),
+            "unexpected error: {err}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let sha = "cd".repeat(32);
+        meta.with_write(|m, txn| {
+            m.inner
+                .blob_claims
+                .remap_data_type::<Str>()
+                .put(txn, &sha, old)?;
+            Ok(())
+        })
+        .unwrap();
+        let txn = meta.read_txn().unwrap();
+        assert!(
+            meta.get_blob_claim(&txn, &sha).is_err(),
+            "reading an old claim from the store must fail"
+        );
+        assert!(meta.all_blob_claims(&txn).is_err());
     }
 
     /// B3: charged wrap ids must be pruned once they age past the retention

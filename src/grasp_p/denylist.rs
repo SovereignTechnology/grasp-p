@@ -9,13 +9,18 @@
 //! Semantics:
 //!
 //! - **Multi-file**: `NGIT_GRASP_P_DENYLIST_PATH` is a comma-separated list
-//!   of files (per-node / per-jurisdiction lists). A MISSING file is
+//!   of files (per-node / per-jurisdiction lists). A file MISSING AT BOOT is
 //!   tolerated (warn + treated as empty); a present-but-unreadable file is
-//!   a hard boot error (fail loud on misconfig). During reload an
-//!   unreadable file keeps its last-known entries (a transient read error
-//!   must not silently unblock taken-down content) and is retried every
-//!   tick. The reload starts from what the boot load read, file by file,
-//!   so "last-known" includes the entries a file had at boot.
+//!   a hard boot error (fail loud on misconfig). During reload a file that
+//!   is unreadable, no longer parses, or has disappeared keeps its
+//!   last-known entries, logs an error and is retried every tick (decision
+//!   D11): an unmounted volume or a deploy that deletes before it writes
+//!   must not lift takedowns. A takedown is lifted only by a readable file
+//!   that no longer lists the hash. A file that had entries and is read
+//!   back empty keeps them too, as a deploy that truncates before it writes
+//!   leaves it for a moment; to clear a list on purpose, leave a comment
+//!   line in it. The reload starts from what the boot load read, file by
+//!   file, so "last-known" includes the entries a file had at boot.
 //! - **Atomic swap**: the live set sits behind an `RwLock`; a reload
 //!   builds the new union off-lock and swaps it in one write critical
 //!   section. Reads (GET/HEAD 451, upload preflight, finish() race
@@ -33,7 +38,8 @@
 //!   over-cap is a hard boot error, and on reload the file keeps its
 //!   last-known entries (error logged, retried every tick). Writers MUST
 //!   update files atomically (write-temp-then-rename): the reload keys off
-//!   mtime, and a torn write is a known staleness window (L1-F7).
+//!   mtime and length, and a torn write that is read half-written is a
+//!   known staleness window (L1-F7).
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
@@ -130,6 +136,13 @@ pub(crate) fn union(files: &[FileState]) -> HashSet<String> {
         .collect()
 }
 
+/// The file's length, `None` when it cannot be read. Compared with the
+/// time: a rewrite on a filesystem with coarse times can keep the time of
+/// a torn read, and would otherwise not be read again until the next one.
+fn file_len(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
 /// The file's modification time. `Ok(None)` when the file does not exist.
 fn modified_time(path: &str) -> std::io::Result<Option<SystemTime>> {
     match std::fs::metadata(path).and_then(|m| m.modified()) {
@@ -145,6 +158,7 @@ fn modified_time(path: &str) -> std::io::Result<Option<SystemTime>> {
 pub(crate) struct FileState {
     path: String,
     mtime: Option<SystemTime>,
+    len: Option<u64>,
     hashes: HashSet<String>,
 }
 
@@ -155,6 +169,7 @@ impl FileState {
         Self {
             path: path.to_string(),
             mtime: None,
+            len: None,
             hashes: HashSet::new(),
         }
     }
@@ -167,19 +182,24 @@ impl FileState {
         // that cannot be read is treated as unknown, which also makes the
         // first reload read the file again.
         let mtime = modified_time(path).ok().flatten();
+        let len = file_len(path);
         match read_file_capped(path) {
             Ok(contents) => Ok(Self {
                 path: path.to_string(),
                 mtime,
+                len,
                 hashes: parse_contents(&contents)
                     .with_context(|| format!("failed to parse private denylist at {path}"))?,
             }),
-            // Open decision (maintainer): a missing file counts as empty, as in `refresh`.
+            // Missing at boot: tolerated, since a jurisdiction's list may
+            // simply not be mounted on this node. Unlike a file that
+            // disappears later, there are no entries to keep.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!("private denylist file {path} not found; treating it as empty");
                 Ok(Self {
                     path: path.to_string(),
                     mtime: None,
+                    len: None,
                     hashes: HashSet::new(),
                 })
             }
@@ -204,13 +224,28 @@ impl FileState {
                 return false;
             }
         };
-        if mtime == self.mtime {
+        let len = file_len(&self.path);
+        if mtime == self.mtime && len == self.len {
             return false;
         }
         match read_file_capped(&self.path) {
+            Ok(contents) if contents.trim().is_empty() && !self.hashes.is_empty() => {
+                // Decision D11: a list that had entries and reads back empty
+                // is most likely a deploy that truncated before it wrote,
+                // read in between; keep the entries and look again next
+                // tick. A list is cleared on purpose by leaving a comment
+                // line in it.
+                tracing::error!(
+                    "private denylist file {} is empty; keeping last-known entries \
+                     (leave a comment line in it to clear it)",
+                    self.path
+                );
+                false
+            }
             Ok(contents) => match parse_contents(&contents) {
                 Ok(hashes) => {
                     self.mtime = mtime;
+                    self.len = len;
                     self.hashes = hashes;
                     true
                 }
@@ -227,20 +262,18 @@ impl FileState {
                     false
                 }
             },
-            // Open decision (maintainer): a missing file counts as empty, as in `load_boot`.
+            // Decision D11: a file that disappeared keeps its last-known
+            // entries, like one that cannot be read, so an unmounted volume
+            // or a non-atomic deploy lifts no takedown. The time is not
+            // advanced, so the error repeats every tick until the file is
+            // back; a file that was never there has no time and never gets
+            // this far.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Disappeared (or still absent): treat as empty. Warn only
-                // on the transition (mtime Some -> None), not every tick.
-                if self.mtime.is_some() {
-                    tracing::warn!(
-                        "private denylist file {} no longer found; treating it as empty",
-                        self.path
-                    );
-                }
-                self.mtime = None;
-                let changed = !self.hashes.is_empty();
-                self.hashes = HashSet::new();
-                changed
+                tracing::error!(
+                    "private denylist file {} has disappeared; keeping last-known entries",
+                    self.path
+                );
+                false
             }
             Err(e) => {
                 // Present but unreadable: boot fails loud, but a live node
@@ -301,8 +334,9 @@ impl FileState {
 }
 
 /// Refresh every file, and return the new union when any of them may have
-/// changed. A file that could not be read or parsed keeps the entries it
-/// had, so they are in the union whatever happened to the other files.
+/// changed. A file that could not be read or parsed, or has disappeared,
+/// keeps the entries it had, so they are in the union whatever happened to
+/// the other files.
 ///
 /// Kept apart from the swap and the purge so that the rule can be tested
 /// without a service or a timer.
@@ -471,8 +505,9 @@ mod tests {
         assert!(!f.refresh());
 
         // Modify (bump mtime into the future so coarse-granularity
-        // filesystems cannot alias the previous write).
-        std::fs::write(&path, "").unwrap();
+        // filesystems cannot alias the previous write). A comment line
+        // clears the list; an empty file would keep it (D11).
+        std::fs::write(&path, "# cleared\n").unwrap();
         let bumped = f.mtime.unwrap() + Duration::from_secs(2);
         let file = std::fs::File::open(&path).unwrap();
         file.set_modified(bumped).unwrap();
@@ -480,8 +515,8 @@ mod tests {
         assert!(f.refresh());
         assert!(f.hashes.is_empty());
 
-        // Repopulate, then remove: present-with-entries → absent is a
-        // change; still-absent afterwards is not.
+        // Repopulate, then remove: the entries are kept (D11), and so is
+        // the time, so the file is looked for again every tick.
         std::fs::write(&path, format!("{sha}\n")).unwrap();
         let bumped = f.mtime.unwrap() + Duration::from_secs(2);
         let file = std::fs::File::open(&path).unwrap();
@@ -490,9 +525,9 @@ mod tests {
         assert!(f.refresh());
         assert!(f.hashes.contains(&sha));
         std::fs::remove_file(&path).unwrap();
-        assert!(f.refresh());
-        assert!(f.hashes.is_empty());
         assert!(!f.refresh());
+        assert!(f.hashes.contains(&sha));
+        assert!(f.mtime.is_some());
     }
 
     /// Write `contents` and move the file's time forward, so that a refresh
@@ -622,17 +657,95 @@ mod tests {
         );
     }
 
-    /// What a file that disappears means is not changed here: its entries
-    /// are dropped, as before. Pinned so that a change to it is deliberate.
+    /// Decision D11: a file that disappears keeps its takedowns, also when
+    /// another file changes and the set is rebuilt, until a readable file
+    /// stops listing them. Without this an unmounted volume lifted every
+    /// takedown in it within one reload interval.
     #[test]
-    fn reload_still_treats_a_file_that_disappeared_as_empty() {
+    fn a_file_that_disappears_keeps_its_entries_until_a_readable_file_drops_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sha_a, sha_b, sha_b2) = ("a".repeat(64), "b".repeat(64), "d".repeat(64));
+        let path_a = dir.path().join("a.txt");
+        let path_b = dir.path().join("b.txt");
+        std::fs::write(&path_a, format!("{sha_a}\n")).unwrap();
+        std::fs::write(&path_b, format!("{sha_b}\n")).unwrap();
+        let mut files = load_boot(&[path_string(&path_a), path_string(&path_b)]).unwrap();
+
+        std::fs::remove_file(&path_a).unwrap();
+        assert!(
+            refresh_all(&mut files).is_none(),
+            "a disappearance alone changes nothing"
+        );
+        rewrite(&path_b, &format!("{sha_b}\n{sha_b2}\n"), files[1].mtime);
+        assert_eq!(
+            refresh_all(&mut files),
+            Some(HashSet::from([
+                sha_a.clone(),
+                sha_b.clone(),
+                sha_b2.clone()
+            ])),
+            "A's entries survive a rebuild while A is gone"
+        );
+
+        // A comes back without its hash: the takedown is lifted now.
+        rewrite(&path_a, "# lifted\n", files[0].mtime);
+        assert_eq!(
+            refresh_all(&mut files),
+            Some(HashSet::from([sha_b, sha_b2]))
+        );
+    }
+
+    /// Decision D11 against a deploy that truncates before it writes: a list
+    /// read back empty keeps its entries, and the rewrite is read even when
+    /// it keeps the time of the torn read, as a filesystem with coarse times
+    /// can; without the length that read would stay in force until the next
+    /// change. A comment line clears a list on purpose.
+    #[test]
+    fn an_emptied_file_keeps_its_entries_and_a_rewrite_at_the_same_time_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.txt");
-        std::fs::write(&path, format!("{}\n", "a".repeat(64))).unwrap();
+        let (sha, sha2) = ("a".repeat(64), "b".repeat(64));
+        std::fs::write(&path, format!("{sha}\n")).unwrap();
         let mut files = load_boot(&[path_string(&path)]).unwrap();
+        let time = files[0].mtime.expect("read at boot");
 
-        std::fs::remove_file(&path).unwrap();
+        rewrite(&path, "", Some(time));
+        assert!(
+            refresh_all(&mut files).is_none(),
+            "an emptied file keeps its entries"
+        );
+        assert_eq!(union(&files), HashSet::from([sha.clone()]));
+
+        std::fs::write(&path, format!("{sha}\n{sha2}\n")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        assert_eq!(
+            refresh_all(&mut files),
+            Some(HashSet::from([sha.clone(), sha2.clone()])),
+            "same time, new length: read again"
+        );
+
+        rewrite(&path, "# cleared\n", files[0].mtime);
         assert_eq!(refresh_all(&mut files), Some(HashSet::new()));
-        assert!(refresh_all(&mut files).is_none());
+    }
+
+    /// A file missing at boot is still tolerated, and a later appearance
+    /// is read like any change.
+    #[test]
+    fn a_file_missing_at_boot_is_tolerated_and_read_when_it_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.txt");
+        let mut files = load_boot(&[path_string(&path)]).unwrap();
+        assert!(union(&files).is_empty());
+        assert!(
+            refresh_all(&mut files).is_none(),
+            "still missing: no change"
+        );
+
+        let sha = "e".repeat(64);
+        std::fs::write(&path, format!("{sha}\n")).unwrap();
+        assert_eq!(refresh_all(&mut files), Some(HashSet::from([sha])));
     }
 }
