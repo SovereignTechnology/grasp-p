@@ -1889,6 +1889,7 @@ features. No package was added.
   sync does the same in ours (`src/grasp_p/`, the watchdog, four tests). `tokio-tungstenite` 0.30
   needed no change. Upstream's `9c31db9` makes the persisted-startup REQ test pre-seed its relay,
   which fixes that test on slow CI hosts (it failed every run on alpha's idle-priority runner).
+  It still overran on alpha from 2026-10-28; the cause and the seam are in the `## Tests` section.
   Upstream's `f1c867e` passes the retained-history exclusions on argv, so the `rev-list --stdin`
   need below is gone; it supersedes our unmerged branch `sovtech/git-2.39-compat`.
 
@@ -2222,4 +2223,18 @@ features. No package was added.
   `grasp_p_dial_refuses_a_nat64_wrapped_internal_address` in `src/sync/relay_connection.rs`
   (it needs that file's private fields), and fixed commit dates in
   the git helper of `src/git/staging/tests.rs`: one upstream test there builds the same
-  commit twice and compares the ids, which only match within one wall-clock second.
+  commit twice and compares the ids, which only match within one wall-clock second, and the
+  two tests in the next item.
+- Two upstream tests failed on alpha's slow CI runner and carry a seam each (2026-10-29):
+  - `startup_historic_sync_stays_within_relay_req_concurrency_limit` in
+    `tests/sync/req_concurrency.rs` seeds its syncing relay with a plain `git clone --bare`,
+    the legacy layout. The relay therefore migrated it to identifier families before serving
+    HTTP, inside the harness's 5 s readiness budget. On alpha its log stopped at `Database
+    backend: lmdb`, the line before the migration, for the rest of that budget three runs in a
+    row. The test now runs `git::migration::migrate_on_startup` on the fixture first and asserts
+    one migrated view and no retained backup.
+    `READY_TIMEOUT` stays 5 s.
+  - `inactivity_terminates_the_whole_process_group` in `src/purgatory/sync/context.rs` killed
+    its fixture's process group after 50 ms of silence, sometimes before `sh` had written its
+    descendant's pid, and then failed on its 2 s bound with `Elapsed`. The inactivity limit is
+    now 1 s and the bound 10 s.
