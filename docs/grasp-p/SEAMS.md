@@ -10,7 +10,8 @@ an upstream sync: every seam listed here has to survive the merge.
 GRASP-P code lives in `src/grasp_p/`, `src/http/blossom.rs`, `src/sync/private_index.rs`,
 `src/sync/grasp_p_sync.rs` and `src/bin/ngit-private-watchdog.rs`. `src/git/version.rs` is
 ours as well: the startup check of the git version, which is not specific to GRASP-P.
-Upstream's files carry thin seams only:
+So is `src/sync/live_swap_backfill.rs`: the backfill after a minimum-churn swap of live
+coverage, which is not specific to GRASP-P either. Upstream's files carry thin seams only:
 
 | Upstream file | Seam |
 |---|---|
@@ -20,9 +21,9 @@ Upstream's files carry thin seams only:
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
 | `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion and the dial checks (one call, `grasp_p::egress::validate_dial_settings`); two GRASP-P lines in the help text of upstream's `NGIT_EVENT_BLACKLIST` (see "Policy fingerprint v4 and the event blacklist"), four in that of upstream's `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`, and a short GRASP-P paragraph at the end of that of upstream's `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, `NGIT_USER_INDEX_RELAYS` and `NGIT_SYNC_PLUS_FALLBACK_RELAYS` (see "Egress on a node that also serves public repositories") |
-| `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`, for a configured peer only (`grasp_p_filters_for`); `register_relay` builds each connection with the GRASP-P node's address check (`with_grasp_p_address_check`) and with duplicate forwarding on a configured peer's connection only (`with_duplicate_event_forwarding`), takes its outbound policy from `grasp_p_peer_policy` when that gives one, and refuses, in upstream's own refusal branch, an event-directed relay that `grasp_p_event_relay_allowed` refuses (a `ws://` relay on a GRASP-P node; see "Egress on a node that also serves public repositories"); `schedule_nip65_discovery` passes over a discovery source that rule refused when it picks the one new source to dial (`grasp_p_discovery_source_refused`, same section); timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`); the source gate in `process_event_static_inner` (`grasp_p_gate`), directly after the id and signature check (see below); the GRASP-P ids counted as delivered in the negentropy completion check of `handle_eose` (`grasp_p_settled_ids`); see "Configured peers" below for these; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`) |
+| `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`, for a configured peer only (`grasp_p_filters_for`); `register_relay` builds each connection with the GRASP-P node's address check (`with_grasp_p_address_check`) and with duplicate forwarding on a configured peer's connection only (`with_duplicate_event_forwarding`), takes its outbound policy from `grasp_p_peer_policy` when that gives one, and refuses, in upstream's own refusal branch, an event-directed relay that `grasp_p_event_relay_allowed` refuses (a `ws://` relay on a GRASP-P node; see "Egress on a node that also serves public repositories"); `schedule_nip65_discovery` passes over a discovery source that rule refused when it picks the one new source to dial (`grasp_p_discovery_source_refused`, same section); timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`); the source gate in `process_event_static_inner` (`grasp_p_gate`), directly after the id and signature check (see below); the GRASP-P ids counted as delivered in the negentropy completion check of `handle_eose` (`grasp_p_settled_ids`); see "Configured peers" below for these; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); declares `live_swap_backfill`, and `sync_live` reads the live set and the clock before its minimum-churn swap and then backfills the groups the swap closed (see "A minimum-churn swap of live coverage is backfilled here" below) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
-| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one, and IPv6 outside `2000::/3` or inside `2001::/23` (see "Configured peers" and "Egress on a node that also serves public repositories"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below) |
+| `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one, and IPv6 outside `2000::/3` or inside `2001::/23` (see "Configured peers" and "Egress on a node that also serves public repositories"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below); the accessor `live_subscriptions`, each live group with its id, for the backfill after a minimum-churn swap |
 | `src/sync/filters.rs`, `src/http/nip11.rs`, `src/nostr/lifecycle/deletion/service.rs`, `src/lib.rs` | additive helpers |
 | `src/nostr/lifecycle/deletion/cascade.rs` | the announcement cascade's plan leaves registrations, state roots and stream wraps out of the events it deletes on a GRASP-P node (`grasp_p::offboard::cascade_exempt`; one more argument to `plan_deleted_announcement_cascade`; see "Who may delete" below) |
 | `src/nostr/lifecycle/deletion/archival.rs` | `archive_and_delete_filter` leaves state roots and stream wraps in place on a GRASP-P node, and a registration unless the deleting path recorded its own author as the owner: the coordinate path and the vanish do, the `e` path and the cascade's unanchored state deletion (kind 30618 only) record none (`grasp_p::offboard::removal_exempt`, given the event and that owner; see "Who may delete" below) |
@@ -36,9 +37,10 @@ With `NGIT_GRASP_P_REPOS_ENABLE` unset no service is built, and the admission ar
 deletion gate, cascade and removal exemptions, blob routes, sync filters, timers, duplicate forwarding, the handling of configured peers (there
 are none, and no connection carries the flag the dial check goes by), the metrics endpoint
 and the rewrite of relay labels are all gated on it, and `/metrics` is upstream's public route with upstream's
-labels; the GRASP-P metrics register lazily on first use. Two seams are deliberately not
-gated, because each fixes a flaw in upstream itself: the id and signature check on synced
-and fetched events, and the hardened NIP-11 probe. Both have a section below. Two more
+labels; the GRASP-P metrics register lazily on first use. Three seams are deliberately not
+gated, because each fixes a fault in upstream itself: the id and signature check on synced
+and fetched events, the hardened NIP-11 probe, and the backfill after a minimum-churn swap
+of live coverage. Each has a section below. Two more
 things differ from upstream with the switch unset, and neither changes what the server
 does: `--version` names the GRASP-P build, and a git older than 2.42, or no git, draws one
 warning at startup.
@@ -160,6 +162,90 @@ ranges is still to be offered upstream, and that seam goes when upstream decodes
 The change and its tests need no other file, so they can be offered upstream as they
 are; offering them is the maintainer's call. When upstream hardens the probe itself, drop
 this seam in the sync that brings the fix.
+
+## A minimum-churn swap of live coverage is backfilled here
+
+Live filters carry `limit(0)` (`live_filter_groups` in `src/sync/mod.rs`), so a live REQ
+returns only what the remote relay stores after it has read that REQ. When coverage grows (a
+new repository or root event, a changed GRASP-P index), `sync_live` calls
+`RelayConnection::extend_live_filter_groups_minimally`, which CLOSEs the core groups it
+repacks and only then opens their replacement. `sync_live` is its only caller, and the
+callers of `sync_live` backfill only what is new: `historic_sync` packs the filters of the
+new items alone, and connect and reconnect run the generic history. An event the remote relay
+stores after it read the CLOSE and before it read the replacement REQ therefore matches no
+subscription, and it waited for a reconnect or the daily full sync, about a day later. Upstream
+v3.0.8 behaves so with GRASP-P on or off. On a loaded CI runner that window was long enough
+for upstream's `test_live_sync_event_ordering` (`tests/sync/live_sync.rs`) to lose the third
+of three issues sent 150 ms apart (2026-10-29); the retry passed. The test is unchanged.
+
+The fork backfills what a swap closed. `sync_live` reads the connection's live set, each
+group with its id (`RelayConnection::live_subscriptions`), and the clock just before the
+swap, and after the swap, whether it succeeded or not, calls
+`SyncManager::backfill_live_groups_closed_by_swap` in `src/sync/live_swap_backfill.rs`:
+
+- A group was closed when its id is no longer held. Ids, not filters, decide, because a group
+  the swap reopened with the same filters, or restored after a failed swap, has a new id and
+  missed the same events. Descendant coverage, which a swap never touches, is left out; it
+  has a baseline of its own.
+- The closed groups' filters, without `limit(0)` and once each, go to upstream's
+  `historic_sync_with_options` as one core batch with no items and REQ+EOSE forced, as
+  upstream's descendant baseline and fallback go, with `since` that clock reading minus 120
+  seconds and `until` the clock after the swap plus 120 seconds. Negentropy would open one
+  paced round per filter, ahead of the caller's own historic sync, and a few minutes hold few
+  events. They take upstream's historic path as paged REQ+EOSE: the connection's subscription
+  ledger, its pacing, its transient REQ cap, the per-relay order of history jobs, and for
+  every event the id and signature check of "Synced events are verified here" and, on a
+  GRASP-P node, the source gate. Only the relay whose groups were closed is asked, so GRASP-P
+  filters still reach a configured peer only.
+- The new filters are not part of it: their caller's own historic sync covers them.
+- A swap closes groups only when it adds filters, and the backfill adds none and opens no live
+  subscription, so there is one backfill per swap at most. Events it brings take the ordinary
+  pipeline; a new repository or root event among them leads to its own swap, as it would from
+  any other sync.
+
+The overlap is 120 seconds (`LIVE_SWAP_BACKFILL_OVERLAP_SECS`). `since` is compared with
+`created_at`, which the author's clock set before the event reached the relay, so the margin
+covers that delay and the difference between the author's clock and this node's. The same
+margin after the swap bounds the window above: what reached the relay before it read the
+replacement was signed before about the end of the swap, and an open window would fetch
+again, on every swap, whatever is dated ahead of the clock. Upstream's 15 minutes
+(`DESCENDANT_FALLBACK_OVERLAP_SECS`, and `QUICK_RECONNECT_WINDOW_SECS` for a quick reconnect)
+would ask for a quarter of an hour of events again on every swap, and swaps can follow each
+other every few seconds while new issues arrive. An event dated more than two minutes before
+the swap that lands in the window is still left to a reconnect or the daily sync.
+
+Opening the replacement before the CLOSE would close the window without a query on a relay
+that reads one connection's frames in order. It was not taken: for a moment it needs the
+replacement's subscription slots and bytes on top of the retired groups', which is what
+minimum churn exists to avoid when a relay's limits are tight, so a fallback would still be
+needed; it would also change upstream's rollback after a failed CLOSE or REQ, which
+`partial_close_failure_restores_the_already_closed_tail_group` and
+`failed_minimum_churn_extension_restores_only_the_retired_tail` describe.
+
+None of this is behind `NGIT_GRASP_P_REPOS_ENABLE`. For an operator, with GRASP-P on or off,
+each swap that closed groups is followed by about one paged REQ per closed group, over the
+swap and two minutes either side of it, logged as "Backfilling live coverage closed by a
+minimum-churn swap".
+
+The seam, at the time of writing: in `src/sync/mod.rs` lines 22-23 (the comment and the
+module declaration) and 8879-8899 (in `sync_live`: the comment, the two readings before the
+swap, `let result =` on upstream's call, the backfill and `result`); in
+`src/sync/relay_connection.rs` lines 1505-1513 (`live_subscriptions`); and
+`src/sync/live_swap_backfill.rs`, which is ours. Unit tests, in that file:
+`event_stored_between_the_swaps_close_and_its_replacement_is_delivered` runs `sync_live`
+twice against a fake relay that stores an event of the first group's filter when it reads that
+group's CLOSE: the event must arrive on a single backfill REQ that carries the closed group's
+filter alone, without `limit`, with `since` the swap minus the overlap and `until` its end
+plus the overlap, and with no NIP-77 round although the test leaves negentropy allowed, as it
+is by default. Without the seam only `limit(0)` REQs follow the CLOSE and the test fails on
+its 30 second wait. `closed_groups_are_found_by_id_and_lose_the_live_limit` checks the choice
+of filters: by id, a reopened group included, an open group and descendant coverage left out,
+each filter once and without its limit.
+
+The maintainer decided to keep this in the fork. When upstream closes the window itself, with
+a swap that opens before it closes or a backfill of its own, drop the seam in the sync that
+brings the fix: the call and the two readings in `sync_live`, the module declaration, the
+accessor and the file.
 
 ## Metrics leave a GRASP-P node on loopback only
 
@@ -2637,3 +2723,7 @@ features. No package was added.
     its fixture's process group after 50 ms of silence, sometimes before `sh` had written its
     descendant's pid, and then failed on its 2 s bound with `Elapsed`. The inactivity limit is
     now 1 s and the bound 10 s.
+- `test_live_sync_event_ordering` in `tests/sync/live_sync.rs` failed once on a loaded CI
+  runner (2026-10-29) and carries no seam: the cause was upstream's live sync, not the test.
+  The fix and its unit tests are in "A minimum-churn swap of live coverage is backfilled
+  here".
