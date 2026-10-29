@@ -1832,8 +1832,9 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
         "exit10: a refused deletion deletes nothing"
     );
 
-    // The event id beside the coordinate is honoured and frees the claims
-    // of the CURRENT edition (the same wedge vector as the a-tag alone).
+    // The event id beside the coordinate is refused too: whether an id is
+    // an edition of the account's own registration depends on which
+    // editions each node of a pair holds. Nothing is deleted.
     let etag_deletion = EventBuilder::new(Kind::EventDeletion, "by id and coordinate")
         .tags(vec![
             Tag::event(reg2.id),
@@ -1844,7 +1845,33 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
         .finalize(&tenant)
         .expect("sign kind-5");
     let (accepted, message) = publish_with_result(relay.url(), &etag_deletion).await;
-    assert!(accepted, "exit10: e-tag kind-5 rejected: {message:?}");
+    assert!(
+        !accepted && message.contains(OFFBOARD_ID_REFUSAL) && !message.contains("unregistered"),
+        "exit10: an offboard request naming an event id must be refused; got accepted={accepted} {message:?}"
+    );
+    assert_eq!(
+        fetch_from(relay.url(), Filter::new().id(reg2.id))
+            .await
+            .len(),
+        1,
+        "exit10: a refused offboard request deletes nothing"
+    );
+
+    // The coordinate alone removes the CURRENT edition and frees its claims
+    // (the same wedge vector as before).
+    let coordinate_deletion = EventBuilder::new(Kind::EventDeletion, "by coordinate")
+        .tags(vec![
+            Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]),
+            Tag::custom("k", vec!["30640".to_string()]),
+        ])
+        .custom_created_at(Timestamp::from_secs(t0 + 4))
+        .finalize(&tenant)
+        .expect("sign kind-5");
+    let (accepted, message) = publish_with_result(relay.url(), &coordinate_deletion).await;
+    assert!(
+        accepted,
+        "exit10: the coordinate kind-5 rejected: {message:?}"
+    );
     let grab_alias2 = random_alias();
     let grab2 = registration_event(
         &other,
@@ -1857,7 +1884,7 @@ async fn exit10_claim_freeing_cutoff_and_etags() {
     let (accepted, message) = publish_with_result(relay.url(), &grab2).await;
     assert!(
         accepted,
-        "exit10: e-tag deletion of the current edition must free its claims; got {message:?}"
+        "exit10: the deletion of the current edition must free its claims; got {message:?}"
     );
 
     // A FOREIGN author cannot free claims with a deletion naming the
@@ -7192,6 +7219,385 @@ async fn exit42_blacklisted_account_is_frozen_and_stays_readable() {
     assert!(
         accepted,
         "exit42: another account's state root; got {message:?}"
+    );
+
+    relay.stop().await;
+}
+
+// ============================================================================
+// Exit tests 44 to 46 — deletion requests and vanishes on a node that also
+// serves public repositories (decisions D15-6 and D15-7)
+// ============================================================================
+
+/// The `OK` text of an offboard request from a key the node could not admit.
+const NOT_ADMITTED_REFUSAL: &str =
+    "invalid: offboard requests are taken only from accounts this node admits";
+
+/// The `OK` text of an offboard request that names an event id.
+const OFFBOARD_ID_REFUSAL: &str =
+    "invalid: an offboard request names its registrations by coordinate only, with no event id";
+
+/// The `OK` text of an offboard request that names something other than its
+/// signer's registration coordinates and the k tag 30640.
+const OFFBOARD_SHAPE_REFUSAL: &str =
+    "invalid: an offboard request names nothing but its signer's registration coordinates and the k tag 30640";
+
+/// The `OK` text of an account's vanish that names neither all relays nor
+/// every node its registrations list.
+const VANISH_TARGETS_REFUSAL: &str =
+    "invalid: an account's vanish names ALL_RELAYS or every node its registrations list";
+
+/// Whether `relay` serves the event `id`.
+async fn served_by_id(relay: &TestRelay, id: EventId) -> bool {
+    !fetch_from(relay.url(), Filter::new().id(id))
+        .await
+        .is_empty()
+}
+
+/// Poll until `relay` no longer serves `alias`'s registration by `tenant`.
+async fn wait_until_registration_gone(relay: &TestRelay, tenant: &Keys, alias: &str) -> bool {
+    let filter = Filter::new()
+        .kind(Kind::Custom(30640))
+        .author(tenant.public_key())
+        .identifier(alias);
+    for _ in 0..50 {
+        if fetch_from(relay.url(), filter.clone()).await.is_empty() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Decision D15-6. A kind 5 with `["k","30640"]` or a 30640 coordinate rides
+/// the peers' sync filter, so it is held to the offboard shape whoever signs
+/// it. Under the shipped whitelist mode a stranger's request of that shape
+/// is refused outright, even one naming only its own coordinate; a listed
+/// account's that also names its own public note, or a public repository,
+/// is refused for its shape. Nothing refused is served, and the note and
+/// the registration stay. The stranger's ordinary deletion of its own note,
+/// with neither mark, is upstream's and is honored. Without the rule the
+/// stranger's two requests and the account's two were taken, and upstream
+/// deleted both notes and the registration; the stranger's naming of the
+/// account's registration was refused already.
+#[tokio::test]
+async fn exit44_offboard_shaped_requests_are_pure_for_every_signer() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let maintainer = Keys::generate();
+    let (_announcement, _fixture) = common::setup_announcement_on_relay(
+        &relay,
+        &maintainer,
+        &[&relay.domain()],
+        "exit44-public",
+    )
+    .await;
+    let public = format!("30617:{}:exit44-public", maintainer.public_key().to_hex());
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let registration = register_alias(&relay, &tenant, &writer, &alias).await;
+
+    let stranger = Keys::generate();
+    let note_by = |keys: &Keys| {
+        EventBuilder::new(Kind::TextNote, "on the public repository")
+            .tags(vec![Tag::custom("a", vec![public.clone()])])
+            .finalize(keys)
+            .expect("sign note")
+    };
+    let stranger_note = note_by(&stranger);
+    let tenant_note = note_by(&tenant);
+    for note in [&stranger_note, &tenant_note] {
+        let (accepted, message) = publish_with_result(relay.url(), note).await;
+        assert!(accepted, "exit44: a public note; got {message:?}");
+    }
+
+    let k = Tag::custom("k", vec!["30640".to_string()]);
+    let own = |keys: &Keys| {
+        Tag::custom(
+            "a",
+            vec![format!(
+                "30640:{}:{}",
+                keys.public_key().to_hex(),
+                random_alias()
+            )],
+        )
+    };
+    let request = |keys: &Keys, tags: Vec<Tag>| {
+        EventBuilder::new(Kind::EventDeletion, "")
+            .tags(tags)
+            .finalize(keys)
+            .expect("sign kind 5")
+    };
+    let tenant_coordinate = Tag::custom("a", vec![reg_coord(&tenant.public_key(), &alias)]);
+    let refused = [
+        (
+            "a stranger's pure offboard request",
+            request(&stranger, vec![own(&stranger), k.clone()]),
+            NOT_ADMITTED_REFUSAL,
+        ),
+        (
+            "a stranger's own coordinate beside its public note",
+            request(
+                &stranger,
+                vec![own(&stranger), k.clone(), Tag::event(stranger_note.id)],
+            ),
+            NOT_ADMITTED_REFUSAL,
+        ),
+        (
+            "a stranger naming the account's registration",
+            request(&stranger, vec![tenant_coordinate.clone(), k.clone()]),
+            "restricted: a registration can be deleted only by the account key that signed it",
+        ),
+        (
+            "the account's offboard beside its public note",
+            request(
+                &tenant,
+                vec![
+                    tenant_coordinate.clone(),
+                    k.clone(),
+                    Tag::event(tenant_note.id),
+                ],
+            ),
+            OFFBOARD_ID_REFUSAL,
+        ),
+        (
+            "the account's offboard beside a public repository",
+            request(
+                &tenant,
+                vec![
+                    tenant_coordinate.clone(),
+                    k.clone(),
+                    Tag::custom("a", vec![public.clone()]),
+                ],
+            ),
+            OFFBOARD_SHAPE_REFUSAL,
+        ),
+    ];
+    for (what, event, expected) in refused {
+        let (accepted, message) = publish_with_result(relay.url(), &event).await;
+        assert!(
+            !accepted && message.contains(expected) && !message.contains("unregistered"),
+            "exit44: {what} must be refused with {expected:?}; got accepted={accepted} {message:?}"
+        );
+        assert!(
+            !served_by_id(&relay, event.id).await,
+            "exit44: {what} must not be served"
+        );
+    }
+    for (what, id) in [
+        ("the stranger's note", stranger_note.id),
+        ("the account's note", tenant_note.id),
+        ("the registration", registration.id),
+    ] {
+        assert!(
+            served_by_id(&relay, id).await,
+            "exit44: {what} must still be served"
+        );
+    }
+
+    // Neither mark: upstream's, as on a node without GRASP-P.
+    let ordinary = request(&stranger, vec![Tag::event(stranger_note.id)]);
+    let (accepted, message) = publish_with_result(relay.url(), &ordinary).await;
+    assert!(
+        accepted,
+        "exit44: the stranger's deletion of its own note; got {message:?}"
+    );
+    assert!(
+        !served_by_id(&relay, stranger_note.id).await,
+        "exit44: upstream honored the stranger's deletion"
+    );
+
+    relay.stop().await;
+}
+
+/// Decision D15-6, the vanish half. Upstream acts on a vanish only on the
+/// node it names, so an account whose registrations list both nodes of a
+/// pair closes only if its vanish names them all, or all relays. A vanish
+/// naming this node alone, which would close the account here and leave it
+/// open on the peer, is refused, and so is one naming the peer alone; the
+/// registration stays live. A vanish naming both closes the account.
+#[tokio::test]
+async fn exit45_an_accounts_vanish_names_every_node_of_its_pair() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let peer = "https://peer.example";
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let mut tags = registration_tags(
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[],
+        &relay.domain(),
+    );
+    tags.push(Tag::custom("server", vec![peer.to_string()]));
+    let registration = EventBuilder::new(Kind::Custom(30640), "")
+        .tags(tags)
+        .finalize(&tenant)
+        .expect("sign 30640");
+    let (accepted, message) = publish_with_result(relay.url(), &registration).await;
+    assert!(
+        accepted,
+        "exit45: a registration naming both nodes; got {message:?}"
+    );
+
+    let vanish = |relays: &[&str]| {
+        EventBuilder::new(Kind::RequestToVanish, "")
+            .tags(
+                relays
+                    .iter()
+                    .map(|target| Tag::custom("relay", vec![target.to_string()])),
+            )
+            .finalize(&tenant)
+            .expect("sign kind 62")
+    };
+    let this_node = [relay.url()];
+    let cases: [(&str, &[&str]); 2] = [
+        ("this node alone", &this_node),
+        ("the peer alone", &["wss://peer.example"]),
+    ];
+    for (what, relays) in cases {
+        let request = vanish(relays);
+        let (accepted, message) = publish_with_result(relay.url(), &request).await;
+        assert!(
+            !accepted && message.contains(VANISH_TARGETS_REFUSAL),
+            "exit45: a vanish naming {what} must be refused; got accepted={accepted} {message:?}"
+        );
+        assert!(
+            !served_by_id(&relay, request.id).await,
+            "exit45: the refused vanish naming {what} must not be served"
+        );
+    }
+    assert!(
+        served_by_id(&relay, registration.id).await,
+        "exit45: the registration must still be served"
+    );
+    let manifest = sha256_hex(&blob_bytes(209, 64));
+    let root = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&manifest, 64),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &root).await;
+    assert!(
+        accepted,
+        "exit45: the account is still open; got {message:?}"
+    );
+
+    let both = vanish(&[relay.url(), "wss://peer.example"]);
+    let (accepted, message) = publish_with_result(relay.url(), &both).await;
+    assert!(
+        accepted,
+        "exit45: a vanish naming both nodes; got {message:?}"
+    );
+    assert!(
+        wait_until_registration_gone(&relay, &tenant, &alias).await,
+        "exit45: the registration is still served after the account's vanish"
+    );
+
+    relay.stop().await;
+}
+
+/// Decision D15-7. A vanish dated before an account's registration still
+/// removes that registration, since upstream's vanish has no date bound, and
+/// now frees every claim of the account with it, so the alias and the write
+/// key are not wedged: another account registers the same alias with the
+/// same write key, and that key's state root is taken. The vanished key
+/// stays refused. Before, the claims of a registration dated after the
+/// vanish were kept while its event was gone, and the other account lost
+/// the alias to a registration nobody could see.
+#[tokio::test]
+async fn exit46_a_stale_vanish_frees_the_alias_for_a_new_registration() {
+    let tenant = Keys::generate();
+    let other = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant, &other]);
+    let relay =
+        TestRelay::start_with_grasp_p(&[("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str())])
+            .await;
+    let writer = Keys::generate();
+    let alias = random_alias();
+    let domain = relay.domain();
+    let now = Timestamp::now().as_secs();
+
+    let registration = registration_event(
+        &tenant,
+        &alias,
+        &[key_entry(&writer, &tenant.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(now - 60),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &registration).await;
+    assert!(accepted, "exit46: registration failed: {message:?}");
+
+    let stale = EventBuilder::new(Kind::RequestToVanish, "")
+        .tags(vec![Tag::custom("relay", vec!["ALL_RELAYS".to_string()])])
+        .custom_created_at(Timestamp::from_secs(now - 3600))
+        .finalize(&tenant)
+        .expect("sign kind 62");
+    let (accepted, message) = publish_with_result(relay.url(), &stale).await;
+    assert!(
+        accepted,
+        "exit46: a vanish dated before the registration; got {message:?}"
+    );
+    assert!(
+        wait_until_registration_gone(&relay, &tenant, &alias).await,
+        "exit46: upstream's vanish must remove the registration dated after it"
+    );
+
+    let taken = registration_event(
+        &other,
+        &alias,
+        &[key_entry(&writer, &other.public_key(), &alias)],
+        &[],
+        &domain,
+        Some(now),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &taken).await;
+    assert!(
+        accepted,
+        "exit46: the alias and the write key must be free for another account; got {message:?}"
+    );
+    let manifest = sha256_hex(&blob_bytes(210, 64));
+    let root = state_root_event(
+        &writer,
+        &other.public_key(),
+        &alias,
+        (&manifest, 64),
+        &[],
+        now + 1,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &root).await;
+    assert!(
+        accepted,
+        "exit46: a state root under the new registration; got {message:?}"
+    );
+
+    let new_alias = random_alias();
+    let again = registration_event(
+        &tenant,
+        &new_alias,
+        &[key_entry(
+            &Keys::generate(),
+            &tenant.public_key(),
+            &new_alias,
+        )],
+        &[],
+        &domain,
+        None,
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &again).await;
+    assert!(
+        !accepted && message.contains("this pubkey has requested to vanish"),
+        "exit46: the vanished key stays refused; got accepted={accepted} {message:?}"
     );
 
     relay.stop().await;

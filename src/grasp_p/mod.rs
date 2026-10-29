@@ -1436,68 +1436,48 @@ impl PrivateService {
     }
 
     /// NIP-09 follow-up (cord-git !13 verify-round): free the key claims of
-    /// every private 30640 this author-valid deletion targets — by `a`-tag
-    /// coordinate or `e`-tag event id. Key claims are otherwise freed only
-    /// by a newer registration edition (the diff in `registration::handle`),
-    /// so a deleted registration left its claims dangling forever: a member
-    /// could squat an epoch's (derivable) rekey addresses, delete their own
-    /// registration, and permanently wedge every future rotation whose widen
-    /// lists those keys ("write key already registered"). Claims must die
-    /// with the registration. The NIP-09 cutoff is honored: a registration
-    /// edition NEWER than the deletion keeps its claims (a replayed stale
-    /// deletion cannot wipe a live edition). An honored deletion also runs
-    /// the shared death cleanup (blob-claim stripping, spec release,
-    /// event-column reset, ring deletion — see `free_registration_claims`);
-    /// the `t:`/`g:` event-byte stranding remains the pre-existing !1/!4
-    /// backlog.
+    /// every private 30640 this author-valid deletion targets by its `a`-tag
+    /// coordinate. Key claims are otherwise freed only by a newer
+    /// registration edition (the diff in `registration::handle`), so a
+    /// deleted registration left its claims dangling forever: a member could
+    /// squat an epoch's (derivable) rekey addresses, delete their own
+    /// registration, and permanently wedge every rotation whose widen lists
+    /// those keys ("write key already registered"). Claims must die with the
+    /// registration. The NIP-09 cutoff is honored, as upstream's coordinate
+    /// path honors it: a registration edition NEWER than the deletion keeps
+    /// its claims (a replayed stale deletion cannot wipe a live edition).
+    /// An `e`-tag id frees nothing: upstream's `e` path removes no
+    /// registration on a GRASP-P node (`offboard::removal_exempt`), so the
+    /// claims go exactly when the coordinate path removes the event. An
+    /// honored deletion also runs the shared death cleanup (blob-claim
+    /// stripping, spec release, event-column reset, ring deletion — see
+    /// `free_registration_claims`); the `t:`/`g:` event-byte stranding
+    /// remains the pre-existing !1/!4 backlog.
     pub fn free_claims_for_deleted_registrations(&self, event: &Event) {
         let author_hex = event.pubkey.to_hex();
         let deletion_at = event.created_at.as_secs();
         let mut coords: Vec<String> = Vec::new();
-        let mut ids: Vec<String> = Vec::new();
         for tag in event.tags.iter() {
-            let v = tag.clone().to_vec();
-            if v.len() < 2 {
+            let v = tag.as_slice();
+            if v.len() < 2 || v[0] != "a" {
                 continue;
             }
-            match v[0].as_str() {
-                "a" => {
-                    let mut parts = v[1].splitn(3, ':');
-                    if let (Some(kind), Some(pubkey), Some(alias)) =
-                        (parts.next(), parts.next(), parts.next())
-                    {
-                        if kind == "30640"
-                            && pubkey == author_hex
-                            && registration::is_valid_alias(alias)
-                        {
-                            coords.push(alias.to_string());
-                        }
-                    }
+            let mut parts = v[1].splitn(3, ':');
+            if let (Some(kind), Some(pubkey), Some(alias)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                if kind == "30640" && pubkey == author_hex && registration::is_valid_alias(alias) {
+                    coords.push(alias.to_string());
                 }
-                "e" => ids.push(v[1].clone()),
-                _ => {}
             }
         }
-        if coords.is_empty() && ids.is_empty() {
+        if coords.is_empty() {
             return;
         }
         let freed = self.meta.with_write(|meta, txn| {
             let mut n = 0usize;
             for alias in &coords {
                 n += free_registration_claims(meta, txn, &author_hex, alias, deletion_at)?;
-            }
-            if !ids.is_empty() {
-                // e-tags carry only the event id — resolve it against the
-                // author's own registrations' current editions.
-                let aliases = meta.get_tenant_aliases(txn, &author_hex)?;
-                for alias in aliases {
-                    let Some(record) = meta.get_registration(txn, &alias)? else {
-                        continue;
-                    };
-                    if ids.contains(&record.event_id) {
-                        n += free_registration_claims(meta, txn, &author_hex, &alias, deletion_at)?;
-                    }
-                }
             }
             Ok(n)
         });
@@ -1515,20 +1495,24 @@ impl PrivateService {
 
     /// NIP-62 follow-up: a vanish deletes ALL of the author's events,
     /// including their 30640s — free every claim they hold (same
-    /// dangling-claim wedge as the kind-5 path). The kind-5 cutoff applies
-    /// here too: registrations newer than the vanish keep their claims (a
-    /// replayed stale vanish cannot wipe a re-registered edition). Death
+    /// dangling-claim wedge as the kind-5 path). There is no date cutoff
+    /// here (decision D15-7): upstream's vanish removes every event of its
+    /// author whatever its `created_at`, and refuses all its later events, so
+    /// a registration dated after the vanish is gone too, and a claim kept
+    /// for it would wedge its alias and keys with no event left to explain
+    /// them. NIP-62 bounds the removal by the vanish's date; if upstream ever
+    /// does, the cutoff comes back (`offboard`'s canary test
+    /// `upstream_vanish_removes_events_of_every_date` fails first). Death
     /// cleanup (blob-claim stripping, spec release, event-column reset,
     /// ring deletion) is shared with the other death paths via
     /// [`free_registration_claims`].
     pub fn free_claims_for_vanished_author(&self, event: &Event) {
         let author_hex = event.pubkey.to_hex();
-        let vanish_at = event.created_at.as_secs();
         let freed = self.meta.with_write(|meta, txn| {
             let mut n = 0usize;
             let aliases = meta.get_tenant_aliases(txn, &author_hex)?;
             for alias in aliases {
-                n += free_registration_claims(meta, txn, &author_hex, &alias, vanish_at)?;
+                n += free_registration_claims(meta, txn, &author_hex, &alias, u64::MAX)?;
             }
             Ok(n)
         });
@@ -1995,7 +1979,8 @@ pub fn spawn_background_tasks(
 /// in the tenant's alias list) iff it belongs to `author_hex` and its
 /// current edition is not newer than `max_created_at` (the NIP-09 cutoff:
 /// editions after the deletion survive with claims intact; conflict-merge
-/// eviction passes `u64::MAX` — the loser is dead regardless of edition).
+/// eviction and a vanish pass `u64::MAX` — the loser, and the vanished
+/// author's registrations, are dead regardless of edition).
 /// Returns the number of claims freed.
 ///
 /// A registration that actually dies here also loses the rest of its

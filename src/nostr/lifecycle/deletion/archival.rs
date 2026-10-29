@@ -352,9 +352,15 @@ impl DeletionPolicy {
         for event in matches {
             // GRASP-P seam: a state root or a stream wrap goes only with its
             // repository's registration (decision D6), however a deletion
-            // request or a vanish got past admission.
+            // request or a vanish got past admission, and a registration only
+            // by a path bound to its author. The owner is None on the `e` path
+            // (`delete_main_db_targets`) and on cascade.rs's unanchored state
+            // deletion (kind 30618 alone).
             if self.ctx.config.private_repos_enable
-                && crate::grasp_p::offboard::removal_exempt(event.kind.as_u16())
+                && crate::grasp_p::offboard::removal_exempt(
+                    &event,
+                    metadata.owner_pubkey.as_deref(),
+                )
             {
                 continue;
             }
