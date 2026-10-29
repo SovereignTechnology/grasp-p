@@ -19,6 +19,8 @@ mod grasp_p_sync;
 pub mod health;
 mod history;
 pub mod in_process_transport;
+// SovTech seam: backfills what a minimum-churn swap of live coverage can miss.
+mod live_swap_backfill;
 pub mod metrics;
 pub mod missing_events;
 pub mod naughty_list;
@@ -8874,7 +8876,10 @@ impl SyncManager {
             .get(relay_url)
             .map(|coverage| coverage.subscription_ids.clone())
             .unwrap_or_default();
-        connection
+        // SovTech seam: backfill the groups the swap closes; limit(0) misses what came between.
+        let held_before = connection.live_subscriptions();
+        let swap_started = Timestamp::now();
+        let result = connection
             .extend_live_filter_groups_minimally(
                 filter_groups,
                 &protected_subscription_ids,
@@ -8882,7 +8887,16 @@ impl SyncManager {
             .await
             .inspect_err(|error| {
                 tracing::error!(relay = %relay_url, error = %error, "Failed to create complete live subscription set");
-            })
+            });
+        self.backfill_live_groups_closed_by_swap(
+            relay_url,
+            &connection,
+            held_before,
+            &protected_subscription_ids,
+            swap_started,
+        )
+        .await;
+        result
     }
 
     /// Sync historical events and track in PendingSyncIndex

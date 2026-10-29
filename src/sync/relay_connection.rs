@@ -1502,6 +1502,16 @@ impl RelayConnection {
             .collect()
     }
 
+    // SovTech seam: live groups with their ids, so the swap backfill knows which it closed.
+    pub(super) fn live_subscriptions(&self) -> Vec<(SubscriptionId, Vec<Filter>)> {
+        self.live_req_permits_held
+            .lock()
+            .expect("live permit map poisoned")
+            .iter()
+            .map(|(id, held)| (id.clone(), held.filters.clone()))
+            .collect()
+    }
+
     pub fn live_subscription_bytes(&self) -> usize {
         self.live_req_permits_held
             .lock()
