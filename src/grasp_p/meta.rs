@@ -17,9 +17,45 @@ use nostr::prelude::Timestamp;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
-/// 4 GiB sparse map — private meta data is small (registrations, ledgers, and
-/// up to N retained 30641 editions per alias at ≤128 KiB each).
-const META_MAP_SIZE: usize = 4 * 1024 * 1024 * 1024;
+/// 48 GiB sparse map — private meta data is small (registrations, ledgers,
+/// blob claims, and up to N retained 30641 editions per alias at ≤128 KiB
+/// each). LMDB grows the file as it writes, so the map reserves address
+/// space, not disk.
+///
+/// A full map fails every GRASP-P write on the node, so the boot check of
+/// `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (`quota::check_min_blob_charge`)
+/// holds the blob charges the budget allows to it: 4 Mi charges at
+/// [`META_BYTES_PER_CHARGE`] each.
+pub(crate) const META_MAP_SIZE: usize = 48 * 1024 * 1024 * 1024;
+
+/// The most of the meta map one blob charge can take, for that boot check:
+/// three LMDB pages of 4 KiB.
+///
+/// A charge is a claim row, or a share of one, and an entry in the
+/// per-repository index. A claim with a single charge is at most 402 bytes
+/// with LMDB's node header and page pointer (its 64-byte key, at most 145
+/// bytes of JSON for its fixed fields, 149 for the charge and 34 for its
+/// alias in `aliases`); an index entry is 172 (a 97-byte key and a 64-byte
+/// value). A claim with ten charges or more moves to overflow pages of its
+/// own, which it fills, so its charges cost less.
+///
+/// The keys are the client's to choose: a 30641 may name any 64 hex
+/// characters, in any order, and a name it drops is released at once. So
+/// the figure rests on what LMDB keeps whatever the order of writes and
+/// deletions, not on how full its pages usually are. A page split can leave
+/// a new leaf with two entries, and a leaf that a deletion leaves under a
+/// quarter full takes an entry from its neighbour, which may leave the
+/// neighbour with a single claim row when the rows differ in size; index
+/// entries, all of one size, keep two. A branch page keeps at least two
+/// children, so a tree has fewer branch pages than leaves. A charge thus
+/// takes less than two pages of the claims and less than one of the index.
+///
+/// In random order, as sha256 keys come from honest writers, a charge takes
+/// under 1 KiB (`a_blob_charge_takes_less_meta_than_the_boot_check_assumes`).
+/// The state ring, the registrations, the ledger and LMDB's free list share
+/// the map and are not counted here, and on a kernel with larger memory
+/// pages LMDB's pages are larger too.
+pub(crate) const META_BYTES_PER_CHARGE: u64 = 3 * 4096;
 
 /// Ledger key for the whole private subsystem.
 pub const LEDGER_GLOBAL_KEY: &str = "g:";
@@ -612,6 +648,60 @@ mod tests {
             meta.inner.charged_wraps_gc.len(&txn).unwrap(),
             2,
             "eviction index must shrink in lockstep with the id set"
+        );
+    }
+
+    /// The meta store one blob charge takes in the usual case, measured:
+    /// claims of one charge each (the largest shape per charge) under
+    /// sha256 keys, with full-length tenant keys and aliases, written as an
+    /// upload writes them, take under 1 KiB a charge, well inside the
+    /// [`META_BYTES_PER_CHARGE`] the boot check of the minimum blob charge
+    /// multiplies by, which holds whatever order a client writes in. A claim
+    /// row or an index key that grows shows here first, in the figure the
+    /// runbook gives operators to expect.
+    #[test]
+    fn a_blob_charge_takes_less_meta_than_the_boot_check_assumes() {
+        use bitcoin_hashes::sha256;
+
+        use crate::grasp_p::claims;
+
+        const CHARGES: u64 = 10_000;
+        const PER_WRITE: u64 = 250;
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let cfg = crate::grasp_p::PrivateConfig::from_config(&crate::config::Config::for_testing());
+        let before = meta.inner.env.non_free_pages_size().unwrap();
+        for write in 0..CHARGES / PER_WRITE {
+            meta.with_write(|m, txn| {
+                for n in write * PER_WRITE..(write + 1) * PER_WRITE {
+                    let sha = sha256::Hash::hash(&n.to_le_bytes()).to_string();
+                    // Ten accounts of ten repositories each.
+                    let tenant = format!("{:064x}", n % 10);
+                    let alias = format!("{:032x}", n % 100);
+                    let size = 268_435_456;
+                    claims::attach_to(m, txn, &cfg, &sha, &tenant, &alias, size)?;
+                    let declared = m.get_blob_claim(txn, &sha)?;
+                    let mut claim = declared.clone().expect("declared");
+                    let moves = claims::settle_stored(&cfg, &mut claim, size, 1_800_000_000);
+                    claims::commit(m, txn, &sha, declared.as_ref(), Some(&claim), &moves)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        let used = meta.inner.env.non_free_pages_size().unwrap() - before;
+        let per_charge = used / CHARGES;
+        assert!(
+            per_charge > 400,
+            "{per_charge} bytes per charge is less than a claim row and its index entry: \
+             the measurement is broken"
+        );
+        // What the random keys of honest writers take, as the runbook says.
+        const USUAL: u64 = 1024;
+        assert!(
+            per_charge <= USUAL,
+            "a blob charge takes {per_charge} bytes of the meta store in random order, more \
+             than the usual {USUAL}"
         );
     }
 }

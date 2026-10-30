@@ -381,17 +381,18 @@ impl UploadSink {
             let mut claim = before.clone().unwrap_or_else(|| claims::new_claim(size));
 
             // Decision D4: the bytes set every repository's charge to their
-            // size, and a client's upload makes its repository pay for them
-            // like any other referrer, also for bytes another account
-            // stored or an earlier run left on disk. The uploader's own
-            // declared charge is part of the moves, so a declare-then-upload
-            // nets out. Another repository the stored size raises past its
-            // own caps stops referencing the blob rather than being carried
-            // over them; the uploader's scopes and the node's are judged
-            // with every move.
-            let mut moves = claims::settle_stored(&mut claim, size, now);
+            // size (decision D5: never below the minimum charge), and a
+            // client's upload makes its repository pay for them like any
+            // other referrer, also for bytes another account stored or an
+            // earlier run left on disk. The uploader's own declared charge
+            // is part of the moves, so a declare-then-upload nets out.
+            // Another repository the stored size raises past its own caps
+            // stops referencing the blob rather than being carried over
+            // them; the uploader's scopes and the node's are judged with
+            // every move.
+            let mut moves = claims::settle_stored(&cfg, &mut claim, size, now);
             if origin == UploadOrigin::Client {
-                moves.extend(claims::attach(&mut claim, &tenant, &alias, size));
+                moves.extend(claims::attach(&cfg, &mut claim, &tenant, &alias, size));
             }
             claims::detach_unaffordable(meta, txn, &cfg, &mut claim, &alias, &mut moves, now)?;
             if !quota::fits(meta, txn, &cfg, &tenant, &alias, 0, &moves)? {
@@ -505,7 +506,8 @@ mod tests {
     /// A blob `alias` of `tenant` declared at `declared` bytes and nobody
     /// stored, as a 30641 leaves it.
     fn declare(meta: &MetaEnv, sha: &str, tenant: &str, alias: &str, declared: u64) {
-        meta.with_write(|m, txn| claims::attach_to(m, txn, sha, tenant, alias, declared))
+        let cfg = test_cfg(1 << 20);
+        meta.with_write(|m, txn| claims::attach_to(m, txn, &cfg, sha, tenant, alias, declared))
             .unwrap();
     }
 
@@ -521,6 +523,7 @@ mod tests {
             quota_tenant_bytes: 1 << 20,
             quota_repo_bytes,
             global_budget_bytes: 1 << 20,
+            min_blob_charge_bytes: 0,
             max_aliases_per_tenant: 8,
             max_write_keys_per_alias: 8,
             state_history_editions: 3,
@@ -782,6 +785,93 @@ mod tests {
         assert!(claim.stored);
         assert_eq!(claim.aliases, vec!["alias".to_string()]);
         assert_eq!(claim.charges, vec![charge("tenant", "alias", 128)]);
+    }
+
+    /// Decision D5 on the upload path: a blob smaller than the floor costs
+    /// the floor at every scope, while the disk, the claim and the
+    /// descriptor keep its real size. A second account that uploads the
+    /// same bytes pays the floor as well. Without the floor each costs 64.
+    #[tokio::test]
+    async fn a_tiny_upload_is_charged_the_floor_and_stored_at_its_size() {
+        let mut h = Harness::new(1 << 20);
+        h.cfg.min_blob_charge_bytes = 4096;
+        let data = [21u8; 64];
+        let sha = sha256::Hash::hash(&data).to_string();
+
+        let descriptor = h.upload(&data).await.unwrap();
+        assert_eq!(descriptor.size, 64);
+        assert_eq!(
+            std::fs::metadata(h.store.path_for(&sha)).unwrap().len(),
+            64,
+            "the disk holds the real bytes"
+        );
+        let claim = h.claim(&sha).unwrap();
+        assert_eq!(claim.size, 64, "the claim records the real size");
+        assert_eq!(claim.charges, vec![charge("tenant", "alias", 4096)]);
+        assert_eq!(h.ledger_blob_bytes(), (4096, 4096, 4096));
+
+        h.register("tenant-2", "alias-2");
+        h.store_as("tenant-2", "alias-2", &data, UploadOrigin::Client)
+            .await
+            .unwrap();
+        assert_eq!(h.scope_bytes("tenant-2", "alias-2"), (4096, 4096));
+        assert_eq!(h.ledger_blob_bytes().2, 8192, "two floors, one file");
+    }
+
+    /// With a floor, a repository's byte cap is also a cap on how many
+    /// blobs it holds: three floors fill a cap of three, and a fourth tiny
+    /// upload is refused and leaves nothing behind. A repeat upload of
+    /// bytes already charged still fits, as it adds nothing. Without the
+    /// floor the fourth costs 64 bytes and is taken.
+    #[tokio::test]
+    async fn tiny_uploads_fill_a_repository_at_the_floor() {
+        let mut h = Harness::new(3 * 4096);
+        h.cfg.min_blob_charge_bytes = 4096;
+        for seed in 0..3u8 {
+            h.upload(&[seed; 64]).await.unwrap();
+        }
+        assert_eq!(h.ledger_blob_bytes(), (3 * 4096, 3 * 4096, 3 * 4096));
+
+        let fourth = [3u8; 64];
+        let err = h.upload(&fourth).await.unwrap_err();
+        assert!(matches!(err, BlobError::QuotaExceeded), "{err:?}");
+        let sha = sha256::Hash::hash(&fourth).to_string();
+        assert!(!h.store.exists(&sha), "nothing placed");
+        assert!(h.claim(&sha).is_none(), "nothing claimed");
+        assert_eq!(h.ledger_blob_bytes().1, 3 * 4096);
+
+        h.upload(&[0u8; 64]).await.unwrap();
+        assert_eq!(h.ledger_blob_bytes().1, 3 * 4096);
+    }
+
+    /// The bytes arriving price a charge again, and so does a repeat
+    /// upload of bytes already here: after the floor goes up, an existing
+    /// charge keeps what it recorded until such an upload prices it at the
+    /// new floor.
+    #[tokio::test]
+    async fn a_repeat_upload_prices_the_charge_at_the_floor_in_force() {
+        let mut h = Harness::new(1 << 20);
+        h.cfg.min_blob_charge_bytes = 1024;
+        let data = [22u8; 64];
+        let sha = sha256::Hash::hash(&data).to_string();
+        h.upload(&data).await.unwrap();
+        assert_eq!(h.ledger_blob_bytes(), (1024, 1024, 1024));
+
+        h.cfg.min_blob_charge_bytes = 2048;
+        // A write that prices another blob's charge leaves this one alone.
+        h.upload(&[23u8; 64]).await.unwrap();
+        assert_eq!(
+            h.claim(&sha).unwrap().charges,
+            vec![charge("tenant", "alias", 1024)],
+            "a new floor alone does not price an existing charge"
+        );
+        assert_eq!(h.ledger_blob_bytes(), (3072, 3072, 3072));
+        h.upload(&data).await.unwrap();
+        assert_eq!(
+            h.claim(&sha).unwrap().charges,
+            vec![charge("tenant", "alias", 2048)]
+        );
+        assert_eq!(h.ledger_blob_bytes(), (4096, 4096, 4096));
     }
 
     #[tokio::test]

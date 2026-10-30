@@ -816,6 +816,23 @@ pub struct Config {
     )]
     pub private_global_budget_bytes: u64,
 
+    /// Minimum billable size of a blob in bytes: every blob a repository
+    /// stores or declares is charged at least this much at the repository,
+    /// account and node scopes, so the byte quotas also bound how many blobs
+    /// fit under them. Only the charge is raised; the disk and the blob's
+    /// recorded size stay its real size. Must not exceed
+    /// NGIT_GRASP_P_QUOTA_REPO_BYTES, and the node refuses to start when
+    /// NGIT_GRASP_P_GLOBAL_BUDGET_BYTES divided by it allows more blob
+    /// charges than the private meta store can hold. 0 = no minimum. Part of
+    /// the policy_fingerprint preimage; advertised in NIP-11 as
+    /// private_repos.min_blob_charge_bytes
+    #[arg(
+        long,
+        env = "NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES",
+        default_value_t = 16384
+    )]
+    pub private_min_blob_charge_bytes: u64,
+
     /// Maximum registrations (aliases) per hosting npub
     #[arg(
         long,
@@ -1670,6 +1687,7 @@ impl Config {
                     "NGIT_GRASP_P_QUOTA_TENANT_BYTES must not exceed NGIT_GRASP_P_GLOBAL_BUDGET_BYTES"
                 ));
             }
+            crate::grasp_p::quota::check_min_blob_charge(self)?;
             if self.effective_private_blob_path().trim().is_empty() {
                 return Err(anyhow!("NGIT_GRASP_P_BLOB_DATA_PATH must not be empty"));
             }
@@ -2075,6 +2093,9 @@ impl Config {
             private_quota_tenant_bytes: 1_073_741_824,
             private_quota_repo_bytes: 536_870_912,
             private_global_budget_bytes: 53_687_091_200,
+            // Not the shipped 16384: unit tests count exact bytes, and the
+            // tests of the minimum set it themselves.
+            private_min_blob_charge_bytes: 0,
             private_max_aliases_per_tenant: 64,
             private_max_write_keys_per_alias: 64,
             private_state_history_editions: 16,

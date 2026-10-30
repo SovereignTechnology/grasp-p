@@ -1717,7 +1717,7 @@ ledger. Every `NGIT_GRASP_P_*` knob is a no-op unless
 `NGIT_GRASP_P_REPOS_ENABLE=true`.
 
 The admission-affecting knobs (mode, pow bits, whitelist, event/blob caps,
-the three quota scopes, alias/key limits, the Phase-4b
+the three quota scopes, the minimum blob charge, alias/key limits, the Phase-4b
 replacement-cadence pair, legacy wrap-kind acceptance, the keys on
 `NGIT_EVENT_BLACKLIST`, and `NGIT_DELETION_REQUEST_DISRESPECTOR`, which
 decides whether an honored deletion request frees a registration's alias
@@ -1763,16 +1763,23 @@ or the startup log line.
 
 #### `NGIT_GRASP_P_QUOTA_REPO_BYTES`
 
-**Description:** Per-alias total quota in bytes (events + blobs). Must be greater than `0` and no larger than `NGIT_GRASP_P_QUOTA_TENANT_BYTES`. Part of the `policy_fingerprint` preimage.  
+**Description:** Per-alias total quota in bytes (events + blobs). Must be greater than `0`, no larger than `NGIT_GRASP_P_QUOTA_TENANT_BYTES` and not below `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES`. Part of the `policy_fingerprint` preimage.  
 **Type:** Integer  
 **Default:** `536870912` (512 MiB)  
 **Required:** No
 
 #### `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES`
 
-**Description:** Whole private-subsystem storage cap in bytes; the ledger refuses charges that would exceed it (HTTP 507 on the blob path). Part of the `policy_fingerprint` preimage.  
+**Description:** Whole private-subsystem storage cap in bytes; the ledger refuses charges that would exceed it (HTTP 507 on the blob path). Part of the `policy_fingerprint` preimage. With a minimum blob charge (`NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES`, default 16384) the node refuses to start when this budget divided by that minimum allows more blob charges than the 48 GiB private meta map holds at 12 KiB each: at the default minimum, a budget above 64 GiB needs a larger minimum.  
 **Type:** Integer  
 **Default:** `53687091200` (50 GiB)  
+**Required:** No
+
+#### `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES`
+
+**Description:** Minimum billable size of a blob in bytes. Every blob a repository stores or declares (in a state root, before the bytes arrive) is charged at least this much at the repository, account and node scopes, so the three quotas also bound how many blobs fit under them: at the default a 512 MiB repository holds at most 32768 blobs, a 1 GiB account 65536. Each blob still costs an inode on the blob volume and a claim in the meta store whatever its size, which is what the minimum pays for. Only the charge is raised: the blob is stored, listed and served at its real size. The charge records what it cost and gives back exactly that when it is released, so changing this value moves no existing charge by itself; a charge takes the new value when it is next priced (a repository starts referencing the blob, its newest state root declares a blob not stored on the node, or the bytes are stored or uploaded again). Must not exceed `NGIT_GRASP_P_QUOTA_REPO_BYTES`. The node refuses to start when `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES` divided by this value allows more charges than the private meta store (a fixed 48 GiB map, sparse on disk) holds at 12 KiB each, the most one charge can take whatever order a client names its blobs in; at the default that allows a budget of up to 64 GiB, and a larger budget needs a larger minimum. `0` = no minimum, with a warning at start: blobs are then charged their real size and nothing bounds how many tiny ones an account holds. Part of the `policy_fingerprint` preimage, so both nodes of a pair must run the same value, and advertised in NIP-11 as `private_repos.min_blob_charge_bytes`.  
+**Type:** Integer  
+**Default:** `16384` (16 KiB)  
 **Required:** No
 
 #### `NGIT_GRASP_P_MAX_ALIASES_PER_TENANT`

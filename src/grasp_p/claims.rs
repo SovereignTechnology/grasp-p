@@ -1,7 +1,8 @@
 //! Who pays for a stored blob (decision D4): every repository that
 //! references it, its full size each, at the repository, account and node
 //! scopes of the ledger. The disk keeps one copy; the ledger holds one
-//! charge per referencing repository.
+//! charge per referencing repository. No charge costs less than the
+//! minimum blob charge (decision D5, `quota::billable`).
 //!
 //! Every change to a claim's references and charges goes through the
 //! functions here, each of which edits a claim in memory and returns the
@@ -17,7 +18,8 @@
 //!
 //! - [`attach`]: a repository that starts referencing a blob is charged its
 //!   size: the stored size once the bytes are on this node, its own declared
-//!   size before. A repository already referencing it is not charged again.
+//!   size before, either raised to the minimum charge. A repository already
+//!   referencing it is not charged again.
 //! - [`redeclare`]: before the bytes are here, the repository's newest
 //!   declaration sets its charge, so that a node that missed an earlier
 //!   edition, or applied the editions of two write keys in another order,
@@ -32,7 +34,7 @@
 //!   is deleted with its last reference, so a claim that exists is either
 //!   charged or on disk.
 //! - [`settle_stored`]: when the bytes arrive, by upload or by the mirror,
-//!   every charge is set to the stored size. A charge then depends on the
+//!   every charge is priced at the stored size. A charge then depends on the
 //!   blob and not on who declared it first, which is what lets the two
 //!   nodes of a pair reach the same ledger whichever of them saw the
 //!   references, the upload and the mirror fetch in which order.
@@ -41,6 +43,22 @@
 //!   stops referencing the blob instead, so that no account's upload
 //!   carries another account over its quota.
 //! - [`release_all`]: GC's purge and a takedown release every charge.
+//!
+//! What a charge costs, and when that is decided: every charge is priced
+//! with `quota::billable`, its size raised to the minimum blob charge, and
+//! the price is recorded on the charge. Every release gives back exactly
+//! the recorded bytes, so a change of the minimum never makes the ledger
+//! drift. A charge is priced again only at three points: by [`attach`],
+//! when a repository starts referencing the blob, or takes up again the
+//! grace charge it left; by [`redeclare`], at each accepted edition that is
+//! the repository's newest naming a blob not stored on this node; and by
+//! [`settle_stored`], every time the bytes are stored or found on this node
+//! (an upload, a repeated upload included, a mirror fetch, or GC finding the
+//! file beside a declared claim), which prices every charge on the claim.
+//! A charge nothing prices again keeps its bytes until it is released, and
+//! the two nodes of a pair price a charge again at their own moments, so
+//! after a change of the minimum their ledgers agree only once each charge
+//! has been priced again on both.
 //!
 //! What still depends on the order things arrive in:
 //!
@@ -134,14 +152,21 @@ fn holds(claim: &BlobClaim, alias: &str) -> bool {
 
 /// `alias` of account `tenant` starts referencing the blob, declaring
 /// `declared` bytes for it.
-pub(crate) fn attach(claim: &mut BlobClaim, tenant: &str, alias: &str, declared: u64) -> Vec<Move> {
+pub(crate) fn attach(
+    cfg: &PrivateConfig,
+    claim: &mut BlobClaim,
+    tenant: &str,
+    alias: &str,
+    declared: u64,
+) -> Vec<Move> {
     let mut moves = Vec::new();
     if claim.aliases.iter().any(|a| a == alias) {
         return moves;
     }
     // Once the bytes are here their size is the truth, whatever this
     // repository declared.
-    let bytes = if claim.stored { claim.size } else { declared };
+    let size = if claim.stored { claim.size } else { declared };
+    let bytes = quota::billable(cfg, size);
     if claim.aliases.is_empty() {
         // With no reference left the only charge a claim can carry is the
         // grace charge of its last referrer. The same repository coming
@@ -187,17 +212,23 @@ pub(crate) fn attach(claim: &mut BlobClaim, tenant: &str, alias: &str, declared:
 
 /// `alias`, which references the blob, declares `declared` bytes for it in
 /// its newest edition. Before the bytes are here that declaration is what
-/// the repository pays; once they are here the stored size is, and this
-/// changes nothing.
-pub(crate) fn redeclare(claim: &mut BlobClaim, alias: &str, declared: u64) -> Vec<Move> {
+/// the repository pays (never less than the minimum charge); once they are
+/// here the stored size is, and this changes nothing.
+pub(crate) fn redeclare(
+    cfg: &PrivateConfig,
+    claim: &mut BlobClaim,
+    alias: &str,
+    declared: u64,
+) -> Vec<Move> {
     let mut moves = Vec::new();
     if claim.stored || !claim.aliases.iter().any(|a| a == alias) {
         return moves;
     }
+    let bytes = quota::billable(cfg, declared);
     if let Some(charge) = claim.charges.iter_mut().find(|c| c.alias == alias) {
-        if charge.bytes != declared {
+        if charge.bytes != bytes {
             moves.push(Move::release(charge));
-            charge.bytes = declared;
+            charge.bytes = bytes;
             moves.push(Move::charge(charge));
         }
     }
@@ -246,17 +277,24 @@ pub(crate) fn detach(claim: &mut BlobClaim, alias: &str, now: u64) -> (Vec<Move>
     (moves, Row::Keep)
 }
 
-/// The blob's bytes are on this node, `size` of them: every charge is set
-/// to that size, and the storing time is kept from the first time.
-pub(crate) fn settle_stored(claim: &mut BlobClaim, size: u64, now: u64) -> Vec<Move> {
+/// The blob's bytes are on this node, `size` of them: the claim records
+/// that size, every charge is priced at it, and the storing time is kept
+/// from the first time.
+pub(crate) fn settle_stored(
+    cfg: &PrivateConfig,
+    claim: &mut BlobClaim,
+    size: u64,
+    now: u64,
+) -> Vec<Move> {
     let mut moves = Vec::new();
     claim.stored = true;
     claim.size = size;
     claim.stored_at.get_or_insert(now);
+    let bytes = quota::billable(cfg, size);
     for charge in claim.charges.iter_mut() {
-        if charge.bytes != size {
+        if charge.bytes != bytes {
             moves.push(Move::release(charge));
-            charge.bytes = size;
+            charge.bytes = bytes;
             moves.push(Move::charge(charge));
         }
     }
@@ -385,6 +423,7 @@ pub(crate) fn commit(
 pub(crate) fn attach_to(
     meta: &MetaEnv,
     txn: &mut RwTxn,
+    cfg: &PrivateConfig,
     sha256: &str,
     tenant: &str,
     alias: &str,
@@ -392,7 +431,7 @@ pub(crate) fn attach_to(
 ) -> Result<()> {
     let before = meta.get_blob_claim(txn, sha256)?;
     let mut claim = before.clone().unwrap_or_else(|| new_claim(declared));
-    let moves = attach(&mut claim, tenant, alias, declared);
+    let moves = attach(cfg, &mut claim, tenant, alias, declared);
     commit(meta, txn, sha256, before.as_ref(), Some(&claim), &moves)?;
     // Idempotent. A referrer's entry is written even when the claim did not
     // change, so that its death always finds the blob.
@@ -403,6 +442,7 @@ pub(crate) fn attach_to(
 pub(crate) fn redeclare_to(
     meta: &MetaEnv,
     txn: &mut RwTxn,
+    cfg: &PrivateConfig,
     sha256: &str,
     alias: &str,
     declared: u64,
@@ -411,7 +451,7 @@ pub(crate) fn redeclare_to(
         return Ok(());
     };
     let mut claim = before.clone();
-    let moves = redeclare(&mut claim, alias, declared);
+    let moves = redeclare(cfg, &mut claim, alias, declared);
     commit(meta, txn, sha256, Some(&before), Some(&claim), &moves)
 }
 
@@ -481,8 +521,32 @@ mod tests {
         blob_bytes(meta, LEDGER_GLOBAL_KEY)
     }
 
+    /// What the claims are priced with: a minimum charge of `floor`.
+    fn priced(floor: u64) -> PrivateConfig {
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+        cfg.min_blob_charge_bytes = floor;
+        cfg
+    }
+
     fn reference(meta: &MetaEnv, sha256: &str, tenant: &str, alias: &str, declared: u64) {
-        meta.with_write(|m, txn| attach_to(m, txn, sha256, tenant, alias, declared))
+        reference_at(meta, &priced(0), sha256, tenant, alias, declared);
+    }
+
+    fn reference_at(
+        meta: &MetaEnv,
+        cfg: &PrivateConfig,
+        sha256: &str,
+        tenant: &str,
+        alias: &str,
+        declared: u64,
+    ) {
+        meta.with_write(|m, txn| attach_to(m, txn, cfg, sha256, tenant, alias, declared))
+            .unwrap();
+    }
+
+    /// `alias`'s newest edition declares `declared` bytes for the blob.
+    fn redeclare_at(meta: &MetaEnv, cfg: &PrivateConfig, sha256: &str, alias: &str, declared: u64) {
+        meta.with_write(|m, txn| redeclare_to(m, txn, cfg, sha256, alias, declared))
             .unwrap();
     }
 
@@ -491,13 +555,17 @@ mod tests {
             .unwrap();
     }
 
-    /// The bytes arrive, as the mirror stores them: every charge is set to
-    /// the stored size and nobody new is attached.
+    /// The bytes arrive, as the mirror stores them: every charge is priced
+    /// at the stored size and nobody new is attached.
     fn store(meta: &MetaEnv, sha256: &str, size: u64) {
+        store_at(meta, &priced(0), sha256, size);
+    }
+
+    fn store_at(meta: &MetaEnv, cfg: &PrivateConfig, sha256: &str, size: u64) {
         meta.with_write(|m, txn| {
             let before = m.get_blob_claim(txn, sha256)?;
             let mut claim = before.clone().unwrap_or_else(|| new_claim(size));
-            let moves = settle_stored(&mut claim, size, NOW);
+            let moves = settle_stored(cfg, &mut claim, size, NOW);
             commit(m, txn, sha256, before.as_ref(), Some(&claim), &moves)
         })
         .unwrap();
@@ -527,15 +595,21 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_invariants(meta: &MetaEnv, repos: &[(&str, &str)]) {
+        assert_priced_invariants(meta, &priced(0), repos);
+    }
+
     /// The invariants every claim row and the ledger keep, over the
-    /// repositories `repos` (alias, account) a test uses:
+    /// repositories `repos` (alias, account) a test uses, when every charge
+    /// was priced with `cfg`:
     ///
     /// - a row is charged or on disk;
     /// - one charge per referencing repository, none twice, and when no
     ///   repository references stored bytes at most one grace charge;
+    /// - a stored blob's charges are its stored size, raised to the floor;
     /// - the index lists a blob under exactly the aliases that hold it;
     /// - the blob column of every scope is the sum of the charges in it.
-    fn assert_invariants(meta: &MetaEnv, repos: &[(&str, &str)]) {
+    fn assert_priced_invariants(meta: &MetaEnv, cfg: &PrivateConfig, repos: &[(&str, &str)]) {
         let txn = meta.read_txn().unwrap();
         let claims = meta.all_blob_claims(&txn).unwrap();
         let mut by_key: BTreeMap<String, u64> = BTreeMap::new();
@@ -572,7 +646,8 @@ mod tests {
             if claim.stored {
                 for charge in &claim.charges {
                     assert_eq!(
-                        charge.bytes, claim.size,
+                        charge.bytes,
+                        quota::billable(cfg, claim.size),
                         "{sha256}: a stored blob is charged its stored size: {claim:?}"
                     );
                 }
@@ -806,9 +881,10 @@ mod tests {
     #[test]
     fn the_newest_declaration_sets_the_charge_until_the_bytes_arrive() {
         fn edition(meta: &MetaEnv, sha256: &str, declared: u64) {
+            let cfg = priced(0);
             meta.with_write(|m, txn| {
-                attach_to(m, txn, sha256, "ta", "ra", declared)?;
-                redeclare_to(m, txn, sha256, "ra", declared)
+                attach_to(m, txn, &cfg, sha256, "ta", "ra", declared)?;
+                redeclare_to(m, txn, &cfg, sha256, "ra", declared)
             })
             .unwrap();
         }
@@ -883,15 +959,26 @@ mod tests {
     /// The forecast a caller judges quota with is what the write does.
     #[test]
     fn moves_sum_to_what_the_ledger_records() {
+        let cfg = priced(0);
         let mut claim = new_claim(100);
-        let mut moves = attach(&mut claim, "ta", "ra", 100);
-        moves.extend(attach(&mut claim, "ta", "ra", 100));
-        moves.extend(attach(&mut claim, "tb", "rb", 70));
-        moves.extend(settle_stored(&mut claim, 80, NOW));
+        let mut moves = attach(&cfg, &mut claim, "ta", "ra", 100);
+        moves.extend(attach(&cfg, &mut claim, "ta", "ra", 100));
+        moves.extend(attach(&cfg, &mut claim, "tb", "rb", 70));
+        moves.extend(settle_stored(&cfg, &mut claim, 80, NOW));
         let total: i128 = moves.iter().map(Move::delta).sum();
         assert_eq!(total, 160, "two charges of the stored size");
         assert_eq!(charge_of(&claim, "ra"), Some(80));
         assert_eq!(charge_of(&claim, "rb"), Some(80));
+
+        // An upload of a tiny blob, as `finish()` forecasts it: the floor,
+        // not the 30 bytes, and the claim keeps the 30.
+        let cfg = priced(100);
+        let mut claim = new_claim(30);
+        let mut moves = settle_stored(&cfg, &mut claim, 30, NOW);
+        moves.extend(attach(&cfg, &mut claim, "ta", "ra", 30));
+        let total: i128 = moves.iter().map(Move::delta).sum();
+        assert_eq!(total, 100, "the floor");
+        assert_eq!((claim.size, charge_of(&claim, "ra")), (30, Some(100)));
     }
 
     /// A small deterministic generator, so that the sequences below are
@@ -929,41 +1016,47 @@ mod tests {
     }
 
     /// Any order of references, drops, stores, deaths and purges keeps
-    /// every invariant after every step.
+    /// every invariant after every step, with no minimum charge and with
+    /// one above some of the blob sizes.
     #[test]
     fn random_operations_keep_every_invariant() {
         let blobs = blobs();
-        for seed in 1..=8u64 {
-            let (_dir, meta) = meta_env();
-            let mut rng = Lcg(seed);
-            let mut dead: HashSet<&str> = HashSet::new();
-            for step in 0..200 {
-                let (alias, tenant) = REPOS[rng.pick(REPOS.len())];
-                let (x, size, declared) = &blobs[rng.pick(blobs.len())];
-                match rng.pick(10) {
-                    0..=3 if !dead.contains(alias) => reference(&meta, x, tenant, alias, *declared),
-                    4..=5 => unreference(&meta, x, alias),
-                    6..=7 => store(&meta, x, *size),
-                    8 if step % 5 == 0 => {
-                        die(&meta, alias);
-                        dead.insert(alias);
-                        let txn = meta.read_txn().unwrap();
-                        for (sha256, claim) in meta.all_blob_claims(&txn).unwrap() {
-                            if charge_of(&claim, alias).is_some() {
-                                assert!(
-                                    claim.stored && claim.aliases.is_empty(),
-                                    "seed {seed}: {alias} died and keeps only grace \
-                                     charges of stored bytes: {sha256} {claim:?}"
-                                );
+        for floor in [0, 150] {
+            let cfg = priced(floor);
+            for seed in 1..=8u64 {
+                let (_dir, meta) = meta_env();
+                let mut rng = Lcg(seed);
+                let mut dead: HashSet<&str> = HashSet::new();
+                for step in 0..200 {
+                    let (alias, tenant) = REPOS[rng.pick(REPOS.len())];
+                    let (x, size, declared) = &blobs[rng.pick(blobs.len())];
+                    match rng.pick(10) {
+                        0..=3 if !dead.contains(alias) => {
+                            reference_at(&meta, &cfg, x, tenant, alias, *declared)
+                        }
+                        4..=5 => unreference(&meta, x, alias),
+                        6..=7 => store_at(&meta, &cfg, x, *size),
+                        8 if step % 5 == 0 => {
+                            die(&meta, alias);
+                            dead.insert(alias);
+                            let txn = meta.read_txn().unwrap();
+                            for (sha256, claim) in meta.all_blob_claims(&txn).unwrap() {
+                                if charge_of(&claim, alias).is_some() {
+                                    assert!(
+                                        claim.stored && claim.aliases.is_empty(),
+                                        "floor {floor}, seed {seed}: {alias} died and keeps \
+                                         only grace charges of stored bytes: {sha256} {claim:?}"
+                                    );
+                                }
                             }
                         }
+                        9 if claim(&meta, x).is_some_and(|c| c.aliases.is_empty()) => {
+                            purge(&meta, x);
+                        }
+                        _ => {}
                     }
-                    9 if claim(&meta, x).is_some_and(|c| c.aliases.is_empty()) => {
-                        purge(&meta, x);
-                    }
-                    _ => {}
+                    assert_priced_invariants(&meta, &cfg, &REPOS);
                 }
-                assert_invariants(&meta, &REPOS);
             }
         }
     }
@@ -1038,7 +1131,7 @@ mod tests {
 
     /// Apply one node's arrival order, then let GC remove every blob nobody
     /// references (its grace period over), and read the ledger.
-    fn run_node(history: &History, order: &[Step]) -> BTreeMap<String, u64> {
+    fn run_node(cfg: &PrivateConfig, history: &History, order: &[Step]) -> BTreeMap<String, u64> {
         let blobs = blobs();
         let (_dir, meta) = meta_env();
         for step in order {
@@ -1051,7 +1144,7 @@ mod tests {
                     let wanted: HashSet<&str> =
                         named.iter().map(|&b| blobs[b].0.as_str()).collect();
                     for &b in named {
-                        reference(&meta, &blobs[b].0, tenant, alias, blobs[b].2);
+                        reference_at(&meta, cfg, &blobs[b].0, tenant, alias, blobs[b].2);
                     }
                     let held = {
                         let txn = meta.read_txn().unwrap();
@@ -1061,17 +1154,17 @@ mod tests {
                         unreference(&meta, x, alias);
                     }
                 }
-                Step::Store(blob) => store(&meta, &blobs[blob].0, blobs[blob].1),
+                Step::Store(blob) => store_at(&meta, cfg, &blobs[blob].0, blobs[blob].1),
                 Step::Death(repo) => die(&meta, REPOS[repo].0),
             }
-            assert_invariants(&meta, &REPOS);
+            assert_priced_invariants(&meta, cfg, &REPOS);
         }
         for (x, _, _) in &blobs {
             if claim(&meta, x).is_some_and(|c| c.aliases.is_empty()) {
                 purge(&meta, x);
             }
         }
-        assert_invariants(&meta, &REPOS);
+        assert_priced_invariants(&meta, cfg, &REPOS);
         let mut keys: Vec<String> = vec![LEDGER_GLOBAL_KEY.to_string()];
         for (alias, tenant) in REPOS {
             keys.push(quota::alias_key(alias));
@@ -1088,41 +1181,182 @@ mod tests {
     /// Decision D4's promise to a pair: whatever order the state roots,
     /// uploads and mirror fetches arrive in, both nodes reach the same
     /// ledger, and it is what the repositories reference at the end, each
-    /// blob at its stored size, a dead repository at nothing.
+    /// blob at its stored size raised to the minimum charge, a dead
+    /// repository at nothing. It holds for two nodes on one minimum; two on
+    /// different minimums keep different ledgers, which is why the minimum
+    /// is in the policy fingerprint.
     #[test]
     fn pair_ledgers_agree_in_any_arrival_order() {
         let history = history();
         let blobs = blobs();
-        let mut expected: HashMap<String, u64> = HashMap::new();
-        for (repo, editions) in history.editions.iter().enumerate() {
-            if history.dies[repo] {
-                continue;
+        // 200 is above some of the blob sizes and below the others.
+        for floor in [0, 200] {
+            let cfg = priced(floor);
+            let mut expected: HashMap<String, u64> = HashMap::new();
+            for (repo, editions) in history.editions.iter().enumerate() {
+                if history.dies[repo] {
+                    continue;
+                }
+                let (alias, tenant) = REPOS[repo];
+                let last = editions.last().cloned().unwrap_or_default();
+                let unique: BTreeSet<usize> = last.into_iter().collect();
+                for b in unique {
+                    for key in [
+                        quota::alias_key(alias),
+                        quota::tenant_key(tenant),
+                        LEDGER_GLOBAL_KEY.to_string(),
+                    ] {
+                        *expected.entry(key).or_insert(0) += quota::billable(&cfg, blobs[b].1);
+                    }
+                }
             }
-            let (alias, tenant) = REPOS[repo];
-            let last = editions.last().cloned().unwrap_or_default();
-            let unique: BTreeSet<usize> = last.into_iter().collect();
-            for b in unique {
-                for key in [
-                    quota::alias_key(alias),
-                    quota::tenant_key(tenant),
-                    LEDGER_GLOBAL_KEY.to_string(),
-                ] {
-                    *expected.entry(key).or_insert(0) += blobs[b].1;
+
+            for (seed_a, seed_b) in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12)] {
+                let node_a = run_node(&cfg, &history, &arrival_order(&history, seed_a));
+                let node_b = run_node(&cfg, &history, &arrival_order(&history, seed_b));
+                assert_eq!(node_a, node_b, "floor {floor}, seeds {seed_a} and {seed_b}");
+                for (key, bytes) in &node_a {
+                    assert_eq!(
+                        *bytes,
+                        expected.get(key).copied().unwrap_or(0),
+                        "floor {floor}, seeds {seed_a}/{seed_b}: {key}"
+                    );
                 }
             }
         }
 
-        for (seed_a, seed_b) in [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12)] {
-            let node_a = run_node(&history, &arrival_order(&history, seed_a));
-            let node_b = run_node(&history, &arrival_order(&history, seed_b));
-            assert_eq!(node_a, node_b, "seeds {seed_a} and {seed_b}");
-            for (key, bytes) in &node_a {
-                assert_eq!(
-                    *bytes,
-                    expected.get(key).copied().unwrap_or(0),
-                    "seeds {seed_a}/{seed_b}: {key}"
-                );
-            }
-        }
+        let order = arrival_order(&history, 1);
+        assert_ne!(
+            run_node(&priced(0), &history, &order),
+            run_node(&priced(200), &history, &order),
+            "the same history on two minimums"
+        );
+    }
+
+    /// Decision D5: every path that prices a charge charges at least the
+    /// floor, at all three scopes: a tiny declared blob, a redeclaration
+    /// below the floor, the bytes arriving smaller than the floor, a second
+    /// repository taking up a tiny stored blob, and the grace charge the
+    /// last referrer keeps. The claim keeps the real size. Without the floor
+    /// each of these costs its own few bytes, and an account can hold
+    /// millions of claims inside its quota.
+    #[test]
+    fn every_charge_costs_at_least_the_floor() {
+        let cfg = priced(1000);
+        let (_dir, meta) = meta_env();
+        let x = sha(20);
+
+        reference_at(&meta, &cfg, &x, "ta", "ra", 10);
+        assert_eq!(
+            (repo(&meta, "ra"), account(&meta, "ta"), node(&meta)),
+            (1000, 1000, 1000),
+            "a tiny declared blob"
+        );
+        assert_eq!(claim(&meta, &x).unwrap().size, 10, "the declared size");
+
+        redeclare_at(&meta, &cfg, &x, "ra", 20);
+        assert_eq!(repo(&meta, "ra"), 1000, "a redeclaration below the floor");
+        redeclare_at(&meta, &cfg, &x, "ra", 1500);
+        assert_eq!(repo(&meta, "ra"), 1500, "one above it is charged in full");
+        redeclare_at(&meta, &cfg, &x, "ra", 5);
+        assert_eq!(repo(&meta, "ra"), 1000, "and one below it again");
+
+        store_at(&meta, &cfg, &x, 30);
+        let stored = claim(&meta, &x).unwrap();
+        assert!(stored.stored);
+        assert_eq!(stored.size, 30, "the claim records the real size");
+        assert_eq!(
+            (repo(&meta, "ra"), account(&meta, "ta"), node(&meta)),
+            (1000, 1000, 1000),
+            "bytes smaller than the floor"
+        );
+
+        reference_at(&meta, &cfg, &x, "tb", "rb", 999);
+        assert_eq!(
+            (repo(&meta, "rb"), account(&meta, "tb"), node(&meta)),
+            (1000, 1000, 2000),
+            "a tiny blob already stored"
+        );
+        assert_priced_invariants(&meta, &cfg, &[("ra", "ta"), ("rb", "tb")]);
+
+        unreference(&meta, &x, "ra");
+        unreference(&meta, &x, "rb");
+        let left = claim(&meta, &x).unwrap();
+        assert!(left.aliases.is_empty());
+        assert_eq!(charge_of(&left, "rb"), Some(1000), "the grace charge");
+        assert_eq!(
+            (repo(&meta, "ra"), repo(&meta, "rb"), node(&meta)),
+            (0, 1000, 1000)
+        );
+        assert_priced_invariants(&meta, &cfg, &[("ra", "ta"), ("rb", "tb")]);
+
+        purge(&meta, &x);
+        assert_eq!(
+            (repo(&meta, "rb"), account(&meta, "tb"), node(&meta)),
+            (0, 0, 0)
+        );
+    }
+
+    /// A charge records what it cost. When the minimum changes, a charge
+    /// keeps its bytes and is released by exactly them; it takes the new
+    /// minimum only where it is priced again: a repository that starts
+    /// referencing the blob, its newest declaration of a blob not stored
+    /// here, the bytes arriving, and a grace charge taken up again. A
+    /// release at the minimum in force, or a charge priced again when it is
+    /// read, would leave the difference on the ledger at every release.
+    #[test]
+    fn a_charge_keeps_its_bytes_until_it_is_priced_again() {
+        let (old, new) = (priced(1000), priced(4000));
+        let (_dir, meta) = meta_env();
+        let (x, y, z) = (sha(21), sha(22), sha(23));
+        let scopes = |meta: &MetaEnv| (repo(meta, "ra"), repo(meta, "rb"), node(meta));
+        reference_at(&meta, &old, &x, "ta", "ra", 10);
+        reference_at(&meta, &old, &y, "ta", "ra", 10);
+        reference_at(&meta, &old, &y, "tb", "rb", 10);
+        reference_at(&meta, &old, &z, "tb", "rb", 10);
+        store_at(&meta, &old, &z, 10);
+        assert_eq!(scopes(&meta), (2000, 2000, 4000));
+
+        // The minimum goes up. Referencing x again prices nothing; a
+        // repository that starts referencing it pays the new minimum.
+        reference_at(&meta, &new, &x, "ta", "ra", 10);
+        reference_at(&meta, &new, &x, "tb", "rb", 10);
+        let both = claim(&meta, &x).unwrap();
+        assert_eq!(charge_of(&both, "ra"), Some(1000), "kept");
+        assert_eq!(charge_of(&both, "rb"), Some(4000), "priced now");
+        assert_eq!(scopes(&meta), (2000, 6000, 8000));
+
+        // Released by what it recorded.
+        unreference(&meta, &x, "ra");
+        assert_eq!(scopes(&meta), (1000, 6000, 7000));
+
+        // The newest declaration of a blob not stored here prices it again.
+        redeclare_at(&meta, &new, &y, "ra", 10);
+        assert_eq!(scopes(&meta), (4000, 6000, 10_000));
+
+        // The bytes arriving price every charge on the claim again.
+        store_at(&meta, &new, &y, 10);
+        assert_eq!(charge_of(&claim(&meta, &y).unwrap(), "rb"), Some(4000));
+        assert_eq!(scopes(&meta), (4000, 9000, 13_000));
+
+        // A grace charge keeps its bytes; taken up again it is priced again.
+        unreference(&meta, &z, "rb");
+        assert_eq!(charge_of(&claim(&meta, &z).unwrap(), "rb"), Some(1000));
+        assert_eq!(scopes(&meta), (4000, 9000, 13_000));
+        reference_at(&meta, &new, &z, "tb", "rb", 10);
+        assert_eq!(charge_of(&claim(&meta, &z).unwrap(), "rb"), Some(4000));
+        assert_eq!(scopes(&meta), (4000, 12_000, 16_000));
+        unreference(&meta, &z, "rb");
+        purge(&meta, &z);
+        assert_eq!(scopes(&meta), (4000, 8000, 12_000));
+
+        // Everything released comes back to nothing, at every scope.
+        unreference(&meta, &x, "rb");
+        unreference(&meta, &y, "ra");
+        unreference(&meta, &y, "rb");
+        purge(&meta, &y);
+        assert_eq!(scopes(&meta), (0, 0, 0));
+        assert_eq!((account(&meta, "ta"), account(&meta, "tb")), (0, 0));
+        assert_invariants(&meta, &[("ra", "ta"), ("rb", "tb")]);
     }
 }

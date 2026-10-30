@@ -116,7 +116,7 @@ fn settle_file_on_disk(svc: &PrivateService, sha: &str, now: u64) -> anyhow::Res
             return Ok(false);
         };
         let mut claim = before.clone();
-        let moves = claims::settle_stored(&mut claim, len, now);
+        let moves = claims::settle_stored(&svc.cfg, &mut claim, len, now);
         claims::commit(meta, txn, sha, Some(&before), Some(&claim), &moves)?;
         Ok(true)
     })
@@ -276,11 +276,11 @@ mod tests {
         // two repositories paying for it.
         svc.meta
             .with_write(|meta, txn| {
-                claims::attach_to(meta, txn, &sha, "tenant", "alias", 512)?;
-                claims::attach_to(meta, txn, &sha, "tenant-2", "alias-2", 512)?;
+                claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant", "alias", 512)?;
+                claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant-2", "alias-2", 512)?;
                 let before = meta.get_blob_claim(txn, &sha)?;
                 let mut claim = before.clone().expect("declared");
-                let moves = claims::settle_stored(&mut claim, 512, 1);
+                let moves = claims::settle_stored(&svc.cfg, &mut claim, 512, 1);
                 claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
             })
             .unwrap();
@@ -343,10 +343,10 @@ mod tests {
             let (_dir, svc) = harness_with_grace(grace).await;
             svc.meta
                 .with_write(|meta, txn| {
-                    claims::attach_to(meta, txn, &sha, "tenant", "alias", 64)?;
+                    claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant", "alias", 64)?;
                     let before = meta.get_blob_claim(txn, &sha)?;
                     let mut claim = before.clone().expect("declared");
-                    let moves = claims::settle_stored(&mut claim, 64, 1);
+                    let moves = claims::settle_stored(&svc.cfg, &mut claim, 64, 1);
                     claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)?;
                     let now = nostr::prelude::Timestamp::now().as_secs();
                     claims::detach_from(meta, txn, &sha, "alias", now)
@@ -385,7 +385,9 @@ mod tests {
         };
         let (_dir, svc) = harness_with_grace(86_400).await;
         svc.meta
-            .with_write(|meta, txn| claims::attach_to(meta, txn, &sha, "tenant", "alias", 500))
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant", "alias", 500)
+            })
             .unwrap();
         let path = svc.blobs.path_for(&sha);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -432,6 +432,10 @@ pub struct PrivateConfig {
     pub quota_tenant_bytes: u64,
     pub quota_repo_bytes: u64,
     pub global_budget_bytes: u64,
+    /// The least a blob charge costs (decision D5, `quota::billable`). Part
+    /// of `policy_fingerprint`: it decides which state roots and uploads
+    /// fit, so the two nodes of a pair must run the same value.
+    pub min_blob_charge_bytes: u64,
     pub max_aliases_per_tenant: u32,
     pub max_write_keys_per_alias: u32,
     pub state_history_editions: u32,
@@ -540,6 +544,7 @@ impl PrivateConfig {
             quota_tenant_bytes: config.private_quota_tenant_bytes,
             quota_repo_bytes: config.private_quota_repo_bytes,
             global_budget_bytes: config.private_global_budget_bytes,
+            min_blob_charge_bytes: config.private_min_blob_charge_bytes,
             max_aliases_per_tenant: config.private_max_aliases_per_tenant,
             max_write_keys_per_alias: config.private_max_write_keys_per_alias,
             state_history_editions: config.private_state_history_editions,
@@ -682,7 +687,10 @@ fn policy_preimage(config: &Config) -> String {
         // are code, not knobs, and join under v4 the same way, as does the
         // charging rule of merge request 16 (every repository that
         // references a blob pays for it), which changes quota verdicts.
-        "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|blacklist={}|deletion_request_disrespector={}|domains={}",
+        // `min_blob_charge` (merge request 17) joins under v4 for the same
+        // reason: it sets what every blob costs, so a pair on two values
+        // takes and refuses different state roots and uploads near a cap.
+        "{}|mode={}|pow_bits={}|whitelist={}|max_event_bytes={}|max_blob_bytes={}|quota_tenant={}|quota_repo={}|global_budget={}|min_blob_charge={}|max_aliases={}|max_keys={}|replace_capacity={}|replace_refill_per_hour={}|accept_legacy_wrap_kind={}|blacklist={}|deletion_request_disrespector={}|domains={}",
         POLICY_VERSION,
         config.private_registration_mode,
         config.private_pow_bits,
@@ -692,6 +700,7 @@ fn policy_preimage(config: &Config) -> String {
         config.private_quota_tenant_bytes,
         config.private_quota_repo_bytes,
         config.private_global_budget_bytes,
+        config.private_min_blob_charge_bytes,
         config.private_max_aliases_per_tenant,
         config.private_max_write_keys_per_alias,
         config.private_registration_replace_capacity,
@@ -906,6 +915,7 @@ impl PrivateService {
             mirror_enabled = svc.cfg.mirror_enable,
             sync_peers = ?sync_peers,
             event_blacklist_keys = svc.cfg.write_blacklist.len(),
+            min_blob_charge_bytes = svc.cfg.min_blob_charge_bytes,
             build = build_info::version(),
             "GRASP-P private repositories enabled"
         );
@@ -1633,8 +1643,10 @@ impl PrivateService {
         // Bytes already stored here are the size finish() would find.
         let size = if claim.stored { claim.size } else { len };
         let now = nostr::prelude::Timestamp::now().as_secs();
-        let mut moves = claims::settle_stored(&mut claim, size, now);
-        moves.extend(claims::attach(&mut claim, tenant_hex, alias, size));
+        let mut moves = claims::settle_stored(&self.cfg, &mut claim, size, now);
+        moves.extend(claims::attach(
+            &self.cfg, &mut claim, tenant_hex, alias, size,
+        ));
         claims::detach_unaffordable(
             &self.meta, &txn, &self.cfg, &mut claim, alias, &mut moves, now,
         )
@@ -2089,6 +2101,7 @@ pub fn nip11_private_repos_value(
     max_event_bytes: u64,
     quota_tenant_bytes: u64,
     quota_repo_bytes: u64,
+    min_blob_charge_bytes: u64,
     service_address: &str,
     policy_fingerprint: &str,
     accept_legacy_wrap_kind: bool,
@@ -2105,6 +2118,9 @@ pub fn nip11_private_repos_value(
         "max_event_bytes": max_event_bytes,
         "quota_tenant_bytes": quota_tenant_bytes,
         "quota_repo_bytes": quota_repo_bytes,
+        // Decision D5: the least any stored or declared blob is charged, so
+        // that a client can show a usage figure that matches the ledger.
+        "min_blob_charge_bytes": min_blob_charge_bytes,
         "blob_endpoints": [format!("https://{service_address}")],
         // R6 parity: short hash of the admission-affecting config. Ops (and
         // `doctor --two-node`) compare this across a node pair; a mismatch
@@ -2139,6 +2155,7 @@ pub fn nip11_private_repos_from_config(config: &Config) -> Option<serde_json::Va
         config.private_max_event_bytes,
         config.private_quota_tenant_bytes,
         config.private_quota_repo_bytes,
+        config.private_min_blob_charge_bytes,
         &config.service_address(),
         &policy_fingerprint(config),
         config.private_accept_legacy_wrap_kind,
@@ -2493,6 +2510,53 @@ mod tests {
         assert_ne!(policy_fingerprint(&honoring), policy_fingerprint(&archival));
     }
 
+    /// The minimum blob charge decides what every blob costs, and so which
+    /// state roots and uploads fit near a cap: it is in the preimage, the
+    /// two nodes of a pair hash the same value only when they run the same
+    /// minimum, and the label stays v4, which no pair has run yet.
+    #[test]
+    fn fingerprint_covers_the_minimum_blob_charge() {
+        let at = |floor: u64, own: &str, peer: &str| {
+            let mut config = pair_node(own, "/", peer);
+            config.private_min_blob_charge_bytes = floor;
+            config
+        };
+        let a = at(16_384, "a.example", "wss://b.example");
+        let b = at(16_384, "b.example", "wss://a.example");
+        assert_eq!(preimage_field(&a, "min_blob_charge"), "16384");
+        assert_eq!(
+            preimage_field(&Config::for_testing(), "min_blob_charge"),
+            "0"
+        );
+        assert_eq!(
+            policy_fingerprint(&a),
+            policy_fingerprint(&b),
+            "one minimum on both nodes"
+        );
+        for other in [0, 4096, 16_383, 16_385] {
+            assert_ne!(
+                policy_fingerprint(&a),
+                policy_fingerprint(&at(other, "b.example", "wss://a.example")),
+                "a peer on a minimum of {other}"
+            );
+        }
+        assert!(policy_preimage(&a).starts_with("grasp-p-policy-v4|"));
+    }
+
+    /// NIP-11 advertises the minimum blob charge the node runs, so that a
+    /// client can show usage as the ledger counts it.
+    #[test]
+    fn nip11_advertises_the_minimum_blob_charge() {
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        for floor in [0, 16_384] {
+            config.private_min_blob_charge_bytes = floor;
+            let advert = nip11_private_repos_from_config(&config).expect("GRASP-P is enabled");
+            assert_eq!(advert["min_blob_charge_bytes"], serde_json::json!(floor));
+            assert_eq!(advert["policy_fingerprint"], policy_fingerprint(&config));
+        }
+    }
+
     /// The label moved to v4 with this preimage, and the advert and the
     /// preimage carry the same label.
     #[test]
@@ -2566,6 +2630,7 @@ mod tests {
                 1,
                 1,
                 1,
+                0,
                 "example.com",
                 "deadbeefdeadbeef",
                 accept_legacy,
@@ -3121,12 +3186,12 @@ mod tests {
         let declared = "cd".repeat(32);
         svc.meta
             .with_write(|meta, txn| {
-                claims::attach_to(meta, txn, &stored, "tenant-a", "alias-a", 4096)?;
+                claims::attach_to(meta, txn, &svc.cfg, &stored, "tenant-a", "alias-a", 4096)?;
                 let before = meta.get_blob_claim(txn, &stored)?;
                 let mut claim = before.clone().expect("declared");
-                let moves = claims::settle_stored(&mut claim, 4096, 1);
+                let moves = claims::settle_stored(&svc.cfg, &mut claim, 4096, 1);
                 claims::commit(meta, txn, &stored, before.as_ref(), Some(&claim), &moves)?;
-                claims::attach_to(meta, txn, &declared, "tenant-b", "alias-b", 900)
+                claims::attach_to(meta, txn, &svc.cfg, &declared, "tenant-b", "alias-b", 900)
             })
             .unwrap();
 
@@ -3147,6 +3212,56 @@ mod tests {
         ));
     }
 
+    /// Decision D5 in the upload preflight: a tiny blob is forecast at the
+    /// floor, so a repository with room for one more floor is let through
+    /// and one with less is refused before any byte is sent; a blob it pays
+    /// for already asks nothing more. Forecast at its 64 bytes, the third
+    /// blob would pass and `finish()` would refuse it after the body.
+    #[tokio::test]
+    async fn upload_preflight_forecasts_the_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_quota_repo_bytes = 8192;
+        config.private_min_blob_charge_bytes = 4096;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: SharedDatabase =
+            std::sync::Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+        let (first, second, third) = ("ab".repeat(32), "cd".repeat(32), "ef".repeat(32));
+        svc.meta
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &svc.cfg, &first, "tenant-a", "alias-a", 64)?;
+                let before = meta.get_blob_claim(txn, &first)?;
+                let mut claim = before.clone().expect("declared");
+                let moves = claims::settle_stored(&svc.cfg, &mut claim, 64, 1);
+                claims::commit(meta, txn, &first, before.as_ref(), Some(&claim), &moves)
+            })
+            .unwrap();
+
+        svc.blob_quota_preflight("tenant-a", "alias-a", &second, 64)
+            .expect("4096 charged and one more floor fits the 8192 cap");
+        svc.meta
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &svc.cfg, &second, "tenant-a", "alias-a", 64)
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                svc.blob_quota_preflight("tenant-a", "alias-a", &third, 1),
+                Err(BlobError::QuotaExceeded)
+            ),
+            "a third blob of one byte costs a third floor"
+        );
+        svc.blob_quota_preflight("tenant-a", "alias-a", &first, 64)
+            .expect("a blob it pays for already");
+    }
+
     /// `/list` names the stored blobs a tenant's repositories reference. A
     /// blob a repository stopped referencing stays in its index while it
     /// pays the grace charge, and must not be listed as the repository's.
@@ -3160,10 +3275,10 @@ mod tests {
         svc.meta
             .with_write(|meta, txn| {
                 meta.put_tenant_aliases(txn, &tenant_hex, &vec![alias.clone()])?;
-                claims::attach_to(meta, txn, &sha, &tenant_hex, &alias, 64)?;
+                claims::attach_to(meta, txn, &svc.cfg, &sha, &tenant_hex, &alias, 64)?;
                 let before = meta.get_blob_claim(txn, &sha)?;
                 let mut claim = before.clone().expect("declared");
-                let moves = claims::settle_stored(&mut claim, 64, 1);
+                let moves = claims::settle_stored(&svc.cfg, &mut claim, 64, 1);
                 claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
             })
             .unwrap();
@@ -3209,7 +3324,9 @@ mod tests {
             .expect("private service");
         let sha = "ab".repeat(32);
         svc.meta
-            .with_write(|meta, txn| claims::attach_to(meta, txn, &sha, "tenant-a", "alias-a", 4096))
+            .with_write(|meta, txn| {
+                claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant-a", "alias-a", 4096)
+            })
             .unwrap();
         assert_eq!(svc.prior_charge(&sha, "alias-a").unwrap(), 4096);
         assert_eq!(svc.prior_charge(&sha, "alias-b").unwrap(), 0);
@@ -3243,10 +3360,10 @@ mod tests {
         let sha = "ab".repeat(32);
         svc.meta
             .with_write(|meta, txn| {
-                claims::attach_to(meta, txn, &sha, "tenant-a", "alias-a", 64)?;
+                claims::attach_to(meta, txn, &svc.cfg, &sha, "tenant-a", "alias-a", 64)?;
                 let before = meta.get_blob_claim(txn, &sha)?;
                 let mut claim = before.clone().expect("declared");
-                let moves = claims::settle_stored(&mut claim, 64, 1);
+                let moves = claims::settle_stored(&svc.cfg, &mut claim, 64, 1);
                 claims::commit(meta, txn, &sha, before.as_ref(), Some(&claim), &moves)
             })
             .unwrap();

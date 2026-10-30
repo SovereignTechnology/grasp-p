@@ -7778,3 +7778,139 @@ async fn exit47_every_referencing_repository_pays_and_none_pins_another() {
 
     relay.stop().await;
 }
+
+// ============================================================================
+// Exit test 48 — tiny blobs are charged the minimum (issue 25, decision D5)
+// ============================================================================
+
+/// Issue 25 end to end: with a minimum blob charge, a repository of tiny
+/// blobs reaches its byte cap after cap / minimum of them, so the cap
+/// bounds how many it holds. Five 64-byte uploads fit a cap of five and a
+/// half minimums, the sixth is refused with 507 at the preflight and on the
+/// PUT, and a state root that declares one more blob of one byte is refused
+/// for quota. The blobs are stored and described at their real size, a
+/// repeat upload adds nothing, and the ledger counts five minimums, the
+/// last referrer's grace charge after a DELETE included. NIP-11 advertises
+/// the minimum. Without it the six uploads cost 384 bytes and all fit.
+#[tokio::test]
+async fn exit48_a_repository_of_tiny_blobs_reaches_its_cap_at_the_minimum() {
+    let tenant = Keys::generate();
+    let whitelist = whitelist_npubs(&[&tenant]);
+    let relay = TestRelay::start_with_grasp_p(&[
+        ("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES", "4096"),
+        // Five minimums and up to 2048 bytes of events (the registration
+        // is about 750), never six minimums.
+        ("NGIT_GRASP_P_QUOTA_REPO_BYTES", "22528"),
+        // At 4096 the default 50 GiB budget allows more charges than the
+        // meta map holds, and the node would refuse to start.
+        ("NGIT_GRASP_P_GLOBAL_BUDGET_BYTES", "1073741824"),
+        ("NGIT_GRASP_P_TENANT_WHITELIST", whitelist.as_str()),
+    ])
+    .await;
+    let doc = nip11_doc(&relay).await;
+    assert_eq!(
+        doc["private_repos"]["min_blob_charge_bytes"], 4096,
+        "exit48: NIP-11 advertises the minimum; got {doc}"
+    );
+
+    let writer = Keys::generate();
+    let alias = random_alias();
+    register_alias(&relay, &tenant, &writer, &alias).await;
+    let authorize = |op: &str, sha: &str| {
+        blossom_auth_event(
+            &writer,
+            op,
+            sha,
+            &tenant.public_key(),
+            &alias,
+            future_expiration(),
+        )
+    };
+    let g0 = global_ledger_bytes(&relay).await;
+    assert!(g0 > 0, "exit48: the registration is on the ledger");
+
+    let mut stored = Vec::new();
+    for seed in 150..155u8 {
+        let data = blob_bytes(seed, 64);
+        let sha = sha256_hex(&data);
+        let (status, descriptor, reason) =
+            put_blob(&relay, data.clone(), &sha, &authorize("upload", &sha)).await;
+        assert_eq!(
+            status, 200,
+            "exit48: tiny blob {seed} fits; X-Reason: {reason}"
+        );
+        assert_eq!(descriptor["size"], 64, "exit48: described at its real size");
+        stored.push((sha, data));
+    }
+
+    // The sixth does not fit: refused before its body is sent, and on the
+    // PUT, and nothing of it is stored.
+    let sixth = blob_bytes(160, 64);
+    let sixth_sha = sha256_hex(&sixth);
+    let (status, reason) = head_upload(
+        &relay,
+        &sixth_sha,
+        64,
+        Some(&authorize("upload", &sixth_sha)),
+    )
+    .await;
+    assert_eq!(
+        status, 507,
+        "exit48: the preflight counts the minimum; X-Reason: {reason}"
+    );
+    let (status, _, reason) =
+        put_blob(&relay, sixth, &sixth_sha, &authorize("upload", &sixth_sha)).await;
+    assert_eq!(
+        status, 507,
+        "exit48: the PUT counts the minimum; X-Reason: {reason}"
+    );
+    assert_eq!(get_blob(&relay, &sixth_sha).await.0, 404);
+
+    // Declaring one more blob, of a single byte, costs a minimum too.
+    let declared_sha = sha256_hex(&blob_bytes(161, 1));
+    let edition = state_root_event(
+        &writer,
+        &tenant.public_key(),
+        &alias,
+        (&declared_sha, 1),
+        &[],
+        Timestamp::now().as_secs(),
+    );
+    let (accepted, message) = publish_with_result(relay.url(), &edition).await;
+    assert!(
+        !accepted && message.contains("quota exceeded"),
+        "exit48: a tiny declared blob costs the minimum; got accepted={accepted} {message:?}"
+    );
+
+    // A blob the repository pays for already costs nothing more, and is
+    // read back at its real size.
+    let (first_sha, first) = stored[0].clone();
+    let (status, _, reason) = put_blob(
+        &relay,
+        first.clone(),
+        &first_sha,
+        &authorize("upload", &first_sha),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "exit48: a repeat upload adds nothing; X-Reason: {reason}"
+    );
+    let (status, body) = get_blob(&relay, &first_sha).await;
+    assert_eq!(status, 200);
+    assert!(body == first, "exit48: the blob reads back whole");
+
+    // The DELETE refreshes the ledger gauge. The repository was the last
+    // referrer of those bytes, so it keeps their grace charge until GC: the
+    // ledger holds five minimums beside the registration, not 5 x 64.
+    let (status, reason) = delete_blob(&relay, &first_sha, &authorize("delete", &first_sha)).await;
+    assert_eq!(status, 200, "exit48: DELETE; X-Reason: {reason}");
+    let want = g0 + 5 * 4096;
+    let ledger = poll_until(want, || global_ledger_bytes(&relay)).await;
+    assert_eq!(
+        ledger, want,
+        "exit48: each tiny blob is charged the minimum"
+    );
+
+    relay.stop().await;
+}

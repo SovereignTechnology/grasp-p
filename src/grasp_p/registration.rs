@@ -1627,14 +1627,15 @@ mod tests {
                     )?;
                 }
                 quota::charge(m, txn, &loser_hex, &alias, 5000, false)?;
-                claims::attach_to(m, txn, &sha_declared, &loser_hex, &alias, 4096)?;
-                claims::attach_to(m, txn, &sha_stored, &loser_hex, &alias, 512)?;
+                let cfg = &svc.cfg;
+                claims::attach_to(m, txn, cfg, &sha_declared, &loser_hex, &alias, 4096)?;
+                claims::attach_to(m, txn, cfg, &sha_stored, &loser_hex, &alias, 512)?;
                 let before = m.get_blob_claim(txn, &sha_stored)?;
                 let mut stored = before.clone().expect("declared");
-                let moves = claims::settle_stored(&mut stored, 512, 1);
+                let moves = claims::settle_stored(cfg, &mut stored, 512, 1);
                 claims::commit(m, txn, &sha_stored, before.as_ref(), Some(&stored), &moves)?;
-                claims::attach_to(m, txn, &sha_shared, &loser_hex, &alias, 100)?;
-                claims::attach_to(m, txn, &sha_shared, &survivor_hex, &other, 100)
+                claims::attach_to(m, txn, cfg, &sha_shared, &loser_hex, &alias, 100)?;
+                claims::attach_to(m, txn, cfg, &sha_shared, &survivor_hex, &other, 100)
             })
             .unwrap();
         let blob_column = |key: String| {
@@ -2928,7 +2929,7 @@ mod tests {
                     &MetaEnv::state_ring_key(&alias, SEATED_AT + 60, "aa"),
                     "{}",
                 )?;
-                claims::attach_to(m, txn, &sha, &holder_hex, &alias, 512)
+                claims::attach_to(m, txn, &svc.cfg, &sha, &holder_hex, &alias, 512)
             })
             .unwrap();
 

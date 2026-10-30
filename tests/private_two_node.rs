@@ -1987,6 +1987,64 @@ async fn exit24_nothing_attaches_to_private_events_on_either_node() {
 }
 
 // ============================================================================
+// Exit test 25 — both nodes of a pair charge one minimum (decision D5)
+// ============================================================================
+
+/// The minimum blob charge sets what every blob costs, and with it which
+/// state roots and uploads fit near a cap, so the two nodes of a pair must
+/// run the same one. Two nodes on one minimum advertise it and match
+/// fingerprints; two on different minimums advertise each their own and
+/// their fingerprints differ, the signal the watchdog and the runbook give
+/// an operator. With the minimum left out of the preimage the second pair
+/// would look paired while refusing different writes.
+#[tokio::test]
+async fn exit25_both_nodes_of_a_pair_charge_one_minimum() {
+    let fingerprint = |doc: &serde_json::Value| {
+        doc["private_repos"]["policy_fingerprint"]
+            .as_str()
+            .expect("private_repos.policy_fingerprint")
+            .to_string()
+    };
+    let floor = ("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES", "16384");
+
+    let (a, b) = start_pair(&[floor]).await;
+    let (doc_a, doc_b) = (nip11_doc(&a).await, nip11_doc(&b).await);
+    for doc in [&doc_a, &doc_b] {
+        assert_eq!(
+            doc["private_repos"]["min_blob_charge_bytes"], 16384,
+            "exit25: the minimum is advertised; got {doc}"
+        );
+    }
+    assert_eq!(
+        fingerprint(&doc_a),
+        fingerprint(&doc_b),
+        "exit25: one minimum on both nodes, one fingerprint"
+    );
+    b.stop().await;
+    a.stop().await;
+
+    // A second minimum the default budget allows at boot, so that the two
+    // nodes differ in nothing else.
+    let (a, b) =
+        start_pair_with_split_env(&[floor], &[("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES", "32768")])
+            .await;
+    let (doc_a, doc_b) = (nip11_doc(&a).await, nip11_doc(&b).await);
+    assert_eq!(doc_a["private_repos"]["min_blob_charge_bytes"], 16384);
+    assert_eq!(doc_b["private_repos"]["min_blob_charge_bytes"], 32768);
+    assert_eq!(
+        doc_a["private_repos"]["policy_version"], doc_b["private_repos"]["policy_version"],
+        "exit25: one build, so the difference is a setting, not a version skew"
+    );
+    assert_ne!(
+        fingerprint(&doc_a),
+        fingerprint(&doc_b),
+        "exit25: two minimums must show as two fingerprints"
+    );
+    b.stop().await;
+    a.stop().await;
+}
+
+// ============================================================================
 // Exit test 9 — mirror finish() re-check + no re-enqueue after death (R2-C)
 // ============================================================================
 

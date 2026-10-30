@@ -650,8 +650,9 @@ let
         default = 536870912;
         description = ''
           GRASP-P: per-alias total quota in bytes (events + blobs). Must
-          be > 0 and <= privateQuotaTenantBytes. Default 512 MiB.
-          policy_fingerprint preimage member.
+          be > 0, <= privateQuotaTenantBytes and >=
+          privateMinBlobChargeBytes. Default 512 MiB. policy_fingerprint
+          preimage member.
         '';
       };
 
@@ -660,7 +661,26 @@ let
         default = 53687091200;
         description = ''
           GRASP-P: whole private-subsystem storage cap in bytes. Default
-          50 GiB. policy_fingerprint preimage member.
+          50 GiB. policy_fingerprint preimage member. The node refuses to
+          start when it divided by privateMinBlobChargeBytes allows more
+          blob charges than the 48 GiB private meta map holds at 12 KiB
+          each: at the default minimum, at most 64 GiB.
+        '';
+      };
+
+      privateMinBlobChargeBytes = mkOption {
+        type = types.int;
+        default = 16384;
+        description = ''
+          GRASP-P: minimum billable size of a blob in bytes. Every blob a
+          repository stores or declares is charged at least this much at
+          the repository, account and node scopes, so the quotas also bound
+          how many blobs fit under them; the disk keeps the real size. Must
+          be <= privateQuotaRepoBytes, and the node refuses to start when
+          privateGlobalBudgetBytes divided by it allows more charges than
+          the 48 GiB private meta store holds at 12 KiB each. 0 = no minimum.
+          Default 16 KiB. policy_fingerprint preimage member; advertised in
+          NIP-11 as private_repos.min_blob_charge_bytes.
         '';
       };
 
@@ -1161,6 +1181,8 @@ let
       NGIT_GRASP_P_QUOTA_REPO_BYTES = toString cfg.privateQuotaRepoBytes;
       NGIT_GRASP_P_GLOBAL_BUDGET_BYTES =
         toString cfg.privateGlobalBudgetBytes;
+      NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES =
+        toString cfg.privateMinBlobChargeBytes;
       NGIT_GRASP_P_MAX_ALIASES_PER_TENANT =
         toString cfg.privateMaxAliasesPerTenant;
       NGIT_GRASP_P_MAX_WRITE_KEYS_PER_ALIAS =

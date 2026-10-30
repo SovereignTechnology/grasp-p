@@ -728,7 +728,9 @@ impl TestRelay {
     /// `NGIT_GRASP_P_REPOS_ENABLE=true` is always set; `extra_env` is applied
     /// afterwards, so a caller can override it. The node also gets a metrics
     /// endpoint on a kernel-assigned loopback port (see
-    /// [`Self::grasp_p_metrics`]), which `extra_env` can override as well.
+    /// [`Self::grasp_p_metrics`]) and `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES=0`
+    /// (blobs charged their real size), which `extra_env` can override as
+    /// well.
     pub async fn start_with_grasp_p(extra_env: &[(&str, &str)]) -> Self {
         Self::start_grasp_p_node(None, extra_env).await
     }
@@ -756,6 +758,12 @@ impl TestRelay {
             (
                 "NGIT_GRASP_P_METRICS_BIND".to_string(),
                 "127.0.0.1:0".to_string(),
+            ),
+            // No minimum blob charge, so that the suites' byte arithmetic
+            // counts real sizes; a test of the minimum sets it.
+            (
+                "NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES".to_string(),
+                "0".to_string(),
             ),
         ];
         env.extend(
@@ -849,10 +857,14 @@ impl TestRelay {
                 "true".to_string(),
             ),
             // See `start_with_grasp_p`: the scrape has a listener of its
-            // own, on a port the kernel picks.
+            // own, on a port the kernel picks, and no minimum blob charge.
             (
                 "NGIT_GRASP_P_METRICS_BIND".to_string(),
                 "127.0.0.1:0".to_string(),
+            ),
+            (
+                "NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES".to_string(),
+                "0".to_string(),
             ),
         ];
         // GRASP-P events and blobs come only from the operator's lists:

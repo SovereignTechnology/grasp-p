@@ -150,10 +150,11 @@ pub(crate) fn clock_now() -> Instant {
 #[derive(Debug, Clone)]
 pub struct WantBlob {
     pub sha256: String,
-    /// Declared size: from the 30641 tag, or the charge of the repository
-    /// the repair scan chose first. A fallback repository is judged, and
-    /// read for, at its own charge instead (`fetch_from_peer`), so no
-    /// account's declaration sets the size fetched for another.
+    /// Declared size: from the 30641 tag, or what the repair scan reads
+    /// from the charge of the repository it chose first ([`declared_size`]).
+    /// A fallback repository is judged, and read for, at the size read
+    /// from its own charge instead (`fetch_from_peer`), so no account's
+    /// declaration sets the size fetched for another.
     pub size: u64,
 }
 
@@ -905,6 +906,32 @@ fn expected_len(announced: Option<u64>, declared: u64, max_blob_bytes: u64) -> R
     Ok(expected)
 }
 
+/// The size a repository declared for a blob not stored here, read from
+/// what it is charged for it, `charge`, with the minimum blob charge
+/// `floor` in force.
+///
+/// A charge above the floor is read as the declaration itself. So is a
+/// charge priced under an earlier, higher minimum, as a declaration of that
+/// minimum, until the repository's next state root naming the blob prices
+/// it again: the forecast then prices the other referrers at that size,
+/// which near the node's cap can refuse a fetch that `finish()` would take.
+/// A charge at the floor says only that the declaration was no larger, so
+/// `fallback` (the claim's or the first route's size) stands in for it,
+/// capped at the floor: the quota forecast is the same for every size up to
+/// the floor, and only a peer that announces no length reads by it. From
+/// such a peer the fetch fails on the length whenever the size read here is
+/// not the blob's real one, which the repository's own declaration, no
+/// longer recorded once it pays the minimum, might have been. Without the
+/// cap a fallback route would be judged at another repository's larger
+/// declaration again. No charge leaves `fallback`.
+fn declared_size(charge: Option<u64>, fallback: u64, floor: u64) -> u64 {
+    match charge {
+        Some(bytes) if bytes > floor => bytes,
+        Some(_) => fallback.min(floor),
+        None => fallback,
+    }
+}
+
 /// How long one request for `len` bytes may take from its first byte sent
 /// to its last byte read: the configured timeout, plus the time the body
 /// needs on the slowest link the mirror allows for. A fixed limit would
@@ -1162,7 +1189,8 @@ struct Wanted {
     /// The claim's size, for a claimant with no charge of its own (which
     /// the claim's invariants rule out).
     claim_size: u64,
-    /// What each referencing repository is charged: its own declared size.
+    /// What each referencing repository is charged: its own declared size,
+    /// raised to the minimum blob charge ([`declared_size`]).
     charges: Vec<super::meta::ClaimCharge>,
     /// The live registrations that claim it.
     live: Vec<Arc<Route>>,
@@ -1325,14 +1353,17 @@ fn scan_missing(svc: &PrivateService, now: Instant) -> Option<ScanOutcome> {
             continue;
         };
         let route = live[chosen].clone();
-        // The size the chosen repository declared, which is what it pays
+        // The size the chosen repository declared, read from what it pays
         // until the bytes arrive: a first declarer's size no longer decides
         // the fetch for everyone.
-        let size = charges
-            .iter()
-            .find(|charge| charge.alias == route.alias)
-            .map(|charge| charge.bytes)
-            .unwrap_or(claim_size);
+        let size = declared_size(
+            charges
+                .iter()
+                .find(|charge| charge.alias == route.alias)
+                .map(|charge| charge.bytes),
+            claim_size,
+            svc.cfg.min_blob_charge_bytes,
+        );
         let blob = WantBlob { sha256, size };
         let count = derived.entry(route.tenant_hex.clone()).or_insert(0);
         if *count >= ACCOUNT_BACKLOG_CAP {
@@ -1404,13 +1435,17 @@ async fn fetch_from_peer(
         PeerVerdict::Unresolved => return Err(UNRESOLVED_REASON.to_string()),
     }
 
-    // What this route's own repository declared, which is what it pays
+    // What this route's own repository declared, read from what it pays
     // until the bytes arrive: for a fallback, `blob.size` is the first
     // route's declaration.
     let own = svc
         .prior_charge(&blob.sha256, &route.alias)
         .map_err(|e| format!("reserve: {}", e.reason()))?;
-    let declared = if own > 0 { own } else { blob.size };
+    let declared = declared_size(
+        (own > 0).then_some(own),
+        blob.size,
+        svc.cfg.min_blob_charge_bytes,
+    );
 
     local_preflight(svc, route, blob, declared)?;
 
@@ -2308,6 +2343,24 @@ mod tests {
         assert_eq!(merge_peer_failures(&[]), None);
     }
 
+    /// The declared size a fetch is judged and read at, from the charge a
+    /// repository carries: a charge above the minimum is the declaration;
+    /// one at the minimum stands for any declaration up to it, so the
+    /// fallback is capped there, and a repository judged at a larger
+    /// declaration of another would be refused for bytes it does not owe;
+    /// no charge leaves the fallback. With no minimum the charge is always
+    /// the declaration, 0 included.
+    #[test]
+    fn declared_size_reads_the_charge_above_the_floor() {
+        assert_eq!(declared_size(Some(5000), 100, 4096), 5000);
+        assert_eq!(declared_size(Some(4096), 100, 4096), 100);
+        assert_eq!(declared_size(Some(4096), 9000, 4096), 4096);
+        assert_eq!(declared_size(None, 9000, 4096), 9000);
+        assert_eq!(declared_size(Some(100), 9000, 0), 100);
+        assert_eq!(declared_size(Some(0), 9000, 0), 0);
+        assert_eq!(declared_size(None, 9000, 0), 9000);
+    }
+
     /// The length a fetch reads: every peer is the operator's, and its
     /// announced length is believed up to the maximum blob size, whatever
     /// the state root declared; no announcement leaves the declared size.
@@ -2552,6 +2605,97 @@ mod tests {
         );
         assert_eq!(task.blob.size, 100, "A's own declared size");
         assert_eq!(task.fallbacks.len(), 1);
+    }
+
+    /// With a minimum blob charge the scan still fetches at what the chosen
+    /// repository declared, never at the minimum it pays: a charge at the
+    /// minimum stands for the claim's size, and one above it is the
+    /// declaration. Read as the size, the minimum would have a peer that
+    /// announces no length read 4096 bytes of a 100-byte blob.
+    #[tokio::test]
+    async fn the_scan_fetches_at_the_declaration_not_at_the_minimum() {
+        use crate::grasp_p::meta::{BlobClaim, ClaimCharge, RegistrationRecord};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::config::Config::for_testing();
+        config.private_repos_enable = true;
+        config.private_min_blob_charge_bytes = 4096;
+        config.private_meta_data_path =
+            Some(dir.path().join("meta").to_string_lossy().into_owned());
+        config.private_blob_data_path =
+            Some(dir.path().join("blobs").to_string_lossy().into_owned());
+        let database: crate::nostr::SharedDatabase =
+            Arc::new(nostr_memory::MemoryDatabase::unbounded());
+        let svc = PrivateService::new(&config, database)
+            .await
+            .expect("private service");
+
+        let record = |tenant: &str| RegistrationRecord {
+            tenant_hex: tenant.to_string(),
+            event_id: "01".repeat(32),
+            created_at: 1,
+            w_keys: Vec::new(),
+            aux_keys: Vec::new(),
+            relays: Vec::new(),
+            servers: Vec::new(),
+            quota_class: None,
+            registered_at: 1,
+            tombstoned_at: None,
+            first_created_at: None,
+            first_event_id: None,
+        };
+        let claim = |alias: &str, charge: ClaimCharge| BlobClaim {
+            size: 100,
+            aliases: vec![alias.to_string()],
+            unreferenced_since: None,
+            stored: false,
+            charges: vec![charge],
+            stored_at: None,
+        };
+        let (tenant_a, tenant_b) = ("0a".repeat(32), "0b".repeat(32));
+        let (alias_a, alias_b) = ("aa".repeat(16), "bb".repeat(16));
+        let (small, large) = ("cd".repeat(32), "ef".repeat(32));
+        // A declared 100 bytes, and pays the minimum.
+        let at_minimum = ClaimCharge {
+            tenant: tenant_a.clone(),
+            alias: alias_a.clone(),
+            bytes: 4096,
+        };
+        // B first declared 100 bytes, then 5000, which it pays.
+        let above = ClaimCharge {
+            tenant: tenant_b.clone(),
+            alias: alias_b.clone(),
+            bytes: 5000,
+        };
+        svc.meta
+            .with_write(|meta, txn| {
+                meta.put_registration(txn, &alias_a, &record(&tenant_a))?;
+                meta.put_registration(txn, &alias_b, &record(&tenant_b))?;
+                meta.put_blob_claim(txn, &small, &claim(&alias_a, at_minimum))?;
+                meta.put_blob_claim(txn, &large, &claim(&alias_b, above))
+            })
+            .expect("seed the registrations and the claims");
+
+        let outcome = scan_missing(&svc, clock_now()).expect("the claim table reads");
+        let fetched: Vec<(&str, &str, u64)> = outcome
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.blob.sha256.as_str(),
+                    task.route.alias.as_str(),
+                    task.blob.size,
+                )
+            })
+            .collect();
+        assert_eq!(
+            fetched,
+            vec![
+                (small.as_str(), alias_a.as_str(), 100),
+                (large.as_str(), alias_b.as_str(), 5000),
+            ],
+            "at the minimum the claim's size, above it the charge"
+        );
     }
 
     #[test]
@@ -3945,6 +4089,7 @@ mod tests {
                 crate::grasp_p::claims::attach_to(
                     meta,
                     txn,
+                    &svc.cfg,
                     &sha,
                     &"0b".repeat(32),
                     &"bb".repeat(16),
@@ -3953,6 +4098,7 @@ mod tests {
                 crate::grasp_p::claims::attach_to(
                     meta,
                     txn,
+                    &svc.cfg,
                     &sha,
                     &route.tenant_hex,
                     &route.alias,

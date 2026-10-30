@@ -294,9 +294,9 @@ pub(crate) fn apply_state_root_txn(
         let mut claim = meta
             .get_blob_claim(txn, sha256)?
             .unwrap_or_else(|| claims::new_claim(declared));
-        moves.extend(claims::attach(&mut claim, tenant_hex, alias, declared));
+        moves.extend(claims::attach(cfg, &mut claim, tenant_hex, alias, declared));
         if !named_later.contains(sha256) {
-            moves.extend(claims::redeclare(&mut claim, alias, declared));
+            moves.extend(claims::redeclare(cfg, &mut claim, alias, declared));
         }
     }
     if !quota::fits(meta, txn, cfg, tenant_hex, alias, event_bytes, &moves)? {
@@ -321,9 +321,9 @@ pub(crate) fn apply_state_root_txn(
     let now = nostr::prelude::Timestamp::now().as_secs();
 
     for &(sha256, declared) in &named {
-        claims::attach_to(meta, txn, sha256, tenant_hex, alias, declared)?;
+        claims::attach_to(meta, txn, cfg, sha256, tenant_hex, alias, declared)?;
         if !named_later.contains(sha256) {
-            claims::redeclare_to(meta, txn, sha256, alias, declared)?;
+            claims::redeclare_to(meta, txn, cfg, sha256, alias, declared)?;
         }
     }
 
@@ -474,13 +474,14 @@ mod tests {
         let (alias_a, alias_b) = ("a".repeat(32), "b".repeat(32));
         let (record_a, record_b) = (record(&owner), record(&other));
         let x = sha(7);
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
         meta.with_write(|m, txn| {
             m.put_registration(txn, &alias_a, &record_a)?;
             m.put_registration(txn, &alias_b, &record_b)?;
-            claims::attach_to(m, txn, &x, &record_a.tenant_hex, &alias_a, 512)?;
+            claims::attach_to(m, txn, &cfg, &x, &record_a.tenant_hex, &alias_a, 512)?;
             let before = m.get_blob_claim(txn, &x)?;
             let mut claim = before.clone().expect("the claim just made");
-            let moves = claims::settle_stored(&mut claim, 512, 1);
+            let moves = claims::settle_stored(&cfg, &mut claim, 512, 1);
             claims::commit(m, txn, &x, before.as_ref(), Some(&claim), &moves)
         })
         .unwrap();
@@ -488,7 +489,6 @@ mod tests {
         // B declares 10 bytes for a blob that is 512 on disk.
         let event = edition(&other, &alias_b, &[(x.as_str(), 10)], 100);
         let event_bytes = event.as_json().len() as u64;
-        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
 
         cfg.quota_repo_bytes = event_bytes + 511;
         let refused = apply(&meta, &cfg, &record_b, &event);
@@ -580,7 +580,7 @@ mod tests {
         meta.with_write(|m, txn| {
             let before = m.get_blob_claim(txn, &x)?;
             let mut claim = before.clone().expect("declared");
-            let moves = claims::settle_stored(&mut claim, 300, 20);
+            let moves = claims::settle_stored(&cfg, &mut claim, 300, 20);
             claims::commit(m, txn, &x, before.as_ref(), Some(&claim), &moves)
         })
         .unwrap();
@@ -652,6 +652,64 @@ mod tests {
                 "{applied} edition(s) applied"
             );
         }
+    }
+
+    /// Decision D5 at the state root: an edition declaring as many tiny
+    /// blobs as it may is charged the floor for each, at every scope, and
+    /// one whose floors do not fit the repository's cap is refused without
+    /// a trace. The claims keep the declared size. Without the floor, 256
+    /// declared blobs of 0 bytes cost the event's bytes and nothing more.
+    #[test]
+    fn tiny_declared_blobs_are_charged_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaEnv::open(dir.path()).unwrap();
+        let keys = Keys::generate();
+        let alias = "f".repeat(32);
+        let record = record(&keys);
+        meta.with_write(|m, txn| m.put_registration(txn, &alias, &record))
+            .unwrap();
+        let shas: Vec<String> = (0..MAX_BLOB_REFS_PER_STATE_ROOT)
+            .map(|n| format!("{n:064x}"))
+            .collect();
+        let blobs: Vec<(&str, u64)> = shas.iter().map(|sha256| (sha256.as_str(), 0)).collect();
+        let event = edition(&keys, &alias, &blobs, 100);
+        let event_bytes = event.as_json().len() as u64;
+        let mut cfg = PrivateConfig::from_config(&crate::config::Config::for_testing());
+        cfg.min_blob_charge_bytes = 4096;
+        let floors = MAX_BLOB_REFS_PER_STATE_ROOT as u64 * 4096;
+
+        cfg.quota_repo_bytes = event_bytes + floors - 1;
+        let refused = apply(&meta, &cfg, &record, &event);
+        assert!(
+            matches!(
+                &refused,
+                Some(WritePolicyResult::Reject { message, .. }) if message.contains("quota exceeded")
+            ),
+            "one byte short of the event and 256 floors must be refused"
+        );
+        {
+            let txn = meta.read_txn().unwrap();
+            assert!(meta.state_ring_for_alias(&txn, &alias).unwrap().is_empty());
+            assert!(meta.all_blob_claims(&txn).unwrap().is_empty());
+        }
+        assert_eq!(blob_bytes(&meta, &quota::alias_key(&alias)), 0);
+
+        cfg.quota_repo_bytes = event_bytes + floors;
+        assert!(
+            apply(&meta, &cfg, &record, &event).is_none(),
+            "it fits exactly"
+        );
+        for key in [
+            quota::alias_key(&alias),
+            quota::tenant_key(&record.tenant_hex),
+            crate::grasp_p::meta::LEDGER_GLOBAL_KEY.to_string(),
+        ] {
+            assert_eq!(blob_bytes(&meta, &key), floors, "{key}");
+        }
+        let txn = meta.read_txn().unwrap();
+        let claims = meta.all_blob_claims(&txn).unwrap();
+        assert_eq!(claims.len(), MAX_BLOB_REFS_PER_STATE_ROOT);
+        assert!(claims.iter().all(|(_, claim)| claim.size == 0));
     }
 
     /// A 30641 at exactly the cap still parses successfully.

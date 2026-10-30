@@ -9,8 +9,61 @@ use anyhow::Result;
 use heed::{RoTxn, RwTxn};
 
 use super::claims::Move;
-use super::meta::{LedgerEntry, MetaEnv, LEDGER_GLOBAL_KEY};
+use super::meta::{LedgerEntry, MetaEnv, LEDGER_GLOBAL_KEY, META_BYTES_PER_CHARGE, META_MAP_SIZE};
 use super::PrivateConfig;
+
+/// What a blob of `size` bytes is charged at each scope: its size, and
+/// never less than `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (decision D5).
+///
+/// Every claim row costs the node meta space and every stored blob an
+/// inode, whatever its size; with a floor on the charge the byte quotas
+/// bound how many of them a repository, an account and the node can hold,
+/// and no separate count is needed. Only the charge is raised: the claim
+/// and the disk keep the real size. `claims.rs` prices every charge with
+/// this and records the result on the charge, so that a later change of
+/// the floor never changes what an existing charge gives back.
+pub(crate) fn billable(cfg: &PrivateConfig, size: u64) -> u64 {
+    size.max(cfg.min_blob_charge_bytes)
+}
+
+/// Boot checks of `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES`, from
+/// `Config::validate`.
+///
+/// A floor above the repository cap would refuse every blob. With a floor,
+/// every charge costs at least that much at the node scope, so the node
+/// holds at most `global budget / floor` of them, and each takes up to
+/// [`META_BYTES_PER_CHARGE`] of a meta map whose size is fixed: a budget
+/// the map cannot hold at that floor would let the claims fill it, and a
+/// full map fails every GRASP-P write on the node. A floor of 0 bounds
+/// nothing; it is allowed, and the operator is warned.
+pub(crate) fn check_min_blob_charge(config: &crate::config::Config) -> Result<()> {
+    let floor = config.private_min_blob_charge_bytes;
+    if floor > config.private_quota_repo_bytes {
+        anyhow::bail!(
+            "NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES must not exceed NGIT_GRASP_P_QUOTA_REPO_BYTES"
+        );
+    }
+    if floor == 0 {
+        tracing::warn!(
+            "NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES=0: blobs are charged their real size, so the \
+             quotas do not bound how many tiny blobs an account can store or declare, and \
+             their claims can fill the private meta store"
+        );
+        return Ok(());
+    }
+    let charges = config.private_global_budget_bytes / floor;
+    let needed = u128::from(charges) * u128::from(META_BYTES_PER_CHARGE);
+    let map = META_MAP_SIZE as u128;
+    if needed > map {
+        anyhow::bail!(
+            "NGIT_GRASP_P_GLOBAL_BUDGET_BYTES / NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES allows \
+             {charges} blob charges, which need about {needed} bytes of the private meta \
+             store at {META_BYTES_PER_CHARGE} bytes each; it holds {map}. Raise \
+             NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES or lower NGIT_GRASP_P_GLOBAL_BUDGET_BYTES"
+        );
+    }
+    Ok(())
+}
 
 /// Ledger key for a tenant scope.
 pub fn tenant_key(tenant_hex: &str) -> String {
@@ -234,5 +287,132 @@ mod tests {
         assert!(!fits(&meta, &txn, &tight_account, "t1", "a1", 0, &takeover).unwrap());
         let tight_repo = limits(920, 1000, 2000);
         assert!(!fits(&meta, &txn, &tight_repo, "t1", "a1", 0, &takeover).unwrap());
+    }
+
+    /// A charge is the size, raised to the floor; a floor of 0 is no floor.
+    #[test]
+    fn billable_raises_a_size_to_the_floor() {
+        let mut cfg = limits(1 << 30, 1 << 30, 1 << 30);
+        for size in [0, 1, 16_383, 16_384, 16_385, u64::MAX] {
+            assert_eq!(billable(&cfg, size), size, "no floor: {size}");
+        }
+        cfg.min_blob_charge_bytes = 16_384;
+        for (size, charged) in [
+            (0, 16_384),
+            (1, 16_384),
+            (16_383, 16_384),
+            (16_384, 16_384),
+            (16_385, 16_385),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(billable(&cfg, size), charged, "floor 16384: {size}");
+        }
+    }
+
+    fn with_floor(floor: u64, global_budget: u64) -> crate::config::Config {
+        crate::config::Config {
+            private_repos_enable: true,
+            private_min_blob_charge_bytes: floor,
+            private_global_budget_bytes: global_budget,
+            ..crate::config::Config::for_testing()
+        }
+    }
+
+    /// The boot checks, through `Config::validate`: the shipped floor and
+    /// budget start; a floor above the repository cap does not; the budget
+    /// may allow as many charges as the meta map holds at
+    /// [`META_BYTES_PER_CHARGE`] each and not one more; 0 starts whatever
+    /// the budget. Without the map check a budget of 50 GiB at a floor of
+    /// one byte would let claims fill the 48 GiB map.
+    #[test]
+    fn the_floor_is_checked_at_boot() {
+        let defaults = crate::config::Config::for_testing();
+        let shipped = with_floor(16_384, defaults.private_global_budget_bytes);
+        shipped
+            .validate()
+            .expect("the shipped floor and budget start");
+
+        // A budget the map holds at this floor, so that only the
+        // repository cap decides.
+        let mut over_repo = with_floor(4096, defaults.private_quota_tenant_bytes);
+        over_repo.private_quota_repo_bytes = 4095;
+        let error = over_repo
+            .validate()
+            .expect_err("a floor above the repository cap must not start")
+            .to_string();
+        assert!(
+            error.contains("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES")
+                && error.contains("NGIT_GRASP_P_QUOTA_REPO_BYTES"),
+            "{error}"
+        );
+        over_repo.private_quota_repo_bytes = 4096;
+        over_repo
+            .validate()
+            .expect("a floor equal to the repository cap starts");
+
+        // 48 GiB / 12 KiB = 4 Mi charges fit the map, at any floor.
+        let rows = META_MAP_SIZE as u64 / META_BYTES_PER_CHARGE;
+        assert_eq!(rows, 4 * 1024 * 1024);
+        let floor = 16_384;
+        with_floor(floor, rows * floor)
+            .validate()
+            .expect("exactly as many charges as the map holds");
+        let error = with_floor(floor, rows * floor + floor)
+            .validate()
+            .expect_err("one charge more than the map holds")
+            .to_string();
+        assert!(
+            error.contains("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES")
+                && error.contains("NGIT_GRASP_P_GLOBAL_BUDGET_BYTES"),
+            "{error}"
+        );
+        assert!(with_floor(1, defaults.private_global_budget_bytes)
+            .validate()
+            .is_err());
+        assert!(with_floor(4096, defaults.private_global_budget_bytes)
+            .validate()
+            .is_err());
+
+        for budget in [1, defaults.private_global_budget_bytes, u64::MAX] {
+            let mut no_floor = with_floor(0, budget);
+            no_floor.private_quota_tenant_bytes = 1;
+            no_floor.private_quota_repo_bytes = 1;
+            no_floor
+                .validate()
+                .unwrap_or_else(|e| panic!("floor 0, budget {budget}: {e}"));
+        }
+
+        // Nothing is checked while GRASP-P is off.
+        let off = crate::config::Config {
+            private_repos_enable: false,
+            ..with_floor(1, defaults.private_global_budget_bytes)
+        };
+        off.validate().expect("GRASP-P off");
+    }
+
+    /// The shipped default is the 16 KiB of decision D5. `for_testing`
+    /// keeps 0, so that unit tests count exact bytes.
+    #[test]
+    fn the_shipped_floor_is_16_kib() {
+        use clap::CommandFactory;
+        let mut command = crate::config::Config::command();
+        command.build();
+        let argument = command
+            .get_arguments()
+            .find(|argument| {
+                argument.get_env().and_then(|name| name.to_str())
+                    == Some("NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES")
+            })
+            .expect("the setting exists");
+        let defaults: Vec<String> = argument
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(defaults, vec!["16384".to_string()]);
+        assert_eq!(
+            crate::config::Config::for_testing().private_min_blob_charge_bytes,
+            0
+        );
     }
 }
